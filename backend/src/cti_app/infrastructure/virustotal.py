@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, BinaryIO, Literal, cast
 from urllib.parse import quote, urljoin, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -885,6 +885,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         route-missing evidence for both v3 endpoints and the opt-in flag.
         """
         correlation_id = uuid4().hex
+        authority = current_virustotal_external_effect_authority()
+        # The durable dispatch ID is stable when this attempt is replayed and
+        # changes only when acquisition authorizes a new bounded retry.
+        occurrence_id = authority.acquisition_dispatch_attempt_id if authority is not None else None
         fingerprint = self.acquisition_route_fingerprint
         if (
             self._file_download_enabled
@@ -939,6 +943,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 secret_values=(self._api_key,) if self._api_key else (),
                 coordinated_request=self._coordinated_download_response,
                 acquisition_hash=normalized,
+                occurrence_id=occurrence_id,
             )
 
         direct_error: VirusTotalHttpError | None = None
@@ -967,6 +972,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                         secret_values=(self._api_key,) if self._api_key else (),
                         coordinated_download=True,
                         acquisition_hash=normalized,
+                        occurrence_id=occurrence_id,
                     )
 
                 try:
@@ -1046,6 +1052,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                             secret_values=(self._api_key,),
                             coordinated_request=self._coordinated_download_response,
                             acquisition_hash=normalized,
+                            occurrence_id=occurrence_id,
                         )
                     ticket_caught_error.fallback_decision = (
                         "no_v2_fallback_unattributed_or_not_route_missing"
@@ -1144,6 +1151,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     secret_values=(self._api_key,) if self._api_key else (),
                     coordinated_request=self._coordinated_download_response,
                     acquisition_hash=normalized,
+                    occurrence_id=occurrence_id,
                 )
         except TimeoutError:
             timeout_error = VirusTotalTransportError(
@@ -1723,6 +1731,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         response_max_bytes: int | None = None,
         coordinated_download: bool = False,
         acquisition_hash: str | None = None,
+        occurrence_id: UUID | None = None,
     ) -> VirusTotalRawResponse:
         correlation_id = correlation_id or uuid4().hex
         normalized_route = _normalize_route(path)
@@ -1738,6 +1747,20 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         location_host: str | None = None
         bytes_read = 0
         try:
+            if (
+                operation is VirusTotalOperation.FILE_DOWNLOAD
+                or capability == VirusTotalCapability.FILE_DOWNLOAD.value
+                or normalized_route
+                in {
+                    "/files/{hash}/download",
+                    "/files/{hash}/download_url",
+                    "/file/download",
+                }
+            ) and not coordinated_download:
+                raise VirusTotalExternalEffectRefusedError(
+                    "A VirusTotal download route requires coordinated transport.",
+                    code="vt_download_coordinator_required",
+                )
             request_params = _proxy_query_params(
                 params,
                 transport=transport,
@@ -1756,6 +1779,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     signed=False,
                     acquisition_hash=acquisition_hash,
                     max_response_bytes=max_response_bytes,
+                    occurrence_id=occurrence_id,
                 )
                 await response.aread()
             elif family is None:
@@ -2076,17 +2100,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         signed: bool,
         acquisition_hash: str | None,
         max_response_bytes: int,
+        occurrence_id: UUID | None,
     ) -> httpx.Response:
         authority = current_virustotal_external_effect_authority()
         coordinator = self._external_effect_coordinator
-        if self._offline_probe_mode and authority is None and coordinator is None:
-            request = client.build_request(
-                "GET",
-                url,
-                params=params,
-                headers=headers,
-            )
-            return await client.send(request, follow_redirects=False, stream=True)
         if authority is None:
             raise VirusTotalExternalEffectRefusedError(
                 "The VirusTotal download has no committed investigation authority.",
@@ -2144,6 +2161,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             normalizer_version=_VT_DOWNLOAD_NORMALIZER_VERSION,
             canonical_request=canonical_request,
             application_request=frozen_request,
+            occurrence_id=occurrence_id,
             evidence_refs=current_virustotal_external_effect_evidence_refs(),
             credential_parameter_names=tuple(sorted(VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES)),
         )
@@ -2766,6 +2784,7 @@ async def _download_response_stream(
     signed: bool,
     acquisition_hash: str | None,
     max_response_bytes: int,
+    occurrence_id: UUID | None = None,
 ) -> AsyncIterator[httpx.Response]:
     if coordinated_request is None:
         async with client.stream(
@@ -2788,6 +2807,7 @@ async def _download_response_stream(
         signed=signed,
         acquisition_hash=acquisition_hash,
         max_response_bytes=max_response_bytes,
+        occurrence_id=occurrence_id,
     )
     try:
         yield response
@@ -2814,6 +2834,7 @@ async def _stream_signed_download(
     secret_values: tuple[str | None, ...] = (),
     coordinated_request: Callable[..., Awaitable[httpx.Response]] | None = None,
     acquisition_hash: str | None = None,
+    occurrence_id: UUID | None = None,
 ) -> VirusTotalDownloadResult:
     return await _stream_route_download(
         None,
@@ -2835,6 +2856,7 @@ async def _stream_signed_download(
         secret_values=secret_values,
         coordinated_request=coordinated_request,
         acquisition_hash=acquisition_hash,
+        occurrence_id=occurrence_id,
     )
 
 
@@ -2864,7 +2886,16 @@ async def _stream_route_download(
     secret_values: tuple[str | None, ...] = (),
     coordinated_request: Callable[..., Awaitable[httpx.Response]] | None = None,
     acquisition_hash: str | None = None,
+    occurrence_id: UUID | None = None,
 ) -> VirusTotalDownloadResult:
+    if (
+        operation is VirusTotalOperation.FILE_DOWNLOAD
+        or capability == VirusTotalCapability.FILE_DOWNLOAD.value
+    ) and coordinated_request is None:
+        raise VirusTotalExternalEffectRefusedError(
+            "A VirusTotal download route requires coordinated transport.",
+            code="vt_download_coordinator_required",
+        )
     current_url = url
     redirects_followed = 0
     current_is_signed = initial_signed
@@ -2911,6 +2942,7 @@ async def _stream_route_download(
                 signed=current_is_signed,
                 acquisition_hash=acquisition_hash,
                 max_response_bytes=max_bytes,
+                occurrence_id=occurrence_id,
             ) as response:
                 location_host = _url_host(response.headers.get("Location"))
                 content_type_class = _content_type_class(response.headers.get("Content-Type"))

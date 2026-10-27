@@ -63,6 +63,7 @@ def authorized_vt_download() -> Iterator[ExternalEffectAuthority]:
         make_test_authority(),
         operation_key="test-vt-download-operation",
         reservation_amounts={"downloads": 1, "vt_units": 1},
+        acquisition_dispatch_attempt_id=uuid4(),
     )
     with virustotal_external_effect_scope(authority):
         yield authority

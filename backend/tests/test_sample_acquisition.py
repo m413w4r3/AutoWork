@@ -37,6 +37,10 @@ from cti_app.domain.production import (
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
+from tests.virustotal_external_effect_fakes import (
+    authorized_vt_download,
+    configure_test_vt_adapter,
+)
 
 BASE = "https://www.virustotal.com/api/v3"
 
@@ -613,22 +617,36 @@ async def test_budget_is_not_refunded_when_the_vt_call_fails_after_being_consume
 
 
 def _adapter(
-    handler: Any, download_handler: Any, *, allowed_hosts: frozenset[str]
+    handler: Any,
+    download_handler: Any,
+    *,
+    allowed_hosts: frozenset[str],
+    download_max_bytes: int = 200 * 1024 * 1024,
 ) -> VirusTotalHttpAdapter:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return VirusTotalHttpAdapter(
+    adapter = VirusTotalHttpAdapter(
         client=client,
         base_url=BASE,
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
-        # These adapter tests exercise the offline HTTP route state machine;
-        # the PostgreSQL S3 oracle covers coordinated investigation downloads.
+        # These adapter tests use MockTransport behind the in-memory effect gate.
         offline_probe_mode=True,
         download_allowed_hosts=allowed_hosts,
+        download_max_bytes=download_max_bytes,
         download_client_factory=lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(download_handler), follow_redirects=False
         ),
     )
+    with authorized_vt_download():
+        configure_test_vt_adapter(adapter)
+    return adapter
+
+
+async def _download_for_test(
+    adapter: VirusTotalHttpAdapter, file_hash: str, sink: Any
+) -> VirusTotalDownloadResult:
+    with authorized_vt_download():
+        return await adapter.file_download(file_hash, sink=sink)
 
 
 @pytest.mark.asyncio
@@ -654,7 +672,7 @@ async def test_adapter_signed_download_carries_no_vt_auth_header_and_verifies_sh
 
     adapter = _adapter(handler, download_handler, allowed_hosts=frozenset({"signed.example.test"}))
     sink = io_bytes_sink()
-    result = await adapter.file_download(sha256, sink=sink)
+    result = await _download_for_test(adapter, sha256, sink)
 
     assert result.sha256 == sha256
     assert sink.getvalue() == content
@@ -686,7 +704,7 @@ async def test_adapter_rejects_signed_host_outside_the_allowlist_before_download
 
     adapter = _adapter(handler, download_handler, allowed_hosts=frozenset({"signed.example.test"}))
     with pytest.raises(VirusTotalDownloadHostNotAllowedError):
-        await adapter.file_download("c" * 64, sink=io_bytes_sink())
+        await _download_for_test(adapter, "c" * 64, io_bytes_sink())
     assert calls == 0
 
 
@@ -708,7 +726,7 @@ async def test_adapter_refuses_a_redirect_to_a_host_outside_the_allowlist() -> N
 
     adapter = _adapter(handler, download_handler, allowed_hosts=frozenset({"signed.example.test"}))
     with pytest.raises(VirusTotalDownloadHostNotAllowedError):
-        await adapter.file_download("d" * 64, sink=io_bytes_sink())
+        await _download_for_test(adapter, "d" * 64, io_bytes_sink())
 
 
 @pytest.mark.asyncio
@@ -727,7 +745,7 @@ async def test_adapter_rejects_wrong_bytes_for_the_requested_hash() -> None:
 
     adapter = _adapter(handler, download_handler, allowed_hosts=frozenset({"signed.example.test"}))
     with pytest.raises(VirusTotalDownloadHashMismatchError):
-        await adapter.file_download("e" * 64, sink=io_bytes_sink())
+        await _download_for_test(adapter, "e" * 64, io_bytes_sink())
 
 
 @pytest.mark.asyncio
@@ -744,21 +762,14 @@ async def test_adapter_enforces_the_download_size_limit_while_streaming() -> Non
 
     from cti_app.application.virustotal import VirusTotalDownloadTooLargeError
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    adapter = VirusTotalHttpAdapter(
-        client=client,
-        base_url=BASE,
-        capabilities=VirusTotalCapabilities(file_download=True),
-        file_download_enabled=True,
-        offline_probe_mode=True,
-        download_allowed_hosts=frozenset({"signed.example.test"}),
+    adapter = _adapter(
+        handler,
+        download_handler,
+        allowed_hosts=frozenset({"signed.example.test"}),
         download_max_bytes=4,
-        download_client_factory=lambda: httpx.AsyncClient(
-            transport=httpx.MockTransport(download_handler), follow_redirects=False
-        ),
     )
     with pytest.raises(VirusTotalDownloadTooLargeError):
-        await adapter.file_download("f" * 64, sink=io_bytes_sink())
+        await _download_for_test(adapter, "f" * 64, io_bytes_sink())
 
 
 def io_bytes_sink() -> Any:

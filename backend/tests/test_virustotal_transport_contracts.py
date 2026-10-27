@@ -39,6 +39,7 @@ from cti_app.domain.virustotal import (
 )
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from tests.virustotal_external_effect_fakes import (
+    authorized_vt_download,
     authorized_vt_read,
     configure_test_vt_adapter,
 )
@@ -63,8 +64,8 @@ def _external_effect_authority(request: pytest.FixtureRequest):
         or "v2_secret" in test_name
         or ("redirect" in test_name and "pcap" not in test_name)
     ):
-        # These cases assert the adapter's offline HTTP route state machine.
-        with virustotal_external_effect_scope(None):
+        # These cases exercise MockTransport behind the in-memory effect gate.
+        with authorized_vt_download():
             yield
     else:
         with authorized_vt_read():
@@ -146,8 +147,7 @@ def _make_adapter(
             }
         ),
         file_download_enabled=True,
-        # This module verifies HTTPX route behavior; the PostgreSQL integration
-        # oracle exercises the same requests through S3 claims.
+        # This module verifies HTTPX route behavior behind the in-memory gate.
         offline_probe_mode=True,
         proxy_query_sentinel_enabled=False,
         behaviour_pcap_enabled=True,

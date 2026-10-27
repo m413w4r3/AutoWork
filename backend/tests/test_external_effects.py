@@ -1831,7 +1831,10 @@ def test_migration_preflight_rejects_default_and_complete_index_drift(
     assert bind.ddl_calls == 0
 
 
-@pytest.mark.parametrize("drift", [None, "missing_dispatch_check", "partial_schema"])
+@pytest.mark.parametrize(
+    "drift",
+    [None, "missing_dispatch_check", "partial_schema", "weaker_terminal_index_predicate"],
+)
 def test_acquisition_dispatch_migration_preflight_checks_complete_shape(
     monkeypatch: pytest.MonkeyPatch, drift: str | None
 ) -> None:
@@ -1923,9 +1926,12 @@ def test_acquisition_dispatch_migration_preflight_checks_complete_shape(
                     "duplicates_constraint": None,
                 }
                 if item.name == migration._INDEX:
-                    row["dialect_options"] = {
-                        "postgresql_where": str(item.dialect_options["postgresql"]["where"])
-                    }
+                    predicate = "dispatch_attempt_id IS NOT NULL"
+                    if drift == "weaker_terminal_index_predicate":
+                        predicate += (
+                            " AND dispatch_attempt_id <> '00000000-0000-0000-0000-000000000000'"
+                        )
+                    row["dialect_options"] = {"postgresql_where": predicate}
                 rows.append(row)
             return rows
 
@@ -1936,8 +1942,11 @@ def test_acquisition_dispatch_migration_preflight_checks_complete_shape(
     elif drift == "partial_schema":
         with pytest.raises(RuntimeError, match="partial schema"):
             migration._preflight(object())
-    else:
+    elif drift == "missing_dispatch_check":
         with pytest.raises(RuntimeError, match="constraints"):
+            migration._preflight(object())
+    else:
+        with pytest.raises(RuntimeError, match="terminal index drift"):
             migration._preflight(object())
 
 

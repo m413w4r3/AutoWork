@@ -185,11 +185,12 @@ def _preflight(bind: Any) -> bool:
     terminal_index = next(
         item for item in inspector.get_indexes(_TERMINAL) if item["name"] == _INDEX
     )
+    terminal_predicate = (terminal_index.get("dialect_options") or {}).get("postgresql_where")
     if (
         terminal_index.get("column_names") != ["dispatch_attempt_id"]
         or not terminal_index.get("unique")
-        or "dispatch_attempt_id IS NOT NULL"
-        not in (terminal_index.get("dialect_options") or {}).get("postgresql_where", "")
+        or not isinstance(terminal_predicate, str)
+        or _tokens(terminal_predicate) != _tokens("dispatch_attempt_id IS NOT NULL")
     ):
         raise RuntimeError("sample acquisition dispatch preflight rejected terminal index drift")
     return True
