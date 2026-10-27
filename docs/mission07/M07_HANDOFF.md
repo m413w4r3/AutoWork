@@ -70,4 +70,31 @@ Gates `main@a506f481` (parent, recette D4) : lint OK ; test-backend 5143 passed 
 - Le label `org.opencontainers.image.revision=ea456083…` est celui de l'**image de base uv**, pas d'AutoWork. Contrôle du SHA déployé = manifeste SHA-256 des `.py` de `/app/src/cti_app` dans le conteneur == `git ls-files backend/src/cti_app` à `22d03e22` (aujourd'hui : live ≠, 55 fichiers diffèrent, `api/osint_policy.py` absent).
 - `make smoke-live` (plan `89b7b4c2…`) inclut Shodan ⇒ exclu. `preflight-supervised-first-run-stack` exige d'attester la base jetable ⇒ **interdit sur le live**.
 - Jeton opérateur : jamais en conversation ; appels API opérateur exécutés **dans le conteneur backend** (`docker exec … python`) lisant `OPERATOR_API_TOKEN` de l'environnement du processus, sans l'imprimer.
-- B2–B6 : plan présenté le 2026-10-27, **mandat global non accordé à ce jour**.
+
+## PHASE B — MANDAT GLOBAL B2–B6 ACCORDÉ (utilisateur, 2026-10-27)
+
+Exécuter B2→B6 d'une traite, sans redemander entre étapes ; seuils d'alerte = observation, pas demande d'autorisation. Interdits sans nouveau mandat : restaurer un dump, redémarrer une image incompatible avec le schéma migré, rejouer à l'aveugle un effet externe ambigu, Shodan, veto D6 / frictions / approbations par appel supplémentaires. TLP, licence, révocation, divulgation restent applicables. **Jeton opérateur : jamais en conversation** — appels API exécutés dans le conteneur backend (`docker exec cti-bulletin-backend-1 python …`) lisant `OPERATOR_API_TOKEN` de l'environnement du processus, sans l'imprimer (OPERATOR_API_TOKEN et OPERATOR_CLIENT_API_TOKEN sont définis, distincts ; l'API est en mode `authenticated` ; `_require_verified_human_operator` exige le scope HUMAN_OPERATOR, pas OPERATOR_CLIENT).
+
+Budgets OSINT_OPEN validés : tool_seconds 86400 ; vt_units 10000 ; downloads 1000 ; bridge_turns 200 ; context_bytes 64 Mio (67108864) ; context_tokens 16 M (16000000) ; effets externes/enquête 500 ; fournisseurs VT + Bridge ; Shodan exclu (shodan_credits = 0/absent).
+
+**Rôles (corrigé par l'utilisateur)** : orchestrateur = `claude/claude-sonnet-5-5`, thinking `medium`. Opérateurs (CTI-ANALYST), agents de correction/implémentation/revue/observation (AUDIT-OBSERVER, BRIDGE-EVALUATOR, FINAL-QA…) = `codex/gpt-6-luna` `xhigh`, mode `auto-review`, **session neuve par tâche**. Les enfants n'atteignent pas PostgreSQL/Docker/live : l'orchestrateur exécute lui-même tout ce qui touche le live. Si contexte > 70 % : mettre à jour ce fichier et lancer un nouvel orchestrateur Sonnet 5.5 medium.
+
+### B2 — FAIT (2026-10-27 ~18:30 UTC)
+- Sauvegarde fraîche : `/home/nill/perso/work/AutoWork-backups/live-pre-b2-20261027T182650Z.dump` (5,0 Mo, SHA-256 `040aa1a034247a8c17990361571c89956f37a43d68b44039628d092e96783afa`, 98 TABLE DATA) ; comptages pré-migration : `…/m07-pre-b2-counts.txt` (samples 225, tool_invocations 1510, jobs 911, blobs 3179, analyst_investigations 12, production_runs 12, 0 job non terminal). Dump précédent : `live-pre-m07-20261027T154631Z.dump` (`413d5cdc…`).
+- Répétition sur copie restaurée (postgres-test, base `m07_rehearsal_b2`, supprimée) : `0002→0005` OK, comptages conservés.
+- Images précédentes étiquetées `cti-bulletin-{backend,worker,analysis-worker,job-recovery,frontend}:pre-m07` (rollback applicatif ; **incompatible avec le schéma 0005 sans nouveau mandat**).
+- `make up` depuis `22d03e22` (arbre propre ; seul un commit docs suit) rc=0 : `migrate` exited OK, tous les conteneurs healthy.
+- Vérifié : Alembic live = **`0005_sample_acquisition_dispatch`** ; comptages identiques ; empreinte SHA-256 de tous les `.py` de `/app/src/cti_app` = `239f62da6a38b8ea` pour backend, worker, analysis-worker, job-recovery == `git ls-files backend/src/cti_app` à `22d03e22` ; `/api/health/ready` = 200 ; inv `5f66ebfb` toujours `running`.
+- **Reste de B2 à contrôler** (non fait) : Bridge `GET /v1/bridge/capabilities` (sans tour de modèle), état Ghidra / analysis-worker prêt (healthcheck compose = OK), frontend servi.
+
+### À FAIRE : B3 → B6 (voir plan présenté ; résumé)
+- **B3** Réconcilier l'inv `5f66ebfb` (`running`, màj 2026-10-20, aucun job) : avant = aucun job/effet externe en cours ou ambigu pour elle (sinon STOP + diagnostic) ; action = passage terminal par action applicative motivée via API/service (CAS), historique + réservations conservés ; les 19 `needs_review` intacts. Trouver l'endpoint/méthode exacts (`conclude`/stop) dans `api/investigation.py` ; vérifier par lecture que ce n'est pas un UPDATE SQL direct.
+- **B4** Activer OSINT_OPEN sur le sujet `d22822d4-27ce-47d2-9cc5-f84cf312986a` avec les budgets validés (service `OsintOpenPolicyService`, `api/osint_policy.py`) ; relire les valeurs et l'événement ACTIVATED/version épinglée.
+- **B5** Smokes ciblés par le chemin applicatif, dans une enquête de smoke distincte sur le dernier run `ec7a6807` puis close : 1 `vt.file_report` ; 1 `advisor.consult` à dossier limité ; 1 `vt.download_sample` seulement si un échantillon admissible manque en quarantaine (sinon « validé hors ligne seulement ») ; 1 `sample.analyze` inerte. Observer requêtes physiques, claims, archives, coûts, erreurs, absence de secret. Pas de `make smoke-live` (Shodan), pas de preflight-supervised (exige base jetable).
+- **B6** Nouveau `production_run` par le chemin normal (réutilisation content-addressée), synthèse `VERIFIED` + vérifier `(subject, run, synthesis_artifact_id, version, canonical_sha256)`, créer et démarrer une investigation `operator_led` rattachée à OSINT_OPEN ACTIVE ; ne rien supprimer/réinitialiser ; ne pas recopier la synthèse historique.
+- Puis phase C : conduite de l'enquête avec CTI-ANALYST (Luna xhigh) et AUDIT-OBSERVER séparé (journal append-only), Bridge conseiller, dans les budgets ; livrables §9 de M07_MISSION.md.
+- Risque R1 : un dossier Bridge citant une observation sha256 non associée à l'enquête est refusé (préexistant) → citer l'observation VT ou télécharger d'abord.
+- Seuils d'observation : 80 % vt_units ; 3 refus consécutifs même raison ; 4 réservations advisor bloquées ; appel identique > 3 fois.
+
+### Rapport final attendu
+SHA déployé (`22d03e22`, empreinte `239f62da6a38b8ea`), Alembic, contrôles de santé, état de la nouvelle investigation, appels réellement effectués, budgets consommés/réservés, blocages.
