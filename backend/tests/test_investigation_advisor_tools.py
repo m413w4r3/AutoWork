@@ -1963,6 +1963,63 @@ async def _submit_preservation_observation(payload, *, question: str, key: str):
     return transport.calls[0]["prompt"], manifest
 
 
+@pytest.mark.parametrize("body_size", [64, 4_096, 128 * 1024])
+@pytest.mark.asyncio
+async def test_explicit_evidence_get_tool_result_body_reaches_bridge_at_any_size(body_size):
+    investigation_id = uuid4()
+    body = f"evidence-get-result-{body_size}:" + ("x" * body_size)
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "investigation-tool-observation.v1",
+            "tool_name": "evidence.get",
+            "schema_version": "1",
+            "operation_key": "operator:evidence-get-fixture",
+            "result": {"opaque_result_field": body},
+        },
+    )
+    observation = replace(
+        observation,
+        kind=EvidenceKind.OTHER,
+        source="evidence.get",
+        source_version="1",
+        object_type="tool_result",
+        object_id="evidence.get",
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The cited result is available.", [str(observation.id)]),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:evidence-get-{body_size}"),
+    )
+
+    assert result.error_code is None, result.output
+    assert result.output["bridge_provenance"]["preflight_status"] == "READY"
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert body in prompt
+    cited = next(
+        item
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(observation.id)
+    )
+    assert cited["body_bytes"] >= len(body.encode("utf-8"))
+
+
 @pytest.mark.asyncio
 async def test_600_byte_dns_raw_base64_reaches_fake_transport() -> None:
     encoded = base64.b64encode(b"A" * 600).decode("ascii")
@@ -6708,4 +6765,31 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     assert result.output["failure_stage"] == "pre_transport_validation"
     assert result.output["confirmed_non_execution"] is True
     assert result.output["provider_usage"] == {"status": "not_submitted"}
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cross_investigation_evidence_reference_is_rejected_before_bridge() -> None:
+    investigation_id = uuid4()
+    foreign_observation, foreign_raw = make_observation(uuid4(), {"content": "foreign evidence"})
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=foreign_observation,
+        raw=foreign_raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(foreign_observation.id)],
+        },
+        make_context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["confirmed_non_execution"] is True
     assert transport.calls == []

@@ -127,6 +127,53 @@ _CTI_METADATA_KEYS = frozenset(
 _HASH_METADATA_KEYS = frozenset(
     {"sha256", "sha256_short", "sample_sha256", "md5", "sha1", "hashes"}
 )
+_GENERIC_METADATA_KEYS = frozenset(
+    {
+        "name",
+        "title",
+        "source",
+        "source_version",
+        "object_type",
+        "object_id",
+        "type",
+        "kind",
+        "schema",
+        "schema_version",
+        "tool_name",
+        "operation_key",
+        "invocation_id",
+        "tool_id",
+        "id",
+        "uuid",
+        "blob_id",
+        "status",
+        "reason",
+        "duration",
+        "duration_ms",
+        "byte_size",
+        "size",
+        "size_bytes",
+        "mime_type",
+        "content_type",
+        "offset",
+        "length",
+        "byte_length",
+        "encoding",
+        "warnings",
+        "limitations",
+        "truncated",
+        "observed_at",
+        "timestamp",
+        "engine",
+        "engines",
+        "trace",
+        "traces",
+        "fragment",
+        "fragments",
+        "association",
+        "associations",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +190,9 @@ class AdvisorDossier:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
 
-def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+def extract_content_excerpts(
+    payload: Mapping[str, Any], *, include_unclassified: bool = False
+) -> list[dict[str, str]]:
     """Extract complete observed methods, text, decoded values, and byte values."""
     sample_context = _contains_sample_context(payload)
     excerpts: list[dict[str, str]] = []
@@ -176,6 +225,16 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         rendered_title = f"{prefix}{title.strip()}"
         seen.add(identity)
         excerpts.append({"kind": kind, "title": rendered_title, "text": text})
+
+    def add_unclassified_scalar(value: object, field_path: tuple[str, ...]) -> None:
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, (bool, int, float)):
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            return
+        title = ".".join(part.replace("_", " ") for part in field_path)
+        add("text", f"Valeur observée — {title or 'contenu'}", text)
 
     def display_name(row: Mapping[str, Any], fallback: str) -> str:
         for key in ("name", "method", "function", "symbol", "member", "key"):
@@ -457,6 +516,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                     continue
                 if isinstance(child, (Mapping, list, tuple)):
                     walk(child, (*path, key))
+                elif include_unclassified and key not in _GENERIC_METADATA_KEYS:
+                    add_unclassified_scalar(child, (*path, key))
             return
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value, start=1):
@@ -474,7 +535,11 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                         child,
                     )
                 else:
-                    walk(child, (*path, str(index)))
+                    child_path = (*path, str(index))
+                    if isinstance(child, (Mapping, list, tuple)):
+                        walk(child, child_path)
+                    elif include_unclassified:
+                        add_unclassified_scalar(child, child_path)
             return
         if isinstance(value, str) and path:
             key = path[-1].casefold()
