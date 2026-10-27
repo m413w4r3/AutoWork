@@ -112,7 +112,6 @@ from cti_app.application.research_context_builder import (
     MAX_OPERATOR_REQUESTS,
     USER_REQUEST_ACTION_PREFIX,
     CanonicalEvidenceSummaryPort,
-    InvestigationContextTooLarge,
     blocked_capabilities_from_history,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
@@ -1258,17 +1257,6 @@ async def get_investigation_operator_context(
                     exc.details.get("dominant_sections", [])[:8],
                 )
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
-        except InvestigationContextTooLarge as exc:
-            _logger.error(
-                "operator_context_too_large investigation_id=%s dominant_sections=%s",
-                investigation_id,
-                exc.dominant_sections[:8],
-            )
-            raise _http_error(
-                413,
-                "operator_context_too_large",
-                details={"dominant_sections": list(exc.dominant_sections[:8])},
-            ) from exc
         except ValidationError as exc:
             errors = _bounded_validation_errors(exc)
             _logger.error(
@@ -1754,7 +1742,7 @@ async def get_investigation_operator_status(
             envelope=envelope,
             invocations=invocations,
             observations=observations,
-            external_llm_allowed=InvestigationService.external_llm_allowed(snapshot, envelope),
+            external_llm_allowed=InvestigationService.bridge_disclosure_allowed(snapshot, envelope),
         )
         if tool_inventory is not None:
             available_tool_names, unavailable_tool_diagnostics = tool_inventory
@@ -2901,7 +2889,8 @@ async def _investigation_view(
         invocations=invocations,
         observations=observations,
         external_llm_allowed=(
-            currently_authorized and InvestigationService.external_llm_allowed(snapshot, envelope)
+            currently_authorized
+            and InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
         ),
     )
     if tool_inventory is None:

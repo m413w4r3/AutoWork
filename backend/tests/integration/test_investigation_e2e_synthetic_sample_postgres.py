@@ -861,16 +861,6 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 expected_source="tlp_red",
             )
             await assert_sample_veto(
-                label="do-not-submit",
-                do_not_submit=True,
-                expected_source="do_not_submit",
-            )
-            await assert_sample_veto(
-                label="external-llm-disabled",
-                external_llm_allowed=False,
-                expected_source="external_llm_allowed_false",
-            )
-            await assert_sample_veto(
                 label="owner-restricted",
                 license_restriction="Synthetic owner restriction sentinel; never disclose.",
                 expected_source="license_restriction",
@@ -1213,8 +1203,8 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert "advisor_call.metadata" in event_types
             source_events = audit_events[:-1]
             event_counts = Counter(item["type"] for item in source_events)
-            # Success, two sensitive-input vetoes, four policy vetoes, and missing-ref refusal.
-            expected_advisor_metadata_events = 1 + 2 + 4 + 1
+            # Success, two sensitive-input vetoes, two policy vetoes, and missing-ref refusal.
+            expected_advisor_metadata_events = 1 + 2 + 2 + 1
             assert event_counts["evidence_observation.recorded"] == len(audit_snapshot.observations)
             assert event_counts["finding.version_recorded"] == len(audit_snapshot.findings)
             assert event_counts["opinion.version_recorded"] == len(audit_snapshot.opinions)

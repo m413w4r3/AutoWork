@@ -79,9 +79,7 @@ from cti_app.application.research_context_builder import (
     PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE,
     USER_REQUEST_ACTION_PREFIX,
     ArticleSnapshot,
-    InvestigationContextTooLarge,
     ResearchContextBuilder,
-    ensure_investigation_context_size,
     provider_authorization_blocked_capabilities,
     provider_download_blocked_capabilities,
 )
@@ -105,6 +103,7 @@ from cti_app.domain.external_effects import (
     EvidenceReference,
     ExternalEffectAuthority,
     ExternalEffectAuthorityKind,
+    ExternalEffectValidationError,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -392,6 +391,17 @@ class InvestigationService:
         snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
     ) -> bool:
         return InvestigationService._external_allowed(snapshot, envelope)
+
+    @staticmethod
+    def bridge_disclosure_allowed(
+        snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
+    ) -> bool:
+        if not InvestigationService._external_tlp_allowed(snapshot, envelope):
+            return False
+        assert envelope is not None
+        return bool(
+            envelope.disclosure.external_llm_allowed and not envelope.disclosure.do_not_submit
+        )
 
     @staticmethod
     def unapproved_budget_for(investigation: AnalystInvestigation) -> InvestigationBudget:
@@ -774,46 +784,31 @@ class InvestigationService:
                 idempotency_key=f"context:{state.turn_index}",
                 available_capabilities=self._available_capabilities,
             )
-            try:
-                if state.pending_context_snapshot_id is not None:
-                    pending_json = await self._context_snapshots.load(
-                        state.pending_context_snapshot_id
-                    )
-                    if (
-                        pending_json is None
-                        or hashlib.sha256(pending_json.encode("utf-8")).hexdigest()
-                        != state.pending_context_sha256
-                    ):
-                        return await self.conclude(
-                            investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW
-                        )
-                    ensure_investigation_context_size(pending_json.encode("utf-8"))
-                    context = parse_investigation_context(pending_json)
-                else:
-                    context = await self._context_builder.build(
-                        investigation_id=investigation_id,
-                        synthesis_artifact_id=investigation.synthesis_artifact_id,
-                        state=state,
-                        tool_context=tool_context,
-                        budget_remaining={
-                            dimension.value: amount
-                            for dimension, amount in budget.remaining.items()
-                        },
-                        registry=self._registry,
-                    )
-                context_bytes = context.canonical_bytes()
-                ensure_investigation_context_size(context_bytes)
-            except InvestigationContextTooLarge as exc:
-                over_limit = state.with_context_limit_failure(
-                    actual_bytes=exc.actual_bytes,
-                    max_bytes=exc.max_bytes,
+            if state.pending_context_snapshot_id is not None:
+                pending_json = await self._context_snapshots.load(state.pending_context_snapshot_id)
+                if (
+                    pending_json is None
+                    or hashlib.sha256(pending_json.encode("utf-8")).hexdigest()
+                    != state.pending_context_sha256
+                ):
+                    return await self.conclude(investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW)
+                context = parse_investigation_context(pending_json)
+            else:
+                context = await self._context_builder.build(
+                    investigation_id=investigation_id,
+                    synthesis_artifact_id=investigation.synthesis_artifact_id,
+                    state=state,
+                    tool_context=tool_context,
+                    budget_remaining={
+                        dimension.value: amount for dimension, amount in budget.remaining.items()
+                    },
+                    registry=self._registry,
                 )
-                await self._save_state(state, over_limit)
-                return await self.conclude(investigation_id, StopReason.BUDGET_EXHAUSTED)
+            context_bytes = context.canonical_bytes()
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
-            allowed = self.external_llm_allowed(snapshot, envelope)
+            allowed = self.bridge_disclosure_allowed(snapshot, envelope)
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
                 action = self._external_policy_block_action(snapshot, envelope, state.turn_index)
@@ -878,6 +873,90 @@ class InvestigationService:
                 # Acquisition tools use their own UoW. Commit this approved
                 # budget snapshot before the Bridge/adapter can read it there.
                 await self._commit_current_uow()
+            bridge_external_effect_authority: ExternalEffectAuthority | None = None
+            if envelope is not None and self._budget_snapshots is not None:
+                bridge_reservation = next(
+                    (
+                        item
+                        for item in envelope.budget.reservations
+                        if item.operation_key == bridge_key
+                        and item.status is BudgetReservationStatus.RESERVED
+                    ),
+                    None,
+                )
+                if bridge_reservation is not None:
+                    authority_kind = (
+                        ExternalEffectAuthorityKind.OSINT_POLICY
+                        if envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+                        else ExternalEffectAuthorityKind.HUMAN_G2
+                    )
+                    bridge_external_effect_authority = ExternalEffectAuthority(
+                        investigation_id=investigation_id,
+                        invocation_id=None,
+                        operation_key=bridge_key,
+                        reservation_amounts={
+                            (
+                                dimension.value
+                                if isinstance(dimension, BudgetDimension)
+                                else str(dimension)
+                            ): int(amount)
+                            for dimension, amount in bridge_reservation.amounts.items()
+                        },
+                        expected_envelope_version=envelope.version,
+                        approval_decision_id=envelope.approval_decision_id,
+                        invocation_arguments_sha256=None,
+                        authority_kind=authority_kind,
+                        policy_event_id=envelope.inherited_policy_event_id,
+                        policy_version=(
+                            str(envelope.inherited_policy_version)
+                            if envelope.inherited_policy_version is not None
+                            else None
+                        ),
+                        pinned_subject_id=(
+                            investigation.subject_id
+                            if authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+                            else None
+                        ),
+                    )
+            try:
+                bridge_external_effect_evidence_refs = (
+                    await self._bridge_context_evidence_references(
+                        investigation_id=investigation_id,
+                        context=context,
+                        snapshot=snapshot,
+                    )
+                    if (
+                        bridge_external_effect_authority is not None
+                        and self._bridge.requires_external_effect_authority
+                    )
+                    else ()
+                )
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._complete_bridge_reservation(
+                        investigation_id,
+                        bridge_key,
+                        budget,
+                        blocked=True,
+                        confirmed_non_submission=True,
+                    )
+                )
+                await asyncio.shield(self._commit_current_uow())
+                raise
+            except Exception as exc:
+                _logger.info(
+                    "Bridge external-effect source resolution refused (%s)",
+                    type(exc).__name__,
+                )
+                await self._complete_bridge_reservation(
+                    investigation_id,
+                    bridge_key,
+                    budget,
+                    blocked=True,
+                    confirmed_non_submission=True,
+                )
+                await self._commit_current_uow()
+                return await self.conclude(investigation_id, StopReason.MODEL_UNAVAILABLE)
             try:
                 turn = await self._bridge.turn(
                     investigation_id=investigation_id,
@@ -890,6 +969,10 @@ class InvestigationService:
                         investigation_id, key, detail
                     ),
                     before_submission=before_bridge_submission,
+                    external_effect_binding_context={
+                        "authority_context": bridge_external_effect_authority,
+                        "evidence_refs": bridge_external_effect_evidence_refs,
+                    },
                 )
             except asyncio.CancelledError as exc:
                 # Once transport submission starts, the external provider may
@@ -1458,7 +1541,7 @@ class InvestigationService:
         tool_envelope = replace(envelope, budget=tool_budget) if envelope is not None else None
         external_effect_authority: ExternalEffectAuthority | None = None
         if (
-            tool_name in _VT_COORDINATED_READ_TOOLS
+            (tool_name in _VT_COORDINATED_READ_TOOLS or tool_name == "advisor.consult")
             and envelope is not None
             and reservation_persisted
             and persisted_reservation is not None
@@ -1556,7 +1639,7 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.external_llm_allowed(snapshot, current_envelope):
+                if not self.bridge_disclosure_allowed(snapshot, current_envelope):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
 
@@ -1888,6 +1971,92 @@ class InvestigationService:
                 )
                 document_refs[reference.id] = reference
         return tuple(document_refs[key] for key in sorted(document_refs))
+
+    async def _bridge_context_evidence_references(
+        self,
+        *,
+        investigation_id: UUID,
+        context: InvestigationContextV1,
+        snapshot: ArticleSnapshot,
+    ) -> tuple[EvidenceReference, ...]:
+        """Resolve canonical sources transmitted in a Bridge context."""
+        observation_ids = _bridge_context_observation_ids(context)
+        references: dict[tuple[str, str], EvidenceReference] = {}
+        for observation_id in sorted(observation_ids, key=str):
+            observation = await self._observations.get(observation_id)
+            if observation is None or observation.investigation_id != investigation_id:
+                raise ExternalEffectValidationError("Bridge context observation is unresolved")
+            reference = EvidenceReference(
+                kind="evidence_observation",
+                id=str(observation.id),
+                version=observation.source_version,
+                sha256=observation.sha256,
+            )
+            references[(reference.kind, reference.id)] = reference
+
+        source_document_ids = _bridge_context_source_document_ids(context)
+        if source_document_ids:
+            if self._source_documents is None:
+                raise ExternalEffectValidationError(
+                    "Bridge context source documents are unavailable"
+                )
+            document_version = f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}"
+            for document_id in sorted(source_document_ids, key=str):
+                document = await self._source_documents.get(document_id)
+                if document is None or document.subject_id != snapshot.subject_id:
+                    raise ExternalEffectValidationError(
+                        "Bridge context source document is unresolved"
+                    )
+                reference = EvidenceReference(
+                    kind="source_document",
+                    id=str(document.id),
+                    version=document_version,
+                    sha256=snapshot.synthesis_sha256,
+                )
+                references[(reference.kind, reference.id)] = reference
+
+        sample_deltas = context.investigation.sample_deltas
+        association_ids: dict[UUID, str] = {}
+        for item in sample_deltas:
+            raw_association_id = item.get("association_id")
+            raw_sha256 = item.get("sha256")
+            if raw_association_id is None and raw_sha256 is None:
+                continue
+            try:
+                association_id = UUID(str(raw_association_id))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ExternalEffectValidationError(
+                    "Bridge context sample association is invalid"
+                ) from exc
+            if not isinstance(raw_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", raw_sha256):
+                raise ExternalEffectValidationError("Bridge context sample hash is invalid")
+            association_ids[association_id] = raw_sha256
+
+        if association_ids:
+            if self._sample_associations is None:
+                raise ExternalEffectValidationError(
+                    "Bridge context sample associations are unavailable"
+                )
+            for association_id, expected_sha256 in sorted(
+                association_ids.items(), key=lambda item: str(item[0])
+            ):
+                association = await self._sample_associations.get(association_id)
+                if (
+                    association is None
+                    or association.investigation_id != investigation_id
+                    or association.sample_sha256 != expected_sha256
+                ):
+                    raise ExternalEffectValidationError(
+                        "Bridge context sample association is unresolved"
+                    )
+                reference = EvidenceReference(
+                    kind="sample_association_sample",
+                    id=str(association.id),
+                    version=str(association.version),
+                    sha256=association.sample_sha256,
+                )
+                references[(reference.kind, reference.id)] = reference
+        return tuple(references[key] for key in sorted(references))
 
     def _tool_operation_key(
         self,
@@ -3158,8 +3327,22 @@ class InvestigationService:
     def _external_allowed(
         snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
     ) -> bool:
-        # External submission always needs a materialized G2 envelope. Policy
-        # inheritance is performed at investigation start, never at invocation.
+        if not InvestigationService._external_tlp_allowed(snapshot, envelope):
+            return False
+        assert envelope is not None
+        return bool(
+            snapshot.external_llm_allowed
+            and envelope.disclosure.external_llm_allowed
+            and not snapshot.do_not_submit
+            and not envelope.disclosure.do_not_submit
+        )
+
+    @staticmethod
+    def _external_tlp_allowed(
+        snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
+    ) -> bool:
+        # Both Bridge and external provider operations need a materialized G2
+        # envelope with a source TLP no higher than its approved TLP bound.
         if envelope is None or not isinstance(snapshot.tlp, str):
             return False
         raw_tlp = snapshot.tlp.strip().casefold()
@@ -3181,14 +3364,7 @@ class InvestigationService:
         }
         if envelope_tlp is not None and tlp_rank[envelope_tlp] < tlp_rank[source_tlp]:
             return False
-        return bool(
-            snapshot.external_llm_allowed
-            and envelope.disclosure.external_llm_allowed
-            and not snapshot.do_not_submit
-            and not envelope.disclosure.do_not_submit
-            and source_tlp is not TLPLevel.RED
-            and envelope_tlp is not TLPLevel.RED
-        )
+        return source_tlp is not TLPLevel.RED and envelope_tlp is not TLPLevel.RED
 
     @staticmethod
     def _external_policy_block_action(
@@ -3705,7 +3881,7 @@ def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope |
         if (
             provider not in envelope.allowed_providers
             or (envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red")
-            or envelope.disclosure.do_not_submit
+            or (envelope.disclosure.do_not_submit and definition.name != "advisor.consult")
         ):
             return False
         if definition.effect is ToolEffect.ACQUIRE and not envelope.acquire_hits_allowed:
@@ -4020,6 +4196,95 @@ def _vt_source_refs_from_parameters(
         except (KeyError, TypeError, ValueError):
             return ()
     return tuple(references)
+
+
+def _bridge_context_observation_ids(context: InvestigationContextV1) -> set[UUID]:
+    """Collect only typed observation IDs serialized into a Bridge context."""
+    payload = context.model_dump(mode="python", by_alias=True)
+    observation_ids: set[UUID] = set()
+    scalar_keys = {"evidence_id", "observation_id"}
+    collection_keys = {"evidence_refs", "observation_refs", "observation_ids"}
+
+    def add(value: object) -> None:
+        if isinstance(value, UUID):
+            observation_ids.add(value)
+            return
+        if isinstance(value, str):
+            try:
+                observation_ids.add(UUID(value))
+            except ValueError as exc:
+                raise ExternalEffectValidationError(
+                    "Bridge context observation reference is invalid"
+                ) from exc
+            return
+        raise ExternalEffectValidationError("Bridge context observation reference is invalid")
+
+    def visit(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if key in scalar_keys or key.endswith("_observation_id"):
+                    add(child)
+                elif key in collection_keys or key.endswith("_observation_ids"):
+                    if not isinstance(child, Sequence) or isinstance(child, str | bytes):
+                        raise ExternalEffectValidationError(
+                            "Bridge context observation references are invalid"
+                        )
+                    for item in child:
+                        add(item)
+                else:
+                    visit(child)
+        elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return observation_ids
+
+
+def _bridge_context_source_document_ids(context: InvestigationContextV1) -> set[UUID]:
+    """Collect source document IDs present in typed provenance fields."""
+    payload = context.model_dump(mode="python", by_alias=True)
+    document_ids: set[UUID] = set()
+
+    def add(value: object, *, reference_text: bool = False) -> None:
+        if reference_text and isinstance(value, str):
+            value = value.split(":", 1)[0]
+        if isinstance(value, UUID):
+            document_ids.add(value)
+        elif isinstance(value, str):
+            try:
+                document_ids.add(UUID(value))
+            except ValueError:
+                if not reference_text:
+                    raise ExternalEffectValidationError(
+                        "Bridge context source document reference is invalid"
+                    ) from None
+
+    def visit(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if key == "source_document_ids":
+                    if not isinstance(child, Sequence) or isinstance(child, str | bytes):
+                        raise ExternalEffectValidationError(
+                            "Bridge context source document references are invalid"
+                        )
+                    for item in child:
+                        add(item)
+                elif key == "source_refs":
+                    if not isinstance(child, Sequence) or isinstance(child, str | bytes):
+                        raise ExternalEffectValidationError(
+                            "Bridge context source references are invalid"
+                        )
+                    for item in child:
+                        add(item, reference_text=True)
+                else:
+                    visit(child)
+        elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return document_ids
 
 
 def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudget:

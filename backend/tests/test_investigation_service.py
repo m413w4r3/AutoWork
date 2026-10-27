@@ -856,30 +856,6 @@ async def test_budget_exhaustion_is_a_local_stop_without_model_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_oversized_full_context_stops_before_snapshot_or_bridge_submission(
-    monkeypatch,
-) -> None:
-    fixture = _Fixture(
-        responses=[_decision(goal="finish", next_action="finish")],
-        tools=(),
-    )
-    monkeypatch.setattr(
-        "cti_app.application.research_context_builder.INVESTIGATION_MAX_CONTEXT_BYTES",
-        1,
-    )
-    state = await fixture.start()
-
-    result = await fixture.service.run(state.investigation_id)
-
-    assert result.stop_reason is StopReason.BUDGET_EXHAUSTED
-    assert fixture.bridge_transport.attempt_count == 0
-    persisted = await fixture.states.get(state.investigation_id)
-    assert persisted is not None
-    assert persisted.recent_actions[-1].startswith("investigation_context_too_large:")
-    assert persisted.pending_context_snapshot_id is None
-
-
-@pytest.mark.asyncio
 async def test_operator_view_explains_local_conversation_and_context_limit_code() -> None:
     from cti_app.application.bridge_investigator import make_investigation_conversation_id
     from cti_app.application.investigation_operator_view import (
@@ -996,14 +972,16 @@ async def test_operator_view_explains_local_conversation_and_context_limit_code(
 
 
 @pytest.mark.parametrize(
-    ("dimension", "limit"),
+    ("dimension", "limit", "expected_stop_reason"),
     (
-        (BudgetDimension.CONTEXT_BYTES, 1),
-        (BudgetDimension.CONTEXT_TOKENS, 0),
+        (BudgetDimension.CONTEXT_BYTES, 1, StopReason.AGENT_FINISHED),
+        (BudgetDimension.CONTEXT_TOKENS, 0, StopReason.BUDGET_EXHAUSTED),
     ),
 )
 @pytest.mark.asyncio
-async def test_context_budget_exhaustion_is_a_local_stop(dimension, limit) -> None:
+async def test_context_budget_limits_bytes_to_accounting_and_enforces_tokens(
+    dimension, limit, expected_stop_reason
+) -> None:
     fixture = _Fixture(
         responses=[_decision(goal="finish", next_action="finish")],
         tools=(),
@@ -1021,11 +999,16 @@ async def test_context_budget_exhaustion_is_a_local_stop(dimension, limit) -> No
 
     result = await fixture.service.run(state.investigation_id)
 
-    assert result.stop_reason is StopReason.BUDGET_EXHAUSTED
-    assert fixture.bridge_transport.attempt_count == 0
+    assert result.stop_reason is expected_stop_reason
+    assert fixture.bridge_transport.attempt_count == (
+        0 if expected_stop_reason is StopReason.BUDGET_EXHAUSTED else 1
+    )
     persisted = await fixture.envelopes.get(state.investigation_id)
     assert persisted is not None
-    assert persisted.budget.consumed[dimension] == 0
+    if dimension is BudgetDimension.CONTEXT_BYTES:
+        assert persisted.budget.consumed[dimension] > 0
+    else:
+        assert persisted.budget.consumed[dimension] == 0
 
 
 @pytest.mark.asyncio
@@ -3908,8 +3891,32 @@ async def test_claim_verification_requires_non_claim_source_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_removed_external_permission_marks_model_unavailable_without_call() -> None:
-    fixture = _Fixture(responses=[], tools=(), external_allowed=False)
+async def test_bridge_submits_when_source_permission_flags_are_false() -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="finish", next_action="finish")],
+        tools=(),
+        external_allowed=False,
+    )
+    fixture.snapshot = replace(fixture.snapshot, do_not_submit=True)
+    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.attempt_count == 1
+    assert fixture.bridge_transport.submission_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["external_llm_allowed", "do_not_submit"])
+async def test_bridge_does_not_submit_when_envelope_disclosure_denies(policy: str) -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="finish", next_action="finish")],
+        tools=(),
+    )
+    disclosure = replace(fixture.envelope.disclosure, **{policy: policy == "do_not_submit"})
+    fixture.envelope = replace(fixture.envelope, disclosure=disclosure)
     state = await fixture.start()
 
     result = await fixture.service.run(state.investigation_id)
@@ -3917,12 +3924,6 @@ async def test_removed_external_permission_marks_model_unavailable_without_call(
     assert result.stop_reason is StopReason.MODEL_UNAVAILABLE
     assert fixture.bridge_transport.attempt_count == 0
     assert fixture.bridge_transport.submission_count == 0
-    policy_action = next(
-        action
-        for action in result.recent_actions
-        if action.startswith("bridge_submission_blocked:external_llm_policy:")
-    )
-    assert "snapshot_external_allowed=0" in policy_action
 
 
 @pytest.mark.asyncio

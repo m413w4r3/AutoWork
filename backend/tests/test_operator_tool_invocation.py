@@ -49,10 +49,7 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationService,
     _canonical_context_content_bytes,
 )
-from cti_app.application.research_context_builder import (
-    CanonicalEvidenceSummaryPort,
-    InvestigationContextTooLarge,
-)
+from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
 from cti_app.config import Settings
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -563,7 +560,7 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
 
 
 @pytest.mark.asyncio
-async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport():
+async def test_operator_dispatcher_sends_advisor_when_source_flags_are_false():
     fixture = _Fixture(responses=[], tools=[("vt.file_report", "vt")])
     state = await fixture.start(
         execution_mode=InvestigationExecutionMode.OPERATOR_LED,
@@ -577,6 +574,8 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
     article_port = fixture.context_builder.article_snapshots
     article_port.snapshot = replace(
         article_port.snapshot,
+        do_not_submit=True,
+        external_llm_allowed=False,
         article_passages=(
             SimpleNamespace(
                 claim_id="S1P1",
@@ -585,6 +584,8 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
             ),
         ),
     )
+    # Source flags no longer veto Bridge; the human G2 envelope disclosure
+    # (left permissive here) remains a veto, covered by the PG egress test.
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
     fixture.envelopes._items[fixture.investigation_id] = fixture.envelope
     fixture.available_capabilities = frozenset({"bridge.advisor"})
@@ -1574,7 +1575,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
 
     assert context.status_code == 200, context.text
     assert context.json()["working_state_version"] == state.version
-    assert context.json()["max_context_bytes"] == 262144
+    assert "max_context_bytes" not in context.json()
     assert "truncation_counts" in context.json()
     assert "truncation_pointers" in context.json()
     assert "context" in context.json()
@@ -2300,14 +2301,22 @@ async def test_materialized_offset_cursors_bind_the_canonical_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_context_too_large_returns_dominant_sections(caplog) -> None:
+async def test_operator_context_larger_than_256kib_is_returned_without_a_size_refusal() -> None:
     fixture, state, service = await _fixture()
+    build_context = fixture.context_builder.build
 
-    async def oversized(**_kwargs):
-        raise InvestigationContextTooLarge(
-            300_000,
-            dominant_sections=("available_tools:270000", "article:30000"),
+    async def oversized(**kwargs):
+        context = await build_context(**kwargs)
+        large_tool = context.available_tools[0].model_copy(
+            update={
+                "arguments_schema": {
+                    "type": "object",
+                    "description": "x" * 300_000,
+                    "properties": {},
+                }
+            }
         )
+        return context.model_copy(update={"available_tools": (large_tool,)})
 
     fixture.context_builder.build = oversized
     app = FastAPI()
@@ -2324,14 +2333,9 @@ async def test_operator_context_too_large_returns_dominant_sections(caplog) -> N
             params={"expected_version": state.version},
         )
 
-    assert response.status_code == 413
-    assert response.json()["detail"]["code"] == "operator_context_too_large"
-    assert response.json()["detail"]["details"]["dominant_sections"] == [
-        "available_tools:270000",
-        "article:30000",
-    ]
-    assert "operator_context_too_large" in caplog.text
-    assert "available_tools:270000" in caplog.text
+    assert response.status_code == 200, response.text
+    assert response.json()["context_bytes"] > 262_144
+    assert "max_context_bytes" not in response.json()
 
 
 @pytest.mark.asyncio

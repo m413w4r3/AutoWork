@@ -131,6 +131,7 @@ from cti_app.application.local_analysis import (
     SampleBytesUnavailableError,
 )
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import BridgeExternalEffectBinding
 from cti_app.application.native_analysis import NativeAnalysisService
 from cti_app.application.network_capture_import import capture_max_bytes
 from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
@@ -727,6 +728,20 @@ class _PermissionAwareInvestigationTransport:
 
     def __init__(self, transport: InvestigationTurnTransport) -> None:
         self._transport = transport
+        self.requires_external_effect_authority = bool(
+            getattr(transport, "requires_external_effect_authority", False)
+        )
+
+    async def build_external_effect_binding(
+        self, *, family: str, **attempt: Any
+    ) -> BridgeExternalEffectBinding | None:
+        build = getattr(self._transport, "build_external_effect_binding", None)
+        if not callable(build):
+            return None
+        binding = await build(family=family, **attempt)
+        if binding is None or isinstance(binding, BridgeExternalEffectBinding):
+            return binding
+        return None
 
     async def reconcile_orphaned_investigation_turn(
         self,
@@ -759,16 +774,20 @@ class _PermissionAwareInvestigationTransport:
         prompt: str,
         external_llm_allowed: bool,
         timeout_seconds: float | None = None,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> TurnSubmission:
-        result = await self._transport.submit(
-            investigation_id=investigation_id,
-            subject_id=subject_id,
-            turn_index=turn_index,
-            context_sha256=context_sha256,
-            prompt=prompt,
-            external_llm_allowed=external_llm_allowed,
-            timeout_seconds=timeout_seconds,
-        )
+        submission_kwargs: dict[str, Any] = {
+            "investigation_id": investigation_id,
+            "subject_id": subject_id,
+            "turn_index": turn_index,
+            "context_sha256": context_sha256,
+            "prompt": prompt,
+            "external_llm_allowed": external_llm_allowed,
+            "timeout_seconds": timeout_seconds,
+        }
+        if bridge_external_effect_binding is not None:
+            submission_kwargs["bridge_external_effect_binding"] = bridge_external_effect_binding
+        result = await self._transport.submit(**submission_kwargs)
         if result.status is not TurnSubmissionStatus.BLOCKED:
             return result
         return TurnSubmission(
@@ -789,6 +808,7 @@ class _PermissionAwareInvestigationTransport:
         external_llm_allowed: bool,
         attempt: int,
         timeout_seconds: float | None = None,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> TurnSubmission:
         submit_attempt = getattr(self._transport, "submit_with_attempt", None)
         if not callable(submit_attempt):
@@ -807,6 +827,11 @@ class _PermissionAwareInvestigationTransport:
                 external_llm_allowed=external_llm_allowed,
                 attempt=attempt,
                 timeout_seconds=timeout_seconds,
+                **(
+                    {"bridge_external_effect_binding": bridge_external_effect_binding}
+                    if bridge_external_effect_binding is not None
+                    else {}
+                ),
             ),
         )
         if result.status is not TurnSubmissionStatus.BLOCKED:
@@ -1550,6 +1575,7 @@ def build_investigation_composition(
                 findings=uow.investigation_findings,
                 investigation_states=uow.investigation_states,
                 experiments=getattr(uow, "investigation_experiments", None),
+                source_documents=getattr(uow, "source_documents", None),
                 opinions=uow.analyst_opinions,
                 sample_associations=uow.sample_associations,
                 samples=getattr(uow, "samples", None),

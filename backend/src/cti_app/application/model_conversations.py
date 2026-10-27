@@ -12,6 +12,8 @@ from uuid import UUID, uuid4
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
+    BridgeExternalEffectBinding,
     ConversationContext,
     ModelExecution,
     ModelGateway,
@@ -214,6 +216,7 @@ class ConversationTurnFailedError(ModelConversationError):
         submission_state: str | None = None,
         retryable: bool = False,
         retry_after_seconds: float | None = None,
+        completed_response: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -221,6 +224,7 @@ class ConversationTurnFailedError(ModelConversationError):
         self.submission_state = submission_state
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
+        self.completed_response = completed_response
 
 
 class ConversationPolicyError(ModelConversationError):
@@ -1097,6 +1101,7 @@ class ModelConversationService:
         correlation_id: str,
         context_subject_id: UUID | None = None,
         lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> ModelConversationTurn:
         message = message.strip()
         if not message:
@@ -1131,18 +1136,26 @@ class ModelConversationService:
                         if duplicate.status is ConversationTurnStatus.FAILED
                         else None
                     )
-                    submission_state = (
-                        "pre_submission"
-                        if failed_run is not None
-                        and failed_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
-                        else None
-                    )
                     failed_details = failed_run.error_details if failed_run is not None else None
+                    completed_response = (
+                        isinstance(failed_details, dict)
+                        and failed_details.get("completed_response") is True
+                    )
+                    if completed_response:
+                        submission_state = "post_submission"
+                    elif (
+                        failed_run is not None
+                        and failed_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+                    ):
+                        submission_state = "pre_submission"
+                    else:
+                        submission_state = None
                     raise ConversationTurnFailedError(
                         duplicate.error_message or "Le tour précédent n'a pas abouti",
                         code=duplicate.error_code or "conversation_turn_failed",
                         status=duplicate.status,
                         submission_state=submission_state,
+                        completed_response=completed_response,
                         retryable=(
                             isinstance(failed_details, dict)
                             and failed_details.get("retryable") is True
@@ -1296,6 +1309,50 @@ class ModelConversationService:
                 idempotency_key=idempotency_key,
                 correlation_id=correlation_id,
             )
+            if bridge_external_effect_binding is not None:
+                if (
+                    not stateless_external
+                    or conversation.transport is not ConversationTransport.CHATGPT_BRIDGE
+                ):
+                    raise ConversationPolicyError(
+                        "External effect bindings are reserved for stateless Bridge turns"
+                    )
+                if bridge_external_effect_binding.authority.bridge_turn_id not in (
+                    None,
+                    turn.id,
+                ) or bridge_external_effect_binding.authority.model_run_id not in (None, run.id):
+                    raise ConversationPolicyError(
+                        "Bridge external effect binding belongs to another persisted attempt"
+                    )
+                authority = replace(
+                    bridge_external_effect_binding.authority,
+                    bridge_turn_id=turn.id,
+                    model_run_id=run.id,
+                )
+                bridge_external_effect_binding = replace(
+                    bridge_external_effect_binding,
+                    authority=authority,
+                    bridge_turn_id=turn.id,
+                    model_run_id=run.id,
+                    model_input_sha256=turn.input_sha256,
+                    authorized_input_hash=run.authorized_input_hash,
+                )
+                run.parameters = {
+                    **run.parameters,
+                    BRIDGE_SOURCE_PROVENANCE_KEY: {
+                        "family": bridge_external_effect_binding.family,
+                        "turn_input_sha256": turn.input_sha256,
+                        "authorized_input_hash": run.authorized_input_hash,
+                        "evidence_refs": [
+                            reference.to_json()
+                            for reference in bridge_external_effect_binding.evidence_refs
+                        ],
+                    },
+                }
+                request = replace(
+                    request,
+                    bridge_external_effect_binding=bridge_external_effect_binding,
+                )
             await uow.model_runs.add(run)
             await uow.model_conversation_turns.add(turn)
             await uow.model_conversations.save(conversation)
@@ -1402,15 +1459,20 @@ class ModelConversationService:
             raise
         except Exception as exc:
             pre_submission = getattr(exc, "submission_state", None) == "pre_submission"
-            uncertain = not pre_submission and (
-                bool(getattr(exc, "retryable", False))
-                or getattr(exc, "code", "")
-                in {
-                    "bridge_server_error",
-                    "bridge_timeout",
-                    "bridge_ui_timeout",
-                    "model_submission_reconciliation_required",
-                }
+            completed_response = getattr(exc, "completed_response", False) is True
+            uncertain = (
+                not pre_submission
+                and not completed_response
+                and (
+                    bool(getattr(exc, "retryable", False))
+                    or getattr(exc, "code", "")
+                    in {
+                        "bridge_server_error",
+                        "bridge_timeout",
+                        "bridge_ui_timeout",
+                        "model_submission_reconciliation_required",
+                    }
+                )
             )
             blocked = getattr(exc, "code", "") == "external_llm_blocked"
             async with self._uow_factory() as uow:

@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import httpx
@@ -30,6 +30,7 @@ from cti_app.application.confined_analysis import (
 from cti_app.application.external_effects import ExternalEffectCoordinator
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_composition import (
     InvestigationCompositionFactory,
     OptionalInvestigationToolPorts,
@@ -42,6 +43,10 @@ from cti_app.application.local_analysis import (
     default_local_command_specs,
 )
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
+    BridgeExternalEffectBinding,
+)
 from cti_app.application.native_analysis import UnavailableNativeAnalysisPort
 from cti_app.application.network_workbench import QuarantinedCaptureSource
 from cti_app.application.persistence import UnitOfWorkFactory
@@ -61,6 +66,7 @@ from cti_app.application.virustotal import (
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST, Settings
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -73,6 +79,10 @@ from cti_app.infrastructure.confined_analysis_dispatch import (
 from cti_app.infrastructure.confined_local_commands import ConfinedLocalCommands
 from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
 from cti_app.infrastructure.database.repositories.external_effects import (
+    BRIDGE_RESOLVER_FAMILY_KEY,
+    BRIDGE_RESOLVER_RUN_HASH_KEY,
+    BRIDGE_RESOLVER_TURN_HASH_KEY,
+    ExternalEffectFamilyBinding,
     SqlAlchemyExternalEffectClaimStore,
 )
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
@@ -119,6 +129,7 @@ class RuntimePortStatus:
 class InvestigationRuntimePorts:
     optional_tool_ports: OptionalInvestigationToolPorts
     statuses: tuple[RuntimePortStatus, ...]
+    external_effect_coordinator: ExternalEffectCoordinator | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +138,124 @@ class InvestigationRuntimeComposition:
 
     composition_factory: InvestigationCompositionFactory
     ports: InvestigationRuntimePorts
+
+
+_BRIDGE_PROVIDER_SCOPE = "bridge.responses"
+_BRIDGE_TURN_FAMILY = "bridge.investigation_turn.v1"
+_ADVISOR_CONSULTATION_FAMILY = "advisor.consultation.v1"
+
+
+def _bridge_source_reference_resolver(
+    family: str,
+) -> Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]:
+    def resolve(parameters: Mapping[str, Any]) -> tuple[EvidenceReference, ...]:
+        provenance = parameters.get(BRIDGE_SOURCE_PROVENANCE_KEY)
+        raw_refs = provenance.get("evidence_refs") if isinstance(provenance, Mapping) else None
+        if (
+            not isinstance(provenance, Mapping)
+            or provenance.get("family") != family
+            or provenance.get("authorized_input_hash")
+            != parameters.get(BRIDGE_RESOLVER_RUN_HASH_KEY)
+            or provenance.get("turn_input_sha256") != parameters.get(BRIDGE_RESOLVER_TURN_HASH_KEY)
+            or parameters.get(BRIDGE_RESOLVER_FAMILY_KEY) != family
+            or not isinstance(raw_refs, (list, tuple))
+            or not raw_refs
+        ):
+            return ()
+        references: list[EvidenceReference] = []
+        for item in raw_refs:
+            if not isinstance(item, Mapping) or set(item) != {
+                "kind",
+                "id",
+                "version",
+                "sha256",
+            }:
+                return ()
+            try:
+                references.append(
+                    EvidenceReference(
+                        kind=item["kind"],
+                        id=item["id"],
+                        version=item["version"],
+                        sha256=item["sha256"],
+                    )
+                )
+            except (TypeError, ValueError):
+                return ()
+        return tuple(references)
+
+    return resolve
+
+
+def create_external_effect_coordinator(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> ExternalEffectCoordinator:
+    """Create the one runtime coordinator shared by Bridge and VT transports."""
+    family_bindings = virustotal_external_effect_family_bindings()
+    family_bindings.update(
+        {
+            _BRIDGE_TURN_FAMILY: ExternalEffectFamilyBinding(
+                provider="bridge",
+                provider_scopes=frozenset({_BRIDGE_PROVIDER_SCOPE}),
+                normalizer_versions=frozenset({"bridge.turn.v1"}),
+                invocation_tool_binding=None,
+                model_submission=True,
+                requires_model_lineage=True,
+                model_run_provider="openai",
+                requires_source_refs=True,
+                source_reference_resolver=_bridge_source_reference_resolver(_BRIDGE_TURN_FAMILY),
+            ),
+            _ADVISOR_CONSULTATION_FAMILY: ExternalEffectFamilyBinding(
+                provider="bridge",
+                provider_scopes=frozenset({_BRIDGE_PROVIDER_SCOPE}),
+                normalizer_versions=frozenset({_ADVISOR_CONSULTATION_FAMILY}),
+                invocation_tool_binding=("advisor.consult", ADVISOR_SCHEMA_VERSION),
+                model_submission=True,
+                requires_model_lineage=True,
+                model_run_provider="openai",
+                requires_source_refs=True,
+                source_reference_resolver=_bridge_source_reference_resolver(
+                    _ADVISOR_CONSULTATION_FAMILY
+                ),
+            ),
+        }
+    )
+    reuse_policy = VirusTotalReadReusePolicy()
+    return ExternalEffectCoordinator(
+        SqlAlchemyExternalEffectClaimStore(
+            session_factory,
+            policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
+            family_bindings=family_bindings,
+        ),
+        reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
+    )
+
+
+async def _build_bridge_external_effect_binding(
+    **attempt: object,
+) -> BridgeExternalEffectBinding | None:
+    authority = attempt.get("authority_context")
+    family = attempt.get("family")
+    if not isinstance(authority, ExternalEffectAuthority) or not isinstance(family, str):
+        return None
+    normalizer_version = {
+        _BRIDGE_TURN_FAMILY: "bridge.turn.v1",
+        _ADVISOR_CONSULTATION_FAMILY: _ADVISOR_CONSULTATION_FAMILY,
+    }.get(family)
+    if normalizer_version is None:
+        return None
+    raw_evidence_refs = attempt.get("evidence_refs", ())
+    if not isinstance(raw_evidence_refs, tuple) or any(
+        not isinstance(reference, EvidenceReference) for reference in raw_evidence_refs
+    ):
+        return None
+    return BridgeExternalEffectBinding(
+        authority=authority,
+        family=family,
+        provider_scope=_BRIDGE_PROVIDER_SCOPE,
+        normalizer_version=normalizer_version,
+        evidence_refs=raw_evidence_refs,
+    )
 
 
 def _unavailable_binary(_name: str) -> None:
@@ -178,6 +307,7 @@ def build_investigation_runtime_ports(
     *,
     uow_factory: UnitOfWorkFactory,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    external_effect_coordinator: ExternalEffectCoordinator | None = None,
     blob_store: BlobStore,
     blob_catalog: BlobCatalogService,
     vt_adapter: VirusTotalPort | None,
@@ -195,6 +325,9 @@ def build_investigation_runtime_ports(
     confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
 ) -> InvestigationRuntimePorts:
     statuses: list[RuntimePortStatus] = []
+    coordinator = external_effect_coordinator
+    if coordinator is None and session_factory is not None:
+        coordinator = create_external_effect_coordinator(session_factory)
 
     configure_vt_effects = getattr(vt_adapter, "configure_external_effects", None)
     vt_effects_ready = bool(
@@ -204,20 +337,12 @@ def build_investigation_runtime_ports(
         and callable(configure_vt_effects)
     )
     if (
-        session_factory is not None
+        coordinator is not None
+        and session_factory is not None
         and vt_adapter is not None
         and vt_observations is not None
         and callable(configure_vt_effects)
     ):
-        reuse_policy = VirusTotalReadReusePolicy()
-        coordinator = ExternalEffectCoordinator(
-            SqlAlchemyExternalEffectClaimStore(
-                session_factory,
-                policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
-                family_bindings=virustotal_external_effect_family_bindings(),
-            ),
-            reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
-        )
         configure_vt_effects(coordinator, vt_observations)
 
     vt_route_status = {
@@ -850,7 +975,11 @@ def build_investigation_runtime_ports(
         confined_rea_runner=native_runner,
         confined_analysis_execution=confined_analysis_execution,
     )
-    return InvestigationRuntimePorts(optional_tool_ports=ports, statuses=tuple(statuses))
+    return InvestigationRuntimePorts(
+        optional_tool_ports=ports,
+        statuses=tuple(statuses),
+        external_effect_coordinator=coordinator,
+    )
 
 
 def build_investigation_runtime_composition_factory(
@@ -858,6 +987,7 @@ def build_investigation_runtime_composition_factory(
     *,
     uow_factory: UnitOfWorkFactory,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    external_effect_coordinator: ExternalEffectCoordinator | None = None,
     blob_store: BlobStore,
     blob_catalog: BlobCatalogService,
     artifact_store: ProductionArtifactStore,
@@ -881,6 +1011,7 @@ def build_investigation_runtime_composition_factory(
         settings,
         uow_factory=uow_factory,
         session_factory=session_factory,
+        external_effect_coordinator=external_effect_coordinator,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         vt_adapter=vt_adapter,
@@ -905,7 +1036,17 @@ def build_investigation_runtime_composition_factory(
             settings=settings,
             optional_tool_ports=ports.optional_tool_ports,
             turn_transport=(
-                ModelConversationTurnTransport(model_conversations)
+                ModelConversationTurnTransport(
+                    model_conversations,
+                    bridge_external_effect_binding_factory=(
+                        _build_bridge_external_effect_binding
+                        if ports.external_effect_coordinator is not None
+                        else None
+                    ),
+                    require_external_effect_authority=(
+                        ports.external_effect_coordinator is not None
+                    ),
+                )
                 if _bridge_turn_transport_configured(settings)
                 else None
             ),

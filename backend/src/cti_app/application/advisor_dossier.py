@@ -335,9 +335,7 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 byte_label_parts.append(f"length={display_length}")
             mime_type = metadata_value("mime_type", "mime")
             if isinstance(mime_type, str) and mime_type.strip():
-                byte_label_parts.append(f"mime_type={mime_type.strip()[:512]}")
-                if len(mime_type) > 512:
-                    byte_label_parts.append("mime_type_truncated=true")
+                byte_label_parts.append(f"mime_type={mime_type.strip()}")
             byte_label = "; ".join(byte_label_parts)
             normalized_value = (
                 re.sub(r"\s+", "", raw_text).casefold() if row_kind == "hex" else raw_text.strip()
@@ -585,7 +583,6 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             f"source_object_id={_as_text(sample.get('source_object_id'))}",
             f"encoding=base64; byte_length={byte_length}; offset=0; "
             f"length={byte_length}; mime_type={mime_type}",
-            f"mime_type_truncated={str(bool(sample.get('mime_type_truncated'))).lower()}",
             f"association_status={_as_text(sample.get('association_status'))}",
             f"content_status={_as_text(sample.get('content_status'))}",
             f"state={_as_text(sample.get('state'))}",
@@ -628,9 +625,6 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         omission_reason = sample.get("content_omission_reason")
         if isinstance(omission_reason, str) and omission_reason:
             lines.append(f"content_omission_reason={omission_reason}")
-        maximum_content_bytes = sample.get("maximum_content_bytes")
-        if type(maximum_content_bytes) is int and maximum_content_bytes > 0:
-            lines.append(f"maximum_content_bytes={maximum_content_bytes}")
         body = "\n".join(lines)
         candidates.append(
             _candidate(
@@ -654,7 +648,6 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     "encoding": "base64",
                     "content_status": _as_text(sample.get("content_status")),
                     "content_omission_reason": _as_text(omission_reason),
-                    "maximum_content_bytes": maximum_content_bytes,
                 },
             )
         )
@@ -854,7 +847,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     provenance.append(f"sample_sha256={sample_sha256}")
                 mime_type = _as_text(fact.get("mime_type", fact.get("mime")))
                 if mime_type:
-                    provenance.append(f"mime_type={mime_type[:512]}")
+                    provenance.append(f"mime_type={mime_type}")
             location = f"offset {offset}" if type(offset) is int and offset >= 0 else ""
             fact_text = f"{kind}, {location}: {value}" if location else f"{kind}: {value}"
             if provenance:
@@ -1026,7 +1019,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     byte_metadata.append(f"{key}={identifier}")
             mime_type = _as_text(item.get("mime_type", item.get("mime")))
             if mime_type:
-                byte_metadata.append(f"mime_type={mime_type[:512]}")
+                byte_metadata.append(f"mime_type={mime_type}")
         offset_label = f"offset {offset}" if type(offset) is int else ""
         if offset_label and byte_metadata:
             offset_label += "; " + "; ".join(byte_metadata)
