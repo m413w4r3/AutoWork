@@ -14,12 +14,14 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application import external_effects as external_effects_module
 from cti_app.application.external_effects import (
     Ambiguous,
     Completed,
     ConsumeCommitted,
+    ConsumePolicyContext,
     ConsumeRefused,
     DefinitelyNotSubmitted,
     ExistingClaim,
@@ -35,6 +37,7 @@ from cti_app.application.external_effects import (
     _NoHandoffProofVerifier,
     _PermitRegistry,
     external_effect_source_do_not_submit_blocks,
+    osint_vt_search_may_cite_unassociated_observation_hash,
 )
 from cti_app.application.model_gateway import BridgeExternalEffectBinding
 from cti_app.domain.external_effects import (
@@ -60,11 +63,12 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     _family_credentials_match,
 )
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
-    _source_flags_block as osint_guard_source_flags_block,
-)
-from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    SqlAlchemyVirusTotalPolicyGuard,
     _source_refs_for_family,
     virustotal_external_effect_family_bindings,
+)
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    _source_flags_block as osint_guard_source_flags_block,
 )
 from cti_app.integrations.models import (
     BridgeTransportError,
@@ -92,6 +96,31 @@ _APPROVAL_ID = UUID("b5e03b5a-9619-461f-9a39-10ec2856373d")
 def test_source_do_not_submit_does_not_block_vt_reads_or_downloads(family: str) -> None:
     assert not external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize(
+    ("authority_kind", "provider", "family", "expected"),
+    [
+        (ExternalEffectAuthorityKind.OSINT_POLICY, "vt", "vt.intelligence_search", True),
+        (ExternalEffectAuthorityKind.HUMAN_G2, "vt", "vt.intelligence_search", False),
+        (ExternalEffectAuthorityKind.OSINT_POLICY, "vt", "vt.file_report", False),
+        (ExternalEffectAuthorityKind.OSINT_POLICY, "other", "vt.intelligence_search", False),
+    ],
+)
+def test_unassociated_observation_hash_exception_is_only_for_osint_vt_search(
+    authority_kind: ExternalEffectAuthorityKind,
+    provider: str,
+    family: str,
+    expected: bool,
+) -> None:
+    assert (
+        osint_vt_search_may_cite_unassociated_observation_hash(
+            authority_kind=authority_kind,
+            provider=provider,
+            family=family,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -2102,6 +2131,193 @@ async def test_consume_allows_unassociated_vt_hash_only_under_osint_policy(polic
         assert isinstance(result, ConsumeCommitted)
     else:
         assert result == ConsumeRefused("sample_hash_not_associated_with_investigation")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "source_restriction"),
+    [(True, None), (False, None), (True, "red"), (True, "license")],
+)
+async def test_consume_allows_unassociated_vt_search_observation_only_under_osint_policy(
+    policy: bool, source_restriction: str | None
+) -> None:
+    observation_id = uuid4()
+    sample_hash = "e" * 64
+    reference = EvidenceReference(
+        "evidence_observation", str(observation_id), "vt-file-report.v1", "f" * 64
+    )
+    parameters = {
+        "query": "type:peexe",
+        "_vt_external_effect_source_refs": [reference.to_json()],
+    }
+    prepared = PreparedExternalRequest.build(
+        family="vt.intelligence_search",
+        provider="vt",
+        provider_scope="default",
+        normalizer_version="vt-read.v1",
+        canonical_request={"query": "type:peexe"},
+        application_request=_wire(target=b"/api/v3/intelligence/search?query=type%3Apeexe"),
+        evidence_refs=(reference,),
+        credential_parameter_names=("apikey",),
+    )
+    authority = _authority(policy=policy)
+    observation = SimpleNamespace(
+        id=observation_id,
+        source_version=reference.version,
+        sha256=reference.sha256,
+        object_type="file",
+        object_id=sample_hash,
+    )
+    restricted_sample = SimpleNamespace(
+        id=uuid4(),
+        subject_id=authority.pinned_subject_id,
+        tlp="RED" if source_restriction == "red" else "GREEN",
+        do_not_submit=False,
+        license_restriction="restricted" if source_restriction == "license" else None,
+    )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.scalar_count = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+        def begin(self):
+            class _NoopContext:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *args: object):
+                    return None
+
+            return _NoopContext()
+
+        async def scalar(self, *args: object, **kwargs: object):
+            return None
+
+        async def scalars(self, *args: object, **kwargs: object):
+            self.scalar_count += 1
+            if self.scalar_count == 1:
+                return [observation]
+            if self.scalar_count in {3, 4} and source_restriction is not None:
+                return [restricted_sample]
+            return []
+
+        async def execute(self, *args: object, **kwargs: object):
+            return SimpleNamespace(scalar_one_or_none=lambda: uuid4())
+
+    class _Guard:
+        async def lock_for_consume(self, session, authority):
+            return True
+
+    class _ConsumeStore(SqlAlchemyExternalEffectClaimStore):
+        async def _lock_authority(self, session, authority, *args, **kwargs):
+            invocation = SimpleNamespace(
+                normalized_parameters=parameters,
+                investigation_id=authority.investigation_id,
+                operation_key=authority.operation_key,
+                status="running",
+                tool_name="vt.intelligence_search",
+                schema_version="1",
+            )
+            investigation = SimpleNamespace(subject_id=authority.pinned_subject_id)
+            reservation = SimpleNamespace(status="reserved")
+            return investigation, object(), invocation, reservation, []
+
+        async def _check_authority(self, *args: object, **kwargs: object):
+            return None
+
+        async def _lock_and_consume_family_attempt(self, *args: object, **kwargs: object):
+            return None
+
+        async def _lock_and_start_model_attempt(self, *args: object, **kwargs: object):
+            return None
+
+    store = _ConsumeStore(
+        lambda: _Session(),  # type: ignore[arg-type]
+        policy_guard=_Guard(),
+        family_bindings=virustotal_external_effect_family_bindings(),
+    )
+    result = await store.consume(
+        authority,
+        prepared,
+        effect_key=effect_key(authority.investigation_id, prepared),
+        occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+    )
+
+    if policy and source_restriction is None:
+        assert isinstance(result, ConsumeCommitted)
+    elif not policy:
+        assert result == ConsumeRefused("evidence_observation_not_associated_with_investigation")
+    else:
+        assert result == ConsumeRefused("sample_source_restricted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "source_restriction"),
+    [(True, None), (False, None), (True, "red"), (True, "license")],
+)
+async def test_vt_policy_guard_checks_unassociated_search_observation_under_osint(
+    policy: bool, source_restriction: str | None
+) -> None:
+    observation_id = uuid4()
+    reference = EvidenceReference(
+        "evidence_observation", str(observation_id), "vt-file-report.v1", "f" * 64
+    )
+    prepared = PreparedExternalRequest.build(
+        family="vt.intelligence_search",
+        provider="vt",
+        provider_scope="default",
+        normalizer_version="vt-read.v1",
+        canonical_request={"query": "type:peexe"},
+        application_request=_wire(target=b"/api/v3/intelligence/search?query=type%3Apeexe"),
+        evidence_refs=(reference,),
+        credential_parameter_names=("apikey",),
+    )
+    authority = _authority(policy=policy)
+    restricted_sample = SimpleNamespace(
+        tlp="RED" if source_restriction == "red" else "GREEN",
+        do_not_submit=False,
+        external_llm_allowed=True,
+        license_restriction="restricted" if source_restriction == "license" else None,
+    )
+    observation = SimpleNamespace(
+        id=observation_id,
+        source_version=reference.version,
+        sha256=reference.sha256,
+        object_type="file",
+        object_id="e" * 64,
+    )
+
+    class _Session(AsyncSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scalar_count = 0
+
+        async def scalars(self, *args: object, **kwargs: object):
+            self.scalar_count += 1
+            if self.scalar_count == 1:
+                return [observation]
+            if self.scalar_count == 3 and source_restriction is not None:
+                return [restricted_sample]
+            return []
+
+    context = ConsumePolicyContext(
+        authority=authority,
+        prepared=prepared,
+        effect_key="osint-search-observation",
+        database_session=_Session(),
+        investigation_subject_id=authority.pinned_subject_id or uuid4(),
+    )
+
+    allowed = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(context)
+
+    assert allowed is (policy and source_restriction is None)
 
 
 @pytest.mark.parametrize(

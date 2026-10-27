@@ -14,6 +14,7 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ReuseDecision,
     external_effect_source_do_not_submit_blocks,
+    osint_vt_search_may_cite_unassociated_observation_hash,
 )
 from cti_app.application.virustotal import (
     VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES,
@@ -477,7 +478,13 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 or not await self._invocation_hash_source_allowed(context, ungrounded_hashes)
             ):
                 return False
-            if observation_hashes - (associated_hashes | sample_hashes):
+            if observation_hashes - (
+                associated_hashes | sample_hashes
+            ) and not osint_vt_search_may_cite_unassociated_observation_hash(
+                authority_kind=context.authority.authority_kind,
+                provider=context.prepared.provider,
+                family=context.prepared.family,
+            ):
                 return False
             sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)
         if association_refs:
@@ -523,7 +530,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 return False
         if source_hashes:
             sample_hash_terms = [BlobRow.sha256.in_(sorted(source_hashes))]
-            if context.prepared.family in _VT_HASH_READ_FAMILIES:
+            if context.prepared.family in _VT_HASH_READ_FAMILIES | {"vt.intelligence_search"}:
                 sample_hash_terms.extend(
                     (
                         SampleRow.expected_hash.in_(sorted(source_hashes)),

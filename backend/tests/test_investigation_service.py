@@ -902,6 +902,68 @@ async def test_trusted_vt_source_refs_accept_any_file_pivot_hash_under_osint(
     )
 
 
+@pytest.mark.asyncio
+async def test_osint_vt_search_allows_cited_unassociated_vt_observation() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+    sample_hash = "c" * 64
+    observation = EvidenceObservation(
+        investigation_id=investigation.id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="d" * 64,
+        source="VirusTotal",
+        source_version="vt.file-report.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=sample_hash,
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    class _EmptySampleRepository:
+        async def list_by_subject_and_sha256(self, _subject_id, _sample_hash):
+            return ()
+
+    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    fixture.service._samples = _EmptySampleRepository()
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.intelligence_search",
+        arguments={"query": "type:peexe", "evidence_refs": [str(observation.id)]},
+        envelope=envelope,
+    )
+
+    assert references == (
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+    )
+    assert not await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.intelligence_search",
+        envelope=envelope,
+    )
+    assert await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.intelligence_search",
+        envelope=fixture.envelope,
+    )
+    revoked_envelope, _revoked_effective = _enable_osint_vt_hash_reads(fixture, authorized=False)
+    assert await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.intelligence_search",
+        envelope=revoked_envelope,
+    )
+
+
 def _compose_fixture_service(fixture: _Fixture) -> Any:
     sample_associations = InMemorySampleAssociationRepository()
     uow = SimpleNamespace(

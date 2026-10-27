@@ -30,6 +30,7 @@ from cti_app.application.external_effects import (
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
     external_effect_source_do_not_submit_blocks,
+    osint_vt_search_may_cite_unassociated_observation_hash,
 )
 from cti_app.domain.external_effects import (
     EffectClaimState,
@@ -1579,7 +1580,13 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
         sample_hash_grounding = sample_hashes if vt_file_hash_read else set()
-        if observation_hashes - (found_hashes | sample_hash_grounding):
+        if observation_hashes - (
+            found_hashes | sample_hash_grounding
+        ) and not osint_vt_search_may_cite_unassociated_observation_hash(
+            authority_kind=authority.authority_kind,
+            provider=prepared.provider,
+            family=prepared.family,
+        ):
             raise _ConsumeDenied("evidence_observation_not_associated_with_investigation")
         model_source_hashes = sample_hashes | observation_hashes
         if is_model_submission and model_source_hashes:
@@ -1598,7 +1605,7 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("sample_not_associated_with_investigation")
 
-        if vt_file_hash_read and source_hashes:
+        if (vt_file_hash_read or prepared.family == "vt.intelligence_search") and source_hashes:
             hash_samples = list(
                 await session.scalars(
                     select(SampleRow)

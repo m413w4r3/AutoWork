@@ -1924,6 +1924,9 @@ class InvestigationService:
                 else ()
             )
             associated_hashes = {association.sample_sha256 for association in associations}
+            allow_unassociated_search_observations = (
+                family == "vt.intelligence_search" and allow_unobserved_hash
+            )
             if any(
                 reference.kind == "sample_hash" for reference in references
             ) and not observation_hashes.issubset(sample_hashes):
@@ -1931,7 +1934,10 @@ class InvestigationService:
             ungrounded_hashes = sample_hashes - (associated_hashes | observation_hashes)
             if ungrounded_hashes and not allow_unobserved_hash:
                 return True
-            if observation_hashes - (associated_hashes | sample_hashes):
+            if (
+                observation_hashes - (associated_hashes | sample_hashes)
+                and not allow_unassociated_search_observations
+            ):
                 return True
         for sample_hash in hashes:
             if sample_repository is None:

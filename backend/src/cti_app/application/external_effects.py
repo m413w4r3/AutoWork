@@ -61,6 +61,22 @@ def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool
     return do_not_submit and family not in _VT_FAMILIES_WITHOUT_SOURCE_UPLOAD
 
 
+def osint_vt_search_may_cite_unassociated_observation_hash(
+    *, authority_kind: ExternalEffectAuthorityKind, provider: str, family: str
+) -> bool:
+    """Allow OSINT_OPEN passive searches to cite same-investigation file observations.
+
+    Callers must still verify the active policy, reference provenance, and source
+    restrictions. This exception concerns evidence references only; the search
+    request sends its query, not sample bytes.
+    """
+    return (
+        authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+        and provider == "vt"
+        and family == "vt.intelligence_search"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FrameworkNoSendProof:
     """A bounded proof that this coordinator invocation made no handoff."""
