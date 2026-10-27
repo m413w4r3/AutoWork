@@ -1050,15 +1050,10 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("provider_not_allowed")
         if envelope.disclosure_tlp == "red":
             raise _ConsumeDenied("tlp_red")
-        is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
-        if envelope.disclosure_do_not_submit and not is_bridge_submission:
+        if envelope.disclosure_do_not_submit:
             raise _ConsumeDenied("do_not_submit")
         is_model_submission = _is_model_submission(prepared, family_binding)
-        if (
-            is_model_submission
-            and not is_bridge_submission
-            and not envelope.disclosure_external_llm_allowed
-        ):
+        if is_model_submission and not envelope.disclosure_external_llm_allowed:
             raise _ConsumeDenied("external_llm_not_allowed")
         if (
             prepared.family.startswith(("acquisition.", "vt.download"))

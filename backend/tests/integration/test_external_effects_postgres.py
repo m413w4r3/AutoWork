@@ -922,6 +922,8 @@ async def test_bridge_submission_cannot_omit_restricted_prompt_source_reference(
         ("sample", None, "sample_license"),
         ("source_document", None, "document_red"),
         ("source_document", None, "document_license"),
+        ("sample", None, "envelope_do_not_submit"),
+        ("sample", None, "envelope_external_llm_denied"),
     ],
 )
 async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_license_vetoes(
@@ -963,8 +965,10 @@ async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_lice
             async with session.begin():
                 envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
                 assert envelope is not None
-                envelope.disclosure_do_not_submit = True
-                envelope.disclosure_external_llm_allowed = False
+                envelope.disclosure_do_not_submit = restriction == "envelope_do_not_submit"
+                envelope.disclosure_external_llm_allowed = (
+                    restriction != "envelope_external_llm_denied"
+                )
                 envelope.version = 5
                 turn = await session.get(ModelConversationTurnRow, authority.bridge_turn_id)
                 run = await session.get(ModelRunRow, run_id)
@@ -1122,12 +1126,21 @@ async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_lice
         )
         if restriction is not None:
             assert isinstance(outcome, Refused)
-            assert outcome.reason == (
+            expected_reason = {
+                "envelope_do_not_submit": "do_not_submit",
+                "envelope_external_llm_denied": "external_llm_not_allowed",
+            }.get(
+                restriction,
                 "sample_source_restricted"
                 if restriction.startswith("sample_")
-                else "source_document_restricted"
+                else "source_document_restricted",
             )
+            assert outcome.reason == expected_reason
             assert transport.calls == 0
+            assert sample_license_text not in repr(outcome)
+            assert document_license_text not in repr(outcome)
+            assert sample_license_text not in caplog.text
+            assert document_license_text not in caplog.text
             restriction_text = (
                 sample_license_text
                 if restriction == "sample_license"
