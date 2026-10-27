@@ -411,7 +411,11 @@ class SqlAlchemyVirusTotalPolicyGuard:
                     return False
                 object_type = observation.object_type.casefold()
                 if object_type in _VT_FILE_OBJECT_TYPES or (
-                    context.prepared.family in _VT_HASH_READ_FAMILIES and object_type == "sha256"
+                    object_type == "sha256"
+                    and (
+                        context.prepared.family in _VT_HASH_READ_FAMILIES
+                        or context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+                    )
                 ):
                     if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
                         return False

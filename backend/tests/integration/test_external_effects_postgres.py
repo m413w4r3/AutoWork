@@ -2902,6 +2902,125 @@ async def test_human_g2_vt_read_permits_acquired_sample_external_llm_flag(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("external_llm_allowed", [True, False])
+async def test_osint_guard_bridge_ignores_sample_do_not_submit_but_keeps_external_llm_veto(
+    migrated_postgres_url: str, tmp_path: Path, external_llm_allowed: bool
+) -> None:
+    # An acquired sample is do_not_submit; Bridge may cite it through a sha256
+    # observation unless the sample forbids external LLMs (VT PCAP derivative).
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    sample_id = uuid4()
+    sample_sha256 = "c" * 64
+    observation_id = uuid4()
+    observation_sha256 = "d" * 64
+    observation_version = "source-v1"
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+                assert blob is not None
+                session.add(
+                    SampleRow(
+                        id=sample_id,
+                        subject_id=subject_id,
+                        blob_id=blob.id,
+                        original_name="bridge-osint-sample.bin",
+                        origin="test",
+                        acquired_at=datetime.now(UTC),
+                        license_restriction=None,
+                        tlp="CLEAR",
+                        do_not_submit=True,
+                        external_llm_allowed=external_llm_allowed,
+                        origin_kind="manual",
+                        state="validated",
+                        source_service=None,
+                        source_object_id=sample_sha256,
+                        expected_hash=sample_sha256,
+                        validation_actor=None,
+                        validation_date=None,
+                        validation_reason=None,
+                        imphash=None,
+                        ssdeep=None,
+                        tlsh=None,
+                        rich_header_hash=None,
+                        vhash=None,
+                        main_icon_dhash=None,
+                        imphash_source=None,
+                        ssdeep_source=None,
+                        tlsh_source=None,
+                        rich_header_hash_source=None,
+                        vhash_source=None,
+                        main_icon_dhash_source=None,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+                session.add(
+                    SampleAssociationRow(
+                        id=uuid4(),
+                        investigation_id=investigation_id,
+                        sample_id=sample_id,
+                        sample_sha256=sample_sha256,
+                        origin="manual",
+                    )
+                )
+                session.add(
+                    EvidenceObservationRow(
+                        id=observation_id,
+                        investigation_id=investigation_id,
+                        kind="other",
+                        blob_id=blob.id,
+                        sha256=observation_sha256,
+                        source="test.source",
+                        source_version=observation_version,
+                        observed_at=datetime.now(UTC),
+                        object_type="sha256",
+                        object_id=sample_sha256,
+                        limitations=[],
+                        invocation_ref=None,
+                    )
+                )
+        source_refs = (
+            EvidenceReference(
+                "evidence_observation",
+                str(observation_id),
+                observation_version,
+                observation_sha256,
+            ),
+        )
+        prepared = PreparedExternalRequest.build(
+            family="advisor.consultation.v1",
+            provider="bridge",
+            provider_scope="bridge.responses",
+            normalizer_version="1",
+            canonical_request={"bridge_request_id": "osint-guard-regression"},
+            application_request=FrozenWireRequest(
+                method=b"POST",
+                target=b"/v1/responses",
+                headers=((b"content-type", b"application/json"),),
+                body=b"{}",
+            ),
+            evidence_refs=source_refs,
+        )
+        async with session_factory() as session:
+            async with session.begin():
+                allowed = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(
+                    ConsumePolicyContext(
+                        authority=authority,
+                        prepared=prepared,
+                        effect_key=effect_key(authority.investigation_id, prepared),
+                        database_session=session,
+                        investigation_subject_id=subject_id,
+                    )
+                )
+        assert allowed is external_llm_allowed
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reference_kind", "expected_reason"),
     [
