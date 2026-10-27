@@ -1,6 +1,121 @@
-# Mission 06-P/R — handoff (2026-10-26)
+# Mission 06-P/R/S — handoff (2026-10-27)
 
-## 0. Mission 06-R FINAL — état courant (prime sur §1–§5)
+## 0. Mission 06-S — état courant (prime sur §0-R et §1–§5)
+
+Parent : Claude Code (`claude-opus-5-5`, non Luna) ; enfants `codex/gpt-6-luna`
+(xhigh implémentation/revue, high tâches étroites), **une session neuve par
+cycle** (consigne utilisateur 2026-10-27). Mode `auto-review` : les enfants
+n'atteignent pas PostgreSQL ; tous les tests PG/workflow sont exécutés par le
+parent. Aucun push, déploiement, migration live, appel fournisseur réel.
+
+**Décisions utilisateur (contraignantes, remplacent §2 déc. 5 et 6).**
+1. `external_llm_allowed` toujours permis : échantillon acquis enregistré
+   `True` ; le drapeau source n'est plus un veto (ni Bridge ni VT).
+2. Aucun plafond d'octets de divulgation Bridge/advisor (CONTEXT_BYTES =
+   comptage seul ; plafond de jetons conservé ; lecture d'échantillon advisor
+   sans plafond — risque mémoire accepté).
+3. (2026-10-27) « Allow all observations to Bridge, remove all friction » :
+   tout type d'observation citable ; `do_not_submit`/`external_llm_allowed`
+   **de source** ne bloquent plus Bridge. Arbitrage parent : restent des vetos
+   TLP RED, `license_restriction`, révocation politique/enveloppe, drapeaux de
+   divulgation **de l'enveloppe G2 humaine**, champs secrets, ancrage exact des
+   refs. VT conserve `do_not_submit` (non tranché par l'utilisateur).
+
+**Git (local, non poussé ; `origin/main` = `111494d3`).** `main` = `05ec9d62`
+= `111494d3` + 3 merges `--no-ff` :
+
+| Lot | Merge | Branche @SHA approuvé | Revues | Statut |
+|---|---|---|---|---|
+| S3-BRIDGE | `288b4bd4` | `m06f/s3-bridge@530d5d1b` | `fef3e133` REVISE → `a3f10c5b` APPROVED | intégré |
+| S3-VT-DOWNLOAD | `9ece1883` | `m06f/s3-vt-download@103e1d70` | `6554093d` REVISE, `84a3f3c7` REVISE, `0707e7a1` APPROVED (3ᵉ cycle hors règle des 2 cycles : retrait de 4 lignes + test de régression, assumé par le parent) | intégré |
+| WF-HARNESS | `05ec9d62` | `m06s/workflow-download-harness@48e464f4` | `d6c453ad` REVISE → `9bfda43a` APPROVED | intégré |
+| E2E continu (lot C) | — | `m06s/e2e-osint-continuous@18712d1b` | non revu | **BLOCKED**, non intégré |
+
+Delta net `111494d3..05ec9d62` : `backend/src` 37 fichiers +2765/−772 ;
+`backend/tests` 36 fichiers +4176/−346 ; migrations +289/−22 (créé :
+`0005_sample_acquisition_dispatch.py`). Le merge VT-DOWNLOAD a d'abord cassé
+workflow FAST/FULL et J2 (faux VT des émulateurs téléchargeant sans consume :
+dispatch resté PREPARED) ; corrigé par WF-HARNESS (téléchargements des
+émulateurs via `VirusTotalHttpAdapter` lié au coordinateur sur MockTransport,
+fixtures ancrées par observation canonique, code
+`external_disclosure_revoked_before_dispatch` persisté).
+
+**Lot C BLOCKED (2 cycles épuisés).** Nœud
+`tests/integration/test_investigation_vertical_postgres.py::test_real_postgres_osint_open_continuous_vt_analysis_advisor`
+sur `18712d1b` : épinglage OSINT_OPEN sans G2, `vt.file_report`,
+`vt.intelligence_search`, téléchargement coordonné (proxy 404 → download_url
+→ CDN 200, association persistée) **verts** ; `sample.analyze` sur le
+candidat → **`unavailable`** dans la composition de ce scénario (l'analyse
+locale n'y est pas câblée alors que W15 analyse un échantillon téléchargé),
+donc ni observation d'analyse ni consultation Bridge ni reprise. Correctif
+probable : composer l'analyse confinée comme W15 (`include_local_analysis` /
+harnais worker) dans ce scénario ; puis audit adversarial et mise à jour de
+`E2E_OSINT_AUDIT.md` (non faits).
+
+**Gates `main@05ec9d62` (parent, venv `/usr/bin/python3.12`, PG jetable
+55432, Typst épinglé).** `make lint-backend` OK ; `make typecheck-backend` 843
+OK ; `make test-backend` 5125 passed/2 skipped ; `make test-integration` 448
+passed (dont `test_migrations` head→0004→head) ; workflow FAST 22/22, FULL
+32/32 ; `make test-ci-scripts` OK ; J2 : voir verdict `LOCAL_TEST_GATES`.
+Frontend non lancé (aucun chemin UI modifié). CI GitHub `40407103494`
+(`111494d3`) : **success** (tous jobs).
+
+**Risque opérationnel.** Les 225 échantillons live ont `do_not_submit=true`,
+toujours veto pour VT : toute lecture VT citant ces échantillons sera refusée
+pendant le run réel (Bridge n'est plus concerné). Décision utilisateur requise
+si ces pivots sont attendus.
+
+### Verdicts (Mission 06-S)
+
+```text
+S3_CORE                     : APPROVED (conservé)
+S3_VT_READ                  : READY (external_llm_allowed source retiré, déc. 1)
+S3_BRIDGE                   : APPROVED + intégré (530d5d1b)
+S3_VT_DOWNLOAD              : APPROVED + intégré (103e1d70)
+OSINT_OPEN_NO_REPEAT_G2     : PASS
+CANDIDATE_LOCAL_ANALYSIS    : PARTIAL (W15 vert ; scénario continu : sample.analyze unavailable)
+E2E_OSINT_CONTINUOUS        : BLOCKED (lot C, repro ci-dessus)
+AUDIT_DECISION_CHAIN        : PARTIAL (audit adversarial non relancé)
+MIGRATION_CHAIN             : PASS (0001→0005 sur base jetable ; live en 0002)
+CI_LATEST                   : PASS pour 111494d3 ; main local 05ec9d62 non poussé
+LOCAL_TEST_GATES            : PASS (J2 : voir rapport final)
+ANALYSIS_WORKER_READINESS   : PASS sonde live (confiné, outils présents) ; Ghidra healthy
+REAL_RUN_TECHNICAL_GO       : NO_GO
+REAL_RUN_OPERATIONAL_GO     : NO_GO
+REAL_INVESTIGATION_STARTED  : NO
+```
+
+### Autorisations encore nécessaires
+
+1. Push de `main@05ec9d62` (puis CI).
+2. Migration de la base live `0002 → 0005` (`0003` OSINT_OPEN, `0004` claims,
+   `0005` dispatch) et redéploiement de la stack sur ce code.
+3. Réconciliation humaine CAS de l'investigation `5f66ebfb` (`running` sans
+   job) et des 19 invocations `needs_review`.
+4. Décision sur `do_not_submit` pour les lectures VT (cf. risque).
+5. Smokes fournisseurs (`make smoke-live`), batch de production (nouvelle
+   lignée), activation OSINT_OPEN par opérateur vérifié, démarrage de
+   l'investigation réelle.
+
+**Prévol live (lecture seule, 2026-10-26).** Alembic live `0002_c2_experiments`
+(`0003`, `0004`, `0005` absentes) ; run 12 `ec7a6807` / investigation
+`5f66ebfb` **`running` sans job actif** (turn 0, arrêtée 2026-10-22) ; 19
+invocations `needs_review` (vt.download_sample ×3 inv. `0fba819c`,
+behaviour_pcap ×4, advisor.consult ×10, relationships ×2, reparse ×1 sur
+`5f66ebfb`) ; aucun job non terminal ; 12 batchs `completed` ; édition
+`11f62c2b` `open` CLEAR ; synthèse run 12 `b3e0c99e` v1 `verified` SHA
+`8eb9cbe0…d618` ; 225 échantillons (204 manual quarantined, 17 vt_hunt_hit
+review_candidate, 4 captures) tous CLEAR et **`do_not_submit=true`** ; 226/226
+blobs MinIO présents et SHA-256 recalculés conformes ; table OSINT_OPEN absente
+(live en `0002`) ; Redis PONG ; MinIO live 200 ; Bridge TCP joignable, `GET
+/v1/models` 401 sans clé (clé non lue) ; analysis-worker confiné
+(`bookworm-internal-v1`, capa 9.4.0, YARA 4.5.0, FLOSS 3.1.1, suricata 7.0.10,
+dotnet ilspy 9.1, MWCP sans parseur autorisé), Ghidra healthy (Docker) ;
+`preflight-supervised-first-run` local = NO_GO `postgres_dsn_missing` (DSN live
+non fourni) ; variante `-stack` non lancée (exige d'attester une base jetable,
+faux pour la base live). API GET non faits (jeton opérateur requis).
+
+## 0-R. Mission 06-R FINAL — état antérieur (historique)
 
 Parent : Claude Code `d6ef7e5e` (`claude-opus-5-5`, non Luna) ; enfants
 `codex/gpt-6-luna` xhigh. Aucun push, déploiement, migration live, appel
