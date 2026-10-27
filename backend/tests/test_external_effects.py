@@ -34,6 +34,7 @@ from cti_app.application.external_effects import (
     TransportResponse,
     _NoHandoffProofVerifier,
     _PermitRegistry,
+    external_effect_source_do_not_submit_blocks,
 )
 from cti_app.application.model_gateway import BridgeExternalEffectBinding
 from cti_app.domain.external_effects import (
@@ -67,6 +68,32 @@ from cti_app.integrations.models import (
 _INVESTIGATION_ID = UUID("b4079022-263e-48cb-86f7-460be4457fcb")
 _INVOCATION_ID = UUID("7f540f99-69eb-49c5-b512-94a297c57208")
 _APPROVAL_ID = UUID("b5e03b5a-9619-461f-9a39-10ec2856373d")
+
+
+@pytest.mark.parametrize(
+    "family",
+    [
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+        "vt.download_sample",
+    ],
+)
+def test_source_do_not_submit_does_not_block_vt_reads_or_downloads(family: str) -> None:
+    assert not external_effect_source_do_not_submit_blocks(family, True)
+    assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize(
+    "family",
+    ["bridge.investigation_turn.v1", "advisor.consultation.v1", "other.upload"],
+)
+def test_source_do_not_submit_blocks_external_upload_families(family: str) -> None:
+    assert external_effect_source_do_not_submit_blocks(family, True)
+    assert not external_effect_source_do_not_submit_blocks(family, False)
 
 
 def _wire(

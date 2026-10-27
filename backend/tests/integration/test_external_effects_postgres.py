@@ -124,6 +124,7 @@ from tests.workflow_emulator.investigation_support import seed_verified_article
 pytestmark = pytest.mark.integration
 
 _FAMILY = "vt.file_report"
+_NON_BRIDGE_MODEL_UPLOAD_FAMILY = "openai.external_upload.v1"
 _PROVIDER = "virustotal"
 _NORMALIZER = "vt.file-report.v1"
 _ARGUMENTS = {"hash": "abc"}
@@ -2386,12 +2387,18 @@ async def test_declared_query_credential_in_canonical_request_is_rejected_before
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("restriction", "expected_reason"),
+    ("restriction", "expected_reason", "family"),
     [
-        ("tlp", "source_document_restricted"),
-        ("external_llm_allowed", "source_document_external_llm_not_allowed"),
-        ("do_not_submit", "source_document_restricted"),
-        ("clear", None),
+        ("tlp", "source_document_restricted", _FAMILY),
+        ("external_llm_allowed", "source_document_external_llm_not_allowed", _FAMILY),
+        ("do_not_submit", None, _FAMILY),
+        ("clear", None, _FAMILY),
+        pytest.param(
+            "do_not_submit",
+            "source_document_restricted",
+            _NON_BRIDGE_MODEL_UPLOAD_FAMILY,
+            id="non-bridge-model-upload-do-not-submit",
+        ),
     ],
 )
 @pytest.mark.parametrize("reference_kind", ["evidence_observation", "source_document"])
@@ -2401,16 +2408,24 @@ async def test_source_document_restrictions_are_checked_at_consume(
     restriction: str,
     expected_reason: str | None,
     reference_kind: str,
+    family: str,
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, base = authorities[0]
+    provider = _PROVIDER if family == _FAMILY else "openai"
+    provider_scope = "tenant-test" if family == _FAMILY else "model-test"
+    normalizer_version = _NORMALIZER if family == _FAMILY else "openai.external-upload.v1"
     observation_id = uuid4()
     observation_sha256 = "c" * 64
     observation_version = "source-v1"
     async with session_factory() as session:
         async with session.begin():
+            if provider != _PROVIDER:
+                envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
+                assert envelope is not None
+                envelope.allowed_providers = [provider]
             blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
             assert blob is not None
             document = SourceDocumentRow(
@@ -2483,19 +2498,46 @@ async def test_source_document_restrictions_are_checked_at_consume(
         )
     )
     prepared = PreparedExternalRequest.build(
-        family=base.family,
-        provider=base.provider,
-        provider_scope=base.provider_scope,
-        normalizer_version=base.normalizer_version,
-        canonical_request=base.canonical_request,
-        application_request=base.application_request,
+        family=family,
+        provider=provider,
+        provider_scope=provider_scope,
+        normalizer_version=normalizer_version,
+        canonical_request=(
+            base.canonical_request
+            if family == _FAMILY
+            else {"artifact": "synthetic-source-document"}
+        ),
+        application_request=(
+            base.application_request
+            if family == _FAMILY
+            else FrozenWireRequest(
+                method=b"POST",
+                target=b"/v1/external-upload",
+                headers=((b"content-type", b"application/json"),),
+                body=b'{"artifact":"synthetic-source-document"}',
+            )
+        ),
         evidence_refs=(reference,),
     )
     transport = _CountingTransport()
+    store = (
+        _store(session_factory, model_submission=True)
+        if family == _FAMILY
+        else SqlAlchemyExternalEffectClaimStore(
+            session_factory,
+            family_bindings={
+                family: ExternalEffectFamilyBinding(
+                    provider=provider,
+                    provider_scopes=frozenset({provider_scope}),
+                    normalizer_versions=frozenset({normalizer_version}),
+                    invocation_tool_binding=(_FAMILY, "v1"),
+                    model_submission=True,
+                )
+            },
+        )
+    )
     try:
-        outcome = await ExternalEffectCoordinator(
-            _store(session_factory, model_submission=True)
-        ).send_one(authority, prepared, transport)
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
         if expected_reason is None:
             assert isinstance(outcome, Completed)
             assert transport.calls == 1
