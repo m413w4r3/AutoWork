@@ -1106,7 +1106,7 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         assert warning.levelname == "WARNING"
         assert warning.tool_name == "vt.download_sample"
         assert warning.exception_class == "SampleAcquisitionDownloadError"
-        assert warning.error_code == "virustotal_external_effect_needs_review"
+        assert warning.error_code == "virustotal_download_truncated"
         assert warning.investigation_id == str(seeded.investigation.id)
         assert warning.invocation_id == str(invocation.id)
         assert material.sample_hash not in warning.getMessage()
