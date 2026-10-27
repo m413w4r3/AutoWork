@@ -49,6 +49,7 @@ from cti_app.domain.investigation import (
     SampleQualification,
     TLPLevel,
     ToolInvocationStatus,
+    canonical_json_bytes,
 )
 from cti_app.domain.osint_open import OsintCapabilities, OsintScopeKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
@@ -740,11 +741,12 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         artifact_store,
         suffix=uuid4().hex[:10],
         material=material,
+        include_seed_observation=False,
     )
-    assert seeded.seed_observation is not None
-    assert seeded.seed_observation.object_id == _SEED_HASH
+    assert seeded.seed_observation is None
     investigation_id = seeded.investigation.id
     candidate_hash = material.sample_hash
+    assert candidate_hash != _SEED_HASH
 
     policy = await OsintOpenPolicyService(uow_factory, Settings(_env_file=None)).activate(
         scope_kind=OsintScopeKind.SUBJECT_SET,
@@ -784,6 +786,27 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
     def mock_vt(request: httpx.Request) -> httpx.Response:
         host_path = (request.url.host or "", request.url.path)
         vt_http_calls.append((request.method, host_path[0], host_path[1]))
+        if host_path == (
+            "www.virustotal.com",
+            f"/api/v3/files/{candidate_hash}",
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": candidate_hash,
+                        "type": "file",
+                        "attributes": {
+                            "sha256": candidate_hash,
+                            "meaningful_name": "arbitrary-osint-hash.bin",
+                            "size": len(material.sample_bytes),
+                            "last_analysis_stats": {"malicious": 0},
+                            "tags": ["peexe"],
+                        },
+                    }
+                },
+                request=request,
+            )
         if host_path == ("www.virustotal.com", f"/api/v3/files/{_SEED_HASH}"):
             return httpx.Response(
                 200,
@@ -980,8 +1003,18 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert envelope.inherited_policy_event_id == policy.event_id
             assert inheritance is not None and inheritance.policy_event_id == policy.event_id
             assert tuple(decisions) == ()
+            async with uow_factory() as uow:
+                preexisting_observations = tuple(
+                    await uow.evidence_observations.list_for_investigation(investigation_id)
+                )
+                preexisting_associations = tuple(
+                    await uow.sample_associations.list_for_investigation(investigation_id)
+                )
+            assert preexisting_observations == ()
+            assert preexisting_associations == ()
 
             operator_results: dict[str, dict[str, Any]] = {}
+            operator_results_by_key: dict[str, dict[str, Any]] = {}
             operator_requests: list[tuple[str, str, dict[str, Any]]] = []
 
             def tool_diagnostic(tool_name: str, result: dict[str, Any]) -> str:
@@ -1026,17 +1059,53 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 assert response.status_code == 200, response.text
                 result: dict[str, Any] = response.json()
                 operator_results[tool_name] = result
+                operator_results_by_key[key] = result
                 operator_requests.append((tool_name, key, request_payload))
                 return result
+
+            arbitrary_report_result = await invoke_operator_tool(
+                "vt.file_report",
+                "1",
+                {"file_hash": candidate_hash},
+                key=f"m07.operator.file-report-arbitrary:{investigation_id}",
+                purpose="Read a synthetic hash that has not been observed or associated.",
+            )
+            assert_tool_status("vt.file_report", arbitrary_report_result, "succeeded")
+            async with uow_factory() as uow:
+                arbitrary_report_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source == "VirusTotal" and item.object_id == candidate_hash
+                    ),
+                    None,
+                )
+            assert arbitrary_report_observation is not None, tool_diagnostic(
+                "vt.file_report", arbitrary_report_result
+            )
 
             report_result = await invoke_operator_tool(
                 "vt.file_report",
                 "1",
                 {"file_hash": _SEED_HASH},
                 key=f"m07.operator.file-report:{investigation_id}",
-                purpose="Read the VT report for the seed hash anchored by the article observation.",
+                purpose="Read the VT report for the hash documented in the verified article.",
             )
             assert_tool_status("vt.file_report", report_result, "succeeded")
+            async with uow_factory() as uow:
+                report_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source == "VirusTotal" and item.object_id == _SEED_HASH
+                    ),
+                    None,
+                )
+            assert report_observation is not None, tool_diagnostic("vt.file_report", report_result)
 
             pivot_result = await invoke_operator_tool(
                 "vt.intelligence_search",
@@ -1044,7 +1113,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 {
                     "query": "type:peexe",
                     "justification": "Find a candidate related to the persisted article seed.",
-                    "evidence_refs": [str(seeded.seed_observation.id)],
+                    "evidence_refs": [str(report_observation.id)],
                 },
                 key=f"m07.operator.intelligence-search:{investigation_id}",
                 purpose="Pivot from the cited seed observation into VT Intelligence Search.",
@@ -1057,7 +1126,9 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         for item in await uow.evidence_observations.list_for_investigation(
                             investigation_id
                         )
-                        if item.source == "VirusTotal" and item.object_id == candidate_hash
+                        if item.source == "VirusTotal"
+                        and item.object_id == candidate_hash
+                        and str(item.id) in pivot_result["invocation"]["response_refs"]
                     ),
                     None,
                 )
@@ -1073,7 +1144,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 {
                     "sha256": candidate_hash,
                     "purpose": "Acquire the candidate identified by the cited VT pivot.",
-                    "evidence_refs": [str(pivot_observation_id)],
+                    "evidence_refs": [str(arbitrary_report_observation.id)],
                 },
                 key=f"m07.operator.download:{investigation_id}:{candidate_hash}",
                 purpose="Quarantine the hash-checked VT candidate without G3 qualification.",
@@ -1273,7 +1344,18 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             )
 
             invocations_by_name = {item.tool_name: item for item in invocations}
-            report_invocation = invocations_by_name["vt.file_report"]
+            report_invocation = next(
+                item
+                for item in invocations
+                if item.tool_name == "vt.file_report"
+                and item.normalized_parameters.get("file_hash") == _SEED_HASH
+            )
+            arbitrary_report_invocation = next(
+                item
+                for item in invocations
+                if item.tool_name == "vt.file_report"
+                and item.normalized_parameters.get("file_hash") == candidate_hash
+            )
             pivot_invocation = invocations_by_name["vt.intelligence_search"]
             download_invocation = invocations_by_name["vt.download_sample"]
             analysis_invocation = invocations_by_name["sample.analyze"]
@@ -1292,22 +1374,35 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     "sha256": _SEED_HASH,
                     "version": "sample-hash.v1",
                 },
+            ]
+            arbitrary_report_parameters = dict(arbitrary_report_invocation.normalized_parameters)
+            arbitrary_source_refs = arbitrary_report_parameters.pop(
+                "_vt_external_effect_source_refs"
+            )
+            assert arbitrary_report_parameters == {"file_hash": candidate_hash}
+            assert [dict(item) for item in arbitrary_source_refs] == [
                 {
-                    "id": str(seeded.seed_observation.id),
-                    "kind": "evidence_observation",
-                    "sha256": seeded.seed_observation.sha256,
-                    "version": str(seeded.seed_observation.source_version),
+                    "id": candidate_hash,
+                    "kind": "sample_hash",
+                    "sha256": candidate_hash,
+                    "version": "sample-hash.v1",
+                },
+            ]
+            download_source_refs = download_invocation.normalized_parameters[
+                "_vt_external_effect_source_refs"
+            ]
+            assert [dict(item) for item in download_source_refs] == [
+                {
+                    "id": candidate_hash,
+                    "kind": "sample_hash",
+                    "sha256": candidate_hash,
+                    "version": "sample-hash.v1",
                 },
             ]
             assert list(pivot_invocation.normalized_parameters["evidence_refs"]) == [
-                str(seeded.seed_observation.id)
+                str(report_observation.id)
             ]
 
-            pivot_observation = next(
-                item
-                for item in observations
-                if item.source == "VirusTotal" and item.object_id == candidate_hash
-            )
             report_observation = next(
                 item
                 for item in observations
@@ -1330,7 +1425,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert report_observation.id in report_invocation.response_refs
             assert pivot_observation.id in pivot_invocation.response_refs
             assert list(download_invocation.normalized_parameters["evidence_refs"]) == [
-                str(pivot_observation.id)
+                str(arbitrary_report_observation.id)
             ]
             assert analysis_invocation.normalized_parameters["association_id"] == str(
                 association.id
@@ -1462,7 +1557,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 }
             }
             assert family_counts == {
-                "vt.file_report": 1,
+                "vt.file_report": 2,
                 "vt.intelligence_search": 1,
                 "vt.download_sample": 3,
                 "advisor.consultation.v1": 1,
@@ -1485,8 +1580,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 item.canonical_request is not None
                 and item.canonical_request.get("sha256") == candidate_hash
                 and any(
-                    reference.get("kind") == "evidence_observation"
-                    and reference.get("id") == str(pivot_observation.id)
+                    reference.get("kind") == "sample_hash" and reference.get("id") == candidate_hash
                     for reference in item.evidence_refs
                 )
                 for item in download_claims
@@ -1517,6 +1611,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert version_rows[0].version == supported_finding.version == 1
             assert bridge_http_calls.count(("POST", "/v1/responses")) == 1
             assert [item[2] for item in vt_http_calls] == [
+                f"/api/v3/files/{candidate_hash}",
                 f"/api/v3/files/{_SEED_HASH}",
                 "/api/v3/intelligence/search",
                 f"/api/v3/files/{candidate_hash}/download",
@@ -1653,6 +1748,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                                 item.tool_name,
                                 item.status.value,
                                 item.version,
+                                canonical_json_bytes(item.normalized_parameters).decode(),
                             )
                             for item in invocations_now
                         )
@@ -1766,12 +1862,12 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 replay = replay_response.json()
                 assert replay["idempotent_replay"] is True, tool_diagnostic(tool_name, replay)
                 assert (
-                    replay["invocation"]["id"] == operator_results[tool_name]["invocation"]["id"]
+                    replay["invocation"]["id"] == operator_results_by_key[key]["invocation"]["id"]
                 ), tool_diagnostic(tool_name, replay)
                 assert_tool_status(
                     tool_name,
                     replay,
-                    operator_results[tool_name]["invocation"]["status"],
+                    operator_results_by_key[key]["invocation"]["status"],
                 )
             assert tuple(vt_http_calls) == vt_calls_before_replay
             assert tuple(bridge_http_calls) == bridge_calls_before_replay

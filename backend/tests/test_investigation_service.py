@@ -77,10 +77,12 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
 )
+from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     DisclosureBounds,
+    EnvelopeAuthorityKind,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
@@ -700,6 +702,266 @@ class _Fixture:
             hypotheses=tuple(hypotheses),
             execution_mode=execution_mode,
         )
+
+
+def _enable_osint_vt_hash_reads(fixture: _Fixture, *, authorized: bool = True):
+    policy_id = uuid4()
+    policy_event_id = uuid4()
+    policy_version = 1
+    envelope = replace(
+        fixture.envelope,
+        approval_decision_id=policy_event_id,
+        authority_kind=EnvelopeAuthorityKind.OSINT_POLICY,
+        inherited_policy_id=policy_id,
+        inherited_policy_version=policy_version,
+        inherited_policy_event_id=policy_event_id,
+        allowed_providers=("vt",),
+    )
+    inheritance = SimpleNamespace(
+        investigation_id=fixture.investigation_id,
+        subject_id=fixture.subject_id,
+        policy_id=policy_id,
+        policy_version=policy_version,
+        policy_event_id=policy_event_id,
+    )
+    policy = SimpleNamespace(
+        policy_id=policy_id,
+        version=policy_version,
+        event_id=policy_event_id,
+        contains_subject=lambda subject_id: subject_id == fixture.subject_id,
+        capabilities=SimpleNamespace(allowed_providers=("vt",)),
+    )
+    effective = SimpleNamespace(authorized=authorized, inheritance=inheritance, policy=policy)
+
+    async def resolve_effective_policy(_investigation_id):
+        return effective
+
+    fixture.service._effective_policy_for = resolve_effective_policy
+    return envelope, effective
+
+
+@pytest.mark.asyncio
+async def test_trusted_vt_source_refs_accept_arbitrary_hash_under_active_osint_policy() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+    arbitrary_hash = "b" * 64
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": arbitrary_hash},
+        envelope=envelope,
+    )
+
+    assert references == (
+        EvidenceReference("sample_hash", arbitrary_hash, "sample-hash.v1", arbitrary_hash),
+    )
+    assert await fixture.observations.list_for_investigation(investigation.id) == ()
+    caller_claims = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={
+            "file_hash": arbitrary_hash,
+            "evidence_refs": ["caller-controlled"],
+            "_vt_external_effect_source_refs": [
+                EvidenceReference("sample_hash", "e" * 64, "sample-hash.v1", "e" * 64).to_json()
+            ],
+        },
+        envelope=envelope,
+    )
+    assert caller_claims == references
+
+
+@pytest.mark.asyncio
+async def test_trusted_vt_source_refs_remain_strict_outside_osint_policy() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    arbitrary_hash = "b" * 64
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={
+            "file_hash": arbitrary_hash,
+            "evidence_refs": ["caller-controlled"],
+            "_vt_external_effect_source_refs": [
+                EvidenceReference(
+                    "sample_hash", arbitrary_hash, "sample-hash.v1", arbitrary_hash
+                ).to_json()
+            ],
+        },
+        envelope=fixture.envelope,
+    )
+
+    assert references == ()
+
+    documented_hash = "a" * 64
+    documented_references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": documented_hash},
+        envelope=fixture.envelope,
+    )
+    assert documented_hash in fixture.snapshot.article.documented_samples
+    assert documented_references == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_hash", ["g" * 64, "a" * 32, "b" * 40])
+async def test_trusted_vt_source_refs_reject_malformed_hash_under_osint_policy(
+    invalid_hash: str,
+) -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": invalid_hash},
+        envelope=envelope,
+    )
+
+    assert references == ()
+
+
+@pytest.mark.asyncio
+async def test_trusted_vt_source_refs_reject_revoked_osint_policy() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, effective = _enable_osint_vt_hash_reads(fixture, authorized=False)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": "b" * 64},
+        envelope=envelope,
+    )
+
+    assert effective.authorized is False
+    assert references == ()
+
+
+@pytest.mark.asyncio
+async def test_trusted_vt_source_refs_normalize_case_and_are_replay_stable() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+    raw_hash = f" {'b' * 64}".upper() + " "
+
+    first = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": raw_hash},
+        envelope=envelope,
+    )
+    replay = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": raw_hash},
+        envelope=envelope,
+    )
+
+    expected = EvidenceReference("sample_hash", "b" * 64, "sample-hash.v1", "b" * 64)
+    assert first == replay == (expected,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("vt.behaviour", {"file_hash": "c" * 64}),
+        ("vt.behaviour_pcap", {"file_hash": "c" * 64}),
+        ("vt.relationships", {"object_type": "file", "object_id": "c" * 64}),
+    ],
+)
+async def test_trusted_vt_source_refs_accept_any_file_pivot_hash_under_osint(
+    tool_name: str, arguments: dict[str, str]
+) -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name=tool_name,
+        arguments=arguments,
+        envelope=envelope,
+    )
+
+    hash_value = arguments.get("file_hash", arguments.get("object_id"))
+    assert references == (
+        EvidenceReference("sample_hash", hash_value, "sample-hash.v1", hash_value),
+    )
+
+
+@pytest.mark.asyncio
+async def test_osint_vt_search_allows_cited_unassociated_vt_observation() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+    sample_hash = "c" * 64
+    observation = EvidenceObservation(
+        investigation_id=investigation.id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="d" * 64,
+        source="VirusTotal",
+        source_version="vt.file-report.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=sample_hash,
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    class _EmptySampleRepository:
+        async def list_by_subject_and_sha256(self, _subject_id, _sample_hash):
+            return ()
+
+    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    fixture.service._samples = _EmptySampleRepository()
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.intelligence_search",
+        arguments={"query": "type:peexe", "evidence_refs": [str(observation.id)]},
+        envelope=envelope,
+    )
+
+    assert references == (
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+    )
+    assert not await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.intelligence_search",
+        envelope=envelope,
+    )
+    assert await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.intelligence_search",
+        envelope=fixture.envelope,
+    )
+    revoked_envelope, _revoked_effective = _enable_osint_vt_hash_reads(fixture, authorized=False)
+    assert await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.intelligence_search",
+        envelope=revoked_envelope,
+    )
 
 
 def _compose_fixture_service(fixture: _Fixture) -> Any:

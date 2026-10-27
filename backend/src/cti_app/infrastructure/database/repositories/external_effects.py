@@ -30,6 +30,7 @@ from cti_app.application.external_effects import (
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
     external_effect_source_do_not_submit_blocks,
+    osint_vt_search_may_cite_unassociated_observation_hash,
 )
 from cti_app.domain.external_effects import (
     EffectClaimState,
@@ -1427,6 +1428,15 @@ class SqlAlchemyExternalEffectClaimStore:
             "vt.behaviour_pcap",
             "vt.relationships",
         }
+        # The policy and persisted invocation reference were already checked by
+        # _check_authority and _validate_external_source_refs above.
+        allows_unassociated_osint_vt_hash = (
+            authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+            and prepared.provider == "vt"
+            and family_binding.provider == "vt"
+            and family_binding.requires_source_refs
+            and (vt_file_hash_read or prepared.family == "vt.download_sample")
+        )
         recognized_kinds = {
             "sample",
             "sample_association_sample",
@@ -1564,10 +1574,19 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("sample_association_missing")
         found_hashes = {item.sample_sha256 for item in associations}
         observation_grounding_hashes = observation_hashes if vt_file_hash_read else set()
-        if sample_hashes - (found_hashes | observation_grounding_hashes):
+        if (
+            sample_hashes - (found_hashes | observation_grounding_hashes)
+            and not allows_unassociated_osint_vt_hash
+        ):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
         sample_hash_grounding = sample_hashes if vt_file_hash_read else set()
-        if observation_hashes - (found_hashes | sample_hash_grounding):
+        if observation_hashes - (
+            found_hashes | sample_hash_grounding
+        ) and not osint_vt_search_may_cite_unassociated_observation_hash(
+            authority_kind=authority.authority_kind,
+            provider=prepared.provider,
+            family=prepared.family,
+        ):
             raise _ConsumeDenied("evidence_observation_not_associated_with_investigation")
         model_source_hashes = sample_hashes | observation_hashes
         if is_model_submission and model_source_hashes:
@@ -1586,7 +1605,7 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("sample_not_associated_with_investigation")
 
-        if vt_file_hash_read and source_hashes:
+        if (vt_file_hash_read or prepared.family == "vt.intelligence_search") and source_hashes:
             hash_samples = list(
                 await session.scalars(
                     select(SampleRow)

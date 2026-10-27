@@ -14,12 +14,18 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ReuseDecision,
     external_effect_source_do_not_submit_blocks,
+    osint_vt_search_may_cite_unassociated_observation_hash,
 )
-from cti_app.application.virustotal import VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES
+from cti_app.application.virustotal import (
+    VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES,
+    VirusTotalInvalidInputError,
+    normalize_file_hash,
+)
 from cti_app.domain.external_effects import (
     EffectClaimState,
     EvidenceReference,
     ExternalEffectAuthority,
+    ExternalEffectAuthorityKind,
     PreparedExternalRequest,
 )
 from cti_app.domain.osint_open import (
@@ -34,6 +40,7 @@ from cti_app.infrastructure.database.models.external_effects import ExternalEffe
 from cti_app.infrastructure.database.models.investigation import (
     EvidenceObservationRow,
     SampleAssociationRow,
+    ToolInvocationRow,
 )
 from cti_app.infrastructure.database.models.osint_open_policy import (
     OsintOpenInheritanceRow,
@@ -108,14 +115,20 @@ def _source_refs_for_family(
     elif family == "vt.download_sample":
         hash_value = parameters.get("sha256")
     if hash_value is not None:
-        if not isinstance(hash_value, str) or not re.fullmatch(r"[0-9a-f]{64}", hash_value):
+        if not isinstance(hash_value, str):
+            return ()
+        try:
+            normalized_hash = normalize_file_hash(hash_value)
+        except VirusTotalInvalidInputError:
+            return ()
+        if len(normalized_hash) != 64:
             return ()
         expected = (
             EvidenceReference(
                 kind="sample_hash",
-                id=hash_value,
+                id=normalized_hash,
                 version="sample-hash.v1",
-                sha256=hash_value,
+                sha256=normalized_hash,
             ),
         )
         if not metadata or metadata == expected:
@@ -459,9 +472,19 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 )
             )
             associated_hashes = {item.sample_sha256 for item in associations}
-            if sample_hashes - (associated_hashes | observation_hashes):
+            ungrounded_hashes = sample_hashes - (associated_hashes | observation_hashes)
+            if ungrounded_hashes and (
+                context.authority.authority_kind is not ExternalEffectAuthorityKind.OSINT_POLICY
+                or not await self._invocation_hash_source_allowed(context, ungrounded_hashes)
+            ):
                 return False
-            if observation_hashes - (associated_hashes | sample_hashes):
+            if observation_hashes - (
+                associated_hashes | sample_hashes
+            ) and not osint_vt_search_may_cite_unassociated_observation_hash(
+                authority_kind=context.authority.authority_kind,
+                provider=context.prepared.provider,
+                family=context.prepared.family,
+            ):
                 return False
             sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)
         if association_refs:
@@ -507,7 +530,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 return False
         if source_hashes:
             sample_hash_terms = [BlobRow.sha256.in_(sorted(source_hashes))]
-            if context.prepared.family in _VT_HASH_READ_FAMILIES:
+            if context.prepared.family in _VT_HASH_READ_FAMILIES | {"vt.intelligence_search"}:
                 sample_hash_terms.extend(
                     (
                         SampleRow.expected_hash.in_(sorted(source_hashes)),
@@ -558,6 +581,56 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 for item in documents
             ):
                 return False
+        return True
+
+    async def _invocation_hash_source_allowed(
+        self, context: ConsumePolicyContext, hashes: set[str]
+    ) -> bool:
+        """Require the matching service-resolved ref persisted on this invocation."""
+        family = context.prepared.family
+        if family not in {*_VT_HASH_READ_FAMILIES, "vt.download_sample"} or len(hashes) != 1:
+            return False
+        session = context.database_session
+        authority = context.authority
+        if not isinstance(session, AsyncSession) or authority.invocation_id is None:
+            return False
+
+        invocation = await session.scalar(
+            select(ToolInvocationRow).where(
+                ToolInvocationRow.id == authority.invocation_id,
+                ToolInvocationRow.investigation_id == authority.investigation_id,
+            )
+        )
+        binding = VT_EXTERNAL_EFFECT_FAMILIES.get(family)
+        if (
+            invocation is None
+            or invocation.status != "running"
+            or invocation.operation_key != authority.operation_key
+            or binding != (invocation.tool_name, invocation.schema_version)
+            or not isinstance(invocation.normalized_parameters, Mapping)
+        ):
+            return False
+
+        sample_hash = next(iter(hashes))
+        expected_reference = EvidenceReference(
+            "sample_hash", sample_hash, "sample-hash.v1", sample_hash
+        )
+        if _metadata_source_refs(invocation.normalized_parameters) != (
+            expected_reference,
+        ) or context.prepared.evidence_refs != (expected_reference,):
+            return False
+
+        parameters = invocation.normalized_parameters
+        if family == "vt.download_sample":
+            requested_hash = parameters.get("sha256")
+        elif family == "vt.relationships":
+            if parameters.get("object_type") != "file":
+                return False
+            requested_hash = parameters.get("object_id")
+        else:
+            requested_hash = parameters.get("file_hash")
+        if not isinstance(requested_hash, str) or requested_hash.strip().lower() != sample_hash:
+            return False
         return True
 
 
