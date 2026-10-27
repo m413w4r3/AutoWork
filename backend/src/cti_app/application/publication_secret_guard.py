@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
@@ -10,7 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from cti_app.application.typst_compilation import TypstCompilationError
 from cti_app.config import get_settings
@@ -61,14 +62,18 @@ _OPERATIONAL_ASSIGNMENT = re.compile(
     r"(?P<value>\[clé masquée\]|\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _SERVICE_DSN = re.compile(
-    r"(?i)\b(?:postgres(?:ql)?|redis|rediss|mysql|mariadb|mongodb(?:\+srv)?)://[^\s,;<>\"']+"
+    r"(?i)\b(?:postgres(?:ql)?|redis|rediss|mysql|mariadb|mongodb(?:\+srv)?)://"
+    r"[^\s,;<>\"']+"
 )
 _URL = re.compile(r"(?i)\bhttps?://[^\s,;<>\"']+")
 _SENSITIVE_QUERY_NAMES = frozenset(
     {
-        "sig",
-        "signature",
-        "access_token",
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-goog-signature",
+        "x-goog-credential",
+        "googleaccessid",
     }
 )
 _IOC_VALUE_FIELDS = frozenset(
@@ -82,6 +87,114 @@ _HOST_PATH_SETTING_SUFFIXES = ("_path", "_root", "_directory", "_dir")
 class PublicationSecretFinding:
     location: str
     secret_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class JsonPathKey:
+    value: str
+    index: int
+
+
+DiagnosticSecretFragments = tuple[frozenset[str], ...]
+
+
+def safe_json_path(
+    parts: Sequence[JsonPathKey | int],
+    *,
+    operational_values: Sequence[tuple[str, str, bool]] | None = None,
+    secret_fragments: DiagnosticSecretFragments | None = None,
+    settings: Any | None = None,
+    root: str = "$",
+) -> str:
+    """Build a JSON-style diagnostic path without exposing sensitive keys."""
+    if secret_fragments is None:
+        path_values = (
+            tuple(operational_values)
+            if operational_values is not None
+            else _operational_values(settings, include_host_paths=False)
+        )
+        fragments = _diagnostic_secret_fragments(path_values)
+    else:
+        fragments = secret_fragments
+    path = root if root == "$" or not _contains_secret_fragment(root, fragments) else "$"
+    for part in parts:
+        if isinstance(part, int):
+            path += f"[{part}]"
+            continue
+        if isinstance(part, JsonPathKey):
+            name, key_index = part.value, part.index
+            if not _safe_diagnostic_key(name, fragments):
+                path += f"[<key#{key_index}>]"
+            elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
+                path += f".{name}"
+            else:
+                path += f"[{json.dumps(name, ensure_ascii=False)}]"
+            continue
+        raise TypeError("JSON path segments must carry their mapping index")
+    return path
+
+
+def _diagnostic_secret_fragments(
+    operational_values: Sequence[tuple[str, str, bool]],
+) -> DiagnosticSecretFragments:
+    fragments: list[set[str]] = [set(), set(), set(), set()]
+    for value, _secret_type, _case_insensitive in operational_values:
+        if not value:
+            continue
+        representations = (
+            *_percent_decoded_candidates(value),
+            *_encoded_secret_representations(value),
+        )
+        for representation in representations:
+            candidate = representation.casefold()
+            width = min(4, len(candidate))
+            if width:
+                fragments[width - 1].update(
+                    candidate[index : index + width] for index in range(len(candidate) - width + 1)
+                )
+    return tuple(frozenset(items) for items in fragments)
+
+
+def _encoded_secret_representations(value: str) -> frozenset[str]:
+    once_encoded = quote(value, safe="")
+    representations = {once_encoded, quote(once_encoded, safe="")}
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return frozenset(representations)
+    representations.update(
+        {
+            encoded.hex(),
+            encoded.hex().upper(),
+            base64.b64encode(encoded).decode("ascii"),
+            base64.b64encode(encoded).decode("ascii").rstrip("="),
+            base64.urlsafe_b64encode(encoded).decode("ascii"),
+            base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
+        }
+    )
+    return frozenset(representations)
+
+
+def _safe_diagnostic_key(name: str, secret_fragments: DiagnosticSecretFragments) -> bool:
+    if len(name) > 64 or re.fullmatch(r"[A-Za-z0-9_.-]+", name) is None:
+        return False
+    return not any(
+        _contains_secret_fragment(candidate, secret_fragments)
+        for candidate in _percent_decoded_candidates(name)
+    )
+
+
+def _contains_secret_fragment(candidate: str, secret_fragments: DiagnosticSecretFragments) -> bool:
+    normalized = candidate.casefold()
+    for width, fragments in enumerate(secret_fragments, start=1):
+        if width > len(normalized):
+            continue
+        if any(
+            normalized[index : index + width] in fragments
+            for index in range(len(normalized) - width + 1)
+        ):
+            return True
+    return False
 
 
 class PublicationSecretDetectedError(TypstCompilationError):
@@ -102,13 +215,20 @@ def guard_publication_render_data(
 ) -> None:
     """Reject AutoWork operational secrets while allowing published CTI material."""
     operational_values = _operational_values(settings)
-    for text, path, field_name, _ioc_type in _rendered_strings(render_data):
+    secret_fragments = _diagnostic_secret_fragments(operational_values)
+    for location, key_secret_type in _rendered_secret_key_findings(
+        render_data, operational_values, secret_fragments=secret_fragments
+    ):
+        raise PublicationSecretDetectedError(PublicationSecretFinding(location, key_secret_type))
+    for text, path, field_name, _ioc_type in _rendered_strings(
+        render_data,
+        operational_values=operational_values,
+        secret_fragments=secret_fragments,
+    ):
         secret_type = _operational_secret_type(text, field_name, operational_values)
         if secret_type is not None:
             raise PublicationSecretDetectedError(
-                PublicationSecretFinding(
-                    location=_redact_known_values(path, operational_values), secret_type=secret_type
-                )
+                PublicationSecretFinding(location=path, secret_type=secret_type)
             )
 
 
@@ -120,37 +240,55 @@ def redact_operational_secrets_with_findings(
 ) -> tuple[Any, tuple[PublicationSecretFinding, ...]]:
     """Redact operational values and return value-free locations for each match."""
     operational_values = _operational_values(settings, include_host_paths=include_host_paths)
+    secret_fragments = _diagnostic_secret_fragments(operational_values)
     findings: list[PublicationSecretFinding] = []
 
-    def walk(item: Any, *, path: str = "$", field_name: str = "") -> Any:
+    def walk(item: Any, *, path: tuple[JsonPathKey | int, ...] = (), field_name: str = "") -> Any:
         if isinstance(item, Mapping):
             cleaned: dict[Any, Any] = {}
-            for key, child in item.items():
-                child_path = _json_path_child(path, key)
-                if _is_operational_field_name(str(key)) and child not in (
+            for key_index, (key, child) in enumerate(item.items()):
+                child_name = str(key)
+                child_path = (*path, JsonPathKey(child_name, key_index))
+                key_secret_type = _mapping_key_secret_type(child_name, operational_values)
+                cleaned_key = key
+                if key_secret_type is not None:
+                    findings.append(
+                        PublicationSecretFinding(
+                            location=_safe_finding_location(
+                                child_path, operational_values, secret_fragments
+                            ),
+                            secret_type=_finding_type(key_secret_type),
+                        )
+                    )
+                    cleaned_key = f"{_SECRET_REDACTION}#{key_index}"
+                    while cleaned_key in item or cleaned_key in cleaned:
+                        cleaned_key += "#"
+                if _is_operational_field_name(child_name) and child not in (
                     None,
                     False,
                     True,
                     _SECRET_REDACTION,
                 ):
-                    cleaned[key] = _SECRET_REDACTION
+                    cleaned[cleaned_key] = _SECRET_REDACTION
                     findings.append(
                         PublicationSecretFinding(
-                            location=_safe_finding_location(child_path, operational_values),
-                            secret_type=_finding_type(_operational_field_type(str(key))),
+                            location=_safe_finding_location(
+                                child_path, operational_values, secret_fragments
+                            ),
+                            secret_type=_finding_type(_operational_field_type(child_name)),
                         )
                     )
                 else:
-                    cleaned[key] = walk(child, path=child_path, field_name=str(key))
+                    cleaned[cleaned_key] = walk(child, path=child_path, field_name=child_name)
             return cleaned
         if isinstance(item, list):
             return [
-                walk(child, path=f"{path}[{index}]", field_name=field_name)
+                walk(child, path=(*path, index), field_name=field_name)
                 for index, child in enumerate(item)
             ]
         if isinstance(item, tuple):
             return tuple(
-                walk(child, path=f"{path}[{index}]", field_name=field_name)
+                walk(child, path=(*path, index), field_name=field_name)
                 for index, child in enumerate(item)
             )
         if isinstance(item, Path):
@@ -160,7 +298,7 @@ def redact_operational_secrets_with_findings(
         redacted_text, secret_types = _redact_operational_text_with_types(item, operational_values)
         findings.extend(
             PublicationSecretFinding(
-                location=_safe_finding_location(path, operational_values),
+                location=_safe_finding_location(path, operational_values, secret_fragments),
                 secret_type=_finding_type(secret_type),
             )
             for secret_type in secret_types
@@ -254,6 +392,8 @@ def contains_explicit_operational_secrets(
         if isinstance(item, Mapping):
             for key, child in item.items():
                 child_name = str(key)
+                if _mapping_key_secret_type(child_name, explicit_values) is not None:
+                    return True
                 if _is_operational_field_name(child_name) and child not in (
                     None,
                     False,
@@ -372,21 +512,53 @@ def _operational_field_type(value: str) -> str:
 
 
 def _is_sensitive_url(value: str) -> bool:
+    for candidate in _percent_decoded_candidates(value):
+        try:
+            parsed = urlsplit(candidate)
+            query_items = parse_qsl(parsed.query, keep_blank_values=True)
+            query_names = {name.casefold() for name, _ in query_items}
+            query_values = {name.casefold(): item for name, item in query_items}
+            strong_signature = bool(query_names & _SENSITIVE_QUERY_NAMES)
+            azure_sas = (
+                bool(query_values.get("sig"))
+                and bool(query_values.get("sv"))
+                and bool(query_values.get("se"))
+            )
+            cloudfront_signature = (
+                bool(query_values.get("signature"))
+                and "key-pair-id" in query_names
+                and bool(query_names & {"expires", "policy"})
+            )
+            has_user_password = bool(parsed.username and parsed.password)
+            if strong_signature or azure_sas or cloudfront_signature or has_user_password:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _percent_decoded_candidates(text: str) -> tuple[str, ...]:
+    candidates = [text]
+    current = text
+    for _ in range(2):
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        candidates.append(decoded)
+        current = decoded
+    return tuple(candidates)
+
+
+def _service_dsn_has_credentials(dsn: str) -> bool:
     try:
-        parsed = urlsplit(value)
-        query_names = {
-            name.casefold() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
-        }
-        signed_query = any(
-            name in _SENSITIVE_QUERY_NAMES
-            or name.startswith("x-amz-")
-            or name.startswith("x-goog-")
-            for name in query_names
-        )
-        has_user_password = bool(parsed.username and parsed.password)
-        return has_user_password or signed_query
+        parsed = urlsplit(dsn)
+        if parsed.username or parsed.password:
+            return True
+        query = parse_qsl(parsed.query, keep_blank_values=False)
     except ValueError:
         return False
+    credential_query_names = {"user", "username", "password", "pass", "pwd"}
+    return any(name.casefold() in credential_query_names for name, value in query if value)
 
 
 def _operational_secret_type(
@@ -394,21 +566,58 @@ def _operational_secret_type(
 ) -> str | None:
     if _is_operational_field_name(field_name) and text.strip() not in {"", _SECRET_REDACTION}:
         return _operational_field_type(field_name)
-    for value, secret_type, case_insensitive in operational_values:
-        found = value.casefold() in text.casefold() if case_insensitive else value in text
-        if found:
-            return secret_type
-    assignment = _OPERATIONAL_ASSIGNMENT.search(text)
-    if assignment is not None and assignment.group("value").strip("\"'`") != _SECRET_REDACTION:
-        return _operational_field_type(assignment.group("label"))
-    if _SERVICE_DSN.search(text):
-        return "service_connection_string"
-    for match in _URL.finditer(text):
-        if _is_sensitive_url(match.group()):
-            parsed = urlsplit(match.group())
-            return (
-                "service_connection_string" if parsed.username or parsed.password else "signed_url"
+    for candidate in _percent_decoded_candidates(text):
+        for value, secret_type, case_insensitive in operational_values:
+            found = (
+                value.casefold() in candidate.casefold() if case_insensitive else value in candidate
             )
+            encoded_match = False
+            if not found:
+                representations = _encoded_secret_representations(value)
+                encoded_match = any(
+                    representation != value
+                    and "%" not in representation
+                    and (
+                        representation.casefold() in candidate.casefold()
+                        if case_insensitive
+                        else representation in candidate
+                    )
+                    for representation in representations
+                )
+                found = encoded_match
+            if found:
+                return "encoded_credential" if encoded_match else secret_type
+        assignment = _OPERATIONAL_ASSIGNMENT.search(candidate)
+        if assignment is not None and assignment.group("value").strip("\"'`") != _SECRET_REDACTION:
+            return _operational_field_type(assignment.group("label"))
+        dsn_match = _SERVICE_DSN.search(candidate)
+        if dsn_match is not None and _service_dsn_has_credentials(dsn_match.group()):
+            return "service_connection_string"
+        for match in _URL.finditer(candidate):
+            if _is_sensitive_url(match.group()):
+                parsed = urlsplit(match.group())
+                return (
+                    "service_connection_string"
+                    if parsed.username or parsed.password
+                    else "signed_url"
+                )
+    return None
+
+
+def _mapping_key_secret_type(
+    key: str, operational_values: tuple[tuple[str, str, bool], ...]
+) -> str | None:
+    secret_type = _operational_secret_type(key, "", operational_values)
+    if secret_type is not None:
+        return secret_type
+    for value, configured_type, _case_insensitive in operational_values:
+        candidates = _percent_decoded_candidates(key)
+        if any(
+            representation in candidate
+            for candidate in candidates
+            for representation in _encoded_secret_representations(value)
+        ):
+            return configured_type
     return None
 
 
@@ -422,6 +631,11 @@ def _redact_operational_text(
 def _redact_operational_text_with_types(
     text: str, operational_values: tuple[tuple[str, str, bool], ...]
 ) -> tuple[str, tuple[str, ...]]:
+    for decoded_text in _percent_decoded_candidates(text)[1:]:
+        secret_type = _operational_secret_type(decoded_text, "", operational_values)
+        if secret_type is not None:
+            return _SECRET_REDACTION, (_finding_type(secret_type),)
+
     secret_types: list[str] = []
 
     def replace_assignment(match: re.Match[str]) -> str:
@@ -432,7 +646,9 @@ def _redact_operational_text_with_types(
 
     cleaned = _OPERATIONAL_ASSIGNMENT.sub(replace_assignment, text)
 
-    def replace_dsn(_match: re.Match[str]) -> str:
+    def replace_dsn(match: re.Match[str]) -> str:
+        if not _service_dsn_has_credentials(match.group()):
+            return match.group()
         secret_types.append("dsn")
         return _SECRET_REDACTION
 
@@ -455,8 +671,19 @@ def _redact_operational_text_with_types(
         if value == _SECRET_REDACTION:
             continue
         flags = re.IGNORECASE if case_insensitive else 0
-        cleaned, replacements = re.subn(re.escape(value), _SECRET_REDACTION, cleaned, flags=flags)
-        secret_types.extend(_finding_type(secret_type) for _ in range(replacements))
+        representations = sorted(
+            {value, *_encoded_secret_representations(value)}, key=len, reverse=True
+        )
+        for representation in representations:
+            cleaned, replacements = re.subn(
+                re.escape(representation), _SECRET_REDACTION, cleaned, flags=flags
+            )
+            finding_type = (
+                "encoded_credential"
+                if representation != value and "%" not in representation
+                else _finding_type(secret_type)
+            )
+            secret_types.extend(finding_type for _ in range(replacements))
     return cleaned, tuple(secret_types)
 
 
@@ -470,47 +697,47 @@ def _finding_type(secret_type: str) -> str:
     return secret_type
 
 
-def _json_path_child(path: str, key: Any) -> str:
-    if isinstance(key, int):
-        return f"{path}[{key}]"
-    name = str(key)
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
-        return f"{path}.{name}"
-    return f"{path}[{json.dumps(name, ensure_ascii=False)}]"
-
-
-def _safe_finding_location(path: str, operational_values: tuple[tuple[str, str, bool], ...]) -> str:
-    cleaned, _ = _redact_operational_text(path, operational_values)
-    return cleaned
-
-
-def _redact_known_values(text: str, operational_values: tuple[tuple[str, str, bool], ...]) -> str:
-    cleaned, _count = _redact_operational_text(text, operational_values)
-    return cleaned
+def _safe_finding_location(
+    path: Sequence[JsonPathKey | int],
+    operational_values: tuple[tuple[str, str, bool], ...],
+    secret_fragments: DiagnosticSecretFragments | None = None,
+) -> str:
+    return safe_json_path(
+        path,
+        operational_values=operational_values,
+        secret_fragments=secret_fragments,
+    )
 
 
 def _rendered_strings(
     value: Any,
     *,
-    path: str = "render-data",
+    path: tuple[JsonPathKey | int, ...] = (),
     field_name: str = "",
     ioc_type: str | None = None,
+    operational_values: tuple[tuple[str, str, bool], ...] = (),
+    secret_fragments: DiagnosticSecretFragments | None = None,
 ) -> Iterator[tuple[str, str, str, str | None]]:
+    if secret_fragments is None:
+        secret_fragments = _diagnostic_secret_fragments(operational_values)
     if isinstance(value, Mapping):
         declared_type = _recognized_ioc_type(value.get("artifact_type", value.get("type")))
         table_cell_types = _table_cell_ioc_types(value)
-        for key, child in value.items():
+        for key_index, (key, child) in enumerate(value.items()):
             name = str(key)
             normalized_name = name.casefold()
+            child_path = (*path, JsonPathKey(name, key_index))
             if normalized_name == "rows" and isinstance(child, (list, tuple)):
                 cell_index = 0
                 for row_index, row in enumerate(child):
                     if not isinstance(row, (list, tuple)):
                         yield from _rendered_strings(
                             row,
-                            path=f"{path}.{name}[{row_index}]",
+                            path=(*child_path, row_index),
                             field_name=name,
                             ioc_type=ioc_type,
+                            operational_values=operational_values,
+                            secret_fragments=secret_fragments,
                         )
                         continue
                     for column_index, cell in enumerate(row):
@@ -521,9 +748,11 @@ def _rendered_strings(
                         )
                         yield from _rendered_strings(
                             cell,
-                            path=f"{path}.{name}[{row_index}][{column_index}]",
+                            path=(*child_path, row_index, column_index),
                             field_name="value" if cell_type is not None else name,
                             ioc_type=cell_type,
+                            operational_values=operational_values,
+                            secret_fragments=secret_fragments,
                         )
                         cell_index += 1
                 continue
@@ -536,9 +765,11 @@ def _rendered_strings(
                     )
                     yield from _rendered_strings(
                         cell,
-                        path=f"{path}.{name}[{cell_index}]",
+                        path=(*child_path, cell_index),
                         field_name="value" if cell_type is not None else name,
                         ioc_type=cell_type,
+                        operational_values=operational_values,
+                        secret_fragments=secret_fragments,
                     )
                 continue
             if normalized_name in _DIGEST_FIELD_NAMES or normalized_name.endswith(
@@ -553,26 +784,77 @@ def _rendered_strings(
             child_type = declared_type or ioc_type
             if name.casefold() in {"hashes", "ips", "domains"}:
                 child_type = {"hashes": "hash", "ips": "ip", "domains": "domain"}[name.casefold()]
-            child_path = f"{path}.{name}"
             yield from _rendered_strings(
                 child,
                 path=child_path,
                 field_name=name,
                 ioc_type=child_type if name.casefold() in _IOC_VALUE_FIELDS else ioc_type,
+                operational_values=operational_values,
+                secret_fragments=secret_fragments,
             )
         return
     if isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             yield from _rendered_strings(
                 child,
-                path=f"{path}[{index}]",
+                path=(*path, index),
                 field_name=field_name,
                 ioc_type=ioc_type,
+                operational_values=operational_values,
+                secret_fragments=secret_fragments,
             )
         return
     if isinstance(value, str):
         if not _UUID.fullmatch(value.strip()):
-            yield value, path, field_name, ioc_type
+            yield (
+                value,
+                safe_json_path(
+                    path,
+                    operational_values=operational_values,
+                    secret_fragments=secret_fragments,
+                    root="render-data",
+                ),
+                field_name,
+                ioc_type,
+            )
+
+
+def _rendered_secret_key_findings(
+    value: Any,
+    operational_values: tuple[tuple[str, str, bool], ...],
+    *,
+    secret_fragments: DiagnosticSecretFragments,
+    path: tuple[JsonPathKey | int, ...] = (),
+) -> Iterator[tuple[str, str]]:
+    if isinstance(value, Mapping):
+        for key_index, (key, child) in enumerate(value.items()):
+            name = str(key)
+            child_path = (*path, JsonPathKey(name, key_index))
+            secret_type = _mapping_key_secret_type(name, operational_values)
+            if secret_type is not None:
+                yield (
+                    safe_json_path(
+                        child_path,
+                        operational_values=operational_values,
+                        secret_fragments=secret_fragments,
+                        root="render-data",
+                    ),
+                    _finding_type(secret_type),
+                )
+            yield from _rendered_secret_key_findings(
+                child,
+                operational_values,
+                secret_fragments=secret_fragments,
+                path=child_path,
+            )
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            yield from _rendered_secret_key_findings(
+                child,
+                operational_values,
+                secret_fragments=secret_fragments,
+                path=(*path, index),
+            )
 
 
 def _recognized_ioc_type(value: Any) -> str | None:
@@ -655,6 +937,7 @@ def _valid_ioc_value(value: str, ioc_type: str | None) -> bool:
 
 
 __all__ = [
+    "JsonPathKey",
     "PublicationSecretDetectedError",
     "PublicationSecretFinding",
     "configured_operational_secret_values",
@@ -663,4 +946,5 @@ __all__ = [
     "guard_publication_render_data",
     "redact_operational_secrets",
     "redact_operational_secrets_with_findings",
+    "safe_json_path",
 ]

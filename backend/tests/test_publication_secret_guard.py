@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
@@ -130,17 +131,107 @@ def test_secret_findings_include_nested_locations_and_types_without_values() -> 
 
 
 @pytest.mark.parametrize(
-    "query_name",
-    ["sig", "signature", "access_token", "X-Amz-Credential", "X-Amz-Anything", "X-Goog-Whatever"],
+    "query",
+    [
+        "X-Amz-Signature=synthetic-value",
+        "X-Amz-Credential=synthetic-value",
+        "X-Amz-Security-Token=synthetic-value",
+        "X-Goog-Signature=synthetic-value",
+        "X-Goog-Credential=synthetic-value",
+        "GoogleAccessId=synthetic-value",
+        "sig=synthetic-value&sv=2024-01-01&se=2027-01-01",
+        "signature=synthetic-value&Expires=123&Key-Pair-Id=fixture",
+    ],
 )
-def test_strong_signature_query_names_are_redacted(query_name: str) -> None:
-    url = f"https://storage.invalid/object?{query_name}=synthetic-value"
+def test_strong_signature_query_sets_are_redacted(query: str) -> None:
+    url = f"https://storage.invalid/object?{query}"
 
     cleaned, findings = redact_operational_secrets_with_findings(
         {"links": [{"url": url}]}, settings=SimpleNamespace(), include_host_paths=False
     )
 
     assert cleaned["links"][0]["url"] == "[clé masquée]"
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.links[0].url", "signed_url")
+    ]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "access_token=attacker-token",
+        "sig=attacker-value",
+        "signature=attacker-value",
+        "X-Amz-Anything=attacker-value",
+        "X-Goog-Whatever=attacker-value",
+    ],
+)
+def test_generic_cti_query_parameters_are_not_redacted(query: str) -> None:
+    url = f"https://evil.example/x?{query}"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"links": [{"url": url}]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["links"][0]["url"] == url
+    assert findings == ()
+
+
+@pytest.mark.parametrize("passes", [1, 2, 3])
+def test_configured_secret_is_blocked_when_percent_encoded_in_generic_query(passes: int) -> None:
+    secret = "fixture/credential+value"
+    settings = SimpleNamespace(operator_api_token=SecretStr(secret))
+    encoded_secret = secret
+    for _ in range(passes):
+        encoded_secret = quote(encoded_secret, safe="")
+    url = f"https://evil.example/x?token={encoded_secret}"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"links": [{"url": url}]}, settings=settings, include_host_paths=False
+    )
+
+    assert cleaned["links"][0]["url"] == "[clé masquée]", "encoded configured value remained"
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.links[0].url", "configured_credential")
+    ]
+
+
+@pytest.mark.parametrize("encoding", ["hex", "base64"])
+def test_configured_secret_is_redacted_when_hex_or_base64_encoded(encoding: str) -> None:
+    import base64
+
+    secret = "fixture-secret/value"
+    encoded_secret = (
+        secret.encode().hex()
+        if encoding == "hex"
+        else base64.b64encode(secret.encode()).decode("ascii")
+    )
+    settings = SimpleNamespace(operator_api_token=SecretStr(secret))
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"evidence": [f"sample={encoded_secret}"]},
+        settings=settings,
+        include_host_paths=False,
+    )
+
+    assert cleaned["evidence"][0] == "sample=[clé masquée]"
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.evidence[0]", "encoded_credential")
+    ]
+
+
+@pytest.mark.parametrize("passes", [1, 2])
+def test_percent_encoded_signed_url_is_redacted(passes: int) -> None:
+    signed_url = "https://storage.invalid/object?X-Amz-Signature=synthetic-value"
+    encoded_url = signed_url
+    for _ in range(passes):
+        encoded_url = quote(encoded_url, safe="")
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"links": [{"url": encoded_url}]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["links"][0]["url"] == "[clé masquée]", "encoded signed URL remained"
     assert [(item.location, item.secret_type) for item in findings] == [
         ("$.links[0].url", "signed_url")
     ]
@@ -160,6 +251,136 @@ def test_user_password_url_is_redacted_but_username_only_url_is_not() -> None:
     assert [(item.location, item.secret_type) for item in findings] == [
         ("$.links[0]", "signed_url")
     ]
+
+
+def test_service_dsn_without_userinfo_is_allowed() -> None:
+    dsn = "postgresql://db.invalid:5432/cti"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [dsn]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["references"][0] == dsn
+    assert findings == ()
+
+
+def test_service_dsn_with_password_query_is_redacted() -> None:
+    dsn = "postgresql://db.invalid:5432/cti?user=fixture-user&password=fixture-password"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [dsn]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["references"][0] == "[clé masquée]"
+    assert [(item.location, item.secret_type) for item in findings] == [("$.references[0]", "dsn")]
+
+
+def test_configured_service_dsn_without_userinfo_remains_blocked() -> None:
+    dsn = "postgresql://db.invalid:5432/cti"
+    settings = SimpleNamespace(postgres_dsn=dsn)
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [dsn]}, settings=settings, include_host_paths=False
+    )
+
+    assert cleaned["references"][0] == "[clé masquée]"
+    assert [(item.location, item.secret_type) for item in findings] == [("$.references[0]", "dsn")]
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://fixture-user@db.invalid:5432/cti",
+        "postgresql://fixture-user:fixture-password@db.invalid:5432/cti",
+    ],
+)
+def test_service_dsn_with_userinfo_is_redacted(dsn: str) -> None:
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [dsn]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["references"][0] == "[clé masquée]"
+    assert [(item.location, item.secret_type) for item in findings] == [("$.references[0]", "dsn")]
+
+
+@pytest.mark.parametrize("passes", [1, 2])
+def test_percent_encoded_service_dsn_with_userinfo_is_redacted(passes: int) -> None:
+    dsn = "postgresql://fixture-user:fixture-password@db.invalid:5432/cti"
+    encoded_dsn = dsn
+    for _ in range(passes):
+        encoded_dsn = quote(encoded_dsn, safe="")
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [encoded_dsn]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["references"][0] == "[clé masquée]", "encoded DSN remained"
+    assert [(item.location, item.secret_type) for item in findings] == [("$.references[0]", "dsn")]
+
+
+def test_finding_paths_mask_configured_and_encoded_dictionary_keys() -> None:
+    import base64
+
+    secret = "fixture-key"
+    encoded_secret = "fixture/key"
+    settings = SimpleNamespace(
+        operator_api_token=SecretStr(secret),
+        operator_client_api_token=SecretStr(encoded_secret),
+    )
+    keys = (
+        secret,
+        quote(encoded_secret, safe=""),
+        encoded_secret.encode().hex(),
+        base64.b64encode(encoded_secret.encode()).decode(),
+        f"prefix-{secret}-suffix",
+        f"prefix-{quote(encoded_secret, safe='')}-suffix",
+        f"prefix-{encoded_secret.encode().hex()}-suffix",
+        f"prefix-{base64.b64encode(encoded_secret.encode()).decode()}-suffix",
+    )
+    payload = {"nested": {key: "ordinary fixture evidence" for key in keys}}
+
+    _cleaned, findings = redact_operational_secrets_with_findings(
+        payload, settings=settings, include_host_paths=False
+    )
+
+    locations = tuple(item.location for item in findings)
+    assert locations == tuple(f"$.nested[<key#{index}>]" for index in range(len(keys))), (
+        "diagnostic path was not masked"
+    )
+    assert all(
+        secret not in location and encoded_secret not in location for location in locations
+    ), "credential appeared in a path"
+
+
+def test_finding_path_masks_secret_fragments_in_mapping_keys() -> None:
+    secret = "fixture-credential-fragment"
+    payload = {
+        f"prefix-{secret[:8]}-suffix": {
+            "references": ["postgresql://fixture-user@db.invalid:5432/cti"]
+        }
+    }
+
+    _cleaned, findings = redact_operational_secrets_with_findings(
+        payload,
+        settings=SimpleNamespace(operator_api_token=SecretStr(secret)),
+        include_host_paths=False,
+    )
+
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$[<key#0>].references[0]", "dsn")
+    ]
+    assert secret[:8] not in findings[0].location, "credential fragment appeared in path"
+
+
+def test_publication_guard_refuses_configured_credential_in_dictionary_key() -> None:
+    secret = "fixture-key"
+    settings = SimpleNamespace(operator_api_token=SecretStr(secret))
+
+    with pytest.raises(PublicationSecretDetectedError) as exc_info:
+        guard_publication_render_data({secret: "ordinary fixture evidence"}, settings=settings)
+
+    assert exc_info.value.location == "render-data[<key#0>]", "credential key leaked into path"
+    assert secret not in str(exc_info.value), "credential appeared in refusal"
 
 
 def test_pure_secret_guard_uses_only_explicit_values_and_deterministic_patterns(

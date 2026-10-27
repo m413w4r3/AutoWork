@@ -67,10 +67,12 @@ from cti_app.application.investigation_tools import (
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_secret_guard import (
+    JsonPathKey,
     PublicationSecretFinding,
     configured_operational_secret_values,
     contains_operational_secrets,
     redact_operational_secrets_with_findings,
+    safe_json_path,
 )
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
@@ -4629,9 +4631,9 @@ def _contains_encoded_operational_secrets(
     def decoded_fragments(
         item: Any,
         *,
-        path: tuple[str | int, ...] = (),
+        path: tuple[JsonPathKey | int, ...] = (),
         inherited_encoding: str | None = None,
-    ) -> Sequence[tuple[bytes, tuple[str | int, ...]]]:
+    ) -> Sequence[tuple[bytes, tuple[JsonPathKey | int, ...]]]:
         if isinstance(item, bytes | bytearray | memoryview):
             return ((bytes(item), path),)
         if isinstance(item, Mapping):
@@ -4641,11 +4643,13 @@ def _contains_encoded_operational_secrets(
             encoding = (
                 encoding_value.casefold() if isinstance(encoding_value, str) else inherited_encoding
             )
-            found: list[tuple[bytes, tuple[str | int, ...]]] = []
-            for raw_key, child in item.items():
+            found: list[tuple[bytes, tuple[JsonPathKey | int, ...]]] = []
+            for key_index, (raw_key, child) in enumerate(item.items()):
                 found.extend(
                     decoded_fragments(
-                        child, path=(*path, str(raw_key)), inherited_encoding=encoding
+                        child,
+                        path=(*path, JsonPathKey(str(raw_key), key_index)),
+                        inherited_encoding=encoding,
                     )
                 )
             return tuple(found)
@@ -4688,24 +4692,12 @@ def _contains_encoded_operational_secrets(
                 decoded_text, settings=settings, include_host_paths=False
             )
             if matches:
-                location = _encoded_json_path(path)
+                location = safe_json_path(path, settings=settings)
                 findings.extend(
                     PublicationSecretFinding(location, "encoded_credential") for _ in matches
                 )
                 break
     return tuple(findings)
-
-
-def _encoded_json_path(parts: Sequence[str | int]) -> str:
-    path = "$"
-    for part in parts:
-        if isinstance(part, int):
-            path += f"[{part}]"
-        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", part):
-            path += f".{part}"
-        else:
-            path += f"[{json.dumps(part, ensure_ascii=False)}]"
-    return path
 
 
 def _advisor_unit_provenance(

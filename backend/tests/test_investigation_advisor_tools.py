@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
@@ -30,6 +31,7 @@ from cti_app.application.investigation_advisor_tools import (
     MAX_ADVISOR_TOOL_SECONDS,
     InvestigationAdvisorTool,
     _advisor_dossier_opinion_source_refs,
+    _contains_encoded_operational_secrets,
     _marked_secret_field_survives,
     _parse_advisor_output,
     _redact_advisor_payload,
@@ -5055,6 +5057,8 @@ async def test_plan_investigation_accepts_cti_paths_and_generic_url_parameters(m
         "Implant path /application/bin/agent and key path /root/.ssh/authorized_keys; "
         "sample path C:\\Windows\\System32\\drivers\\etc\\hosts; "
         "attacker URL https://evil.example/x?key=abc&token=def; "
+        "attacker OAuth field https://evil.example/x?access_token=jeton-attaquant; "
+        "credential-free reference postgresql://db.invalid:5432/cti; "
         f"GitHub token {attacker_token}."
     )
     transport = Transport(
@@ -5134,6 +5138,34 @@ async def test_dsn_with_password_refuses_with_nested_location_and_type(monkeypat
         {"location": "$.evidence[0].content_excerpts[0].text", "type": "dsn"}
     ]
     assert "fixture-password" not in repr(result.output)
+
+
+def test_encoded_credential_diagnostics_mask_sensitive_mapping_keys() -> None:
+    safe_key_secret = "fixture-key"
+    encoded_key_secret = "fixture/key"
+    settings = SimpleNamespace(
+        operator_api_token=SecretStr(safe_key_secret),
+        operator_client_api_token=SecretStr(encoded_key_secret),
+    )
+    keyed_values = (
+        (safe_key_secret, safe_key_secret.encode()),
+        (encoded_key_secret, encoded_key_secret.encode()),
+        (quote(encoded_key_secret, safe=""), encoded_key_secret.encode()),
+        (encoded_key_secret.encode().hex(), encoded_key_secret.encode()),
+        (base64.b64encode(encoded_key_secret.encode()).decode(), encoded_key_secret.encode()),
+    )
+    payload = {"nested": {key: {"raw_bytes": raw} for key, raw in keyed_values}}
+
+    findings = _contains_encoded_operational_secrets(payload, settings=settings)
+
+    expected = tuple(f"$.nested[<key#{index}>].raw_bytes" for index in range(len(keyed_values)))
+    assert tuple(item.location for item in findings) == expected, (
+        "encoded credential diagnostics exposed a mapping key"
+    )
+    assert all(
+        safe_key_secret not in item.location and encoded_key_secret not in item.location
+        for item in findings
+    ), "credential appeared in an encoded finding path"
 
 
 @pytest.mark.asyncio
