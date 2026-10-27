@@ -919,6 +919,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         artifact_store=artifact_store,
         required_families=("sample_analysis",),
     )
+    settings = confined_worker.settings
     runtime = build_investigation_runtime_composition_factory(
         settings,
         uow_factory=uow_factory,
