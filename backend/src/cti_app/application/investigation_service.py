@@ -1655,20 +1655,11 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                local_download_reuse = (
-                    tool_name == "vt.download_sample"
-                    and await self._verified_local_download_reuse(
-                        current_investigation, external_effect_evidence_refs
-                    )
-                )
                 if not self.external_llm_allowed(
                     snapshot, current_envelope
                 ) or await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
-                    require_external_llm_allowed=(
-                        tool_name != "vt.download_sample" and not local_download_reuse
-                    ),
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
@@ -1853,8 +1844,6 @@ class InvestigationService:
         self,
         investigation: AnalystInvestigation,
         references: tuple[EvidenceReference, ...],
-        *,
-        require_external_llm_allowed: bool = True,
     ) -> bool:
         sample_hashes = {
             reference.id for reference in references if reference.kind == "sample_hash"
@@ -1918,7 +1907,6 @@ class InvestigationService:
                 sample.tlp is TLP.RED
                 or sample.do_not_submit
                 or bool((sample.license_restriction or "").strip())
-                or (require_external_llm_allowed and not sample.external_llm_allowed)
                 for sample in samples
             ):
                 return True
@@ -1938,7 +1926,6 @@ class InvestigationService:
                     or document.tlp is TLP.RED
                     or document.do_not_submit
                     or bool((document.license_restriction or "").strip())
-                    or (require_external_llm_allowed and not document.external_llm_allowed)
                 ):
                     return True
         return False
