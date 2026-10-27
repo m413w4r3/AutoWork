@@ -1710,7 +1710,7 @@ async def test_observation_grounded_vt_read_allows_historical_sample_do_not_subm
 
 
 @pytest.mark.asyncio
-async def test_ungrounded_vt_hash_read_is_refused_before_transport(
+async def test_osint_open_ungrounded_vt_hash_read_is_sent(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
     file_hash = _synthetic_hash()
@@ -1731,12 +1731,14 @@ async def test_ungrounded_vt_hash_read_is_refused_before_transport(
         associate_hashes=False,
     )
     try:
-        assert physical_requests == []
+        # OSINT_OPEN: any valid hash may be read; provenance is the invocation itself.
+        assert len(physical_requests) == 1
         assert result["invocations"]
-        assert result["invocations"][0].status in {
-            ToolInvocationStatus.POLICY_DENIED,
-            ToolInvocationStatus.NEEDS_REVIEW,
-        }
+        assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
+        assert len(result["claims"]) == 1
+        assert any(
+            reference["kind"] == "sample_hash" for reference in result["claims"][0].evidence_refs
+        )
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()

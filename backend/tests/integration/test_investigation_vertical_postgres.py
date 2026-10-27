@@ -1391,14 +1391,16 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             download_source_refs = download_invocation.normalized_parameters[
                 "_vt_external_effect_source_refs"
             ]
-            assert [dict(item) for item in download_source_refs] == [
-                {
-                    "id": candidate_hash,
-                    "kind": "sample_hash",
-                    "sha256": candidate_hash,
-                    "version": "sample-hash.v1",
-                },
-            ]
+            # The download follows an earlier VT report of the same hash: its refs carry the
+            # hash plus the investigation's own observations of it (richer provenance).
+            download_refs = [dict(item) for item in download_source_refs]
+            assert download_refs[0] == {
+                "id": candidate_hash,
+                "kind": "sample_hash",
+                "sha256": candidate_hash,
+                "version": "sample-hash.v1",
+            }
+            assert {item["kind"] for item in download_refs[1:]} <= {"evidence_observation"}
             assert list(pivot_invocation.normalized_parameters["evidence_refs"]) == [
                 str(report_observation.id)
             ]

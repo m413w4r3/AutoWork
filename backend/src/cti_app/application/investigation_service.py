@@ -2005,8 +2005,6 @@ class InvestigationService:
                 version="sample-hash.v1",
                 sha256=normalized_hash,
             )
-            if await self._osint_open_vt_hash_reads_allowed(investigation, envelope):
-                return (hash_reference,)
             associations = (
                 await self._sample_associations.list_for_investigation(investigation.id)
                 if self._sample_associations is not None
@@ -2034,6 +2032,8 @@ class InvestigationService:
                         for item in sorted(matching_observations, key=lambda value: str(value.id))
                     ),
                 )
+            if await self._osint_open_vt_hash_reads_allowed(investigation, envelope):
+                return (hash_reference,)
             return ()
 
         if tool_name == "vt.intelligence_search":
