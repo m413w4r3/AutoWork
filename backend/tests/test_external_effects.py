@@ -59,6 +59,9 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     _ConsumeDenied,
     _family_credentials_match,
 )
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    _source_do_not_submit_blocks as osint_guard_source_do_not_submit_blocks,
+)
 from cti_app.integrations.models import (
     BridgeTransportError,
     HttpResponsesTransport,
@@ -94,6 +97,24 @@ def test_source_do_not_submit_does_not_block_vt_reads_or_downloads(family: str) 
 def test_source_do_not_submit_blocks_external_upload_families(family: str) -> None:
     assert external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize(
+    ("family", "blocks"),
+    [
+        ("vt.download_sample", False),
+        ("bridge.investigation_turn.v1", False),
+        ("advisor.consultation.v1", False),
+        ("other.upload", True),
+    ],
+)
+def test_osint_policy_guard_source_veto_exempts_bridge_like_consume(
+    family: str, blocks: bool
+) -> None:
+    # An acquired sample is stored with do_not_submit; OSINT_OPEN must still
+    # let Bridge cite it while keeping the veto for upload families.
+    assert osint_guard_source_do_not_submit_blocks(family, True) is blocks
+    assert osint_guard_source_do_not_submit_blocks(family, False) is False
 
 
 def _wire(

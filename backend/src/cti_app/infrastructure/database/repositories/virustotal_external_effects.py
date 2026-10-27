@@ -62,6 +62,15 @@ _VT_HASH_READ_FAMILIES = {
     "vt.behaviour_pcap",
     "vt.relationships",
 }
+# Bridge/advisor dossiers exempt themselves from the source veto, as the claim
+# store does at consume (user decision 2026-10-27); TLP RED and licences bind.
+_BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
+
+
+def _source_do_not_submit_blocks(family: str, do_not_submit: bool) -> bool:
+    return external_effect_source_do_not_submit_blocks(
+        family, do_not_submit
+    ) and not family.startswith(_BRIDGE_FAMILY_PREFIXES)
 
 
 def _metadata_source_refs(parameters: Mapping[str, object]) -> tuple[EvidenceReference, ...]:
@@ -449,9 +458,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if {item.id for item in samples} != sample_ids or any(
                 item.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    context.prepared.family, item.do_not_submit
-                )
+                or _source_do_not_submit_blocks(context.prepared.family, item.do_not_submit)
                 or bool((item.license_restriction or "").strip())
                 for item in samples
             ):
@@ -478,9 +485,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if any(
                 item.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    context.prepared.family, item.do_not_submit
-                )
+                or _source_do_not_submit_blocks(context.prepared.family, item.do_not_submit)
                 or bool((item.license_restriction or "").strip())
                 for item in hash_samples
             ):
@@ -498,9 +503,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if {item.id for item in documents} != document_ids or any(
                 item.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    context.prepared.family, item.do_not_submit
-                )
+                or _source_do_not_submit_blocks(context.prepared.family, item.do_not_submit)
                 or bool((item.license_restriction or "").strip())
                 for item in documents
             ):

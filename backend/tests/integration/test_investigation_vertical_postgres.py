@@ -1282,8 +1282,24 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 assert invocation.status.value == operator_results[name]["invocation"]["status"], (
                     tool_diagnostic(name, operator_results[name])
                 )
-            assert report_invocation.normalized_parameters == {"file_hash": _SEED_HASH}
-            assert pivot_invocation.normalized_parameters["evidence_refs"] == [
+            report_parameters = dict(report_invocation.normalized_parameters)
+            report_source_refs = report_parameters.pop("_vt_external_effect_source_refs")
+            assert report_parameters == {"file_hash": _SEED_HASH}
+            assert [dict(item) for item in report_source_refs] == [
+                {
+                    "id": _SEED_HASH,
+                    "kind": "sample_hash",
+                    "sha256": _SEED_HASH,
+                    "version": "sample-hash.v1",
+                },
+                {
+                    "id": str(seeded.seed_observation.id),
+                    "kind": "evidence_observation",
+                    "sha256": seeded.seed_observation.sha256,
+                    "version": str(seeded.seed_observation.source_version),
+                },
+            ]
+            assert list(pivot_invocation.normalized_parameters["evidence_refs"]) == [
                 str(seeded.seed_observation.id)
             ]
 
@@ -1313,17 +1329,17 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert advisor_observation.id in advisor_invocation.response_refs
             assert report_observation.id in report_invocation.response_refs
             assert pivot_observation.id in pivot_invocation.response_refs
-            assert download_invocation.normalized_parameters["evidence_refs"] == [
+            assert list(download_invocation.normalized_parameters["evidence_refs"]) == [
                 str(pivot_observation.id)
             ]
             assert analysis_invocation.normalized_parameters["association_id"] == str(
                 association.id
             )
-            assert analysis_invocation.normalized_parameters["evidence_refs"] == [
+            assert list(analysis_invocation.normalized_parameters["evidence_refs"]) == [
                 str(pivot_observation.id)
             ]
             assert analysis_observation.id in analysis_invocation.response_refs
-            assert advisor_invocation.normalized_parameters["evidence_refs"] == [
+            assert list(advisor_invocation.normalized_parameters["evidence_refs"]) == [
                 str(analysis_observation.id)
             ]
 
@@ -1705,11 +1721,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     ),
                     tuple(
                         sorted(
-                            (
-                                str(item.id),
-                                str(item.claim_id),
-                                str(item.dispatch_attempt_id),
-                            )
+                            (str(item.claim_id), str(item.dispatch_attempt_id))
                             for item in links_now
                         )
                     ),
