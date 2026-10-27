@@ -1976,6 +1976,16 @@ class InvestigationAdvisorTool:
         context: ToolExecutionContext,
         question: str,
     ) -> dict[str, Any]:
+        raw_observation_refs = arguments.get("evidence_refs", ())
+        explicit_observation_ids = (
+            {
+                str(reference)
+                for reference in raw_observation_refs
+                if isinstance(reference, (str, UUID))
+            }
+            if isinstance(raw_observation_refs, (list, tuple))
+            else set()
+        )
         base: dict[str, Any] = {
             "investigation_id": str(investigation_id),
             "consultation_type": consultation_type,
@@ -2399,7 +2409,9 @@ class InvestigationAdvisorTool:
                 (
                     row["content_excerpts"],
                     row["blob_read_verified"],
-                ) = await self._observation_content_projection(item)
+                ) = await self._observation_content_projection(
+                    item, include_unclassified=str(item.id) in explicit_observation_ids
+                )
                 try:
                     measured_rows = await self._measurement_rows(item)
                 except _AdvisorInputValidationError:
@@ -2699,6 +2711,9 @@ class InvestigationAdvisorTool:
                     "finding",
                 }:
                     add(str(reference["kind"]), reference.get("id"))
+        explicit_observation_refs = {
+            identifier for kind, identifier in references if kind == "observation"
+        }
         for observation in evidence:
             add("observation", observation.id)
 
@@ -2750,7 +2765,9 @@ class InvestigationAdvisorTool:
             (
                 row["content_excerpts"],
                 row["blob_read_verified"],
-            ) = await self._observation_content_projection(item)
+            ) = await self._observation_content_projection(
+                item, include_unclassified=item.id in explicit_observation_refs
+            )
             observation_payload.append(row)
 
             try:
@@ -3223,7 +3240,7 @@ class InvestigationAdvisorTool:
         return excerpts
 
     async def _observation_content_projection(
-        self, observation: EvidenceObservation
+        self, observation: EvidenceObservation, *, include_unclassified: bool = False
     ) -> tuple[list[dict[str, str]], bool]:
         """Return extracted facts and whether the canonical blob read verified."""
         try:
@@ -3232,7 +3249,7 @@ class InvestigationAdvisorTool:
             payload = None
         if payload is None:
             return [], False
-        return extract_content_excerpts(payload), True
+        return extract_content_excerpts(payload, include_unclassified=include_unclassified), True
 
     async def _measurement_payload(
         self, observation: EvidenceObservation
