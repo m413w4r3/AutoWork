@@ -919,16 +919,14 @@ async def test_bridge_submission_cannot_omit_restricted_prompt_source_reference(
         ("evidence_observation", "tool_result", None),
         ("evidence_observation", "source_document", None),
         ("sample", None, "sample_red"),
-        ("sample", None, "sample_do_not_submit"),
         ("sample", None, "sample_license"),
         ("source_document", None, "document_red"),
-        ("source_document", None, "document_do_not_submit"),
         ("source_document", None, "document_license"),
         ("sample", None, "envelope_do_not_submit"),
         ("sample", None, "envelope_external_llm_denied"),
     ],
 )
-async def test_bridge_source_rules_keep_do_not_submit_red_and_license_vetoes(
+async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_license_vetoes(
     migrated_postgres_url: str,
     tmp_path: Path,
     reference_kind: str,
@@ -991,7 +989,7 @@ async def test_bridge_source_rules_keep_do_not_submit_red_and_license_vetoes(
                             sample_license_text if restriction == "sample_license" else None
                         ),
                         tlp="RED" if restriction == "sample_red" else "CLEAR",
-                        do_not_submit=restriction == "sample_do_not_submit",
+                        do_not_submit=True,
                         external_llm_allowed=False,
                         origin_kind="manual",
                         state="validated",
@@ -1037,7 +1035,7 @@ async def test_bridge_source_rules_keep_do_not_submit_red_and_license_vetoes(
                             document_license_text if restriction == "document_license" else None
                         ),
                         tlp="RED" if restriction == "document_red" else "CLEAR",
-                        do_not_submit=restriction == "document_do_not_submit",
+                        do_not_submit=True,
                         external_llm_allowed=False,
                         created_at=now,
                     )

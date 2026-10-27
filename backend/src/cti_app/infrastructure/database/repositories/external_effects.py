@@ -1623,8 +1623,11 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 sample.subject_id != subject_id
                 or sample.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    prepared.family, sample.do_not_submit
+                or (
+                    external_effect_source_do_not_submit_blocks(
+                        prepared.family, sample.do_not_submit
+                    )
+                    and not is_bridge_submission
                 )
                 or bool((sample.license_restriction or "").strip())
             ):
@@ -1649,8 +1652,11 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 document.subject_id != subject_id
                 or document.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    prepared.family, document.do_not_submit
+                or (
+                    external_effect_source_do_not_submit_blocks(
+                        prepared.family, document.do_not_submit
+                    )
+                    and not is_bridge_submission
                 )
                 or bool(document.license_restriction)
             ):
