@@ -60,10 +60,14 @@ Gates `main@a506f481` (parent, recette D4) : lint OK ; test-backend 5143 passed 
 - D4 (env, non code) : 5 tests Typst réels échouent sans la recette du
   binaire épinglé (`TYPST_BINARY`, `FONT_BUNDLE_ROOT`, `TMPDIR`) ; verts avec.
 
-- D6 (hors périmètre, décision utilisateur) : le claim store (`repositories/external_effects.py` ~1622-1670, commit `15b36abe`) ne contrôle pas `external_llm_allowed` des samples et l'ignore pour les documents Bridge, y compris sous HUMAN_G2. Sous OSINT_POLICY le guard le contrôle désormais. Non bloquant pour le run.
+- D6 (**observation documentée, non bloquante — décision utilisateur 2026-10-27 : pas de veto `external_llm_allowed` supplémentaire au point d'envoi Bridge, aucune campagne de correction**) : le claim store (`repositories/external_effects.py` ~1622-1670, commit `15b36abe`) ne contrôle pas `external_llm_allowed` des samples et l'ignore pour les documents Bridge, y compris sous HUMAN_G2. Sous OSINT_POLICY le guard le contrôle désormais. Non bloquant pour le run.
 - R1 (risque run) : un dossier Bridge citant une observation `sha256` de hash **non associé** à l'investigation (pivot VT non téléchargé) est refusé au consume (`evidence_observation_not_associated_with_investigation`, préexistant). Citer l'observation VT du rapport/pivot (type fichier) ou télécharger d'abord.
 - R2 : 3 tests `test_confined_analysis_dispatch` (capa/MWCP) échouent localement hors `make` (identiques sur main) ; verts via `make test-backend`.
 
 ## Prochaines actions
 
-1. Phase A close. Phase B : autorisation opérateur présentée le 2026-10-27 (push ; migration live `0002→0005` via `make up` ; jeton opérateur + OSINT_OPEN `tool_seconds` ≥ 86 400 ; smokes VT/Bridge ciblés ; nouveau production_run ; investigation). **Non accordée à ce jour** : ne rien exécuter sur le live sans réponse explicite.
+- **B1 FAIT** : `main@22d03e22` poussé (diff vérifié : aucun secret, chemins backend/src, backend/tests, docs/mission07), CI #40556064348 verte (backend, frontend, compose, typst, W10+J2).
+- Le label `org.opencontainers.image.revision=ea456083…` est celui de l'**image de base uv**, pas d'AutoWork. Contrôle du SHA déployé = manifeste SHA-256 des `.py` de `/app/src/cti_app` dans le conteneur == `git ls-files backend/src/cti_app` à `22d03e22` (aujourd'hui : live ≠, 55 fichiers diffèrent, `api/osint_policy.py` absent).
+- `make smoke-live` (plan `89b7b4c2…`) inclut Shodan ⇒ exclu. `preflight-supervised-first-run-stack` exige d'attester la base jetable ⇒ **interdit sur le live**.
+- Jeton opérateur : jamais en conversation ; appels API opérateur exécutés **dans le conteneur backend** (`docker exec … python`) lisant `OPERATOR_API_TOKEN` de l'environnement du processus, sans l'imprimer.
+- B2–B6 : plan présenté le 2026-10-27, **mandat global non accordé à ce jour**.
