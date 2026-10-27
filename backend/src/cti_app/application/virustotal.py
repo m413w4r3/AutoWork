@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Protocol
 
+from cti_app.application.external_effects import FrameworkNoSendProof
 from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJob,
@@ -190,6 +191,16 @@ class VirusTotalError(RuntimeError):
 
 class VirusTotalExternalEffectRefusedError(VirusTotalError):
     code = "virustotal_external_effect_refused"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        framework_no_send_proof: FrameworkNoSendProof | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.framework_no_send_proof = framework_no_send_proof
 
 
 class VirusTotalExternalEffectNeedsReviewError(VirusTotalExternalEffectRefusedError):

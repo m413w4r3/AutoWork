@@ -1132,6 +1132,33 @@ def test_invocation_reconciliation_route_uses_verified_actor_cas_and_idempotency
     ]
 
 
+def test_invocation_reconciliation_rejects_operator_client_identity() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:agent-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    client, store = _client()
+    client.app.state.identity_provider = OperatorIdentityProvider()
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/invocations/{uuid4()}/reconcile",
+        json={
+            "expected_version": 3,
+            "outcome": "not_executed",
+            "reason": "The operator client cannot make the reconciliation decision.",
+            "response_refs": [],
+        },
+        headers={"Idempotency-Key": "operator-client-reconcile-denied"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "verified_human_operator_required"
+    assert store.reconciliations == []
+
+
 def test_targeted_request_is_idempotent_and_requeues_a_paused_investigation() -> None:
     client, store = _client()
     started = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=_start_body())

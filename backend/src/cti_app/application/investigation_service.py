@@ -573,6 +573,18 @@ class InvestigationService:
                 continue
             resolved = invocation.resolve_pre_submission_failure()
             await self._invocations.update_if_version(resolved, expected_version=invocation.version)
+            await self._complete_tool_reservation(
+                investigation_id=invocation.investigation_id,
+                operation_key=invocation.operation_key,
+                result=ToolResult(
+                    status=ToolInvocationStatus.FAILED,
+                    error_code=proof.value,
+                    framework_pre_submission_proof=proof,
+                ),
+                reserved_amounts=invocation.reserved_budget,
+                uncertain=False,
+                external_effect=True,
+            )
             proof_resolved = True
         if proof_resolved:
             await self._commit_current_uow()
@@ -625,6 +637,11 @@ class InvestigationService:
         envelope = await self._envelopes.get(invocation.investigation_id)
         if envelope is None:
             return None, None
+        if len(invocation.response_refs) != 1:
+            return (
+                None,
+                "framework_proof_reference_count_mismatch" if invocation.response_refs else None,
+            )
         reservation = next(
             (
                 item
@@ -635,7 +652,8 @@ class InvestigationService:
         )
         if (
             reservation is None
-            or reservation.status is not BudgetReservationStatus.RELEASED
+            or reservation.status
+            not in {BudgetReservationStatus.RELEASED, BudgetReservationStatus.RESERVED}
             or dict(reservation.amounts) != dict(invocation.reserved_budget)
         ):
             return None, None
@@ -654,7 +672,14 @@ class InvestigationService:
             try:
                 proof = FrameworkPreSubmissionProof(observation.object_type)
             except ValueError:
-                continue
+                if (
+                    observation.object_type not in {"tool_call", "tool_result"}
+                    or invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
+                    or invocation.consumed_budget
+                    or len(invocation.response_refs) != 1
+                ):
+                    continue
+                proof = FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
             rejection = await self._verify_framework_pre_submission_proof(
                 invocation, observation, proof
             )
@@ -726,17 +751,49 @@ class InvestigationService:
         if canonical_payload != raw:
             return "framework_proof_payload_not_canonical"
         result = payload.get("result")
-        proof_payload = (
-            result.get("framework_pre_submission_proof") if isinstance(result, dict) else None
-        )
         if (
             payload.get("schema") != "investigation-tool-observation.v1"
             or payload.get("tool_name") != invocation.tool_name
             or payload.get("schema_version") != invocation.schema_version
             or payload.get("operation_key") != invocation.operation_key
-            or not isinstance(proof_payload, dict)
-            or proof_payload != {"object_type": observation.object_type}
-            or observation.object_type != proof.value
+            or not isinstance(result, dict)
+        ):
+            return "framework_proof_payload_mismatch"
+        if observation.object_type == proof.value:
+            proof_payload = result.get("framework_pre_submission_proof")
+            if not isinstance(proof_payload, dict) or proof_payload != {
+                "object_type": observation.object_type
+            }:
+                return "framework_proof_payload_mismatch"
+            return None
+
+        legacy_refusal_codes = {
+            "virustotal_external_effect_refused_source_references_mismatch",
+            "vt_refused_source_references_mismatch",
+        }
+        legacy_refusal_code = next(
+            (
+                value
+                for value in (
+                    result.get("error_code"),
+                    result.get("refusal_reason"),
+                    result.get("reason"),
+                )
+                if isinstance(value, str)
+            ),
+            None,
+        )
+        if (
+            proof is not FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            or observation.object_type not in {"tool_call", "tool_result"}
+            or not invocation.tool_name.startswith("vt.")
+            or result.get("status") != ToolInvocationStatus.NEEDS_REVIEW.value
+            or result.get("outcome") != "external_effect_unconfirmed"
+            or result.get("adapter_output_archived") is not False
+            or result.get("external_effect_claim_id") is not None
+            or result.get("claim_id") is not None
+            or legacy_refusal_code not in legacy_refusal_codes
+            or "framework_pre_submission_proof" in result
         ):
             return "framework_proof_payload_mismatch"
         return None

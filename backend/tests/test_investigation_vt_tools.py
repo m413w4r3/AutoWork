@@ -21,6 +21,7 @@ from cti_app.application.article_novelty import (
 )
 from cti_app.application.bridge_investigator import BridgeInvestigator, ScriptedTurnTransport
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+from cti_app.application.external_effects import FrameworkNoSendProof
 from cti_app.application.investigation_contracts import ArticleClaimV1, ArticleContextV1
 from cti_app.application.investigation_persistence import (
     InMemoryAnalystOpinionRepository,
@@ -55,6 +56,7 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalDownloadResult,
     VirusTotalExternalEffectNeedsReviewError,
+    VirusTotalExternalEffectRefusedError,
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalHttpError,
@@ -68,6 +70,7 @@ from cti_app.application.virustotal import (
     VirusTotalRoutingPolicy,
     VirusTotalSearchResult,
     VirusTotalTransportError,
+    record_virustotal_external_effect,
     validate_search_query,
 )
 from cti_app.domain.analyst_opinion import (
@@ -82,6 +85,7 @@ from cti_app.domain.investigation import (
     EvidenceKind,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     SampleAssociation,
@@ -801,6 +805,56 @@ async def test_disclosure_bounds_deny_external_vt_without_a_call(
     result = await _dispatch(tools, "vt.file_report", {"file_hash": _SEED_HASH})
     assert result.status is ToolInvocationStatus.POLICY_DENIED
     assert tools.vt.calls["file_report"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "reason_code", "expected_status"),
+    (
+        ("PRE_CONSUME", "source_references_mismatch", ToolInvocationStatus.POLICY_DENIED),
+        ("PREPARATION", "invalid_prepared_effect", ToolInvocationStatus.FAILED),
+    ),
+)
+async def test_framework_presend_refusal_is_terminal_and_carries_no_send_proof(
+    stage: str,
+    reason_code: str,
+    expected_status: ToolInvocationStatus,
+) -> None:
+    tools = _tool_set()
+    tools.vt.errors["file_report"] = VirusTotalExternalEffectRefusedError(
+        "The coordinator refused before consume.",
+        code=f"virustotal_external_effect_refused_{reason_code}",
+        framework_no_send_proof=FrameworkNoSendProof(stage, reason_code),
+    )
+
+    result = await _dispatch(tools, "vt.file_report", {"file_hash": _SEED_HASH})
+
+    assert result.status is expected_status
+    assert result.framework_pre_submission_proof is (
+        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+    assert result.error_code == f"virustotal_external_effect_refused_{reason_code}"
+    assert result.output["reason"] == "external_effect_refused"
+    assert tools.vt.calls["file_report"] == 1
+
+
+@pytest.mark.asyncio
+async def test_presend_refusal_after_prior_send_does_not_attest_whole_tool_nonexecution() -> None:
+    tools = _tool_set()
+    refusal = VirusTotalExternalEffectRefusedError(
+        "The coordinator refused before consume.",
+        framework_no_send_proof=FrameworkNoSendProof("PRE_CONSUME", "source_references_mismatch"),
+    )
+
+    async def send_then_refuse(_file_hash: str) -> VirusTotalFileReport:
+        record_virustotal_external_effect(reused=False)
+        raise refusal
+
+    tools.vt.file_report = send_then_refuse
+    result = await _dispatch(tools, "vt.file_report", {"file_hash": _SEED_HASH})
+
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.framework_pre_submission_proof is None
 
 
 @pytest.mark.asyncio

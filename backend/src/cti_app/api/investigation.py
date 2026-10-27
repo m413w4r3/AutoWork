@@ -4066,7 +4066,7 @@ async def reconcile_investigation_invocation(
 ) -> InvocationReconciliationResponse:
     from cti_app.application.investigation_service import InvocationReconciliationOutcome
 
-    identity = await _identity(request)
+    identity = await _require_verified_human_operator(request)
     async with _uow_factory(request)() as uow:
         try:
             composition = _composition_factory(request).build(uow, investigation_id)

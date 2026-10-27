@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
+from cti_app.application.external_effects import FrameworkNoSendProof
 from cti_app.application.investigation_persistence import (
     EvidenceObservationRepository,
     FindingRepository,
@@ -36,6 +37,7 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolRegistry,
     ToolResult,
+    _authorize_framework_refusal_proof_adapter,
 )
 from cti_app.application.research_context_builder import ArticleSnapshot
 from cti_app.application.virustotal import (
@@ -66,6 +68,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
     EvidenceObservation,
+    FrameworkPreSubmissionProof,
     InvestigationEnvelope,
     TLPLevel,
     ToolInvocationStatus,
@@ -524,12 +527,36 @@ class _VirusTotalAdapter:
                     error_code=_safe_external_effect_error_code(exc),
                 )
             except VirusTotalExternalEffectRefusedError as exc:
+                framework_no_send_proof = getattr(exc, "framework_no_send_proof", None)
+                external_effect_counts = virustotal_external_effect_counts()
+                pre_send_reason = (
+                    framework_no_send_proof.reason_code
+                    if (
+                        isinstance(framework_no_send_proof, FrameworkNoSendProof)
+                        and framework_no_send_proof.kind in {"PREPARATION", "PRE_CONSUME"}
+                    )
+                    else None
+                )
+                proven_pre_send_refusal = False
+                refusal_status = ToolInvocationStatus.NEEDS_REVIEW
+                if (
+                    pre_send_reason is not None
+                    and external_effect_counts is not None
+                    and not any(external_effect_counts)
+                ):
+                    proven_pre_send_refusal = True
+                    refusal_status = _pre_send_refusal_status(pre_send_reason)
                 return self._result(
                     state,
-                    ToolInvocationStatus.NEEDS_REVIEW,
+                    refusal_status,
                     reason="external_effect_refused",
                     message="The VirusTotal request was refused before a new send.",
                     error_code=_safe_external_effect_error_code(exc),
+                    framework_pre_submission_proof=(
+                        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+                        if proven_pre_send_refusal
+                        else None
+                    ),
                 )
             except VirusTotalInvalidInputError:
                 return self._result(
@@ -705,6 +732,7 @@ class _VirusTotalAdapter:
         reason: str | None = None,
         message: str = "",
         error_code: str | None = None,
+        framework_pre_submission_proof: FrameworkPreSubmissionProof | None = None,
         extra: Mapping[str, Any] | None = None,
         zero_cost: bool = False,
     ) -> ToolResult:
@@ -752,6 +780,7 @@ class _VirusTotalAdapter:
             output=output,
             message=message,
             error_code=error_code,
+            framework_pre_submission_proof=framework_pre_submission_proof,
         )
 
     def _alternatives(self, state: _ExecutionState) -> tuple[str, ...]:
@@ -1767,6 +1796,7 @@ def register_virustotal_tools(
             ),
         )
     for name, schema, adapter, reserved_units in adapters:
+        _authorize_framework_refusal_proof_adapter(adapter)
         capability_key = _CAPABILITY_NAMES[name]
         registry.register(
             ToolDefinition(
@@ -1819,6 +1849,26 @@ def _safe_external_effect_error_code(error: Exception) -> str:
     if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,80}", code):
         return code
     return "virustotal_external_effect_refused"
+
+
+def _pre_send_refusal_status(reason_code: str) -> ToolInvocationStatus:
+    if reason_code in {
+        "acquisition_not_allowed",
+        "do_not_submit",
+        "evidence_observation_not_associated_with_investigation",
+        "external_llm_not_allowed",
+        "provider_not_allowed",
+        "sample_hash_not_associated_with_investigation",
+        "sample_not_associated_with_investigation",
+        "sample_source_restricted",
+        "source_document_external_llm_not_allowed",
+        "source_references_mismatch",
+        "source_observation_restricted",
+        "tlp_red",
+        "vt_source_disclosure_denied",
+    }:
+        return ToolInvocationStatus.POLICY_DENIED
+    return ToolInvocationStatus.FAILED
 
 
 def _normalize_dork(value: str) -> str:
