@@ -56,7 +56,7 @@ harnais worker) dans ce scénario ; puis audit adversarial et mise à jour de
 55432, Typst épinglé).** `make lint-backend` OK ; `make typecheck-backend` 843
 OK ; `make test-backend` 5125 passed/2 skipped ; `make test-integration` 448
 passed (dont `test_migrations` head→0004→head) ; workflow FAST 22/22, FULL
-32/32 ; `make test-ci-scripts` OK ; J2 : voir verdict `LOCAL_TEST_GATES`.
+32/32 ; `make test-ci-scripts` OK ; J2 navigateur passed.
 Frontend non lancé (aucun chemin UI modifié). CI GitHub `40407103494`
 (`111494d3`) : **success** (tous jobs).
 
@@ -78,7 +78,7 @@ E2E_OSINT_CONTINUOUS        : BLOCKED (lot C, repro ci-dessus)
 AUDIT_DECISION_CHAIN        : PARTIAL (audit adversarial non relancé)
 MIGRATION_CHAIN             : PASS (0001→0005 sur base jetable ; live en 0002)
 CI_LATEST                   : PASS pour 111494d3 ; main local 05ec9d62 non poussé
-LOCAL_TEST_GATES            : PASS (J2 : voir rapport final)
+LOCAL_TEST_GATES            : PASS (J2 navigateur passed sur 05ec9d62)
 ANALYSIS_WORKER_READINESS   : PASS sonde live (confiné, outils présents) ; Ghidra healthy
 REAL_RUN_TECHNICAL_GO       : NO_GO
 REAL_RUN_OPERATIONAL_GO     : NO_GO
