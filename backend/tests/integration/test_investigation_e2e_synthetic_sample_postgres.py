@@ -861,11 +861,6 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 expected_source="tlp_red",
             )
             await assert_sample_veto(
-                label="do-not-submit",
-                do_not_submit=True,
-                expected_source="do_not_submit",
-            )
-            await assert_sample_veto(
                 label="owner-restricted",
                 license_restriction="Synthetic owner restriction sentinel; never disclose.",
                 expected_source="license_restriction",

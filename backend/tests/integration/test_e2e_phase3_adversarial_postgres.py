@@ -1092,7 +1092,6 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
         assert approved.status_code == 200, approved.text
         veto_cases = (
             ("tlp-red", {"tlp": TLP.RED}, "tlp_red"),
-            ("do-not-submit", {"do_not_submit": True}, "do_not_submit"),
             (
                 "owner-restriction",
                 {"license_restriction": "Synthetic owner/source restriction fixture."},

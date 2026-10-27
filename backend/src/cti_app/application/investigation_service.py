@@ -396,7 +396,12 @@ class InvestigationService:
     def bridge_disclosure_allowed(
         snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
     ) -> bool:
-        return InvestigationService._external_tlp_allowed(snapshot, envelope)
+        if not InvestigationService._external_tlp_allowed(snapshot, envelope):
+            return False
+        assert envelope is not None
+        return bool(
+            envelope.disclosure.external_llm_allowed and not envelope.disclosure.do_not_submit
+        )
 
     @staticmethod
     def unapproved_budget_for(investigation: AnalystInvestigation) -> InvestigationBudget:

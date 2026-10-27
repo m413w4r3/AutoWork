@@ -4522,8 +4522,17 @@ def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["external_llm_allowed", "do_not_submit", "tlp_red"])
-async def test_bridge_egress_ignores_submission_flags_but_enforces_red(policy) -> None:
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "source_external_disabled",
+        "source_do_not_submit",
+        "envelope_external_disabled",
+        "envelope_do_not_submit",
+        "tlp_red",
+    ],
+)
+async def test_bridge_source_flags_are_permissive_but_envelope_policy_is_enforced(policy) -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
@@ -4543,8 +4552,11 @@ async def test_bridge_egress_ignores_submission_flags_but_enforces_red(policy) -
     context = make_context(investigation_id)
     envelope = context.envelope
     assert envelope is not None
-    if policy == "external_llm_allowed":
+    if policy == "source_external_disabled":
         snapshot.external_llm_allowed = False
+    elif policy == "source_do_not_submit":
+        snapshot.do_not_submit = True
+    elif policy == "envelope_external_disabled":
         context = replace(
             context,
             envelope=replace(
@@ -4556,8 +4568,7 @@ async def test_bridge_egress_ignores_submission_flags_but_enforces_red(policy) -
                 ),
             ),
         )
-    elif policy == "do_not_submit":
-        snapshot.do_not_submit = True
+    elif policy == "envelope_do_not_submit":
         context = replace(
             context,
             envelope=replace(
@@ -4579,7 +4590,7 @@ async def test_bridge_egress_ignores_submission_flags_but_enforces_red(policy) -
         context,
     )
 
-    if policy == "tlp_red":
+    if policy in {"envelope_external_disabled", "envelope_do_not_submit", "tlp_red"}:
         assert result.status is ToolInvocationStatus.POLICY_DENIED
         assert result.error_code == "POLICY_DENIED"
         assert result.output["advisor_status"] == "policy_denied"

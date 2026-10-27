@@ -3891,7 +3891,7 @@ async def test_claim_verification_requires_non_claim_source_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bridge_submits_when_external_permission_flags_are_false() -> None:
+async def test_bridge_submits_when_source_permission_flags_are_false() -> None:
     fixture = _Fixture(
         responses=[_decision(goal="finish", next_action="finish")],
         tools=(),
@@ -3899,14 +3899,6 @@ async def test_bridge_submits_when_external_permission_flags_are_false() -> None
     )
     fixture.snapshot = replace(fixture.snapshot, do_not_submit=True)
     fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
-    fixture.envelope = replace(
-        fixture.envelope,
-        disclosure=DisclosureBounds(
-            tlp=TLPLevel.GREEN,
-            do_not_submit=True,
-            external_llm_allowed=False,
-        ),
-    )
     state = await fixture.start()
 
     result = await fixture.service.run(state.investigation_id)
@@ -3914,6 +3906,24 @@ async def test_bridge_submits_when_external_permission_flags_are_false() -> None
     assert result.stop_reason is StopReason.AGENT_FINISHED
     assert fixture.bridge_transport.attempt_count == 1
     assert fixture.bridge_transport.submission_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["external_llm_allowed", "do_not_submit"])
+async def test_bridge_does_not_submit_when_envelope_disclosure_denies(policy: str) -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="finish", next_action="finish")],
+        tools=(),
+    )
+    disclosure = replace(fixture.envelope.disclosure, **{policy: policy == "do_not_submit"})
+    fixture.envelope = replace(fixture.envelope, disclosure=disclosure)
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.MODEL_UNAVAILABLE
+    assert fixture.bridge_transport.attempt_count == 0
+    assert fixture.bridge_transport.submission_count == 0
 
 
 @pytest.mark.asyncio
