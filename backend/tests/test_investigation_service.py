@@ -3298,6 +3298,7 @@ async def test_framework_budget_refusal_resumes_after_budget_extension_without_d
         ("payload_version_mismatch", "framework_proof_payload_mismatch"),
         ("payload_operation_mismatch", "framework_proof_payload_mismatch"),
         ("proof_object_mismatch", "framework_proof_payload_mismatch"),
+        ("additional_response_ref", "framework_proof_reference_count_mismatch"),
     ),
 )
 @pytest.mark.asyncio
@@ -3328,10 +3329,20 @@ async def test_framework_budget_refusal_stays_blocked_when_proof_blob_is_invalid
     assert fixture.tools["vt.search"].calls == []
 
     refusal = (await fixture.invocations.list_for_investigation(state.investigation_id))[0]
+    if corruption == "additional_response_ref":
+        refusal = await fixture.invocations.update_if_version(
+            refusal.transition(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                response_refs=(*refusal.response_refs, uuid4()),
+            ),
+            expected_version=refusal.version,
+        )
     proof_observation = await fixture.observations.get(refusal.response_refs[0])
     assert proof_observation is not None
     assert proof_observation.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
-    if corruption == "tampered_bytes":
+    if corruption == "additional_response_ref":
+        pass
+    elif corruption == "tampered_bytes":
         stored = fixture.proof_artifacts.blobs[proof_observation.blob_id]
         fixture.proof_artifacts.blobs[proof_observation.blob_id] = (
             bytes((stored[0] ^ 1,)) + stored[1:]

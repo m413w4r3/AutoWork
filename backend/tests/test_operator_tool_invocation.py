@@ -41,7 +41,10 @@ from cti_app.application.investigation_experiments import (
     InMemoryInvestigationExperimentRepository,
     register_operator_experiment_tools,
 )
-from cti_app.application.investigation_tools import ToolResult
+from cti_app.application.investigation_tools import (
+    ToolResult,
+    _authorize_framework_refusal_proof_adapter,
+)
 from cti_app.application.operator_advisor_guidance import build_advisor_guidance
 from cti_app.application.operator_context_summary import InvestigationOperatorContextSummaryV1
 from cti_app.application.operator_tool_invocation import (
@@ -55,6 +58,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
     EvidenceObservation,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -1406,6 +1410,223 @@ async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() ->
             idempotency_key=f"{idempotency_key}-fresh",
         )
     assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_persisted_presend_refusal_does_not_block_equivalent_fresh_key_retry() -> None:
+    fixture, state, _ = await _fixture()
+    arguments = {"query": "source reference retry"}
+    purpose = "Retry after a recorded pre-consume refusal."
+    operation_key = "operator:legacy-presend-refusal"
+    reserved = {BudgetDimension.VT_UNITS: 1}
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+
+    payload = canonical_json_bytes(
+        {
+            "schema": "investigation-tool-observation.v1",
+            "tool_name": "vt.file_report",
+            "schema_version": "1",
+            "operation_key": operation_key,
+            "result": {
+                "status": "needs_review",
+                "outcome": "external_effect_unconfirmed",
+                "adapter_output_archived": False,
+                "external_effect_claim_id": None,
+                "error_code": ("virustotal_external_effect_refused_source_references_mismatch"),
+            },
+        }
+    )
+    invocation_id = uuid4()
+    blob_id = uuid4()
+    fixture.proof_artifacts.store(blob_id, payload)
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="tool_call",
+        object_id=operation_key,
+        invocation_ref=invocation_id,
+    )
+    await fixture.observations.append_if_absent(observation)
+    prior = (
+        ToolInvocation(
+            investigation_id=fixture.investigation_id,
+            operation_key=operation_key,
+            tool_name="vt.file_report",
+            schema_version="1",
+            normalized_parameters=arguments,
+            purpose=purpose,
+            reserved_budget=reserved,
+            response_refs=(observation.id,),
+            id=invocation_id,
+        )
+        .transition(ToolInvocationStatus.RUNNING)
+        .transition(ToolInvocationStatus.NEEDS_REVIEW)
+    )
+    await fixture.invocations.add_if_absent(prior)
+
+    service = _service(
+        fixture,
+        observations=fixture.observations,
+        evidence_summaries=fixture.proof_artifacts,
+    )
+    await fixture.service.resume(state.investigation_id)
+
+    resolved_before_retry = await fixture.invocations.get(prior.id)
+    released_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    released_reservation = next(
+        item
+        for item in released_envelope.budget.reservations
+        if item.operation_key == operation_key
+    )
+    assert resolved_before_retry is not None
+    assert resolved_before_retry.status is ToolInvocationStatus.FAILED
+    assert released_reservation.status.value == "released"
+
+    retried = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments=arguments,
+        purpose=purpose,
+        expected_version=state.version,
+        idempotency_key="fresh-presend-refusal-retry",
+    )
+
+    resolved = await fixture.invocations.get(prior.id)
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert retried.invocation.id != prior.id
+    assert retried.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert resolved is not None
+    assert resolved.status is ToolInvocationStatus.FAILED
+    assert reservation.status.value == "released"
+    assert fixture.tools["vt.file_report"].calls == [arguments]
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_external_result_still_blocks_equivalent_fresh_key_retry() -> None:
+    fixture, state, service = await _fixture()
+    arguments = {"query": "ambiguous external effect"}
+    fixture.tools["vt.file_report"].result = ToolResult(
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        output={"outcome": "external_effect_unconfirmed", "adapter_output_archived": False},
+    )
+
+    first = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments=arguments,
+        purpose="Perform the possibly handed-off read.",
+        expected_version=state.version,
+        idempotency_key="ambiguous-first-attempt",
+    )
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments=arguments,
+            purpose="Perform the possibly handed-off read.",
+            expected_version=first.working_state_version,
+            idempotency_key="ambiguous-fresh-key",
+        )
+
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+    assert fixture.tools["vt.file_report"].calls == [arguments]
+
+
+@pytest.mark.asyncio
+async def test_proven_presend_refusal_releases_budget_and_allows_new_invocation() -> None:
+    fixture, state, service = await _fixture()
+    arguments = {"query": "typed pre-consume refusal"}
+    purpose = "Retry after the coordinator refused before consume."
+    fixture.tools["vt.file_report"].result = ToolResult(
+        status=ToolInvocationStatus.POLICY_DENIED,
+        output={"reason": "external_effect_refused"},
+        error_code="virustotal_external_effect_refused_source_references_mismatch",
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    _authorize_framework_refusal_proof_adapter(fixture.tools["vt.file_report"])
+
+    first = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments=arguments,
+        purpose=purpose,
+        expected_version=state.version,
+        idempotency_key="typed-presend-refusal-first",
+    )
+
+    first_reservation = next(
+        item
+        for item in (await fixture.envelopes.get(fixture.investigation_id)).budget.reservations
+        if item.operation_key == first.invocation.operation_key
+    )
+    assert first.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert first_reservation.status.value == "released"
+    fixture.tools["vt.file_report"].result = None
+
+    retry = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments=arguments,
+        purpose=purpose,
+        expected_version=first.working_state_version,
+        idempotency_key="typed-presend-refusal-retry",
+    )
+
+    assert retry.invocation.id != first.invocation.id
+    assert retry.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert fixture.tools["vt.file_report"].calls == [arguments, arguments]
+
+
+@pytest.mark.asyncio
+async def test_unregistered_vt_adapter_cannot_claim_coordinator_refusal_proof() -> None:
+    fixture, state, service = await _fixture()
+    arguments = {"query": "untrusted adapter proof"}
+    fixture.tools["vt.file_report"].result = ToolResult(
+        status=ToolInvocationStatus.POLICY_DENIED,
+        error_code="virustotal_external_effect_refused_source_references_mismatch",
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+
+    first = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments=arguments,
+        purpose="An untrusted adapter cannot prove non-submission.",
+        expected_version=state.version,
+        idempotency_key="untrusted-vt-proof-first",
+    )
+
+    assert first.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments=arguments,
+            purpose="An untrusted adapter cannot prove non-submission.",
+            expected_version=first.working_state_version,
+            idempotency_key="untrusted-vt-proof-retry",
+        )
+
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+    assert fixture.tools["vt.file_report"].calls == [arguments]
 
 
 class _IdentityProvider:

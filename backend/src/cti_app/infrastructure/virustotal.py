@@ -2100,6 +2100,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             raise VirusTotalExternalEffectRefusedError(
                 "The coordinator refused the VirusTotal request before a new send.",
                 code=refusal_code,
+                framework_no_send_proof=(
+                    outcome.framework_no_send_proof if isinstance(outcome, Refused) else None
+                ),
             )
         raise VirusTotalExternalEffectNeedsReviewError(
             "The coordinator returned an unknown VirusTotal outcome."
@@ -2216,6 +2219,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 raise VirusTotalExternalEffectRefusedError(
                     "The coordinator refused the VirusTotal download before a new send.",
                     code=code,
+                    framework_no_send_proof=(
+                        outcome.framework_no_send_proof if isinstance(outcome, Refused) else None
+                    ),
                 )
             if isinstance(outcome, Ambiguous):
                 stream_failure = transport_adapter.take_stream_read_failure()

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID
+from weakref import WeakSet
 
 from pydantic import (
     ConfigDict,
@@ -347,6 +348,14 @@ class ToolAdapter(Protocol):
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult: ...
+
+
+_FRAMEWORK_REFUSAL_PROOF_ADAPTERS: WeakSet[object] = WeakSet()
+
+
+def _authorize_framework_refusal_proof_adapter(adapter: ToolAdapter) -> None:
+    """Allow an explicitly trusted built-in adapter to return coordinator refusal proof."""
+    _FRAMEWORK_REFUSAL_PROOF_ADAPTERS.add(adapter)
 
 
 def tool_operation_cache_identity(adapter: ToolAdapter) -> Mapping[str, Any] | None:
@@ -823,9 +832,27 @@ class RegistryToolDispatcher:
             )
             self._completed[operation_key] = (identity, result)
             return result
-        # Adapters may return arbitrary ToolResult fields. Only the dispatcher
-        # can attest that it refused before adapter entry.
-        result = replace(result, framework_pre_submission_proof=None)
+        # Adapters may return arbitrary ToolResult fields. Preserve only the
+        # typed coordinator refusal emitted by the built-in VT tools; every
+        # other proof must come from a dispatcher-owned pre-adapter check.
+        coordinator_refusal_proof = (
+            result.framework_pre_submission_proof
+            if (
+                adapter in _FRAMEWORK_REFUSAL_PROOF_ADAPTERS
+                and definition.name.startswith("vt.")
+                and definition.effect
+                in {
+                    ToolEffect.EXTERNAL_READ,
+                    ToolEffect.ACQUIRE,
+                    ToolEffect.EXTERNAL_ACTIVE,
+                    ToolEffect.EXTERNAL_SUBMIT,
+                }
+                and result.framework_pre_submission_proof
+                is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            )
+            else None
+        )
+        result = replace(result, framework_pre_submission_proof=coordinator_refusal_proof)
         try:
             consumed = result.budget_consumed or reserved_amounts
             context.budget.commit(operation_key, consumed)

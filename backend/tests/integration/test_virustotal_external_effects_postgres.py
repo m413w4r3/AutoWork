@@ -1479,7 +1479,7 @@ async def test_osint_open_claim_ceiling_refuses_a_distinct_vt_effect_before_send
         assert len(result["claims"]) == 1
         assert [item.status for item in result["invocations"]] == [
             ToolInvocationStatus.SUCCEEDED,
-            ToolInvocationStatus.NEEDS_REVIEW,
+            ToolInvocationStatus.FAILED,
         ]
         assert result["human_decisions"] == []
     finally:
@@ -1531,6 +1531,7 @@ async def test_tlp_red_sample_vt_read_is_refused_before_transport(
         assert result["invocations"]
         assert result["invocations"][0].status in {
             ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.FAILED,
             ToolInvocationStatus.NEEDS_REVIEW,
         }
         if not bypass_legacy_guard:
@@ -1599,6 +1600,7 @@ async def test_vt_file_report_ignores_sample_flags_but_keeps_tlp_veto(
             assert result["invocations"]
             assert result["invocations"][0].status in {
                 ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.FAILED,
                 ToolInvocationStatus.NEEDS_REVIEW,
             }
     finally:
@@ -1813,6 +1815,7 @@ async def test_source_document_vt_read_keeps_tlp_license_veto_but_ignores_do_not
         else:
             assert result["invocations"][0].status in {
                 ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.FAILED,
                 ToolInvocationStatus.NEEDS_REVIEW,
             }
             assert result["claims"] == []

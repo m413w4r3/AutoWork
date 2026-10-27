@@ -1119,6 +1119,8 @@ async def test_refusal_mints_no_permit_and_never_sends() -> None:
     outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, Refused)
     assert outcome.reason == "provider_not_allowed"
+    assert outcome.framework_no_send_proof.kind == "PRE_CONSUME"
+    assert outcome.framework_no_send_proof.reason_code == "provider_not_allowed"
     assert transport.calls == []
 
 

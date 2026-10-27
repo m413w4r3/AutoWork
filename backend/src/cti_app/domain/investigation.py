@@ -28,7 +28,7 @@ class ToolInvocationStatus(StrEnum):
 
 
 class FrameworkPreSubmissionProof(StrEnum):
-    """Framework-attested outcomes proving an adapter was never entered."""
+    """Framework-attested outcomes proving no external submit or handoff occurred."""
 
     INVALID_ARGUMENTS = "framework_pre_submission_invalid_arguments"
     TOOL_UNAVAILABLE = "framework_pre_submission_tool_unavailable"
@@ -40,6 +40,7 @@ class FrameworkPreSubmissionProof(StrEnum):
     INVESTIGATION_MISSING = "framework_pre_submission_investigation_missing"
     DISCLOSURE_REVOKED = "framework_pre_submission_disclosure_revoked"
     OPERATOR_INTERRUPTED = "framework_pre_submission_operator_interrupted"
+    EXTERNAL_EFFECT_PRE_SEND_REFUSAL = "framework_pre_submission_external_effect_refused"
 
 
 class InvestigationExecutionMode(StrEnum):
