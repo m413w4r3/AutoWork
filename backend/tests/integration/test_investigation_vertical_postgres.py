@@ -1024,7 +1024,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     json=request_payload,
                 )
                 assert response.status_code == 200, response.text
-                result = response.json()
+                result: dict[str, Any] = response.json()
                 operator_results[tool_name] = result
                 operator_requests.append((tool_name, key, request_payload))
                 return result
