@@ -420,11 +420,7 @@ class InvestigationService:
             return False
         assert envelope is not None
         return bool(
-            envelope.disclosure.external_llm_allowed
-            and not envelope.disclosure.do_not_submit
-            and not external_effect_source_do_not_submit_blocks(
-                "bridge.investigation_turn.v1", snapshot.do_not_submit
-            )
+            envelope.disclosure.external_llm_allowed and not envelope.disclosure.do_not_submit
         )
 
     @staticmethod

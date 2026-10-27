@@ -3935,35 +3935,18 @@ def test_vt_read_ignores_source_do_not_submit_but_keeps_envelope_veto() -> None:
     assert not InvestigationService.vt_external_disclosure_allowed(
         fixture.snapshot, restricted_envelope, "vt.file_report"
     )
-    assert not InvestigationService.bridge_disclosure_allowed(
-        source_flagged_snapshot, fixture.envelope
-    )
+    assert InvestigationService.bridge_disclosure_allowed(source_flagged_snapshot, fixture.envelope)
 
 
 @pytest.mark.asyncio
-async def test_bridge_does_not_submit_when_source_do_not_submit_is_true() -> None:
-    fixture = _Fixture(
-        responses=[_decision(goal="finish", next_action="finish")],
-        tools=(),
-    )
-    fixture.snapshot = replace(fixture.snapshot, do_not_submit=True)
-    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
-    state = await fixture.start()
-
-    result = await fixture.service.run(state.investigation_id)
-
-    assert result.stop_reason is StopReason.MODEL_UNAVAILABLE
-    assert fixture.bridge_transport.attempt_count == 0
-    assert fixture.bridge_transport.submission_count == 0
-
-
-@pytest.mark.asyncio
-async def test_bridge_submits_when_only_source_external_llm_flag_is_false() -> None:
+async def test_bridge_submits_when_source_permission_flags_are_false() -> None:
     fixture = _Fixture(
         responses=[_decision(goal="finish", next_action="finish")],
         tools=(),
         external_allowed=False,
     )
+    fixture.snapshot = replace(fixture.snapshot, do_not_submit=True)
+    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
     state = await fixture.start()
 
     result = await fixture.service.run(state.investigation_id)
