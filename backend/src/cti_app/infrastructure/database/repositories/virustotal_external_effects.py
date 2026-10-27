@@ -373,8 +373,22 @@ class SqlAlchemyVirusTotalPolicyGuard:
             for reference in context.prepared.evidence_refs
             if reference.kind == "evidence_observation"
         }
+        # Bridge cites associations by association id, as the claim store reads them.
+        is_bridge = context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+        association_refs: dict[UUID, EvidenceReference | None] = {}
         for reference in context.prepared.evidence_refs:
-            if reference.kind in {"sample", "sample_association_sample"}:
+            if is_bridge and reference.kind in {"sample_association", "sample_association_sample"}:
+                try:
+                    association_id = UUID(reference.id)
+                except ValueError:
+                    return False
+                cited = association_refs.get(association_id)
+                if reference.kind == "sample_association_sample":
+                    if cited is not None and cited != reference:
+                        return False
+                    cited = reference
+                association_refs[association_id] = cited
+            elif reference.kind in {"sample", "sample_association_sample"}:
                 try:
                     sample_ids.add(UUID(reference.id))
                 except ValueError:
@@ -450,6 +464,25 @@ class SqlAlchemyVirusTotalPolicyGuard:
             if observation_hashes - (associated_hashes | sample_hashes):
                 return False
             sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)
+        if association_refs:
+            cited_associations = list(
+                await session.scalars(
+                    select(SampleAssociationRow)
+                    .where(SampleAssociationRow.id.in_(sorted(association_refs, key=str)))
+                    .with_for_update()
+                )
+            )
+            if {item.id for item in cited_associations} != set(association_refs):
+                return False
+            for association in cited_associations:
+                cited = association_refs[association.id]
+                if (
+                    association.investigation_id != context.authority.investigation_id
+                    or association.sample_id is None
+                    or (cited is not None and cited.sha256 != association.sample_sha256)
+                ):
+                    return False
+                sample_ids.add(association.sample_id)
         if sample_ids:
             samples = list(
                 await session.scalars(

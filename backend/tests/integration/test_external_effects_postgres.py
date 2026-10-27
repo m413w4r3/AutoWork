@@ -2903,8 +2903,15 @@ async def test_human_g2_vt_read_permits_acquired_sample_external_llm_flag(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("external_llm_allowed", [True, False])
+@pytest.mark.parametrize(
+    "reference_kind",
+    ["evidence_observation", "sample_association_sample", "sample_association"],
+)
 async def test_osint_guard_bridge_ignores_sample_do_not_submit_but_keeps_external_llm_veto(
-    migrated_postgres_url: str, tmp_path: Path, external_llm_allowed: bool
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    external_llm_allowed: bool,
+    reference_kind: str,
 ) -> None:
     # An acquired sample is do_not_submit; Bridge may cite it through a sha256
     # observation unless the sample forbids external LLMs (VT PCAP derivative).
@@ -2913,6 +2920,7 @@ async def test_osint_guard_bridge_ignores_sample_do_not_submit_but_keeps_externa
     )
     authority, _base = authorities[0]
     sample_id = uuid4()
+    association_id = uuid4()
     sample_sha256 = "c" * 64
     observation_id = uuid4()
     observation_sha256 = "d" * 64
@@ -2959,7 +2967,7 @@ async def test_osint_guard_bridge_ignores_sample_do_not_submit_but_keeps_externa
                 )
                 session.add(
                     SampleAssociationRow(
-                        id=uuid4(),
+                        id=association_id,
                         investigation_id=investigation_id,
                         sample_id=sample_id,
                         sample_sha256=sample_sha256,
@@ -2982,40 +2990,43 @@ async def test_osint_guard_bridge_ignores_sample_do_not_submit_but_keeps_externa
                         invocation_ref=None,
                     )
                 )
-        source_refs = (
-            EvidenceReference(
-                "evidence_observation",
-                str(observation_id),
-                observation_version,
-                observation_sha256,
-            ),
-        )
-        prepared = PreparedExternalRequest.build(
-            family="advisor.consultation.v1",
-            provider="bridge",
-            provider_scope="bridge.responses",
-            normalizer_version="1",
-            canonical_request={"bridge_request_id": "osint-guard-regression"},
-            application_request=FrozenWireRequest(
-                method=b"POST",
-                target=b"/v1/responses",
-                headers=((b"content-type", b"application/json"),),
-                body=b"{}",
-            ),
-            evidence_refs=source_refs,
-        )
-        async with session_factory() as session:
-            async with session.begin():
-                allowed = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(
-                    ConsumePolicyContext(
-                        authority=authority,
-                        prepared=prepared,
-                        effect_key=effect_key(authority.investigation_id, prepared),
-                        database_session=session,
-                        investigation_subject_id=subject_id,
+        if reference_kind == "evidence_observation":
+            source_ref = EvidenceReference(
+                "evidence_observation", str(observation_id), observation_version, observation_sha256
+            )
+        else:
+            source_ref = EvidenceReference(reference_kind, str(association_id), "1", sample_sha256)
+
+        async def disclosure_allowed(*references: EvidenceReference) -> bool:
+            prepared = PreparedExternalRequest.build(
+                family="advisor.consultation.v1",
+                provider="bridge",
+                provider_scope="bridge.responses",
+                normalizer_version="1",
+                canonical_request={"bridge_request_id": "osint-guard-regression"},
+                application_request=FrozenWireRequest(
+                    method=b"POST",
+                    target=b"/v1/responses",
+                    headers=((b"content-type", b"application/json"),),
+                    body=b"{}",
+                ),
+                evidence_refs=references,
+            )
+            async with session_factory() as session:
+                async with session.begin():
+                    return await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(
+                        ConsumePolicyContext(
+                            authority=authority,
+                            prepared=prepared,
+                            effect_key=effect_key(authority.investigation_id, prepared),
+                            database_session=session,
+                            investigation_subject_id=subject_id,
+                        )
                     )
-                )
-        assert allowed is external_llm_allowed
+
+        assert await disclosure_allowed(source_ref) is external_llm_allowed
+        if reference_kind == "sample_association_sample":
+            assert not await disclosure_allowed(replace(source_ref, sha256="f" * 64))
     finally:
         await engine.dispose()
 
