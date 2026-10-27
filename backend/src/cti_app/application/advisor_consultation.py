@@ -167,7 +167,9 @@ def _prepare_projection(projection: Mapping[str, Any]) -> PreparedConsultation |
             for name, value in vars(settings).items()
         }
     )
-    cleaned, redacted_secret_count = redact_operational_secrets(projection, settings=guard_settings)
+    cleaned, redacted_secret_count = redact_operational_secrets(
+        projection, settings=guard_settings, include_host_paths=False
+    )
     if not isinstance(cleaned, Mapping):
         return PreparationRefusal(
             reason_code="invalid_projection", redacted_secret_count=redacted_secret_count
@@ -180,7 +182,7 @@ def _prepare_projection(projection: Mapping[str, Any]) -> PreparedConsultation |
     prompt_data["dossier_sha256"] = dossier.sha256
     prompt_data["dossier_bytes"] = dossier.byte_size
 
-    if contains_operational_secrets(cleaned, settings=guard_settings):
+    if contains_operational_secrets(cleaned, settings=guard_settings, include_host_paths=False):
         completeness = evaluate_advisor_evidence_preflight(prompt_data, dossier, dossier.text)
         return PreparationRefusal(
             reason_code="secret_field_remaining",

@@ -851,6 +851,16 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                     "autowork_credential_or_signed_url_detected"
                 )
                 assert refusal.output["confirmed_non_execution"] is True
+                secret_findings = refusal.output["secret_findings"]
+                assert secret_findings, label
+                assert refusal.output["redacted_secret_count"] == len(secret_findings), label
+                assert all(
+                    set(finding) == {"location", "type"}
+                    and finding["location"].startswith("$")
+                    and finding["type"] in {"configured_credential", "signed_url"}
+                    and marker not in finding["location"]
+                    for finding in secret_findings
+                ), label
                 assert marker not in str(refusal.output)
         assert transport.calls == []
         assert transport.real_network_calls == 0

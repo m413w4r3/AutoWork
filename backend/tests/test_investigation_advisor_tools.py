@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
@@ -30,6 +31,7 @@ from cti_app.application.investigation_advisor_tools import (
     MAX_ADVISOR_TOOL_SECONDS,
     InvestigationAdvisorTool,
     _advisor_dossier_opinion_source_refs,
+    _contains_encoded_operational_secrets,
     _marked_secret_field_survives,
     _parse_advisor_output,
     _redact_advisor_payload,
@@ -2760,6 +2762,10 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
     assert transport.calls == []
     assert result.output["advisor_status"] == "refused"
     assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    assert result.output["redacted_secret_count"] == len(result.output["secret_findings"])
+    assert result.output["secret_findings"]
+    assert all(item["type"] == "encoded_credential" for item in result.output["secret_findings"])
+    assert all(item["location"].startswith("$") for item in result.output["secret_findings"])
     safe_output = repr(result.output)
     assert operator_secret not in safe_output
     assert "synthetic-signed-sample-url" not in safe_output
@@ -4988,11 +4994,11 @@ async def test_service_current_envelope_recheck_preserves_needs_review_recovery(
 
 
 def test_advisor_payload_redacts_credentials_embedded_in_urls() -> None:
-    cleaned, count = _redact_advisor_payload(
+    cleaned, findings = _redact_advisor_payload(
         {"request": "fetch https://analyst:secret@example.test/path"}
     )
     assert cleaned["request"] == "fetch [clé masquée]"
-    assert count == 1
+    assert [(item.location, item.secret_type) for item in findings] == [("$.request", "signed_url")]
 
 
 @pytest.mark.asyncio
@@ -5030,9 +5036,136 @@ async def test_signed_url_in_payload_refuses_before_bridge_without_leaking_signa
     assert transport.calls == []
     assert result.output["advisor_status"] == "refused"
     assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    assert result.output["redacted_secret_count"] == 1
+    assert [dict(item) for item in result.output["secret_findings"]] == [
+        {"location": "$.evidence[0].content_excerpts[0].text", "type": "signed_url"}
+    ]
     safe_output = repr(result.output)
     assert signed_url not in safe_output
     assert signature not in safe_output
+
+
+@pytest.mark.asyncio
+async def test_plan_investigation_accepts_cti_paths_and_generic_url_parameters(monkeypatch) -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "synthetic-article-evidence.v1", "sample_sha256": "c" * 64},
+    )
+    attacker_token = "ghp_" + "a" * 36
+    cti_text = (
+        "Implant path /application/bin/agent and key path /root/.ssh/authorized_keys; "
+        "sample path C:\\Windows\\System32\\drivers\\etc\\hosts; "
+        "attacker URL https://evil.example/x?key=abc&token=def; "
+        "attacker OAuth field https://evil.example/x?access_token=jeton-attaquant; "
+        "credential-free reference postgresql://db.invalid:5432/cti; "
+        f"GitHub token {attacker_token}."
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Review the CTI passage.", []),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    async def consultation_data(**_kwargs):
+        return {
+            "question": "Assess the implant paths and observed network indicators.",
+            "evidence": [
+                {
+                    "evidence_id": str(observation.id),
+                    "source": observation.source,
+                    "object_type": "sample",
+                    "sha256": observation.sha256,
+                    "content_excerpts": [{"title": "Article passage", "text": cti_text}],
+                }
+            ],
+            "hypotheses": [{"statement": cti_text}],
+        }
+
+    monkeypatch.setattr(tool, "_consultation_data", consultation_data)
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
+    )
+
+    assert len(transport.calls) == 1, (
+        result.error_code,
+        result.output.get("failure_reason"),
+        result.output.get("secret_findings"),
+    )
+    assert result.error_code != "advisor_secret_field_remaining"
+    assert "secret_findings" not in result.output
+    assert cti_text in transport.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_dsn_with_password_refuses_with_nested_location_and_type(monkeypatch) -> None:
+    investigation_id = uuid4()
+    dsn = "postgresql://fixture-user:fixture-password@db.invalid:5432/cti"
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+
+    async def consultation_data(**_kwargs):
+        return {
+            "question": "Review the connection reference.",
+            "evidence": [
+                {
+                    "evidence_id": str(uuid4()),
+                    "content_excerpts": [{"title": "Reference", "text": dsn}],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(tool, "_consultation_data", consultation_data)
+    result = await tool.execute(
+        {"consultation_type": "plan_investigation"}, make_context(investigation_id)
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["redacted_secret_count"] == 1
+    assert [dict(item) for item in result.output["secret_findings"]] == [
+        {"location": "$.evidence[0].content_excerpts[0].text", "type": "dsn"}
+    ]
+    assert "fixture-password" not in repr(result.output)
+
+
+def test_encoded_credential_diagnostics_mask_sensitive_mapping_keys() -> None:
+    safe_key_secret = "fixture-key-" + "S" * 8
+    encoded_key_secret = "fixture/key-" + "T" * 8
+    settings = SimpleNamespace(
+        operator_api_token=SecretStr(safe_key_secret),
+        operator_client_api_token=SecretStr(encoded_key_secret),
+    )
+    keyed_values = (
+        (safe_key_secret, safe_key_secret.encode()),
+        (encoded_key_secret, encoded_key_secret.encode()),
+        (quote(encoded_key_secret, safe=""), encoded_key_secret.encode()),
+        (encoded_key_secret.encode().hex(), encoded_key_secret.encode()),
+        (base64.b64encode(encoded_key_secret.encode()).decode(), encoded_key_secret.encode()),
+    )
+    payload = {"nested": {key: {"raw_bytes": raw} for key, raw in keyed_values}}
+
+    findings = _contains_encoded_operational_secrets(payload, settings=settings)
+
+    expected = tuple(f"$.nested[<key#{index}>].raw_bytes" for index in range(len(keyed_values)))
+    assert tuple(item.location for item in findings) == expected, (
+        "encoded credential diagnostics exposed a mapping key"
+    )
+    assert all(
+        safe_key_secret not in item.location and encoded_key_secret not in item.location
+        for item in findings
+    ), "credential appeared in an encoded finding path"
 
 
 @pytest.mark.asyncio
@@ -5127,10 +5260,14 @@ def test_advisor_secret_filter_preserves_sample_material_and_redacts_autowork_se
         "operator_token_assignment": f"OPERATOR_API_TOKEN={operator_secret}",
     }
 
-    cleaned, count = _redact_advisor_payload(payload, settings=settings)
+    cleaned, findings = _redact_advisor_payload(payload, settings=settings)
 
     encoded = json.dumps(cleaned, ensure_ascii=False)
-    assert count == 2
+    assert len(findings) == 2
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.operator_api_token", "configured_credential"),
+        ("$.operator_token_assignment", "configured_credential"),
+    ]
     assert encoded.count("[clé masquée]") == 2
     assert rc4_key in encoded
     assert attacker_token in encoded
@@ -5173,9 +5310,13 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
                     "content_excerpts": [
                         {
                             "title": "Canal C2 de l'implant — paramètres de chiffrement",
-                            "text": f"Clé RC4: {rc4_key}; jeton GitHub extrait: {attacker_token}.",
+                            "text": (
+                                f"Clé RC4: {rc4_key}; jeton GitHub extrait: {attacker_token}; "
+                                f"jeton opérateur cité: {operator_secret}."
+                            ),
                         }
                     ],
+                    "raw_base64": base64.b64encode(operator_secret.encode()).decode("ascii"),
                 }
             ],
             "operator_api_token": operator_secret,
@@ -5190,6 +5331,21 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
     assert result.status is ToolInvocationStatus.FAILED
     assert result.output["advisor_status"] == "refused"
     assert result.output["confirmed_non_execution"] is True
+    assert result.output["redacted_secret_count"] == 3, (
+        result.output["redacted_secret_count"],
+        [dict(item) for item in result.output["secret_findings"]],
+    )
+    assert [dict(item) for item in result.output["secret_findings"]] == [
+        {
+            "location": "$.evidence[0].raw_base64",
+            "type": "encoded_credential",
+        },
+        {
+            "location": "$.evidence[0].content_excerpts[0].text",
+            "type": "configured_credential",
+        },
+        {"location": "$.operator_api_token", "type": "configured_credential"},
+    ]
     safe_output = repr(result.output)
     assert operator_secret not in safe_output
     assert rc4_key not in safe_output
@@ -5206,7 +5362,7 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
     monkeypatch.setattr(
         advisor_tools_module,
         "_redact_advisor_payload",
-        lambda _payload, settings=None: ({"operator_api_token": "test sentinel"}, 0),
+        lambda _payload, settings=None: ({"operator_api_token": "test sentinel"}, ()),
     )
 
     result = await tool.execute(
@@ -5216,6 +5372,10 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_secret_field_remaining"
     assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    assert result.output["redacted_secret_count"] == 1
+    assert [dict(item) for item in result.output["secret_findings"]] == [
+        {"location": "$.operator_api_token", "type": "configured_credential"}
+    ]
     assert "test sentinel" not in repr(result.output)
     assert transport.calls == []
     call = next(
@@ -5226,6 +5386,11 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
     persisted = json.loads(await tool._artifact_store.read_bytes(call.blob_id, max_bytes=16 * 1024))
     assert persisted["advisor_status"] == "refused"
     assert persisted["bridge_turns_consumed"] == 0
+    assert persisted["redacted_secret_count"] == 1
+    assert persisted["secret_findings"] == [
+        {"location": "$.operator_api_token", "type": "configured_credential"}
+    ]
+    assert persisted["output"]["secret_findings"] == persisted["secret_findings"]
 
 
 @pytest.mark.asyncio
