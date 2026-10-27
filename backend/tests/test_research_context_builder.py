@@ -69,7 +69,6 @@ from cti_app.application.research_context_builder import (
     MAX_CONTEXT_SOURCE_PAGE,
     ArticleSnapshot,
     CanonicalEvidenceSummaryPort,
-    InvestigationContextTooLarge,
     RepositoryInvestigationGraphReadPort,
     ResearchContextBuilder,
     provider_authorization_blocked_capabilities,
@@ -754,7 +753,7 @@ async def test_tool_coverage_includes_more_than_recent_evidence_with_bounded_saf
 
 
 @pytest.mark.asyncio
-async def test_tool_coverage_caps_history_at_two_hundred_entries_and_bytes() -> None:
+async def test_tool_coverage_caps_history_by_item_count_without_a_byte_ceiling() -> None:
     investigation_id = uuid4()
     snapshot = ArticleSnapshot(
         subject_id=uuid4(),
@@ -815,7 +814,7 @@ async def test_tool_coverage_caps_history_at_two_hundred_entries_and_bytes() -> 
     entries = context.investigation.tool_coverage
     encoded_index_bytes = sum(len(item.model_dump_json().encode()) + 1 for item in entries)
     assert 0 < len(entries) <= 200
-    assert encoded_index_bytes <= 48 * 1024
+    assert encoded_index_bytes > 48 * 1024
     assert context.investigation.tool_coverage_truncated is True
 
 
@@ -2683,7 +2682,7 @@ async def test_large_full_context_is_deterministically_bounded_and_keeps_iocs_fi
 
 
 @pytest.mark.asyncio
-async def test_large_operator_led_context_is_reduced_deterministically() -> None:
+async def test_large_operator_led_context_is_preserved_deterministically() -> None:
     investigation_id = uuid4()
     synthesis_artifact_id = uuid4()
     observations = InMemoryEvidenceObservationRepository()
@@ -3190,9 +3189,8 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
             sort_keys=True,
         )
     )
-    assert len(context.canonical_bytes()) <= 262_144
     assert context.canonical_bytes() == repeated.canonical_bytes()
-    assert len(compact_prompt.encode("utf-8")) <= 96_000
+    assert len(compact_prompt.encode("utf-8")) > 96_000
     assert "BEGIN_CANONICAL_INVESTIGATION_CONTEXT" not in compact_prompt
     assert "arguments_schema" not in compact_prompt
     assert all(reference in compact_prompt for reference in set(evidence_ref_values))
@@ -3212,16 +3210,15 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
     assert context.unavailable_tools == ("analysis.missing:analysis_worker_disabled",)
     assert context.advisor_guidance.checkpoint_due is True
     assert context.advisor_guidance.suggested_consultation_type == "plan_investigation"
-    assert len(context.canonical_bytes()) <= 262_144
+    assert len(context.canonical_bytes()) > 262_144
     assert context.article is not None
     assert context.article.publication_anchors[0].anchor == "overview"
-    assert len(context.investigation.evidence_index) < 200
+    assert len(context.investigation.evidence_index) == 200
     assert context.investigation.evidence_index_truncated is True
     assert context.investigation.truncation_counts["evidence_index"] > 0
     assert context.investigation.truncation_counts["findings_superseded"] == 14
     assert summary.context_sha256 == hashlib.sha256(context.canonical_bytes()).hexdigest()
     assert summary.working_state_sha256 == state.sha256
-    assert summary.max_context_bytes == 262_144
     assert (
         summary.summary_sha256
         == hashlib.sha256(summary.canonical_bytes(include_summary_hash=False)).hexdigest()
@@ -3352,7 +3349,7 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
 
 
 @pytest.mark.asyncio
-async def test_builder_reports_dominant_sections_when_required_tools_cannot_fit() -> None:
+async def test_builder_preserves_required_tools_when_context_exceeds_256kib() -> None:
     investigation_id = UUID("00000000-0000-0000-0000-000000000201")
     synthesis_artifact_id = UUID("00000000-0000-0000-0000-000000000202")
     snapshot = ArticleSnapshot(
@@ -3404,23 +3401,22 @@ async def test_builder_reports_dominant_sections_when_required_tools_cannot_fit(
         approval_actor_id="analyst-test",
     )
 
-    with pytest.raises(InvestigationContextTooLarge) as error:
-        await builder.build(
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
             investigation_id=investigation_id,
-            synthesis_artifact_id=synthesis_artifact_id,
-            state=_state(investigation_id),
-            tool_context=ToolExecutionContext(
-                investigation_id=investigation_id,
-                envelope=envelope,
-                budget=envelope.budget,
-                idempotency_key="required-tools-too-large",
-                available_capabilities=frozenset({"synthetic.read"}),
-            ),
-            budget_remaining={},
-        )
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="required-tools-too-large",
+            available_capabilities=frozenset({"synthetic.read"}),
+        ),
+        budget_remaining={},
+    )
 
-    assert error.value.actual_bytes > error.value.max_bytes
-    assert error.value.dominant_sections[0].startswith("available_tools:")
+    assert len(context.canonical_bytes()) > 262_144
+    assert len(context.available_tools) == 48
 
 
 @pytest.mark.asyncio

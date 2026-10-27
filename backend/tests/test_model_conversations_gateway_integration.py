@@ -18,12 +18,19 @@ never mocking `gateway.execute` itself.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
+import httpx
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.bridge_investigator import ModelConversationTurnTransport
+from cti_app.application.external_effects import ExternalEffectCoordinator
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
@@ -50,7 +57,13 @@ from cti_app.domain.model_runs import (
     ModelUsage,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
-from cti_app.integrations.models import BlobModelOutputStore, FakeModelAdapter
+from cti_app.integrations.models import (
+    BlobModelOutputStore,
+    FakeModelAdapter,
+    HttpResponsesTransport,
+    OpenAIResearchAdapter,
+    create_coordinated_http_responses_transport,
+)
 from tests.conversation_support import InMemoryConversationUnitOfWorkFactory
 
 
@@ -178,6 +191,85 @@ async def test_q1_fresh_conversation_reaches_the_adapter_exactly_once(tmp_path: 
     assert len(adapter.calls) == 1
 
 
+async def test_general_conversation_turn_uses_plain_bridge_gateway(tmp_path: Path) -> None:
+    posts: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+            payload = request.read()
+            conversation = json.loads(payload)["conversation"]
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "id": "plain-general-response",
+                    "status": "completed",
+                    "output_text": "Réponse de conversation générale",
+                    "metadata": {
+                        "conversation": {
+                            "id": conversation["id"],
+                            "mode": conversation["mode"],
+                            "external_locator": "https://chatgpt.com/opaque/plain",
+                            "turn_id": "plain-general-turn-1",
+                            "verified": True,
+                        }
+                    },
+                },
+            )
+        return httpx.Response(200, json={"status": "completed"})
+
+    bridge_transport = HttpResponsesTransport(
+        "https://bridge.test/v1",
+        api_key=None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    bridge_transport._last_capabilities_check = time.monotonic()
+    adapter = OpenAIResearchAdapter(bridge_transport, model="test-model")
+    conversation_uow = InMemoryConversationUnitOfWorkFactory()
+    blob_store = FilesystemBlobStore(tmp_path)
+    output_store = BlobModelOutputStore(
+        BlobCatalogService(blob_store, conversation_uow)  # type: ignore[arg-type]
+    )
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        conversation_uow,
+        output_store,
+    )
+    service = ModelConversationService(
+        conversation_uow,  # type: ignore[arg-type]
+        gateway,
+        blob_store,
+    )
+    conversation = await service.create(
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.SUBJECT_RESEARCH,
+        title="General analyst conversation",
+        edition_id=None,
+        subject_id=None,
+        expected_profile=None,
+        requested_model=None,
+    )
+
+    turn = await service.add_turn(
+        conversation.id,
+        message="Synthetic general analyst prompt",
+        mode=ConversationMode.FRESH,
+        external_llm_allowed=True,
+        idempotency_key="general-conversation-turn",
+        correlation_id="general-conversation-test",
+    )
+
+    assert turn.status is ConversationTurnStatus.SUCCEEDED
+    assert len(posts) == 1
+
+
 async def test_q4_drafting_fresh_conversation_reaches_the_adapter_exactly_once(
     tmp_path: Path,
 ) -> None:
@@ -205,6 +297,71 @@ async def test_q4_drafting_fresh_conversation_reaches_the_adapter_exactly_once(
 
     assert turn.status is ConversationTurnStatus.SUCCEEDED
     assert len(adapter.calls) == 1
+
+
+async def test_investigation_bridge_turn_without_binding_is_refused_before_http_send(
+    tmp_path: Path,
+) -> None:
+    posts: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"id": "capabilities", "status": "completed", "output_text": "unused"},
+        )
+
+    bridge_transport = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key=None,
+        coordinator=cast(ExternalEffectCoordinator, object()),
+        http_transport=httpx.MockTransport(handler),
+    )
+    # Skip the control-plane capabilities GET; this test isolates the gated
+    # physical Bridge POST from an investigation turn with no binding.
+    bridge_transport._last_capabilities_check = time.monotonic()
+    adapter = OpenAIResearchAdapter(bridge_transport, model="test-model")
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    conversation_uow = InMemoryConversationUnitOfWorkFactory(known_subject_ids={subject_id})
+    blob_store = FilesystemBlobStore(tmp_path)
+    output_store = BlobModelOutputStore(
+        BlobCatalogService(blob_store, conversation_uow)  # type: ignore[arg-type]
+    )
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        conversation_uow,
+        output_store,
+    )
+    service = ModelConversationService(
+        conversation_uow,  # type: ignore[arg-type]
+        gateway,
+        blob_store,
+    )
+    investigation_turns = ModelConversationTurnTransport(
+        service,
+        require_external_effect_authority=True,
+    )
+
+    result = await investigation_turns.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=1,
+        context_sha256=hashlib.sha256(b"synthetic investigation context").hexdigest(),
+        prompt="Synthetic investigation prompt",
+        external_llm_allowed=True,
+    )
+
+    assert result.status.value == "unavailable"
+    assert result.error_code == "external_effect_authority_required"
+    assert posts == []
 
 
 class _CrashesBeforeGatewayClaimsTheRun(ModelGateway):

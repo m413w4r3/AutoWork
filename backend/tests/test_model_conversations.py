@@ -313,6 +313,24 @@ class _FailOnceBeforeSubmissionAdapter(_ScriptedBridgeAdapter):
         )
 
 
+class _CompletedRateLimitAdapter(_ScriptedBridgeAdapter):
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        raise BridgeTransportError(
+            "bridge_rate_limited",
+            "Le bridge limite temporairement les requêtes.",
+            retryable=True,
+            retry_after=4,
+            phase="generation",
+            status_code=429,
+            submission_state="post_submission",
+            completed_response=True,
+        )
+
+
 class _FailNTimesBeforeSubmissionAdapter(_ScriptedBridgeAdapter):
     def __init__(self, answer: str, *, failures: int) -> None:
         super().__init__(answer)
@@ -390,6 +408,44 @@ async def test_model_transport_recovers_persisted_confirmed_pre_submission_failu
         ConversationTurnStatus.FAILED,
         ConversationTurnStatus.SUCCEEDED,
     }
+
+
+@pytest.mark.asyncio
+async def test_completed_rate_limit_replay_preserves_rejection_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    adapter = _CompletedRateLimitAdapter("unused")
+    subject_id = uuid4()
+    service, state = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+    transport = ModelConversationTurnTransport(service)
+    args = {
+        "investigation_id": uuid4(),
+        "subject_id": subject_id,
+        "turn_index": 1,
+        "context_sha256": hashlib.sha256(b"completed 429 prompt").hexdigest(),
+        "prompt": "A stable synthetic investigation prompt.",
+        "external_llm_allowed": True,
+    }
+
+    first = await transport.submit(**args)
+    replay = await transport.submit(**args)
+
+    assert first.status is TurnSubmissionStatus.UNAVAILABLE
+    assert first.error_code == "bridge_rate_limited"
+    assert first.completed_response is True
+    assert first.submission_state == "post_submission"
+    assert first.retry_after_seconds == 4
+    assert replay.status is TurnSubmissionStatus.UNAVAILABLE
+    assert replay.error_code == "bridge_rate_limited"
+    assert replay.completed_response is True
+    assert replay.submission_state == "post_submission"
+    assert replay.retry_after_seconds == 4
+    assert len(adapter.calls) == 1
+    assert len(state.turns) == 1
 
 
 @pytest.mark.asyncio

@@ -75,6 +75,7 @@ from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
 from cti_app.domain.classification import TLP
+from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservation,
@@ -98,7 +99,6 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_TOOL_SECONDS = 3_600
-DEFAULT_ADVISOR_SAMPLE_BLOB_MAX_BYTES = 64 * 1024 * 1024
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
 # the archive timeout and the 35s advisor preparation/scheduling margin. This
@@ -146,6 +146,7 @@ class InvestigationAdvisorTool:
         findings: Any,
         investigation_states: Any | None = None,
         experiments: Any | None = None,
+        source_documents: Any | None = None,
         opinions: Any,
         sample_associations: Any,
         samples: Any,
@@ -161,6 +162,7 @@ class InvestigationAdvisorTool:
         self._findings = findings
         self._investigation_states = investigation_states
         self._experiments = experiments
+        self._source_documents = source_documents
         self._opinions = opinions
         self._sample_associations = sample_associations
         self._samples = samples
@@ -207,7 +209,7 @@ class InvestigationAdvisorTool:
             if investigation is None:
                 return no_context_cost
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
-            if not InvestigationService.external_llm_allowed(snapshot, context.envelope):
+            if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return no_context_cost
             evidence = await self._load_evidence(context.investigation_id, evidence_refs)
             if not evidence_refs and consultation_type not in {
@@ -516,7 +518,7 @@ class InvestigationAdvisorTool:
                     },
                     error_code="advisor_disclosure_restricted",
                 )
-            if not InvestigationService.external_llm_allowed(snapshot, context.envelope):
+            if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return self._finish(
                     context,
                     ToolResult(
@@ -850,6 +852,15 @@ class InvestigationAdvisorTool:
                     ),
                 )
             transmitted_refs = _prompt_transmitted_refs(prompt_data)
+            external_effect_evidence_refs = await _advisor_external_effect_evidence_refs(
+                transmitted_refs,
+                evidence,
+                observation_repository=self._observations,
+                investigation_id=context.investigation_id,
+                snapshot=snapshot,
+                source_document_repository=self._source_documents,
+                blob_repository=self._blobs,
+            )
             advisor_observation_refs = tuple(
                 UUID(item["id"]) for item in transmitted_refs if item["kind"] == "observation"
             )
@@ -1097,6 +1108,13 @@ class InvestigationAdvisorTool:
             deadline_monotonic=execution_deadline_monotonic,
             minimum_timeout_seconds=minimum_execution_seconds,
             clock=execution_clock,
+            external_effect_binding_context={
+                "authority_context": getattr(context, "external_effect_authority", None),
+                "invocation_arguments": dict(arguments),
+                "transmitted_refs": transmitted_refs,
+                "evidence_refs": external_effect_evidence_refs,
+                "reservation_operation_key": reservation_key,
+            },
         )
         evidence_preflight = evaluate_advisor_evidence_preflight(
             prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)
@@ -1957,6 +1975,9 @@ class InvestigationAdvisorTool:
                         if type(getattr(item, "section_index", None)) is int
                         else {}
                     ),
+                    "source_document_ids": [
+                        str(document_id) for document_id in getattr(item, "source_document_ids", ())
+                    ],
                 }
                 for item in getattr(snapshot, "article_passages", ())
             ],
@@ -2887,33 +2908,18 @@ class InvestigationAdvisorTool:
             sample_origin = getattr(sample_origin, "value", sample_origin)
             blob_content: bytes | None = None
             content_status = "verified"
-            configured_blob_limit = getattr(
-                self._settings,
-                "advisor_sample_blob_max_bytes",
-                DEFAULT_ADVISOR_SAMPLE_BLOB_MAX_BYTES,
-            )
-            max_content_bytes = (
-                configured_blob_limit
-                if type(configured_blob_limit) is int and configured_blob_limit > 0
-                else DEFAULT_ADVISOR_SAMPLE_BLOB_MAX_BYTES
-            )
-            content_omission_reason: str | None = None
-            if descriptor.size > max_content_bytes:
-                content_status = "omitted_technical_size_limit"
-                content_omission_reason = "sample_blob_exceeds_configured_technical_limit"
-            else:
-                try:
-                    blob_content = await self._artifact_store.read_bytes(
-                        blob_id, max_bytes=descriptor.size
-                    )
-                    if (
-                        len(blob_content) != descriptor.size
-                        or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
-                    ):
-                        blob_content = None
-                        content_status = "blob_content_verification_failed"
-                except Exception:
-                    content_status = "blob_content_unavailable"
+            try:
+                blob_content = await self._artifact_store.read_bytes(
+                    blob_id, max_bytes=descriptor.size
+                )
+                if (
+                    len(blob_content) != descriptor.size
+                    or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
+                ):
+                    blob_content = None
+                    content_status = "blob_content_verification_failed"
+            except Exception:
+                content_status = "blob_content_unavailable"
             raw_mime_type = getattr(descriptor, "mime_type", "application/octet-stream")
             mime_type = (
                 raw_mime_type.strip()
@@ -2933,8 +2939,7 @@ class InvestigationAdvisorTool:
                     "evidence_ids": [str(item.id) for item in associated_observations],
                     "evidence_blob_ids": [str(item.blob_id) for item in associated_observations],
                     "evidence_sha256s": [item.sha256 for item in associated_observations],
-                    "mime_type": mime_type[:512],
-                    "mime_type_truncated": len(mime_type) > 512,
+                    "mime_type": mime_type,
                     "byte_length": descriptor.size,
                     "encoding": "base64",
                     "content_base64": (
@@ -2943,8 +2948,6 @@ class InvestigationAdvisorTool:
                         else ""
                     ),
                     "content_status": content_status,
-                    "content_omission_reason": content_omission_reason,
-                    "maximum_content_bytes": max_content_bytes,
                     "association_status": _safe_text(
                         getattr(
                             getattr(association, "qualification", "unknown"),
@@ -3576,7 +3579,7 @@ class InvestigationAdvisorTool:
                 sample.blob_id,
                 measured_hash,
                 str(association_id) if association_id is not None else "",
-                mime_type[:512],
+                mime_type,
             )
         return None
 
@@ -5223,6 +5226,12 @@ def _typed_transmitted_refs(data: Mapping[str, Any], snapshot: Any) -> list[dict
         getattr(snapshot, "synthesis_sha256", None),
         getattr(snapshot, "synthesis_sha256", None),
     )
+    synthesis_sha256 = getattr(snapshot, "synthesis_sha256", None)
+    for passage in data.get("article_passages", ()):
+        if not isinstance(passage, Mapping):
+            continue
+        for document_id in passage.get("source_document_ids", ()):
+            add("source_document", document_id, synthesis_sha256)
     evidence_sha: dict[str, str] = {}
     for item in data.get("evidence", ()):
         if isinstance(item, Mapping):
@@ -5271,6 +5280,18 @@ def _transmitted_refs_for_dossier(
                 identifier = f"article:{identifier}"
             if kind in {"article", "observation", "finding", "measurement"}:
                 selected.add((kind, identifier))
+                if kind == "article":
+                    passage_claim_id = item.get("claim_id")
+                    for passage in data.get("article_passages", ()):
+                        if (
+                            isinstance(passage, Mapping)
+                            and passage.get("claim_id") == passage_claim_id
+                        ):
+                            selected.update(
+                                ("source_document", str(document_id))
+                                for document_id in passage.get("source_document_ids", ())
+                                if isinstance(document_id, str)
+                            )
             if kind in {"measurement", "fact"}:
                 evidence_id = item.get("evidence_id")
                 if isinstance(evidence_id, str):
@@ -5294,6 +5315,75 @@ def _prompt_transmitted_refs(prompt_data: Mapping[str, Any]) -> tuple[dict[str, 
         ):
             refs.append({"kind": item["kind"], "id": item["id"], "sha256": item["sha256"]})
     return tuple(refs)
+
+
+async def _advisor_external_effect_evidence_refs(
+    transmitted_refs: tuple[dict[str, str], ...],
+    evidence: Sequence[EvidenceObservation],
+    *,
+    observation_repository: Any,
+    investigation_id: UUID,
+    snapshot: Any,
+    source_document_repository: Any | None,
+    blob_repository: Any,
+) -> tuple[EvidenceReference, ...]:
+    """Resolve transmitted observations and source documents canonically."""
+    observations = {str(item.id): item for item in evidence}
+    references: dict[tuple[str, str], EvidenceReference] = {}
+    for reference in transmitted_refs:
+        if reference["kind"] == "source_document":
+            if (
+                source_document_repository is None
+                or blob_repository is None
+                or reference["sha256"] != getattr(snapshot, "synthesis_sha256", None)
+            ):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            try:
+                document_id = UUID(reference["id"])
+            except ValueError as exc:
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            document = await source_document_repository.get(document_id)
+            if document is None or document.subject_id != getattr(snapshot, "subject_id", None):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            blob = await blob_repository.get(document.blob_id)
+            blob_descriptor = getattr(blob, "descriptor", None)
+            blob_sha256 = getattr(blob_descriptor, "sha256", None)
+            if (
+                not isinstance(blob_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", blob_sha256) is None
+            ):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            resolved = EvidenceReference(
+                kind="source_document",
+                id=str(document.id),
+                version=f"blob:{document.blob_id}",
+                sha256=blob_sha256,
+            )
+            references[(resolved.kind, resolved.id)] = resolved
+            continue
+        if reference["kind"] != "observation":
+            continue
+        observation = observations.get(reference["id"])
+        if observation is None:
+            try:
+                observation_id = UUID(reference["id"])
+            except ValueError as exc:
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            observation = await observation_repository.get(observation_id)
+        if (
+            observation is None
+            or observation.investigation_id != investigation_id
+            or observation.sha256 != reference["sha256"]
+        ):
+            raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+        resolved = EvidenceReference(
+            kind="evidence_observation",
+            id=str(observation.id),
+            version=observation.source_version,
+            sha256=observation.sha256,
+        )
+        references[(resolved.kind, resolved.id)] = resolved
+    return tuple(references[key] for key in sorted(references))
 
 
 def _attach_advisor_provenance(result: ToolResult, provenance: Mapping[str, Any]) -> ToolResult:
@@ -6596,7 +6686,7 @@ def _drop_findings_linked_to_restricted_evidence(
 
 
 def _sample_policy_allows_external(sample: object) -> bool:
-    """Apply explicit sample rules before disclosing associated sample data.
+    """Apply TLP and license restrictions before disclosing associated sample data.
 
     D7 maps every non-empty license_restriction to an explicit owner/source
     veto when sample metadata or content would be sent externally. This
@@ -6609,9 +6699,7 @@ def _sample_policy_allows_external(sample: object) -> bool:
         str(license_restriction).strip()
     )
     return not (
-        bool(getattr(sample, "do_not_submit", False))
-        or not bool(getattr(sample, "external_llm_allowed", True))
-        or (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
+        (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
         or has_license_restriction
     )
 
@@ -6621,10 +6709,6 @@ def _sample_restriction_sources(sample: object | None) -> list[str]:
     if sample is None:
         return []
     sources: list[str] = []
-    if bool(getattr(sample, "do_not_submit", False)):
-        sources.append("do_not_submit")
-    if not bool(getattr(sample, "external_llm_allowed", True)):
-        sources.append("external_llm_allowed_false")
     tlp = getattr(sample, "tlp", None)
     tlp_value = getattr(tlp, "value", tlp)
     if isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold():

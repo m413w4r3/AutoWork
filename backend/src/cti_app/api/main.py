@@ -132,6 +132,7 @@ from cti_app.infrastructure.health import InfrastructureReadinessChecker
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.investigation_runtime_ports import (
     build_investigation_runtime_composition_factory,
+    create_external_effect_coordinator,
     describe_tool_inventory,
 )
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
@@ -179,6 +180,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     def uow_factory() -> UnitOfWork:
         return SqlAlchemyUnitOfWork(session_factory)
 
+    external_effect_coordinator = create_external_effect_coordinator(session_factory)
     model_gateway = create_model_gateway(settings, uow_factory)
     vt_proxy_client: httpx.AsyncClient | None = None
     vt_direct_client: httpx.AsyncClient | None = None
@@ -363,6 +365,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         conversation_session_closer=bridge_provider,
         visible_recovery_transport=bridge_provider,
     )
+    investigation_model_gateway = create_model_gateway(
+        settings,
+        uow_factory,
+        external_effect_coordinator=external_effect_coordinator,
+    )
+    investigation_model_conversation_service = ModelConversationService(
+        uow_factory,
+        investigation_model_gateway,
+        blob_store,
+        retention_days=settings.model_conversation_retention_days,
+        conversation_session_closer=bridge_provider,
+        visible_recovery_transport=bridge_provider,
+    )
 
     blob_catalog = BlobCatalogService(blob_store, uow_factory)
     production_artifact_store = ProductionArtifactStore(blob_catalog)
@@ -384,10 +399,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings,
         uow_factory=uow_factory,
         session_factory=session_factory,
+        external_effect_coordinator=external_effect_coordinator,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         artifact_store=production_artifact_store,
-        model_conversations=model_conversation_service,
+        model_conversations=investigation_model_conversation_service,
         vt_adapter=vt_adapter,
         vt_capabilities=vt_capabilities,
         vt_observations=vt_observations,

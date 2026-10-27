@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import importlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,8 +34,22 @@ from cti_app.application.external_effects import (
     ReuseDecision,
     TransportResponse,
 )
+from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_service import InvestigationService
+from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
+    AdapterResult,
+    AdapterResultStatus,
+    BridgeExternalEffectBinding,
+    ModelCapabilities,
+    ModelGateway,
+    ModelRouter,
+    ModelUsage,
+)
+from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.config import Settings
 from cti_app.domain.external_effects import (
     EvidenceReference,
     ExternalEffectAuthority,
@@ -51,11 +66,20 @@ from cti_app.domain.external_effects import (
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
+    DisclosureBounds,
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationExecutionMode,
+    TLPLevel,
 )
 from cti_app.domain.investigation_state import InvestigationWorkingState
+from cti_app.domain.model_conversations import (
+    ConversationMode,
+    ConversationPurpose,
+    ConversationTransport,
+)
+from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRole, ModelTransport
+from cti_app.domain.osint_open import OsintCapabilities, OsintScopeKind
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
 from cti_app.infrastructure.database.models.external_effects import (
@@ -87,6 +111,13 @@ from cti_app.infrastructure.database.repositories.virustotal_external_effects im
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from cti_app.infrastructure.investigation_runtime_ports import create_external_effect_coordinator
+from cti_app.integrations.models import (
+    BlobModelOutputStore,
+    BridgeTransportError,
+    FakeModelAdapter,
+    create_coordinated_http_responses_transport,
+)
 from tests.integration.conftest import _alembic_config
 from tests.workflow_emulator.investigation_support import seed_verified_article
 
@@ -143,6 +174,45 @@ class _CountingRawClient:
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+
+class _SyntheticOpenAIBridgeAdapter:
+    """A deterministic local adapter for persisted Bridge conversation fixtures."""
+
+    provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    requested_model = "test-model"
+    is_external = True
+    is_configured = True
+    capabilities = ModelCapabilities()
+
+    async def invoke(
+        self,
+        _request: Any,
+        *,
+        role: ModelRole,
+        output_schema: type[Any] | None = None,
+    ) -> AdapterResult:
+        del role, output_schema
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(),
+            output_text="Synthetic local advisor response.",
+        )
+
+    async def resume(
+        self,
+        response_id: str,
+        *,
+        role: ModelRole,
+        output_schema: type[Any] | None = None,
+    ) -> AdapterResult:
+        del response_id, role, output_schema
+        raise AssertionError("The deterministic synthetic adapter is never resumed.")
 
 
 class _BarrierPolicyGuard:
@@ -452,7 +522,7 @@ async def _prepare_model_submission_case(
         async with session.begin():
             envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
             assert envelope is not None
-            envelope.allowed_providers = ["openai"]
+            envelope.allowed_providers = ["bridge"]
             session.add(
                 ModelConversationRow(
                     id=conversation_id,
@@ -547,7 +617,7 @@ async def _prepare_model_submission_case(
     authority = replace(authority, bridge_turn_id=turn_id, model_run_id=run_id)
     prepared = PreparedExternalRequest.build(
         family="bridge.investigation_turn.v1",
-        provider="openai",
+        provider="bridge",
         provider_scope="bridge-test",
         normalizer_version="bridge.turn.v1",
         canonical_request={
@@ -566,7 +636,7 @@ async def _prepare_model_submission_case(
         session_factory,
         family_bindings={
             prepared.family: ExternalEffectFamilyBinding(
-                provider="openai",
+                provider="bridge",
                 provider_scopes=frozenset({"bridge-test"}),
                 normalizer_versions=frozenset({"bridge.turn.v1"}),
                 invocation_tool_binding=(_FAMILY, "v1"),
@@ -577,6 +647,25 @@ async def _prepare_model_submission_case(
         },
     )
     return session_factory, engine, investigation_id, authority, prepared, store, run_id
+
+
+def _bridge_model_lineage_store(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> SqlAlchemyExternalEffectClaimStore:
+    return SqlAlchemyExternalEffectClaimStore(
+        session_factory,
+        family_bindings={
+            "bridge.investigation_turn.v1": ExternalEffectFamilyBinding(
+                provider="bridge",
+                provider_scopes=frozenset({"bridge-test"}),
+                normalizer_versions=frozenset({"bridge.turn.v1"}),
+                invocation_tool_binding=None,
+                model_submission=True,
+                requires_model_lineage=True,
+                model_run_provider="openai",
+            )
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -612,6 +701,1156 @@ async def test_prestarted_bridge_attempt_matches_request_and_does_not_increment_
         assert run.submission_attempt == 1
         assert run.bridge_request_id == prepared.canonical_request["bridge_request_id"]
         assert claim is not None and claim.model_run_id == run_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_coordinated_bridge_http_post_completes_one_persisted_model_claim(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        authority,
+        prepared,
+        store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    api_key = "pg-bridge-api-key-canary-do-not-persist"
+    captured: list[httpx.Request] = []
+    prompt = "Exact synthetic prompt bytes for the PostgreSQL transport test."
+    payload = {"model": "chatgpt-web", "input": prompt}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"id":"resp-synthetic","status":"completed","output_text":"ok"}',
+        )
+
+    assert authority.bridge_turn_id is not None
+    assert authority.model_run_id == run_id
+    assert isinstance(prepared.canonical_request["model_input_sha256"], str)
+    assert isinstance(prepared.canonical_request["authorized_input_hash"], str)
+    binding = BridgeExternalEffectBinding(
+        authority=authority,
+        family=prepared.family,
+        provider_scope=prepared.provider_scope,
+        normalizer_version=prepared.normalizer_version,
+        bridge_turn_id=authority.bridge_turn_id,
+        model_run_id=run_id,
+        model_input_sha256=prepared.canonical_request["model_input_sha256"],
+        authorized_input_hash=prepared.canonical_request["authorized_input_hash"],
+    )
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.synthetic/v1",
+        api_key=api_key,
+        coordinator=ExternalEffectCoordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await transport.create(
+            payload,
+            idempotency_key="bridge-request-1",
+            bridge_external_effect_binding=binding,
+        )
+        assert result["output_text"] == "ok"
+        assert len(captured) == 1
+        request = captured[0]
+        assert request.method == "POST"
+        assert request.url.path == "/v1/responses"
+        assert json.loads(request.content)["input"] == prompt
+        assert request.headers["Authorization"] == f"Bearer {api_key}"
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id,
+                        ExternalEffectClaimRow.family == "bridge.investigation_turn.v1",
+                    )
+                )
+            )
+            run = await session.get(ModelRunRow, run_id)
+        assert len(claims) == 1
+        claim = claims[0]
+        assert claim.state == "COMPLETED"
+        assert claim.bridge_turn_id == authority.bridge_turn_id
+        assert claim.model_run_id == run_id
+        assert claim.application_request_sha256 == application_request_sha256(
+            FrozenWireRequest(
+                method=request.method.encode("ascii"),
+                target=request.url.raw_path,
+                headers=tuple(request.headers.raw),
+                body=request.content,
+            )
+        )
+        assert api_key not in claim.application_request_sha256
+        persisted_columns = {
+            column.name: getattr(claim, column.name)
+            for column in ExternalEffectClaimRow.__table__.columns
+        }
+        assert api_key not in repr(persisted_columns)
+        assert run is not None and run.submission_state == "result_obtained"
+        assert api_key not in caplog.text
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_submission_cannot_omit_restricted_prompt_source_reference(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        initial_authority,
+        _prepared,
+        _store_for_other_family,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    assert initial_authority.bridge_turn_id is not None
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+    )
+    passage = "Synthetic passage restricted from external submission."
+    document_id = uuid4()
+    prompt = f"Summarize source_document {document_id}: {passage}"
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    request_id = "bridge-request-1"
+    sent: list[httpx.Request] = []
+    now = datetime.now(UTC)
+
+    async with session_factory() as session:
+        async with session.begin():
+            turn = await session.get(ModelConversationTurnRow, authority.bridge_turn_id)
+            run = await session.get(ModelRunRow, run_id)
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert turn is not None and run is not None and blob is not None
+            conversation = await session.get(ModelConversationRow, turn.conversation_id)
+            assert conversation is not None
+            run.authorized_input_hash = prompt_sha256
+            turn.input_blob_reference = f"sha256:{prompt_sha256}"
+            turn.input_sha256 = prompt_sha256
+            session.add(
+                SourceDocumentRow(
+                    id=document_id,
+                    subject_id=conversation.subject_id,
+                    blob_id=blob.id,
+                    original_name="restricted-synthetic-source.txt",
+                    origin="test",
+                    acquired_at=now,
+                    license_restriction=None,
+                    tlp="RED",
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    created_at=now,
+                )
+            )
+
+    # This caller-supplied binding has valid authority and model lineage, but
+    # omits the source_document ref for the restricted passage in the prompt.
+    binding = BridgeExternalEffectBinding(
+        authority=authority,
+        family="bridge.investigation_turn.v1",
+        provider_scope="bridge.responses",
+        normalizer_version="bridge.turn.v1",
+        evidence_refs=(),
+        bridge_turn_id=authority.bridge_turn_id,
+        model_run_id=run_id,
+        model_input_sha256=prompt_sha256,
+        authorized_input_hash=prompt_sha256,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["input"] == prompt
+        sent.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"id":"resp-synthetic","status":"completed","output_text":"ok"}',
+        )
+
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.synthetic/v1",
+        api_key=None,
+        coordinator=create_external_effect_coordinator(session_factory),
+        http_transport=httpx.MockTransport(handler),
+    )
+    refusal: BridgeTransportError | None = None
+    try:
+        try:
+            await transport.create(
+                {"model": "chatgpt-web", "input": prompt},
+                idempotency_key=request_id,
+                bridge_external_effect_binding=binding,
+            )
+        except BridgeTransportError as exc:
+            refusal = exc
+
+        assert refusal is not None, "restricted passage without a source ref was dispatched"
+        assert refusal.code == "external_effect_authority_required"
+        assert sent == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference_kind", "observation_object_type", "restriction"),
+    [
+        ("sample", None, None),
+        ("sample_association_sample", None, None),
+        ("sample_association", None, None),
+        ("sample_hash", None, None),
+        ("source_document", None, None),
+        ("evidence_observation", "tool_result", None),
+        ("evidence_observation", "source_document", None),
+        ("sample", None, "sample_red"),
+        ("sample", None, "sample_license"),
+        ("source_document", None, "document_red"),
+        ("source_document", None, "document_license"),
+        ("sample", None, "envelope_do_not_submit"),
+        ("sample", None, "envelope_external_llm_denied"),
+    ],
+)
+async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_license_vetoes(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    reference_kind: str,
+    observation_object_type: str | None,
+    restriction: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        initial_authority,
+        initial_prepared,
+        _unused_store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+        expected_envelope_version=5,
+    )
+    sample_id = uuid4()
+    association_id = uuid4()
+    document_id = uuid4()
+    observation_id = uuid4()
+    sample_sha256 = "9" * 64
+    observation_version = "source-v1"
+    sample_license_text = "sample license restriction canary"
+    document_license_text = "document license restriction canary"
+    now = datetime.now(UTC)
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
+                assert envelope is not None
+                envelope.disclosure_do_not_submit = restriction == "envelope_do_not_submit"
+                envelope.disclosure_external_llm_allowed = (
+                    restriction != "envelope_external_llm_denied"
+                )
+                envelope.version = 5
+                turn = await session.get(ModelConversationTurnRow, authority.bridge_turn_id)
+                run = await session.get(ModelRunRow, run_id)
+                blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+                assert turn is not None and run is not None and blob is not None
+                sample_sha256 = blob.sha256
+                conversation = await session.get(ModelConversationRow, turn.conversation_id)
+                assert conversation is not None
+                session.add(
+                    SampleRow(
+                        id=sample_id,
+                        subject_id=conversation.subject_id,
+                        blob_id=blob.id,
+                        original_name="bridge-permission-flag-sample.bin",
+                        origin="test",
+                        acquired_at=now,
+                        license_restriction=(
+                            sample_license_text if restriction == "sample_license" else None
+                        ),
+                        tlp="RED" if restriction == "sample_red" else "CLEAR",
+                        do_not_submit=True,
+                        external_llm_allowed=False,
+                        origin_kind="manual",
+                        state="validated",
+                        source_service=None,
+                        source_object_id=sample_sha256,
+                        expected_hash=sample_sha256,
+                        validation_actor=None,
+                        validation_date=None,
+                        validation_reason=None,
+                        imphash=None,
+                        ssdeep=None,
+                        tlsh=None,
+                        rich_header_hash=None,
+                        vhash=None,
+                        main_icon_dhash=None,
+                        imphash_source=None,
+                        ssdeep_source=None,
+                        tlsh_source=None,
+                        rich_header_hash_source=None,
+                        vhash_source=None,
+                        main_icon_dhash_source=None,
+                        created_at=now,
+                    )
+                )
+                session.add(
+                    SampleAssociationRow(
+                        id=association_id,
+                        investigation_id=investigation_id,
+                        sample_id=sample_id,
+                        sample_sha256=sample_sha256,
+                        origin="manual",
+                    )
+                )
+                session.add(
+                    SourceDocumentRow(
+                        id=document_id,
+                        subject_id=conversation.subject_id,
+                        blob_id=blob.id,
+                        original_name="bridge-permission-flag-source.txt",
+                        origin="test",
+                        acquired_at=now,
+                        license_restriction=(
+                            document_license_text if restriction == "document_license" else None
+                        ),
+                        tlp="RED" if restriction == "document_red" else "CLEAR",
+                        do_not_submit=True,
+                        external_llm_allowed=False,
+                        created_at=now,
+                    )
+                )
+                if reference_kind == "evidence_observation":
+                    session.add(
+                        EvidenceObservationRow(
+                            id=observation_id,
+                            investigation_id=investigation_id,
+                            kind="other",
+                            blob_id=blob.id,
+                            sha256=blob.sha256,
+                            source="test.source",
+                            source_version=observation_version,
+                            observed_at=now,
+                            object_type=observation_object_type or "tool_result",
+                            object_id=(
+                                str(document_id)
+                                if observation_object_type == "source_document"
+                                else "synthetic-tool-result"
+                            ),
+                            limitations=[],
+                            invocation_ref=None,
+                        )
+                    )
+                if reference_kind in {"sample", "sample_association_sample"}:
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=(
+                            str(association_id)
+                            if reference_kind == "sample_association_sample"
+                            else str(sample_id)
+                        ),
+                        version=(
+                            "1" if reference_kind == "sample_association_sample" else "sample.v1"
+                        ),
+                        sha256=sample_sha256,
+                    )
+                elif reference_kind == "sample_association":
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=str(association_id),
+                        version="association.v1",
+                        sha256=sample_sha256,
+                    )
+                elif reference_kind == "sample_hash":
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=sample_sha256,
+                        version="sample-hash.v1",
+                        sha256=sample_sha256,
+                    )
+                elif reference_kind == "source_document":
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=str(document_id),
+                        version=f"blob:{blob.id}",
+                        sha256=blob.sha256,
+                    )
+                else:
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=str(observation_id),
+                        version=observation_version,
+                        sha256=blob.sha256,
+                    )
+                run.parameters = {
+                    BRIDGE_SOURCE_PROVENANCE_KEY: {
+                        "family": initial_prepared.family,
+                        "authorized_input_hash": run.authorized_input_hash,
+                        "turn_input_sha256": turn.input_sha256,
+                        "evidence_refs": [source_ref.to_json()],
+                    }
+                }
+
+        prepared = PreparedExternalRequest.build(
+            family=initial_prepared.family,
+            provider=initial_prepared.provider,
+            provider_scope="bridge.responses",
+            normalizer_version=initial_prepared.normalizer_version,
+            canonical_request=initial_prepared.canonical_request,
+            application_request=initial_prepared.application_request,
+            evidence_refs=(source_ref,),
+        )
+        transport = _CountingTransport()
+        outcome = await create_external_effect_coordinator(session_factory).send_one(
+            authority, prepared, transport
+        )
+        if restriction is not None:
+            assert isinstance(outcome, Refused)
+            expected_reason = {
+                "envelope_do_not_submit": "do_not_submit",
+                "envelope_external_llm_denied": "external_llm_not_allowed",
+            }.get(
+                restriction,
+                "sample_source_restricted"
+                if restriction.startswith("sample_")
+                else "source_document_restricted",
+            )
+            assert outcome.reason == expected_reason
+            assert transport.calls == 0
+            assert sample_license_text not in repr(outcome)
+            assert document_license_text not in repr(outcome)
+            assert sample_license_text not in caplog.text
+            assert document_license_text not in caplog.text
+            restriction_text = (
+                sample_license_text
+                if restriction == "sample_license"
+                else document_license_text
+                if restriction == "document_license"
+                else None
+            )
+            if restriction_text is not None:
+                assert restriction_text not in repr(outcome)
+                assert restriction_text not in caplog.text
+            async with session_factory() as session:
+                claim_count = await session.scalar(
+                    select(func.count())
+                    .select_from(ExternalEffectClaimRow)
+                    .where(ExternalEffectClaimRow.investigation_id == investigation_id)
+                )
+            assert claim_count == 0
+            return
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id,
+                        ExternalEffectClaimRow.family == prepared.family,
+                    )
+                )
+            )
+        assert len(claims) == 1
+        assert claims[0].state == "COMPLETED"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_rate_limit_retry_and_correction_consume_one_claim_per_persisted_attempt(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        initial_authority,
+        initial_prepared,
+        _unused_store,
+        first_run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    first_turn_id = initial_authority.bridge_turn_id
+    assert first_turn_id is not None
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+    )
+    coordinator = ExternalEffectCoordinator(_bridge_model_lineage_store(session_factory))
+    first_transport = _CountingTransport(
+        response=TransportResponse(outcome_code="bridge_rate_limited")
+    )
+    second_transport = _CountingTransport()
+    third_transport = _CountingTransport()
+    second_turn_id = uuid4()
+    second_run_id = uuid4()
+    second_request_id = "bridge-request-retry-2"
+    second_input_sha256 = "c" * 64
+    third_turn_id = uuid4()
+    third_run_id = uuid4()
+    third_request_id = "bridge-request-correction-3"
+    third_input_sha256 = "d" * 64
+    now = datetime.now(UTC)
+
+    async def persist_next_attempt(
+        previous_turn_id: UUID,
+        previous_run_id: UUID,
+        *,
+        previous_turn_status: str,
+        previous_run_status: str,
+        turn_id: UUID,
+        run_id: UUID,
+        request_id: str,
+        input_sha256: str,
+    ) -> None:
+        async with session_factory() as session:
+            async with session.begin():
+                previous_turn = await session.get(ModelConversationTurnRow, previous_turn_id)
+                previous_run = await session.get(ModelRunRow, previous_run_id)
+                assert previous_turn is not None and previous_run is not None
+                conversation = await session.get(
+                    ModelConversationRow, previous_turn.conversation_id
+                )
+                assert conversation is not None
+                previous_turn.status = previous_turn_status
+                previous_turn.finished_at = now
+                previous_run.status = previous_run_status
+                previous_run.finished_at = now
+
+                run_values = {
+                    column.name: getattr(previous_run, column.name)
+                    for column in ModelRunRow.__table__.columns
+                }
+                run_values.update(
+                    {
+                        "id": run_id,
+                        "authorized_input_hash": input_sha256,
+                        "status": "running",
+                        "submission_state": "external_state_unknown",
+                        "submission_attempt": 1,
+                        "bridge_request_id": request_id,
+                        "response_id": None,
+                        "output_references": [],
+                        "error_code": None,
+                        "error_message": None,
+                        "error_details": None,
+                        "raw_output_reference": None,
+                        "raw_output_sha256": None,
+                        "raw_output_chars": None,
+                        "normalized_output_reference": None,
+                        "normalized_output_sha256": None,
+                        "duration_ms": None,
+                        "usage": None,
+                        "finished_at": None,
+                        "updated_at": now,
+                        "started_at": now,
+                    }
+                )
+                session.add(ModelRunRow(**run_values))
+                await session.flush()
+
+                turn_values = {
+                    column.name: getattr(previous_turn, column.name)
+                    for column in ModelConversationTurnRow.__table__.columns
+                }
+                turn_values.update(
+                    {
+                        "id": turn_id,
+                        "sequence": previous_turn.sequence + 1,
+                        "parent_turn_id": previous_turn.id,
+                        "model_run_id": run_id,
+                        "input_blob_reference": "sha256:" + input_sha256,
+                        "input_sha256": input_sha256,
+                        "output_blob_reference": None,
+                        "output_sha256": None,
+                        "status": "running",
+                        "external_turn_id": None,
+                        "idempotency_key": request_id,
+                        "correlation_id": request_id,
+                        "error_code": None,
+                        "error_message": None,
+                        "error_details": None,
+                        "created_at": now,
+                        "started_at": now,
+                        "finished_at": None,
+                    }
+                )
+                session.add(ModelConversationTurnRow(**turn_values))
+                conversation.turn_count += 1
+                conversation.version += 1
+                conversation.updated_at = now
+
+    try:
+        first = await coordinator.send_one(authority, initial_prepared, first_transport)
+        assert isinstance(first, Completed)
+        assert first.outcome_code == "bridge_rate_limited"
+        await persist_next_attempt(
+            first_turn_id,
+            first_run_id,
+            previous_turn_status="failed",
+            previous_run_status="failed",
+            turn_id=second_turn_id,
+            run_id=second_run_id,
+            request_id=second_request_id,
+            input_sha256=second_input_sha256,
+        )
+        second_authority = replace(
+            authority,
+            bridge_turn_id=second_turn_id,
+            model_run_id=second_run_id,
+        )
+        second_prepared = PreparedExternalRequest.build(
+            family="bridge.investigation_turn.v1",
+            provider="bridge",
+            provider_scope="bridge-test",
+            normalizer_version="bridge.turn.v1",
+            canonical_request={
+                "model_input_sha256": second_input_sha256,
+                "authorized_input_hash": second_input_sha256,
+                "bridge_request_id": second_request_id,
+            },
+            application_request=FrozenWireRequest(
+                method=b"POST",
+                target=b"/responses",
+                headers=((b"content-type", b"application/json"),),
+                body=b'{"input":"corrected synthetic request"}',
+            ),
+        )
+        retry = await coordinator.send_one(second_authority, second_prepared, second_transport)
+        assert isinstance(retry, Completed)
+        assert first.claim_id != retry.claim_id
+        await persist_next_attempt(
+            second_turn_id,
+            second_run_id,
+            previous_turn_status="succeeded",
+            previous_run_status="succeeded",
+            turn_id=third_turn_id,
+            run_id=third_run_id,
+            request_id=third_request_id,
+            input_sha256=third_input_sha256,
+        )
+        correction_authority = replace(
+            authority,
+            bridge_turn_id=third_turn_id,
+            model_run_id=third_run_id,
+        )
+        correction_prepared = PreparedExternalRequest.build(
+            family="bridge.investigation_turn.v1",
+            provider="bridge",
+            provider_scope="bridge-test",
+            normalizer_version="bridge.turn.v1",
+            canonical_request={
+                "model_input_sha256": third_input_sha256,
+                "authorized_input_hash": third_input_sha256,
+                "bridge_request_id": third_request_id,
+            },
+            application_request=FrozenWireRequest(
+                method=b"POST",
+                target=b"/responses",
+                headers=((b"content-type", b"application/json"),),
+                body=b'{"input":"corrective synthetic request"}',
+            ),
+        )
+        correction = await coordinator.send_one(
+            correction_authority, correction_prepared, third_transport
+        )
+        assert isinstance(correction, Completed)
+        assert len({first.claim_id, retry.claim_id, correction.claim_id}) == 3
+        assert first_transport.calls == second_transport.calls == third_transport.calls == 1
+        async with session_factory() as session:
+            async with session.begin():
+                final_turn = await session.get(ModelConversationTurnRow, third_turn_id)
+                final_run = await session.get(ModelRunRow, third_run_id)
+                assert final_turn is not None and final_run is not None
+                final_turn.status = "succeeded"
+                final_turn.finished_at = now
+                final_run.status = "succeeded"
+                final_run.finished_at = now
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow)
+                    .where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id,
+                        ExternalEffectClaimRow.family == "bridge.investigation_turn.v1",
+                    )
+                    .order_by(ExternalEffectClaimRow.created_at, ExternalEffectClaimRow.id)
+                )
+            )
+        assert len(claims) == 3
+        assert {claim.model_run_id for claim in claims} == {
+            first_run_id,
+            second_run_id,
+            third_run_id,
+        }
+        assert {claim.bridge_turn_id for claim in claims} == {
+            first_turn_id,
+            second_turn_id,
+            third_turn_id,
+        }
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+
+    def uow_factory() -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
+    blob_store = FilesystemBlobStore(tmp_path / f"osint-advisor-{uuid4().hex}")
+    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    seeded = await seed_verified_article(
+        uow_factory,
+        artifact_store,
+        suffix=f"osint-advisor-{uuid4().hex[:12]}",
+        include_seed=True,
+    )
+    policy_service = OsintOpenPolicyService(uow_factory, Settings(_env_file=None))
+    policy = await policy_service.activate(
+        scope_kind=OsintScopeKind.SUBJECT_SET,
+        scope_ref=str(seeded.subject.id),
+        capabilities=OsintCapabilities(
+            allowed_providers=("bridge",),
+            budget_limits={
+                BudgetDimension.VT_UNITS: 0,
+                BudgetDimension.SHODAN_CREDITS: 0,
+                BudgetDimension.DOWNLOADS: 0,
+                BudgetDimension.BRIDGE_TURNS: 4,
+                BudgetDimension.TOOL_SECONDS: 120,
+                BudgetDimension.CONTEXT_BYTES: 1024,
+                BudgetDimension.CONTEXT_TOKENS: 256,
+            },
+            acquire_hits_allowed=False,
+            disclosure=DisclosureBounds(
+                tlp=TLPLevel.CLEAR,
+                do_not_submit=False,
+                external_llm_allowed=True,
+            ),
+            max_effect_claims_per_investigation=10,
+        ),
+        actor_id="human:s3-advisor-integration",
+        reason="Authorize a synthetic inherited Bridge advisor consultation.",
+        correlation_id=f"s3-advisor-policy:{seeded.subject.id}:{uuid4()}",
+    )
+
+    async with uow_factory() as uow:
+        investigation = await uow.analyst_investigations.get(seeded.investigation.id)
+        assert investigation is not None
+        inherited_envelope = await policy_service.ensure_inherited_envelope(
+            uow,
+            investigation=investigation,
+            snapshot=SimpleNamespace(
+                subject_id=seeded.subject.id,
+                tlp=TLPLevel.CLEAR,
+                do_not_submit=False,
+                external_llm_allowed=True,
+            ),
+            at_start=True,
+        )
+        assert inherited_envelope is not None
+        await uow.commit()
+
+    now = datetime.now(UTC)
+    conversation_id: UUID | None = None
+    first_invocation_id = uuid4()
+    first_operation_key = f"advisor-osint-first:{uuid4()}"
+    second_invocation_id = uuid4()
+    second_operation_key = f"advisor-osint-second:{uuid4()}"
+    assert seeded.seed_observation is not None
+    source_document_id = uuid4()
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                SourceDocumentRow(
+                    id=source_document_id,
+                    subject_id=seeded.subject.id,
+                    blob_id=seeded.seed_observation.blob_id,
+                    original_name="synthetic-advisor-source.txt",
+                    origin="test",
+                    acquired_at=now,
+                    license_restriction=None,
+                    tlp="CLEAR",
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    created_at=now,
+                )
+            )
+            observation = await session.get(EvidenceObservationRow, seeded.seed_observation.id)
+            assert observation is not None
+            observation.object_type = "source_document"
+            observation.object_id = str(source_document_id)
+    evidence_refs = (
+        EvidenceReference(
+            kind="evidence_observation",
+            id=str(seeded.seed_observation.id),
+            version=seeded.seed_observation.source_version,
+            sha256=seeded.seed_observation.sha256,
+        ),
+    )
+    arguments = {
+        "consultation_type": "draft_text",
+        "question": "Synthetic advisor request.",
+        "evidence_refs": [str(seeded.seed_observation.id)],
+    }
+    reservation_dimensions = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 10,
+        BudgetDimension.CONTEXT_BYTES: 128,
+        BudgetDimension.CONTEXT_TOKENS: 32,
+    }
+    reservation_json = {key.value: value for key, value in reservation_dimensions.items()}
+    fake_bridge_adapter = _SyntheticOpenAIBridgeAdapter()
+    model_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake_bridge_adapter,
+            openai_structured=fake_bridge_adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        uow_factory,
+        BlobModelOutputStore(BlobCatalogService(blob_store, uow_factory)),
+    )
+    model_conversations = ModelConversationService(uow_factory, model_gateway, blob_store)
+
+    async def persist_attempt(
+        *,
+        index: int,
+        operation_key: str,
+        invocation_id: UUID,
+    ) -> tuple[ExternalEffectAuthority, PreparedExternalRequest]:
+        nonlocal conversation_id
+        async with uow_factory() as uow:
+            envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+            assert envelope is not None
+            envelope.budget.reserve(operation_key, reservation_dimensions)
+            reserved_envelope = replace(envelope, version=envelope.version + 1)
+            await uow.investigation_envelopes.save_if_version(
+                reserved_envelope, expected_version=envelope.version
+            )
+            await uow.commit()
+        assert reserved_envelope.approval_decision_id is not None
+
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    insert(InvestigationBudgetRecordRow)
+                    .values(
+                        investigation_id=seeded.investigation.id,
+                        version=1,
+                        updated_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[InvestigationBudgetRecordRow.investigation_id]
+                    )
+                )
+                await session.execute(update_investigation_status(seeded.investigation.id))
+                session.add(
+                    ToolInvocationRow(
+                        id=invocation_id,
+                        investigation_id=seeded.investigation.id,
+                        operation_key=operation_key,
+                        tool_name="advisor.consult",
+                        schema_version=ADVISOR_SCHEMA_VERSION,
+                        normalized_parameters=arguments,
+                        purpose="Synthetic inherited Bridge advisor consultation.",
+                        status="running",
+                        reserved_budget=reservation_json,
+                        consumed_budget={},
+                        response_refs=[],
+                        created_at=now,
+                        updated_at=now,
+                        version=1,
+                    )
+                )
+                session.add(
+                    InvestigationBudgetReservationRow(
+                        investigation_id=seeded.investigation.id,
+                        operation_key=operation_key,
+                        status="reserved",
+                        sequence=index,
+                    )
+                )
+                await session.flush()
+                session.add_all(
+                    [
+                        InvestigationBudgetReservationAmountRow(
+                            investigation_id=seeded.investigation.id,
+                            operation_key=operation_key,
+                            dimension=dimension.value,
+                            reserved_amount=amount,
+                            committed_amount=None,
+                        )
+                        for dimension, amount in reservation_dimensions.items()
+                    ]
+                )
+
+        if conversation_id is None:
+            conversation = await model_conversations.create(
+                provider=ModelProvider.OPENAI,
+                transport=ConversationTransport.CHATGPT_BRIDGE,
+                purpose=ConversationPurpose.PIVOT_RESEARCH,
+                title="Synthetic inherited advisor conversation",
+                edition_id=None,
+                subject_id=seeded.subject.id,
+                expected_profile=None,
+                requested_model="test-model",
+            )
+            conversation_id = conversation.id
+        turn = await model_conversations.add_turn(
+            conversation_id,
+            message=(
+                f"Synthetic advisor request. Evidence observation {seeded.seed_observation.id}."
+            ),
+            mode=ConversationMode.FRESH if index == 1 else ConversationMode.CONTINUE,
+            external_llm_allowed=True,
+            stateless_external=True,
+            idempotency_key=f"advisor-turn:{uuid4()}",
+            correlation_id=f"advisor-correlation:{uuid4()}",
+            bridge_external_effect_binding=BridgeExternalEffectBinding(
+                authority=ExternalEffectAuthority(
+                    investigation_id=seeded.investigation.id,
+                    invocation_id=invocation_id,
+                    operation_key=operation_key,
+                    reservation_amounts=reservation_json,
+                    expected_envelope_version=reserved_envelope.version,
+                    approval_decision_id=reserved_envelope.approval_decision_id,
+                    invocation_arguments_sha256=hashlib.sha256(
+                        canonical_json_bytes(arguments)
+                    ).hexdigest(),
+                    authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
+                    policy_event_id=policy.event_id,
+                    policy_version=str(policy.version),
+                    pinned_subject_id=seeded.subject.id,
+                ),
+                family="advisor.consultation.v1",
+                provider_scope="bridge.responses",
+                normalizer_version="advisor.consultation.v1",
+                evidence_refs=evidence_refs,
+            ),
+        )
+
+        async with uow_factory() as uow:
+            envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+            run = await uow.model_runs.get(turn.model_run_id)
+            assert envelope is not None and run is not None
+            assert run.bridge_request_id is not None
+            assert conversation_id is not None
+            input_sha256 = turn.input_sha256
+            request_id = run.bridge_request_id
+            run_sha256 = run.authorized_input_hash
+            await uow.commit()
+        async with session_factory() as session:
+            async with session.begin():
+                run_row = await session.get(ModelRunRow, run.id)
+                turn_row = await session.get(ModelConversationTurnRow, turn.id)
+                conversation_row = await session.get(ModelConversationRow, conversation_id)
+                assert run_row is not None and turn_row is not None and conversation_row is not None
+                run_row.status = "running"
+                run_row.submission_state = "external_state_unknown"
+                run_row.submission_attempt = 1
+                run_row.finished_at = None
+                run_row.error_code = None
+                run_row.error_message = None
+                run_row.error_details = None
+                turn_row.status = "running"
+                turn_row.finished_at = None
+                turn_row.error_code = None
+                turn_row.error_message = None
+                turn_row.error_details = None
+                conversation_row.status = "busy"
+                conversation_row.updated_at = now
+
+        authority = ExternalEffectAuthority(
+            investigation_id=seeded.investigation.id,
+            invocation_id=invocation_id,
+            operation_key=operation_key,
+            reservation_amounts=reservation_json,
+            expected_envelope_version=envelope.version,
+            approval_decision_id=envelope.approval_decision_id,
+            invocation_arguments_sha256=hashlib.sha256(canonical_json_bytes(arguments)).hexdigest(),
+            bridge_turn_id=turn.id,
+            model_run_id=run.id,
+            authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
+            policy_event_id=policy.event_id,
+            policy_version=str(policy.version),
+            pinned_subject_id=seeded.subject.id,
+        )
+        prepared = PreparedExternalRequest.build(
+            family="advisor.consultation.v1",
+            provider="bridge",
+            provider_scope="bridge.responses",
+            normalizer_version="advisor.consultation.v1",
+            canonical_request={
+                "authorized_input_hash": run_sha256,
+                "bridge_request_id": request_id,
+                "model_input_sha256": input_sha256,
+            },
+            evidence_refs=evidence_refs,
+            application_request=FrozenWireRequest(
+                method=b"POST",
+                target=b"/responses",
+                headers=((b"content-type", b"application/json"),),
+                body=canonical_json_bytes(
+                    {
+                        "input": (
+                            "Synthetic advisor request. Evidence observation "
+                            f"{seeded.seed_observation.id}."
+                        )
+                    }
+                ),
+            ),
+        )
+        return authority, prepared
+
+    try:
+        active_authority, active_prepared = await persist_attempt(
+            index=1,
+            operation_key=first_operation_key,
+            invocation_id=first_invocation_id,
+        )
+        coordinator = create_external_effect_coordinator(session_factory)
+        transport = _CountingTransport()
+        sent = await coordinator.send_one(active_authority, active_prepared, transport)
+        assert isinstance(sent, Completed)
+        assert transport.calls == 1
+
+        assert active_authority.bridge_turn_id is not None
+        assert active_authority.model_run_id is not None
+        async with session_factory() as session:
+            async with session.begin():
+                active_turn = await session.get(
+                    ModelConversationTurnRow, active_authority.bridge_turn_id
+                )
+                active_run = await session.get(ModelRunRow, active_authority.model_run_id)
+                assert active_turn is not None and active_run is not None
+                active_conversation = await session.get(
+                    ModelConversationRow, active_turn.conversation_id
+                )
+                assert active_conversation is not None
+                active_turn.status = "succeeded"
+                active_turn.finished_at = now
+                active_run.status = "succeeded"
+                active_run.finished_at = now
+                active_conversation.status = "ready"
+                active_conversation.updated_at = now
+
+        revoked_authority, revoked_prepared = await persist_attempt(
+            index=2,
+            operation_key=second_operation_key,
+            invocation_id=second_invocation_id,
+        )
+        revoked = await policy_service.revoke(
+            policy_id=policy.policy_id,
+            expected_version=policy.version,
+            actor_id="human:s3-advisor-integration",
+            reason="Stop further synthetic Bridge consultations.",
+            correlation_id=f"s3-advisor-revoke:{seeded.investigation.id}:{uuid4()}",
+        )
+        assert revoked.status.value == "revoked"
+        refused = await coordinator.send_one(revoked_authority, revoked_prepared, transport)
+        assert isinstance(refused, Refused)
+        assert transport.calls == 1
+
+        async with uow_factory() as uow:
+            human_decisions = await uow.analyst_decisions.list_for_investigation(
+                seeded.investigation.id
+            )
+            persisted_envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == seeded.investigation.id
+                    )
+                )
+            )
+        assert human_decisions == []
+        assert inherited_envelope.authority_kind.value == "osint_policy"
+        assert persisted_envelope is not None
+        assert persisted_envelope.authority_kind.value == "osint_policy"
+        assert len(claims) == 1
+        assert claims[0].invocation_id == first_invocation_id
+        assert claims[0].state == "COMPLETED"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["timeout", "http_500"])
+async def test_bridge_ambiguous_response_needs_review_and_replay_sends_nothing(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        initial_authority,
+        prepared,
+        _unused_store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+    )
+    coordinator = ExternalEffectCoordinator(_bridge_model_lineage_store(session_factory))
+    if failure_kind == "http_500":
+        request = httpx.Request("POST", "https://bridge.test/v1/responses")
+        response = httpx.Response(500, request=request)
+        failure = httpx.HTTPStatusError(
+            "synthetic post-handoff HTTP 500", request=request, response=response
+        )
+    else:
+        failure = httpx.ReadTimeout("synthetic response timeout")
+    transport = _CountingTransport(response=failure)
+    try:
+        first = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(first, Ambiguous)
+        replay = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(replay, Ambiguous)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            claim = await session.get(ExternalEffectClaimRow, first.claim_id)
+            run = await session.get(ModelRunRow, run_id)
+        assert claim is not None and claim.state == "NEEDS_REVIEW"
+        assert claim.bridge_turn_id == authority.bridge_turn_id
+        assert claim.model_run_id == run_id
+        assert run is not None
+        assert run.status == "needs_review"
+        assert run.submission_state == "external_state_unknown"
     finally:
         await engine.dispose()
 
@@ -1155,11 +2394,13 @@ async def test_declared_query_credential_in_canonical_request_is_rejected_before
         ("clear", None),
     ],
 )
-async def test_evidence_observation_source_document_restrictions_are_checked_at_consume(
+@pytest.mark.parametrize("reference_kind", ["evidence_observation", "source_document"])
+async def test_source_document_restrictions_are_checked_at_consume(
     migrated_postgres_url: str,
     tmp_path: Path,
     restriction: str,
     expected_reason: str | None,
+    reference_kind: str,
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
@@ -1207,6 +2448,9 @@ async def test_evidence_observation_source_document_restrictions_are_checked_at_
                 document.external_llm_allowed = False
             elif restriction == "do_not_submit":
                 document.do_not_submit = True
+            document_id = document.id
+            document_blob_id = document.blob_id
+            document_blob_sha256 = blob.sha256
             session.add(
                 EvidenceObservationRow(
                     id=observation_id,
@@ -1223,11 +2467,20 @@ async def test_evidence_observation_source_document_restrictions_are_checked_at_
                     invocation_ref=None,
                 )
             )
-    reference = EvidenceReference(
-        kind="evidence_observation",
-        id=str(observation_id),
-        version=observation_version,
-        sha256=observation_sha256,
+    reference = (
+        EvidenceReference(
+            kind="evidence_observation",
+            id=str(observation_id),
+            version=observation_version,
+            sha256=observation_sha256,
+        )
+        if reference_kind == "evidence_observation"
+        else EvidenceReference(
+            kind="source_document",
+            id=str(document_id),
+            version=f"blob:{document_blob_id}",
+            sha256=document_blob_sha256,
+        )
     )
     prepared = PreparedExternalRequest.build(
         family=base.family,
@@ -1484,7 +2737,7 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
 
 
 @pytest.mark.asyncio
-async def test_human_g2_vt_read_checks_external_llm_source_restriction_at_consume(
+async def test_human_g2_vt_read_permits_acquired_sample_external_llm_flag(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
@@ -1600,9 +2853,8 @@ async def test_human_g2_vt_read_checks_external_llm_source_restriction_at_consum
     transport = _CountingTransport()
     try:
         outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
-        assert isinstance(outcome, Refused)
-        assert outcome.reason == "vt_source_disclosure_denied"
-        assert transport.calls == 0
+        assert not isinstance(outcome, Refused)
+        assert transport.calls == 1
     finally:
         await engine.dispose()
 

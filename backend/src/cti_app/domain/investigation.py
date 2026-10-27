@@ -290,6 +290,9 @@ class InvestigationBudget:
                 raise ValueError("An operation key cannot be reused with a different reservation")
             return existing
         for dimension, amount in requested.items():
+            # Context bytes are recorded for accounting, not used as a disclosure cap.
+            if dimension is BudgetDimension.CONTEXT_BYTES:
+                continue
             limit = self.limits.get(dimension)
             if limit is not None and (
                 self.consumed[dimension] + self.reserved[dimension] + amount > limit

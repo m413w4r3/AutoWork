@@ -31,6 +31,10 @@ from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
     ModelConversationService,
 )
+from cti_app.application.model_gateway import (
+    BridgeExternalEffectBinding,
+    BridgeExternalEffectBindingFactory,
+)
 from cti_app.config import Settings, get_settings
 from cti_app.domain.investigation import canonical_json_bytes
 from cti_app.domain.investigation_state import DecisionValidationCode
@@ -244,6 +248,7 @@ class TurnSubmission:
     retry_after_seconds: float | None = None
     failure_stage: str | None = None
     failure_reason: str | None = None
+    completed_response: bool = False
 
     def __post_init__(self) -> None:
         if self.submission_state is None:
@@ -274,6 +279,7 @@ async def submit_bridge_consultation_once(
     deadline_monotonic: float | None = None,
     minimum_timeout_seconds: float = 0,
     clock: Callable[[], float] | None = None,
+    external_effect_binding_context: Mapping[str, Any] | None = None,
 ) -> TurnSubmission:
     """Submit one non-decision consultation using Bridge's shared pacing and transport."""
     key = make_investigation_turn_idempotency_key(
@@ -345,28 +351,64 @@ async def submit_bridge_consultation_once(
         transport_timeout = timeout_seconds
 
     async def submit(attempt: int, call_timeout_seconds: float | None) -> TurnSubmission | None:
-        if attempt == 0:
-            return await transport.submit(
+        submission_kwargs: dict[str, Any] = {
+            "investigation_id": investigation_id,
+            "subject_id": subject_id,
+            "turn_index": turn_index,
+            "context_sha256": context_sha256,
+            "prompt": prompt,
+            "external_llm_allowed": True,
+            "timeout_seconds": call_timeout_seconds,
+        }
+        binding_builder = getattr(transport, "build_external_effect_binding", None)
+        binding: BridgeExternalEffectBinding | None = None
+        if callable(binding_builder):
+            binding_context = dict(external_effect_binding_context or {})
+            binding_context.update(
+                family="advisor.consultation.v1",
                 investigation_id=investigation_id,
                 subject_id=subject_id,
                 turn_index=turn_index,
+                attempt=attempt,
                 context_sha256=context_sha256,
                 prompt=prompt,
-                external_llm_allowed=True,
-                timeout_seconds=call_timeout_seconds,
+            )
+            try:
+                binding = await binding_builder(**binding_context)
+            except Exception:
+                return TurnSubmission(
+                    TurnSubmissionStatus.UNAVAILABLE,
+                    idempotency_key=key,
+                    conversation_id=conversation_id,
+                    detail="Advisor external-effect authorization is unavailable.",
+                    error_code="external_effect_authority_unavailable",
+                    submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                    failure_stage="external_effect_authority",
+                    failure_reason="binding_unavailable",
+                )
+        if binding is not None:
+            submission_kwargs["bridge_external_effect_binding"] = binding
+        elif getattr(transport, "requires_external_effect_authority", False):
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                idempotency_key=key,
+                conversation_id=conversation_id,
+                detail="Advisor external-effect authorization is required.",
+                error_code="external_effect_authority_required",
+                submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                failure_stage="external_effect_authority",
+                failure_reason="authority_context_missing",
+            )
+        if attempt == 0:
+            return await transport.submit(
+                **submission_kwargs,
             )
         submit_with_attempt = getattr(transport, "submit_with_attempt", None)
         if not callable(submit_with_attempt):
             return None
         attempt_aware_transport = cast(_AttemptAwareInvestigationTurnTransport, transport)
         return await attempt_aware_transport.submit_with_attempt(
-            investigation_id=investigation_id,
-            subject_id=subject_id,
-            turn_index=turn_index,
-            context_sha256=context_sha256,
-            prompt=prompt,
-            external_llm_allowed=True,
-            timeout_seconds=call_timeout_seconds,
+            **submission_kwargs,
             attempt=attempt,
         )
 
@@ -474,9 +516,16 @@ async def submit_bridge_consultation_once(
     if (
         submission.status is not TurnSubmissionStatus.UNAVAILABLE
         or not is_rate_limited
-        or submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
+        or (
+            submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
+            and not submission.completed_response
+        )
     ):
-        if submission.status is TurnSubmissionStatus.UNAVAILABLE and is_rate_limited:
+        if (
+            submission.status is TurnSubmissionStatus.UNAVAILABLE
+            and is_rate_limited
+            and not submission.completed_response
+        ):
             return TurnSubmission(
                 TurnSubmissionStatus.NEEDS_REVIEW,
                 idempotency_key=submission.idempotency_key or key,
@@ -587,11 +636,27 @@ class ModelConversationTurnTransport:
         provider: ModelProvider = ModelProvider.OPENAI,
         transport: ConversationTransport = ConversationTransport.CHATGPT_BRIDGE,
         requested_model: str | None = None,
+        bridge_external_effect_binding_factory: BridgeExternalEffectBindingFactory | None = None,
+        require_external_effect_authority: bool = False,
     ) -> None:
         self._model_conversations = model_conversations
         self._provider = ModelProvider(provider)
         self._transport = ConversationTransport(transport)
         self._requested_model = requested_model
+        self._bridge_external_effect_binding_factory = bridge_external_effect_binding_factory
+        self.requires_external_effect_authority = (
+            require_external_effect_authority or bridge_external_effect_binding_factory is not None
+        )
+
+    async def build_external_effect_binding(
+        self, *, family: str, **attempt: Any
+    ) -> BridgeExternalEffectBinding | None:
+        if self._bridge_external_effect_binding_factory is None:
+            return None
+        return await self._bridge_external_effect_binding_factory(
+            family=family,
+            **attempt,
+        )
 
     async def reconcile_orphaned_investigation_turn(
         self,
@@ -675,6 +740,7 @@ class ModelConversationTurnTransport:
         external_llm_allowed: bool,
         timeout_seconds: float | None = None,
         attempt: int = 0,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> TurnSubmission:
         key = make_investigation_turn_idempotency_key(
             investigation_id=investigation_id,
@@ -802,6 +868,7 @@ class ModelConversationTurnTransport:
                 context_subject_id=subject_id,
                 lifecycle_policy=ConversationPolicy.KEEP,
                 timeout_seconds=timeout_seconds,
+                bridge_external_effect_binding=bridge_external_effect_binding,
             )
             if turn.status is ConversationTurnStatus.NEEDS_REVIEW:
                 captured = await self._recover_persisted_output(
@@ -901,10 +968,12 @@ class ModelConversationTurnTransport:
             if captured is not None:
                 return captured
             submission_state = _normalize_bridge_submission_state(exc.submission_state)
+            completed_response = exc.completed_response
             submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             status = (
                 TurnSubmissionStatus.NEEDS_REVIEW
-                if exc.status is ConversationTurnStatus.NEEDS_REVIEW or submitted
+                if not completed_response
+                and (exc.status is ConversationTurnStatus.NEEDS_REVIEW or submitted)
                 else TurnSubmissionStatus.UNAVAILABLE
             )
             return TurnSubmission(
@@ -914,12 +983,13 @@ class ModelConversationTurnTransport:
                 detail=str(exc),
                 error_code=exc.code,
                 submission_state=submission_state,
-                retryable=exc.retryable and not submitted,
+                retryable=exc.retryable and (not submitted or completed_response),
                 retry_after_seconds=getattr(
                     exc, "retry_after_seconds", getattr(exc, "retry_after", None)
                 ),
                 failure_stage=str(getattr(exc, "failure_stage", "conversation_turn"))[:64],
                 failure_reason=str(getattr(exc, "failure_reason", exc.code))[:128],
+                completed_response=completed_response,
             )
         except ConversationPolicyError as exc:
             return TurnSubmission(
@@ -941,6 +1011,7 @@ class ModelConversationTurnTransport:
             submission_state = _normalize_bridge_submission_state(
                 getattr(exc, "submission_state", None)
             )
+            completed_response = getattr(exc, "completed_response", False) is True
             error_code = str(getattr(exc, "code", ""))[:64] or None
             if error_code == "model_submission_reconciliation_required":
                 submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
@@ -948,7 +1019,7 @@ class ModelConversationTurnTransport:
             return TurnSubmission(
                 (
                     TurnSubmissionStatus.NEEDS_REVIEW
-                    if submitted
+                    if submitted and not completed_response
                     else TurnSubmissionStatus.UNAVAILABLE
                 ),
                 idempotency_key=key,
@@ -958,11 +1029,15 @@ class ModelConversationTurnTransport:
                 submission_state=submission_state,
                 retryable=(
                     bool(getattr(exc, "retryable", False))
-                    and submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                    and (
+                        submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                        or completed_response
+                    )
                 ),
                 retry_after_seconds=getattr(exc, "retry_after", None),
                 failure_stage=str(getattr(exc, "phase", failure_stage))[:64],
                 failure_reason=str(getattr(exc, "code", None) or type(exc).__name__)[:128],
+                completed_response=completed_response,
             )
 
     async def submit_with_attempt(
@@ -976,6 +1051,7 @@ class ModelConversationTurnTransport:
         external_llm_allowed: bool,
         attempt: int,
         timeout_seconds: float | None = None,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> TurnSubmission:
         return await self.submit(
             investigation_id=investigation_id,
@@ -986,6 +1062,7 @@ class ModelConversationTurnTransport:
             external_llm_allowed=external_llm_allowed,
             timeout_seconds=timeout_seconds,
             attempt=attempt,
+            bridge_external_effect_binding=bridge_external_effect_binding,
         )
 
 
@@ -1090,6 +1167,9 @@ class ScriptedTurnTransport:
                     bridge_invocation_id=raw.bridge_invocation_id,
                     provider_usage=raw.provider_usage,
                     retry_after_seconds=raw.retry_after_seconds,
+                    failure_stage=raw.failure_stage,
+                    failure_reason=raw.failure_reason,
+                    completed_response=raw.completed_response,
                 )
             elif isinstance(raw, Mapping):
                 submission = TurnSubmission(
@@ -1167,6 +1247,10 @@ class BridgeInvestigator:
                 rng=rng,
             )
 
+    @property
+    def requires_external_effect_authority(self) -> bool:
+        return bool(getattr(self._transport, "requires_external_effect_authority", False))
+
     async def _sleep(self, seconds: float) -> None:
         if self._sleeper is None:
             await asyncio.sleep(seconds)
@@ -1205,6 +1289,7 @@ class BridgeInvestigator:
         external_llm_allowed: bool,
         on_invalid_output: Callable[[str, str], Awaitable[None]] | None = None,
         before_submission: Callable[[], Awaitable[bool]] | None = None,
+        external_effect_binding_context: Mapping[str, Any] | None = None,
     ) -> BridgeTurnResult:
         if not external_llm_allowed:
             context_sha256 = hashlib.sha256(context.canonical_bytes()).hexdigest()
@@ -1269,6 +1354,51 @@ class BridgeInvestigator:
                             submissions_made=submissions_made,
                             attempts_made=attempts_made,
                         )
+                submission_kwargs.pop("bridge_external_effect_binding", None)
+                binding_builder = getattr(self._transport, "build_external_effect_binding", None)
+                binding: BridgeExternalEffectBinding | None = None
+                if callable(binding_builder):
+                    try:
+                        binding_context = dict(external_effect_binding_context or {})
+                        binding_context.update(
+                            family="bridge.investigation_turn.v1",
+                            investigation_id=investigation_id,
+                            subject_id=subject_id,
+                            turn_index=turn_index,
+                            attempt=request_attempt,
+                            context=active_context,
+                            context_sha256=context_sha256,
+                            prompt=submission_kwargs["prompt"],
+                        )
+                        binding = await binding_builder(
+                            **binding_context,
+                        )
+                    except Exception:
+                        return BridgeTurnResult(
+                            TurnSubmissionStatus.UNAVAILABLE,
+                            None,
+                            context_sha256,
+                            idempotency_key,
+                            detail="Bridge external-effect authorization is unavailable.",
+                            submissions_made=submissions_made,
+                            attempts_made=attempts_made,
+                            submission_state="pre_submission",
+                        )
+                if binding is None and getattr(
+                    self._transport, "requires_external_effect_authority", False
+                ):
+                    return BridgeTurnResult(
+                        TurnSubmissionStatus.UNAVAILABLE,
+                        None,
+                        context_sha256,
+                        idempotency_key,
+                        detail="Bridge external-effect authorization is required.",
+                        submissions_made=submissions_made,
+                        attempts_made=attempts_made,
+                        submission_state="pre_submission",
+                    )
+                if binding is not None:
+                    submission_kwargs["bridge_external_effect_binding"] = binding
                 try:
                     await self._pacer.wait_for_next_submission()
                 except asyncio.CancelledError as exc:
@@ -1325,6 +1455,7 @@ class BridgeInvestigator:
                     submission.status is TurnSubmissionStatus.UNAVAILABLE
                     and submission.submission_state is BridgeSubmissionState.PRE_SUBMISSION
                 )
+                completed_rejection = submission.completed_response
                 if (
                     not confirmed_not_submitted
                     and submission.status is not TurnSubmissionStatus.BLOCKED
@@ -1351,8 +1482,11 @@ class BridgeInvestigator:
                 may_retry_other_pre_submission = (
                     not is_rate_limited and pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
                 )
+                retryable_submission = confirmed_not_submitted or (
+                    completed_rejection and is_rate_limited
+                )
                 if (
-                    confirmed_not_submitted
+                    retryable_submission
                     and submission.retryable
                     and (may_retry_rate_limit or may_retry_other_pre_submission)
                 ):
@@ -1380,6 +1514,7 @@ class BridgeInvestigator:
             assert submission is not None
             uncertain_retryable_failure = (
                 submission.status is TurnSubmissionStatus.UNAVAILABLE
+                and not submission.completed_response
                 and submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
                 and (
                     submission.retryable
