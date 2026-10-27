@@ -3921,6 +3921,23 @@ async def test_claim_verification_requires_non_claim_source_evidence() -> None:
     assert any("observation de preuve" in item for item in findings[0].limitations)
 
 
+def test_vt_read_ignores_source_do_not_submit_but_keeps_envelope_veto() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    source_flagged_snapshot = replace(fixture.snapshot, do_not_submit=True)
+    restricted_envelope = replace(
+        fixture.envelope,
+        disclosure=replace(fixture.envelope.disclosure, do_not_submit=True),
+    )
+
+    assert InvestigationService.vt_external_disclosure_allowed(
+        source_flagged_snapshot, fixture.envelope, "vt.file_report"
+    )
+    assert not InvestigationService.vt_external_disclosure_allowed(
+        fixture.snapshot, restricted_envelope, "vt.file_report"
+    )
+    assert InvestigationService.bridge_disclosure_allowed(source_flagged_snapshot, fixture.envelope)
+
+
 @pytest.mark.asyncio
 async def test_bridge_submits_when_source_permission_flags_are_false() -> None:
     fixture = _Fixture(

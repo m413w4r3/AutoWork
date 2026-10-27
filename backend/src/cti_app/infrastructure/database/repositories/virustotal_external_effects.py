@@ -13,6 +13,7 @@ from cti_app.application.external_effects import (
     ConsumePolicyContext,
     ExternalEffectClaim,
     ReuseDecision,
+    external_effect_source_do_not_submit_blocks,
 )
 from cti_app.application.virustotal import VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES
 from cti_app.domain.external_effects import (
@@ -448,7 +449,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if {item.id for item in samples} != sample_ids or any(
                 item.tlp.casefold() == "red"
-                or item.do_not_submit
+                or external_effect_source_do_not_submit_blocks(
+                    context.prepared.family, item.do_not_submit
+                )
                 or bool((item.license_restriction or "").strip())
                 for item in samples
             ):
@@ -475,7 +478,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if any(
                 item.tlp.casefold() == "red"
-                or item.do_not_submit
+                or external_effect_source_do_not_submit_blocks(
+                    context.prepared.family, item.do_not_submit
+                )
                 or bool((item.license_restriction or "").strip())
                 for item in hash_samples
             ):
@@ -493,7 +498,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if {item.id for item in documents} != document_ids or any(
                 item.tlp.casefold() == "red"
-                or item.do_not_submit
+                or external_effect_source_do_not_submit_blocks(
+                    context.prepared.family, item.do_not_submit
+                )
                 or bool((item.license_restriction or "").strip())
                 for item in documents
             ):
