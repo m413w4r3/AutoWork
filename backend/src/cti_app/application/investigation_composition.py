@@ -1084,7 +1084,6 @@ def build_investigation_composition(
     optional_tool_ports: OptionalInvestigationToolPorts | None = None,
     tool_registrar: ToolRegistrar | None = None,
     turn_transport: InvestigationTurnTransport | None = None,
-    advisor_turn_transport: InvestigationTurnTransport | None = None,
     operator_mode: bool = False,
 ) -> InvestigationComposition:
     article_snapshots = ProductionArticleSnapshotAdapter(uow_factory, artifact_store)
@@ -1564,38 +1563,28 @@ def build_investigation_composition(
                 settings=settings,
             ),
         )
-
-    # Operator-led mode can reuse its turn transport. A Bridge-led composition
-    # must inject a separate authority-bound advisor transport explicitly so an
-    # ordinary investigator turn transport is never treated as authorization.
-    advisor_transport = advisor_turn_transport
-    if advisor_transport is None and operator_led:
-        advisor_transport = turn_transport
-    advisor_unavailable_reason = "bridge_transport_unavailable"
-    if advisor_transport is not None and not operator_led and not getattr(
-        advisor_transport, "requires_external_effect_authority", False
-    ):
-        advisor_transport = None
-        advisor_unavailable_reason = "external_effect_authority_required"
-    if advisor_transport is not None:
-        advisor_tool = InvestigationAdvisorTool(
-            transport=advisor_transport,
-            settings=settings,
-            investigations=uow.analyst_investigations,
-            observations=uow.evidence_observations,
-            findings=uow.investigation_findings,
-            investigation_states=uow.investigation_states,
-            experiments=getattr(uow, "investigation_experiments", None),
-            source_documents=getattr(uow, "source_documents", None),
-            opinions=uow.analyst_opinions,
-            sample_associations=uow.sample_associations,
-            samples=getattr(uow, "samples", None),
-            blobs=getattr(uow, "blobs", None),
-            article_snapshots=dependencies.article_snapshots,
-            artifact_store=artifact_store,
-            registry=registry,
-        )
-        register_investigation_advisor_tool(registry, adapter=advisor_tool)
+        # ModelConversationService always exposes conversation persistence
+        # methods, even when no Bridge transport is configured. Only an
+        # explicitly injected turn transport proves the advisor can execute.
+        if turn_transport is not None:
+            advisor_tool = InvestigationAdvisorTool(
+                transport=turn_transport,
+                settings=settings,
+                investigations=uow.analyst_investigations,
+                observations=uow.evidence_observations,
+                findings=uow.investigation_findings,
+                investigation_states=uow.investigation_states,
+                experiments=getattr(uow, "investigation_experiments", None),
+                source_documents=getattr(uow, "source_documents", None),
+                opinions=uow.analyst_opinions,
+                sample_associations=uow.sample_associations,
+                samples=getattr(uow, "samples", None),
+                blobs=getattr(uow, "blobs", None),
+                article_snapshots=dependencies.article_snapshots,
+                artifact_store=artifact_store,
+                registry=registry,
+            )
+            register_investigation_advisor_tool(registry, adapter=advisor_tool)
 
     if tool_registrar is not None:
         tool_registrar(registry, dependencies)
@@ -1620,12 +1609,13 @@ def build_investigation_composition(
             "opinion.compose",
             "opinion.revise",
             "opinion.note",
+            "advisor.consult",
         ):
             unavailable_tool_reasons[name] = "operator_mode_required"
     else:
         unavailable_tool_reasons["sample.set_qualification"] = "human_qualification_required"
-    if advisor_tool is None:
-        unavailable_tool_reasons["advisor.consult"] = advisor_unavailable_reason
+        if advisor_tool is None:
+            unavailable_tool_reasons["advisor.consult"] = "bridge_transport_unavailable"
     registry.set_availability_catalog(OPTIONAL_TOOL_NAMES, unavailable_tool_reasons)
     availability_context = ToolExecutionContext(
         investigation_id=investigation_id,
@@ -1814,7 +1804,6 @@ class InvestigationCompositionFactory:
     optional_tool_ports: OptionalInvestigationToolPorts | None = None
     tool_registrar: ToolRegistrar | None = None
     turn_transport: InvestigationTurnTransport | None = None
-    advisor_turn_transport: InvestigationTurnTransport | None = None
     tool_dependencies: InvestigationToolDependencies | None = None
 
     @property
@@ -1843,6 +1832,5 @@ class InvestigationCompositionFactory:
             optional_tool_ports=self.optional_tool_ports,
             tool_registrar=self.tool_registrar,
             turn_transport=self.turn_transport,
-            advisor_turn_transport=self.advisor_turn_transport,
             operator_mode=operator_mode,
         )

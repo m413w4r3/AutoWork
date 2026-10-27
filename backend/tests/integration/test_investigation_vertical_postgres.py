@@ -21,6 +21,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmissionStatus,
 )
 from cti_app.application.external_effects import ExternalEffectCoordinator
+from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     BRIDGE_SOURCE_PROVENANCE_KEY,
@@ -142,6 +143,16 @@ from tests.workflow_emulator.investigation_support import (
 pytestmark = pytest.mark.integration
 
 
+class _ContinuousOsintIdentityProvider:
+    def __init__(self) -> None:
+        self.identity = Identity(
+            "human:m07-continuous-osint", frozenset({IdentityScope.HUMAN_OPERATOR})
+        )
+
+    async def current(self) -> Identity:
+        return self.identity
+
+
 class _PartialDownloadFailureStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield b"partial-synthetic-sample"
@@ -205,223 +216,6 @@ def _real_vt_runtime_ports(
         ghidra_adapter=None,
     )
     return engine, runtime.optional_tool_ports
-
-
-class _ContinuousOsintTransport(_VerticalScriptedTransport):
-    """Enqueue each next step only after its evidence is persisted."""
-
-    def __init__(
-        self,
-        *,
-        uow_factory,
-        investigation_id: UUID,
-        candidate_hash: str,
-        seed_observation_id: UUID,
-        final_builder,
-    ) -> None:
-        self._investigation_id = investigation_id
-        self._candidate_hash = candidate_hash
-        self._download_enqueued = False
-        self._analysis_enqueued = False
-        self._advisor_enqueued = False
-        super().__init__(
-            [
-                _decision(
-                    "Read the canonical report for the article seed.",
-                    tool_call={
-                        "tool_name": "vt.file_report",
-                        "schema_version": "1",
-                        "arguments": {"file_hash": _SEED_HASH},
-                        "purpose": "Check the VT report for the article's persisted seed hash.",
-                    },
-                ),
-                _decision(
-                    "Search VT Intelligence from the seed observation for a candidate.",
-                    tool_call={
-                        "tool_name": "vt.intelligence_search",
-                        "schema_version": "1",
-                        "arguments": {
-                            "query": "type:peexe",
-                            "justification": (
-                                "Find a file candidate related to the persisted article seed."
-                            ),
-                            "evidence_refs": [str(seed_observation_id)],
-                        },
-                        "purpose": "Pivot from the cited seed into VT Intelligence Search.",
-                    },
-                ),
-            ],
-            uow_factory=uow_factory,
-            investigation_id=investigation_id,
-            material=_SyntheticSampleMaterial(
-                seed_hash=_SEED_HASH,
-                sample_bytes=b"unused-bytes-for-dynamic-transport",
-                sample_hash=candidate_hash,
-            ),
-            inject_analysis_at_turn=None,
-            analyze_pending_samples=False,
-            final_response_builder=final_builder,
-        )
-
-    async def submit(self, **kwargs: Any):
-        async with self._uow_factory() as uow:
-            invocations = tuple(
-                await uow.tool_invocations.list_for_investigation(self._investigation_id)
-            )
-            associations = tuple(
-                await uow.sample_associations.list_for_investigation(self._investigation_id)
-            )
-            observations = tuple(
-                await uow.evidence_observations.list_for_investigation(self._investigation_id)
-            )
-            decisions = tuple(
-                await uow.analyst_decisions.list_for_investigation(self._investigation_id)
-            )
-        invocations_by_name = {item.tool_name: item for item in invocations}
-        pivot_invocation = invocations_by_name.get("vt.intelligence_search")
-        if (
-            not self._download_enqueued
-            and pivot_invocation is not None
-            and pivot_invocation.status is ToolInvocationStatus.SUCCEEDED
-        ):
-            pivot_observation = next(
-                item
-                for item in observations
-                if item.object_id == self._candidate_hash and item.source == "VirusTotal"
-            )
-            self._responses.appendleft(
-                _decision(
-                    "Acquire only the hash named by the persisted pivot observation.",
-                    tool_call={
-                        "tool_name": "vt.download_sample",
-                        "schema_version": "1",
-                        "arguments": {
-                            "sha256": self._candidate_hash,
-                            "purpose": "Acquire the candidate named by VT Intelligence Search.",
-                            "evidence_refs": [str(pivot_observation.id)],
-                        },
-                        "purpose": "Quarantine the pivot candidate without G3 qualification.",
-                    },
-                )
-            )
-            self._download_enqueued = True
-
-        download_invocation = invocations_by_name.get("vt.download_sample")
-        if (
-            download_invocation is not None
-            and download_invocation.status is ToolInvocationStatus.SUCCEEDED
-            and not self._analysis_enqueued
-        ):
-            association = next(
-                item for item in associations if item.sample_sha256 == self._candidate_hash
-            )
-            assert association.qualification is SampleQualification.CANDIDATE
-            assert decisions == (), "The candidate must remain unqualified before sample.analyze."
-            pivot_observation = next(
-                item
-                for item in observations
-                if item.source == "VirusTotal" and item.object_id == self._candidate_hash
-            )
-            self._responses.appendleft(
-                _decision(
-                    "Analyze the quarantined candidate association created by its download.",
-                    tool_call={
-                        "tool_name": "sample.analyze",
-                        "schema_version": "1",
-                        "arguments": {
-                            "association_id": str(association.id),
-                            "purpose": "Run bounded static analysis on the quarantined candidate.",
-                            "evidence_refs": [str(pivot_observation.id)],
-                        },
-                        "purpose": "Measure the persisted candidate locally without qualifying it.",
-                    },
-                )
-            )
-            self._analysis_enqueued = True
-
-        analysis_invocation = invocations_by_name.get("sample.analyze")
-        if (
-            analysis_invocation is not None
-            and analysis_invocation.status
-            in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-            and not self._advisor_enqueued
-        ):
-            analysis_observation = next(
-                item
-                for item in observations
-                if item.source.startswith("autowork.analysis_worker")
-                and item.object_type == "sample"
-                and item.object_id == self._candidate_hash
-            )
-            self.enqueue(
-                _decision(
-                    "Ask the Bridge advisor whether this local measurement "
-                    "discriminates the candidate.",
-                    tool_call={
-                        "tool_name": "advisor.consult",
-                        "schema_version": "advisor-consult.v1",
-                        "arguments": {
-                            "consultation_type": "draft_text",
-                            "question": (
-                                "Does this persisted static analysis measurement distinguish the "
-                                "inert loader candidate from an arbitrary file? State the "
-                                "observation and the remaining uncertainty."
-                            ),
-                            "evidence_refs": [str(analysis_observation.id)],
-                            "assertions": [
-                                {
-                                    "id": "static_analysis_measurement",
-                                    "text": (
-                                        "The persisted static measurement distinguishes this "
-                                        "candidate without establishing execution or attribution."
-                                    ),
-                                    "nature": "analyse",
-                                    "refs": [
-                                        {
-                                            "kind": "observation",
-                                            "id": str(analysis_observation.id),
-                                        }
-                                    ],
-                                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
-                                    "form": "body",
-                                    "anchor": None,
-                                }
-                            ],
-                        },
-                        "purpose": (
-                            "Assess the discriminating sample-analysis observation and its limits."
-                        ),
-                    },
-                )
-            )
-            self._advisor_enqueued = True
-        return await super().submit(**kwargs)
-
-
-class _RecordingAdvisorAdapter:
-    def __init__(self, delegate: Any, results: list[Any]) -> None:
-        self._delegate = delegate
-        self._results = results
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._delegate, name)
-
-    async def execute(self, arguments: Any, context: Any) -> Any:
-        result = await self._delegate.execute(arguments, context)
-        self._results.append(result)
-        return result
-
-
-def _advisor_result_recorder(results: list[Any]):
-    def register(registry: Any, _dependencies: Any) -> None:
-        registered = registry.get("advisor.consult", "advisor-consult.v1")
-        if registered is None:
-            return
-        definition, adapter = registered
-        registry.unregister(definition.name, definition.schema_version)
-        registry.register(definition, _RecordingAdvisorAdapter(adapter, results))
-
-    return register
 
 
 @pytest.mark.asyncio
@@ -948,6 +742,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         material=material,
     )
     assert seeded.seed_observation is not None
+    assert seeded.seed_observation.object_id == _SEED_HASH
     investigation_id = seeded.investigation.id
     candidate_hash = material.sample_hash
 
@@ -1119,99 +914,6 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         require_external_effect_authority=True,
     )
 
-    async def final_response_builder(observations):
-        async with uow_factory() as uow:
-            findings = tuple(
-                await uow.investigation_findings.list_for_investigation(investigation_id)
-            )
-        supported_findings = tuple(
-            item
-            for item in findings
-            if item.assessment is FindingAssessment.SUPPORTED and item.observation_refs
-        )
-        if not supported_findings:
-            pivot_observation = next(
-                (
-                    item
-                    for item in observations
-                    if item.source == "VirusTotal" and item.object_id == candidate_hash
-                ),
-                None,
-            )
-            assert pivot_observation is not None
-            analysis_observation = next(
-                (
-                    item
-                    for item in observations
-                    if item.source.startswith("autowork.analysis_worker")
-                    and item.object_type == "sample"
-                    and item.object_id == candidate_hash
-                ),
-                None,
-            )
-            assert analysis_observation is not None
-            return _decision(
-                "Record the candidate's discriminating local measurement and remaining limits.",
-                next_action="continue",
-                finding_proposals=[
-                    {
-                        "kind": FindingKind.NEW_SAMPLE.value,
-                        "assessment": FindingAssessment.SUPPORTED.value,
-                        "statement": (
-                            "The VT pivot candidate has a persisted local static-analysis "
-                            "measurement."
-                        ),
-                        "observation_refs": [
-                            str(pivot_observation.id),
-                            str(analysis_observation.id),
-                        ],
-                        "subject_ref": candidate_hash,
-                        "claim_refs": [],
-                        "novelty": NoveltyClass.NEW_TO_ARTICLE.value,
-                        "scope": "Compared only with the verified article snapshot.",
-                        "limitations": [
-                            "Static analysis does not establish execution or incident attribution."
-                        ],
-                    }
-                ],
-            )
-
-        evidence_refs = tuple(
-            sorted(
-                {ref for item in supported_findings for ref in item.observation_refs},
-                key=lambda ref: ref.hex,
-            )
-        )
-        response = _decision(
-            "Persist the cited result, its limits, and the next editorial decision.",
-            next_action="finish",
-        )
-        response["opinion_delta"] = {
-            "blocks": [
-                {
-                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
-                    "text": (
-                        "The article-relative VT pivot returned a quarantined candidate with a "
-                        "local static-analysis measurement; execution and attribution remain "
-                        "unestablished."
-                    ),
-                    "finding_refs": [str(item.id) for item in supported_findings],
-                    "evidence_refs": [str(item) for item in evidence_refs],
-                    "qualification": OpinionClaimQualification.FACT.value,
-                    "certainty": 0.8,
-                }
-            ]
-        }
-        return response
-
-    scripted = _ContinuousOsintTransport(
-        uow_factory=uow_factory,
-        investigation_id=investigation_id,
-        candidate_hash=candidate_hash,
-        seed_observation_id=seeded.seed_observation.id,
-        final_builder=final_response_builder,
-    )
-    advisor_results: list[Any] = []
     settings = _settings(providers=True, local_analysis=True)
     runtime_engine, runtime_ports = _real_vt_runtime_ports(
         database_url=migrated_postgres_url,
@@ -1233,23 +935,19 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
         settings=settings,
-        transport=scripted,
+        transport=coordinated_advisor_transport,
         virustotal=vt_adapter,
         include_local_analysis=True,
         # Preserve W15's in-process confined worker. The production runtime's
         # default execution port is not allowed to override that test harness.
         additional_ports=replace(runtime_ports, confined_analysis_execution=None),
     )
-    composition_factory = replace(
-        composition_factory,
-        advisor_turn_transport=coordinated_advisor_transport,
-        tool_registrar=_advisor_result_recorder(advisor_results),
-    )
-    app, registry, dispatcher = _build_app(
+    app, _, _ = _build_app(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
         composition_factory=composition_factory,
     )
+    app.state.identity_provider = _ContinuousOsintIdentityProvider()
 
     try:
         async with httpx.AsyncClient(
@@ -1261,35 +959,265 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     "production_run_id": str(seeded.run.id),
                     "synthesis_artifact_id": str(seeded.synthesis.id),
                     "synthesis_sha256": seeded.synthesis.input_hash,
+                    "execution_mode": "operator_led",
                 },
             )
             assert started_response.status_code == 200, started_response.text
-            started = started_response.json()
-            job_id = UUID(started["job_id"])
+            app.state.identity_provider.identity = Identity(
+                "operator:m07-continuous-osint-client",
+                frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
 
             async with uow_factory() as uow:
                 envelope = await uow.investigation_envelopes.get(investigation_id)
+                working_state = await uow.investigation_states.get(investigation_id)
                 inheritance = await uow.osint_open_policies.get_inheritance(investigation_id)
                 decisions = await uow.analyst_decisions.list_for_investigation(investigation_id)
             assert envelope is not None
+            assert working_state is not None
+            assert working_state.execution_mode.value == "operator_led"
             assert envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
             assert envelope.inherited_policy_event_id == policy.event_id
             assert inheritance is not None and inheritance.policy_event_id == policy.event_id
             assert tuple(decisions) == ()
 
-            await _run_http_job(app, uow_factory, registry, dispatcher, job_id)
+            operator_results: dict[str, dict[str, Any]] = {}
+            operator_requests: list[tuple[str, str, dict[str, Any]]] = []
+
+            def tool_diagnostic(tool_name: str, result: dict[str, Any]) -> str:
+                invocation_view = result.get("invocation", {})
+                return (
+                    f"{tool_name} status={invocation_view.get('status')!r} "
+                    f"error_code={invocation_view.get('error_code')!r} "
+                    f"output={result.get('output')!r} "
+                    f"advisor_output={result.get('advisor_output')!r}"
+                )
+
+            def assert_tool_status(
+                tool_name: str, result: dict[str, Any], expected: str | tuple[str, ...]
+            ) -> None:
+                expected_statuses = (expected,) if isinstance(expected, str) else expected
+                assert result["invocation"]["status"] in expected_statuses, tool_diagnostic(
+                    tool_name, result
+                )
+
+            async def invoke_operator_tool(
+                tool_name: str,
+                schema_version: str,
+                arguments: dict[str, Any],
+                *,
+                key: str,
+                purpose: str,
+            ) -> dict[str, Any]:
+                async with uow_factory() as uow:
+                    working_state = await uow.investigation_states.get(investigation_id)
+                assert working_state is not None
+                request_payload = {
+                    "schema_version": schema_version,
+                    "arguments": arguments,
+                    "purpose": purpose,
+                    "expected_version": working_state.version,
+                }
+                response = await client.post(
+                    f"/api/investigations/{investigation_id}/operator/tools/{tool_name}",
+                    headers={"Idempotency-Key": key},
+                    json=request_payload,
+                )
+                assert response.status_code == 200, response.text
+                result = response.json()
+                operator_results[tool_name] = result
+                operator_requests.append((tool_name, key, request_payload))
+                return result
+
+            report_result = await invoke_operator_tool(
+                "vt.file_report",
+                "1",
+                {"file_hash": _SEED_HASH},
+                key=f"m07.operator.file-report:{investigation_id}",
+                purpose="Read the VT report for the seed hash anchored by the article observation.",
+            )
+            assert_tool_status("vt.file_report", report_result, "succeeded")
+
+            pivot_result = await invoke_operator_tool(
+                "vt.intelligence_search",
+                "1",
+                {
+                    "query": "type:peexe",
+                    "justification": "Find a candidate related to the persisted article seed.",
+                    "evidence_refs": [str(seeded.seed_observation.id)],
+                },
+                key=f"m07.operator.intelligence-search:{investigation_id}",
+                purpose="Pivot from the cited seed observation into VT Intelligence Search.",
+            )
+            assert_tool_status("vt.intelligence_search", pivot_result, "succeeded")
+            async with uow_factory() as uow:
+                pivot_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source == "VirusTotal" and item.object_id == candidate_hash
+                    ),
+                    None,
+                )
+            assert pivot_observation is not None, tool_diagnostic(
+                "vt.intelligence_search", pivot_result
+            )
+            pivot_observation_id = pivot_observation.id
+            assert str(pivot_observation_id) in pivot_result["invocation"]["response_refs"]
+
+            download_result = await invoke_operator_tool(
+                "vt.download_sample",
+                "1",
+                {
+                    "sha256": candidate_hash,
+                    "purpose": "Acquire the candidate identified by the cited VT pivot.",
+                    "evidence_refs": [str(pivot_observation_id)],
+                },
+                key=f"m07.operator.download:{investigation_id}:{candidate_hash}",
+                purpose="Quarantine the hash-checked VT candidate without G3 qualification.",
+            )
+            assert_tool_status("vt.download_sample", download_result, "succeeded")
+            async with uow_factory() as uow:
+                candidate_association = next(
+                    (
+                        item
+                        for item in await uow.sample_associations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.sample_sha256 == candidate_hash
+                    ),
+                    None,
+                )
+                decisions_before_analysis = tuple(
+                    await uow.analyst_decisions.list_for_investigation(investigation_id)
+                )
+            assert candidate_association is not None, tool_diagnostic(
+                "vt.download_sample", download_result
+            )
+            association_id = candidate_association.id
+            assert candidate_association.qualification is SampleQualification.CANDIDATE
+            assert decisions_before_analysis == ()
+
+            analysis_result = await invoke_operator_tool(
+                "sample.analyze",
+                "1",
+                {
+                    "association_id": str(association_id),
+                    "purpose": "Run bounded static analysis on the quarantined candidate.",
+                    "evidence_refs": [str(pivot_observation_id)],
+                },
+                key=f"m07.operator.sample-analysis:{investigation_id}:{association_id}",
+                purpose="Measure the persisted candidate locally before any G3 decision.",
+            )
+            assert_tool_status("sample.analyze", analysis_result, ("succeeded", "partial"))
+            async with uow_factory() as uow:
+                analysis_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source.startswith("autowork.analysis_worker")
+                        and item.object_type == "sample"
+                        and item.object_id == candidate_hash
+                    ),
+                    None,
+                )
+            assert analysis_observation is not None, tool_diagnostic(
+                "sample.analyze", analysis_result
+            )
+            analysis_observation_id = analysis_observation.id
+            assert str(analysis_observation_id) in analysis_result["invocation"]["response_refs"]
+
+            advisor_result = await invoke_operator_tool(
+                "advisor.consult",
+                "advisor-consult.v1",
+                {
+                    "consultation_type": "draft_text",
+                    "question": (
+                        "Does this persisted static analysis measurement distinguish the inert "
+                        "loader candidate from an arbitrary file? State the observation and the "
+                        "remaining uncertainty."
+                    ),
+                    "evidence_refs": [str(analysis_observation_id)],
+                    "assertions": [
+                        {
+                            "id": "static_analysis_measurement",
+                            "text": (
+                                "The persisted static measurement distinguishes this candidate "
+                                "without establishing execution or attribution."
+                            ),
+                            "nature": "analyse",
+                            "refs": [
+                                {
+                                    "kind": "observation",
+                                    "id": str(analysis_observation_id),
+                                }
+                            ],
+                            "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                },
+                key=f"m07.operator.advisor:{investigation_id}",
+                purpose="Assess the cited local analysis observation and its limitations.",
+            )
+            assert_tool_status("advisor.consult", advisor_result, "succeeded")
+            advisor_output = advisor_result.get("advisor_output")
+            assert (
+                isinstance(advisor_output, dict)
+                and advisor_output.get("advisor_status") == "succeeded"
+            ), tool_diagnostic("advisor.consult", advisor_result)
+            async with uow_factory() as uow:
+                advisor_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source == "advisor.consult" and item.object_type == "advisor_call"
+                    ),
+                    None,
+                )
+            assert advisor_observation is not None, tool_diagnostic(
+                "advisor.consult", advisor_result
+            )
+            advisor_observation_id = advisor_observation.id
+            assert str(advisor_observation_id) in advisor_result["invocation"]["response_refs"]
+
+            finding_statement = (
+                "The VT pivot candidate has a persisted local static-analysis measurement."
+            )
+            finding_result = await invoke_operator_tool(
+                "finding.propose",
+                "operator-finding.v1",
+                {
+                    "action": "propose",
+                    "kind": FindingKind.NEW_SAMPLE.value,
+                    "assessment": FindingAssessment.SUPPORTED.value,
+                    "statement": finding_statement,
+                    "subject_ref": candidate_hash,
+                    "observation_refs": [
+                        str(pivot_observation_id),
+                        str(analysis_observation_id),
+                    ],
+                    "claim_refs": [],
+                    "novelty": NoveltyClass.NEW_TO_ARTICLE.value,
+                    "scope": "Compared only with the verified article snapshot.",
+                    "limitations": [
+                        "Static analysis does not establish execution or incident attribution."
+                    ],
+                },
+                key=f"m07.operator.finding:{investigation_id}:{candidate_hash}",
+                purpose="Record an evidence-backed candidate finding with bounded limitations.",
+            )
+            assert_tool_status("finding.propose", finding_result, "succeeded")
 
             state_response = await client.get(f"/api/investigations/{investigation_id}")
             assert state_response.status_code == 200, state_response.text
-            state_payload = state_response.json()
-            assert state_payload["status"] == "completed", (
-                f"status={state_payload['status']} "
-                f"stop_reason={state_payload['stop_reason']} "
-                f"findings={len(state_payload['findings'])} "
-                f"opinion_draft={state_payload['opinion_draft'] is not None}"
-            )
-            assert state_payload["stop_reason"] == "agent_finished"
-            assert state_payload["opinion_draft"] is not None
 
             sample_response = await client.get(f"/api/investigations/{investigation_id}/samples")
             assert sample_response.status_code == 200, sample_response.text
@@ -1350,24 +1278,10 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             download_invocation = invocations_by_name["vt.download_sample"]
             analysis_invocation = invocations_by_name["sample.analyze"]
             advisor_invocation = invocations_by_name["advisor.consult"]
-            advisor_result = advisor_results[-1] if advisor_results else None
-            assert report_invocation.status is ToolInvocationStatus.SUCCEEDED
-            assert pivot_invocation.status is ToolInvocationStatus.SUCCEEDED
-            assert download_invocation.status is ToolInvocationStatus.SUCCEEDED
-            assert analysis_invocation.status in {
-                ToolInvocationStatus.SUCCEEDED,
-                ToolInvocationStatus.PARTIAL,
-            }
-            assert (
-                advisor_invocation.status is ToolInvocationStatus.SUCCEEDED
-                and advisor_result is not None
-                and advisor_result.status is ToolInvocationStatus.SUCCEEDED
-            ), (
-                f"advisor_invocation_status={advisor_invocation.status.value} "
-                f"advisor_result_status={getattr(advisor_result, 'status', None)} "
-                f"advisor_result_error_code={getattr(advisor_result, 'error_code', None)!r} "
-                f"advisor_result_output={getattr(advisor_result, 'output', None)!r}"
-            )
+            for name, invocation in invocations_by_name.items():
+                assert invocation.status.value == operator_results[name]["invocation"]["status"], (
+                    tool_diagnostic(name, operator_results[name])
+                )
             assert report_invocation.normalized_parameters == {"file_hash": _SEED_HASH}
             assert pivot_invocation.normalized_parameters["evidence_refs"] == [
                 str(seeded.seed_observation.id)
@@ -1395,6 +1309,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 for item in observations
                 if item.source == "advisor.consult" and item.object_type == "advisor_call"
             )
+            assert advisor_observation.id == advisor_observation_id
             assert advisor_observation.id in advisor_invocation.response_refs
             assert report_observation.id in report_invocation.response_refs
             assert pivot_observation.id in pivot_invocation.response_refs
@@ -1413,23 +1328,16 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             ]
 
             supported_finding = next(
-                item
-                for item in findings
-                if item.kind is FindingKind.NEW_SAMPLE
-                and item.assessment is FindingAssessment.SUPPORTED
+                (item for item in findings if item.statement == finding_statement),
+                None,
             )
+            assert supported_finding is not None, tool_diagnostic("finding.propose", finding_result)
+            assert supported_finding.kind is FindingKind.NEW_SAMPLE
+            assert supported_finding.assessment is FindingAssessment.SUPPORTED
             assert pivot_observation.id in supported_finding.observation_refs
             assert analysis_observation.id in supported_finding.observation_refs
             assert supported_finding.limitations
             assert "execution" in supported_finding.limitations[0]
-            assert state_payload["opinion_draft"]["status"] == "draft"
-            opinion_block = next(
-                item
-                for item in state_payload["opinion_draft"]["blocks"]
-                if item["type"] == OpinionBlockType.KEY_FINDINGS.value
-            )
-            assert str(supported_finding.id) in opinion_block["finding_refs"]
-            assert "execution and attribution remain unestablished" in opinion_block["text"]
 
             invocation_order = [item.tool_name for item in invocations]
             assert invocation_order.index("vt.file_report") < invocation_order.index(
@@ -1443,6 +1351,9 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             )
             assert invocation_order.index("sample.analyze") < invocation_order.index(
                 "advisor.consult"
+            )
+            assert invocation_order.index("advisor.consult") < invocation_order.index(
+                "finding.propose"
             )
 
             async with effect_sessions() as session:
@@ -1628,6 +1539,12 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     findings_now = tuple(
                         await uow.investigation_findings.list_for_investigation(investigation_id)
                     )
+                    samples_now = tuple(
+                        await uow.samples.list_by_subject_and_sha256(
+                            seeded.subject.id, candidate_hash
+                        )
+                    )
+                    blobs_now = tuple([await uow.blobs.get(item.blob_id) for item in samples_now])
                 async with effect_sessions() as session:
                     claims_now = tuple(
                         (
@@ -1658,6 +1575,27 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                             )
                         ).all()
                     )
+                    dispatches_now = tuple(
+                        (
+                            await session.scalars(
+                                select(SampleAcquisitionDispatchAttemptRow).where(
+                                    SampleAcquisitionDispatchAttemptRow.investigation_id
+                                    == investigation_id
+                                )
+                            )
+                        ).all()
+                    )
+                    links_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ExternalEffectAcquisitionDispatchRow).where(
+                                    ExternalEffectAcquisitionDispatchRow.dispatch_attempt_id.in_(
+                                        [item.id for item in dispatches_now]
+                                    )
+                                )
+                            )
+                        ).all()
+                    )
                     versions_now = tuple(
                         (
                             await session.scalars(
@@ -1668,14 +1606,137 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                             )
                         ).all()
                     )
+                    run_ids = {
+                        item.model_run_id for item in claims_now if item.model_run_id is not None
+                    }
+                    runs_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ModelRunRow).where(ModelRunRow.id.in_(run_ids))
+                            )
+                        ).all()
+                    )
+                    turn_ids_now = {
+                        item.bridge_turn_id for item in claims_now if item.bridge_turn_id
+                    }
+                    turns_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ModelConversationTurnRow).where(
+                                    ModelConversationTurnRow.id.in_(turn_ids_now)
+                                )
+                            )
+                        ).all()
+                    )
                 return (
-                    tuple(sorted(str(item.id) for item in invocations_now)),
-                    tuple(sorted(str(item.id) for item in observations_now)),
-                    tuple(sorted(str(item.id) for item in associations_now)),
-                    tuple(sorted((str(item.id), item.version) for item in findings_now)),
-                    tuple(sorted(str(item.id) for item in claims_now)),
-                    tuple(sorted(str(item.id) for item in uses_now)),
-                    tuple(sorted(str(item.id) for item in attempts_now)),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.operation_key,
+                                item.tool_name,
+                                item.status.value,
+                                item.version,
+                            )
+                            for item in invocations_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), item.source, item.sha256) for item in observations_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.version,
+                                item.sample_sha256,
+                                item.qualification.value,
+                            )
+                            for item in associations_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.version,
+                                item.assessment.value,
+                                tuple(str(ref) for ref in item.observation_refs),
+                            )
+                            for item in findings_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.family,
+                                item.state,
+                                str(item.model_run_id),
+                                str(item.bridge_turn_id),
+                                json.dumps(item.evidence_refs, sort_keys=True),
+                            )
+                            for item in claims_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), str(item.claim_id), item.use_kind) for item in uses_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.requested_hash,
+                                item.outcome,
+                                str(item.sample_id),
+                            )
+                            for item in attempts_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), item.requested_hash, item.state)
+                            for item in dispatches_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                str(item.claim_id),
+                                str(item.dispatch_attempt_id),
+                            )
+                            for item in links_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), str(item.blob_id), item.state.value)
+                            for item in samples_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.descriptor.sha256 if item is not None else None,
+                                item.descriptor.size if item is not None else None,
+                            )
+                            for item in blobs_now
+                        )
+                    ),
+                    tuple(sorted((str(item.id), item.version) for item in claims_now)),
+                    tuple(sorted((str(item.id), item.status) for item in runs_now)),
+                    tuple(
+                        sorted(
+                            (str(item.id), str(item.model_run_id), item.status)
+                            for item in turns_now
+                        )
+                    ),
                     tuple(sorted((str(item.id), item.version) for item in versions_now)),
                 )
 
@@ -1683,7 +1744,23 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             audit_before_replay = audit_snapshot
             vt_calls_before_replay = tuple(vt_http_calls)
             bridge_calls_before_replay = tuple(bridge_http_calls)
-            await _run_http_job(app, uow_factory, registry, dispatcher, job_id)
+            for tool_name, key, request_payload in operator_requests:
+                replay_response = await client.post(
+                    f"/api/investigations/{investigation_id}/operator/tools/{tool_name}",
+                    headers={"Idempotency-Key": key},
+                    json=request_payload,
+                )
+                assert replay_response.status_code == 200, replay_response.text
+                replay = replay_response.json()
+                assert replay["idempotent_replay"] is True, tool_diagnostic(tool_name, replay)
+                assert (
+                    replay["invocation"]["id"] == operator_results[tool_name]["invocation"]["id"]
+                ), tool_diagnostic(tool_name, replay)
+                assert_tool_status(
+                    tool_name,
+                    replay,
+                    operator_results[tool_name]["invocation"]["status"],
+                )
             assert tuple(vt_http_calls) == vt_calls_before_replay
             assert tuple(bridge_http_calls) == bridge_calls_before_replay
             assert bridge_http_calls.count(("POST", "/v1/responses")) == 1
