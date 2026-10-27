@@ -4,7 +4,6 @@ import hashlib
 import json
 import struct
 from contextlib import ExitStack
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -511,8 +510,7 @@ async def _run_inherited_case(
         artifact_store=artifact_store,
         settings=settings,
         transport=turn_transport,
-        external_effect_session_factory=session_factory,
-        additional_ports=replace(runtime_ports.optional_tool_ports, acquisition=None),
+        additional_ports=runtime_ports.optional_tool_ports,
     )
     app, registry, dispatcher = build_investigation_app(
         uow_factory=uow_factory,
