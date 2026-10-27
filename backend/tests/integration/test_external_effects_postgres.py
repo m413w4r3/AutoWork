@@ -2241,10 +2241,15 @@ async def test_credential_redacted_digest_is_the_only_wire_digest_persisted(
 
 @pytest.mark.asyncio
 async def test_downgrade_refuses_committed_external_effect_rows(
-    migrated_postgres_url: str, tmp_path: Path
+    temporary_postgres_url: str, tmp_path: Path
 ) -> None:
+    await asyncio.to_thread(
+        command.upgrade,
+        _alembic_config(temporary_postgres_url),
+        "head",
+    )
     session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
-        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+        temporary_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, prepared = authorities[0]
     store = _store(session_factory)
@@ -2256,10 +2261,15 @@ async def test_downgrade_refuses_committed_external_effect_rows(
             occurrence_digest=occurrence_sha256(prepared.occurrence_id),
         )
         assert isinstance(consumed, ConsumeCommitted)
+        await asyncio.to_thread(
+            command.downgrade,
+            _alembic_config(temporary_postgres_url),
+            "0004_external_effect_claims",
+        )
         with pytest.raises(RuntimeError, match="refusing to drop external effect"):
             await asyncio.to_thread(
                 command.downgrade,
-                _alembic_config(migrated_postgres_url),
+                _alembic_config(temporary_postgres_url),
                 "0003_osint_open_policy",
             )
         async with session_factory() as session:

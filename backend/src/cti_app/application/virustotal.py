@@ -26,6 +26,42 @@ from cti_app.domain.virustotal import (
     VirusTotalTransportKind,
 )
 
+VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES = frozenset(
+    {
+        "apikey",
+        "x",
+        "hash",
+        "X-Amz-Algorithm",
+        "X-Amz-Credential",
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "X-Amz-Security-Token",
+        "X-Amz-Signature",
+        "X-Amz-SignedHeaders",
+        "X-Amz-Content-Sha256",
+        "X-Goog-Algorithm",
+        "X-Goog-Credential",
+        "X-Goog-Date",
+        "X-Goog-Expires",
+        "X-Goog-Signature",
+        "X-Goog-SignedHeaders",
+        "AWSAccessKeyId",
+        "GoogleAccessId",
+        "Signature",
+        "sig",
+        "token",
+        "access_key",
+        "expires",
+        "policy",
+        "key-pair-id",
+        "response-content-disposition",
+        "response-content-type",
+        "response-cache-control",
+        "response-content-encoding",
+        "response-content-language",
+    }
+)
+
 if TYPE_CHECKING:
     from cti_app.application.sample_acquisition import SampleAcquisitionResponseOrigin
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+from dataclasses import replace
 from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -11,6 +13,7 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalCapabilityDisabledError,
     VirusTotalError,
+    VirusTotalExternalEffectNeedsReviewError,
     VirusTotalHttpError,
     VirusTotalInvalidInputError,
     VirusTotalNotAuthorizedError,
@@ -19,6 +22,8 @@ from cti_app.application.virustotal import (
     VirusTotalRelationNotAllowedError,
     VirusTotalRouteStep,
     VirusTotalRoutingPolicy,
+    current_virustotal_external_effect_authority,
+    virustotal_external_effect_scope,
 )
 from cti_app.config import Settings
 from cti_app.domain.virustotal import (
@@ -28,6 +33,7 @@ from cti_app.domain.virustotal import (
     VirusTotalOperation,
     VirusTotalTransportKind,
 )
+from cti_app.infrastructure import virustotal as virustotal_module
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from cti_app.workers.tasks import virustotal_capabilities_from_settings
 from tests.virustotal_external_effect_fakes import (
@@ -434,6 +440,113 @@ async def test_download_does_not_use_ticket_after_non_404(status: int) -> None:
     finally:
         await client.aclose()
     assert paths == [f"/api/v3/files/{SHA256}/download"]
+
+
+@pytest.mark.asyncio
+async def test_download_429_retry_uses_new_dispatch_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"direct-v3-sample"
+    digest = hashlib.sha256(content).hexdigest()
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(
+                429,
+                json={"error": {"code": "QuotaExceeded"}},
+                headers={"Retry-After": "1"},
+                request=request,
+            )
+        return httpx.Response(200, content=content, request=request)
+
+    value, client = _adapter(
+        handler,
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+    )
+    authority = current_virustotal_external_effect_authority()
+    assert authority is not None
+    first_attempt = replace(authority, acquisition_dispatch_attempt_id=uuid4())
+    retry_attempt = replace(authority, acquisition_dispatch_attempt_id=uuid4())
+    result_marker = object()
+
+    async def run_coordinated_hop(
+        client_arg: httpx.AsyncClient | None, url: str, **kwargs: Any
+    ) -> Any:
+        assert client_arg is not None
+        assert kwargs["occurrence_id"] is not None
+        response = await kwargs["coordinated_request"](
+            client_arg,
+            url,
+            params=kwargs.get("params"),
+            headers={"accept-encoding": "identity"},
+            route=kwargs["route"],
+            transport="proxy-v3",
+            hop_index=0,
+            signed=False,
+            acquisition_hash=kwargs["acquisition_hash"],
+            max_response_bytes=kwargs["max_bytes"],
+            occurrence_id=kwargs["occurrence_id"],
+        )
+        status_code = response.status_code
+        await response.aclose()
+        if status_code >= 400:
+            raise VirusTotalHttpError("synthetic quota response", status_code=status_code)
+        return result_marker
+
+    monkeypatch.setattr(virustotal_module, "_stream_route_download", run_coordinated_hop)
+
+    async def send(attempt: Any) -> Any:
+        with virustotal_external_effect_scope(attempt):
+            return await value.file_download(digest, sink=io.BytesIO())
+
+    try:
+        with pytest.raises(VirusTotalHttpError) as caught:
+            await send(first_attempt)
+        assert caught.value.status_code == 429
+        assert await send(retry_attempt) is result_marker
+    finally:
+        await client.aclose()
+
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert requests == 2
+    assert len(claims) == 2
+    assert len({claim.effect_key for claim in claims}) == 2
+    assert all(claim.state.name == "COMPLETED" for claim in claims)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_download_replay_keeps_dispatch_occurrence_and_does_not_send() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadError("synthetic interruption after handoff", request=request)
+
+    value, client = _adapter(
+        handler,
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+    )
+    authority = current_virustotal_external_effect_authority()
+    assert authority is not None
+    attempt = replace(authority, acquisition_dispatch_attempt_id=uuid4())
+    try:
+        with virustotal_external_effect_scope(attempt):
+            for _ in range(2):
+                with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
+                    await value.file_download(SHA256, sink=io.BytesIO())
+    finally:
+        await client.aclose()
+
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert calls == 1
+    assert len(claims) == 1
+    assert claims[0].state.name == "NEEDS_REVIEW"
 
 
 @pytest.mark.asyncio

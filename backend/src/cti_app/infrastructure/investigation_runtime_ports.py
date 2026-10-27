@@ -227,7 +227,11 @@ def create_external_effect_coordinator(
             policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
             family_bindings=family_bindings,
         ),
-        reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
+        reuse_policies={
+            family: reuse_policy
+            for family in VT_EXTERNAL_EFFECT_FAMILIES
+            if family != "vt.download_sample"
+        },
     )
 
 

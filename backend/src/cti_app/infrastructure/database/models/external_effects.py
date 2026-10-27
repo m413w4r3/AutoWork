@@ -198,4 +198,37 @@ class ExternalEffectUseRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-__all__ = ["ExternalEffectClaimRow", "ExternalEffectUseRow"]
+class ExternalEffectAcquisitionDispatchRow(Base):
+    """Link an S3 physical request claim to its durable logical pre-send attempt."""
+
+    __tablename__ = "effect_acquisition_dispatch_links"
+    __table_args__ = (
+        PrimaryKeyConstraint("claim_id", name="pk_effect_acquisition_dispatch_link"),
+        Index("ix_effect_acquisition_dispatch_attempt", "dispatch_attempt_id"),
+    )
+
+    claim_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "external_effect_claim.id",
+            name="fk_effect_acquisition_dispatch_claim",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    dispatch_attempt_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "sample_acquisition_dispatch_attempts.id",
+            name="fk_effect_acquisition_dispatch_attempt",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+
+
+__all__ = [
+    "ExternalEffectAcquisitionDispatchRow",
+    "ExternalEffectClaimRow",
+    "ExternalEffectUseRow",
+]

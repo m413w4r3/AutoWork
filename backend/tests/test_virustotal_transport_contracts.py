@@ -39,6 +39,7 @@ from cti_app.domain.virustotal import (
 )
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from tests.virustotal_external_effect_fakes import (
+    authorized_vt_download,
     authorized_vt_read,
     configure_test_vt_adapter,
 )
@@ -51,9 +52,24 @@ SIGNED_URL = "https://cdn.example.test/object.bin?signature=do-not-log-this"
 
 
 @pytest.fixture(autouse=True)
-def _external_effect_authority():
-    with authorized_vt_read():
-        yield
+def _external_effect_authority(request: pytest.FixtureRequest):
+    test_name = request.node.name
+    if (
+        "download" in test_name
+        or "signed_cdn" in test_name
+        or "unattributed_404" in test_name
+        or "stream_read_error" in test_name
+        or "v2_fallback" in test_name
+        or "policy_or_quota" in test_name
+        or "v2_secret" in test_name
+        or ("redirect" in test_name and "pcap" not in test_name)
+    ):
+        # These cases exercise MockTransport behind the in-memory effect gate.
+        with authorized_vt_download():
+            yield
+    else:
+        with authorized_vt_read():
+            yield
 
 
 def _route(capability: VirusTotalCapability) -> VirusTotalRoutingPolicy:
@@ -131,6 +147,8 @@ def _make_adapter(
             }
         ),
         file_download_enabled=True,
+        # This module verifies HTTPX route behavior behind the in-memory gate.
+        offline_probe_mode=True,
         proxy_query_sentinel_enabled=False,
         behaviour_pcap_enabled=True,
         download_allowed_hosts=download_allowed_hosts,

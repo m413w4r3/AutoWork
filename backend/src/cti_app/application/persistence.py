@@ -92,6 +92,8 @@ from cti_app.domain.production import (
     ProductionReuseInvalidation,
     ProductionRun,
     SampleAcquisitionAttempt,
+    SampleAcquisitionDispatchAttempt,
+    SampleAcquisitionDispatchState,
     SourceExtraction,
 )
 from cti_app.domain.production_source_additions import SourceAdditionJournalEntryV1
@@ -492,6 +494,22 @@ class SampleAcquisitionAttemptRepository(Protocol):
     ) -> SampleAcquisitionAttempt | None: ...
 
     async def append(self, attempt: SampleAcquisitionAttempt) -> None: ...
+
+    async def prepare_dispatch(
+        self, attempt: SampleAcquisitionDispatchAttempt
+    ) -> tuple[SampleAcquisitionDispatchAttempt, bool]: ...
+
+    async def get_dispatch(
+        self, investigation_id: UUID, operation_key: str
+    ) -> SampleAcquisitionDispatchAttempt | None: ...
+
+    async def transition_dispatch(
+        self,
+        dispatch_attempt_id: UUID,
+        *,
+        expected: SampleAcquisitionDispatchState,
+        target: SampleAcquisitionDispatchState,
+    ) -> bool: ...
 
 
 class ProvenanceRepository(Protocol):

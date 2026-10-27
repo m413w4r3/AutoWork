@@ -28,6 +28,7 @@ from cti_app.application.investigation_governance import (
     InvestigationEnvelopeService,
     SampleQualificationService,
 )
+from cti_app.application.investigation_persistence import InMemorySampleAssociationRepository
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
@@ -143,6 +144,12 @@ class _PartialDownloadTimeoutPort(FakeVirusTotalPort):
         self.download_calls.append(file_hash)
         sink.write(self.sample_bytes[:8])
         raise TimeoutError("synthetic partial download timeout")
+
+
+class _NoExistingSamples:
+    async def list_by_subject_and_sha256(self, subject_id: UUID, sha256: str) -> tuple[Any, ...]:
+        del subject_id, sha256
+        return ()
 
 
 @pytest.mark.asyncio
@@ -444,6 +451,9 @@ async def test_ambiguous_download_failure_stops_without_persisting_adapter_outpu
         ),
     )
     fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
+    source_associations = InMemorySampleAssociationRepository()
+    fixture.service._sample_associations = source_associations
+    fixture.service._samples = cast(Any, _NoExistingSamples())
     database.investigations[fixture.investigation_id] = make_investigation()
     port = _PartialDownloadTimeoutPort(sample)
     hits = HitAcquisitionService(
@@ -451,6 +461,8 @@ async def test_ambiguous_download_failure_stops_without_persisting_adapter_outpu
         acquisition=make_sample_acquisition_service(database, port),
         recorder=make_evidence_recorder(database),
     )
+    association = await hits.register_hit(fixture.investigation_id, sha256, SampleOrigin.VT_PIVOT)
+    await source_associations.append_version(association, expected_version=0)
     actual_registry = _register(database, hits)
     definition, adapter = actual_registry.get("vt.download_sample", "1")
     fixture.registry.unregister("vt.download_sample", "1")

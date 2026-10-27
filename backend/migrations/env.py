@@ -36,7 +36,14 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-_EXTERNAL_EFFECT_TABLES = frozenset({"external_effect_claim", "external_effect_use"})
+_EXTERNAL_EFFECT_TABLES = frozenset(
+    {
+        "external_effect_claim",
+        "external_effect_use",
+        "effect_acquisition_dispatch_links",
+        "sample_acquisition_dispatch_attempts",
+    }
+)
 _OSINT_POLICY_TABLES = frozenset(
     {
         "osint_open_policies",
@@ -52,6 +59,7 @@ _OSINT_ENVELOPE_COLUMNS = frozenset(
         "inherited_policy_event_id",
     }
 )
+_SAMPLE_ACQUISITION_DISPATCH_COLUMNS = frozenset({"dispatch_attempt_id"})
 
 
 def _metadata_for_frozen_baseline() -> MetaData:
@@ -70,27 +78,45 @@ def _metadata_for_frozen_baseline() -> MetaData:
         ):
             continue
         table = source_table.to_metadata(metadata)
-        if table.name != "investigation_envelopes":
-            continue
-
-        for constraint in tuple(table.constraints):
-            if constraint.name in {
-                "ck_investigation_envelopes_authority_lineage",
-                "fk_investigation_envelopes_inherited_policy",
-                "fk_investigation_envelopes_inherited_event",
-            }:
-                table.constraints.discard(constraint)
-        for foreign_key in tuple(table.foreign_keys):
-            if (
-                foreign_key.parent is not None
-                and foreign_key.parent.name in _OSINT_ENVELOPE_COLUMNS
-            ):
-                table.foreign_keys.discard(foreign_key)
-                if foreign_key.constraint is not None:
-                    table.constraints.discard(foreign_key.constraint)
-        for column_name in _OSINT_ENVELOPE_COLUMNS:
-            if column_name in table.c:
-                table._columns.remove(table.c[column_name])
+        if table.name == "investigation_envelopes":
+            for constraint in tuple(table.constraints):
+                if constraint.name in {
+                    "ck_investigation_envelopes_authority_lineage",
+                    "fk_investigation_envelopes_inherited_policy",
+                    "fk_investigation_envelopes_inherited_event",
+                }:
+                    table.constraints.discard(constraint)
+            for foreign_key in tuple(table.foreign_keys):
+                if (
+                    foreign_key.parent is not None
+                    and foreign_key.parent.name in _OSINT_ENVELOPE_COLUMNS
+                ):
+                    table.foreign_keys.discard(foreign_key)
+                    if foreign_key.constraint is not None:
+                        table.constraints.discard(foreign_key.constraint)
+            for column_name in _OSINT_ENVELOPE_COLUMNS:
+                if column_name in table.c:
+                    table._columns.remove(table.c[column_name])
+        if table.name == "sample_acquisition_attempts":
+            for constraint in tuple(table.constraints):
+                if constraint.name == "fk_sample_acquisition_attempts_dispatch":
+                    table.constraints.discard(constraint)
+            for foreign_key in tuple(table.foreign_keys):
+                if (
+                    foreign_key.parent is not None
+                    and foreign_key.parent.name in _SAMPLE_ACQUISITION_DISPATCH_COLUMNS
+                ):
+                    table.foreign_keys.discard(foreign_key)
+                    if foreign_key.constraint is not None:
+                        table.constraints.discard(foreign_key.constraint)
+            for index in tuple(table.indexes):
+                if any(
+                    column.name in _SAMPLE_ACQUISITION_DISPATCH_COLUMNS for column in index.columns
+                ):
+                    table.indexes.discard(index)
+            for column_name in _SAMPLE_ACQUISITION_DISPATCH_COLUMNS:
+                if column_name in table.c:
+                    table._columns.remove(table.c[column_name])
     return metadata
 
 

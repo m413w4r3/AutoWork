@@ -93,6 +93,7 @@ from cti_app.infrastructure.database.models.investigation import (
 from cti_app.infrastructure.database.models.investigation import (
     SampleAssociationRow as SampleAssociationIdentityRow,
 )
+from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
 
 
 def _budget_to_payload(budget: InvestigationBudget) -> dict[str, Any]:
@@ -959,6 +960,38 @@ class SqlAlchemySampleAssociationRepository:
             )
         await self._session.flush()
         return association
+
+    async def link_sample(
+        self, association_id: UUID, sample_id: UUID, *, expected_sha256: str
+    ) -> None:
+        identity = await self._session.scalar(
+            select(SampleAssociationIdentityRow)
+            .where(SampleAssociationIdentityRow.id == association_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if identity is None or identity.sample_sha256 != expected_sha256:
+            raise ValueError("Sample association does not match the acquired sample hash")
+        subject_id = await self._session.scalar(
+            select(AnalystInvestigationRow.subject_id).where(
+                AnalystInvestigationRow.id == identity.investigation_id
+            )
+        )
+        matching_sample_id = await self._session.scalar(
+            select(SampleRow.id)
+            .join(BlobRow, BlobRow.id == SampleRow.blob_id)
+            .where(
+                SampleRow.id == sample_id,
+                SampleRow.subject_id == subject_id,
+                BlobRow.sha256 == expected_sha256,
+            )
+        )
+        if subject_id is None or matching_sample_id != sample_id:
+            raise ValueError("Acquired sample does not belong to the investigation subject")
+        if identity.sample_id not in {None, sample_id}:
+            raise ValueError("Sample association is already linked to another sample")
+        identity.sample_id = sample_id
+        await self._session.flush()
 
     async def _sample_id_for_hash(self, sha256: str) -> UUID | None:
         sample_ids = list(

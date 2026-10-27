@@ -530,7 +530,7 @@ async def test_same_subject_sample_reuse_through_registered_tools_in_postgres(
                     disclosure=DisclosureBounds(
                         tlp=TLPLevel.CLEAR,
                         do_not_submit=False,
-                        external_llm_allowed=False,
+                        external_llm_allowed=True,
                     ),
                 ),
                 actor_id="analyst:integration",

@@ -16,7 +16,10 @@ from cti_app.application.external_effects import (
     ReuseDecision,
     _NoHandoffProofVerifier,
 )
-from cti_app.application.virustotal import virustotal_external_effect_scope
+from cti_app.application.virustotal import (
+    current_virustotal_external_effect_authority,
+    virustotal_external_effect_scope,
+)
 from cti_app.application.virustotal_persistence import (
     ArchivedVirusTotalResponse,
     VirusTotalObservationService,
@@ -50,6 +53,18 @@ def make_test_authority(*, invocation_id: UUID | None = None) -> ExternalEffectA
 @contextmanager
 def authorized_vt_read(*, invocation_id: UUID | None = None) -> Iterator[ExternalEffectAuthority]:
     authority = make_test_authority(invocation_id=invocation_id)
+    with virustotal_external_effect_scope(authority):
+        yield authority
+
+
+@contextmanager
+def authorized_vt_download() -> Iterator[ExternalEffectAuthority]:
+    authority = replace(
+        make_test_authority(),
+        operation_key="test-vt-download-operation",
+        reservation_amounts={"downloads": 1, "vt_units": 1},
+        acquisition_dispatch_attempt_id=uuid4(),
+    )
     with virustotal_external_effect_scope(authority):
         yield authority
 
@@ -235,6 +250,11 @@ def configure_test_vt_adapter(
 ) -> tuple[InMemoryExternalEffectClaimStore, InMemoryVirusTotalArchive]:
     store = InMemoryExternalEffectClaimStore()
     archive = InMemoryVirusTotalArchive()
+    if (
+        getattr(adapter, "_offline_probe_mode", False)
+        and current_virustotal_external_effect_authority() is None
+    ):
+        return store, archive
     coordinator = ExternalEffectCoordinator(
         store,
         reuse_policies={

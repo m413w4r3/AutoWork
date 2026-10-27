@@ -132,6 +132,10 @@ class SampleAssociationRepository(Protocol):
         self, association: SampleAssociation, *, expected_version: int
     ) -> SampleAssociation: ...
 
+    async def link_sample(
+        self, association_id: UUID, sample_id: UUID, *, expected_sha256: str
+    ) -> None: ...
+
 
 class DetectionCandidateRepository(Protocol):
     async def get(self, version_id: UUID) -> DetectionCandidateVersion | None: ...

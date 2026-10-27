@@ -30,6 +30,7 @@ from cti_app.application.virustotal import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import ProvenanceEvent, Sample
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
@@ -149,6 +150,8 @@ class HitAcquisitionService:
         evidence_refs: tuple[UUID, ...] = (),
         operation_key: str | None = None,
         envelope: InvestigationEnvelope | None = None,
+        external_effect_authority: ExternalEffectAuthority | None = None,
+        external_effect_evidence_refs: tuple[EvidenceReference, ...] = (),
     ) -> HitAcquisitionResult:
         if not purpose.strip():
             raise ValueError("Acquisition purpose must not be empty")
@@ -380,6 +383,15 @@ class HitAcquisitionService:
                 subject_id=investigation.subject_id,
                 requested_hash=association.sample_sha256,
                 reason=SampleAcquisitionReason.HIT_REVIEW,
+                association_id=association.id,
+                operation_key=key,
+                invocation_id=(
+                    external_effect_authority.invocation_id
+                    if external_effect_authority is not None
+                    else None
+                ),
+                external_effect_authority=external_effect_authority,
+                external_effect_evidence_refs=external_effect_evidence_refs,
                 policy=SampleAcquisitionPolicy(
                     tlp=acquisition_tlp,
                     do_not_submit=active_envelope.disclosure.do_not_submit,
@@ -699,6 +711,11 @@ class HitAcquisitionService:
                 raise HitAcquisitionError(
                     "Quarantined blob hash does not match the requested SHA-256"
                 )
+            await uow.sample_associations.link_sample(
+                association.id,
+                sample.id,
+                expected_sha256=association.sample_sha256,
+            )
             if reused_from_subject_sample:
                 events = await uow.provenance.list_for_aggregate("sample", sample.id)
                 already_recorded = any(
@@ -729,7 +746,7 @@ class HitAcquisitionService:
                             tlp=sample.tlp,
                         )
                     )
-                    await uow.commit()
+            await uow.commit()
         is_subject_reuse = reused_from_subject_sample
         observation = await self._recorder.record_existing_blob(
             investigation_id=association.investigation_id,

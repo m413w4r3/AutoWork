@@ -83,7 +83,8 @@ from cti_app.application.research_context_builder import (
     provider_authorization_blocked_capabilities,
     provider_download_blocked_capabilities,
 )
-from cti_app.application.virustotal import normalize_file_hash
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
+from cti_app.application.virustotal import VirusTotalInvalidInputError, normalize_file_hash
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
@@ -99,6 +100,7 @@ from cti_app.domain.editorial import (
     AnalystDecisionTargetType,
     AnalystDecisionType,
 )
+from cti_app.domain.entities import SampleState
 from cti_app.domain.external_effects import (
     EvidenceReference,
     ExternalEffectAuthority,
@@ -167,6 +169,7 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
         "vt.intelligence_search",
         "vt.behaviour",
         "vt.behaviour_pcap",
+        "vt.download_sample",
     }
 )
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
@@ -1374,11 +1377,21 @@ class InvestigationService:
                     invocation_parameters
                 )
             else:
-                external_effect_evidence_refs = await self._trusted_vt_source_references(
-                    investigation=investigation,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                )
+                if tool_name == "vt.download_sample":
+                    # Resolve the target hash from canonical investigation
+                    # evidence or an existing association. Caller supplied
+                    # evidence_refs cannot authorize the target hash.
+                    external_effect_evidence_refs = await self._trusted_vt_source_references(
+                        investigation=investigation,
+                        tool_name="vt.file_report",
+                        arguments={"file_hash": arguments.get("sha256")},
+                    )
+                else:
+                    external_effect_evidence_refs = await self._trusted_vt_source_references(
+                        investigation=investigation,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                    )
                 invocation_parameters = {
                     **arguments,
                     _VT_SOURCE_REFS_PARAMETER: [
@@ -1622,6 +1635,23 @@ class InvestigationService:
                 current_investigation = await self._investigations.get(investigation.id)
                 if current_investigation is None:
                     return FrameworkPreSubmissionProof.INVESTIGATION_MISSING
+                if tool_name == "vt.download_sample":
+                    raw_hash = arguments.get("sha256")
+                    try:
+                        target_hash = (
+                            normalize_file_hash(raw_hash) if isinstance(raw_hash, str) else ""
+                        )
+                    except (TypeError, ValueError, VirusTotalInvalidInputError):
+                        target_hash = ""
+                    if (
+                        len(target_hash) == 64
+                        and sum(
+                            reference.kind == "sample_hash"
+                            for reference in external_effect_evidence_refs
+                        )
+                        != 1
+                    ):
+                        return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
@@ -1722,6 +1752,16 @@ class InvestigationService:
         valid_refs = await self._valid_observation_refs(
             investigation.id, tuple(dict.fromkeys(result_refs))
         )
+        if uncertain_external:
+            coordinator_transition = await self._invocations.get(invocation.id)
+            if (
+                coordinator_transition is not None
+                and coordinator_transition.status is ToolInvocationStatus.NEEDS_REVIEW
+            ):
+                # The coordinator durably marks the invocation when it records
+                # an ambiguous post-handoff result. Continue from that version
+                # so the framework diagnostic can attach without a stale CAS.
+                invocation = coordinator_transition
         terminal = invocation.transition(
             result.status,
             response_refs=valid_refs,
@@ -1745,6 +1785,60 @@ class InvestigationService:
         await self._commit_current_uow()
         _log_terminal_tool_failure(invocation, result)
         return invocation, result, valid_refs, uncertain_external
+
+    async def _verified_local_download_reuse(
+        self,
+        investigation: AnalystInvestigation,
+        references: tuple[EvidenceReference, ...],
+    ) -> bool:
+        """Prove a local quarantine hit before exempting it from egress disclosure."""
+        hash_references = tuple(
+            reference for reference in references if reference.kind == "sample_hash"
+        )
+        if (
+            len(hash_references) != 1
+            or self._samples is None
+            or self._artifact_store is None
+            or self._evidence_summaries is None
+        ):
+            return False
+        requested_hash = hash_references[0].id
+        if len(requested_hash) != 64:
+            return False
+        try:
+            if normalize_file_hash(requested_hash) != requested_hash:
+                return False
+        except (TypeError, ValueError, VirusTotalInvalidInputError):
+            return False
+        samples = await self._samples.list_by_subject_and_sha256(
+            investigation.subject_id, requested_hash
+        )
+        if len(samples) != 1:
+            return False
+        sample = samples[0]
+        if (
+            sample.external_llm_allowed
+            or sample.expected_hash not in {None, requested_hash}
+            or sample.state not in {SampleState.QUARANTINED, SampleState.REVIEW_CANDIDATE}
+        ):
+            return False
+        descriptor = await self._evidence_summaries.blob_metadata(sample.blob_id)
+        if descriptor is None:
+            return False
+        size = descriptor.get("byte_size")
+        if (
+            descriptor.get("sha256") != requested_hash
+            or descriptor.get("logical_bucket") != SAMPLES_QUARANTINE_BUCKET
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            return False
+        try:
+            content = await self._artifact_store.read_bytes(sample.blob_id, max_bytes=size)
+        except Exception:
+            return False
+        return len(content) == size and hashlib.sha256(content).hexdigest() == requested_hash
 
     async def _vt_source_disclosure_restricted(
         self,
@@ -1813,7 +1907,6 @@ class InvestigationService:
                 sample.tlp is TLP.RED
                 or sample.do_not_submit
                 or bool((sample.license_restriction or "").strip())
-                or not sample.external_llm_allowed
                 for sample in samples
             ):
                 return True
@@ -1833,7 +1926,6 @@ class InvestigationService:
                     or document.tlp is TLP.RED
                     or document.do_not_submit
                     or bool((document.license_restriction or "").strip())
-                    or not document.external_llm_allowed
                 ):
                     return True
         return False
@@ -2193,7 +2285,7 @@ class InvestigationService:
                 for item in await self._invocations.list_for_investigation(investigation.id)
                 if item.tool_name == proposed.tool_name
                 and item.schema_version == proposed.schema_version
-                and thaw_json(item.normalized_parameters) == thaw_json(proposed.arguments)
+                and _tool_call_arguments_match(item.normalized_parameters, proposed.arguments)
             )
             matching_invocations = tuple(
                 item
@@ -4196,6 +4288,19 @@ def _vt_source_refs_from_parameters(
         except (KeyError, TypeError, ValueError):
             return ()
     return tuple(references)
+
+
+def _tool_call_arguments_match(
+    normalized_parameters: Mapping[str, Any], arguments: Mapping[str, Any]
+) -> bool:
+    stored_arguments = thaw_json(normalized_parameters)
+    if not isinstance(stored_arguments, dict):
+        return False
+    call_arguments = thaw_json(arguments)
+    if not isinstance(call_arguments, dict):
+        return False
+    stored_arguments.pop(_VT_SOURCE_REFS_PARAMETER, None)
+    return stored_arguments == call_arguments
 
 
 def _bridge_context_observation_ids(context: InvestigationContextV1) -> set[UUID]:

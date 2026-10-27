@@ -3,12 +3,14 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -72,6 +74,10 @@ ANALYST_DECISION_TARGET_VALUES_SQL = (
 SAMPLE_ACQUISITION_REASON_VALUES_SQL = "'seed', 'hit_review'"
 SAMPLE_ACQUISITION_OUTCOME_VALUES_SQL = "'success', 'error'"
 SAMPLE_ACQUISITION_HASH_FAMILY_VALUES_SQL = "'md5', 'sha1', 'sha256'"
+SAMPLE_ACQUISITION_DISPATCH_STATE_VALUES_SQL = (
+    "'PREPARED', 'SUBMISSION_IN_PROGRESS', 'COMPLETED', "
+    "'DEFINITIVELY_NOT_SUBMITTED', 'NEEDS_REVIEW'"
+)
 
 
 class ProductionRunRow(Base):
@@ -506,6 +512,12 @@ class SampleAcquisitionAttemptRow(Base):
             postgresql_where=text("outcome = 'success'"),
         ),
         Index("ix_sample_acquisition_attempts_investigation", "investigation_id"),
+        Index(
+            "uq_sample_acquisition_attempt_dispatch",
+            "dispatch_attempt_id",
+            unique=True,
+            postgresql_where=text("dispatch_attempt_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -522,7 +534,87 @@ class SampleAcquisitionAttemptRow(Base):
         Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT")
     )
     error_code: Mapped[str | None] = mapped_column(String(64))
+    dispatch_attempt_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "sample_acquisition_dispatch_attempts.id",
+            name="fk_sample_acquisition_attempts_dispatch",
+            ondelete="RESTRICT",
+        ),
+    )
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SampleAcquisitionDispatchAttemptRow(Base):
+    """Durable logical dispatch identity created before any provider request."""
+
+    __tablename__ = "sample_acquisition_dispatch_attempts"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_sample_acquisition_dispatch_attempt"),
+        UniqueConstraint(
+            "investigation_id", "operation_key", name="uq_sample_acquisition_dispatch_operation"
+        ),
+        CheckConstraint(
+            f"reason IN ({SAMPLE_ACQUISITION_REASON_VALUES_SQL})",
+            name="ck_sample_acquisition_dispatch_reason",
+        ),
+        CheckConstraint(
+            f"hash_family IN ({SAMPLE_ACQUISITION_HASH_FAMILY_VALUES_SQL})",
+            name="ck_sample_acquisition_dispatch_hash_family",
+        ),
+        CheckConstraint(
+            "requested_hash ~ '^[0-9a-f]{32}$' OR requested_hash ~ '^[0-9a-f]{40}$' "
+            "OR requested_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_sample_acquisition_dispatch_requested_hash",
+        ),
+        CheckConstraint(
+            f"state IN ({SAMPLE_ACQUISITION_DISPATCH_STATE_VALUES_SQL})",
+            name="ck_sample_acquisition_dispatch_state",
+        ),
+        CheckConstraint("version >= 1", name="ck_sample_acquisition_dispatch_version"),
+        CheckConstraint(
+            "length(btrim(operation_key)) BETWEEN 1 AND 255",
+            name="ck_sample_acquisition_dispatch_operation_key",
+        ),
+        Index("ix_sample_acquisition_dispatch_investigation", "investigation_id", "created_at"),
+        Index("ix_sample_acquisition_dispatch_association", "association_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "analyst_investigations.id",
+            name="fk_sample_acquisition_dispatch_investigation",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    association_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "sample_associations.id",
+            name="fk_sample_acquisition_dispatch_association",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    invocation_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "tool_invocations.id",
+            name="fk_sample_acquisition_dispatch_invocation",
+            ondelete="RESTRICT",
+        ),
+    )
+    operation_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    requested_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    hash_family: Mapped[str] = mapped_column(String(8), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class EditionProductionBatchRow(Base):
