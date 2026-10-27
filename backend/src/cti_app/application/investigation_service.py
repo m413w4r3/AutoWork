@@ -32,6 +32,7 @@ from cti_app.application.evidence_recorder import (
     _sanitize_json,
     sanitize_evidence_text,
 )
+from cti_app.application.external_effects import external_effect_source_do_not_submit_blocks
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
     InvestigationContextV1,
@@ -396,6 +397,22 @@ class InvestigationService:
         return InvestigationService._external_allowed(snapshot, envelope)
 
     @staticmethod
+    def vt_external_disclosure_allowed(
+        snapshot: ArticleSnapshot,
+        envelope: InvestigationEnvelope | None,
+        family: str,
+    ) -> bool:
+        if not InvestigationService._external_tlp_allowed(snapshot, envelope):
+            return False
+        assert envelope is not None
+        return bool(
+            snapshot.external_llm_allowed
+            and envelope.disclosure.external_llm_allowed
+            and not envelope.disclosure.do_not_submit
+            and not external_effect_source_do_not_submit_blocks(family, snapshot.do_not_submit)
+        )
+
+    @staticmethod
     def bridge_disclosure_allowed(
         snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
     ) -> bool:
@@ -403,7 +420,11 @@ class InvestigationService:
             return False
         assert envelope is not None
         return bool(
-            envelope.disclosure.external_llm_allowed and not envelope.disclosure.do_not_submit
+            envelope.disclosure.external_llm_allowed
+            and not envelope.disclosure.do_not_submit
+            and not external_effect_source_do_not_submit_blocks(
+                "bridge.investigation_turn.v1", snapshot.do_not_submit
+            )
         )
 
     @staticmethod
@@ -1655,11 +1676,12 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.external_llm_allowed(
-                    snapshot, current_envelope
+                if not self.vt_external_disclosure_allowed(
+                    snapshot, current_envelope, tool_name
                 ) or await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
+                    tool_name,
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
@@ -1844,6 +1866,7 @@ class InvestigationService:
         self,
         investigation: AnalystInvestigation,
         references: tuple[EvidenceReference, ...],
+        family: str,
     ) -> bool:
         sample_hashes = {
             reference.id for reference in references if reference.kind == "sample_hash"
@@ -1905,7 +1928,7 @@ class InvestigationService:
             )
             if any(
                 sample.tlp is TLP.RED
-                or sample.do_not_submit
+                or external_effect_source_do_not_submit_blocks(family, sample.do_not_submit)
                 or bool((sample.license_restriction or "").strip())
                 for sample in samples
             ):
@@ -1924,7 +1947,7 @@ class InvestigationService:
                     document is None
                     or document.subject_id != investigation.subject_id
                     or document.tlp is TLP.RED
-                    or document.do_not_submit
+                    or external_effect_source_do_not_submit_blocks(family, document.do_not_submit)
                     or bool((document.license_restriction or "").strip())
                 ):
                     return True

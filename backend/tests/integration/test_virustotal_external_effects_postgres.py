@@ -55,6 +55,7 @@ from cti_app.infrastructure.database.models.core import BlobRow, SampleRow
 from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectAcquisitionDispatchRow,
     ExternalEffectClaimRow,
+    ExternalEffectUseRow,
 )
 from cti_app.infrastructure.database.models.investigation import (
     SampleAssociationRow,
@@ -86,7 +87,11 @@ def _synthetic_hash() -> str:
 
 
 def _policy_capabilities(
-    *, max_claims: int, acquire_hits_allowed: bool = False, external_llm_allowed: bool = True
+    *,
+    max_claims: int,
+    acquire_hits_allowed: bool = False,
+    do_not_submit: bool = False,
+    external_llm_allowed: bool = True,
 ) -> OsintCapabilities:
     return OsintCapabilities(
         allowed_providers=("vt",),
@@ -102,7 +107,7 @@ def _policy_capabilities(
         acquire_hits_allowed=acquire_hits_allowed,
         disclosure=DisclosureBounds(
             tlp=TLPLevel.CLEAR,
-            do_not_submit=False,
+            do_not_submit=do_not_submit,
             external_llm_allowed=external_llm_allowed,
         ),
         max_effect_claims_per_investigation=max_claims,
@@ -115,6 +120,7 @@ async def _activate_policy(
     *,
     max_claims: int,
     acquire_hits_allowed: bool = False,
+    do_not_submit: bool = False,
     external_llm_allowed: bool = True,
 ):
     service = OsintOpenPolicyService(uow_factory, Settings(_env_file=None))
@@ -124,6 +130,7 @@ async def _activate_policy(
         capabilities=_policy_capabilities(
             max_claims=max_claims,
             acquire_hits_allowed=acquire_hits_allowed,
+            do_not_submit=do_not_submit,
             external_llm_allowed=external_llm_allowed,
         ),
         actor_id="human:vt-read-integration",
@@ -265,6 +272,7 @@ async def _run_inherited_case(
     download_client_factory=None,
     proxy_transport: httpx.AsyncBaseTransport | None = None,
     acquire_hits_allowed: bool = False,
+    policy_do_not_submit: bool = False,
     policy_external_llm_allowed: bool = True,
     revoke_policy_before_download_consume: bool = False,
     repeat_tool_call_in_same_turn: bool = False,
@@ -390,6 +398,7 @@ async def _run_inherited_case(
         seeded.subject.id,
         max_claims=max_claims,
         acquire_hits_allowed=acquire_hits_allowed,
+        do_not_submit=policy_do_not_submit,
         external_llm_allowed=policy_external_llm_allowed,
     )
 
@@ -584,6 +593,15 @@ async def _run_inherited_case(
                     )
                 ).all()
             )
+            uses = list(
+                (
+                    await session.scalars(
+                        select(ExternalEffectUseRow).where(
+                            ExternalEffectUseRow.claim_id.in_([claim.id for claim in claims])
+                        )
+                    )
+                ).all()
+            )
         return {
             "adapter": adapter,
             "acquisition_errors": acquisition_errors,
@@ -597,6 +615,7 @@ async def _run_inherited_case(
             "policy": policy,
             "proxy_client": proxy_client,
             "session_factory": session_factory,
+            "uses": uses,
             "engine": engine,
         }
     except BaseException:
@@ -1466,21 +1485,11 @@ async def test_osint_open_claim_ceiling_refuses_a_distinct_vt_effect_before_send
         await result["engine"].dispose()
 
 
-@pytest.mark.parametrize(
-    ("sample_tlp", "sample_do_not_submit"),
-    [
-        (TLP.RED, False),
-        (TLP.CLEAR, True),
-    ],
-    ids=("tlp-red", "do-not-submit"),
-)
 @pytest.mark.parametrize("bypass_legacy_guard", [False, True], ids=("legacy", "coordinator"))
 @pytest.mark.asyncio
-async def test_restricted_sample_vt_read_is_refused_before_transport(
+async def test_tlp_red_sample_vt_read_is_refused_before_transport(
     migrated_postgres_url: str,
     tmp_path: Path,
-    sample_tlp: TLP,
-    sample_do_not_submit: bool,
     bypass_legacy_guard: bool,
 ) -> None:
     sample_bytes = f"synthetic restricted VT source {uuid4()}".encode()
@@ -1508,8 +1517,7 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
         hashes=(file_hash,),
         proxy_handler=proxy_handler,
         sample_bytes=sample_bytes,
-        sample_tlp=sample_tlp,
-        sample_do_not_submit=sample_do_not_submit,
+        sample_tlp=TLP.RED,
         sample_external_llm_allowed=True,
         bypass_legacy_guard=bypass_legacy_guard,
     )
@@ -1534,12 +1542,12 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
     ("sample_tlp", "sample_do_not_submit", "expected_transport_calls"),
     [
         pytest.param(TLP.CLEAR, False, 1, id="clear-external-llm-disallowed"),
-        pytest.param(TLP.CLEAR, True, 0, id="do-not-submit"),
+        pytest.param(TLP.CLEAR, True, 1, id="do-not-submit-does-not-block-vt-read"),
         pytest.param(TLP.RED, False, 0, id="tlp-red"),
     ],
 )
 @pytest.mark.asyncio
-async def test_vt_file_report_respects_sample_submission_restrictions_not_external_llm_flag(
+async def test_vt_file_report_ignores_sample_flags_but_keeps_tlp_veto(
     migrated_postgres_url: str,
     tmp_path: Path,
     sample_tlp: TLP,
@@ -1597,10 +1605,56 @@ async def test_vt_file_report_respects_sample_submission_restrictions_not_extern
 
 
 @pytest.mark.asyncio
-async def test_restricted_observation_grounded_vt_read_is_refused_before_transport(
+async def test_inherited_envelope_do_not_submit_still_refuses_vt_read(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
-    sample_bytes = f"synthetic restricted observation-grounded source {uuid4()}".encode()
+    sample_bytes = f"synthetic envelope-restricted VT source {uuid4()}".encode()
+    file_hash = hashlib.sha256(sample_bytes).hexdigest()
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200,
+            json={"data": {"id": file_hash, "type": "file"}},
+            request=request,
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        sample_bytes=sample_bytes,
+        sample_do_not_submit=True,
+        sample_observation_hashes=(file_hash,),
+        associate_hashes=False,
+        policy_do_not_submit=True,
+    )
+    try:
+        assert result["envelope"].authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        assert result["envelope"].disclosure.do_not_submit is True
+        assert result["human_decisions"] == []
+        assert physical_requests == []
+        assert result["claims"] == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.asyncio
+async def test_observation_grounded_vt_read_allows_historical_sample_do_not_submit(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    sample_bytes = f"synthetic historical observation-grounded source {uuid4()}".encode()
     file_hash = hashlib.sha256(sample_bytes).hexdigest()
     physical_requests: list[httpx.Request] = []
 
@@ -1618,17 +1672,27 @@ async def test_restricted_observation_grounded_vt_read_is_refused_before_transpo
         proxy_handler=proxy_handler,
         sample_bytes=sample_bytes,
         sample_do_not_submit=True,
+        sample_tlp=TLP.CLEAR,
         associate_hashes=False,
         sample_observation_hashes=(file_hash,),
-        bypass_legacy_guard=True,
     )
     try:
-        assert physical_requests == []
-        assert result["invocations"]
-        assert result["invocations"][0].status in {
-            ToolInvocationStatus.POLICY_DENIED,
-            ToolInvocationStatus.NEEDS_REVIEW,
-        }
+        assert len(physical_requests) == 1
+        assert result["envelope"].authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        assert result["inheritance"].policy_event_id == result["policy"].event_id
+        assert result["envelope"].disclosure.do_not_submit is False
+        assert result["human_decisions"] == []
+        assert len(result["invocations"]) == 1
+        assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
+        assert len(result["claims"]) == 1
+        claim = result["claims"][0]
+        assert claim.family == "vt.file_report"
+        assert claim.state == "COMPLETED"
+        assert any(reference["kind"] == "evidence_observation" for reference in claim.evidence_refs)
+        assert any(reference["kind"] == "sample_hash" for reference in claim.evidence_refs)
+        assert len(result["uses"]) == 1
+        assert result["uses"][0].claim_id == claim.id
+        assert result["uses"][0].use_kind == "SENT"
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()
@@ -1672,22 +1736,28 @@ async def test_ungrounded_vt_hash_read_is_refused_before_transport(
 
 
 @pytest.mark.parametrize(
-    ("source_tlp", "source_do_not_submit", "source_license_restriction"),
+    (
+        "source_tlp",
+        "source_do_not_submit",
+        "source_license_restriction",
+        "expected_transport_calls",
+    ),
     [
-        (TLP.RED, False, None),
-        (TLP.CLEAR, True, None),
-        (TLP.CLEAR, False, "no external submission"),
+        (TLP.RED, False, None, 0),
+        (TLP.CLEAR, True, None, 1),
+        (TLP.CLEAR, False, "no external submission", 0),
     ],
-    ids=("tlp-red", "do-not-submit", "license-veto"),
+    ids=("tlp-red-veto", "do-not-submit-allows-metadata-read", "license-veto"),
 )
 @pytest.mark.parametrize("bypass_legacy_guard", [False, True], ids=("legacy", "coordinator"))
 @pytest.mark.asyncio
-async def test_restricted_source_document_vt_read_is_refused_before_transport(
+async def test_source_document_vt_read_keeps_tlp_license_veto_but_ignores_do_not_submit(
     migrated_postgres_url: str,
     tmp_path: Path,
     source_tlp: TLP,
     source_do_not_submit: bool,
     source_license_restriction: str | None,
+    expected_transport_calls: int,
     bypass_legacy_guard: bool,
 ) -> None:
     physical_requests: list[httpx.Request] = []
@@ -1717,14 +1787,18 @@ async def test_restricted_source_document_vt_read_is_refused_before_transport(
         bypass_legacy_guard=bypass_legacy_guard,
     )
     try:
-        assert physical_requests == []
+        assert len(physical_requests) == expected_transport_calls
         assert result["human_decisions"] == []
         assert result["invocations"]
-        assert result["invocations"][0].status in {
-            ToolInvocationStatus.POLICY_DENIED,
-            ToolInvocationStatus.NEEDS_REVIEW,
-        }
-        if not bypass_legacy_guard:
+        if expected_transport_calls:
+            assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
+            assert len(result["claims"]) == 1
+            assert result["claims"][0].state == "COMPLETED"
+        else:
+            assert result["invocations"][0].status in {
+                ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.NEEDS_REVIEW,
+            }
             assert result["claims"] == []
     finally:
         if result["direct_client"] is not None:

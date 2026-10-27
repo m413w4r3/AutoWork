@@ -37,6 +37,28 @@ from cti_app.domain.external_effects import (
     validate_prepared_request,
 )
 
+_VT_FAMILIES_WITHOUT_SOURCE_UPLOAD = frozenset(
+    {
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+        "vt.download_sample",
+    }
+)
+
+
+def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool) -> bool:
+    """Return whether a source flag blocks this external effect family.
+
+    VT reports, metadata reads, and downloads do not send source bytes out of
+    AutoWork. Other external effects, including model submissions, retain the
+    source ``do_not_submit`` veto.
+    """
+    return do_not_submit and family not in _VT_FAMILIES_WITHOUT_SOURCE_UPLOAD
+
 
 @dataclass(frozen=True, slots=True)
 class FrameworkNoSendProof:

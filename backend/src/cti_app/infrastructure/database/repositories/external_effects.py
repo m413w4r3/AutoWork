@@ -29,6 +29,7 @@ from cti_app.application.external_effects import (
     ReuseDecision,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
+    external_effect_source_do_not_submit_blocks,
 )
 from cti_app.domain.external_effects import (
     EffectClaimState,
@@ -1622,7 +1623,9 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 sample.subject_id != subject_id
                 or sample.tlp.casefold() == "red"
-                or (sample.do_not_submit and not is_bridge_submission)
+                or external_effect_source_do_not_submit_blocks(
+                    prepared.family, sample.do_not_submit
+                )
                 or bool((sample.license_restriction or "").strip())
             ):
                 raise _ConsumeDenied("sample_source_restricted")
@@ -1646,7 +1649,9 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 document.subject_id != subject_id
                 or document.tlp.casefold() == "red"
-                or (document.do_not_submit and not is_bridge_submission)
+                or external_effect_source_do_not_submit_blocks(
+                    prepared.family, document.do_not_submit
+                )
                 or bool(document.license_restriction)
             ):
                 raise _ConsumeDenied("source_document_restricted")
