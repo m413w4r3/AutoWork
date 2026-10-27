@@ -62,6 +62,16 @@ _VT_HASH_READ_FAMILIES = {
     "vt.behaviour_pcap",
     "vt.relationships",
 }
+# Bridge/advisor dossiers ignore the source do_not_submit veto, as the claim
+# store does at consume (user decision 2026-10-27); a source that forbids
+# external LLMs, TLP RED and licences still bind.
+_BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
+
+
+def _source_flags_block(family: str, *, do_not_submit: bool, external_llm_allowed: bool) -> bool:
+    if family.startswith(_BRIDGE_FAMILY_PREFIXES):
+        return not external_llm_allowed
+    return external_effect_source_do_not_submit_blocks(family, do_not_submit)
 
 
 def _metadata_source_refs(parameters: Mapping[str, object]) -> tuple[EvidenceReference, ...]:
@@ -363,8 +373,22 @@ class SqlAlchemyVirusTotalPolicyGuard:
             for reference in context.prepared.evidence_refs
             if reference.kind == "evidence_observation"
         }
+        # Bridge cites associations by association id, as the claim store reads them.
+        is_bridge = context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+        association_refs: dict[UUID, EvidenceReference | None] = {}
         for reference in context.prepared.evidence_refs:
-            if reference.kind in {"sample", "sample_association_sample"}:
+            if is_bridge and reference.kind in {"sample_association", "sample_association_sample"}:
+                try:
+                    association_id = UUID(reference.id)
+                except ValueError:
+                    return False
+                cited = association_refs.get(association_id)
+                if reference.kind == "sample_association_sample":
+                    if cited is not None and cited != reference:
+                        return False
+                    cited = reference
+                association_refs[association_id] = cited
+            elif reference.kind in {"sample", "sample_association_sample"}:
                 try:
                     sample_ids.add(UUID(reference.id))
                 except ValueError:
@@ -401,7 +425,11 @@ class SqlAlchemyVirusTotalPolicyGuard:
                     return False
                 object_type = observation.object_type.casefold()
                 if object_type in _VT_FILE_OBJECT_TYPES or (
-                    context.prepared.family in _VT_HASH_READ_FAMILIES and object_type == "sha256"
+                    object_type == "sha256"
+                    and (
+                        context.prepared.family in _VT_HASH_READ_FAMILIES
+                        or context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+                    )
                 ):
                     if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
                         return False
@@ -436,6 +464,25 @@ class SqlAlchemyVirusTotalPolicyGuard:
             if observation_hashes - (associated_hashes | sample_hashes):
                 return False
             sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)
+        if association_refs:
+            cited_associations = list(
+                await session.scalars(
+                    select(SampleAssociationRow)
+                    .where(SampleAssociationRow.id.in_(sorted(association_refs, key=str)))
+                    .with_for_update()
+                )
+            )
+            if {item.id for item in cited_associations} != set(association_refs):
+                return False
+            for association in cited_associations:
+                cited = association_refs[association.id]
+                if (
+                    association.investigation_id != context.authority.investigation_id
+                    or association.sample_id is None
+                    or (cited is not None and cited.sha256 != association.sample_sha256)
+                ):
+                    return False
+                sample_ids.add(association.sample_id)
         if sample_ids:
             samples = list(
                 await session.scalars(
@@ -449,8 +496,10 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if {item.id for item in samples} != sample_ids or any(
                 item.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    context.prepared.family, item.do_not_submit
+                or _source_flags_block(
+                    context.prepared.family,
+                    do_not_submit=item.do_not_submit,
+                    external_llm_allowed=item.external_llm_allowed,
                 )
                 or bool((item.license_restriction or "").strip())
                 for item in samples
@@ -478,8 +527,10 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if any(
                 item.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    context.prepared.family, item.do_not_submit
+                or _source_flags_block(
+                    context.prepared.family,
+                    do_not_submit=item.do_not_submit,
+                    external_llm_allowed=item.external_llm_allowed,
                 )
                 or bool((item.license_restriction or "").strip())
                 for item in hash_samples
@@ -498,8 +549,10 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             if {item.id for item in documents} != document_ids or any(
                 item.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    context.prepared.family, item.do_not_submit
+                or _source_flags_block(
+                    context.prepared.family,
+                    do_not_submit=item.do_not_submit,
+                    external_llm_allowed=item.external_llm_allowed,
                 )
                 or bool((item.license_restriction or "").strip())
                 for item in documents

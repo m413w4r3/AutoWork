@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -10,6 +11,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from httpx import ASGITransport
+from sqlalchemy import select
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.bridge_investigator import (
@@ -17,15 +19,27 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
+from cti_app.application.external_effects import ExternalEffectCoordinator
+from cti_app.application.identity import Identity, IdentityScope
+from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
+    ModelGateway,
+    ModelRouter,
+)
+from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
+from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualification
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
     BudgetDimension,
+    DisclosureBounds,
+    EnvelopeAuthorityKind,
     FindingAssessment,
     FindingKind,
     FrameworkPreSubmissionProof,
@@ -33,17 +47,47 @@ from cti_app.domain.investigation import (
     SampleAssociation,
     SampleOrigin,
     SampleQualification,
+    TLPLevel,
     ToolInvocationStatus,
 )
+from cti_app.domain.osint_open import OsintCapabilities, OsintScopeKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     publication_document_from_json,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.investigation_audit_reader import (
+    read_investigation_audit_snapshot,
+)
+from cti_app.infrastructure.database.models.external_effects import (
+    ExternalEffectAcquisitionDispatchRow,
+    ExternalEffectClaimRow,
+    ExternalEffectUseRow,
+)
+from cti_app.infrastructure.database.models.investigation import InvestigationFindingVersionRow
+from cti_app.infrastructure.database.models.model_execution import (
+    ModelConversationTurnRow,
+    ModelRunRow,
+)
+from cti_app.infrastructure.database.models.production import (
+    SampleAcquisitionAttemptRow,
+    SampleAcquisitionDispatchAttemptRow,
+)
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
-from cti_app.infrastructure.investigation_runtime_ports import build_investigation_runtime_ports
+from cti_app.infrastructure.investigation_runtime_ports import (
+    build_investigation_runtime_composition_factory,
+    build_investigation_runtime_ports,
+    create_external_effect_coordinator,
+)
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
+from cti_app.integrations.models import (
+    BlobModelOutputStore,
+    FakeModelAdapter,
+    OpenAIResearchAdapter,
+    create_coordinated_http_responses_transport,
+)
+from tests.confined_worker_harness import build_confined_worker_harness
 from tests.workflow_emulator.investigation_support import (
     DEFAULT_IOC as _IOC,
 )
@@ -99,6 +143,16 @@ from tests.workflow_emulator.investigation_support import (
 pytestmark = pytest.mark.integration
 
 
+class _ContinuousOsintIdentityProvider:
+    def __init__(self) -> None:
+        self.identity = Identity(
+            "human:m07-continuous-osint", frozenset({IdentityScope.HUMAN_OPERATOR})
+        )
+
+    async def current(self) -> Identity:
+        return self.identity
+
+
 class _PartialDownloadFailureStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield b"partial-synthetic-sample"
@@ -144,12 +198,15 @@ def _real_vt_runtime_ports(
     settings,
     virustotal: VirusTotalHttpAdapter,
     capabilities: VirusTotalCapabilities,
+    session_factory=None,
+    external_effect_coordinator: ExternalEffectCoordinator | None = None,
 ):
     engine = create_postgres_engine(database_url)
     runtime = build_investigation_runtime_ports(
         settings,
         uow_factory=uow_factory,
-        session_factory=create_session_factory(engine),
+        session_factory=session_factory or create_session_factory(engine),
+        external_effect_coordinator=external_effect_coordinator,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         vt_adapter=virustotal,
@@ -667,6 +724,1068 @@ async def test_postgres_bridge_pre_submission_exhaustion_resumes_with_new_attemp
             final_envelope = await uow.investigation_envelopes.get(investigation_id)
         assert final_envelope is not None
         assert final_envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
+    uow_factory, migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    """Exercise pinned OSINT_OPEN through VT, quarantine, local analysis, and Bridge."""
+    blob_store = FilesystemBlobStore(tmp_path / "continuous-osint-blob-storage")
+    blob_catalog = BlobCatalogService(blob_store, uow_factory)
+    artifact_store = ProductionArtifactStore(blob_catalog)
+    material = _unique_sample_material()
+    seeded = await _seed_verified_article(
+        uow_factory,
+        artifact_store,
+        suffix=uuid4().hex[:10],
+        material=material,
+    )
+    assert seeded.seed_observation is not None
+    assert seeded.seed_observation.object_id == _SEED_HASH
+    investigation_id = seeded.investigation.id
+    candidate_hash = material.sample_hash
+
+    policy = await OsintOpenPolicyService(uow_factory, Settings(_env_file=None)).activate(
+        scope_kind=OsintScopeKind.SUBJECT_SET,
+        scope_ref=str(seeded.subject.id),
+        capabilities=OsintCapabilities(
+            allowed_providers=("bridge", "vt"),
+            budget_limits={
+                BudgetDimension.VT_UNITS: 40,
+                BudgetDimension.SHODAN_CREDITS: 0,
+                BudgetDimension.DOWNLOADS: 1,
+                BudgetDimension.BRIDGE_TURNS: 12,
+                BudgetDimension.TOOL_SECONDS: 86_400,
+                BudgetDimension.CONTEXT_BYTES: 1_000_000,
+                BudgetDimension.CONTEXT_TOKENS: 100_000,
+            },
+            acquire_hits_allowed=True,
+            disclosure=DisclosureBounds(
+                tlp=TLPLevel.CLEAR,
+                do_not_submit=False,
+                external_llm_allowed=True,
+            ),
+            max_effect_claims_per_investigation=10,
+        ),
+        actor_id="human:continuous-osint-integration",
+        reason="Authorize the synthetic continuous OSINT_OPEN integration journey.",
+        correlation_id=f"continuous-osint-policy:{investigation_id}:{uuid4()}",
+    )
+
+    effect_engine = create_postgres_engine(migrated_postgres_url)
+    effect_sessions = create_session_factory(effect_engine)
+    effect_coordinator = create_external_effect_coordinator(effect_sessions)
+    vt_http_calls: list[tuple[str, str, str]] = []
+    signed_url = (
+        "https://vtsamples.commondatastorage.googleapis.com/synthetic-sample?signature=synthetic"
+    )
+
+    def mock_vt(request: httpx.Request) -> httpx.Response:
+        host_path = (request.url.host or "", request.url.path)
+        vt_http_calls.append((request.method, host_path[0], host_path[1]))
+        if host_path == ("www.virustotal.com", f"/api/v3/files/{_SEED_HASH}"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": _SEED_HASH,
+                        "type": "file",
+                        "attributes": {
+                            "sha256": _SEED_HASH,
+                            "meaningful_name": "article-seed.bin",
+                            "size": 123,
+                            "last_analysis_stats": {"malicious": 1},
+                            "tags": ["peexe"],
+                        },
+                    }
+                },
+                request=request,
+            )
+        if host_path == ("www.virustotal.com", "/api/v3/intelligence/search"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": candidate_hash,
+                            "type": "file",
+                            "attributes": {
+                                "meaningful_name": "synthetic-stage-two.bin",
+                                "type_description": "Win32 EXE",
+                                "size": len(material.sample_bytes),
+                            },
+                        }
+                    ]
+                },
+                request=request,
+            )
+        if host_path == (
+            "www.virustotal.com",
+            f"/api/v3/files/{candidate_hash}/download",
+        ):
+            return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+        if host_path == (
+            "www.virustotal.com",
+            f"/api/v3/files/{candidate_hash}/download_url",
+        ):
+            return httpx.Response(200, json={"data": signed_url}, request=request)
+        if host_path == (
+            "vtsamples.commondatastorage.googleapis.com",
+            "/synthetic-sample",
+        ):
+            return httpx.Response(
+                200,
+                content=material.sample_bytes,
+                headers={"content-type": "application/octet-stream"},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+
+    vt_adapter = VirusTotalHttpAdapter(
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_vt),
+            trust_env=False,
+        ),
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(
+            file_report=True,
+            intelligence_search=True,
+            file_download=True,
+        ),
+        file_download_enabled=True,
+        download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
+        download_allowed_ports=frozenset({443}),
+        download_client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_vt),
+            trust_env=False,
+        ),
+    )
+
+    bridge_http_calls: list[tuple[str, str]] = []
+
+    def mock_bridge(request: httpx.Request) -> httpx.Response:
+        bridge_http_calls.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/v1/bridge/capabilities":
+            return httpx.Response(200, json={"capabilities": []}, request=request)
+        if request.method == "POST" and request.url.path == "/v1/responses":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "synthetic-bridge-response-1",
+                    "status": "completed",
+                    "output_text": (
+                        "advisor-wire.v1\n"
+                        "TYPE: draft_text\n"
+                        "STATUS: succeeded\n"
+                        "BLOCK: KEY_FINDINGS | BODY | -\n"
+                        "S: The persisted static measurement distinguishes this candidate "
+                        "without establishing execution or attribution. [A1]\n"
+                        "LIMITATION: Static analysis does not establish execution or attribution."
+                    ),
+                },
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "NotFound"}, request=request)
+
+    bridge_http = create_coordinated_http_responses_transport(
+        "https://bridge.fixture.invalid/v1",
+        api_key=None,
+        coordinator=effect_coordinator,
+        http_transport=httpx.MockTransport(mock_bridge),
+    )
+    bridge_adapter = OpenAIResearchAdapter(bridge_http, model="synthetic-bridge-model")
+    model_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=bridge_adapter,
+            openai_structured=bridge_adapter,
+            openai_drafting=bridge_adapter,
+            openai_critic=bridge_adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        uow_factory,
+        BlobModelOutputStore(blob_catalog),
+    )
+    model_conversations = ModelConversationService(uow_factory, model_gateway, blob_store)
+    # Satisfy the production Bridge routing gate; model requests still use the
+    # MockTransport-backed gateway configured above.
+    settings = _settings(providers=True, local_analysis=True).model_copy(
+        update={"openai_bridge_base_url": "https://bridge.fixture.invalid/v1"}
+    )
+    confined_worker = build_confined_worker_harness(
+        settings=settings,
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        required_families=("sample_analysis",),
+    )
+    settings = confined_worker.settings
+    runtime = build_investigation_runtime_composition_factory(
+        settings,
+        uow_factory=uow_factory,
+        session_factory=effect_sessions,
+        external_effect_coordinator=effect_coordinator,
+        blob_store=blob_store,
+        blob_catalog=blob_catalog,
+        artifact_store=artifact_store,
+        model_conversations=model_conversations,
+        vt_adapter=vt_adapter,
+        vt_capabilities=VirusTotalCapabilities(
+            file_report=True,
+            intelligence_search=True,
+            file_download=True,
+        ),
+        vt_observations=VirusTotalObservationService(blob_catalog, uow_factory),
+        shodan_adapter=None,
+        ghidra_adapter=None,
+        confined_analysis_execution=confined_worker.port,
+    )
+    assert runtime.ports.optional_tool_ports.acquisition is not None
+    composition_factory = runtime.composition_factory
+    app, _, _ = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=composition_factory,
+    )
+    app.state.identity_provider = _ContinuousOsintIdentityProvider()
+
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            started_response = await client.post(
+                f"/api/subjects/{seeded.subject.id}/investigations",
+                json={
+                    "production_run_id": str(seeded.run.id),
+                    "synthesis_artifact_id": str(seeded.synthesis.id),
+                    "synthesis_sha256": seeded.synthesis.input_hash,
+                    "execution_mode": "operator_led",
+                },
+            )
+            assert started_response.status_code == 200, started_response.text
+            app.state.identity_provider.identity = Identity(
+                "operator:m07-continuous-osint-client",
+                frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+            async with uow_factory() as uow:
+                envelope = await uow.investigation_envelopes.get(investigation_id)
+                working_state = await uow.investigation_states.get(investigation_id)
+                inheritance = await uow.osint_open_policies.get_inheritance(investigation_id)
+                decisions = await uow.analyst_decisions.list_for_investigation(investigation_id)
+            assert envelope is not None
+            assert working_state is not None
+            assert working_state.execution_mode.value == "operator_led"
+            assert envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+            assert envelope.inherited_policy_event_id == policy.event_id
+            assert inheritance is not None and inheritance.policy_event_id == policy.event_id
+            assert tuple(decisions) == ()
+
+            operator_results: dict[str, dict[str, Any]] = {}
+            operator_requests: list[tuple[str, str, dict[str, Any]]] = []
+
+            def tool_diagnostic(tool_name: str, result: dict[str, Any]) -> str:
+                invocation_view = result.get("invocation", {})
+                return (
+                    f"{tool_name} status={invocation_view.get('status')!r} "
+                    f"error_code={invocation_view.get('error_code')!r} "
+                    f"output={result.get('output')!r} "
+                    f"advisor_output={result.get('advisor_output')!r}"
+                )
+
+            def assert_tool_status(
+                tool_name: str, result: dict[str, Any], expected: str | tuple[str, ...]
+            ) -> None:
+                expected_statuses = (expected,) if isinstance(expected, str) else expected
+                assert result["invocation"]["status"] in expected_statuses, tool_diagnostic(
+                    tool_name, result
+                )
+
+            async def invoke_operator_tool(
+                tool_name: str,
+                schema_version: str,
+                arguments: dict[str, Any],
+                *,
+                key: str,
+                purpose: str,
+            ) -> dict[str, Any]:
+                async with uow_factory() as uow:
+                    working_state = await uow.investigation_states.get(investigation_id)
+                assert working_state is not None
+                request_payload = {
+                    "schema_version": schema_version,
+                    "arguments": arguments,
+                    "purpose": purpose,
+                    "expected_version": working_state.version,
+                }
+                response = await client.post(
+                    f"/api/investigations/{investigation_id}/operator/tools/{tool_name}",
+                    headers={"Idempotency-Key": key},
+                    json=request_payload,
+                )
+                assert response.status_code == 200, response.text
+                result = response.json()
+                operator_results[tool_name] = result
+                operator_requests.append((tool_name, key, request_payload))
+                return result
+
+            report_result = await invoke_operator_tool(
+                "vt.file_report",
+                "1",
+                {"file_hash": _SEED_HASH},
+                key=f"m07.operator.file-report:{investigation_id}",
+                purpose="Read the VT report for the seed hash anchored by the article observation.",
+            )
+            assert_tool_status("vt.file_report", report_result, "succeeded")
+
+            pivot_result = await invoke_operator_tool(
+                "vt.intelligence_search",
+                "1",
+                {
+                    "query": "type:peexe",
+                    "justification": "Find a candidate related to the persisted article seed.",
+                    "evidence_refs": [str(seeded.seed_observation.id)],
+                },
+                key=f"m07.operator.intelligence-search:{investigation_id}",
+                purpose="Pivot from the cited seed observation into VT Intelligence Search.",
+            )
+            assert_tool_status("vt.intelligence_search", pivot_result, "succeeded")
+            async with uow_factory() as uow:
+                pivot_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source == "VirusTotal" and item.object_id == candidate_hash
+                    ),
+                    None,
+                )
+            assert pivot_observation is not None, tool_diagnostic(
+                "vt.intelligence_search", pivot_result
+            )
+            pivot_observation_id = pivot_observation.id
+            assert str(pivot_observation_id) in pivot_result["invocation"]["response_refs"]
+
+            download_result = await invoke_operator_tool(
+                "vt.download_sample",
+                "1",
+                {
+                    "sha256": candidate_hash,
+                    "purpose": "Acquire the candidate identified by the cited VT pivot.",
+                    "evidence_refs": [str(pivot_observation_id)],
+                },
+                key=f"m07.operator.download:{investigation_id}:{candidate_hash}",
+                purpose="Quarantine the hash-checked VT candidate without G3 qualification.",
+            )
+            assert_tool_status("vt.download_sample", download_result, "succeeded")
+            async with uow_factory() as uow:
+                candidate_association = next(
+                    (
+                        item
+                        for item in await uow.sample_associations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.sample_sha256 == candidate_hash
+                    ),
+                    None,
+                )
+                decisions_before_analysis = tuple(
+                    await uow.analyst_decisions.list_for_investigation(investigation_id)
+                )
+            assert candidate_association is not None, tool_diagnostic(
+                "vt.download_sample", download_result
+            )
+            association_id = candidate_association.id
+            assert candidate_association.qualification is SampleQualification.CANDIDATE
+            assert decisions_before_analysis == ()
+
+            analysis_result = await invoke_operator_tool(
+                "sample.analyze",
+                "1",
+                {
+                    "association_id": str(association_id),
+                    "purpose": "Run bounded static analysis on the quarantined candidate.",
+                    "evidence_refs": [str(pivot_observation_id)],
+                },
+                key=f"m07.operator.sample-analysis:{investigation_id}:{association_id}",
+                purpose="Measure the persisted candidate locally before any G3 decision.",
+            )
+            assert_tool_status("sample.analyze", analysis_result, ("succeeded", "partial"))
+            async with uow_factory() as uow:
+                analysis_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source.startswith("autowork.analysis_worker")
+                        and item.object_type == "sample"
+                        and item.object_id == candidate_hash
+                    ),
+                    None,
+                )
+            assert analysis_observation is not None, tool_diagnostic(
+                "sample.analyze", analysis_result
+            )
+            analysis_observation_id = analysis_observation.id
+            assert str(analysis_observation_id) in analysis_result["invocation"]["response_refs"]
+
+            advisor_result = await invoke_operator_tool(
+                "advisor.consult",
+                "advisor-consult.v1",
+                {
+                    "consultation_type": "draft_text",
+                    "question": (
+                        "Does this persisted static analysis measurement distinguish the inert "
+                        "loader candidate from an arbitrary file? State the observation and the "
+                        "remaining uncertainty."
+                    ),
+                    "evidence_refs": [str(analysis_observation_id)],
+                    "assertions": [
+                        {
+                            "id": "static_analysis_measurement",
+                            "text": (
+                                "The persisted static measurement distinguishes this candidate "
+                                "without establishing execution or attribution."
+                            ),
+                            "nature": "analyse",
+                            "refs": [
+                                {
+                                    "kind": "observation",
+                                    "id": str(analysis_observation_id),
+                                }
+                            ],
+                            "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                },
+                key=f"m07.operator.advisor:{investigation_id}",
+                purpose="Assess the cited local analysis observation and its limitations.",
+            )
+            assert_tool_status("advisor.consult", advisor_result, "succeeded")
+            advisor_output = advisor_result.get("advisor_output")
+            assert (
+                isinstance(advisor_output, dict)
+                and advisor_output.get("advisor_status") == "succeeded"
+            ), tool_diagnostic("advisor.consult", advisor_result)
+            async with uow_factory() as uow:
+                advisor_observation = next(
+                    (
+                        item
+                        for item in await uow.evidence_observations.list_for_investigation(
+                            investigation_id
+                        )
+                        if item.source == "advisor.consult" and item.object_type == "advisor_call"
+                    ),
+                    None,
+                )
+            assert advisor_observation is not None, tool_diagnostic(
+                "advisor.consult", advisor_result
+            )
+            advisor_observation_id = advisor_observation.id
+            assert str(advisor_observation_id) in advisor_result["invocation"]["response_refs"]
+
+            finding_statement = (
+                "The VT pivot candidate has a persisted local static-analysis measurement."
+            )
+            finding_result = await invoke_operator_tool(
+                "finding.propose",
+                "operator-finding.v1",
+                {
+                    "action": "propose",
+                    "kind": FindingKind.NEW_SAMPLE.value,
+                    "assessment": FindingAssessment.SUPPORTED.value,
+                    "statement": finding_statement,
+                    "subject_ref": candidate_hash,
+                    "observation_refs": [
+                        str(pivot_observation_id),
+                        str(analysis_observation_id),
+                    ],
+                    "claim_refs": [],
+                    "novelty": NoveltyClass.NEW_TO_ARTICLE.value,
+                    "scope": "Compared only with the verified article snapshot.",
+                    "limitations": [
+                        "Static analysis does not establish execution or incident attribution."
+                    ],
+                },
+                key=f"m07.operator.finding:{investigation_id}:{candidate_hash}",
+                purpose="Record an evidence-backed candidate finding with bounded limitations.",
+            )
+            assert_tool_status("finding.propose", finding_result, "succeeded")
+
+            state_response = await client.get(f"/api/investigations/{investigation_id}")
+            assert state_response.status_code == 200, state_response.text
+
+            sample_response = await client.get(f"/api/investigations/{investigation_id}/samples")
+            assert sample_response.status_code == 200, sample_response.text
+            sample_views = sample_response.json()
+            assert len(sample_views) == 1
+            assert sample_views[0]["sample_sha256"] == candidate_hash
+            assert sample_views[0]["qualification"] == "candidate"
+
+            async with uow_factory() as uow:
+                persisted_envelope = await uow.investigation_envelopes.get(investigation_id)
+                decisions = tuple(
+                    await uow.analyst_decisions.list_for_investigation(investigation_id)
+                )
+                invocations = tuple(
+                    await uow.tool_invocations.list_for_investigation(investigation_id)
+                )
+                observations = tuple(
+                    await uow.evidence_observations.list_for_investigation(investigation_id)
+                )
+                findings = tuple(
+                    await uow.investigation_findings.list_for_investigation(investigation_id)
+                )
+                associations = tuple(
+                    await uow.sample_associations.list_for_investigation(investigation_id)
+                )
+                acquisition = await uow.sample_acquisition_attempts.find_successful(
+                    investigation_id, candidate_hash
+                )
+                samples = await uow.samples.list_by_subject_and_sha256(
+                    seeded.subject.id, candidate_hash
+                )
+                acquired = samples[0] if samples else None
+                quarantine_blob = (
+                    await uow.blobs.get(acquired.blob_id) if acquired is not None else None
+                )
+            assert persisted_envelope is not None
+            assert persisted_envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+            assert decisions == ()
+            assert len(associations) == 1
+            association = associations[0]
+            assert association.qualification is SampleQualification.CANDIDATE
+            assert acquisition is not None
+            assert acquisition.outcome.value == "success"
+            assert acquisition.sample_id is not None
+            assert len(samples) == 1
+            assert acquired is not None
+            assert acquired.state.value == "review_candidate"
+            assert quarantine_blob is not None
+            assert quarantine_blob.descriptor.sha256 == candidate_hash
+            assert hashlib.sha256(material.sample_bytes).hexdigest() == candidate_hash
+            assert (
+                await blob_catalog.read(acquired.blob_id, max_bytes=1024) == material.sample_bytes
+            )
+
+            invocations_by_name = {item.tool_name: item for item in invocations}
+            report_invocation = invocations_by_name["vt.file_report"]
+            pivot_invocation = invocations_by_name["vt.intelligence_search"]
+            download_invocation = invocations_by_name["vt.download_sample"]
+            analysis_invocation = invocations_by_name["sample.analyze"]
+            advisor_invocation = invocations_by_name["advisor.consult"]
+            for name, invocation in invocations_by_name.items():
+                assert invocation.status.value == operator_results[name]["invocation"]["status"], (
+                    tool_diagnostic(name, operator_results[name])
+                )
+            report_parameters = dict(report_invocation.normalized_parameters)
+            report_source_refs = report_parameters.pop("_vt_external_effect_source_refs")
+            assert report_parameters == {"file_hash": _SEED_HASH}
+            assert [dict(item) for item in report_source_refs] == [
+                {
+                    "id": _SEED_HASH,
+                    "kind": "sample_hash",
+                    "sha256": _SEED_HASH,
+                    "version": "sample-hash.v1",
+                },
+                {
+                    "id": str(seeded.seed_observation.id),
+                    "kind": "evidence_observation",
+                    "sha256": seeded.seed_observation.sha256,
+                    "version": str(seeded.seed_observation.source_version),
+                },
+            ]
+            assert list(pivot_invocation.normalized_parameters["evidence_refs"]) == [
+                str(seeded.seed_observation.id)
+            ]
+
+            pivot_observation = next(
+                item
+                for item in observations
+                if item.source == "VirusTotal" and item.object_id == candidate_hash
+            )
+            report_observation = next(
+                item
+                for item in observations
+                if item.source == "VirusTotal" and item.object_id == _SEED_HASH
+            )
+            analysis_observation = next(
+                item
+                for item in observations
+                if item.source.startswith("autowork.analysis_worker")
+                and item.object_type == "sample"
+                and item.object_id == candidate_hash
+            )
+            advisor_observation = next(
+                item
+                for item in observations
+                if item.source == "advisor.consult" and item.object_type == "advisor_call"
+            )
+            assert advisor_observation.id == advisor_observation_id
+            assert advisor_observation.id in advisor_invocation.response_refs
+            assert report_observation.id in report_invocation.response_refs
+            assert pivot_observation.id in pivot_invocation.response_refs
+            assert list(download_invocation.normalized_parameters["evidence_refs"]) == [
+                str(pivot_observation.id)
+            ]
+            assert analysis_invocation.normalized_parameters["association_id"] == str(
+                association.id
+            )
+            assert list(analysis_invocation.normalized_parameters["evidence_refs"]) == [
+                str(pivot_observation.id)
+            ]
+            assert analysis_observation.id in analysis_invocation.response_refs
+            assert list(advisor_invocation.normalized_parameters["evidence_refs"]) == [
+                str(analysis_observation.id)
+            ]
+
+            supported_finding = next(
+                (item for item in findings if item.statement == finding_statement),
+                None,
+            )
+            assert supported_finding is not None, tool_diagnostic("finding.propose", finding_result)
+            assert supported_finding.kind is FindingKind.NEW_SAMPLE
+            assert supported_finding.assessment is FindingAssessment.SUPPORTED
+            assert pivot_observation.id in supported_finding.observation_refs
+            assert analysis_observation.id in supported_finding.observation_refs
+            assert supported_finding.limitations
+            assert "execution" in supported_finding.limitations[0]
+
+            invocation_order = [item.tool_name for item in invocations]
+            assert invocation_order.index("vt.file_report") < invocation_order.index(
+                "vt.intelligence_search"
+            )
+            assert invocation_order.index("vt.intelligence_search") < invocation_order.index(
+                "vt.download_sample"
+            )
+            assert invocation_order.index("vt.download_sample") < invocation_order.index(
+                "sample.analyze"
+            )
+            assert invocation_order.index("sample.analyze") < invocation_order.index(
+                "advisor.consult"
+            )
+            assert invocation_order.index("advisor.consult") < invocation_order.index(
+                "finding.propose"
+            )
+
+            async with effect_sessions() as session:
+                claims = tuple(
+                    (
+                        await session.scalars(
+                            select(ExternalEffectClaimRow).where(
+                                ExternalEffectClaimRow.investigation_id == investigation_id
+                            )
+                        )
+                    ).all()
+                )
+                uses = tuple(
+                    (
+                        await session.scalars(
+                            select(ExternalEffectUseRow).where(
+                                ExternalEffectUseRow.invocation_id.in_(
+                                    [item.id for item in invocations]
+                                )
+                            )
+                        )
+                    ).all()
+                )
+                dispatches = tuple(
+                    (
+                        await session.scalars(
+                            select(SampleAcquisitionDispatchAttemptRow).where(
+                                SampleAcquisitionDispatchAttemptRow.investigation_id
+                                == investigation_id
+                            )
+                        )
+                    ).all()
+                )
+                sample_attempts = tuple(
+                    (
+                        await session.scalars(
+                            select(SampleAcquisitionAttemptRow).where(
+                                SampleAcquisitionAttemptRow.investigation_id == investigation_id
+                            )
+                        )
+                    ).all()
+                )
+                links = tuple(
+                    (
+                        await session.scalars(
+                            select(ExternalEffectAcquisitionDispatchRow).where(
+                                ExternalEffectAcquisitionDispatchRow.dispatch_attempt_id.in_(
+                                    [item.id for item in dispatches]
+                                )
+                            )
+                        )
+                    ).all()
+                )
+                version_rows = tuple(
+                    (
+                        await session.scalars(
+                            select(InvestigationFindingVersionRow).where(
+                                InvestigationFindingVersionRow.investigation_id == investigation_id
+                            )
+                        )
+                    ).all()
+                )
+                model_run_ids = {
+                    item.model_run_id for item in claims if item.model_run_id is not None
+                }
+                model_runs = tuple(
+                    (
+                        await session.scalars(
+                            select(ModelRunRow).where(ModelRunRow.id.in_(model_run_ids))
+                        )
+                    ).all()
+                )
+                turn_ids = {item.bridge_turn_id for item in claims if item.bridge_turn_id}
+                turns = tuple(
+                    (
+                        await session.scalars(
+                            select(ModelConversationTurnRow).where(
+                                ModelConversationTurnRow.id.in_(turn_ids)
+                            )
+                        )
+                    ).all()
+                )
+            family_counts = {
+                family: sum(item.family == family for item in claims)
+                for family in {
+                    "vt.file_report",
+                    "vt.intelligence_search",
+                    "vt.download_sample",
+                    "advisor.consultation.v1",
+                }
+            }
+            assert family_counts == {
+                "vt.file_report": 1,
+                "vt.intelligence_search": 1,
+                "vt.download_sample": 3,
+                "advisor.consultation.v1": 1,
+            }
+            assert all(item.state == "COMPLETED" for item in claims)
+            assert len(uses) == len(claims)
+            assert all(item.use_kind == "SENT" for item in uses)
+            assert {item.claim_id for item in uses} == {item.id for item in claims}
+            assert len(dispatches) == 1
+            assert dispatches[0].requested_hash == candidate_hash
+            assert dispatches[0].state == "COMPLETED"
+            assert len(sample_attempts) == 1
+            assert sample_attempts[0].requested_hash == candidate_hash
+            assert sample_attempts[0].outcome == "success"
+            assert sample_attempts[0].sample_id == acquired.id
+            assert len(links) == 3
+            download_claims = tuple(item for item in claims if item.family == "vt.download_sample")
+            assert {item.id for item in download_claims} == {item.claim_id for item in links}
+            assert all(
+                item.canonical_request is not None
+                and item.canonical_request.get("sha256") == candidate_hash
+                and any(
+                    reference.get("kind") == "evidence_observation"
+                    and reference.get("id") == str(pivot_observation.id)
+                    for reference in item.evidence_refs
+                )
+                for item in download_claims
+            )
+            bridge_claim = next(item for item in claims if item.family == "advisor.consultation.v1")
+            assert bridge_claim.bridge_turn_id is not None
+            assert bridge_claim.model_run_id is not None
+            assert bridge_claim.evidence_refs
+            assert {item.get("id") for item in bridge_claim.evidence_refs} == {
+                str(analysis_observation.id)
+            }
+            assert len(model_runs) == 1
+            model_run = model_runs[0]
+            assert model_run.id == bridge_claim.model_run_id
+            assert model_run.status == "succeeded"
+            provenance = model_run.parameters[BRIDGE_SOURCE_PROVENANCE_KEY]
+            assert provenance["family"] == "advisor.consultation.v1"
+            assert {item["id"] for item in provenance["evidence_refs"]} == {
+                str(analysis_observation.id)
+            }
+            assert len(turns) == 1
+            bridge_turn = turns[0]
+            assert bridge_turn.id == bridge_claim.bridge_turn_id
+            assert bridge_turn.model_run_id == model_run.id
+            assert bridge_turn.status == "succeeded"
+            assert len(version_rows) == len(findings) == 1
+            assert version_rows[0].id == supported_finding.id
+            assert version_rows[0].version == supported_finding.version == 1
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == 1
+            assert [item[2] for item in vt_http_calls] == [
+                f"/api/v3/files/{_SEED_HASH}",
+                "/api/v3/intelligence/search",
+                f"/api/v3/files/{candidate_hash}/download",
+                f"/api/v3/files/{candidate_hash}/download_url",
+                "/synthetic-sample",
+            ]
+
+            audit_snapshot = await read_investigation_audit_snapshot(
+                effect_sessions, investigation_id, artifact_store
+            )
+            assert audit_snapshot.investigation_id == str(investigation_id)
+            assert {item.id for item in audit_snapshot.observations} >= {
+                pivot_observation.id,
+                analysis_observation.id,
+                advisor_observation.id,
+            }
+            assert {(item.id, item.version) for item in audit_snapshot.findings} == {
+                (supported_finding.id, 1)
+            }
+            assert len(audit_snapshot.advisor_call_metadata) == 1
+            advisor_metadata = audit_snapshot.advisor_call_metadata[0]
+            assert advisor_metadata["observation_id"] == str(advisor_observation.id)
+            assert advisor_metadata["metadata"]["advisor_status"] == "succeeded"
+
+            async def persisted_snapshot() -> tuple[Any, ...]:
+                async with uow_factory() as uow:
+                    invocations_now = tuple(
+                        await uow.tool_invocations.list_for_investigation(investigation_id)
+                    )
+                    observations_now = tuple(
+                        await uow.evidence_observations.list_for_investigation(investigation_id)
+                    )
+                    associations_now = tuple(
+                        await uow.sample_associations.list_for_investigation(investigation_id)
+                    )
+                    findings_now = tuple(
+                        await uow.investigation_findings.list_for_investigation(investigation_id)
+                    )
+                    samples_now = tuple(
+                        await uow.samples.list_by_subject_and_sha256(
+                            seeded.subject.id, candidate_hash
+                        )
+                    )
+                    blobs_now = tuple([await uow.blobs.get(item.blob_id) for item in samples_now])
+                async with effect_sessions() as session:
+                    claims_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ExternalEffectClaimRow).where(
+                                    ExternalEffectClaimRow.investigation_id == investigation_id
+                                )
+                            )
+                        ).all()
+                    )
+                    uses_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ExternalEffectUseRow).where(
+                                    ExternalEffectUseRow.invocation_id.in_(
+                                        [item.id for item in invocations_now]
+                                    )
+                                )
+                            )
+                        ).all()
+                    )
+                    attempts_now = tuple(
+                        (
+                            await session.scalars(
+                                select(SampleAcquisitionAttemptRow).where(
+                                    SampleAcquisitionAttemptRow.investigation_id == investigation_id
+                                )
+                            )
+                        ).all()
+                    )
+                    dispatches_now = tuple(
+                        (
+                            await session.scalars(
+                                select(SampleAcquisitionDispatchAttemptRow).where(
+                                    SampleAcquisitionDispatchAttemptRow.investigation_id
+                                    == investigation_id
+                                )
+                            )
+                        ).all()
+                    )
+                    links_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ExternalEffectAcquisitionDispatchRow).where(
+                                    ExternalEffectAcquisitionDispatchRow.dispatch_attempt_id.in_(
+                                        [item.id for item in dispatches_now]
+                                    )
+                                )
+                            )
+                        ).all()
+                    )
+                    versions_now = tuple(
+                        (
+                            await session.scalars(
+                                select(InvestigationFindingVersionRow).where(
+                                    InvestigationFindingVersionRow.investigation_id
+                                    == investigation_id
+                                )
+                            )
+                        ).all()
+                    )
+                    run_ids = {
+                        item.model_run_id for item in claims_now if item.model_run_id is not None
+                    }
+                    runs_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ModelRunRow).where(ModelRunRow.id.in_(run_ids))
+                            )
+                        ).all()
+                    )
+                    turn_ids_now = {
+                        item.bridge_turn_id for item in claims_now if item.bridge_turn_id
+                    }
+                    turns_now = tuple(
+                        (
+                            await session.scalars(
+                                select(ModelConversationTurnRow).where(
+                                    ModelConversationTurnRow.id.in_(turn_ids_now)
+                                )
+                            )
+                        ).all()
+                    )
+                return (
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.operation_key,
+                                item.tool_name,
+                                item.status.value,
+                                item.version,
+                            )
+                            for item in invocations_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), item.source, item.sha256) for item in observations_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.version,
+                                item.sample_sha256,
+                                item.qualification.value,
+                            )
+                            for item in associations_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.version,
+                                item.assessment.value,
+                                tuple(str(ref) for ref in item.observation_refs),
+                            )
+                            for item in findings_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.family,
+                                item.state,
+                                str(item.model_run_id),
+                                str(item.bridge_turn_id),
+                                json.dumps(item.evidence_refs, sort_keys=True),
+                            )
+                            for item in claims_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), str(item.claim_id), item.use_kind) for item in uses_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.requested_hash,
+                                item.outcome,
+                                str(item.sample_id),
+                            )
+                            for item in attempts_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), item.requested_hash, item.state)
+                            for item in dispatches_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.claim_id), str(item.dispatch_attempt_id))
+                            for item in links_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (str(item.id), str(item.blob_id), item.state.value)
+                            for item in samples_now
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                str(item.id),
+                                item.descriptor.sha256 if item is not None else None,
+                                item.descriptor.size if item is not None else None,
+                            )
+                            for item in blobs_now
+                        )
+                    ),
+                    tuple(sorted((str(item.id), item.version) for item in claims_now)),
+                    tuple(sorted((str(item.id), item.status) for item in runs_now)),
+                    tuple(
+                        sorted(
+                            (str(item.id), str(item.model_run_id), item.status)
+                            for item in turns_now
+                        )
+                    ),
+                    tuple(sorted((str(item.id), item.version) for item in versions_now)),
+                )
+
+            before_replay = await persisted_snapshot()
+            audit_before_replay = audit_snapshot
+            vt_calls_before_replay = tuple(vt_http_calls)
+            bridge_calls_before_replay = tuple(bridge_http_calls)
+            for tool_name, key, request_payload in operator_requests:
+                replay_response = await client.post(
+                    f"/api/investigations/{investigation_id}/operator/tools/{tool_name}",
+                    headers={"Idempotency-Key": key},
+                    json=request_payload,
+                )
+                assert replay_response.status_code == 200, replay_response.text
+                replay = replay_response.json()
+                assert replay["idempotent_replay"] is True, tool_diagnostic(tool_name, replay)
+                assert (
+                    replay["invocation"]["id"] == operator_results[tool_name]["invocation"]["id"]
+                ), tool_diagnostic(tool_name, replay)
+                assert_tool_status(
+                    tool_name,
+                    replay,
+                    operator_results[tool_name]["invocation"]["status"],
+                )
+            assert tuple(vt_http_calls) == vt_calls_before_replay
+            assert tuple(bridge_http_calls) == bridge_calls_before_replay
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == 1
+            assert await persisted_snapshot() == before_replay
+            assert (
+                await read_investigation_audit_snapshot(
+                    effect_sessions, investigation_id, artifact_store
+                )
+                == audit_before_replay
+            )
+    finally:
+        await vt_adapter._client.aclose()
+        await effect_engine.dispose()
 
 
 @pytest.mark.asyncio
