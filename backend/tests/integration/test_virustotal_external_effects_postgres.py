@@ -44,6 +44,7 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocationStatus,
 )
+from cti_app.domain.investigation_state import StopReason
 from cti_app.domain.osint_open import OsintCapabilities, OsintScopeKind
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -582,6 +583,7 @@ async def _run_inherited_case(
                 )
                 if latest_error is not None:
                     acquisition_errors.append(latest_error)
+            state = await uow.investigation_states.get(seeded.investigation.id)
             await uow.commit()
         async with session_factory() as session:
             claims = list(
@@ -615,6 +617,8 @@ async def _run_inherited_case(
             "policy": policy,
             "proxy_client": proxy_client,
             "session_factory": session_factory,
+            "state": state,
+            "turn_transport": turn_transport,
             "uses": uses,
             "engine": engine,
         }
@@ -1605,7 +1609,7 @@ async def test_vt_file_report_ignores_sample_flags_but_keeps_tlp_veto(
 
 
 @pytest.mark.asyncio
-async def test_inherited_envelope_do_not_submit_still_refuses_vt_read(
+async def test_inherited_envelope_do_not_submit_blocks_before_external_vt_read(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
     sample_bytes = f"synthetic envelope-restricted VT source {uuid4()}".encode()
@@ -1635,14 +1639,19 @@ async def test_inherited_envelope_do_not_submit_still_refuses_vt_read(
     try:
         assert result["envelope"].authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
         assert result["envelope"].disclosure.do_not_submit is True
+        assert result["state"] is not None
+        assert result["state"].stop_reason is StopReason.MODEL_UNAVAILABLE
+        assert any(
+            action.startswith("bridge_submission_blocked:external_llm_policy:")
+            and "envelope_do_not_submit=1" in action
+            for action in result["state"].recent_actions
+        )
+        assert result["turn_transport"].attempt_count == 0
+        assert result["turn_transport"].submission_count == 0
         assert result["human_decisions"] == []
         assert physical_requests == []
         assert result["claims"] == []
-        assert result["invocations"]
-        assert result["invocations"][0].status in {
-            ToolInvocationStatus.POLICY_DENIED,
-            ToolInvocationStatus.NEEDS_REVIEW,
-        }
+        assert result["invocations"] == []
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()
@@ -1762,10 +1771,15 @@ async def test_source_document_vt_read_keeps_tlp_license_veto_but_ignores_do_not
 ) -> None:
     physical_requests: list[httpx.Request] = []
     observation_id = uuid4()
+    result_hash = _synthetic_hash()
 
     def proxy_handler(request: httpx.Request) -> httpx.Response:
         physical_requests.append(request)
-        return httpx.Response(200, json={"data": []}, request=request)
+        return httpx.Response(
+            200,
+            json={"data": [{"id": result_hash, "type": "file"}]},
+            request=request,
+        )
 
     result = await _run_inherited_case(
         database_url=migrated_postgres_url,
