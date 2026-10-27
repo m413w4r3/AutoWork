@@ -207,33 +207,6 @@ def _real_vt_runtime_ports(
     return engine, runtime.optional_tool_ports
 
 
-class _AdvisorCoordinatorTransport:
-    """Keep scripted investigation turns while routing advisor calls through S3 Bridge."""
-
-    requires_external_effect_authority = False
-
-    def __init__(
-        self,
-        scripted: _VerticalScriptedTransport,
-        coordinated: ModelConversationTurnTransport,
-    ) -> None:
-        self.scripted = scripted
-        self.coordinated = coordinated
-
-    async def build_external_effect_binding(self, *, family: str, **attempt: Any) -> Any:
-        if family != "advisor.consultation.v1":
-            return None
-        return await self.coordinated.build_external_effect_binding(
-            family=family,
-            **attempt,
-        )
-
-    async def submit(self, **kwargs: Any):
-        if kwargs.get("bridge_external_effect_binding") is not None:
-            return await self.coordinated.submit(**kwargs)
-        return await self.scripted.submit(**kwargs)
-
-
 class _ContinuousOsintTransport(_VerticalScriptedTransport):
     """Enqueue each next step only after its evidence is persisted."""
 
@@ -395,6 +368,25 @@ class _ContinuousOsintTransport(_VerticalScriptedTransport):
                                 "observation and the remaining uncertainty."
                             ),
                             "evidence_refs": [str(analysis_observation.id)],
+                            "assertions": [
+                                {
+                                    "id": "static_analysis_measurement",
+                                    "text": (
+                                        "The persisted static measurement distinguishes this "
+                                        "candidate without establishing execution or attribution."
+                                    ),
+                                    "nature": "analyse",
+                                    "refs": [
+                                        {
+                                            "kind": "observation",
+                                            "id": str(analysis_observation.id),
+                                        }
+                                    ],
+                                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                                    "form": "body",
+                                    "anchor": None,
+                                }
+                            ],
                         },
                         "purpose": (
                             "Assess the discriminating sample-analysis observation and its limits."
@@ -404,6 +396,32 @@ class _ContinuousOsintTransport(_VerticalScriptedTransport):
             )
             self._advisor_enqueued = True
         return await super().submit(**kwargs)
+
+
+class _RecordingAdvisorAdapter:
+    def __init__(self, delegate: Any, results: list[Any]) -> None:
+        self._delegate = delegate
+        self._results = results
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def execute(self, arguments: Any, context: Any) -> Any:
+        result = await self._delegate.execute(arguments, context)
+        self._results.append(result)
+        return result
+
+
+def _advisor_result_recorder(results: list[Any]):
+    def register(registry: Any, _dependencies: Any) -> None:
+        registered = registry.get("advisor.consult", "advisor-consult.v1")
+        if registered is None:
+            return
+        definition, adapter = registered
+        registry.unregister(definition.name, definition.schema_version)
+        registry.register(definition, _RecordingAdvisorAdapter(adapter, results))
+
+    return register
 
 
 @pytest.mark.asyncio
@@ -1061,7 +1079,15 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 json={
                     "id": "synthetic-bridge-response-1",
                     "status": "completed",
-                    "output_text": "The static observation is discriminating but incomplete.",
+                    "output_text": (
+                        "advisor-wire.v1\n"
+                        "TYPE: draft_text\n"
+                        "STATUS: succeeded\n"
+                        "BLOCK: KEY_FINDINGS | BODY | -\n"
+                        "S: The persisted static measurement distinguishes this candidate "
+                        "without establishing execution or attribution. [A1]\n"
+                        "LIMITATION: Static analysis does not establish execution or attribution."
+                    ),
                 },
                 request=request,
             )
@@ -1185,7 +1211,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         seed_observation_id=seeded.seed_observation.id,
         final_builder=final_response_builder,
     )
-    transport = _AdvisorCoordinatorTransport(scripted, coordinated_advisor_transport)
+    advisor_results: list[Any] = []
     settings = _settings(providers=True, local_analysis=True)
     runtime_engine, runtime_ports = _real_vt_runtime_ports(
         database_url=migrated_postgres_url,
@@ -1207,12 +1233,17 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
         settings=settings,
-        transport=transport,
+        transport=scripted,
         virustotal=vt_adapter,
         include_local_analysis=True,
         # Preserve W15's in-process confined worker. The production runtime's
         # default execution port is not allowed to override that test harness.
         additional_ports=replace(runtime_ports, confined_analysis_execution=None),
+    )
+    composition_factory = replace(
+        composition_factory,
+        advisor_turn_transport=coordinated_advisor_transport,
+        tool_registrar=_advisor_result_recorder(advisor_results),
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,
@@ -1319,6 +1350,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             download_invocation = invocations_by_name["vt.download_sample"]
             analysis_invocation = invocations_by_name["sample.analyze"]
             advisor_invocation = invocations_by_name["advisor.consult"]
+            advisor_result = advisor_results[-1] if advisor_results else None
             assert report_invocation.status is ToolInvocationStatus.SUCCEEDED
             assert pivot_invocation.status is ToolInvocationStatus.SUCCEEDED
             assert download_invocation.status is ToolInvocationStatus.SUCCEEDED
@@ -1326,7 +1358,16 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 ToolInvocationStatus.SUCCEEDED,
                 ToolInvocationStatus.PARTIAL,
             }
-            assert advisor_invocation.status is ToolInvocationStatus.SUCCEEDED
+            assert (
+                advisor_invocation.status is ToolInvocationStatus.SUCCEEDED
+                and advisor_result is not None
+                and advisor_result.status is ToolInvocationStatus.SUCCEEDED
+            ), (
+                f"advisor_invocation_status={advisor_invocation.status.value} "
+                f"advisor_result_status={getattr(advisor_result, 'status', None)} "
+                f"advisor_result_error_code={getattr(advisor_result, 'error_code', None)!r} "
+                f"advisor_result_output={getattr(advisor_result, 'output', None)!r}"
+            )
             assert report_invocation.normalized_parameters == {"file_hash": _SEED_HASH}
             assert pivot_invocation.normalized_parameters["evidence_refs"] == [
                 str(seeded.seed_observation.id)
@@ -1645,6 +1686,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             await _run_http_job(app, uow_factory, registry, dispatcher, job_id)
             assert tuple(vt_http_calls) == vt_calls_before_replay
             assert tuple(bridge_http_calls) == bridge_calls_before_replay
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == 1
             assert await persisted_snapshot() == before_replay
             assert (
                 await read_investigation_audit_snapshot(

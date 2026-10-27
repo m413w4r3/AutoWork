@@ -99,6 +99,10 @@ class _BlockedTransport:
         )
 
 
+class _AuthorityBoundBlockedTransport(_BlockedTransport):
+    requires_external_effect_authority = True
+
+
 @pytest.mark.asyncio
 async def test_permission_aware_transport_forwards_orphan_reconciliation() -> None:
     class _OrphanAwareTransport(_BlockedTransport):
@@ -333,6 +337,62 @@ async def test_operator_inventory_capabilities_match_the_dispatcher() -> None:
             operation_key=f"operator-tool-parity:{name}",
         )
         assert result.status is not ToolInvocationStatus.UNAVAILABLE
+
+
+def test_bridge_led_composition_registers_an_explicit_advisor_transport() -> None:
+    investigation_id = uuid4()
+    ordinary_turn_only = build_investigation_composition(
+        _unit_of_work(),
+        uow_factory=cast(UnitOfWorkFactory, lambda: None),
+        artifact_store=cast(ProductionArtifactStore, SimpleNamespace()),
+        model_conversations=cast(ModelConversationService, SimpleNamespace()),
+        settings=Settings.model_construct(),
+        investigation_id=investigation_id,
+        turn_transport=_BlockedTransport(),
+    )
+    assert ordinary_turn_only.registry.get("advisor.consult", "advisor-consult.v1") is None
+    assert ordinary_turn_only.unavailable_tool_reasons["advisor.consult"] == (
+        "bridge_transport_unavailable"
+    )
+
+    unbound_advisor_transport = build_investigation_composition(
+        _unit_of_work(),
+        uow_factory=cast(UnitOfWorkFactory, lambda: None),
+        artifact_store=cast(ProductionArtifactStore, SimpleNamespace()),
+        model_conversations=cast(ModelConversationService, SimpleNamespace()),
+        settings=Settings.model_construct(),
+        investigation_id=investigation_id,
+        advisor_turn_transport=_BlockedTransport(),
+    )
+    assert unbound_advisor_transport.registry.get("advisor.consult", "advisor-consult.v1") is None
+    assert unbound_advisor_transport.unavailable_tool_reasons["advisor.consult"] == (
+        "external_effect_authority_required"
+    )
+
+    composition = build_investigation_composition(
+        _unit_of_work(),
+        uow_factory=cast(UnitOfWorkFactory, lambda: None),
+        artifact_store=cast(ProductionArtifactStore, SimpleNamespace()),
+        model_conversations=cast(ModelConversationService, SimpleNamespace()),
+        settings=Settings.model_construct(),
+        investigation_id=investigation_id,
+        advisor_turn_transport=_AuthorityBoundBlockedTransport(),
+    )
+    context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="bridge-led-advisor-transport",
+        available_capabilities=composition.available_capabilities,
+        unavailable_tool_reasons=composition.unavailable_tool_reasons,
+    )
+
+    registration = composition.registry.get("advisor.consult", "advisor-consult.v1")
+    assert registration is not None
+    availability = project_tool_availability(composition.registry, context)
+    assert "advisor.consult" in availability.available_names
+    assert "advisor.consult:operator_mode_required" not in availability.unavailable_diagnostics
+    assert "finding.propose:operator_mode_required" in availability.unavailable_diagnostics
 
 
 @pytest.mark.asyncio
