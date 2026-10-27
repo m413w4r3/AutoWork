@@ -37,6 +37,7 @@ from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualification
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
+    canonical_json_bytes,
     BudgetDimension,
     DisclosureBounds,
     EnvelopeAuthorityKind,
@@ -1747,7 +1748,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                                 item.tool_name,
                                 item.status.value,
                                 item.version,
-                                json.dumps(item.normalized_parameters, sort_keys=True),
+                                canonical_json_bytes(item.normalized_parameters).decode(),
                             )
                             for item in invocations_now
                         )
