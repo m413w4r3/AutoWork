@@ -6738,6 +6738,36 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
 
 
 @pytest.mark.asyncio
+async def test_general_contradiction_search_reaches_bridge_without_a_refuted_finding() -> None:
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "Review contradictions in the loaded passage.", ["article:" + "a" * 64]
+            ),
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": (
+                "Plan the next investigation step for Blackwood and search for contradictions."
+            ),
+        },
+        make_context(investigation_id),
+    )
+
+    assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "Aucune réfutation connue" in prompt
+    assert result.output["bridge_provenance"]["preflight_status"] == "READY"
+
+
+@pytest.mark.asyncio
 async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(investigation_id, {"schema": "offline-test.v1"})

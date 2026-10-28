@@ -26,6 +26,10 @@ from cti_app.domain.advisor_completeness import (
 _WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
 _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
 _UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+_FINDING_REFERENCE_ID = re.compile(
+    r"(?i)\b(?:finding|constat|r[eé]futation|contradiction)\s*(?:id\s*)?[:#]?\s*"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
 _INTERNAL_SHA = re.compile(r"(?i)\b(?:sha(?:-?256)?\s*[:=]\s*)?[0-9a-f]{64}\b")
 _STOP = frozenset(
     "avec dans pour sans cette celui celle sont être avoir mais comme dans sur sous une des les "
@@ -584,7 +588,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
     relevance_text = f"{task}\n{target_text}"
     task_terms = _terms(relevance_text)
     explicit_claims = _requested_claim_ids(prompt_data, relevance_text)
-    contradiction_required = _contradiction_is_required(prompt_data, relevance_text)
+    contradiction_requested = _contradiction_is_requested(prompt_data, relevance_text)
     explicitly_referenced = set(_explicit_reference_ids(prompt_data))
     unavailable_observations: set[str] = set()
     candidates: list[dict[str, Any]] = []
@@ -971,7 +975,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         )
         if (
             assessment == "refuted"
-            and contradiction_required
+            and contradiction_requested
             and _finding_matches_requested_claims(item, explicit_claims)
         ):
             score += 100
@@ -1434,6 +1438,36 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             f"{len(unavailable_observations)} observation(s) citée(s)."
         )
 
+    if contradiction_requested:
+        selected_claims = {
+            _as_text(item.get("extra", {}).get("claim_id")).casefold()
+            for item in selected
+            if item["kind"] == "article" and _as_text(item.get("extra", {}).get("claim_id"))
+        }
+        contradiction_claims = explicit_claims or selected_claims
+        refuted_claims = {
+            _as_text(claim_id).casefold()
+            for item in prompt_data.get("findings", ())
+            if isinstance(item, Mapping) and _as_text(item.get("assessment")) == "refuted"
+            for claim_id in item.get("claim_refs", ())
+        }
+        uncovered_claims = sorted(contradiction_claims - refuted_claims)
+        if uncovered_claims:
+            lines.append(
+                "Aucune réfutation connue pour les passages "
+                f"{', '.join(uncovered_claims)} ; la recherche de contradictions fait l'objet "
+                "de cette consultation. Cette absence ne prouve pas qu'aucune contradiction "
+                "n'existe."
+            )
+        elif not any(
+            item["kind"] == "finding" and item.get("assessment") == "refuted" for item in selected
+        ):
+            lines.append(
+                "Aucun finding évalué comme réfuté n'a été chargé dans le dossier ; la recherche "
+                "de contradictions fait l'objet de cette consultation. Cette absence ne prouve "
+                "pas qu'aucune contradiction n'existe."
+            )
+
     return AdvisorDossier(text="\n\n".join(lines), manifest=tuple(manifest))
 
 
@@ -1451,7 +1485,13 @@ def evaluate_advisor_evidence_preflight(
         + [_as_text(item.get("text")) for item in _target_rows(prompt_data)]
     )
     claim_ids = _requested_claim_ids(prompt_data, task)
-    contradiction_required = _contradiction_is_required(prompt_data, task)
+    contradiction_requested = _contradiction_is_requested(prompt_data, task)
+    contradiction_required = _contradiction_is_required(
+        prompt_data, _as_text(prompt_data.get("question"))
+    )
+    requested_finding_ids = _requested_contradiction_finding_ids(
+        prompt_data, _as_text(prompt_data.get("question"))
+    )
     references = set(_explicit_reference_ids(prompt_data))
     records: list[dict[str, Any]] = []
     missing_refs: list[dict[str, str]] = []
@@ -1895,8 +1935,8 @@ def evaluate_advisor_evidence_preflight(
                 "this question."
             ),
         )
-    if contradiction_required:
-        if claim_ids:
+    if contradiction_requested:
+        if contradiction_required and claim_ids:
             covered_claims = {
                 claim
                 for item in records
@@ -1915,9 +1955,25 @@ def evaluate_advisor_evidence_preflight(
                     f"No refuted finding is linked to requested claim passage {claim_id}.",
                     claim_id=claim_id,
                 )
-        elif not any(
-            item["kind"] == "finding" and item.get("assessment") == "refuted" for item in records
-        ):
+        elif contradiction_required and requested_finding_ids:
+            covered_finding_ids = {
+                item["id"].casefold()
+                for item in records
+                if item["kind"] == "finding" and item.get("assessment") == "refuted"
+            }
+            for finding_id in sorted(requested_finding_ids - covered_finding_ids):
+                add(
+                    "contradiction",
+                    f"required-contradiction:finding:{finding_id}",
+                    "",
+                    {"kind": "finding", "id": finding_id},
+                    False,
+                    True,
+                    f"Finding {finding_id} is cited as a contradiction target but no refuted "
+                    "finding was loaded.",
+                    finding_id=finding_id,
+                )
+        elif contradiction_required:
             add(
                 "contradiction",
                 "required-contradiction",
@@ -1927,6 +1983,50 @@ def evaluate_advisor_evidence_preflight(
                 True,
                 "No refuted finding was loaded for the requested contradiction.",
             )
+        else:
+            relevant_claims = {
+                _as_text(item.get("claim_id")).casefold()
+                for item in records
+                if item["kind"] == "article"
+                and item["required"]
+                and item["body_present"]
+                and _as_text(item.get("claim_id"))
+            }
+            covered_claims = {
+                _as_text(claim).casefold()
+                for item in records
+                if item["kind"] == "finding" and item.get("assessment") == "refuted"
+                for claim in item.get("claim_refs", ())
+            }
+            uncovered_claims = sorted(relevant_claims - covered_claims)
+            for claim_id in uncovered_claims:
+                add(
+                    "contradiction",
+                    f"informational-contradiction:{claim_id}",
+                    "",
+                    {"kind": "claim", "id": claim_id},
+                    False,
+                    False,
+                    "Aucune réfutation connue pour ce passage ; la recherche de contradictions "
+                    "fait l'objet de la consultation.",
+                    claim_id=claim_id,
+                    informational=True,
+                )
+            if not relevant_claims and not any(
+                item["kind"] == "finding" and item.get("assessment") == "refuted"
+                for item in records
+            ):
+                add(
+                    "contradiction",
+                    "informational-contradiction",
+                    "",
+                    None,
+                    False,
+                    False,
+                    "Aucun finding réfuté n'a été chargé ; cette absence ne prouve pas qu'aucune "
+                    "contradiction n'existe.",
+                    informational=True,
+                )
 
     known = {(item["kind"], item["id"]) for item in records}
     for kind, identifier in sorted(references - known):
@@ -1981,6 +2081,8 @@ def evaluate_advisor_evidence_preflight(
 
         if item["required"]:
             mark(AdvisorEvidenceStatus.REQUIRED, item["reason"])
+        elif item.get("informational"):
+            mark(AdvisorEvidenceStatus.INFORMATIONAL, item["reason"])
         verified = item.get("verified", True)
         if item["body_present"] and sha_valid and verified:
             mark(
@@ -2120,7 +2222,7 @@ def evaluate_advisor_evidence_preflight(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
                 "This optional reference was omitted after its canonical blob read failed.",
             )
-        elif not item["required"] and not item["body_present"]:
+        elif not item["required"] and not item["body_present"] and not item.get("informational"):
             mark(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
                 "This unrequired reference has no body loaded in the consultation snapshot.",
@@ -2413,10 +2515,36 @@ def _requested_claim_ids(data: Mapping[str, Any], task: str) -> set[str]:
     return claims
 
 
-def _contradiction_is_required(data: Mapping[str, Any], task: str) -> bool:
+def _contradiction_is_requested(data: Mapping[str, Any], task: str) -> bool:
     return _requires_contradiction(task) or any(
         isinstance(item, Mapping) and item.get("nature") == "contradiction"
         for item in data.get("assertions", ())
+    )
+
+
+def _requested_contradiction_finding_ids(data: Mapping[str, Any], task: str) -> set[str]:
+    finding_ids = {value.casefold() for value in _FINDING_REFERENCE_ID.findall(task)}
+    for item in data.get("assertions", ()):
+        if not isinstance(item, Mapping) or item.get("nature") != "contradiction":
+            continue
+        finding_id = _as_text(item.get("finding_id"))
+        if finding_id:
+            finding_ids.add(finding_id.casefold())
+        refs = item.get("refs", ())
+        if isinstance(refs, (list, tuple)):
+            finding_ids.update(
+                _as_text(ref.get("id")).casefold()
+                for ref in refs
+                if isinstance(ref, Mapping)
+                and ref.get("kind") == "finding"
+                and _as_text(ref.get("id"))
+            )
+    return finding_ids
+
+
+def _contradiction_is_required(data: Mapping[str, Any], task: str) -> bool:
+    return _contradiction_is_requested(data, task) and bool(
+        _requested_claim_ids(data, task) or _requested_contradiction_finding_ids(data, task)
     )
 
 

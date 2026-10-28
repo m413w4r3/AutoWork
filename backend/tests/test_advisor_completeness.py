@@ -95,6 +95,71 @@ def test_decisive_proof_moves_from_retrieval_needed_to_sent() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "consultation_type", ["plan_investigation", "pivot_strategy", "figure_plan"]
+)
+def test_general_contradiction_search_is_informational_without_a_targeted_claim(
+    consultation_type: str,
+) -> None:
+    question = "Planifier la suite et rechercher les contradictions autour de Blackwood."
+    data = _planning_data(question=question, evidence=[], findings=[])
+    data["consultation_type"] = consultation_type
+    data["units"] = [{"id": "U1", "text": "Investigate the selected passage S1P3.1."}]
+    data["article_passages"] = [
+        {
+            "claim_id": "S1P3.1",
+            "heading": "Synthetic claim",
+            "text": "Blackwood uses a synthetic behavior marker.",
+        }
+    ]
+    if consultation_type == "figure_plan":
+        data["findings"] = [
+            {
+                "finding_id": str(uuid4()),
+                "sha256": "c" * 64,
+                "assessment": "inconclusive",
+                "kind": "claim_verification",
+                "line": "Blackwood uses a synthetic behavior marker.",
+                "claim_refs": ["S1P3.1"],
+            }
+        ]
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "READY"
+    contradiction = next(row for row in preflight["items"] if row["kind"] == "contradiction")
+    assert contradiction["required"] is False
+    assert {status["status"] for status in contradiction["statuses"]} == {"INFORMATIONAL"}
+    assert "Aucune réfutation connue" in " ".join(
+        status["reason"] for status in contradiction["statuses"]
+    )
+    assert "Aucune réfutation connue" in dossier.text
+
+
+def test_contradiction_assertion_with_a_cited_finding_still_requires_refutation() -> None:
+    finding_id = str(uuid4())
+    question = "Review the contradiction attached to this finding."
+    data = _planning_data(question=question, evidence=[], findings=[])
+    data["assertions"] = [
+        {
+            "nature": "contradiction",
+            "text": "Check whether the cited finding is refuted.",
+            "refs": [{"kind": "finding", "id": finding_id}],
+        }
+    ]
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
+    contradiction = _item(
+        preflight, "contradiction", f"required-contradiction:finding:{finding_id}"
+    )
+    assert contradiction["required"] is True
+    assert any(finding_id in row["ref"] for row in preflight["missing_refs"])
+
+
 def test_canonical_contradiction_omitted_from_dossier_requests_retrieval() -> None:
     finding_id = str(uuid4())
     question = "Expose la contradiction dans les constatations canoniques."
