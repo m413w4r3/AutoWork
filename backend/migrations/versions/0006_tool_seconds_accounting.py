@@ -52,8 +52,7 @@ def _current_expression(bind: Any) -> tuple[str, ...]:
     if not {"dimension", "reserved_amount", "committed_amount"} <= columns:
         raise RuntimeError("tool-seconds migration preflight rejected budget table columns")
     checks = {
-        item["name"]: _tokens(item["sqltext"])
-        for item in inspector.get_check_constraints(_TABLE)
+        item["name"]: _tokens(item["sqltext"]) for item in inspector.get_check_constraints(_TABLE)
     }
     if _CONSTRAINT not in checks:
         raise RuntimeError("tool-seconds migration preflight rejected missing budget check")
