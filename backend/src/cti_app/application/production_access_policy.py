@@ -19,7 +19,7 @@ class SourceAccessPolicy:
 
     @property
     def submission_allowed(self) -> bool:
-        return self.external_llm_allowed and not self.do_not_submit
+        return self.external_llm_allowed
 
 
 def resolve_source_policy(document: Any, collection: Any | None) -> SourceAccessPolicy:

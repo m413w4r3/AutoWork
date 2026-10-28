@@ -3233,7 +3233,7 @@ def _disclosure_from_request(
         raise _http_error(422, "disclosure_bounds_cannot_be_relaxed")
     if _tlp_rank(tlp) < max(_tlp_rank(source.tlp), _tlp_rank(approved_ceiling.tlp)):
         raise _http_error(422, "disclosure_bounds_cannot_be_relaxed")
-    if do_not_submit or tlp is TLPLevel.RED:
+    if tlp is TLPLevel.RED:
         external_allowed = False
     return DisclosureBounds(
         tlp=tlp,

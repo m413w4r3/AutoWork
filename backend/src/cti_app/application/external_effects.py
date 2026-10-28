@@ -48,17 +48,21 @@ _VT_FAMILIES_WITHOUT_SOURCE_UPLOAD = frozenset(
         "vt.download_sample",
     }
 )
+_BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
 
 
 def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool) -> bool:
     """Return whether a source flag blocks this external effect family.
 
     VT reports, metadata reads, and downloads do not send source bytes out of
-    AutoWork. Other external effects retain the
-    source ``do_not_submit`` veto; Bridge consume exempts itself (user decision
-    2026-10-27).
+    AutoWork. Bridge/advisor consultations also ignore this source flag;
+    external upload families retain the veto.
     """
-    return do_not_submit and family not in _VT_FAMILIES_WITHOUT_SOURCE_UPLOAD
+    return (
+        do_not_submit
+        and family not in _VT_FAMILIES_WITHOUT_SOURCE_UPLOAD
+        and not family.startswith(_BRIDGE_FAMILY_PREFIXES)
+    )
 
 
 def osint_vt_search_may_cite_unassociated_observation_hash(

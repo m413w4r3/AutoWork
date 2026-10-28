@@ -836,13 +836,13 @@ class ProductionRelevanceProjectionService:
                     error_code="relevance_classifier_access_policy_unavailable",
                     reason=str(exc),
                 )
-            if access_policy.do_not_submit or not access_policy.external_llm_allowed:
+            if not access_policy.external_llm_allowed:
                 return await self._persist_classifier_fallback(
                     run,
                     snapshot,
                     baseline_projection,
                     error_code="relevance_classifier_policy_blocked",
-                    reason="The source access policy forbids a model submission.",
+                    reason="The source access policy forbids external LLM access.",
                     details={
                         "do_not_submit": access_policy.do_not_submit,
                         "external_llm_allowed": access_policy.external_llm_allowed,

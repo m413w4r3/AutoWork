@@ -2089,7 +2089,7 @@ class ProductionSynthesisRevisionService:
                 access_policy = await self._synthesis._load_access_policy(
                     context.snapshot, extraction
                 )
-                if access_policy.do_not_submit or not access_policy.external_llm_allowed:
+                if not access_policy.external_llm_allowed:
                     calls = 0
                 else:
                     identity = _sha256(self._request_identity_payload(request))
@@ -2636,7 +2636,7 @@ class ProductionSynthesisRevisionService:
             raise TargetedEditorialRevisionConflictError(
                 "The frozen synthesis inputs no longer match their verified artifacts"
             )
-        if access_policy.do_not_submit or not access_policy.external_llm_allowed:
+        if not access_policy.external_llm_allowed:
             raise TargetedSynthesisRevisionValidationError("synthesis_revision_policy_blocked")
 
         base_request = build_synthesis_model_request(

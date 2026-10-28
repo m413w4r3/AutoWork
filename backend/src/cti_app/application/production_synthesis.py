@@ -1931,9 +1931,7 @@ def build_synthesis_model_request(
         prompt_template_id="production-synthesis",
         prompt_template_version=SYNTHESIS_PROMPT_VERSION,
         evidence_pack_hash=pack_hash,
-        external_llm_allowed=(
-            access_policy.external_llm_allowed and not access_policy.do_not_submit
-        ),
+        external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
         sensitivity=access_policy.effective_tlp.value,
         metadata={
@@ -3370,9 +3368,7 @@ class ProductionSynthesisService:
             return control.result()
         if reused is not None:
             return reused
-        if policy.do_not_submit or not policy.external_llm_allowed:
-            # A do_not_submit source forbids every model submission; only the
-            # model gateway route could turn this evidence into a draft.
+        if not policy.external_llm_allowed:
             return ProductionSynthesisExecution(
                 status=SynthesisExecutionStatus.NEEDS_REVIEW,
                 mode=SynthesisMode.FRESH,
@@ -3380,7 +3376,7 @@ class ProductionSynthesisService:
                 extraction_hash=extraction_hash,
                 model_calls=0,
                 error_code=SynthesisStageErrorCode.POLICY_BLOCKED.value,
-                error="The source access policy forbids any model submission.",
+                error="The source access policy forbids external LLM access.",
                 details={
                     "do_not_submit": policy.do_not_submit,
                     "external_llm_allowed": policy.external_llm_allowed,

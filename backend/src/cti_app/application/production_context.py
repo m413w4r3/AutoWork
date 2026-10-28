@@ -110,11 +110,11 @@ async def build_subject_production_context(
                 continue
             policy = resolve_source_policy(document, item)
             effective_tlps.append(policy.tlp)
-            if policy.do_not_submit or not policy.external_llm_allowed:
+            if not policy.external_llm_allowed:
                 blocking_urls.append(item.canonical_url)
         else:
             effective_tlps.append(item.source_tlp)
-            if item.do_not_submit or not item.external_llm_allowed:
+            if not item.external_llm_allowed:
                 blocking_urls.append(item.canonical_url)
     for source in snapshot.core_sources:
         if not source.external_llm_allowed:

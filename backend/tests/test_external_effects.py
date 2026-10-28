@@ -154,10 +154,16 @@ def test_vt_consume_source_refs_keep_md5_and_sha1_outside_sample_hash_policy(
 
 @pytest.mark.parametrize(
     "family",
-    ["bridge.investigation_turn.v1", "advisor.consultation.v1", "other.upload"],
+    ["other.upload"],
 )
 def test_source_do_not_submit_blocks_external_upload_families(family: str) -> None:
     assert external_effect_source_do_not_submit_blocks(family, True)
+    assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize("family", ["bridge.investigation_turn.v1", "advisor.consultation.v1"])
+def test_source_do_not_submit_does_not_block_bridge_consultations(family: str) -> None:
+    assert not external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
 
 

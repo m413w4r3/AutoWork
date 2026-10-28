@@ -814,9 +814,7 @@ def _require_disclosure_within_bounds(
         raise ValueError("An envelope extension cannot enable external LLM access")
     if _tlp_rank(disclosure.tlp) < _tlp_rank(ceiling.tlp):
         raise ValueError("An envelope extension cannot widen the approved TLP")
-    if (disclosure.do_not_submit or disclosure.tlp is TLPLevel.RED) and (
-        disclosure.external_llm_allowed
-    ):
+    if disclosure.tlp is TLPLevel.RED and disclosure.external_llm_allowed:
         raise ValueError("Disclosure policy forbids external LLM access")
 
 

@@ -3654,7 +3654,7 @@ def _diagram_wire_for_quality(
     return "\n".join(lines)
 
 
-def _document(*, do_not_submit: bool = False) -> SourceDocument:
+def _document(*, do_not_submit: bool = False, external_llm_allowed: bool = True) -> SourceDocument:
     return SourceDocument(
         id=_DOCUMENT_ID,
         subject_id=_SUBJECT_ID,
@@ -3664,7 +3664,7 @@ def _document(*, do_not_submit: bool = False) -> SourceDocument:
         acquired_at=datetime.now(UTC),
         license_restriction=None,
         tlp=TLP.CLEAR,
-        external_llm_allowed=not do_not_submit,
+        external_llm_allowed=external_llm_allowed,
         do_not_submit=do_not_submit,
     )
 
@@ -4293,10 +4293,10 @@ async def test_restart_resumes_from_verified_raw_output_with_identical_result() 
 
 
 @pytest.mark.asyncio
-async def test_do_not_submit_needs_review_without_call_or_empty_artifact() -> None:
+async def test_external_llm_disabled_needs_review_without_call_or_empty_artifact() -> None:
     world = _world(
         _RecordingGateway(lambda request: _succeeded(request, None)),
-        documents=(_document(do_not_submit=True),),
+        documents=(_document(do_not_submit=True, external_llm_allowed=False),),
     )
 
     result = await _execute(world)
@@ -4305,6 +4305,21 @@ async def test_do_not_submit_needs_review_without_call_or_empty_artifact() -> No
     assert result.error_code == EditorialEnrichmentStageErrorCode.POLICY_BLOCKED.value
     assert result.model_calls == 0
     assert world.gateway.calls == [] and world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_do_not_submit_does_not_block_editorial_model_call() -> None:
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))),
+        documents=(_document(do_not_submit=True),),
+    )
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.model_calls > 0
+    assert world.gateway.calls
+    assert all(request.external_llm_allowed for request, _ in world.gateway.calls)
 
 
 @pytest.mark.asyncio

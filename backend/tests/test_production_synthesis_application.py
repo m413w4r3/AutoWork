@@ -2940,7 +2940,7 @@ def test_fallback_title_drops_trailing_connectors_after_truncation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_do_not_submit_source_policy_stops_before_drafting():
+async def test_do_not_submit_does_not_block_external_synthesis():
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
     extraction = _matched_extraction(
@@ -2954,8 +2954,8 @@ async def test_do_not_submit_source_policy_stops_before_drafting():
             make_document(
                 subject_id,
                 source_id,
-                tlp=TLP.RED,
-                external_llm_allowed=False,
+                tlp=TLP.CLEAR,
+                external_llm_allowed=True,
                 do_not_submit=True,
             ),
         ),
@@ -2964,13 +2964,11 @@ async def test_do_not_submit_source_policy_stops_before_drafting():
 
     result = await world.service.execute(world.run, snapshot, world.artifact)
 
-    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
-    assert result.error_code == SynthesisStageErrorCode.POLICY_BLOCKED.value
-    assert result.model_calls == 0
+    assert result.model_calls == 1
+    assert len(gateway.calls) == 1
+    assert gateway.calls[0][0].external_llm_allowed is True
+    assert result.error_code != SynthesisStageErrorCode.POLICY_BLOCKED.value
     assert result.extraction_hash == canonical_extraction_hash(extraction)
-    assert result.details["do_not_submit"] is True
-    assert gateway.calls == []
-    assert world.writer.calls == []
 
 
 @pytest.mark.asyncio

@@ -73,6 +73,10 @@ stocke le blob dans le bucket de quarantaine et crée une tentative
 **HIT_REVIEW**. Le résultat reste **candidate**; acquisition ou analyse ne
 constituent jamais une validation G3.
 
+Le champ **do_not_submit** reste stocké pour les envois publics d'échantillons,
+mais ne bloque pas une consultation Bridge/advisor autorisée par le G2, le TLP
+et **external_llm_allowed**.
+
 **LocalSampleAnalysisService** ne lit qu'un échantillon quarantiné dont le blob
 correspond au SHA-256 de l'association. Il compose les services existants
 Static Analysis, SMDA (**CodeFeatureService**), capa (**CapabilitiesService**) et

@@ -1067,7 +1067,8 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("provider_not_allowed")
         if envelope.disclosure_tlp == "red":
             raise _ConsumeDenied("tlp_red")
-        if envelope.disclosure_do_not_submit:
+        is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
+        if envelope.disclosure_do_not_submit and not is_bridge_submission:
             raise _ConsumeDenied("do_not_submit")
         is_model_submission = _is_model_submission(prepared, family_binding)
         if is_model_submission and not envelope.disclosure_external_llm_allowed:
@@ -1642,6 +1643,7 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 sample.subject_id != subject_id
                 or sample.tlp.casefold() == "red"
+                or (is_model_submission and not sample.external_llm_allowed)
                 or (
                     external_effect_source_do_not_submit_blocks(
                         prepared.family, sample.do_not_submit
@@ -1680,11 +1682,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 or bool(document.license_restriction)
             ):
                 raise _ConsumeDenied("source_document_restricted")
-            if (
-                _is_model_submission(prepared, family_binding)
-                and not is_bridge_submission
-                and not document.external_llm_allowed
-            ):
+            if _is_model_submission(prepared, family_binding) and not document.external_llm_allowed:
                 raise _ConsumeDenied("source_document_external_llm_not_allowed")
         if document_ids and {document.id for document in documents} != document_ids:
             raise _ConsumeDenied("source_document_missing")

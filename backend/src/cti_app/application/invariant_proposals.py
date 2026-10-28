@@ -673,7 +673,6 @@ class ProposalConversationService:
                     "origin_kind": _enum_value(sample.origin_kind),
                     "state": _enum_value(sample.state),
                     "tlp": _enum_value(sample.tlp),
-                    "do_not_submit": sample.do_not_submit,
                     "external_llm_allowed": sample.external_llm_allowed,
                 }
             )
@@ -1085,9 +1084,7 @@ def _render_p10_facts(context: Mapping[str, Any], alias_by_ref: Mapping[str, str
                 f"state={item.get('state')}",
                 f"TLP={item.get('tlp')}",
             ]
-            if item.get("do_not_submit") is True:
-                fields.append("submission prohibited")
-            elif item.get("external_llm_allowed") is False:
+            if item.get("external_llm_allowed") is False:
                 fields.append("external submission prohibited")
             lines.append("- " + "; ".join(value for value in fields if not value.endswith("=None")))
 
@@ -2389,7 +2386,7 @@ def _string_or_none(value: Any) -> str | None:
 
 def _external_disclosure_allowed(policy: DerivedPolicy) -> bool:
     """External routing needs every explicitly applicable disclosure rule to pass."""
-    return policy.external_llm_allowed and not policy.do_not_submit and policy.tlp is not TLP.RED
+    return policy.external_llm_allowed and policy.tlp is not TLP.RED
 
 
 _URL_USERINFO = re.compile(r"(?i)(https?://|www\.)[^\s/@:]+(?::[^\s/@]*)?@")

@@ -11,6 +11,7 @@ from httpx import ASGITransport
 
 from cti_app.api.investigation import router as investigation_router
 from cti_app.api.osint_policy import router as policy_router
+from cti_app.application.analyst_handoff import analyst_handoff_policy_from_sources
 from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.investigation_governance import (
     InvestigationActor,
@@ -168,20 +169,35 @@ def test_disclosure_intersection_uses_most_restrictive_tlp_and_fails_closed(
         assert result.do_not_submit is True
 
 
-def test_disclosure_intersection_never_clears_source_restrictions() -> None:
+def test_disclosure_intersection_preserves_source_do_not_submit_without_blocking_bridge() -> None:
     result = intersect_disclosure(
         TLPLevel.GREEN,
         True,
         True,
         DisclosureBounds(
             tlp=TLPLevel.CLEAR,
-            do_not_submit=False,
+            do_not_submit=True,
             external_llm_allowed=True,
         ),
     )
     assert result.tlp is TLPLevel.GREEN
     assert result.do_not_submit is True
-    assert result.external_llm_allowed is False
+    assert result.external_llm_allowed is True
+
+
+def test_handoff_keeps_external_llm_right_when_source_do_not_submit_is_true() -> None:
+    policy = analyst_handoff_policy_from_sources(
+        [
+            SimpleNamespace(
+                tlp="GREEN",
+                do_not_submit=True,
+                external_llm_allowed=True,
+            )
+        ]
+    )
+
+    assert policy.do_not_submit is True
+    assert policy.external_llm_allowed is True
 
 
 def test_capabilities_require_finite_dimensions_and_growth_only_extension() -> None:

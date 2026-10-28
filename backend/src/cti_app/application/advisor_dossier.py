@@ -22,7 +22,7 @@ from cti_app.domain.advisor_completeness import (
     AdvisorEvidenceStatus,
     AdvisorPreflightStatus,
 )
-from cti_app.domain.investigation import EnvelopeAuthorityKind, InvestigationEnvelope
+from cti_app.domain.investigation import InvestigationEnvelope
 
 _WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
 _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
@@ -586,25 +586,14 @@ def _sample_disclosure_restriction_sources(
 ) -> tuple[str, ...]:
     """Return disclosure veto names for a sample under the current envelope.
 
-    An inherited OSINT policy that allows external LLM disclosure supersedes a
-    sample's source-level ``do_not_submit`` flag for Bridge consultations. The
-    sample's own TLP, external-LLM, and licence restrictions continue to apply.
+    ``do_not_submit`` is not a Bridge disclosure veto. The sample's own TLP,
+    external-LLM, and licence restrictions continue to apply.
     """
 
     def value(name: str, default: object = None) -> object:
         if isinstance(sample, Mapping):
             return sample.get(name, default)
         return getattr(sample, name, default)
-
-    ignore_sample_do_not_submit = bool(
-        envelope is not None
-        and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
-        and envelope.inherited_policy_id is not None
-        and envelope.inherited_policy_version is not None
-        and envelope.inherited_policy_event_id is not None
-        and envelope.disclosure.external_llm_allowed
-        and not envelope.disclosure.do_not_submit
-    )
 
     sources: list[str] = []
     tlp = value("tlp")
@@ -632,8 +621,6 @@ def _sample_disclosure_restriction_sources(
         ):
             sources.append("tlp_above_envelope_bound")
 
-    if bool(value("do_not_submit", False)) and not ignore_sample_do_not_submit:
-        sources.append("do_not_submit")
     if value("external_llm_allowed", True) is False:
         sources.append("external_llm_disallowed")
     license_restriction = value("license_restriction")
@@ -732,7 +719,6 @@ def build_advisor_dossier(
             f"original_name={_as_text(sample.get('original_name'))}",
             f"source_service={_as_text(sample.get('source_service'))}",
             f"tlp={_as_text(sample.get('tlp'))}",
-            f"do_not_submit={str(sample.get('do_not_submit')).lower()}",
             f"external_llm_allowed={str(sample.get('external_llm_allowed')).lower()}",
         ]
         evidence_ids = sample.get("evidence_ids")

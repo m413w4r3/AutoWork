@@ -570,7 +570,7 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
 
 
 @pytest.mark.asyncio
-async def test_operator_dispatcher_sends_advisor_when_source_flags_are_false():
+async def test_operator_dispatcher_sends_advisor_when_source_do_not_submit_is_true():
     fixture = _Fixture(responses=[], tools=[("vt.file_report", "vt")])
     state = await fixture.start(
         execution_mode=InvestigationExecutionMode.OPERATOR_LED,
@@ -585,7 +585,7 @@ async def test_operator_dispatcher_sends_advisor_when_source_flags_are_false():
     article_port.snapshot = replace(
         article_port.snapshot,
         do_not_submit=True,
-        external_llm_allowed=False,
+        external_llm_allowed=True,
         article_passages=(
             SimpleNamespace(
                 claim_id="S1P1",
@@ -594,8 +594,8 @@ async def test_operator_dispatcher_sends_advisor_when_source_flags_are_false():
             ),
         ),
     )
-    # Source flags no longer veto Bridge; the human G2 envelope disclosure
-    # (left permissive here) remains a veto, covered by the PG egress test.
+    # Acquisition-time do_not_submit metadata no longer vetoes Bridge when
+    # the effective source and human G2 envelope allow external LLM use.
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
     fixture.envelopes._items[fixture.investigation_id] = fixture.envelope
     fixture.available_capabilities = frozenset({"bridge.advisor"})
@@ -1222,15 +1222,15 @@ async def test_external_llm_disclosure_is_required_for_operator_client() -> None
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "policy",
-    ("red_tlp", "snapshot_do_not_submit", "envelope_do_not_submit", "external_llm_denied"),
+    ("red_tlp", "envelope_do_not_submit", "external_llm_denied"),
 )
-async def test_disclosure_controls_block_context_before_external_tool_dispatch(policy: str) -> None:
+async def test_vt_disclosure_controls_block_context_before_external_tool_dispatch(
+    policy: str,
+) -> None:
     fixture, state, service = await _fixture()
-    article_port = fixture.context_builder.article_snapshots
     if policy == "red_tlp":
+        article_port = fixture.context_builder.article_snapshots
         article_port.snapshot = replace(article_port.snapshot, tlp="RED")
-    elif policy == "snapshot_do_not_submit":
-        article_port.snapshot = replace(article_port.snapshot, do_not_submit=True)
     else:
         envelope = fixture.envelopes._items[fixture.investigation_id]
         if policy == "envelope_do_not_submit":
@@ -1254,6 +1254,25 @@ async def test_disclosure_controls_block_context_before_external_tool_dispatch(p
     assert error.value.code == "external_disclosure_denied"
     assert fixture.tools["vt.file_report"].calls == []
     assert await fixture.invocations.list_for_investigation(fixture.investigation_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_vt_report_read_keeps_existing_source_do_not_submit_behavior() -> None:
+    fixture, state, service = await _fixture()
+    article_port = fixture.context_builder.article_snapshots
+    article_port.snapshot = replace(article_port.snapshot, do_not_submit=True)
+
+    result = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "sample hash"},
+        purpose="read a public VirusTotal report without sending source bytes",
+        expected_version=state.version,
+        idempotency_key="vt-source-do-not-submit",
+    )
+
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert len(fixture.tools["vt.file_report"].calls) == 1
 
 
 @pytest.mark.asyncio

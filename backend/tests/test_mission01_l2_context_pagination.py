@@ -628,7 +628,7 @@ def test_disclosure_controls_refuse_external_context_submission() -> None:
     )
     assert (
         InvestigationService.external_llm_allowed(replace(snapshot, do_not_submit=True), envelope)
-        is False
+        is True
     )
     assert (
         InvestigationService.external_llm_allowed(
@@ -648,5 +648,5 @@ def test_disclosure_controls_refuse_external_context_submission() -> None:
                 ),
             ),
         )
-        is False
+        is True
     )

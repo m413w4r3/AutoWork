@@ -69,9 +69,8 @@ _VT_HASH_READ_FAMILIES = {
     "vt.behaviour_pcap",
     "vt.relationships",
 }
-# Bridge/advisor dossiers ignore the source do_not_submit veto, as the claim
-# store does at consume (user decision 2026-10-27); a source that forbids
-# external LLMs, TLP RED and licences still bind.
+# Bridge/advisor consultations ignore source do_not_submit metadata, as the
+# claim store does at consume; external-LLM denials, TLP RED and licences bind.
 _BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
 
 
@@ -330,7 +329,10 @@ class SqlAlchemyVirusTotalPolicyGuard:
             return False
         if (
             pinned.disclosure_tlp.casefold() == "red"
-            or pinned.disclosure_do_not_submit
+            or (
+                pinned.disclosure_do_not_submit
+                and not context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+            )
             or not pinned.disclosure_external_llm_allowed
             or not await self.authorize_source_disclosure(context)
         ):

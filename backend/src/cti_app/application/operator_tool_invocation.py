@@ -924,6 +924,14 @@ class OperatorToolInvocationService:
             and not InvestigationService.external_llm_allowed(snapshot, envelope)
         ):
             self._require_external_disclosure(snapshot, envelope)
+        if (
+            requires_external_disclosure
+            and tool_name.startswith("vt.")
+            and not InvestigationService.vt_external_disclosure_allowed(
+                snapshot, envelope, tool_name
+            )
+        ):
+            raise OperatorToolInvocationError("external_disclosure_denied", 403)
 
         prior = tuple(
             item

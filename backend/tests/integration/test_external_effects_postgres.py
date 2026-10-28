@@ -991,7 +991,7 @@ async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_lice
                         ),
                         tlp="RED" if restriction == "sample_red" else "CLEAR",
                         do_not_submit=True,
-                        external_llm_allowed=False,
+                        external_llm_allowed=True,
                         origin_kind="manual",
                         state="validated",
                         source_service=None,
@@ -1037,7 +1037,7 @@ async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_lice
                         ),
                         tlp="RED" if restriction == "document_red" else "CLEAR",
                         do_not_submit=True,
-                        external_llm_allowed=False,
+                        external_llm_allowed=True,
                         created_at=now,
                     )
                 )
@@ -1125,10 +1125,9 @@ async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_lice
         outcome = await create_external_effect_coordinator(session_factory).send_one(
             authority, prepared, transport
         )
-        if restriction is not None:
+        if restriction is not None and restriction != "envelope_do_not_submit":
             assert isinstance(outcome, Refused)
             expected_reason = {
-                "envelope_do_not_submit": "do_not_submit",
                 "envelope_external_llm_denied": "external_llm_not_allowed",
             }.get(
                 restriction,
@@ -1452,7 +1451,7 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
             acquire_hits_allowed=False,
             disclosure=DisclosureBounds(
                 tlp=TLPLevel.CLEAR,
-                do_not_submit=False,
+                do_not_submit=True,
                 external_llm_allowed=True,
             ),
             max_effect_claims_per_investigation=10,
@@ -1471,7 +1470,7 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
             snapshot=SimpleNamespace(
                 subject_id=seeded.subject.id,
                 tlp=TLPLevel.CLEAR,
-                do_not_submit=False,
+                do_not_submit=True,
                 external_llm_allowed=True,
             ),
             at_start=True,
@@ -1499,7 +1498,7 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
                     acquired_at=now,
                     license_restriction=None,
                     tlp="CLEAR",
-                    do_not_submit=False,
+                    do_not_submit=True,
                     external_llm_allowed=True,
                     created_at=now,
                 )

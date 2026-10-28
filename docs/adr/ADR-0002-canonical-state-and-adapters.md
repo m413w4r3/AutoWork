@@ -11,7 +11,7 @@ Le pipeline est evidence-first. Les sorties de modèles ou de services tiers son
 
 PostgreSQL portera l'état canonique transactionnel. Les fichiers versionnés et evidence packs porteront les artefacts immuables et leur provenance. Une conversation LLM, un cache ou une réponse d'API ne sera jamais la source de vérité.
 
-Les systèmes externes seront accessibles uniquement via des interfaces typées définies côté application et des adaptateurs remplaçables côté infrastructure/intégrations. Chaque appel futur devra appliquer provenance, TLP, sensibilité, `external_llm_allowed` et `do_not_submit`. Les opérations de découverte technique et les décisions d'attribution resteront séparées.
+Les systèmes externes seront accessibles uniquement via des interfaces typées définies côté application et des adaptateurs remplaçables côté infrastructure/intégrations. Chaque appel futur devra appliquer provenance, TLP, sensibilité et `external_llm_allowed`; `do_not_submit` ne bloque pas une consultation Bridge/advisor/LLM autrement autorisée, mais ses gardes restent applicables aux envois publics d'échantillons et aux lectures/téléchargements VT. Les opérations de découverte technique et les décisions d'attribution resteront séparées.
 
 ## Conséquences
 
