@@ -26,6 +26,7 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import (
+    _sample_disclosure_restriction_sources,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -78,7 +79,6 @@ from cti_app.application.publication_secret_guard import (
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
-from cti_app.domain.classification import TLP
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -87,6 +87,7 @@ from cti_app.domain.investigation import (
     EvidenceKind,
     EvidenceObservation,
     FrameworkPreSubmissionProof,
+    InvestigationEnvelope,
     ToolInvocationStatus,
     canonical_json_bytes,
     thaw_json,
@@ -259,7 +260,7 @@ class InvestigationAdvisorTool:
                     by_id = {item.id: item for item in (*evidence, *linked)}
                     evidence = tuple(by_id.values())
             restricted_sample_hashes = await self._restricted_sample_hashes(
-                context.investigation_id, investigation.subject_id
+                context.investigation_id, investigation.subject_id, context.envelope
             )
             for item in evidence:
                 for sample_hash in restricted_sample_hashes:
@@ -292,7 +293,7 @@ class InvestigationAdvisorTool:
                 prompt_data, settings=self._settings
             ):
                 return no_context_cost
-            dossier = build_advisor_dossier(prompt_data)
+            dossier = build_advisor_dossier(prompt_data, envelope=context.envelope)
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
             prompt_data["dossier_text"] = dossier.text
             prompt_data["dossier_sha256"] = dossier.sha256
@@ -482,7 +483,7 @@ class InvestigationAdvisorTool:
                 )
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
             restricted_sample_hashes = await self._restricted_sample_hashes(
-                context.investigation_id, investigation.subject_id
+                context.investigation_id, investigation.subject_id, context.envelope
             )
             restricted_evidence_refs: tuple[UUID, ...] = ()
             restricted_evidence: tuple[EvidenceObservation, ...] = ()
@@ -505,6 +506,7 @@ class InvestigationAdvisorTool:
                     context.investigation_id,
                     restricted_sample_hashes,
                     restricted_evidence,
+                    envelope=context.envelope,
                 )
                 return await self._persist_preflight_failure(
                     context,
@@ -630,6 +632,7 @@ class InvestigationAdvisorTool:
                         context.investigation_id,
                         restricted_sample_hashes,
                         tuple(restricted_resolved_items),
+                        envelope=context.envelope,
                         finding_observation_refs=finding_observation_refs,
                     )
                     return await self._persist_preflight_failure(
@@ -739,7 +742,7 @@ class InvestigationAdvisorTool:
                     redacted_secret_count=redacted_secret_count,
                     secret_findings=secret_findings,
                 )
-            dossier = build_advisor_dossier(prompt_data)
+            dossier = build_advisor_dossier(prompt_data, envelope=context.envelope)
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
             prompt_data["dossier_text"] = dossier.text
             prompt_data["dossier_sha256"] = dossier.sha256
@@ -2285,6 +2288,7 @@ class InvestigationAdvisorTool:
                 investigation_id=investigation_id,
                 evidence=evidence,
                 prompt_data=base,
+                envelope=context.envelope,
             )
             base["evidence"] = evidence_payload
             base["measured_facts"] = measured_facts
@@ -2310,6 +2314,7 @@ class InvestigationAdvisorTool:
                         investigation_id,
                         evidence_item.object_id,
                         measurement.sample_sha256,
+                        context.envelope,
                     )
                     if sample_blob is None:
                         continue
@@ -2331,6 +2336,7 @@ class InvestigationAdvisorTool:
                             investigation_id,
                             evidence_item.object_id,
                             legacy.get("sample_sha256"),
+                            context.envelope,
                         )
                         if sample_blob is None:
                             continue
@@ -2412,6 +2418,7 @@ class InvestigationAdvisorTool:
                         investigation_id,
                         observation.object_id,
                         measurement.sample_sha256,
+                        context.envelope,
                     )
                     identity = (
                         measurement.observation_id,
@@ -2460,7 +2467,10 @@ class InvestigationAdvisorTool:
                 sample_blob = None
                 if measured_rows:
                     sample_blob = await self._sample_blob_for_hash(
-                        investigation_id, item.object_id, measured_rows[0].get("sample_sha256")
+                        investigation_id,
+                        item.object_id,
+                        measured_rows[0].get("sample_sha256"),
+                        context.envelope,
                     )
                 if sample_blob is not None:
                     row["sample_blob_id"] = str(sample_blob[0])
@@ -2470,6 +2480,7 @@ class InvestigationAdvisorTool:
                             investigation_id,
                             item.object_id,
                             measurement.get("sample_sha256"),
+                            context.envelope,
                         )
                         if measurement_sample is None:
                             continue
@@ -2644,7 +2655,7 @@ class InvestigationAdvisorTool:
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
-        sample_rows = await self._sample_inventory(investigation_id, evidence)
+        sample_rows = await self._sample_inventory(investigation_id, evidence, context.envelope)
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
         mime_types_by_evidence: dict[str, list[str]] = {}
@@ -2765,6 +2776,7 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         evidence: tuple[EvidenceObservation, ...],
         prompt_data: Mapping[str, Any],
+        envelope: InvestigationEnvelope | None = None,
     ) -> tuple[
         tuple[EvidenceObservation, ...],
         list[dict[str, Any]],
@@ -2934,6 +2946,7 @@ class InvestigationAdvisorTool:
                     investigation_id,
                     item.object_id,
                     sample_hash,
+                    envelope,
                 )
                 fact: dict[str, Any] = {
                     "evidence_id": str(item.id),
@@ -2990,6 +3003,7 @@ class InvestigationAdvisorTool:
         self,
         investigation_id: UUID,
         observations: tuple[EvidenceObservation, ...],
+        envelope: InvestigationEnvelope | None,
     ) -> list[dict[str, Any]]:
         investigation = await self._investigations.get(investigation_id)
         if investigation is None:
@@ -3012,6 +3026,8 @@ class InvestigationAdvisorTool:
                 None,
             )
             if sample is None:
+                continue
+            if _sample_disclosure_restriction_sources(sample, envelope):
                 continue
             associated_observations = [
                 item
@@ -3180,6 +3196,9 @@ class InvestigationAdvisorTool:
                     ),
                     "do_not_submit": bool(getattr(sample, "do_not_submit", False)),
                     "external_llm_allowed": bool(getattr(sample, "external_llm_allowed", True)),
+                    "license_restricted": bool(
+                        str(getattr(sample, "license_restriction", "") or "").strip()
+                    ),
                 }
             )
         return rows
@@ -3574,7 +3593,12 @@ class InvestigationAdvisorTool:
                 )
         return rows
 
-    async def _restricted_sample_hashes(self, investigation_id: UUID, subject_id: UUID) -> set[str]:
+    async def _restricted_sample_hashes(
+        self,
+        investigation_id: UUID,
+        subject_id: UUID,
+        envelope: InvestigationEnvelope | None,
+    ) -> set[str]:
         """Return hashes with explicit restrictions for included sample material.
 
         D7 treats any non-empty sample ``license_restriction`` as an explicit
@@ -3614,7 +3638,7 @@ class InvestigationAdvisorTool:
                             break
             if not matched_hashes:
                 continue
-            if _sample_policy_allows_external(sample):
+            if not _sample_disclosure_restriction_sources(sample, envelope):
                 continue
             restricted.update(matched_hashes)
         return restricted
@@ -3625,6 +3649,7 @@ class InvestigationAdvisorTool:
         restricted_hashes: set[str],
         observations: tuple[EvidenceObservation, ...],
         *,
+        envelope: InvestigationEnvelope | None,
         finding_observation_refs: Mapping[UUID, tuple[UUID, ...]] | None = None,
     ) -> list[dict[str, object]]:
         """Describe the linked sample associations behind a disclosure refusal.
@@ -3671,7 +3696,7 @@ class InvestigationAdvisorTool:
                 {
                     source
                     for item in matching_samples
-                    for source in _sample_restriction_sources(item)
+                    for source in _sample_disclosure_restriction_sources(item, envelope)
                 }
             )
             matching_associations = tuple(
@@ -3735,6 +3760,7 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         object_id: str,
         measured_hash: object,
+        envelope: InvestigationEnvelope | None,
     ) -> tuple[UUID, str, str, str] | None:
         investigation = await self._investigations.get(investigation_id)
         if investigation is None or not isinstance(measured_hash, str):
@@ -3765,7 +3791,7 @@ class InvestigationAdvisorTool:
                 "review_candidate",
             }:
                 continue
-            if not _sample_policy_allows_external(sample):
+            if _sample_disclosure_restriction_sources(sample, envelope):
                 # A sample-level restriction binds this measurement even when
                 # the case envelope itself permits external disclosure.
                 continue
@@ -7036,46 +7062,6 @@ def _drop_findings_linked_to_restricted_evidence(
         kept.append(finding)
     prompt_data["findings"] = kept
     return tuple(dropped)
-
-
-def _sample_policy_allows_external(sample: object) -> bool:
-    """Apply the sample's explicit disclosure rules before sending its data.
-
-    D7 maps every non-empty license_restriction to an explicit owner/source
-    veto when sample metadata or content would be sent externally. This
-    conservative mapping is intentionally sample-scoped.
-    """
-    tlp = getattr(sample, "tlp", None)
-    tlp_value = getattr(tlp, "value", tlp)
-    license_restriction = getattr(sample, "license_restriction", None)
-    has_license_restriction = license_restriction is not None and bool(
-        str(license_restriction).strip()
-    )
-    return not (
-        (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
-        or bool(getattr(sample, "do_not_submit", False))
-        or getattr(sample, "external_llm_allowed", True) is False
-        or has_license_restriction
-    )
-
-
-def _sample_restriction_sources(sample: object | None) -> list[str]:
-    """Return policy flag names, never the restriction text itself."""
-    if sample is None:
-        return []
-    sources: list[str] = []
-    tlp = getattr(sample, "tlp", None)
-    tlp_value = getattr(tlp, "value", tlp)
-    if isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold():
-        sources.append("tlp_red")
-    if bool(getattr(sample, "do_not_submit", False)):
-        sources.append("do_not_submit")
-    if getattr(sample, "external_llm_allowed", True) is False:
-        sources.append("external_llm_disallowed")
-    license_restriction = getattr(sample, "license_restriction", None)
-    if license_restriction is not None and bool(str(license_restriction).strip()):
-        sources.append("license_restriction")
-    return sources
 
 
 def _safe_text(value: str, max_chars: int) -> str:
