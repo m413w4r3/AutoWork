@@ -225,11 +225,9 @@ def test_contradiction_must_match_the_claim_named_in_the_question() -> None:
         data, wrong_claim_dossier, f"TASK: {question}\n{wrong_claim_dossier.text}"
     )
 
-    assert blocked["status"] == "INSUFFICIENT_EVIDENCE"
-    assert any(
-        row["ref"] == '{"id":"s1p3.1","kind":"claim"}' and "s1p3.1" in row["reason"].casefold()
-        for row in blocked["missing_refs"]
-    )
+    # A missing refutation is information, never a blocking gap (friction removed).
+    assert blocked["status"] == "READY"
+    assert blocked["missing_refs"] == []
 
     data["findings"].append(
         {
@@ -280,15 +278,9 @@ def test_multi_claim_contradiction_requires_each_named_claim() -> None:
     dossier = build_advisor_dossier(data)
     preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
 
-    assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
-    assert any(row["ref"] == '{"id":"s1p3.2","kind":"claim"}' for row in preflight["missing_refs"])
-    uncovered = next(
-        row
-        for row in preflight["items"]
-        if row["kind"] == "contradiction" and row["id"] == "required-contradiction:s1p3.2"
-    )
-    assert {"REQUIRED", "MISSING"} <= {row["status"] for row in uncovered["statuses"]}
-    assert "s1p3.2" in " ".join(row["reason"] for row in uncovered["statuses"]).casefold()
+    # The second claim has no refuted finding: informational only, the consultation proceeds.
+    assert preflight["status"] == "READY"
+    assert preflight["missing_refs"] == []
 
     data["findings"].append(
         {

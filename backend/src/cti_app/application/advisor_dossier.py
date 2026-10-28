@@ -2543,8 +2543,11 @@ def _requested_contradiction_finding_ids(data: Mapping[str, Any], task: str) -> 
 
 
 def _contradiction_is_required(data: Mapping[str, Any], task: str) -> bool:
+    # Only a cited finding id (question text or a contradiction assertion) is a hard
+    # requirement. Naming claim passages in a question never makes a missing refutation
+    # blocking: the absence of a refuted finding is information, not missing evidence.
     return _contradiction_is_requested(data, task) and bool(
-        _requested_claim_ids(data, task) or _requested_contradiction_finding_ids(data, task)
+        _requested_contradiction_finding_ids(data, task)
     )
 
 
