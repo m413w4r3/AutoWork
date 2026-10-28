@@ -145,7 +145,7 @@ def _advisor_wire_output_contract(consultation_type: str) -> list[str]:
     ]
     if consultation_type == "review_text":
         return [
-            "SORTIE: texte simple; aucun JSON ni format spécial n\u2019est nécessaire.",
+            "SORTIE: texte simple, sans mise en forme particulière.",
             (
                 "Pour chaque unité, écrire un paragraphe court qui commence par son alias "
                 "(U1, U2, etc.)."
@@ -159,7 +159,7 @@ def _advisor_wire_output_contract(consultation_type: str) -> list[str]:
         ]
     if consultation_type == "draft_text":
         return [
-            "SORTIE: texte simple; aucun JSON ni format spécial n\u2019est nécessaire.",
+            "SORTIE: texte simple, sans mise en forme particulière.",
             (
                 "Pour chaque unité, écrire un paragraphe court qui commence par son alias "
                 "(U1, U2, etc.)."
