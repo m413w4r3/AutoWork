@@ -1643,8 +1643,9 @@ async def test_inherited_envelope_do_not_submit_allows_bridge_and_external_vt_re
         assert result["envelope"].disclosure.do_not_submit is True
         assert result["state"] is not None
         assert result["state"].stop_reason is StopReason.AGENT_FINISHED
-        assert result["turn_transport"].attempt_count == 1
-        assert result["turn_transport"].submission_count == 1
+        # Two Bridge turns: the tool request, then the finish decision after the VT read.
+        assert result["turn_transport"].attempt_count == 2
+        assert result["turn_transport"].submission_count == 2
         assert result["human_decisions"] == []
         assert len(physical_requests) == 1
         assert len(result["claims"]) == 1

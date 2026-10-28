@@ -184,7 +184,10 @@ async def test_context_refuses_to_build_without_a_production_input_snapshot() ->
 async def test_context_blocks_external_model_when_a_source_forbids_it() -> None:
     subject_id = uuid4()
     restricted = _collection("https://restricted.example/report")
+    # ``do_not_submit`` no longer vetoes external disclosure (product decision); the
+    # remaining source veto is ``external_llm_allowed``.
     restricted.do_not_submit = True
+    restricted.external_llm_allowed = False
     uow = _Uow([_collection("https://research.example/ok"), restricted])
 
     ctx = await build_subject_production_context(
