@@ -2171,7 +2171,8 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         "local_objdump": _local_binary_version("objdump", "--version"),
         "local_xxd": _local_binary_version("xxd", "-v"),
         "local_sha256sum": _local_binary_version("sha256sum", "--version"),
-        "local_7z": _local_binary_version("7z", "i"),
+        "local_7z": _seven_zip_version(),
+        "zip_members": "autowork-zip-members-v1",
         "local_monodis": _monodis_package_version() if shutil.which("monodis") else None,
         "ilspycmd": ilspy_version,
         "ilspycmd_package_sha512": ilspy_package_sha512,
@@ -2285,6 +2286,31 @@ def _binary_version(name: str, argument: str) -> str | None:
         return None
     match = _VERSION.search(result.stdout + result.stderr)
     return match.group(1) if result.returncode == 0 and match else None
+
+
+_P7ZIP_VERSION = re.compile(r"\bp7zip Version ([0-9]+(?:\.[0-9]+)+)\b")
+
+
+def _seven_zip_version() -> str | None:
+    """Report the p7zip package version (the banner may also print an unrelated 7-Zip build)."""
+    executable = shutil.which("7z")
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "i"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _P7ZIP_VERSION.search((result.stdout + result.stderr)[:4096])
+    if result.returncode == 0 and match:
+        return match.group(1)
+    return _local_binary_version("7z", "i")
 
 
 @functools.cache

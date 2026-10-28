@@ -540,3 +540,25 @@ async def test_7z_extract_hash_reports_bad_crc_and_timeout_statuses(
     assert timed_out_report["members"][0]["status"] == "timeout"
     assert list(tmp_path.iterdir()) == []
     assert requested_tempdirs == ["/tmp", "/tmp"]
+
+
+def test_seven_zip_version_reads_the_p7zip_package_version_from_a_double_banner(
+    monkeypatch,
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from cti_app.workers import confined_analysis
+
+    banner = (
+        "\n7-Zip [64] 26.02 : Copyright (c) 1999-2026 Igor Pavlov : 2026-06-25\n"
+        "p7zip Version 16.02 (locale=C.UTF-8,Utf16=on,HugeFiles=on,64 bits)\n"
+    )
+    monkeypatch.setattr(confined_analysis.shutil, "which", lambda name: "/usr/bin/7z")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=banner, stderr=""),
+    )
+
+    assert confined_analysis._seven_zip_version() == "16.02"
