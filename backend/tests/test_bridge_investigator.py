@@ -18,6 +18,7 @@ from cti_app.application.bridge_investigator import (
     submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_advisor_tools import (
+    _bridge_turns_consumed,
     _submission_proves_no_execution,
 )
 from cti_app.application.investigation_contracts import (
@@ -807,6 +808,59 @@ async def test_confirmed_pre_submission_failure_retries_with_distinct_attempt_ke
 
 
 @pytest.mark.asyncio
+async def test_conversation_unavailable_uses_bounded_backoff_and_fresh_bridge_run() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    response = {
+        "reasoning_summary": "The request can proceed after a fresh Temporary Chat check.",
+        "goal": "Finish the investigation.",
+        "hypothesis_refs": [],
+        "proposed_tool_calls": [],
+        "finding_proposals": [],
+        "opinion_delta": None,
+        "next_action": AgentNextAction.FINISH.value,
+    }
+    transport = ScriptedTurnTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="conversation_unavailable",
+                submission_state="not_submitted",
+                retryable=True,
+            ),
+            response,
+        ]
+    )
+    clock = _ManualClock()
+    bridge = BridgeInvestigator(
+        transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+        pre_submission_retry_base_seconds=1,
+        pre_submission_retry_max_seconds=20,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0.5,
+    )
+
+    result = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=5,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert result.submissions_made == 1
+    assert result.attempts_made == 2
+    assert len(transport._by_key) == 2
+    assert result.idempotency_key.endswith(":attempt=1")
+    assert transport.prompts[0] == transport.prompts[1]
+    assert clock.delays == [5]
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_bridge_failure_is_never_retried_automatically() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)
@@ -1489,6 +1543,253 @@ async def test_advisor_complete_rate_limit_retry_builds_a_new_bound_attempt(monk
     assert transport.binding_attempts == [0, 1]
     assert transport.submit_attempts == [0, 1]
     assert pacer.delays == [2]
+
+
+@pytest.mark.asyncio
+async def test_advisor_conversation_unavailable_retries_to_success_as_one_turn(monkeypatch) -> None:
+    class NoWaitPacer:
+        def __init__(self) -> None:
+            self.delays: list[float] = []
+
+        async def wait_for_next_submission(self):
+            return True
+
+        async def defer_submissions(self, seconds, *, deadline_monotonic=None):
+            del deadline_monotonic
+            self.delays.append(seconds)
+            return True
+
+    pacer = NoWaitPacer()
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+
+    class ConversationUnavailableThenSuccess:
+        def __init__(self) -> None:
+            self.attempts: list[int] = []
+
+        async def submit(self, **_kwargs):
+            self.attempts.append(0)
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="conversation_unavailable",
+                submission_state="pre_submission",
+                retryable=True,
+                failure_stage="bridge_transport_pre_submission",
+                idempotency_key="consultation-attempt-0",
+            )
+
+        async def submit_with_attempt(self, *, attempt, **_kwargs):
+            self.attempts.append(attempt)
+            assert attempt == 1
+            return TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text="synthetic consultation response",
+                idempotency_key="consultation-attempt-1",
+            )
+
+    transport = ConversationUnavailableThenSuccess()
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=7,
+        context_sha256="e" * 64,
+        prompt="Synthetic consultation.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert result.idempotency_key == "consultation-attempt-1"
+    assert transport.attempts == [0, 1]
+    assert _bridge_turns_consumed(result) == 1
+    assert pacer.delays == [5]
+
+
+@pytest.mark.asyncio
+async def test_advisor_conversation_unavailable_retries_are_bounded_at_three_attempts(
+    monkeypatch,
+) -> None:
+    class NoWaitPacer:
+        def __init__(self) -> None:
+            self.delays: list[float] = []
+
+        async def wait_for_next_submission(self):
+            return True
+
+        async def defer_submissions(self, seconds, *, deadline_monotonic=None):
+            del deadline_monotonic
+            self.delays.append(seconds)
+            return True
+
+    pacer = NoWaitPacer()
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+
+    class AlwaysUnavailable:
+        def __init__(self) -> None:
+            self.attempts: list[int] = []
+
+        async def submit(self, **_kwargs):
+            self.attempts.append(0)
+            return self._failure(0)
+
+        async def submit_with_attempt(self, *, attempt, **_kwargs):
+            self.attempts.append(attempt)
+            return self._failure(attempt)
+
+        @staticmethod
+        def _failure(attempt: int):
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="conversation_unavailable",
+                submission_state="pre_submission",
+                retryable=True,
+                failure_stage="bridge_transport_pre_submission",
+                idempotency_key=f"consultation-attempt-{attempt}",
+            )
+
+    transport = AlwaysUnavailable()
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=8,
+        context_sha256="f" * 64,
+        prompt="Synthetic consultation.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+    )
+
+    assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert result.submission_state == "pre_submission"
+    assert result.prior_submission_made is False
+    assert transport.attempts == [0, 1, 2]
+    assert pacer.delays == [5, 10]
+    assert _bridge_turns_consumed(result) == 0
+
+
+@pytest.mark.asyncio
+async def test_advisor_without_distinct_attempt_transport_preserves_pre_send_proof(
+    monkeypatch,
+) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return True
+
+        async def defer_submissions(self, seconds, *, deadline_monotonic=None):
+            del seconds, deadline_monotonic
+            return True
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+
+    class NoDistinctAttemptTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def submit(self, **_kwargs):
+            self.calls += 1
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="conversation_unavailable",
+                submission_state="pre_submission",
+                retryable=True,
+                failure_stage="bridge_transport_pre_submission",
+            )
+
+    transport = NoDistinctAttemptTransport()
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=10,
+        context_sha256="2" * 64,
+        prompt="Synthetic consultation.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+    )
+
+    assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert result.failure_stage == "bridge_transport_pre_submission"
+    assert result.submission_state == "pre_submission"
+    assert result.prior_submission_made is False
+    assert transport.calls == 1
+    assert _bridge_turns_consumed(result) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TurnSubmission(
+            TurnSubmissionStatus.NEEDS_REVIEW,
+            error_code="conversation_unavailable",
+            submission_state="post_submission",
+            retryable=True,
+        ),
+        TurnSubmission(
+            TurnSubmissionStatus.UNAVAILABLE,
+            error_code="bridge_extension_disconnected",
+            submission_state="pre_submission",
+            retryable=True,
+        ),
+        TurnSubmission(
+            TurnSubmissionStatus.UNAVAILABLE,
+            error_code="conversation_unavailable",
+            submission_state="pre_submission",
+            retryable=True,
+            prior_submission_made=True,
+        ),
+    ],
+)
+async def test_advisor_only_retries_conversation_unavailable_with_pre_submission_proof(
+    monkeypatch, failure
+) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return True
+
+        async def defer_submissions(self, seconds, *, deadline_monotonic=None):
+            del seconds, deadline_monotonic
+            return True
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+
+    class SingleResponseTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def submit(self, **_kwargs):
+            self.calls += 1
+            return failure
+
+        async def submit_with_attempt(self, **_kwargs):
+            raise AssertionError("ineligible Bridge failure must not be retried")
+
+    transport = SingleResponseTransport()
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=9,
+        context_sha256="1" * 64,
+        prompt="Synthetic consultation.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+    )
+
+    assert result.status is failure.status
+    assert transport.calls == 1
 
 
 @pytest.mark.asyncio

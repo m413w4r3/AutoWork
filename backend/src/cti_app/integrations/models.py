@@ -743,7 +743,47 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 
 # Submission boundary values a provider contract may state explicitly.
-_SUBMISSION_STATES = frozenset({"pre_submission", "submission_attempted", "post_submission"})
+_SUBMISSION_STATES = frozenset(
+    {
+        "pre_submission",
+        "not_submitted",
+        "submission_attempted",
+        "post_submission",
+        "external_state_unknown",
+    }
+)
+
+
+def _bridge_submission_state(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if value == "not_submitted":
+        return "pre_submission"
+    return value if value in _SUBMISSION_STATES else None
+
+
+def _explicit_bridge_submission_state(
+    *sources: dict[str, Any],
+) -> tuple[str | None, bool, bool]:
+    """Return an explicit state only when all declared values agree."""
+    declarations: list[str] = []
+    invalid_declaration = False
+    for source in sources:
+        if "submission_state" not in source or source["submission_state"] is None:
+            continue
+        normalized = _bridge_submission_state(source["submission_state"])
+        if normalized is None:
+            invalid_declaration = True
+        else:
+            declarations.append(normalized)
+    conflict = invalid_declaration or len(set(declarations)) > 1
+    if conflict:
+        return None, False, True
+    if declarations:
+        return declarations[0], True, False
+    return None, False, False
+
+
 _BRIDGE_DIAGNOSTIC_CODE_ALIASES = {
     "ambiguous_response_roots": "bridge_ambiguous_response_roots",
     "tab_closed": "bridge_tab_closed",
@@ -763,6 +803,8 @@ def _bridge_http_error(
     submission_state: str | None = None
     diagnostics: dict[str, Any] = {}
     explicit_retryable: bool | None = None
+    explicit_submission_state = False
+    conflicting_submission_state = False
     server_message: str | None = None
     reason: str | None = None
     conversation_id: str | None = None
@@ -793,9 +835,6 @@ def _bridge_http_error(
                 phase = source["phase"][:64]
             if isinstance(source.get("retryable"), bool):
                 explicit_retryable = source["retryable"]
-            # FastAPI puts the Bridge contract directly under `detail`.
-            if source.get("submission_state") in _SUBMISSION_STATES:
-                submission_state = source["submission_state"]
             metadata = source.get("metadata")
             if isinstance(metadata, dict) and isinstance(metadata.get("phase"), str):
                 phase = metadata["phase"][:64]
@@ -818,8 +857,6 @@ def _bridge_http_error(
                 verified_no_answer = True
             if isinstance(error.get("phase"), str):
                 phase = error["phase"][:64]
-            if error.get("submission_state") in _SUBMISSION_STATES:
-                submission_state = error["submission_state"]
             if isinstance(error.get("details"), dict):
                 diagnostics = _safe_bridge_diagnostics(error["details"])
             if isinstance(error.get("retryable"), bool):
@@ -830,9 +867,19 @@ def _bridge_http_error(
                 value = error.get(field)
                 if isinstance(value, (bool, int, str)):
                     diagnostics[field] = value
+        state_sources = [source] if isinstance(source, dict) else []
+        if isinstance(body, dict) and body is not source:
+            state_sources.append(body)
+        if isinstance(error, dict):
+            state_sources.append(error)
+        (
+            submission_state,
+            explicit_submission_state,
+            conflicting_submission_state,
+        ) = _explicit_bridge_submission_state(*state_sources)
     except ValueError:
         pass
-    if default_phase == "preflight":
+    if default_phase == "preflight" and submission_state is None:
         submission_state = "pre_submission"
     elif status == 429 and submission_state is None:
         # An HTTP 429 is a completed provider rejection. The request did not
@@ -848,6 +895,11 @@ def _bridge_http_error(
         # was submitted as pre-submission; generic 5xx/UI timeouts remain
         # ambiguous and continue to require reconciliation.
         submission_state = "pre_submission"
+    if conflicting_submission_state:
+        # A malformed or contradictory contract cannot establish a send
+        # boundary, even when a status code would otherwise imply pre-send.
+        submission_state = None
+        explicit_submission_state = False
     if (
         server_code
         in {
@@ -891,13 +943,16 @@ def _bridge_http_error(
         if explicit_retryable is not None
         else status in {408, 429, 502, 503, 504} or status >= 500
     )
-    if code in {
+    if code == "conversation_unavailable":
+        # Temporary Chat verification failures are retryable only when this
+        # Bridge response explicitly proves that no submission started.
+        retryable = explicit_submission_state and submission_state == "pre_submission"
+    elif code in {
         "bridge_auth_failed",
         "bridge_payload_conflict",
         "bridge_protocol_error",
         "bridge_wait_budget_exceeded",
         "conversation_busy",
-        "conversation_unavailable",
         "conversation_profile_mismatch",
     }:
         retryable = False
@@ -1284,8 +1339,23 @@ def _chat_completions_http_error(
         if isinstance(value, str) and _SAFE_PROVIDER_TOKEN.fullmatch(value):
             diagnostics[name] = value
     # An explicit provider contract is more specific than the status class.
-    if error.get("submission_state") in _SUBMISSION_STATES:
-        submission_state = str(error["submission_state"])
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    state_sources = [error]
+    if isinstance(body, dict):
+        state_sources.append(body)
+        detail = body.get("detail")
+        if isinstance(detail, dict) and detail is not error:
+            state_sources.append(detail)
+    submission_state, state_is_explicit, state_conflict = _explicit_bridge_submission_state(
+        *state_sources
+    )
+    if state_conflict:
+        submission_state = None
+    elif not state_is_explicit:
+        submission_state = "pre_submission" if status in _CHAT_PRE_SUBMISSION_STATUSES else None
     message = _safe_provider_message(error.get("message"), payload)
     if message is not None:
         diagnostics["provider_message"] = message
@@ -1874,16 +1944,13 @@ def _failed_response_error(raw: dict[str, Any], *, response_id: str | None) -> B
     )
     raw_phase = error.get("phase") or raw.get("phase") or metadata.get("phase")
     phase = raw_phase[:64] if isinstance(raw_phase, str) and raw_phase else "generation"
-    raw_submission_state = error.get("submission_state") or raw.get("submission_state")
-    submission_state = (
-        raw_submission_state[:32]
-        if isinstance(raw_submission_state, str) and raw_submission_state
-        else None
-    )
+    submission_state, _, _ = _explicit_bridge_submission_state(error, raw)
     raw_retryable = error.get("retryable")
     if not isinstance(raw_retryable, bool):
         raw_retryable = raw.get("retryable")
     retryable = raw_retryable if isinstance(raw_retryable, bool) else False
+    if code == "conversation_unavailable":
+        retryable = submission_state == "pre_submission"
     raw_conversation_id = error.get("conversation_id") or raw.get("conversation_id")
     conversation_id = (
         raw_conversation_id

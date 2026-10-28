@@ -2664,7 +2664,13 @@ async def test_operator_http_route_rejects_invalid_body_before_dispatch() -> Non
 
 
 @pytest.mark.asyncio
-async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry() -> None:
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["evidence_preflight", "bridge_transport_pre_submission"],
+)
+async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry(
+    failure_stage: str,
+) -> None:
     reserved = {
         BudgetDimension.BRIDGE_TURNS: 1,
         BudgetDimension.TOOL_SECONDS: 3_600,
@@ -2768,8 +2774,12 @@ async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry() -
                 "confirmed_non_execution": True,
                 "bridge_turns_consumed": 0,
                 "prior_submission_made": False,
-                "failure_stage": "evidence_preflight",
-                "failure_reason": "required_canonical_evidence_not_in_payload",
+                "failure_stage": failure_stage,
+                "failure_reason": (
+                    "required_canonical_evidence_not_in_payload"
+                    if failure_stage == "evidence_preflight"
+                    else "conversation_unavailable"
+                ),
             },
         )
     )

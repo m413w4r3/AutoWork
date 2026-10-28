@@ -7468,6 +7468,44 @@ def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
     assert result.framework_pre_submission_proof is None
 
 
+def test_exhausted_transport_pre_submission_retry_gets_typed_no_send_proof() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+    )
+    submission = TurnSubmission(
+        TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED,
+        error_code="conversation_unavailable",
+        submission_state="pre_submission",
+        failure_stage="bridge_transport_pre_submission",
+        prior_submission_made=False,
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic bounded consultation prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=256,
+        consultation_type="review_text",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={},
+    )
+    result = tool._finish(make_context(investigation_id, key="advisor:transport-presend"), result)
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["bridge_turns_consumed"] == 0
+    assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+
+
 def test_cited_unknown_evidence_ref_is_ignored_and_reported_instead_of_rejecting() -> None:
     import asyncio
     from types import SimpleNamespace

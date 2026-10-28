@@ -115,11 +115,15 @@ class TerminalFailureThenSuccessTransport:
         retryable: bool = True,
         bridge_status: str | None = "failed",
         verified_no_answer: bool = False,
+        code: str = "bridge_server_error",
+        submission_state: str = "post_submission",
     ) -> None:
         self.failures = failures
         self.retryable = retryable
         self.bridge_status = bridge_status
         self.verified_no_answer = verified_no_answer
+        self.code = code
+        self.submission_state = submission_state
         self.idempotency_keys: list[str | None] = []
 
     async def create(
@@ -129,11 +133,11 @@ class TerminalFailureThenSuccessTransport:
         self.idempotency_keys.append(idempotency_key)
         if len(self.idempotency_keys) <= self.failures:
             raise BridgeTransportError(
-                "bridge_server_error",
+                self.code,
                 "contrat DOM de la réponse non résolu",
                 retryable=self.retryable,
                 phase="generation",
-                submission_state="post_submission",
+                submission_state=self.submission_state,
                 bridge_run_id=f"resp_failed_{len(self.idempotency_keys)}",
                 bridge_status=self.bridge_status,
                 verified_no_answer=self.verified_no_answer,
@@ -503,6 +507,26 @@ async def test_failed_without_verified_no_answer_reconciles_without_retry() -> N
     assert run.status is ModelRunStatus.NEEDS_REVIEW
     assert run.submission_state.value == "external_state_unknown"
     assert run.error_details["diagnostic_code"] == "bridge_server_error"
+
+
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+async def test_conversation_unavailable_after_submission_is_not_terminally_replayed() -> None:
+    transport = TerminalFailureThenSuccessTransport(
+        failures=1,
+        bridge_status="failed",
+        verified_no_answer=True,
+        code="conversation_unavailable",
+        submission_state="post_submission",
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert len(transport.idempotency_keys) == 1
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
 
 
 @pytest.mark.parametrize(
