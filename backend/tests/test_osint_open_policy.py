@@ -852,3 +852,19 @@ async def test_human_mutation_routes_reject_client_supplied_actor_override(
         )
 
     assert response.status_code == 422, response.text
+
+
+def test_api_capabilities_accept_shodan_with_a_positive_credit_limit() -> None:
+    from cti_app.api.osint_policy import PolicyCapabilitiesRequest, _capabilities
+
+    service = OsintOpenPolicyService(lambda: None, _settings())  # type: ignore[arg-type]
+    capabilities = _capabilities(
+        service,
+        PolicyCapabilitiesRequest(
+            allowed_providers=["bridge", "vt", "shodan"],
+            budget_limits={"shodan_credits": 1000},
+        ),
+    )
+
+    assert set(capabilities.allowed_providers) == {"bridge", "vt", "shodan"}
+    assert capabilities.budget_limits[BudgetDimension.SHODAN_CREDITS] == 1000

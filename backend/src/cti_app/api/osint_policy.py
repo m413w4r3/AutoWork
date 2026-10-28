@@ -118,8 +118,12 @@ def _capabilities(
 ) -> OsintCapabilities:
     if request is None:
         return service.default_capabilities()
+    # Defaults are only a base for unspecified fields: building them with "shodan" would
+    # fail before the requested SHODAN_CREDITS limit is applied below.
     defaults = service.default_capabilities(
-        tuple(request.allowed_providers) if request.allowed_providers is not None else None
+        tuple(name for name in request.allowed_providers if name != "shodan")
+        if request.allowed_providers is not None
+        else None
     )
     limits = dict(defaults.budget_limits)
     for name, value in request.budget_limits.items():
