@@ -1310,7 +1310,7 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     # C8 intentionally stamps the anchored editorial section layout as v11/v25.
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v14-typst-v32-literal-notes"
+        == "publication-v15-typst-v33-opinion-pipe-tables"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

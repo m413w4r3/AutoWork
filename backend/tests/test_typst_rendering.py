@@ -17,6 +17,7 @@ from cti_app.application.typst_rendering import (
     TypstTemplateBundle,
     _display_date,
     _indicator_values,
+    _opinion_pipe_table,
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
@@ -100,6 +101,35 @@ def _ref(source_document_id: UUID, token: str) -> PublicationEvidenceRefV1:
         kind=PublicationEvidenceKind.FACT,
         evidence_key=token * 64,
     )
+
+
+def test_opinion_pipe_table_parser_handles_alignment_inline_code_and_safe_limits() -> None:
+    hash_value = "a" * 64
+    parsed = _opinion_pipe_table(
+        "Context before the table.\n"
+        "| Artifact | SHA-256 | Location |\n"
+        "| :--- | ---: | :---: |\n"
+        f"| `sample.bin` | {hash_value} | `dir/sample.bin` |\n"
+        "Notes after the table."
+    )
+
+    assert parsed is not None
+    assert parsed["prefix"] == "Context before the table.\n"
+    assert parsed["suffix"] == "Notes after the table."
+    assert parsed["alignment"] == ["left", "right", "center"]
+    assert parsed["wide"] is True
+    assert parsed["header"][0]["segments"][0]["text"] == "Artifact"
+    assert parsed["rows"][0][0]["segments"][0]["code"] is True
+    assert parsed["rows"][0][0]["segments"][0]["text"] == "sample.bin"
+    assert parsed["rows"][0][1]["text"] == hash_value
+
+    assert _opinion_pipe_table("| A | B |\n| --- |\n| x | y |") is None
+    assert _opinion_pipe_table("| A |\n| --- |\n| unmatched `code |") is None
+    too_many_columns = "|" + "|".join(f"C{index}" for index in range(9)) + "|\n"
+    too_many_columns += "|" + "|".join("---" for _ in range(9)) + "|"
+    assert _opinion_pipe_table(too_many_columns) is None
+    too_many_rows = "| A |\n| --- |\n" + "| row |\n" * 201
+    assert _opinion_pipe_table(too_many_rows) is None
 
 
 def _full_document(
@@ -258,11 +288,12 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert (
-        data["schema_version"] == "typst-publication-model-v30-contiguous-protocol-figure-captions"
-    )
+    assert data["schema_version"] == "typst-publication-model-v31-editorial-layout-metadata"
     assert data["document_label"] == "Libellé de fixture"
     assert data["document_header"] == "Publication"
+    assert data["overview"] == {"status_label": "Publication", "source_count": 1}
+    assert data["brand_logo_available"] is False
+    assert "classification_label" not in data
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert len(references["entries"]) == 1
@@ -756,9 +787,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert (
-        data["schema_version"] == "typst-publication-model-v30-contiguous-protocol-figure-captions"
-    )
+    assert data["schema_version"] == "typst-publication-model-v31-editorial-layout-metadata"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text

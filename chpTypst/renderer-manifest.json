@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v33-literal-analyst-notes",
+  "template_version": "chp-article-v34-opinion-layout-pipe-tables",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

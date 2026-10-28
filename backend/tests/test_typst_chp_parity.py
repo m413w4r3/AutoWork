@@ -55,6 +55,11 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationState,
     AnalystObservationV1,
     AnalystOpinionStatus,
+    ImplantMaterialEditorialV1,
+    ImplantMaterialType,
+    OpinionBlock,
+    OpinionBlockType,
+    opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
 )
 from cti_app.domain.investigation_graph import (
@@ -82,6 +87,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     editorial_enrichment_from_json,
 )
+from cti_app.domain.production_synthesis import SynthesisUncertaintyV1
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationIndicatorGroupV1,
@@ -1271,6 +1277,235 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
 
 
 @pytest.mark.asyncio
+async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    publication, case_metadata, *_case = _frontmatter_v6_case()
+    source_ids_by_url = {
+        source.canonical_url: source.source_document_id for source in publication.sources
+    }
+    synthesis = replace(
+        case_metadata["synthesis"],
+        uncertainties=(
+            SynthesisUncertaintyV1(
+                "Archive coverage remains uncertain.",
+                (
+                    source_ids_by_url["https://example.com/report"],
+                    source_ids_by_url["https://a.example/report"],
+                ),
+            ),
+            SynthesisUncertaintyV1(
+                "Archive coverage needs a second review.",
+                (source_ids_by_url["https://a.example/report"],),
+            ),
+        ),
+    )
+    domain_group = next(
+        group
+        for group in publication.original_indicators
+        if group.artifact_type is ArtifactType.DOMAIN
+    )
+    source_document_id = domain_group.indicators[0].source_document_ids[0]
+    additional_iocs = tuple(
+        PublicationIndicatorV1(
+            value=f"fixture-ioc-{index:02d}.example",
+            normalized_value=f"fixture-ioc-{index:02d}.example",
+            artifact_type=ArtifactType.DOMAIN,
+            source_document_ids=(source_document_id,),
+        )
+        for index in range(25)
+    )
+    publication = replace(
+        publication,
+        original_indicators=tuple(
+            replace(group, indicators=(*group.indicators, *additional_iocs))
+            if group.artifact_type is ArtifactType.DOMAIN
+            else group
+            for group in publication.original_indicators
+        ),
+    )
+    opinion, _citation_context = _approved_opinion(publication)
+    source_opinion_block = opinion.blocks[0]
+    table_lines = [
+        "| Archive member | SHA-256 | Kind | Context | Path |",
+        "| :--- | ---: | :---: | --- | ---: |",
+    ]
+    row_hashes: list[str] = []
+    for index in range(80):
+        row_hash = f"{index + 1:064x}"
+        row_hashes.append(row_hash)
+        if index == 0:
+            table_lines.append(
+                f'| `sample-{index:03d}.bin` | {row_hash} | #raw("PIPE_TABLE_INJECTION_SENTINEL") '
+                "| literal ] bracket | `dir/sample.bin` |"
+            )
+        else:
+            table_lines.append(
+                f"| `sample-{index:03d}.bin` | {row_hash} | data | collected | "
+                f"`dir/sample-{index:03d}.bin` |"
+            )
+    valid_table_text = (
+        "Inventory fixture intro.\n" + "\n".join(table_lines) + "\nInventory fixture end."
+    )
+    malformed_table_text = "| Malformed | Table |\n| --- |\n| literal fallback | row |"
+    material_sha256 = "e" * 64
+    material = ImplantMaterialEditorialV1(
+        type=ImplantMaterialType.AES_KEY,
+        value="00112233445566778899aabbccddeeff",
+        role="Synthetic fixture decryption key",
+        sample_location="config/key.bin:0x20-0x2f",
+        sample_sha256=material_sha256,
+        evidence_observation_id=UUID(int=903),
+    )
+    blocks = opinion_blocks_with_implant_materials(
+        (
+            OpinionBlock(
+                OpinionBlockType.KEY_FINDINGS,
+                valid_table_text,
+                finding_refs=source_opinion_block.finding_refs,
+                evidence_refs=source_opinion_block.evidence_refs,
+                qualification=source_opinion_block.qualification,
+                certainty=source_opinion_block.certainty,
+            ),
+            OpinionBlock(OpinionBlockType.ADDITIONAL_SAMPLES, malformed_table_text),
+        ),
+        (material,),
+    )
+    opinion = replace(
+        opinion,
+        blocks=blocks,
+        status=AnalystOpinionStatus.DRAFT,
+        reviewer_id=None,
+        content_sha256="",
+    )
+    preview = TypstDraftPreviewDocument(
+        base_publication=publication,
+        analyst_opinion=opinion,
+        synthesis=synthesis,
+    )
+
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = _render(preview, template_bundle)
+    render_data = json.loads(render_source.render_data_bytes)
+    assert render_data["brand_logo_available"] is True
+    opinion_section = next(
+        item for item in render_data["content_sections"] if item["type"] == "analyst_opinion"
+    )
+    assert opinion_section["blocks"][0]["pipe_table"]["wide"] is True
+    assert opinion_section["blocks"][0]["pipe_table"]["prefix"] == "Inventory fixture intro.\n"
+    assert opinion_section["blocks"][0]["pipe_table"]["suffix"] == "Inventory fixture end."
+    assert opinion_section["blocks"][1]["pipe_table"] is None
+    typed_materials = next(
+        item for item in render_data["content_sections"] if item["type"] == "technical_materials"
+    )
+    assert typed_materials["items"][0]["type"] == "aes_key"
+    assert typed_materials["items"][0]["sample_sha256"] == material_sha256
+    limitations = next(
+        item for item in render_data["content_sections"] if item["type"] == "limitations"
+    )
+    assert limitations["source_list"] == [
+        {"number": 1, "url": "https://a.example/report"},
+        {"number": 2, "url": "https://example.com/report"},
+    ]
+    assert {
+        item["text"]: [reference["number"] for reference in item["source_refs"]]
+        for item in limitations["items"]
+    } == {
+        "Archive coverage remains uncertain.": [1, 2],
+        "Archive coverage needs a second review.": [1],
+    }
+
+    workspace_root = tmp_path / "pipe-table-workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "pipe-table-font-snapshot"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    pdf_path = tmp_path / "opinion-pipe-tables.pdf"
+    pdf_path.write_bytes(compiled.content)
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    page_texts = [page.extract_text() or "" for page in reader.pages]
+    pdftotext = shutil.which("pdftotext")
+    assert pdftotext is not None, "Poppler pdftotext is required for pipe-table verification"
+    with anyio.fail_after(15):
+        extracted_result = await anyio.run_process(
+            (pdftotext, str(pdf_path), "-"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    extracted = extracted_result.stdout.decode("utf-8", errors="replace")
+
+    limitation_page_text = next(
+        page_text for page_text in page_texts if "LIMITES DES PREUVES" in page_text
+    )
+    limitation_start = limitation_page_text.index("LIMITES DES PREUVES")
+    opinion_start = limitation_page_text.index("AVIS DE L\u2019ANALYSTE", limitation_start)
+    limitation_section_text = limitation_page_text[limitation_start:opinion_start]
+    assert limitation_section_text.count("https://a.example/report") == 1
+    assert limitation_section_text.count("https://example.com/report") == 1
+    assert "Sources" in limitation_section_text
+    assert "Archive coverage remains uncertain." in limitation_section_text
+    assert "Archive coverage needs a second review." in limitation_section_text
+    linked_uris = {
+        str(action.get_object().get("/URI"))
+        for page in reader.pages
+        for annotation in page.get("/Annots", ())
+        if (action := annotation.get_object().get("/A")) is not None
+        and action.get_object().get("/URI") is not None
+    }
+    assert {
+        "https://a.example/report",
+        "https://example.com/report",
+    } <= linked_uris
+
+    table_page_indices = [
+        index
+        for index, page_text in enumerate(page_texts)
+        if all(marker in page_text for marker in ("SHA-256", "Kind", "Context", "Path"))
+    ]
+    assert len(table_page_indices) >= 2
+    assert all(
+        float(reader.pages[index].mediabox.width) > float(reader.pages[index].mediabox.height)
+        for index in table_page_indices
+    )
+    assert row_hashes[-1] in extracted
+    assert "Inventory fixture intro." in extracted
+    assert "Inventory fixture end." in extracted
+    assert '#raw("PIPE_TABLE_INJECTION_SENTINEL")' in extracted
+    assert "literal ] bracket" in extracted
+    assert "Malformed" in extracted and "literal fallback" in extracted
+    assert "00112233445566778899aabbccddeeff" in extracted
+    assert material_sha256 in extracted
+    assert "Clé AES" in extracted
+    assert "Synthetic fixture decryption key" in extracted
+    assert "config/key.bin:0x20-0x2f" in extracted
+    assert "Observation de preuve : [E1]" in extracted
+    assert sum(f"fixture-ioc-{index:02d}[.]example" in extracted for index in range(25)) == 25
+    typed_material_page = next(
+        index
+        for index, page_text in enumerate(page_texts)
+        if "Synthetic fixture decryption key" in page_text
+    )
+    assert float(reader.pages[typed_material_page].mediabox.height) > float(
+        reader.pages[typed_material_page].mediabox.width
+    )
+
+
+@pytest.mark.asyncio
 async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigable_refs(
     tmp_path: Path,
     typst_binary: str,
@@ -1563,7 +1798,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v30-contiguous-protocol-figure-captions",
+        "schema_version": "typst-publication-model-v31-editorial-layout-metadata",
         "section_types": [
             "references",
             "chronology",

@@ -80,7 +80,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v14-typst-v32-literal-notes"
+PUBLICATION_RENDERER_VERSION = "publication-v15-typst-v33-opinion-pipe-tables"
 PUBLICATION_IDENTITY_LABEL_FIELD = "document_label"
 PDF_LINEAGE_RENDER_DATA_FIELD = "pdf_lineage"
 
