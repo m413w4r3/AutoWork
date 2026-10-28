@@ -131,6 +131,9 @@ _REDACTED_SECRET = "[clé masquée]"
 
 logger = logging.getLogger(__name__)
 
+_REFERENCE_PAYLOAD_CACHE_ENTRIES = 48
+_REFERENCE_ANSWER_CACHE_ENTRIES = 50_000
+
 
 def _internal_failure_detail(exc: BaseException) -> dict[str, str | int]:
     """Bounded, code-only description of an unexpected local preparation error."""
@@ -200,6 +203,8 @@ class InvestigationAdvisorTool:
         self._registry = registry
         self._results: dict[str, ToolResult] = {}
         self._ignored_evidence_refs: dict[str, tuple[str, ...]] = {}
+        self._reference_answers: dict[tuple[UUID, str, str], bool] = {}
+        self._reference_payloads: dict[tuple[UUID, str], Any | None] = {}
 
     def take_result(self, operation_key: str) -> _AdvisorToolResultSnapshot | None:
         result = self._results.pop(operation_key, None)
@@ -3803,6 +3808,28 @@ class InvestigationAdvisorTool:
             return True
         if not re.fullmatch(r"[0-9a-f]{64}", sample_hash):
             return False
+        # Observation blobs are immutable and content-addressed (sha256), so both the parsed
+        # payload and the per-sample answer can be memoized; recomputing them read and parsed
+        # every blob once per (observation, sample) pair and stalled large consultations.
+        answer_key = (observation.id, observation.sha256, sample_hash)
+        cached_answer = self._reference_answers.get(answer_key)
+        if cached_answer is not None:
+            return cached_answer
+        payload_key = (observation.blob_id, observation.sha256)
+        if payload_key in self._reference_payloads:
+            payload = self._reference_payloads[payload_key]
+        else:
+            payload = await self._load_observation_json_payload(observation)
+            if len(self._reference_payloads) >= _REFERENCE_PAYLOAD_CACHE_ENTRIES:
+                self._reference_payloads.pop(next(iter(self._reference_payloads)))
+            self._reference_payloads[payload_key] = payload
+        answer = payload is not None and _payload_references_sample_hash(payload, sample_hash)
+        if len(self._reference_answers) >= _REFERENCE_ANSWER_CACHE_ENTRIES:
+            self._reference_answers.clear()
+        self._reference_answers[answer_key] = answer
+        return answer
+
+    async def _load_observation_json_payload(self, observation: EvidenceObservation) -> Any | None:
         blob = await self._blobs.get(observation.blob_id)
         descriptor = getattr(blob, "descriptor", None)
         if (
@@ -3812,17 +3839,16 @@ class InvestigationAdvisorTool:
             or type(descriptor.size) is not int
             or descriptor.size < 0
         ):
-            return False
+            return None
         try:
             raw = await self._artifact_store.read_bytes(
                 observation.blob_id, max_bytes=descriptor.size
             )
             if len(raw) != descriptor.size or hashlib.sha256(raw).hexdigest() != observation.sha256:
-                return False
-            payload = json.loads(raw.decode("utf-8"))
+                return None
+            return json.loads(raw.decode("utf-8"))
         except Exception:
-            return False
-        return _payload_references_sample_hash(payload, sample_hash)
+            return None
 
     async def _sample_blob_for_hash(
         self,

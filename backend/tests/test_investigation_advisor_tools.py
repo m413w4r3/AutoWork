@@ -7497,3 +7497,33 @@ def test_cited_unknown_evidence_ref_is_ignored_and_reported_instead_of_rejecting
     assert tool._ignored_evidence_refs["key-1"] == (str(foreign), str(missing))
     with pytest.raises(ValueError, match="None of the cited evidence references"):
         asyncio.run(tool._load_cited_evidence(context, (foreign, missing)))
+
+
+@pytest.mark.asyncio
+async def test_observation_sample_reference_check_loads_each_blob_once() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id, {"schema": "offline-test.v1", "sample_sha256": "a" * 64}
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+        observation=observation,
+        raw=raw,
+    )
+    loads = 0
+    original = tool._load_observation_json_payload
+
+    async def counting(item):
+        nonlocal loads
+        loads += 1
+        return await original(item)
+
+    tool._load_observation_json_payload = counting  # type: ignore[method-assign]
+
+    hashes = ("a" * 64, "b" * 64, "c" * 64)
+    first = [await tool._observation_references_sample(observation, h) for h in hashes]
+    again = [await tool._observation_references_sample(observation, h) for h in hashes]
+
+    assert first == again
+    assert loads == 1
