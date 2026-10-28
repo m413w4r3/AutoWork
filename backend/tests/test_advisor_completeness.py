@@ -140,7 +140,20 @@ def test_general_contradiction_search_is_informational_without_a_targeted_claim(
 def test_contradiction_assertion_with_a_cited_finding_is_informational_not_blocking() -> None:
     finding_id = str(uuid4())
     question = "Review the contradiction attached to this finding."
-    data = _planning_data(question=question, evidence=[], findings=[])
+    data = _planning_data(
+        question=question,
+        evidence=[],
+        findings=[
+            {
+                "finding_id": finding_id,
+                "sha256": "d" * 64,
+                "assessment": "qualified",
+                "kind": "claim_verification",
+                "line": "Qualified finding; no refutation is known for it.",
+                "claim_refs": ["S1P3.1"],
+            }
+        ],
+    )
     data["assertions"] = [
         {
             "nature": "contradiction",
