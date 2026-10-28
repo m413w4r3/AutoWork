@@ -22,6 +22,7 @@ from cti_app.domain.advisor_completeness import (
     AdvisorEvidenceStatus,
     AdvisorPreflightStatus,
 )
+from cti_app.domain.investigation import EnvelopeAuthorityKind, InvestigationEnvelope
 
 _WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
 _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
@@ -579,7 +580,75 @@ def _contains_sample_context(value: object) -> bool:
     return False
 
 
-def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
+def _sample_disclosure_restriction_sources(
+    sample: object,
+    envelope: InvestigationEnvelope | None,
+) -> tuple[str, ...]:
+    """Return disclosure veto names for a sample under the current envelope.
+
+    An inherited OSINT policy that allows external LLM disclosure supersedes a
+    sample's source-level ``do_not_submit`` flag for Bridge consultations. The
+    sample's own TLP, external-LLM, and licence restrictions continue to apply.
+    """
+
+    def value(name: str, default: object = None) -> object:
+        if isinstance(sample, Mapping):
+            return sample.get(name, default)
+        return getattr(sample, name, default)
+
+    ignore_sample_do_not_submit = bool(
+        envelope is not None
+        and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        and envelope.inherited_policy_id is not None
+        and envelope.inherited_policy_version is not None
+        and envelope.inherited_policy_event_id is not None
+        and envelope.disclosure.external_llm_allowed
+        and not envelope.disclosure.do_not_submit
+    )
+
+    sources: list[str] = []
+    tlp = value("tlp")
+    raw_tlp = getattr(tlp, "value", tlp)
+    if isinstance(raw_tlp, str):
+        tlp_name = raw_tlp.strip().casefold()
+        if tlp_name.startswith("tlp:"):
+            tlp_name = tlp_name[4:].strip()
+        tlp_ranks = {
+            "white": 0,
+            "clear": 1,
+            "green": 2,
+            "amber": 3,
+            "amber+strict": 4,
+            "red": 5,
+        }
+        if tlp_name == "red":
+            sources.append("tlp_red")
+        elif (
+            envelope is not None
+            and envelope.disclosure.tlp is not None
+            and tlp_name in tlp_ranks
+            and envelope.disclosure.tlp.value.casefold() in tlp_ranks
+            and tlp_ranks[tlp_name] > tlp_ranks[envelope.disclosure.tlp.value.casefold()]
+        ):
+            sources.append("tlp_above_envelope_bound")
+
+    if bool(value("do_not_submit", False)) and not ignore_sample_do_not_submit:
+        sources.append("do_not_submit")
+    if value("external_llm_allowed", True) is False:
+        sources.append("external_llm_disallowed")
+    license_restriction = value("license_restriction")
+    if (license_restriction is not None and bool(str(license_restriction).strip())) or value(
+        "license_restricted", False
+    ) is True:
+        sources.append("license_restriction")
+    return tuple(sources)
+
+
+def build_advisor_dossier(
+    prompt_data: Mapping[str, Any],
+    *,
+    envelope: InvestigationEnvelope | None = None,
+) -> AdvisorDossier:
     """Select pertinent whole facts and render a shared French task dossier."""
     consultation_type = _as_text(prompt_data.get("consultation_type"))
     task = _as_text(prompt_data.get("question")) or _DEFAULT_TASKS.get(consultation_type, "")
@@ -633,6 +702,8 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
 
     for sample in prompt_data.get("samples", ()):
         if not isinstance(sample, Mapping) or sample.get("verified") is not True:
+            continue
+        if envelope is not None and _sample_disclosure_restriction_sources(sample, envelope):
             continue
         sample_id = _as_text(sample.get("sample_id"))
         association_id = _as_text(sample.get("association_id"))

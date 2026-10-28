@@ -51,6 +51,7 @@ from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
+    EnvelopeAuthorityKind,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
@@ -418,6 +419,18 @@ def make_context(
         idempotency_key=key,
         available_capabilities=frozenset(capabilities),
     )
+
+
+def make_osint_policy_context(investigation_id, *, key):
+    context = make_context(investigation_id, key=key)
+    envelope = replace(
+        context.envelope,
+        authority_kind=EnvelopeAuthorityKind.OSINT_POLICY,
+        inherited_policy_id=uuid4(),
+        inherited_policy_version=1,
+        inherited_policy_event_id=context.envelope.approval_decision_id,
+    )
+    return replace(context, envelope=envelope)
 
 
 def make_dispatch_context(investigation_id, *, context_byte_limit=None):
@@ -2945,6 +2958,137 @@ async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest
     )
     statuses = {row["status"] for row in item["statuses"]}
     assert {"PRESENT_IN_CANONICAL", "IN_DOSSIER", "SENT_TO_BRIDGE"} <= statuses
+
+
+@pytest.mark.asyncio
+async def test_osint_policy_allows_cited_do_not_submit_sample_bytes() -> None:
+    investigation_id = uuid4()
+    sample_content = bytes(range(256)) * 40
+    (
+        tool,
+        transport,
+        observation,
+        sample_id,
+        association_id,
+        blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        sample_content,
+        do_not_submit=True,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_osint_policy_context(
+            investigation_id,
+            key="operator:advisor:osint-do-not-submit-sample",
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert f"sample_id={sample_id}" in prompt
+    assert f"association_id={association_id}" in prompt
+    assert f"blob_id={blob_id}" in prompt
+    assert f"sample_sha256={sample_hash}" in prompt
+    assert "do_not_submit=true" in prompt
+    assert "length=4096" in prompt
+    assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
+    )
+    item = next(
+        row
+        for row in persisted["completeness_manifest"]
+        if row["kind"] == "observation" and row["id"] == str(observation.id)
+    )
+    statuses = {row["status"] for row in item["statuses"]}
+    assert {"PRESENT_IN_CANONICAL", "IN_DOSSIER", "SENT_TO_BRIDGE"} <= statuses
+
+
+@pytest.mark.asyncio
+async def test_osint_policy_keeps_external_llm_veto_for_do_not_submit_sample() -> None:
+    investigation_id = uuid4()
+    (
+        tool,
+        transport,
+        observation,
+        _sample_id,
+        _association_id,
+        _blob_id,
+        _sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        bytes(range(256)),
+        do_not_submit=True,
+        external_llm_allowed=False,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_osint_policy_context(
+            investigation_id,
+            key="operator:advisor:osint-external-veto-sample",
+        ),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["failure_reason"] == "explicit_sample_restriction"
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert tuple(rows[0]["restriction_sources"]) == ("external_llm_disallowed",)
+
+
+@pytest.mark.asyncio
+async def test_human_g2_keeps_sample_do_not_submit_refusal() -> None:
+    investigation_id = uuid4()
+    (
+        tool,
+        transport,
+        observation,
+        _sample_id,
+        _association_id,
+        _blob_id,
+        _sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        bytes(range(256)),
+        do_not_submit=True,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(
+            investigation_id,
+            key="operator:advisor:human-g2-do-not-submit-sample",
+        ),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert tuple(rows[0]["restriction_sources"]) == ("do_not_submit",)
 
 
 @pytest.mark.asyncio
