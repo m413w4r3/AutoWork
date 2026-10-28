@@ -889,9 +889,10 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                 "arguments": {
                     "consultation_type": "plan_investigation",
                     "question": "Check evidence completeness before local Advisor dispatch.",
-                    "evidence_refs": [str(first.id), str(uuid4())],
+                    # Unknown references are ignored; refusal happens when none resolves.
+                    "evidence_refs": [str(uuid4())],
                 },
-                "purpose": "Check one valid synthetic reference and one absent reference.",
+                "purpose": "Check that a request citing only an absent reference is refused.",
                 "expected_version": latest_state.version,
             },
             headers={"Idempotency-Key": f"m05d-missing-ref-{investigation_id}"},

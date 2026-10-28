@@ -872,7 +872,8 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 {
                     "consultation_type": "plan_investigation",
                     "question": "Check evidence completeness before local Advisor dispatch.",
-                    "evidence_refs": [str(analysis_observation.id), str(missing_ref)],
+                    # Unknown references are ignored; refusal happens when none resolves.
+                    "evidence_refs": [str(missing_ref)],
                 },
                 key=f"m05c-advisor-veto:missing-ref:{investigation_id}",
             )

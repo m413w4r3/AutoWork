@@ -7360,7 +7360,8 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
-            "evidence_refs": [str(observation.id), str(missing_observation_id)],
+            # Unknown references are ignored; the call is refused only when none resolves.
+            "evidence_refs": [str(missing_observation_id)],
         },
         make_context(investigation_id),
     )
@@ -7369,6 +7370,7 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     assert result.error_code == "advisor_input_invalid"
     assert result.output["advisor_status"] == "invalid_input"
     assert result.output["input_error_code"] == "advisor_input_rejected"
+    assert str(missing_observation_id) in result.output["input_error_detail"]["message"]
     assert result.output["failure_stage"] == "pre_transport_validation"
     assert result.output["confirmed_non_execution"] is True
     assert result.output["provider_usage"] == {"status": "not_submitted"}
@@ -7439,3 +7441,34 @@ def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
     assert result.framework_pre_submission_proof is None
+
+
+def test_cited_unknown_evidence_ref_is_ignored_and_reported_instead_of_rejecting() -> None:
+    import asyncio
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
+
+    case = uuid4()
+    known, foreign, missing = uuid4(), uuid4(), uuid4()
+    rows = {
+        known: SimpleNamespace(id=known, investigation_id=case),
+        foreign: SimpleNamespace(id=foreign, investigation_id=uuid4()),
+    }
+
+    class Observations:
+        async def get(self, ref):
+            return rows.get(ref)
+
+    tool = InvestigationAdvisorTool.__new__(InvestigationAdvisorTool)
+    tool._observations = Observations()
+    tool._ignored_evidence_refs = {}
+    context = SimpleNamespace(investigation_id=case, idempotency_key="key-1")
+
+    found = asyncio.run(tool._load_cited_evidence(context, (known, foreign, missing)))
+
+    assert [item.id for item in found] == [known]
+    assert tool._ignored_evidence_refs["key-1"] == (str(foreign), str(missing))
+    with pytest.raises(ValueError, match="None of the cited evidence references"):
+        asyncio.run(tool._load_cited_evidence(context, (foreign, missing)))

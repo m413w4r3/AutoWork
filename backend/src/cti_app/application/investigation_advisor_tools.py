@@ -198,6 +198,7 @@ class InvestigationAdvisorTool:
         self._artifact_store = artifact_store
         self._registry = registry
         self._results: dict[str, ToolResult] = {}
+        self._ignored_evidence_refs: dict[str, tuple[str, ...]] = {}
 
     def take_result(self, operation_key: str) -> _AdvisorToolResultSnapshot | None:
         result = self._results.pop(operation_key, None)
@@ -238,7 +239,7 @@ class InvestigationAdvisorTool:
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
             if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return no_context_cost
-            evidence = await self._load_evidence(context.investigation_id, evidence_refs)
+            evidence = await self._load_cited_evidence(context, evidence_refs)
             if not evidence_refs and consultation_type not in {
                 "review_text",
                 "draft_text",
@@ -365,10 +366,18 @@ class InvestigationAdvisorTool:
             raw_refs = arguments.get("evidence_refs", ())
             if not isinstance(raw_refs, (tuple, list)):
                 raise _AdvisorInputValidationError("evidence_refs_invalid")
-            try:
-                evidence_refs = tuple(UUID(str(item)) for item in raw_refs)
-            except (TypeError, ValueError):
-                raise _AdvisorInputValidationError("evidence_ref_invalid") from None
+            parsed_refs: list[UUID] = []
+            malformed_refs: list[str] = []
+            for item in raw_refs:
+                try:
+                    parsed_refs.append(UUID(str(item)))
+                except (TypeError, ValueError):
+                    malformed_refs.append(str(item)[:64])
+            if raw_refs and not parsed_refs:
+                raise _AdvisorInputValidationError("evidence_ref_invalid")
+            if malformed_refs:
+                self._ignored_evidence_refs[context.idempotency_key] = tuple(malformed_refs)
+            evidence_refs = tuple(parsed_refs)
             if "units" in arguments:
                 raw_units = arguments.get("units")
                 if consultation_type not in {"draft_text", "review_text"}:
@@ -444,10 +453,7 @@ class InvestigationAdvisorTool:
             )
             if pacing_result is not None:
                 return self._finish(context, _attest_advisor_pre_submission(pacing_result))
-            evidence = await self._load_evidence(
-                context.investigation_id,
-                evidence_refs,
-            )
+            evidence = await self._load_cited_evidence(context, evidence_refs)
             if not evidence_refs and consultation_type not in {
                 "review_text",
                 "draft_text",
@@ -1926,6 +1932,37 @@ class InvestigationAdvisorTool:
             return tuple(self._registry.list_available(context))
         except (AttributeError, TypeError):
             return tuple(self._registry.list_registered())
+
+    async def _load_cited_evidence(
+        self,
+        context: ToolExecutionContext,
+        refs: tuple[UUID, ...],
+    ) -> tuple[EvidenceObservation, ...]:
+        """Load the analyst-cited observations, ignoring unknown ones instead of rejecting.
+
+        Foreign or absent references are never included in the dossier; they are reported
+        back in the result. The call only fails when none of the cited references resolves.
+        """
+        unique_refs = tuple(dict.fromkeys(refs))
+        found: list[EvidenceObservation] = []
+        ignored: list[str] = []
+        for ref in unique_refs:
+            item = await self._observations.get(ref)
+            if item is None or item.investigation_id != context.investigation_id:
+                ignored.append(str(ref))
+                continue
+            found.append(item)
+        if unique_refs and not found:
+            raise ValueError(
+                "None of the cited evidence references exists in this investigation: "
+                + ", ".join(ignored[:8])
+            )
+        if ignored:
+            self._ignored_evidence_refs[context.idempotency_key] = (
+                *self._ignored_evidence_refs.get(context.idempotency_key, ()),
+                *ignored,
+            )
+        return tuple(found)
 
     async def _load_evidence(
         self,
@@ -4166,6 +4203,12 @@ class InvestigationAdvisorTool:
         return self._finish(context, result)
 
     def _finish(self, context: ToolExecutionContext, result: ToolResult) -> ToolResult:
+        ignored = self._ignored_evidence_refs.pop(context.idempotency_key, ())
+        if ignored:
+            result = replace(
+                result,
+                output={**dict(result.output), "ignored_evidence_refs": list(ignored)},
+            )
         result = _attest_advisor_pre_submission(result)
         self._results[context.idempotency_key] = result
         if len(self._results) > 128:
