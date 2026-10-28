@@ -59,7 +59,9 @@ from cti_app.application.investigation_tools import (
     ToolConfidentiality,
     ToolDefinition,
     ToolEffect,
+    ToolExecutionContext,
     ToolResult,
+    _authorize_framework_refusal_proof_adapter,
 )
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationService
@@ -1032,6 +1034,15 @@ def _tool_call(name, query, purpose):
     }
 
 
+def _advisor_tool_call(question: str) -> dict[str, Any]:
+    return {
+        "tool_name": "advisor.consult",
+        "schema_version": ADVISOR_SCHEMA_VERSION,
+        "arguments": {"consultation_type": "plan_investigation", "question": question},
+        "purpose": "review the investigation plan",
+    }
+
+
 def _proposal(
     kind,
     assessment,
@@ -1080,6 +1091,196 @@ def _decision(*, goal, next_action, tools=(), findings=(), opinion=None, hypothe
         "opinion_delta": opinion,
         "next_action": next_action,
     }
+
+
+async def _zero_prompt_advisor_cost(_arguments, _context):
+    return {
+        BudgetDimension.CONTEXT_BYTES: 0,
+        BudgetDimension.CONTEXT_TOKENS: 0,
+    }
+
+
+async def _fixture_context(fixture: _Fixture, state):
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert envelope is not None
+    return await fixture.context_builder.build(
+        investigation_id=state.investigation_id,
+        synthesis_artifact_id=fixture.synthesis.id,
+        state=state,
+        tool_context=ToolExecutionContext(
+            investigation_id=state.investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key=f"context:{state.turn_index}",
+            available_capabilities=fixture.available_capabilities,
+        ),
+        budget_remaining={
+            dimension.value: amount for dimension, amount in envelope.budget.remaining.items()
+        },
+        registry=fixture.registry,
+    )
+
+
+@pytest.mark.asyncio
+async def test_secret_refused_advisor_question_is_redacted_and_retry_limited() -> None:
+    sentinel = "synthetic-configured-credential-sentinel"
+    refused_call = _advisor_tool_call(sentinel)
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="check an advisor question", next_action="continue", tools=(refused_call,)
+            ),
+            _decision(
+                goal="retry the same advisor question",
+                next_action="continue",
+                tools=(refused_call,),
+            ),
+            _decision(
+                goal="stop retrying the refused question",
+                next_action="continue",
+                tools=(refused_call,),
+            ),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                {
+                    BudgetDimension.BRIDGE_TURNS: 1,
+                },
+            ),
+        ),
+    )
+    tool = fixture.tools["advisor.consult"]
+    _authorize_framework_refusal_proof_adapter(tool)
+    tool.reservation_cost = _zero_prompt_advisor_cost
+    tool.result = ToolResult(
+        status=ToolInvocationStatus.FAILED,
+        error_code="advisor_secret_field_remaining",
+        output={
+            "advisor_status": "refused",
+            "failure_stage": "secret_preflight",
+            "confirmed_non_execution": True,
+            "bridge_turns_consumed": 0,
+        },
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    state = await fixture.start()
+
+    first = await fixture.service.run(state.investigation_id)
+    assert first.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(tool.calls) == 1
+    first_invocation = (await fixture.invocations.list_for_investigation(state.investigation_id))[0]
+    assert first_invocation.status is ToolInvocationStatus.FAILED
+    assert sentinel not in json.dumps(dict(first_invocation.normalized_parameters))
+    assert "question" not in first_invocation.normalized_parameters
+    next_state = await fixture.states.get(state.investigation_id)
+    assert next_state is not None
+    next_context = await _fixture_context(fixture, next_state)
+    assert sentinel.encode() not in next_context.canonical_bytes()
+    assert first_invocation.normalized_parameters["_advisor_preflight_refusal_expected"] is True
+    await fixture.service.resume(state.investigation_id)
+    second = await fixture.service.run(state.investigation_id)
+    assert second.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(tool.calls) == 2
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(invocations) == 2
+    assert all(sentinel not in json.dumps(dict(item.normalized_parameters)) for item in invocations)
+    assert all("question" not in item.normalized_parameters for item in invocations)
+    assert all(sentinel not in prompt for prompt in fixture.bridge_transport.prompts)
+    assert invocations[1].operation_key.endswith(":retry:1")
+    assert all(item.response_refs for item in invocations)
+    await fixture.service.resume(state.investigation_id)
+    await fixture.service.run(state.investigation_id)
+    latest_invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(tool.calls) == 2
+    assert len(latest_invocations) == 2
+    assert all(":retry:2" not in item.operation_key for item in latest_invocations)
+    assert all(sentinel not in prompt for prompt in fixture.bridge_transport.prompts)
+
+
+@pytest.mark.asyncio
+async def test_sample_disclosure_refusal_stops_actions_and_redacts_later_context() -> None:
+    refused_call = _advisor_tool_call("Review the restricted sample metadata.")
+    later_call = _tool_call("vt.search", "synthetic:later", "search after advisor refusal")
+    sample_id = str(uuid4())
+    association_id = str(uuid4())
+    sample_sha256 = "f" * 64
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="review sample evidence",
+                next_action="continue",
+                tools=(refused_call, later_call),
+            ),
+            _decision(goal="finish after local refusal", next_action="finish"),
+        ],
+        tools=(
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                {
+                    BudgetDimension.BRIDGE_TURNS: 1,
+                },
+            ),
+            ("vt.search", "vt"),
+        ),
+    )
+    advisor = fixture.tools["advisor.consult"]
+    _authorize_framework_refusal_proof_adapter(advisor)
+    advisor.reservation_cost = _zero_prompt_advisor_cost
+    advisor.result = ToolResult(
+        status=ToolInvocationStatus.UNAVAILABLE,
+        error_code="advisor_disclosure_restricted",
+        output={
+            "advisor_status": "disclosure_restricted",
+            "failure_stage": "sample_disclosure_restricted",
+            "failure_reason": "explicit_sample_restriction",
+            "confirmed_non_execution": True,
+            "bridge_turns_consumed": 0,
+            "disclosure_restricted_sample_associations": [
+                {
+                    "sample_id": sample_id,
+                    "association_id": association_id,
+                    "sample_sha256": sample_sha256,
+                    "byte_size": 12345,
+                }
+            ],
+        },
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    state = await fixture.start()
+
+    stopped = await fixture.service.run(state.investigation_id)
+
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(fixture.bridge_transport.prompts) == 1
+    assert fixture.tools["vt.search"].calls == []
+    next_state = await fixture.states.get(state.investigation_id)
+    assert next_state is not None
+    next_context = await _fixture_context(fixture, next_state)
+    next_context_bytes = next_context.canonical_bytes()
+    assert sample_id.encode() not in next_context_bytes
+    assert association_id.encode() not in next_context_bytes
+    assert sample_sha256.encode() not in next_context_bytes
+    assert b"12345" not in next_context_bytes
+    await fixture.service.resume(state.investigation_id)
+    await fixture.service.run(state.investigation_id)
+    assert len(fixture.bridge_transport.prompts) == 2
+    following_prompt = fixture.bridge_transport.prompts[1]
+    assert sample_id not in following_prompt
+    assert association_id not in following_prompt
+    assert sample_sha256 not in following_prompt
+    assert "12345" not in following_prompt
 
 
 def _opinion_delta(finding_id, observation_id, *, text="The observation supports this conclusion."):

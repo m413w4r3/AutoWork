@@ -177,6 +177,7 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
     }
 )
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
+_ADVISOR_PREFLIGHT_REFUSAL_PARAMETER = "_advisor_preflight_refusal_expected"
 
 
 class InvocationReconciliationOutcome(StrEnum):
@@ -1419,6 +1420,7 @@ class InvestigationService:
         definition = registered[0] if registered else None
         requested_cost = thaw_json(definition.cost_model) if definition is not None else {}
         existing: ToolInvocation | None = None
+        advisor_preflight_refusal_expected = False
         if registered is not None:
             adapter = registered[1]
             existing_lookup = getattr(self._invocations, "get_by_operation_key", None)
@@ -1451,6 +1453,11 @@ class InvestigationService:
                         type(exc).__name__,
                     )
                 requested_cost.update(dynamic_cost)
+                advisor_preflight_refusal_expected = (
+                    tool_name == "advisor.consult"
+                    and dynamic_cost.get(BudgetDimension.CONTEXT_BYTES, 0) == 0
+                    and dynamic_cost.get(BudgetDimension.CONTEXT_TOKENS, 0) == 0
+                )
         external_effect = definition is not None and definition.effect in {
             ToolEffect.EXTERNAL_READ,
             ToolEffect.ACQUIRE,
@@ -1488,6 +1495,21 @@ class InvestigationService:
                         reference.to_json() for reference in external_effect_evidence_refs
                     ],
                 }
+        elif tool_name == "advisor.consult" and existing is not None:
+            invocation_parameters = existing.normalized_parameters
+        elif tool_name == "advisor.consult" and advisor_preflight_refusal_expected:
+            # The local advisor preflight has already established that no prompt
+            # can be submitted. Keep only non-free-text identity fields in the
+            # durable invocation; the operation key still binds the full input.
+            consultation_type = arguments.get("consultation_type")
+            invocation_parameters = {
+                **(
+                    {"consultation_type": consultation_type}
+                    if isinstance(consultation_type, str)
+                    else {}
+                ),
+                _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER: True,
+            }
         invocation = ToolInvocation(
             investigation_id=investigation.id,
             operation_key=operation_key,
@@ -1669,7 +1691,11 @@ class InvestigationService:
                 expected_envelope_version=envelope.version,
                 approval_decision_id=envelope.approval_decision_id,
                 invocation_arguments_sha256=hashlib.sha256(
-                    canonical_json_bytes(invocation.normalized_parameters)
+                    canonical_json_bytes(
+                        arguments
+                        if tool_name == "advisor.consult"
+                        else invocation.normalized_parameters
+                    )
                 ).hexdigest(),
                 authority_kind=authority_kind,
                 policy_event_id=envelope.inherited_policy_event_id,
@@ -2494,7 +2520,11 @@ class InvestigationService:
                 for item in await self._invocations.list_for_investigation(investigation.id)
                 if item.tool_name == proposed.tool_name
                 and item.schema_version == proposed.schema_version
-                and _tool_call_arguments_match(item.normalized_parameters, proposed.arguments)
+                and (
+                    _operation_key_base(item.operation_key) == base_operation_key
+                    if proposed.tool_name == "advisor.consult"
+                    else _tool_call_arguments_match(item.normalized_parameters, proposed.arguments)
+                )
             )
             matching_invocations = tuple(
                 item
@@ -2527,7 +2557,11 @@ class InvestigationService:
                     )
                     return state, StopReason.SUBMISSION_NEEDS_REVIEW
             definitive_failures = sum(
-                item.status is ToolInvocationStatus.FAILED and not item.response_refs
+                item.status is ToolInvocationStatus.FAILED
+                and (
+                    not item.response_refs
+                    or item.normalized_parameters.get(_ADVISOR_PREFLIGHT_REFUSAL_PARAMETER) is True
+                )
                 for item in all_matching_invocations
             )
             if external_effect and definitive_failures >= MAX_IDENTICAL_DEFINITE_TOOL_FAILURES:
@@ -2718,6 +2752,12 @@ class InvestigationService:
                     if _confirmed_external_non_execution(result)
                     else StopReason.SUBMISSION_NEEDS_REVIEW
                 )
+            if invocation.tool_name == "advisor.consult" and (
+                result.error_code == "advisor_secret_field_remaining"
+                or result.output.get("failure_stage")
+                in {"secret_preflight", "sample_disclosure_restricted"}
+            ):
+                return state, StopReason.SUBMISSION_NEEDS_REVIEW
             # An ordinary policy denial is local to the operation; G2 reductions above
             # end this turn before any other proposed external operation is started.
 
