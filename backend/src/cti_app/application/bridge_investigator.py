@@ -61,6 +61,8 @@ class TurnSubmissionStatus(StrEnum):
 
 
 MAX_PRE_SUBMISSION_ATTEMPTS = 3
+CONVERSATION_UNAVAILABLE_RETRY_BASE_SECONDS = 5.0
+CONVERSATION_UNAVAILABLE_RETRY_MAX_SECONDS = 20.0
 BRIDGE_PROVIDER_KEY = "openai_chatgpt_bridge"
 # Bound shared blocking caused by provider-supplied Retry-After values to avoid
 # an untrusted response stalling this process indefinitely; this is not a provider policy.
@@ -255,7 +257,11 @@ class TurnSubmission:
         if self.submission_state is None:
             return
         try:
-            state = BridgeSubmissionState(self.submission_state)
+            state = (
+                BridgeSubmissionState.PRE_SUBMISSION
+                if self.submission_state == "not_submitted"
+                else BridgeSubmissionState(self.submission_state)
+            )
         except (TypeError, ValueError):
             object.__setattr__(
                 self, "submission_state", BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
@@ -481,7 +487,12 @@ async def submit_bridge_consultation_once(
                 retryable=retryable,
                 retry_after_seconds=retry_after,
                 submission_state=submission_state,
-                failure_stage=str(getattr(exc, "phase", "bridge_transport"))[:64],
+                failure_stage=(
+                    "bridge_transport_pre_submission"
+                    if code == "conversation_unavailable"
+                    and submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                    else str(getattr(exc, "phase", "bridge_transport"))[:64]
+                ),
                 failure_reason=code,
             )
         if result is None:
@@ -502,6 +513,36 @@ async def submit_bridge_consultation_once(
         return result
 
     submission = await submit_with_deadline(0, transport_timeout)
+    if _retryable_conversation_unavailable(submission):
+        for attempt in range(1, MAX_PRE_SUBMISSION_ATTEMPTS):
+            if not _retryable_conversation_unavailable(submission):
+                return submission
+            retry_delay = min(
+                CONVERSATION_UNAVAILABLE_RETRY_BASE_SECONDS * 2 ** (attempt - 1),
+                CONVERSATION_UNAVAILABLE_RETRY_MAX_SECONDS,
+            )
+            cooldown_accepted = await pacer.defer_submissions(
+                retry_delay, deadline_monotonic=deadline
+            )
+            if not cooldown_accepted or not await wait_for_pacing():
+                return _conversation_unavailable_retries_exhausted(submission)
+            retry_timeout = (
+                deadline - operation_clock() if deadline is not None else timeout_seconds
+            )
+            if retry_timeout is not None and retry_timeout < minimum_timeout_seconds:
+                return _conversation_unavailable_retries_exhausted(submission)
+            retry_submission = await submit_with_deadline(attempt, retry_timeout)
+            if (
+                retry_submission.error_code == "bridge_retry_attempt_unavailable"
+                and retry_submission.failure_stage == "retry_admission"
+                and retry_submission.submission_state is BridgeSubmissionState.PRE_SUBMISSION
+            ):
+                return _conversation_unavailable_retries_exhausted(submission)
+            submission = retry_submission
+            if not _retryable_conversation_unavailable(submission):
+                return submission
+        return _conversation_unavailable_retries_exhausted(submission)
+
     is_rate_limited = submission.error_code == "bridge_rate_limited"
     retry_after: float | None = None
     retry_delay = 0.0
@@ -616,6 +657,27 @@ def _bridge_execution_budget_refusal(
     )
 
 
+def _retryable_conversation_unavailable(submission: TurnSubmission) -> bool:
+    return (
+        submission.status is TurnSubmissionStatus.UNAVAILABLE
+        and submission.error_code == "conversation_unavailable"
+        and submission.submission_state is BridgeSubmissionState.PRE_SUBMISSION
+        and submission.retryable
+        and not submission.prior_submission_made
+        and not submission.completed_response
+        and submission.output_text is None
+    )
+
+
+def _conversation_unavailable_retries_exhausted(submission: TurnSubmission) -> TurnSubmission:
+    return replace(
+        submission,
+        status=TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED,
+        failure_stage="bridge_transport_pre_submission",
+        failure_reason=submission.failure_reason or "conversation_unavailable",
+    )
+
+
 def _retry_after_or_none(value: Any) -> float | None:
     if (
         isinstance(value, int | float)
@@ -630,6 +692,8 @@ def _retry_after_or_none(value: Any) -> float | None:
 def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | None:
     if value is None:
         return None
+    if value == "not_submitted":
+        return BridgeSubmissionState.PRE_SUBMISSION
     try:
         return BridgeSubmissionState(value)
     except (TypeError, ValueError):
@@ -1021,7 +1085,12 @@ class ModelConversationTurnTransport:
                 retry_after_seconds=getattr(
                     exc, "retry_after_seconds", getattr(exc, "retry_after", None)
                 ),
-                failure_stage=str(getattr(exc, "failure_stage", "conversation_turn"))[:64],
+                failure_stage=(
+                    "bridge_transport_pre_submission"
+                    if exc.code == "conversation_unavailable"
+                    and submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                    else str(getattr(exc, "failure_stage", "conversation_turn"))[:64]
+                ),
                 failure_reason=str(getattr(exc, "failure_reason", exc.code))[:128],
                 completed_response=completed_response,
             )
@@ -1069,9 +1138,14 @@ class ModelConversationTurnTransport:
                     )
                 ),
                 retry_after_seconds=getattr(exc, "retry_after", None),
-                failure_stage=str(
-                    getattr(exc, "failure_stage", None) or getattr(exc, "phase", failure_stage)
-                )[:64],
+                failure_stage=(
+                    "bridge_transport_pre_submission"
+                    if error_code == "conversation_unavailable"
+                    and submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                    else str(
+                        getattr(exc, "failure_stage", None) or getattr(exc, "phase", failure_stage)
+                    )[:64]
+                ),
                 failure_reason=str(
                     getattr(exc, "failure_reason", None)
                     or getattr(exc, "code", None)
@@ -1504,8 +1578,15 @@ class BridgeInvestigator:
                     # turn because the provider may already have accepted them.
                     submissions_made += 1
                 is_rate_limited = submission.error_code == "bridge_rate_limited"
-                raw_retry_delay = _retry_after_or_none(submission.retry_after_seconds)
-                if raw_retry_delay is None:
+                if submission.error_code == "conversation_unavailable":
+                    raw_retry_delay = min(
+                        CONVERSATION_UNAVAILABLE_RETRY_BASE_SECONDS
+                        * 2 ** min(pre_submission_attempt, MAX_PRE_SUBMISSION_ATTEMPTS),
+                        CONVERSATION_UNAVAILABLE_RETRY_MAX_SECONDS,
+                    )
+                else:
+                    raw_retry_delay = _retry_after_or_none(submission.retry_after_seconds)
+                if submission.error_code != "conversation_unavailable" and raw_retry_delay is None:
                     raw_retry_delay = _bounded_retry_backoff(
                         self._retry_backoff_base_seconds,
                         self._retry_backoff_max_seconds,
@@ -1528,6 +1609,11 @@ class BridgeInvestigator:
                 if (
                     retryable_submission
                     and submission.retryable
+                    and not submission.prior_submission_made
+                    and (
+                        submission.submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                        or completed_rejection
+                    )
                     and (may_retry_rate_limit or may_retry_other_pre_submission)
                 ):
                     retry_offset += 1

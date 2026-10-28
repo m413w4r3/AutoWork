@@ -612,6 +612,85 @@ async def test_bridge_server_error_explicitly_before_submission_is_confirmed_pre
     assert error.submission_state == "pre_submission"
 
 
+@pytest.mark.parametrize(
+    ("submission_state", "expected_state", "expected_retryable"),
+    [
+        ("pre_submission", "pre_submission", True),
+        ("not_submitted", "pre_submission", True),
+        ("submission_attempted", "submission_attempted", False),
+        ("post_submission", "post_submission", False),
+        (None, None, False),
+    ],
+)
+async def test_conversation_unavailable_retries_only_with_explicit_pre_submission_proof(
+    submission_state: str | None,
+    expected_state: str | None,
+    expected_retryable: bool,
+) -> None:
+    detail: dict[str, Any] = {"code": "conversation_unavailable", "retryable": False}
+    if submission_state is not None:
+        detail["submission_state"] = submission_state
+    response = httpx.Response(
+        503,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        json={"detail": detail},
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.code == "conversation_unavailable"
+    assert error.submission_state == expected_state
+    assert error.retryable is expected_retryable
+
+
+@pytest.mark.parametrize(
+    ("outer_state", "nested_state"),
+    [
+        ("post_submission", "not_submitted"),
+        ("pre_submission", "submission_attempted"),
+        ("unknown_state", "pre_submission"),
+    ],
+)
+async def test_conversation_unavailable_rejects_conflicting_or_invalid_state_proof(
+    outer_state: str,
+    nested_state: str,
+) -> None:
+    response = httpx.Response(
+        503,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        json={
+            "detail": {
+                "code": "conversation_unavailable",
+                "submission_state": outer_state,
+                "error": {"submission_state": nested_state},
+            }
+        },
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.submission_state is None
+    assert error.retryable is False
+
+
+async def test_conversation_unavailable_preflight_does_not_override_post_submission_proof() -> None:
+    response = httpx.Response(
+        503,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        json={
+            "detail": {
+                "code": "conversation_unavailable",
+                "submission_state": "post_submission",
+            }
+        },
+    )
+
+    error = _bridge_http_error(response, attempts=1, default_phase="preflight")
+
+    assert error.submission_state == "post_submission"
+    assert error.retryable is False
+
+
 async def test_bridge_server_error_without_explicit_non_submission_remains_uncertain() -> None:
     request = httpx.Request("POST", "https://bridge.test/v1/responses")
     response = httpx.Response(
@@ -849,6 +928,27 @@ def test_failed_response_requires_explicit_verified_no_answer_signal() -> None:
         with pytest.raises(BridgeTransportError) as caught:
             _responses_result(response, ModelProvider.OPENAI)
         assert caught.value.verified_no_answer is expected
+
+
+def test_failed_response_rejects_conflicting_submission_state_proof() -> None:
+    from cti_app.integrations.models import _responses_result
+
+    response = {
+        "id": "resp_terminal",
+        "status": "failed",
+        "code": "conversation_unavailable",
+        "submission_state": "post_submission",
+        "error": {
+            "code": "conversation_unavailable",
+            "submission_state": "not_submitted",
+        },
+    }
+
+    with pytest.raises(BridgeTransportError) as caught:
+        _responses_result(response, ModelProvider.OPENAI)
+
+    assert caught.value.submission_state is None
+    assert caught.value.retryable is False
 
 
 def _chat_payload(prompt: str = "Texte autorisé") -> dict[str, Any]:

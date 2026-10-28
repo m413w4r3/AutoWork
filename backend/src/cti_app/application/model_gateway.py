@@ -60,7 +60,14 @@ class ModelProviderNotConfiguredError(ModelGatewayError):
 _BRIDGE_TERMINAL_FAILURE_RETRIES = 2
 _BRIDGE_TERMINAL_FAILURE_RETRY_DELAY_SECONDS = 5.0
 _BRIDGE_NON_REPLAYABLE_CODES = frozenset(
-    {"bridge_auth_failed", "bridge_payload_conflict", "bridge_protocol_error"}
+    {
+        "bridge_auth_failed",
+        "bridge_payload_conflict",
+        "bridge_protocol_error",
+        # Conversation failures are retried by the caller only after a fresh
+        # persisted turn and external-effect binding have been created.
+        "conversation_unavailable",
+    }
 )
 _MODEL_SUBMISSION_RECONCILIATION_MESSAGE = (
     "La soumission du modèle doit être réconciliée avant toute nouvelle tentative."
