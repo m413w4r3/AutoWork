@@ -282,16 +282,28 @@ async def test_second_reservation_failure_releases_the_first_without_dispatch(mo
 
 
 @pytest.mark.asyncio
-async def test_266_seconds_refusal_is_only_a_request_and_has_no_external_output() -> None:
-    requested = {BudgetDimension.TOOL_SECONDS: 3_600}
+async def test_vt_unit_refusal_requires_approval_and_low_tool_time_does_not_block_retry() -> None:
+    requested = {
+        BudgetDimension.VT_UNITS: 1,
+        BudgetDimension.TOOL_SECONDS: 3_600,
+    }
     fixture, state, service = await _external_fixture(cost=requested)
+    fixture.tools["vt.file_report"].result = ToolResult(
+        status=ToolInvocationStatus.SUCCEEDED,
+        budget_consumed={BudgetDimension.VT_UNITS: 1, BudgetDimension.TOOL_SECONDS: 2},
+    )
     _enable_persisted_result_summaries(fixture, service)
     governance, decisions = _audited_envelope_service(fixture)
     envelope = await fixture.envelopes.get(fixture.investigation_id)
-    budget = InvestigationBudget(limits=dict(envelope.budget.limits))
+    limits = dict(envelope.budget.limits)
+    limits[BudgetDimension.VT_UNITS] = 1
+    budget = InvestigationBudget(limits=limits)
     for reservation in envelope.budget.reservations:
         budget.restore_reservation(reservation)
-    budget.reserve("already-consumed", {BudgetDimension.TOOL_SECONDS: 5_344})
+    budget.reserve(
+        "already-consumed",
+        {BudgetDimension.VT_UNITS: 1, BudgetDimension.TOOL_SECONDS: 5_344},
+    )
     budget.commit("already-consumed")
     budget.reserve("other-active-operation", {BudgetDimension.TOOL_SECONDS: 1_590})
     await fixture.envelopes.save_if_version(
@@ -303,7 +315,7 @@ async def test_266_seconds_refusal_is_only_a_request_and_has_no_external_output(
         tool_name="vt.file_report",
         schema_version="1",
         arguments={"query": "budget boundary"},
-        purpose="check the remaining tool time",
+        purpose="check the non-time budget while recording tool time",
         expected_version=state.version,
         idempotency_key="tool-seconds-266",
     )
@@ -315,11 +327,13 @@ async def test_266_seconds_refusal_is_only_a_request_and_has_no_external_output(
         if item.operation_key == result.invocation.operation_key
     )
     assert latest.budget.remaining[BudgetDimension.TOOL_SECONDS] == 266
-    assert result.invocation.reserved_budget == requested  # requested, not admitted
+    assert latest.budget.remaining[BudgetDimension.VT_UNITS] == 0
+    assert result.invocation.reserved_budget == requested
     assert result.invocation.consumed_budget == {}
     assert result.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
     assert operation_reservation.status is BudgetReservationStatus.RELEASED
     assert latest.budget.reserved[BudgetDimension.TOOL_SECONDS] == 1_590
+    assert latest.budget.consumed[BudgetDimension.VT_UNITS] == 1
     assert fixture.tools["vt.file_report"].calls == []
     assert fixture.bridge_transport.submission_count == 0
     proof_observation = await fixture.observations.get(result.invocation.response_refs[0])
@@ -327,39 +341,52 @@ async def test_266_seconds_refusal_is_only_a_request_and_has_no_external_output(
     assert proof_observation.invocation_ref == result.invocation.id
     assert proof_observation.object_id == result.invocation.operation_key
 
-    # The refusal is a safe, persisted pre-submission outcome. A fresh key may
-    # retry after a versioned budget extension while the old key remains replay-only.
+    # The non-time refusal is persisted and requires a human-approved budget extension.
+    extended_limits = dict(latest.budget.limits)
+    extended_limits[BudgetDimension.VT_UNITS] = 2
     extended = await governance.extend(
         fixture.investigation_id,
         expected_version=latest.version,
         allowed_providers=latest.allowed_providers,
-        budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 10_800}),
+        budget=InvestigationBudget(limits=extended_limits),
         acquire_hits_allowed=latest.acquire_hits_allowed,
         disclosure=latest.disclosure,
         actor_id="analyst:alice",
-        reason="Increase the approved tool-time budget after review.",
-        correlation_id="g2:tool-seconds-approved-retry",
+        reason="Increase the approved VirusTotal unit budget after review.",
+        correlation_id="g2:vt-units-approved-retry",
     )
     assert extended.version == latest.version + 1
     assert len(decisions) == 1
     assert decisions[-1].decision_type is AnalystDecisionType.PIVOT_APPROVE
     assert decisions[-1].actor_id == "analyst:alice"
-    assert decisions[-1].reason == "Increase the approved tool-time budget after review."
-    assert decisions[-1].correlation_id == "g2:tool-seconds-approved-retry"
+    assert decisions[-1].reason == "Increase the approved VirusTotal unit budget after review."
+    assert decisions[-1].correlation_id == "g2:vt-units-approved-retry"
+    assert extended.budget.remaining[BudgetDimension.TOOL_SECONDS] == 266
     latest_state = await fixture.states.get(fixture.investigation_id)
     retried = await service.invoke(
         tool_name="vt.file_report",
         schema_version="1",
         arguments={"query": "budget boundary"},
-        purpose="check the remaining tool time",
+        purpose="retry with low remaining tool time",
         expected_version=latest_state.version,
         idempotency_key="tool-seconds-after-approved-extension",
     )
 
     previous = await fixture.invocations.get_by_operation_key(result.invocation.operation_key)
+    after_retry = await fixture.envelopes.get(fixture.investigation_id)
+    retry_reservation = next(
+        item
+        for item in after_retry.budget.reservations
+        if item.operation_key == retried.invocation.operation_key
+    )
     assert previous.status is ToolInvocationStatus.FAILED
     assert retried.invocation.status is ToolInvocationStatus.SUCCEEDED
     assert len(fixture.tools["vt.file_report"].calls) == 1
+    assert retried.invocation.consumed_budget[BudgetDimension.TOOL_SECONDS] == 2
+    assert retry_reservation.status is BudgetReservationStatus.COMMITTED
+    assert retry_reservation.committed_amounts[BudgetDimension.TOOL_SECONDS] == 2
+    assert after_retry.budget.consumed[BudgetDimension.TOOL_SECONDS] == 5_346
+    assert after_retry.budget.remaining[BudgetDimension.TOOL_SECONDS] == 264
 
 
 @pytest.mark.asyncio

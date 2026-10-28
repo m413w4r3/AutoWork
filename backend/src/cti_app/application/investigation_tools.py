@@ -972,6 +972,8 @@ class RegistryToolDispatcher:
                 continue
             exceeds_remaining = False
             for dimension, amount in definition.cost_model.items():
+                if dimension is BudgetDimension.TOOL_SECONDS:
+                    continue
                 available = remaining[dimension]
                 if available is not None and amount > available:
                     exceeds_remaining = True

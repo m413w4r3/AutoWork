@@ -267,8 +267,11 @@ async def test_budget_and_envelope_policy_refuse_only_the_selected_tool() -> Non
     registry = InMemoryToolRegistry()
     adapter = FakeAdapter()
     registry.register(_definition(), adapter)
+    registry.register(_tool_seconds_definition("local.time", 1), FakeAdapter())
     dispatcher = RegistryToolDispatcher(registry)
-    exhausted = _context(vt_limit=0)
+    exhausted = _context(vt_limit=0, tool_seconds_limit=1)
+    exhausted.budget.reserve("prior-time", {BudgetDimension.TOOL_SECONDS: 1})
+    exhausted.budget.commit("prior-time", {BudgetDimension.TOOL_SECONDS: 2})
     over_budget = await dispatcher.dispatch(
         exhausted,
         tool_name="vt.file_report",
@@ -287,34 +290,36 @@ async def test_budget_and_envelope_policy_refuse_only_the_selected_tool() -> Non
         operation_key="policy-op",
     )
     assert over_budget.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert "local.time" in over_budget.suggested_alternatives
     assert policy_denied.status is ToolInvocationStatus.POLICY_DENIED
     assert adapter.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_tool_seconds_overage_refuses_only_the_selected_operation() -> None:
+async def test_tool_seconds_overage_is_recorded_without_refusing_the_operation() -> None:
     class ToolSecondsAdapter:
-        def __init__(self) -> None:
+        def __init__(self, consumed_seconds: int) -> None:
             self.calls = 0
+            self.consumed_seconds = consumed_seconds
 
         async def execute(self, arguments, context) -> ToolResult:
             del arguments, context
             self.calls += 1
             return ToolResult(
                 ToolInvocationStatus.SUCCEEDED,
-                budget_consumed={BudgetDimension.TOOL_SECONDS: 1},
+                budget_consumed={BudgetDimension.TOOL_SECONDS: self.consumed_seconds},
             )
 
     registry = InMemoryToolRegistry()
-    over_budget_adapter = ToolSecondsAdapter()
-    available_adapter = ToolSecondsAdapter()
-    registry.register(_tool_seconds_definition("local.large", 2), over_budget_adapter)
+    over_budget_adapter = ToolSecondsAdapter(3)
+    available_adapter = ToolSecondsAdapter(2)
+    registry.register(_tool_seconds_definition("local.large", 1), over_budget_adapter)
     registry.register(_tool_seconds_definition("local.small", 1), available_adapter)
     dispatcher = RegistryToolDispatcher(registry)
     context = _context(tool_seconds_limit=1)
     arguments = {"sha256": "f" * 64}
 
-    refused = await dispatcher.dispatch(
+    larger = await dispatcher.dispatch(
         context,
         tool_name="local.large",
         schema_version="1",
@@ -331,10 +336,14 @@ async def test_tool_seconds_overage_refuses_only_the_selected_operation() -> Non
         operation_key="local-small-op",
     )
 
-    assert refused.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert over_budget_adapter.calls == 0
+    assert larger.status is ToolInvocationStatus.SUCCEEDED
+    assert larger.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3
+    assert over_budget_adapter.calls == 1
     assert allowed.status is ToolInvocationStatus.SUCCEEDED
+    assert allowed.budget_consumed[BudgetDimension.TOOL_SECONDS] == 2
     assert available_adapter.calls == 1
+    assert context.budget.consumed[BudgetDimension.TOOL_SECONDS] == 5
+    assert context.budget.reserved[BudgetDimension.TOOL_SECONDS] == 0
 
 
 @pytest.mark.asyncio

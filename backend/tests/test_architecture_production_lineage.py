@@ -98,6 +98,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0003_osint_open_policy.py",
         "0004_external_effect_claims.py",
         "0005_sample_acquisition_dispatch.py",
+        "0006_tool_seconds_accounting.py",
     ]
 
 

@@ -12,6 +12,7 @@ EXPECTED_CHAIN = (
     "0003_osint_open_policy",
     "0004_external_effect_claims",
     "0005_sample_acquisition_dispatch",
+    "0006_tool_seconds_accounting",
 )
 
 
@@ -21,7 +22,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [script.revision for script in revisions]
 
-    assert scripts.get_heads() == ["0005_sample_acquisition_dispatch"]
+    assert scripts.get_heads() == ["0006_tool_seconds_accounting"]
     assert all(revision_id for revision_id in revision_ids)
     assert all(len(revision_id) <= 32 for revision_id in revision_ids)
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
@@ -32,4 +33,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0003_osint_open_policy": "0002_c2_experiments",
         "0004_external_effect_claims": "0003_osint_open_policy",
         "0005_sample_acquisition_dispatch": "0004_external_effect_claims",
+        "0006_tool_seconds_accounting": "0005_sample_acquisition_dispatch",
     }

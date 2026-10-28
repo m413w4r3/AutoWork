@@ -203,6 +203,7 @@ def make_tool(
     raw=None,
     allowed=True,
     role_timeout_seconds=7_200,
+    max_tool_seconds=3_600,
 ):
     class _Hypothesis:
         def to_payload(self):
@@ -251,6 +252,7 @@ def make_tool(
             openai_bridge_min_submission_interval_seconds=0,
             openai_bridge_submission_jitter_fraction=0,
             openai_bridge_wait_timeout_research_seconds=role_timeout_seconds,
+            investigation_max_tool_seconds=max_tool_seconds,
             operator_advisor_checkpoint_tool_threshold=12,
         ),
         investigations=SimpleNamespace(get=lambda _id: None),

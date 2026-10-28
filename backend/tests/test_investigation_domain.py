@@ -175,6 +175,28 @@ def test_investigation_budget_reserve_commit_release_are_idempotent_and_bounded(
     assert budget.reserved[BudgetDimension.VT_UNITS] == 0
 
 
+def test_tool_seconds_actual_usage_can_exceed_its_accounting_reservation() -> None:
+    budget = InvestigationBudget(
+        limits={BudgetDimension.TOOL_SECONDS: 1, BudgetDimension.VT_UNITS: 1}
+    )
+    budget.reserve(
+        "advisor-call",
+        {BudgetDimension.TOOL_SECONDS: 10, BudgetDimension.VT_UNITS: 1},
+    )
+
+    committed = budget.commit(
+        "advisor-call",
+        {BudgetDimension.TOOL_SECONDS: 75, BudgetDimension.VT_UNITS: 1},
+    )
+
+    assert committed.committed_amounts[BudgetDimension.TOOL_SECONDS] == 75
+    assert budget.consumed[BudgetDimension.TOOL_SECONDS] == 75
+    assert budget.remaining[BudgetDimension.TOOL_SECONDS] == 0
+    with pytest.raises(BudgetExceeded) as raised:
+        budget.reserve("vt-read", {BudgetDimension.VT_UNITS: 1})
+    assert raised.value.dimension is BudgetDimension.VT_UNITS
+
+
 def test_revoked_budget_can_restore_and_commit_an_in_flight_reservation() -> None:
     approved = InvestigationBudget(
         limits={BudgetDimension.VT_UNITS: 2, BudgetDimension.TOOL_SECONDS: 120}

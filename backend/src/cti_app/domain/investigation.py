@@ -230,7 +230,8 @@ class BudgetReservation:
         object.__setattr__(self, "amounts", _budget_values(self.amounts))
         object.__setattr__(self, "committed_amounts", _budget_values(self.committed_amounts))
         if any(
-            amount > self.amounts.get(dimension, 0)
+            dimension is not BudgetDimension.TOOL_SECONDS
+            and amount > self.amounts.get(dimension, 0)
             for dimension, amount in self.committed_amounts.items()
         ):
             raise ValueError("Committed budget cannot exceed its reservation")
@@ -291,8 +292,8 @@ class InvestigationBudget:
                 raise ValueError("An operation key cannot be reused with a different reservation")
             return existing
         for dimension, amount in requested.items():
-            # Context bytes are recorded for accounting, not used as a disclosure cap.
-            if dimension is BudgetDimension.CONTEXT_BYTES:
+            # Context bytes and tool time are recorded for accounting, not used as caps.
+            if dimension in (BudgetDimension.CONTEXT_BYTES, BudgetDimension.TOOL_SECONDS):
                 continue
             limit = self.limits.get(dimension)
             if limit is not None and (
@@ -339,7 +340,11 @@ class InvestigationBudget:
         if existing.status is BudgetReservationStatus.RELEASED:
             raise ValueError("A released reservation cannot be committed")
         actual = _budget_values(consumed if consumed is not None else existing.amounts)
-        if any(amount > existing.amounts.get(dimension, 0) for dimension, amount in actual.items()):
+        if any(
+            dimension is not BudgetDimension.TOOL_SECONDS
+            and amount > existing.amounts.get(dimension, 0)
+            for dimension, amount in actual.items()
+        ):
             raise ValueError("Consumed budget cannot exceed the reservation")
         committed = replace(
             existing,

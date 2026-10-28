@@ -5037,10 +5037,10 @@ def _advisor_execution_timeout(
     context: ToolExecutionContext,
     settings: Any,
 ) -> tuple[int, ToolResult | None]:
-    """Return the hard call cap from this operation's live G2 reservation.
+    """Return the per-call hang guard, independent of accounting reservations.
 
     Duration-based cost estimation from ModelRun.duration_ms is DEFERred; this
-    enforces only the hard execution bound and never predicts provider cost.
+    enforces only the configured execution bound and never predicts provider cost.
     """
     reservation = next(
         (
@@ -5051,16 +5051,13 @@ def _advisor_execution_timeout(
         None,
     )
     if reservation is None or reservation.status is not BudgetReservationStatus.RESERVED:
-        reason = "tool_seconds_reservation_missing_or_inactive"
+        reason = "advisor_operation_reservation_missing_or_inactive"
         return 0, _advisor_budget_refusal(reason)
     if reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0) < 1:
         return 0, _advisor_budget_refusal("bridge_turn_reservation_missing_or_insufficient")
     minimum_execution_seconds = _advisor_minimum_execution_seconds(settings)
     if minimum_execution_seconds is None:
         return 0, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
-    reserved_seconds = reservation.amounts.get(BudgetDimension.TOOL_SECONDS, 0)
-    if reserved_seconds < minimum_execution_seconds:
-        return 0, _advisor_budget_refusal("tool_seconds_reservation_below_minimum")
 
     role_timeout = getattr(settings, "openai_bridge_wait_timeout_research_seconds", 7_200.0)
     if (
@@ -5070,7 +5067,7 @@ def _advisor_execution_timeout(
         or role_timeout <= 0
     ):
         return 0, _advisor_budget_refusal("research_role_timeout_invalid")
-    effective_timeout = math.floor(min(reserved_seconds, role_timeout))
+    effective_timeout = math.floor(min(_advisor_tool_seconds_limit(settings), role_timeout))
     if effective_timeout < minimum_execution_seconds:
         return 0, _advisor_budget_refusal("effective_execution_timeout_below_minimum")
     return effective_timeout, None
