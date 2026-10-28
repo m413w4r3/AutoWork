@@ -3894,11 +3894,20 @@ class InvestigationAdvisorTool:
         safe_output = dict(output)
         stage = str(safe_output.get("failure_stage", "pre_transport_validation"))[:64]
         reason = str(safe_output.get("failure_reason", error_code))[:128]
+        message = ""
+        if stage == "evidence_preflight":
+            message = (
+                "Required canonical evidence could not be verified for the advisor dossier. "
+                "If a missing reference is raw sample bytes, cite the VT report or an analysis "
+                "observation instead of raw sample bytes."
+            )
+            safe_output.setdefault("refusal_guidance", message)
         result = ToolResult(
             ToolInvocationStatus.UNAVAILABLE,
             observation_refs=evidence_refs,
             budget_consumed={BudgetDimension.BRIDGE_TURNS: 0},
             error_code=error_code,
+            message=message,
             exception_class=exception_class,
             output=safe_output,
         )
@@ -3924,6 +3933,7 @@ class InvestigationAdvisorTool:
                     "bridge_turns_consumed": 0,
                     "failure_stage": stage,
                     "failure_reason": reason,
+                    **({"message": message} if message else {}),
                     "input_observation_refs": [str(item) for item in evidence_refs],
                     "output": safe_output,
                 },
@@ -4976,6 +4986,7 @@ def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
             "coordinator_consume_refused",
             "secret_preflight",
             "sample_disclosure_restricted",
+            "evidence_preflight",
         }
     ):
         return result
