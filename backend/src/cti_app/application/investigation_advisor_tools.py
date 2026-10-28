@@ -76,6 +76,7 @@ from cti_app.application.publication_secret_guard import (
     PublicationSecretFinding,
     configured_operational_secret_values,
     contains_operational_secrets,
+    redact_explicit_operational_secrets,
     redact_operational_secrets_with_findings,
     safe_json_path,
 )
@@ -5930,11 +5931,36 @@ def _parse_advisor_output(
             validation_rejection.update(code="advisor_parser_version_unsupported", path="$")
         return None
     if consultation_type in _TYPED_CONSULTATION_TYPES:
-        parsed_typed = parse_typed_advisor_response(
+        legacy_json = extract_json_object(raw)
+        _, legacy_secret_count = redact_explicit_operational_secrets(
             raw,
-            consultation_type=consultation_type,
-            prompt_data=prompt_data or {},
-            safe_text=_safe_text,
+            operational_secret_values=operational_secret_values,
+        )
+        preserve_legacy_review = (
+            consultation_type == "review_text"
+            and not legacy_secret_count
+            and isinstance(legacy_json, Mapping)
+            and legacy_json.get("schema") == ADVISOR_RESPONSE_SCHEMA_V2
+            and any(
+                key in legacy_json
+                for key in (
+                    "summary",
+                    "alternative_hypotheses",
+                    "discriminating_experiment",
+                    "recommended_next_tools",
+                )
+            )
+        )
+        parsed_typed = (
+            None
+            if preserve_legacy_review
+            else parse_typed_advisor_response(
+                raw,
+                consultation_type=consultation_type,
+                prompt_data=prompt_data or {},
+                safe_text=_safe_text,
+                operational_secret_values=operational_secret_values,
+            )
         )
         if parsed_typed is not None:
             return parsed_typed

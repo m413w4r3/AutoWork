@@ -145,11 +145,12 @@ def _advisor_wire_output_contract(consultation_type: str) -> list[str]:
     ]
     if consultation_type == "review_text":
         return [
-            *common,
+            "SORTIE: texte simple; aucun JSON ni format spécial n\u2019est nécessaire.",
             (
-                "Pour chaque unité, écrire UNIT: U1, une ou plusieurs REMARK: concises et "
-                "vérifiables, puis REFS: E1,E2 pour les sources utiles."
+                "Pour chaque unité, écrire un paragraphe court qui commence par son alias "
+                "(U1, U2, etc.)."
             ),
+            "Terminer par une ligne OVERALL: avec la conclusion générale de la relecture.",
             "Ne pas réécrire ni approuver le texte canonique.",
             (
                 "Ajouter LIMITATION: seulement si une incertitude matérielle change "
@@ -158,15 +159,12 @@ def _advisor_wire_output_contract(consultation_type: str) -> list[str]:
         ]
     if consultation_type == "draft_text":
         return [
-            *common,
+            "SORTIE: texte simple; aucun JSON ni format spécial n\u2019est nécessaire.",
             (
-                "Pour chaque unité, écrire UNIT: U1 puis une ou plusieurs phrases françaises "
-                "complètes sous S:."
+                "Pour chaque unité, écrire un paragraphe court qui commence par son alias "
+                "(U1, U2, etc.)."
             ),
-            (
-                "Terminer chaque phrase par ses alias de revendication entre crochets, par exemple "
-                "[A1,A2]; utiliser uniquement ceux du texte cible."
-            ),
+            "Terminer par une ligne OVERALL: avec la conclusion générale du brouillon.",
             (
                 "Ajouter LIMITATION: seulement si une incertitude matérielle change "
                 "l\u2019analyse; omettre sinon."

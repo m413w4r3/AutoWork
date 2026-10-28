@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, cast
 
 from cti_app.application.advisor_wire import (
     advisor_wire_aliases,
     parse_advisor_wire,
 )
+from cti_app.application.publication_secret_guard import redact_explicit_operational_secrets
 from cti_app.domain.advisor_figure_plan import AdvisorFigurePlanV1
 
 ADVISOR_RESPONSE_SCHEMA_V3 = "advisor-response.v3"
@@ -26,10 +28,23 @@ _INFORMATIVE_ADVISOR_WARNINGS = {
     "invariants_missing",
     "limitations_missing",
     "source_alias_in_prose",
+    "heuristic_unit_assignment",
+    "secret_redacted",
+    "response_bounded",
     "type_missing",
+    "unstructured_overall",
+    "unstructured_draft",
     "wire_header_missing",
     "wire_prose_ignored",
 }
+_REVIEW_STATUS_NEUTRAL_WARNINGS = frozenset(
+    {
+        "reference_alias_invalid",
+        "reference_alias_unknown",
+        "reference_list_partial",
+        "source_alias_in_prose",
+    }
+)
 _GLOBAL_BLOCKING_WARNING_MARKERS = ("byte", "secret", "truncat", "output_size", "oversized")
 _BLOCK_TYPES = {
     "key_findings",
@@ -50,25 +65,103 @@ def parse_typed_advisor_response(
     prompt_data: Mapping[str, Any],
     safe_text: Callable[[str, int], str],
     measurement_sha256_overrides: Mapping[str, str] | None = None,
+    operational_secret_values: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     """Parse a legacy v3 object or the current tolerant text wire without clipping."""
-    parsed = extract_json_object(raw)
+    raw_text = raw if isinstance(raw, str) else ""
+    parsed = extract_json_object(raw_text)
+    if parsed is None and consultation_type == "review_text":
+        parsed = _extract_jsonish_object(raw_text)
+    redacted_raw, raw_secret_count = redact_explicit_operational_secrets(
+        raw_text, operational_secret_values=operational_secret_values
+    )
+    raw_safe = str(redacted_raw)
     if parsed is None:
         wire_result = _parse_typed_advisor_wire(
-            raw,
+            raw_safe,
             consultation_type=consultation_type,
             prompt_data=prompt_data,
             safe_text=safe_text,
             measurement_sha256_overrides=measurement_sha256_overrides,
         )
+        if consultation_type == "review_text":
+            if wire_result is not None and wire_result.get("usable") is True:
+                return _classify_advisor_warnings(
+                    _finish_review_normalization(
+                        wire_result,
+                        raw_text=raw_text,
+                        raw_safe=raw_safe,
+                        raw_secret_count=raw_secret_count,
+                        warnings=(),
+                    )
+                )
+            heuristic = _normalize_heuristic_review(
+                raw_safe,
+                json_payload=None,
+                prompt_data=prompt_data,
+                safe_text=safe_text,
+            )
+            heuristic = heuristic or _unusable_review_result(raw_safe)
+            return _classify_advisor_warnings(
+                _finish_review_normalization(
+                    heuristic,
+                    raw_text=raw_text,
+                    raw_safe=raw_safe,
+                    raw_secret_count=raw_secret_count,
+                    warnings=(),
+                )
+            )
+        if consultation_type == "draft_text":
+            if wire_result is not None and not any(
+                warning in wire_result.get("warnings", ())
+                for warning in ("wire_header_missing", "type_missing", "status_missing")
+            ):
+                return _classify_advisor_warnings(wire_result)
+            heuristic = _normalize_heuristic_draft(
+                raw_safe,
+                json_payload=None,
+                prompt_data=prompt_data,
+                safe_text=safe_text,
+            )
+            heuristic = heuristic or _unusable_draft_result()
+            if raw_secret_count:
+                _append_warning(heuristic, "secret_redacted")
+            return _classify_advisor_warnings(heuristic)
         return _classify_advisor_warnings(wire_result)
-    parsed, alias_warnings = _resolve_typed_json_aliases(parsed, prompt_data)
+    parsed, secret_count = redact_explicit_operational_secrets(
+        parsed, operational_secret_values=operational_secret_values
+    )
+    raw_secret_count = max(raw_secret_count, secret_count)
+    if not isinstance(parsed, dict):
+        return None
     if (
         parsed.get("schema") != ADVISOR_RESPONSE_SCHEMA_V3
         or parsed.get("consultation_type") != consultation_type
         or parsed.get("untrusted") is not True
     ):
-        return None
+        if consultation_type != "review_text":
+            return None
+        if parsed.get("consultation_type") not in {None, consultation_type}:
+            return None
+        if parsed.get("status") in {"refused", "invalid", "ambiguous"}:
+            return None
+        heuristic = _normalize_heuristic_review(
+            raw_safe,
+            json_payload=parsed,
+            prompt_data=prompt_data,
+            safe_text=safe_text,
+        )
+        heuristic = heuristic or _unusable_review_result(raw_safe)
+        return _classify_advisor_warnings(
+            _finish_review_normalization(
+                heuristic,
+                raw_text=raw_text,
+                raw_safe=raw_safe,
+                raw_secret_count=raw_secret_count,
+                warnings=(),
+            )
+        )
+    parsed, alias_warnings = _resolve_typed_json_aliases(parsed, prompt_data)
     result: dict[str, Any] | None = None
     try:
         if consultation_type == "draft_text":
@@ -98,9 +191,560 @@ def parse_typed_advisor_response(
             alias_warnings,
             limitations=[],
         )
+    if result is None and consultation_type == "review_text":
+        heuristic = _normalize_heuristic_review(
+            raw_safe,
+            json_payload=parsed,
+            prompt_data=prompt_data,
+            safe_text=safe_text,
+        )
+        result = heuristic or _unusable_review_result(raw_safe)
     if result is not None and alias_warnings:
         result = _mark_typed_partial(result, alias_warnings)
+    if consultation_type == "review_text" and result is not None:
+        result = _finish_review_normalization(
+            result,
+            raw_text=raw_text,
+            raw_safe=raw_safe,
+            raw_secret_count=raw_secret_count,
+            warnings=(),
+        )
     return _classify_advisor_warnings(result)
+
+
+_MAX_ADVISOR_RAW_OUTPUT_CHARS = 64 * 1024
+_MAX_HEURISTIC_REVIEW_TEXT_CHARS = 4000
+_REVIEW_TEXT_KEYS = frozenset(
+    {
+        "analysis",
+        "comment",
+        "comments",
+        "concerns",
+        "feedback",
+        "issues",
+        "issue",
+        "recommendations",
+        "recommendation",
+        "remarks",
+        "review",
+        "summary",
+        "suggestion",
+        "text",
+        "verdict",
+        "why",
+    }
+)
+_REVIEW_PLACEHOLDERS = frozenset(
+    {"", "...", "{}", "[]", "json", "null", "none", "n/a", "no response"}
+)
+_REVIEW_ALIAS_HEADING = re.compile(r"(?i)^(?:unit\s*)?([ut]?\s*\d+)$")
+
+
+def _extract_jsonish_object(raw: str) -> dict[str, Any] | None:
+    """Recover one JSON or Python-literal object from a Bridge-like answer."""
+    candidate = _json_object_candidate(raw)
+    if candidate is None:
+        return None
+    try:
+        value = json.loads(
+            candidate,
+            object_pairs_hook=_unique_object_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        try:
+            tree = ast.parse(candidate, mode="eval")
+            if _ast_has_duplicate_string_keys(tree):
+                return None
+            value = ast.literal_eval(tree)
+        except (SyntaxError, TypeError, ValueError, MemoryError, RecursionError):
+            return None
+    return dict(value) if isinstance(value, Mapping) else None
+
+
+def _json_object_candidate(raw: str) -> str | None:
+    text = raw.strip()
+    if not text:
+        return None
+    fences = list(re.finditer(r"```(?:json)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL))
+    if fences:
+        if len(fences) != 1 or text.count("```") != 2:
+            return None
+        candidate = fences[0].group(1).strip()
+        return candidate if candidate.startswith("{") and candidate.endswith("}") else None
+    starts: list[int] = []
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    end_positions: list[int] = []
+    for index, char in enumerate(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "{":
+            if depth == 0:
+                starts.append(index)
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                end_positions.append(index + 1)
+    if len(starts) != 1 or len(end_positions) != 1:
+        return None
+    return text[starts[0] : end_positions[0]]
+
+
+def _ast_has_duplicate_string_keys(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = [
+            key.value
+            for key in node.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        ]
+        if len(keys) != len(set(keys)):
+            return True
+    return False
+
+
+def _normalize_heuristic_review(
+    raw: str,
+    *,
+    json_payload: Mapping[str, Any] | None,
+    prompt_data: Mapping[str, Any],
+    safe_text: Callable[[str, int], str],
+) -> dict[str, Any] | None:
+    units = _requested_review_units(prompt_data)
+    if not units:
+        return _unusable_review_result(raw)
+
+    grouped: dict[str, list[str]] = {}
+    assignments: dict[str, str] = {}
+    overall_text: str | None = None
+    if json_payload is not None:
+        grouped, assignments, overall_text = _reviews_from_json(json_payload, units)
+        if not grouped and overall_text is None:
+            return _unusable_review_result(raw)
+        assignment_status = "unstructured_overall" if overall_text and not grouped else "heuristic"
+        if overall_text and not grouped:
+            grouped = {unit_id: [overall_text] for unit_id, _unit in units}
+            assignments = {unit_id: "unstructured_overall" for unit_id, _unit in units}
+            warning_codes = ["unstructured_overall"]
+        else:
+            warning_codes = ["heuristic_unit_assignment"]
+    else:
+        grouped, assignments, overall_text = _reviews_from_prose(raw, units)
+        if not grouped and overall_text is not None:
+            grouped = {unit_id: [overall_text] for unit_id, _unit in units}
+            assignments = {unit_id: "unstructured_overall" for unit_id, _unit in units}
+        if not grouped:
+            return _unusable_review_result(raw)
+        assignment_status = (
+            "unstructured_overall"
+            if all(value == "unstructured_overall" for value in assignments.values())
+            else "heuristic"
+        )
+        warning_codes = (
+            ["unstructured_overall"]
+            if assignment_status == "unstructured_overall"
+            else ["heuristic_unit_assignment"]
+        )
+
+    review_items = []
+    for unit_id, remarks in grouped.items():
+        bounded = [_bound_review_remark(item) for item in remarks if _review_text_is_useful(item)]
+        if not bounded:
+            continue
+        review_items.append(
+            {
+                "unit_id": unit_id,
+                "remarks": bounded,
+                "basis_refs": [],
+                "assignment": assignments.get(unit_id, "heuristic"),
+            }
+        )
+    if not review_items:
+        return _unusable_review_result(raw)
+    normalized = _parse_review_text(
+        {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+            "consultation_type": "review_text",
+            "status": "partial",
+            "language": "fr",
+            "reviews": review_items,
+            "limitations": [],
+            "warnings": warning_codes,
+            "normalization_status": "partial",
+            "untrusted": True,
+        },
+        prompt_data=prompt_data,
+        safe_text=safe_text,
+    )
+    if normalized is None:
+        return _unusable_review_result(raw)
+    normalized["unit_assignment_status"] = assignment_status
+    if overall_text is not None:
+        normalized["overall_review"] = _bound_review_remark(overall_text)
+    return normalized
+
+
+def _normalize_heuristic_draft(
+    raw: str,
+    *,
+    json_payload: Mapping[str, Any] | None,
+    prompt_data: Mapping[str, Any],
+    safe_text: Callable[[str, int], str],
+) -> dict[str, Any] | None:
+    units = _requested_review_units(prompt_data)
+    grouped: dict[str, list[str]] = {}
+    assignments: dict[str, str] = {}
+    overall_text: str | None = None
+    if json_payload is not None:
+        grouped, assignments, overall_text = _reviews_from_json(json_payload, units)
+    else:
+        grouped, assignments, overall_text = _reviews_from_prose(raw, units)
+    blocks: list[dict[str, Any]] = []
+    units_by_id = {unit_id: unit for unit_id, unit in units}
+    for unit_id, text_values in grouped.items():
+        unit = units_by_id.get(unit_id)
+        if unit is None:
+            continue
+        sentences: list[dict[str, Any]] = []
+        for value in text_values:
+            if not _review_text_is_useful(value):
+                continue
+            cleaned = safe_text(value, _MAX_HEURISTIC_REVIEW_TEXT_CHARS + 1)
+            if _review_text_is_useful(cleaned):
+                sentences.append({"text": _bound_review_remark(cleaned), "assertion_ids": []})
+        if not sentences:
+            continue
+        blocks.append(
+            {
+                "unit_id": unit_id,
+                "block_type": unit.get("block_type"),
+                "form": unit.get("form", "body"),
+                "anchor": unit.get("anchor"),
+                "sentences": sentences,
+                "warnings": ["unstructured_draft"],
+                "usable": True,
+                "assignment": assignments.get(unit_id, "heuristic"),
+            }
+        )
+    if blocks:
+        warning_codes = ["heuristic_unit_assignment", "unstructured_draft"]
+        return {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+            "consultation_type": "draft_text",
+            "status": "partial",
+            "untrusted": True,
+            "blocks": blocks,
+            "summary": " ".join(
+                sentence["text"] for block in blocks for sentence in block["sentences"]
+            ),
+            "warnings": warning_codes,
+            "normalization_status": "partial",
+            "unit_assignment_status": "heuristic",
+            "usable": True,
+        }
+    if overall_text is None or not _review_text_is_useful(overall_text):
+        return None
+    overall_text = safe_text(overall_text, _MAX_HEURISTIC_REVIEW_TEXT_CHARS + 1)
+    if not _review_text_is_useful(overall_text):
+        return None
+    return {
+        "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+        "consultation_type": "draft_text",
+        "status": "partial",
+        "untrusted": True,
+        "summary": _bound_review_remark(overall_text),
+        "warnings": ["unstructured_overall"],
+        "normalization_status": "partial",
+        "unit_assignment_status": "unstructured_overall",
+        "usable": True,
+    }
+
+
+def _requested_review_units(prompt_data: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
+    raw_units = prompt_data.get("units")
+    if isinstance(raw_units, list):
+        return [
+            (str(item.get("unit_id", item.get("id"))), item)
+            for item in raw_units
+            if isinstance(item, Mapping) and item.get("unit_id", item.get("id")) is not None
+        ]
+    legacy = prompt_data.get("review_text")
+    return [("U1", legacy)] if isinstance(legacy, Mapping) else []
+
+
+def _reviews_from_json(
+    payload: Mapping[str, Any], units: list[tuple[str, Mapping[str, Any]]]
+) -> tuple[dict[str, list[str]], dict[str, str], str | None]:
+    unit_rows: list[tuple[object, object]] = []
+    overall_values: list[str] = []
+    unit_container: object = payload.get("units", payload.get("reviews"))
+    if isinstance(unit_container, list):
+        unit_rows.extend((None, item) for item in unit_container)
+    elif isinstance(unit_container, Mapping):
+        unit_rows.extend(unit_container.items())
+    elif unit_container is not None:
+        unit_rows.append((None, unit_container))
+
+    grouped: dict[str, list[str]] = {}
+    assignments: dict[str, str] = {}
+    for overall_key in ("verdict", "issues", "recommendations", "summary"):
+        if overall_key not in payload:
+            continue
+        value = payload[overall_key]
+        if isinstance(value, Mapping):
+            entry_label = _review_entry_label(value)
+            normalized_keys = {str(key).casefold().replace("-", "_") for key in value}
+            if entry_label is not None:
+                unit_rows.append((None, value))
+            elif normalized_keys & _REVIEW_TEXT_KEYS:
+                overall_values.extend(_review_text_values(value))
+            else:
+                unit_rows.extend(value.items())
+        elif isinstance(value, list):
+            unit_rows.extend((None, item) for item in value)
+        else:
+            overall_values.extend(_review_text_values(value))
+
+    for order_index, (key, value) in enumerate(unit_rows):
+        label: object = key
+        entry: object = value
+        if isinstance(value, Mapping):
+            label = _review_entry_label(value) or key
+        unit_id, assignment = _resolve_review_unit(label, units, order_index)
+        content = _review_text_values(entry)
+        if content and unit_id is not None:
+            grouped.setdefault(unit_id, []).extend(content)
+            assignments.setdefault(unit_id, assignment)
+        elif content:
+            overall_values.extend(content)
+    overall = "\n".join(item for item in overall_values if _review_text_is_useful(item)).strip()
+    return grouped, assignments, overall or None
+
+
+def _review_entry_label(value: Mapping[str, Any]) -> object | None:
+    for key in (
+        "unit_id",
+        "unit",
+        "alias",
+        "target",
+        "id",
+        "index",
+        "unit_index",
+        "block_type",
+        "anchor",
+    ):
+        if key in value:
+            return cast(object, value[key])
+    return None
+
+
+def _review_text_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if _review_text_is_useful(text) else []
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _review_text_values(item)]
+    if isinstance(value, Mapping):
+        texts: list[str] = []
+        for key, child in value.items():
+            normalized = str(key).casefold().replace("-", "_")
+            if normalized in _REVIEW_TEXT_KEYS:
+                texts.extend(_review_text_values(child))
+            elif isinstance(child, Mapping):
+                texts.extend(_review_text_values(child))
+        return texts
+    return []
+
+
+def _resolve_review_unit(
+    label: object, units: list[tuple[str, Mapping[str, Any]]], order_index: int
+) -> tuple[str | None, str]:
+    if isinstance(label, int) and not isinstance(label, bool):
+        index = label - 1 if label > 0 else label
+        return (units[index][0], "index") if 0 <= index < len(units) else (None, "index")
+    if isinstance(label, str):
+        candidate = label.strip().strip("*_`[](){}<>: ")
+        for unit_id, _unit in units:
+            if candidate.casefold() == unit_id.casefold():
+                return unit_id, "alias"
+        alias_match = _REVIEW_ALIAS_HEADING.fullmatch(candidate)
+        if alias_match:
+            digits = re.search(r"\d+", alias_match.group(1))
+            index = int(digits.group()) - 1 if digits else -1
+            if 0 <= index < len(units):
+                return units[index][0], "alias"
+        for unit_id, unit in units:
+            if candidate.casefold() in {
+                str(unit.get("block_type", "")).casefold(),
+                str(unit.get("anchor", "")).casefold(),
+            }:
+                return unit_id, "block_type_or_anchor"
+    if 0 <= order_index < len(units):
+        return units[order_index][0], "order"
+    return None, "order"
+
+
+def _reviews_from_prose(
+    raw: str, units: list[tuple[str, Mapping[str, Any]]]
+) -> tuple[dict[str, list[str]], dict[str, str], str | None]:
+    grouped: dict[str, list[str]] = {}
+    assignments: dict[str, str] = {}
+    overall_lines: list[str] = []
+    active_id: str | None = None
+    active_assignment = "alias"
+    active_lines: list[str] = []
+    saw_heading = False
+
+    def flush() -> None:
+        nonlocal active_lines
+        text = "\n".join(active_lines).strip()
+        if active_id is not None and _review_text_is_useful(text):
+            grouped.setdefault(active_id, []).append(text)
+            assignments.setdefault(active_id, active_assignment)
+        active_lines = []
+
+    for line in raw.splitlines():
+        heading, body = _review_heading(line, units)
+        if heading == "overall":
+            flush()
+            active_id = None
+            overall_lines.append(body)
+            continue
+        if isinstance(heading, tuple):
+            flush()
+            active_id, active_assignment = heading
+            saw_heading = True
+            if body:
+                active_lines.append(body)
+            continue
+        if active_id is None:
+            overall_lines.append(line)
+        else:
+            active_lines.append(line)
+    flush()
+    overall = "\n".join(overall_lines).strip()
+    if saw_heading and grouped:
+        return grouped, assignments, overall if _review_text_is_useful(overall) else None
+    whole = raw.strip()
+    return {}, {}, whole if _review_text_is_useful(whole) else None
+
+
+def _review_heading(
+    line: str, units: list[tuple[str, Mapping[str, Any]]]
+) -> tuple[tuple[str, str] | str | None, str]:
+    cleaned = re.sub(r"^\s*(?:[-*+]\s+)?(?:#{1,6}\s*)?", "", line).strip()
+    cleaned = cleaned.strip("*_` ")
+    if re.match(r"(?i)^overall\s*:", cleaned):
+        return "overall", re.sub(r"(?i)^overall\s*:\s*", "", cleaned).strip()
+    separator = re.search(r"\s*(?::|[\u2014\u2013])\s*", cleaned)
+    if separator is None:
+        separator = re.search(r"\s+-\s+", cleaned)
+    if separator is None:
+        resolved = _resolve_review_unit(cleaned, units, -1)
+        if resolved[0] is not None:
+            return (resolved[0], resolved[1]), ""
+        return None, ""
+    label = cleaned[: separator.start()].strip("*_` ")
+    body = cleaned[separator.end() :].strip().strip("*_` ")
+    resolved = _resolve_review_unit(label, units, -1)
+    if resolved[0] is None:
+        return None, ""
+    return (resolved[0], resolved[1]), body
+
+
+def _review_text_is_useful(value: str) -> bool:
+    normalized = value.strip().strip("`*_# ").casefold()
+    if normalized in _REVIEW_PLACEHOLDERS:
+        return False
+    return re.search(r"[\wÀ-ÖØ-öø-ÿ]{2,}", normalized) is not None
+
+
+def _bound_review_remark(value: str) -> str:
+    text = value.strip()
+    if len(text) <= _MAX_HEURISTIC_REVIEW_TEXT_CHARS:
+        return text
+    return text[: _MAX_HEURISTIC_REVIEW_TEXT_CHARS - 1].rstrip() + "…"
+
+
+def _unusable_review_result(_raw: str) -> dict[str, Any]:
+    return {
+        "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+        "consultation_type": "review_text",
+        "status": "partial",
+        "untrusted": True,
+        "language": "fr",
+        "reviews": [],
+        "limitations": [],
+        "warnings": ["review_response_unusable"],
+        "normalization_status": "partial",
+        "unit_assignment_status": "unusable",
+        "usable": False,
+    }
+
+
+def _unusable_draft_result() -> dict[str, Any]:
+    return {
+        "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+        "consultation_type": "draft_text",
+        "status": "partial",
+        "untrusted": True,
+        "blocks": [],
+        "warnings": ["draft_response_unusable"],
+        "normalization_status": "partial",
+        "usable": False,
+    }
+
+
+def _append_warning(result: dict[str, Any], warning: str) -> None:
+    warnings = result.setdefault("warnings", [])
+    if isinstance(warnings, list) and warning not in warnings:
+        warnings.append(warning)
+    result["status"] = "partial"
+    result["normalization_status"] = "partial"
+
+
+def _finish_review_normalization(
+    result: dict[str, Any],
+    *,
+    raw_text: str,
+    raw_safe: str,
+    raw_secret_count: int,
+    warnings: tuple[str, ...],
+) -> dict[str, Any]:
+    for warning in warnings:
+        _append_warning(result, warning)
+    if raw_secret_count:
+        _append_warning(result, "secret_redacted")
+    raw_output = raw_safe
+    if len(raw_output) > _MAX_ADVISOR_RAW_OUTPUT_CHARS:
+        raw_output = raw_output[:_MAX_ADVISOR_RAW_OUTPUT_CHARS].rstrip() + "…"
+        _append_warning(result, "response_bounded")
+    encoded = raw_text.encode("utf-8")
+    result["raw_output"] = raw_output
+    result["raw_output_bytes"] = len(encoded)
+    result["raw_output_sha256"] = hashlib.sha256(encoded).hexdigest()
+    result["raw_output_retained"] = True
+    result["raw_output_truncated"] = len(raw_safe) > _MAX_ADVISOR_RAW_OUTPUT_CHARS
+    return result
+
+
+def _bounded_advisor_raw_output(raw: str, result: dict[str, Any]) -> str:
+    if len(raw) <= _MAX_ADVISOR_RAW_OUTPUT_CHARS:
+        return raw
+    _append_warning(result, "response_bounded")
+    return raw[:_MAX_ADVISOR_RAW_OUTPUT_CHARS].rstrip() + "…"
 
 
 def _warning_is_blocking(code: object) -> bool:
@@ -121,11 +765,18 @@ def _warning_classification(warnings: object) -> dict[str, list[str]]:
     }
 
 
+def _review_warnings_require_partial(warnings: object) -> bool:
+    return isinstance(warnings, (list, tuple)) and any(
+        isinstance(item, str) and item not in _REVIEW_STATUS_NEUTRAL_WARNINGS for item in warnings
+    )
+
+
 def _has_global_blocking_warning(warnings: object) -> bool:
     if not isinstance(warnings, (list, tuple)):
         return False
     return any(
         isinstance(item, str)
+        and item != "secret_redacted"
         and any(marker in item.casefold() for marker in _GLOBAL_BLOCKING_WARNING_MARKERS)
         for item in warnings
     )
@@ -136,7 +787,18 @@ def _classify_advisor_warnings(result: dict[str, Any] | None) -> dict[str, Any] 
         return None
     classified = dict(result)
     warnings = classified.get("warnings", [])
-    classified["warning_classification"] = _warning_classification(warnings)
+    classification = _warning_classification(warnings)
+    if classified.get("consultation_type") == "review_text":
+        reference_warnings = [
+            item for item in classification["blocking"] if item in _REVIEW_STATUS_NEUTRAL_WARNINGS
+        ]
+        classification["blocking"] = [
+            item for item in classification["blocking"] if item not in reference_warnings
+        ]
+        classification["informative"].extend(
+            item for item in reference_warnings if item not in classification["informative"]
+        )
+    classified["warning_classification"] = classification
     for collection in ("blocks", "reviews"):
         items = classified.get(collection)
         if not isinstance(items, list):
@@ -680,11 +1342,13 @@ def _parse_typed_advisor_wire(
             limits = limits + [f"Wire recovery: {item}." for item in warnings]
         return {
             **common,
-            "status": "partial" if warnings else "succeeded",
+            "status": "partial" if _review_warnings_require_partial(warnings) else "succeeded",
             "language": "fr",
             "reviews": reviews,
             "limitations": limits,
-            "normalization_status": "partial" if warnings else "complete",
+            "normalization_status": (
+                "partial" if _review_warnings_require_partial(warnings) else "complete"
+            ),
             "warnings": warnings,
             "usable": any(item["usable"] for item in reviews),
         }
@@ -1211,7 +1875,7 @@ def _parse_review_text(
     for item in raw_reviews:
         if (
             not isinstance(item, Mapping)
-            or set(item) - {"unit_id", "remarks", "basis_refs"}
+            or set(item) - {"unit_id", "remarks", "basis_refs", "assignment"}
             or not {"unit_id", "remarks"}.issubset(item)
         ):
             warn("review_item_invalid")
@@ -1264,17 +1928,19 @@ def _parse_review_text(
                 warn("source_alias_in_prose", unit_id)
             clean_remarks.append(remark)
         if clean_remarks:
-            reviews.append(
-                {
-                    "unit_id": unit_id,
-                    "remarks": clean_remarks,
-                    "basis_refs": basis_refs,
-                    "warnings": unit_warnings.get(unit_id, []),
-                    "usable": not any(
-                        _warning_is_blocking(item) for item in unit_warnings.get(unit_id, [])
-                    ),
-                }
-            )
+            normalized_review = {
+                "unit_id": unit_id,
+                "remarks": clean_remarks,
+                "basis_refs": basis_refs,
+                "warnings": unit_warnings.get(unit_id, []),
+                "usable": not any(
+                    _warning_is_blocking(item) for item in unit_warnings.get(unit_id, [])
+                ),
+            }
+            assignment = item.get("assignment")
+            if isinstance(assignment, str):
+                normalized_review["assignment"] = assignment
+            reviews.append(normalized_review)
         else:
             warn("review_unit_missing", unit_id)
     for unit_id in unit_ids - seen:
@@ -1296,12 +1962,18 @@ def _parse_review_text(
         clean_limitations.append(limitation)
     return {
         **_typed_base(parsed),
-        "status": "partial" if parsed.get("status") == "partial" or warnings else "succeeded",
+        "status": (
+            "partial"
+            if parsed.get("status") == "partial" or _review_warnings_require_partial(warnings)
+            else "succeeded"
+        ),
         "reviews": reviews,
         "limitations": clean_limitations,
         "warnings": warnings,
         "normalization_status": (
-            "partial" if warnings else parsed.get("normalization_status", "complete")
+            "partial"
+            if _review_warnings_require_partial(warnings)
+            else parsed.get("normalization_status", "complete")
         ),
         "usable": any(item["usable"] for item in reviews),
     }

@@ -63,6 +63,10 @@ _OPERATIONAL_ASSIGNMENT = re.compile(
     r"(?:PRE)?SIGNED_URL)\b\s*[:=]\s*)"
     r"(?P<value>\[clé masquée\]|\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
+_JSON_OPERATIONAL_FIELD = re.compile(
+    r"(?P<prefix>['\"](?P<label>[^'\"]+)['\"]\s*:\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^,}\]\s]+)"
+)
 _SERVICE_DSN = re.compile(
     r"(?i)\b(?:postgres(?:ql)?|redis|rediss|mysql|mariadb|mongodb)(?:\+[a-z0-9_]+)?://"
     r"[^\s,;<>\"']+"
@@ -417,6 +421,70 @@ def contains_explicit_operational_secrets(
         return _operational_secret_type(item, field_name, explicit_values) is not None
 
     return contains(value)
+
+
+def redact_explicit_operational_secrets(
+    value: Any, *, operational_secret_values: Sequence[str] = ()
+) -> tuple[Any, int]:
+    """Redact operational secrets using only caller-supplied values and fixed patterns.
+
+    Unlike :func:`redact_operational_secrets`, this helper does not load settings,
+    inspect the environment, or resolve host paths. It is safe for deterministic
+    parser paths that receive their configured credentials explicitly.
+    """
+    explicit_values = tuple(
+        (item, "service_credential", False)
+        for item in operational_secret_values
+        if isinstance(item, str) and item and item != _SECRET_REDACTION
+    )
+    redacted_count = 0
+
+    def walk(item: Any) -> Any:
+        nonlocal redacted_count
+        if isinstance(item, Mapping):
+            cleaned: dict[Any, Any] = {}
+            for key_index, (key, child) in enumerate(item.items()):
+                key_name = str(key)
+                key_secret = _mapping_key_secret_type(key_name, explicit_values)
+                if key_secret is not None:
+                    cleaned_key: Any = f"{_SECRET_REDACTION}#{key_index}"
+                    while cleaned_key in item or cleaned_key in cleaned:
+                        cleaned_key += "#"
+                    cleaned[cleaned_key] = _SECRET_REDACTION
+                    redacted_count += 1
+                elif _is_operational_field_name(key_name) and child not in (
+                    None,
+                    False,
+                    True,
+                    _SECRET_REDACTION,
+                ):
+                    cleaned[key] = _SECRET_REDACTION
+                    redacted_count += 1
+                else:
+                    cleaned[key] = walk(child)
+            return cleaned
+        if isinstance(item, list):
+            return [walk(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(walk(child) for child in item)
+        if isinstance(item, str):
+
+            def replace_json_field(match: re.Match[str]) -> str:
+                nonlocal redacted_count
+                if not _is_operational_field_name(match.group("label")):
+                    return match.group()
+                redacted_count += 1
+                return f'{match.group("prefix")}"{_SECRET_REDACTION}"'
+
+            json_redacted = _JSON_OPERATIONAL_FIELD.sub(replace_json_field, item)
+            cleaned_text, secret_types = _redact_operational_text_with_types(
+                json_redacted, explicit_values
+            )
+            redacted_count += len(secret_types)
+            return cleaned_text
+        return item
+
+    return walk(value), redacted_count
 
 
 def _operational_values(
@@ -957,6 +1025,7 @@ __all__ = [
     "contains_explicit_operational_secrets",
     "contains_operational_secrets",
     "guard_publication_render_data",
+    "redact_explicit_operational_secrets",
     "redact_operational_secrets",
     "redact_operational_secrets_with_findings",
     "safe_json_path",

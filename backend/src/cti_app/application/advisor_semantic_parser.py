@@ -20,13 +20,17 @@ from cti_app.application.advisor_consultation import (
     find_source_ref_conflicts,
     restricted_source_identities,
 )
+from cti_app.application.advisor_contracts import parse_typed_advisor_response
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
 )
 from cti_app.application.advisor_wire import advisor_wire_aliases, parse_advisor_wire
-from cti_app.application.publication_secret_guard import contains_explicit_operational_secrets
+from cti_app.application.publication_secret_guard import (
+    contains_explicit_operational_secrets,
+    redact_explicit_operational_secrets,
+)
 
 ADVISOR_RESPONSE_SCHEMA_V4 = "advisor-response.v4"
 ADVISOR_SOURCE_PARSER_VERSION_V4 = "advisor-source-parser.v4"
@@ -62,11 +66,16 @@ def parse_advisor_semantic_response(
     """Parse one v4 adviser response without I/O or canonical fact promotion."""
     raw_text = raw if isinstance(raw, str) else ""
     raw_bytes = raw_text.encode("utf-8")
+    redacted_raw, redacted_secret_count = redact_explicit_operational_secrets(
+        raw_text, operational_secret_values=operational_secret_values
+    )
+    safe_raw_text = str(redacted_raw)
     provenance: dict[str, Any] = {
-        "raw_output": raw_text,
+        "raw_output": safe_raw_text,
         "raw_output_bytes": len(raw_bytes),
         "raw_output_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "raw_output_retained": True,
+        "raw_output_redacted": bool(redacted_secret_count),
     }
 
     def terminal(
@@ -100,8 +109,11 @@ def parse_advisor_semantic_response(
     if prompt_data.get("consultation_type") not in {None, consultation_type}:
         return terminal("invalid", reason="consultation_type_mismatch")
 
+    secret_check: dict[str, Any] = {"prompt_data": dict(prompt_data)}
+    if consultation_type != "review_text":
+        secret_check["raw_output"] = raw_text
     if contains_explicit_operational_secrets(
-        {"raw_output": raw_text, "prompt_data": dict(prompt_data)},
+        secret_check,
         operational_secret_values=operational_secret_values,
     ):
         return terminal("refused", reason="operational_secret_detected", retain_raw=False)
@@ -115,7 +127,7 @@ def parse_advisor_semantic_response(
         return terminal("invalid", reason="evidence_context_invalid")
 
     try:
-        response = _decode_response(raw_text, consultation_type)
+        response = _decode_response(safe_raw_text, consultation_type)
     except _DuplicateJSONKey:
         result = terminal("ambiguous", reason="duplicate_response_key")
         result["unresolved_refs"] = [
@@ -124,6 +136,36 @@ def parse_advisor_semantic_response(
         return result
     except (AttributeError, TypeError, ValueError):
         return terminal("invalid", reason="response_invalid")
+    heuristic_review: dict[str, Any] | None = None
+    heuristic_review_warnings: list[str] = []
+    if response is None and consultation_type == "review_text":
+        legacy_review = parse_typed_advisor_response(
+            safe_raw_text,
+            consultation_type="review_text",
+            prompt_data=prompt_data,
+            safe_text=lambda value, _limit: value.strip(),
+        )
+        if legacy_review is not None and legacy_review.get("usable") is True:
+            heuristic_review = legacy_review
+            heuristic_review_warnings = list(legacy_review.get("warnings", ()))
+            response = {
+                "status": "succeeded",
+                "opinions": [
+                    {
+                        "unit_id": item["unit_id"],
+                        "text": "\n".join(item.get("remarks", ())),
+                        "source_aliases": [],
+                    }
+                    for item in legacy_review.get("reviews", ())
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("unit_id"), str)
+                    and isinstance(item.get("remarks"), list)
+                    and item.get("remarks")
+                ],
+                "incomplete_units": [],
+            }
+        else:
+            response = None
     if response is None:
         return terminal("invalid", reason="response_invalid")
 
@@ -141,6 +183,38 @@ def parse_advisor_semantic_response(
             {"alias": None, "reason": "advisor_marked_ambiguous", "unit_id": None}
         ]
         return result
+
+    response_opinions = response.get("opinions")
+    if consultation_type == "review_text" and (
+        not isinstance(response_opinions, list) or not response_opinions
+    ):
+        legacy_review = parse_typed_advisor_response(
+            safe_raw_text,
+            consultation_type="review_text",
+            prompt_data=prompt_data,
+            safe_text=lambda value, _limit: value.strip(),
+        )
+        if legacy_review is None or legacy_review.get("usable") is not True:
+            return terminal("invalid", reason="opinions_missing")
+        heuristic_review = legacy_review
+        heuristic_review_warnings = list(legacy_review.get("warnings", ()))
+        response = {
+            "status": "succeeded",
+            "opinions": [
+                {
+                    "unit_id": item["unit_id"],
+                    "text": "\n".join(item.get("remarks", ())),
+                    "source_aliases": [],
+                }
+                for item in legacy_review.get("reviews", ())
+                if isinstance(item, Mapping)
+                and isinstance(item.get("unit_id"), str)
+                and isinstance(item.get("remarks"), list)
+                and item.get("remarks")
+            ],
+            "incomplete_units": [],
+        }
+        status = "succeeded"
 
     raw_manifest = prompt_data.get("dossier_manifest")
     conflicts = find_source_ref_conflicts(prompt_data, dossier, raw_manifest=raw_manifest)
@@ -251,7 +325,7 @@ def parse_advisor_semantic_response(
                     "validated": False,
                 }
             )
-        if not source_refs:
+        if not source_refs and consultation_type != "review_text":
             inferred_incomplete.add(unit_id)
         opinion = {
             "unit_id": unit_id,
@@ -264,7 +338,7 @@ def parse_advisor_semantic_response(
 
     incomplete_units.extend(sorted(inferred_incomplete))
     incomplete_units = list(dict.fromkeys(incomplete_units))
-    if status == "partial" and not incomplete_units:
+    if status == "partial" and not incomplete_units and consultation_type != "review_text":
         return terminal("invalid", reason="partial_units_missing")
     if any_ambiguous_alias:
         status = "ambiguous"
@@ -282,22 +356,73 @@ def parse_advisor_semantic_response(
         }
         for item in opinions
     ]
-    return {
+    normalized_reviews: list[dict[str, Any]] = []
+    if consultation_type == "review_text":
+        if heuristic_review is not None:
+            normalized_reviews = [
+                dict(item)
+                for item in heuristic_review.get("reviews", ())
+                if isinstance(item, Mapping)
+            ]
+        else:
+            normalized_reviews = [
+                {
+                    "unit_id": item["unit_id"],
+                    "remarks": [item["text"]],
+                    "basis_refs": [
+                        {"kind": ref["kind"], "id": ref["id"]}
+                        for ref in item["source_refs"]
+                        if isinstance(ref.get("kind"), str) and isinstance(ref.get("id"), str)
+                    ],
+                    "warnings": [],
+                    "usable": True,
+                    "assignment": "explicit_alias",
+                }
+                for item in opinions
+                if isinstance(item.get("unit_id"), str) and isinstance(item.get("text"), str)
+            ]
+        if heuristic_review is not None or redacted_secret_count:
+            status = "partial"
+        if redacted_secret_count and "secret_redacted" not in heuristic_review_warnings:
+            heuristic_review_warnings.append("secret_redacted")
+    warnings = list(dict.fromkeys(heuristic_review_warnings))
+    result = {
         "schema": ADVISOR_RESPONSE_SCHEMA_V4,
         "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
         "consultation_type": consultation_type,
         "status": status,
         "untrusted": True,
-        "usable": bool(candidates) and status == "succeeded",
+        "usable": (
+            bool(normalized_reviews)
+            and any(item.get("usable") is True for item in normalized_reviews)
+            and status in {"succeeded", "partial"}
+            if consultation_type == "review_text"
+            else bool(candidates) and status == "succeeded"
+        ),
         "opinions": opinions,
         "candidates": candidates,
         "incomplete_units": incomplete_units,
         "unresolved_refs": unresolved_refs,
         "validated_facts": [],
-        "warnings": [],
+        "warnings": warnings,
         "evidence_preflight": completeness,
         **provenance,
     }
+    if consultation_type == "review_text":
+        result["reviews"] = normalized_reviews
+        result["unit_assignment_status"] = (
+            heuristic_review.get("unit_assignment_status", "heuristic")
+            if heuristic_review is not None
+            else "structured"
+        )
+        result["normalization_status"] = (
+            "partial" if warnings or status == "partial" else "complete"
+        )
+        result["warning_classification"] = {
+            "blocking": [],
+            "informative": warnings,
+        }
+    return result
 
 
 def _decode_response(raw: str, consultation_type: str) -> dict[str, Any] | None:
