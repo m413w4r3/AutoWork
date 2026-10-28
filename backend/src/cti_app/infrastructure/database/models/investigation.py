@@ -697,7 +697,8 @@ class InvestigationBudgetReservationAmountRow(Base):
             "(reserved_amount IS NULL OR reserved_amount >= 0) AND "
             "(committed_amount IS NULL OR committed_amount >= 0) AND "
             "(reserved_amount IS NOT NULL OR committed_amount IS NOT NULL) AND "
-            "(committed_amount IS NULL OR committed_amount <= coalesce(reserved_amount, 0))",
+            "(dimension = 'tool_seconds' OR committed_amount IS NULL OR "
+            "committed_amount <= coalesce(reserved_amount, 0))",
             name="ck_budget_reservation_amounts_values",
         ),
     )

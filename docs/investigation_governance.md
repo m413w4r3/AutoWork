@@ -11,8 +11,9 @@ faire passer à **confirmed** ou **rejected** au G3.
 **InvestigationEnvelopeService.propose_default(investigation_id)** retourne une
 proposition locale, non persistée et non approuvée. Elle n'autorise aucun
 provider ni acquisition, fixe les budgets **VT_UNITS** et **DOWNLOADS** à zéro,
-interdit la soumission et l'envoi à un LLM externe. Elle inclut aussi les
-plafonds globaux **TOOL_SECONDS=3600**, **CONTEXT_BYTES=4 000 000** et
+interdit la soumission et l'envoi à un LLM externe. Elle enregistre aussi
+**TOOL_SECONDS=3600** pour le suivi comptable et inclut les plafonds globaux
+**CONTEXT_BYTES=4 000 000** et
 **CONTEXT_TOKENS=1 000 000** par défaut. L'enveloppe persistée n'existe
 qu'après une décision G2.
 
@@ -43,8 +44,9 @@ l'approbation ou d'une extension, les plafonds historiques
 transaction. Ils ne diminuent jamais, y compris lors d'une révocation; le G2
 révoqué fixe ses droits externes à zéro et reste l'autorité d'accès.
 
-Le dispatcher réserve **TOOL_SECONDS** avant l'appel et refuse localement
-l'outil concerné avec **needs_review** quand le budget est épuisé. Les plafonds
+Le dispatcher réserve et comptabilise **TOOL_SECONDS**, sans refuser un appel
+quand ce montant comptable est épuisé. Les délais de garde configurés par appel
+continuent de limiter la durée d'exécution. Les plafonds
 **CONTEXT_BYTES** et **CONTEXT_TOKENS** sont inscrits dans l'enveloppe, mais
 leur consommation par le constructeur de contexte n'est pas encore branchée.
 

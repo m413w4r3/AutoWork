@@ -85,7 +85,7 @@ def _head_revision() -> str:
 
     The rest of this module compares the full migrated schema against
     ``Base.metadata``. The current head includes additive migrations through
-    ``0005_sample_acquisition_dispatch``.
+    ``0006_tool_seconds_accounting``.
     """
     from alembic.script import ScriptDirectory
 
@@ -537,6 +537,20 @@ async def _database_snapshot(database_url: str) -> dict[str, dict[str, Any]]:
     try:
         async with engine.connect() as connection:
             return await connection.run_sync(_snapshot_database)
+    finally:
+        await engine.dispose()
+
+
+async def _check_constraints(database_url: str, table_name: str) -> dict[str, str]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(
+                lambda sync: {
+                    str(check["name"]): str(check["sqltext"])
+                    for check in inspect(sync).get_check_constraints(table_name)
+                }
+            )
     finally:
         await engine.dispose()
 
@@ -1044,7 +1058,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0005_sample_acquisition_dispatch"
+    assert _head_revision() == "0006_tool_seconds_accounting"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -1065,6 +1079,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
         "created_at",
         "updated_at",
     }
+
     assert not edition_columns & {
         "target_articles",
         "previous_edition_id",
@@ -1105,6 +1120,47 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
 
 
+def test_tool_seconds_migration_updates_the_existing_reservation_check(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0005_sample_acquisition_dispatch")
+
+    async def _restore_pre_0006_check() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE investigation_budget_reservation_amounts "
+                        "DROP CONSTRAINT ck_budget_reservation_amounts_values"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "ALTER TABLE investigation_budget_reservation_amounts "
+                        "ADD CONSTRAINT ck_budget_reservation_amounts_values CHECK ("
+                        "(reserved_amount IS NULL OR reserved_amount >= 0) AND "
+                        "(committed_amount IS NULL OR committed_amount >= 0) AND "
+                        "(reserved_amount IS NOT NULL OR committed_amount IS NOT NULL) AND "
+                        "(committed_amount IS NULL OR "
+                        "committed_amount <= coalesce(reserved_amount, 0)))"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_restore_pre_0006_check())
+    command.upgrade(config, "head")
+
+    checks = asyncio.run(
+        _check_constraints(temporary_postgres_url, "investigation_budget_reservation_amounts")
+    )
+    tool_seconds_check = checks["ck_budget_reservation_amounts_values"]
+    assert "dimension = 'tool_seconds'" in tool_seconds_check
+    assert "committed_amount <= coalesce" in tool_seconds_check
+
+
 def _assert_c2_absent(database_url: str) -> None:
     tables = asyncio.run(_table_names(database_url))
     assert not {"investigation_experiment_heads", "investigation_experiments"} & tables
@@ -1142,9 +1198,7 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
 
     command.upgrade(config, "head")
 
-    assert (
-        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0006_tool_seconds_accounting"
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
         "authority_kind",
@@ -1186,9 +1240,7 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
 
     command.upgrade(config, "head")
 
-    assert (
-        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0006_tool_seconds_accounting"
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
@@ -1281,9 +1333,7 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     )
 
     command.upgrade(config, "head")
-    assert (
-        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0006_tool_seconds_accounting"
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
 
     command.downgrade(config, "base")
@@ -1307,9 +1357,7 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
     with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
         command.downgrade(config, "0001_baseline")
 
-    assert (
-        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0006_tool_seconds_accounting"
 
     async def _experiment_count() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -1397,9 +1445,7 @@ def test_osint_policy_downgrade_refuses_policy_and_inherited_lineage_rows(
     with pytest.raises(RuntimeError, match="Cannot downgrade populated OSINT_OPEN policy storage"):
         command.downgrade(config, "0002_c2_experiments")
 
-    assert (
-        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0006_tool_seconds_accounting"
     assert asyncio.run(_state_counts()) == (1, 1, 1, 1, 1, 1)
 
 
@@ -1467,6 +1513,4 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
     raw_authority, interpreted_authority = asyncio.run(_read_legacy_envelope())
     assert raw_authority is None
     assert interpreted_authority is EnvelopeAuthorityKind.HUMAN_G2
-    assert (
-        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0006_tool_seconds_accounting"
