@@ -205,6 +205,7 @@ def build_confined_worker_harness(
         "analysis_local_binutils_expected_version": detected_versions.get("local_strings"),
         "analysis_local_xxd_expected_version": detected_versions.get("local_xxd"),
         "analysis_local_coreutils_expected_version": detected_versions.get("local_sha256sum"),
+        "analysis_local_7z_expected_version": detected_versions.get("local_7z") or "16.02",
         "analysis_local_monodis_expected_version": detected_versions.get("local_monodis"),
     }
     worker_settings = base_settings.model_copy(

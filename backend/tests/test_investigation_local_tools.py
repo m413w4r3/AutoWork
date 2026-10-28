@@ -355,6 +355,8 @@ def test_schemas_capabilities_and_dynamic_command_enum() -> None:
     assert local is not None
     assert local.input_schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
     assert tuple(local.input_schema["properties"]["command_id"]["enum"]) == (
+        "archive_extract_hash",
+        "archive_list",
         "file",
         "monodis",
         "objdump",
@@ -362,7 +364,11 @@ def test_schemas_capabilities_and_dynamic_command_enum() -> None:
         "sha256sum",
         "xxd",
         "yara",
+        "zip_members",
     )
+    options_schema = local.input_schema["properties"]["options"]["properties"]
+    assert options_schema["max_members"]["maximum"] == 2000
+    assert options_schema["archive_preset"]["enum"] == ("none", "infected", "malware")
     assert "local.run_command" in local_tool_capabilities(harness.command_catalog)
     assert not local_tool_capabilities(harness.command_catalog, ghidra_enabled=False) - {
         "local.run_command"

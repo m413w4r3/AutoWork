@@ -278,8 +278,14 @@ def _local_command_catalog(
     )
     local_commands = family_statuses.get("local_command")
     yara = family_statuses.get("yara")
+    zip_members = family_statuses.get("zip_members")
+    archive_tools = family_statuses.get("archive_tools")
 
     def worker_binary(name: str) -> str | None:
+        if name == "zip_members":
+            return "/usr/bin/python3" if zip_members is not None and zip_members.available else None
+        if name == "7z":
+            return "/usr/bin/7z" if archive_tools is not None and archive_tools.available else None
         if name == "yara":
             return "/usr/bin/yara" if yara is not None and yara.available else None
         if local_commands is not None and local_commands.available:

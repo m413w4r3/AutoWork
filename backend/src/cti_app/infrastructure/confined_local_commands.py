@@ -150,7 +150,15 @@ class ConfinedLocalCommands:
                 "local_analysis_disabled",
             )
 
-        family_name = "yara" if normalized_id is LocalCommandId.YARA else "local_command"
+        family_name = (
+            "yara"
+            if normalized_id is LocalCommandId.YARA
+            else "zip_members"
+            if normalized_id is LocalCommandId.ZIP_MEMBERS
+            else "archive_tools"
+            if normalized_id in {LocalCommandId.ARCHIVE_LIST, LocalCommandId.ARCHIVE_EXTRACT_HASH}
+            else "local_command"
+        )
         family = self.execution.family_statuses.get(family_name)
         if not self.execution.available:
             return _result(
@@ -207,7 +215,16 @@ class ConfinedLocalCommands:
         }
         arguments: tuple[str, ...] = (normalized_id.value,)
         tool = ConfinedAnalysisTool.LOCAL_COMMAND
-        if normalized_id is LocalCommandId.YARA:
+        if normalized_id is LocalCommandId.ZIP_MEMBERS:
+            tool = ConfinedAnalysisTool.ZIP_MEMBERS
+            arguments = ()
+        elif normalized_id is LocalCommandId.ARCHIVE_LIST:
+            tool = ConfinedAnalysisTool.ARCHIVE_LIST
+            arguments = ()
+        elif normalized_id is LocalCommandId.ARCHIVE_EXTRACT_HASH:
+            tool = ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH
+            arguments = ()
+        elif normalized_id is LocalCommandId.YARA:
             tool = ConfinedAnalysisTool.YARA
             arguments = ()
             analysis_parameters = {"rule_source": _render_yara_rule(normalized_options)}
@@ -320,6 +337,9 @@ class ConfinedLocalCommands:
                 LocalCommandId.OBJDUMP: "local_objdump",
                 LocalCommandId.YARA: "yara",
                 LocalCommandId.MONODIS: "local_monodis",
+                LocalCommandId.ZIP_MEMBERS: "zip_members",
+                LocalCommandId.ARCHIVE_LIST: "local_7z",
+                LocalCommandId.ARCHIVE_EXTRACT_HASH: "local_7z",
             }[normalized_id]
             version = self.execution.attestation.versions.get(version_key)
         return LocalCommandResult(

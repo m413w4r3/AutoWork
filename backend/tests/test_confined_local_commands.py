@@ -138,6 +138,28 @@ async def test_xxd_unknown_option_is_denied_before_sample_resolution() -> None:
 
     assert result.status is LocalCommandStatus.POLICY_DENIED
     assert result.detail_code == "option_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_archive_tools_require_their_own_worker_attestation_before_blob_lookup() -> None:
+    execution = _Execution(ConfinedAnalysisFamilyStatus("local_command", True, "v1"))
+    service = ConfinedLocalCommands(
+        execution=execution,
+        catalog=_full_catalog(),
+        uow_factory=lambda: pytest.fail("unattested archive tools must not resolve the sample"),
+        settings=Settings(_env_file=None),
+        enabled=True,
+        max_sample_bytes=200 * 1024 * 1024,
+    )
+
+    for command_id in (
+        LocalCommandId.ZIP_MEMBERS,
+        LocalCommandId.ARCHIVE_LIST,
+        LocalCommandId.ARCHIVE_EXTRACT_HASH,
+    ):
+        result = await service.run_for_investigation(uuid4(), command_id, "a" * 64, {})
+        assert result.status is LocalCommandStatus.UNAVAILABLE
+        assert result.detail_code == "analysis_family_not_attested"
     assert execution.requests == []
 
 

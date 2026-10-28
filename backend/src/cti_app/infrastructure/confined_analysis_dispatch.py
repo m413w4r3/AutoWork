@@ -97,6 +97,12 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
         family = (
             "dotnet"
             if request.tool is ConfinedAnalysisTool.DOTNET_ILSPY
+            else "archive_tools"
+            if request.tool
+            in {
+                ConfinedAnalysisTool.ARCHIVE_LIST,
+                ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+            }
             else "suricata"
             if request.tool
             in {
@@ -395,6 +401,8 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
                 "local_objdump",
                 "local_xxd",
                 "local_sha256sum",
+                "local_7z",
+                "zip_members",
                 "ilspycmd",
                 "ilspycmd_package_sha512",
             }
@@ -552,6 +560,10 @@ def _family_statuses(
         "local-command-catalog-v1" if local_command_reason is None else None,
         local_command_reason,
     )
+    zip_members = status("zip_members", versions.get("zip_members"), "autowork-zip-members-v1")
+    archive_tools = status(
+        "archive_tools", versions.get("local_7z"), settings.analysis_local_7z_expected_version
+    )
     sample = ConfinedAnalysisFamilyStatus(
         "sample_analysis",
         "sample_analysis" in supported_families
@@ -587,6 +599,8 @@ def _family_statuses(
             *mwcp_parser_families.values(),
             yara,
             local_command,
+            zip_members,
+            archive_tools,
             sample,
             dotnet,
         )
@@ -605,6 +619,8 @@ def _unavailable_families(reason: str) -> dict[str, ConfinedAnalysisFamilyStatus
         "mwcp",
         "yara",
         "local_command",
+        "zip_members",
+        "archive_tools",
         "sample_analysis",
         "dotnet",
     )

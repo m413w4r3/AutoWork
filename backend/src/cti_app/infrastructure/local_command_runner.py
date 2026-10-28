@@ -170,6 +170,22 @@ class LocalCommandRunner:
                 capability.version,
                 "filesystem_confinement_required",
             )
+        if spec.id in {
+            LocalCommandId.ZIP_MEMBERS,
+            LocalCommandId.ARCHIVE_LIST,
+            LocalCommandId.ARCHIVE_EXTRACT_HASH,
+        }:
+            return _make_result(
+                spec,
+                LocalCommandStatus.UNAVAILABLE,
+                sample_sha256,
+                started_at,
+                0,
+                "",
+                (spec.binary,),
+                capability.version,
+                "confined_archive_worker_required",
+            )
         if self._require_filesystem_confinement and not self.filesystem_confined:
             return _make_result(
                 spec,

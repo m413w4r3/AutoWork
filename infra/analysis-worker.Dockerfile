@@ -42,7 +42,7 @@ RUN apt-get update \
         > /etc/apt/sources.list.d/bookworm-backports.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        tshark file binutils xxd coreutils mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
+        tshark file binutils xxd coreutils p7zip-full mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
         dotnet-runtime-8.0=8.0.32-1 \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         -t bookworm-backports suricata=1:7.0.10-1~bpo12+1 \
@@ -58,6 +58,7 @@ RUN apt-get update \
     && objdump --version \
     && xxd -v \
     && sha256sum --version \
+    && 7z i | grep -Eq '(^|[[:space:]])16\.02([[:space:]]|$)' \
     && dpkg-query -W -f='${Version}\n' mono-utils \
     && (monodis --help 2>&1 | grep -q -- "--userstrings") \
     && tshark --version \

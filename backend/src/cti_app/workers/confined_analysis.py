@@ -27,6 +27,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisArtifactKind,
     ConfinedAnalysisJobParameters,
     ConfinedAnalysisTool,
+    validate_archive_tool_request,
 )
 from cti_app.application.evidence_recorder import sanitize_evidence_text
 from cti_app.application.local_analysis import detect_file_type
@@ -56,6 +57,7 @@ from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
 from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.static_analysis import StaticFeatureExtractor, build_packing_signals
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLimits
+from cti_app.workers.archive_commands import run_7z_archive_command, run_zip_members
 from cti_app.workers.dotnet_analysis import probe_ilspycmd, run_dotnet_analysis
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -66,6 +68,7 @@ _LOCAL_VERSION = re.compile(r"\b([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]+(?:\.[0-9]+)+)
 _SURICATA_VERSION = re.compile(r"\bSuricata(?:\s+version)?\s+([0-9]+\.[0-9]+\.[0-9]+)", re.I)
 _FIELD_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,160}$")
 _MONODIS_PACKAGE_VERSION = re.compile(r"^[A-Za-z0-9.+:~_-]{1,128}$")
+ZIP_MEMBERS_TOOL_VERSION = "autowork-zip-members-v1"
 _MONODIS_METHOD_ROW = re.compile(r"^\s*(\d+):.*?\s('[^']+'|[^\s(]+)\s+\(")
 _VT_SANDBOX_PCAP_SOURCE_VERSION = "vt-sandbox-pcap.v1"
 _FOLLOW_STREAM = re.compile(r"^(?:follow,tcp|follow,udp),raw,[0-9]{1,8}$")
@@ -136,6 +139,14 @@ async def execute_confined_analysis_job(
                 parameters.arguments,
                 parameters.analysis_parameters,
                 max_range_bytes=settings.analysis_local_command_max_range_bytes,
+            )
+        elif parameters.tool in {
+            ConfinedAnalysisTool.ZIP_MEMBERS,
+            ConfinedAnalysisTool.ARCHIVE_LIST,
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+        }:
+            validate_archive_tool_request(
+                parameters.tool, parameters.arguments, parameters.analysis_parameters
             )
         if (
             parameters.tool
@@ -361,6 +372,31 @@ async def _execute_tool(
         )
     if tool is ConfinedAnalysisTool.LOCAL_COMMAND:
         return await _run_local_command(parameters, payload, settings)
+    if tool is ConfinedAnalysisTool.ZIP_MEMBERS:
+        return await run_zip_members(
+            payload,
+            member_prefix=parameters.analysis_parameters.get("member_prefix"),
+            max_members=int(parameters.analysis_parameters.get("max_members", "2000")),
+            max_output_bytes=max(1, parameters.max_output_bytes - 4096),
+            tool_version=ZIP_MEMBERS_TOOL_VERSION,
+        )
+    if tool in {
+        ConfinedAnalysisTool.ARCHIVE_LIST,
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+    }:
+        return await run_7z_archive_command(
+            tool,
+            payload,
+            member_prefix=parameters.analysis_parameters.get("member_prefix"),
+            max_members=int(parameters.analysis_parameters.get("max_members", "2000")),
+            archive_preset=parameters.analysis_parameters.get("archive_preset", "none"),
+            max_output_bytes=max(1, parameters.max_output_bytes - 4096),
+            timeout_seconds=min(
+                parameters.timeout_seconds, settings.local_analysis_timeout_seconds
+            ),
+            memory_limit_bytes=settings.local_analysis_memory_limit_bytes,
+            tool_version=settings.analysis_local_7z_expected_version,
+        )
     if tool is ConfinedAnalysisTool.DOTNET_ILSPY:
         if sample is None:
             raise ConfinedAnalysisArtifactMismatch("analysis_tool_requires_sample_artifact")
@@ -2135,6 +2171,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         "local_objdump": _local_binary_version("objdump", "--version"),
         "local_xxd": _local_binary_version("xxd", "-v"),
         "local_sha256sum": _local_binary_version("sha256sum", "--version"),
+        "local_7z": _local_binary_version("7z", "i"),
         "local_monodis": _monodis_package_version() if shutil.which("monodis") else None,
         "ilspycmd": ilspy_version,
         "ilspycmd_package_sha512": ilspy_package_sha512,
@@ -2175,6 +2212,8 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
             "tshark",
             "capinfos",
             "local_command",
+            "zip_members",
+            "archive_tools",
             "suricata",
             "floss",
             "mwcp",

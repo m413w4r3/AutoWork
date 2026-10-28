@@ -183,7 +183,10 @@ def _local_command_schema(catalog: LocalCommandCatalog) -> dict[str, Any]:
                 "enum": available_ids,
                 "description": (
                     "Commande typée du catalogue: file, strings, readelf, objdump, xxd, "
-                    "sha256sum, monodis ou yara selon disponibilité. monodis accepte "
+                    "sha256sum, monodis, yara, zip_members, archive_list ou "
+                    "archive_extract_hash selon disponibilité. zip_members calcule les SHA-256 "
+                    "des membres ZIP en mémoire; les commandes archive utilisent 7z dans "
+                    "le worker confiné et ne lancent pas le contenu. monodis accepte "
                     "operation=userstrings|typedef|methods|cil; cil requiert un seul "
                     "method_name ou method_rid et une plage offset/length bornée en octets. "
                     "xxd lit au plus 4096 octets; sha256sum accepte une sous-plage bornée. "
@@ -236,6 +239,29 @@ def _local_command_schema(catalog: LocalCommandCatalog) -> dict[str, Any]:
                         "minimum": 1,
                         "maximum": 16777215,
                         "description": "RID MethodDef pour operation=cil.",
+                    },
+                    "member_prefix": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1024,
+                        "pattern": _SAFE_UNTRUSTED_TEXT,
+                        "description": (
+                            "Préfixe littéral de nom de membre; le nom reste une donnée."
+                        ),
+                    },
+                    "max_members": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "description": "Nombre maximal de membres listés ou traités.",
+                    },
+                    "archive_preset": {
+                        "type": "string",
+                        "enum": ["none", "infected", "malware"],
+                        "description": (
+                            "Mot de passe d'archive fixe allowlisté; aucun autre texte "
+                            "n'est accepté."
+                        ),
                     },
                 },
                 "additionalProperties": option_value_schema,
