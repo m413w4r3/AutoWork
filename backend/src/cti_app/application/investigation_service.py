@@ -216,6 +216,7 @@ class ProductionArtifactObservationWriter:
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
         framework_proof = result.framework_pre_submission_proof
+        has_framework_proof = framework_proof is not None
         reason = result.output.get("reason")
         provider_auth_refusal = (
             result.status is ToolInvocationStatus.UNAVAILABLE
@@ -240,12 +241,12 @@ class ProductionArtifactObservationWriter:
             and invocation.tool_name not in {"vt.download_sample", "sample.analyze"}
             and not provider_auth_refusal
             and not provider_download_refusal
-            and framework_proof is None
+            and not has_framework_proof
         ):
             return ()
         safe_result = _sanitize_json(thaw_json(result.output))
         if not safe_result:
-            if framework_proof is None:
+            if not has_framework_proof:
                 return ()
             safe_result = {}
         if framework_proof is None:
@@ -642,6 +643,16 @@ class InvestigationService:
         multiple_refs = len(invocation.response_refs) > 1
         if multiple_refs and invocation.tool_name != "advisor.consult":
             return None, "framework_proof_reference_count_mismatch"
+        # Advisor results can reference both source evidence and the framework
+        # proof artifact. Verify each ref instead of requiring a single ref.
+        if len(invocation.response_refs) != len(set(invocation.response_refs)):
+            return None, "framework_proof_reference_count_mismatch"
+        referenced_observations: list[EvidenceObservation] = []
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if observation is None or observation.investigation_id != invocation.investigation_id:
+                return None, "framework_proof_reference_count_mismatch"
+            referenced_observations.append(observation)
         reservation = next(
             (
                 item
@@ -658,12 +669,9 @@ class InvestigationService:
         ):
             return None, None
         first_rejection: str | None = None
-        for observation_id in invocation.response_refs:
-            observation = await self._observations.get(observation_id)
+        for observation in referenced_observations:
             if (
-                observation is None
-                or observation.investigation_id != invocation.investigation_id
-                or observation.invocation_ref != invocation.id
+                observation.invocation_ref != invocation.id
                 or observation.source != invocation.tool_name
                 or observation.source_version != invocation.schema_version
                 or observation.object_id != invocation.operation_key
@@ -1769,8 +1777,13 @@ class InvestigationService:
             # The coordinator repeats the authoritative checks under its consume lock.
             pre_dispatch_check=check_current_admission,
         )
+        advisor_admission_recheck = (
+            tool_name == "advisor.consult"
+            and result.output.get("failure_stage") == "post_preparation_admission"
+        )
         if (
             tool_name == "advisor.consult"
+            and not advisor_admission_recheck
             and result.framework_pre_submission_proof
             is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
         ):
@@ -1782,7 +1795,9 @@ class InvestigationService:
                 status=ToolInvocationStatus.FAILED,
                 output=output,
             )
-        framework_proves_non_execution = _confirmed_external_non_execution(result)
+        framework_proves_non_execution = (
+            _confirmed_external_non_execution(result) and not advisor_admission_recheck
+        )
         unproven_external_failure = (
             external_effect
             and result.status
@@ -1794,7 +1809,9 @@ class InvestigationService:
             }
             and not framework_proves_non_execution
         )
-        ambiguous_adapter_response = unproven_external_failure
+        ambiguous_adapter_response = (
+            unproven_external_failure and result.framework_pre_submission_proof is None
+        )
         if unproven_external_failure and result.status is not ToolInvocationStatus.NEEDS_REVIEW:
             result = replace(
                 result,
@@ -3078,10 +3095,15 @@ class InvestigationService:
     async def _persist_result_observations(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
-        external_refusal_proof = (
-            result.framework_pre_submission_proof
-            is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
-        )
+        registered = self._registry.get(invocation.tool_name, invocation.schema_version)
+        definition = registered[0] if registered is not None else None
+        external_effect = definition is not None and definition.effect in {
+            ToolEffect.EXTERNAL_READ,
+            ToolEffect.ACQUIRE,
+            ToolEffect.EXTERNAL_ACTIVE,
+            ToolEffect.EXTERNAL_SUBMIT,
+        }
+        has_framework_proof = external_effect and result.framework_pre_submission_proof is not None
         if (
             result.error_code == "invalid_tool_arguments"
             or result.output.get("error_code") == "invalid_tool_arguments"
@@ -3101,12 +3123,12 @@ class InvestigationService:
                 "provider_download_authorization_refused",
             }
         )
-        if (not result.output and not external_refusal_proof) or (
+        if (not result.output and not has_framework_proof) or (
             result.observation_refs
             and invocation.tool_name not in {"vt.download_sample", "sample.analyze"}
             and not provider_auth_refusal
             and not provider_download_refusal
-            and not external_refusal_proof
+            and not has_framework_proof
         ):
             return ()
         if self._observation_writer is None:
@@ -3707,35 +3729,33 @@ class InvestigationService:
         if repository is None:
             return
         try:
-            current = await repository.get(envelope.investigation_id)
-            if current is None:
-                await repository.save_if_version(
-                    InvestigationBudgetSnapshot(
-                        investigation_id=envelope.investigation_id,
-                        version=1,
-                        budget=envelope.budget,
-                    ),
-                    expected_version=None,
-                )
-                return
-            if current.budget == envelope.budget:
-                return
-            await repository.save_if_version(
-                InvestigationBudgetSnapshot(
+            # The envelope CAS is canonical; retry snapshot CAS conflicts so a
+            # concurrent mirror update cannot strand a released reservation.
+            for _ in range(3):
+                current = await repository.get(envelope.investigation_id)
+                if current is not None and current.budget == envelope.budget:
+                    return
+                expected_version = current.version if current is not None else None
+                snapshot = InvestigationBudgetSnapshot(
                     investigation_id=envelope.investigation_id,
-                    version=current.version + 1,
+                    version=current.version + 1 if current is not None else 1,
                     budget=envelope.budget,
-                ),
-                expected_version=current.version,
-            )
+                )
+                try:
+                    await repository.save_if_version(
+                        snapshot,
+                        expected_version=expected_version,
+                    )
+                    return
+                except VersionConflictError:
+                    continue
+            raise VersionConflictError("Investigation budget snapshot changed repeatedly")
         except asyncio.CancelledError:
             await self._rollback_budget_snapshot_pair()
             raise
         except Exception as exc:
             await self._rollback_budget_snapshot_pair()
-            raise _BudgetSnapshotPersistenceError(
-                "Envelope budget mirror failed before external dispatch."
-            ) from exc
+            raise _BudgetSnapshotPersistenceError("Envelope budget mirror failed.") from exc
 
     async def _rollback_budget_snapshot_pair(self) -> None:
         if self._rollback_uow is not None:
@@ -3919,9 +3939,16 @@ class InvestigationService:
         external_effect: bool = False,
     ) -> None:
         for _ in range(3):
-            envelope = await self._envelopes.get(investigation_id)
-            if envelope is None:
+            current_envelope = await self._envelopes.get(investigation_id)
+            if current_envelope is None:
                 return
+            # In-memory repositories may return the stored envelope object
+            # itself. Release a private budget copy so a failed CAS cannot
+            # mutate canonical state before it is durably saved.
+            envelope = replace(
+                current_envelope,
+                budget=_copy_investigation_budget(current_envelope.budget),
+            )
             reservation = next(
                 (
                     item
@@ -3944,7 +3971,10 @@ class InvestigationService:
                 # operation because the envelope's limits and provider scope stay revoked.
                 envelope.budget.restore_reservation(expected_reservation)
                 reservation = expected_reservation
-            if reservation.status is not BudgetReservationStatus.RESERVED or uncertain:
+            if reservation.status is not BudgetReservationStatus.RESERVED:
+                await self._save_budget_snapshot(envelope)
+                return
+            if uncertain:
                 return
             if (
                 external_effect
