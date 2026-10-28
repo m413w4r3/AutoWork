@@ -117,6 +117,105 @@ async def test_main_bridge_fails_closed_when_external_effect_authority_is_missin
     assert transport.submission_count == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("builder_mode", "authority_context", "expected_reason"),
+    [
+        ("missing", object(), "builder_missing"),
+        ("returns_none", object(), "builder_returned_none"),
+        ("available", None, "authority_context_missing"),
+    ],
+)
+async def test_advisor_external_effect_refusal_reason_identifies_missing_binding_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    builder_mode: str,
+    authority_context: object | None,
+    expected_reason: str,
+) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return True
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+
+    class RequiredAuthorityTransport:
+        requires_external_effect_authority = True
+
+        def __init__(self) -> None:
+            self.builder_calls = 0
+            self.submission_calls = 0
+
+        async def build_external_effect_binding(self, **kwargs):
+            self.builder_calls += 1
+            if builder_mode == "returns_none" or kwargs.get("authority_context") is None:
+                return None
+            return object()
+
+        async def submit(self, **_kwargs):
+            self.submission_calls += 1
+            return TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="synthetic")
+
+    transport = RequiredAuthorityTransport()
+    if builder_mode == "missing":
+        delattr(RequiredAuthorityTransport, "build_external_effect_binding")
+
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=0,
+        context_sha256="d" * 64,
+        prompt="Synthetic advisor request.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        external_effect_binding_context={"authority_context": authority_context},
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.error_code == "external_effect_authority_required"
+    assert result.submission_state == "pre_submission"
+    assert result.failure_reason == expected_reason
+    assert transport.submission_calls == 0
+    if builder_mode == "available" and authority_context is None:
+        assert transport.builder_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_advisor_reports_missing_factory_on_model_conversation_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return True
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    transport = ModelConversationTurnTransport(
+        SimpleNamespace(), require_external_effect_authority=True
+    )
+
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=0,
+        context_sha256="a" * 64,
+        prompt="Synthetic advisor request.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        external_effect_binding_context={"authority_context": object()},
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.failure_reason == "builder_missing"
+    assert result.submission_state == "pre_submission"
+
+
 def _context(investigation_id, *, claims=()):
     return InvestigationContextV1(
         view="full",
