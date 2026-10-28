@@ -3132,6 +3132,10 @@ async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
 
     assert result.status is ToolInvocationStatus.UNAVAILABLE
     assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
     assert transport.calls == []
     item = next(
         row
@@ -3142,6 +3146,20 @@ async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
     assert "NOT_VERIFIED" in statuses
     assert "RETRIEVABLE" not in statuses
     assert any("unreadable" in row["reason"].casefold() for row in result.output["missing_refs"])
+    archived_call = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.object_type == "advisor_call"
+    )
+    archived = json.loads(
+        await tool._artifact_store.read_bytes(archived_call.blob_id, max_bytes=1_000_000)
+    )
+    assert archived["output"]["failure_reason"] == "required_canonical_evidence_not_in_payload"
+    assert archived["output"]["missing_refs"] == [
+        dict(item) for item in result.output["missing_refs"]
+    ]
+    assert "raw sample bytes" in archived["message"]
+    assert "VT report" in archived["message"]
 
 
 @pytest.mark.asyncio
@@ -6566,6 +6584,7 @@ LIMITATION: none
 
     assert result.status is ToolInvocationStatus.NEEDS_REVIEW
     assert result.output["advisor_status"] == "needs_review"
+    assert result.framework_pre_submission_proof is None
     assert "blocks" not in result.output
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
@@ -6770,7 +6789,10 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
     )
     assert result.output["bridge_turns_consumed"] == 0
     assert result.output["usable"] is False
-    assert result.framework_pre_submission_proof is None
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
     assert transport.calls == []
 
 

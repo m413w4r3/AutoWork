@@ -33,6 +33,7 @@ from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
     ADVISOR_SCHEMA_VERSION,
     InvestigationAdvisorTool,
+    _attest_advisor_pre_submission,
     register_investigation_advisor_tool,
 )
 from cti_app.application.investigation_experiments import (
@@ -2719,19 +2720,20 @@ async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry() -
     adapter = fixture.tools["advisor.consult"]
     _authorize_framework_refusal_proof_adapter(adapter)
     adapter.after_execute = lambda: setattr(snapshots, "fail_release_once", True)
-    adapter.result = ToolResult(
-        ToolInvocationStatus.NEEDS_REVIEW,
-        observation_refs=(input_observation.id,),
-        error_code="advisor_preflight_refused",
-        output={
-            "advisor_status": "needs_review",
-            "confirmed_non_execution": True,
-            "bridge_turns_consumed": 0,
-            "failure_stage": "evidence_preflight",
-        },
-        framework_pre_submission_proof=(
-            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
-        ),
+    adapter.result = _attest_advisor_pre_submission(
+        ToolResult(
+            ToolInvocationStatus.UNAVAILABLE,
+            observation_refs=(input_observation.id,),
+            error_code="advisor_preflight_refused",
+            output={
+                "advisor_status": "technical_blocked",
+                "confirmed_non_execution": True,
+                "bridge_turns_consumed": 0,
+                "prior_submission_made": False,
+                "failure_stage": "evidence_preflight",
+                "failure_reason": "required_canonical_evidence_not_in_payload",
+            },
+        )
     )
     envelopes = _ReleaseConflictOnce(fixture.envelopes)
     fixture.envelopes = envelopes
