@@ -41,7 +41,12 @@ from cti_app.application.investigation_experiments import (
     InMemoryInvestigationExperimentRepository,
     register_operator_experiment_tools,
 )
+from cti_app.application.investigation_persistence import (
+    InMemoryInvestigationBudgetRepository,
+    VersionConflictError,
+)
 from cti_app.application.investigation_tools import (
+    ToolEffect,
     ToolResult,
     _authorize_framework_refusal_proof_adapter,
 )
@@ -2617,3 +2622,287 @@ async def test_operator_http_route_rejects_invalid_body_before_dispatch() -> Non
 
     assert response.status_code == 422
     assert fixture.tools["vt.file_report"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry() -> None:
+    reserved = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 3_600,
+        BudgetDimension.CONTEXT_BYTES: 16_384,
+        BudgetDimension.CONTEXT_TOKENS: 4_096,
+    }
+    fixture = _Fixture(
+        responses=[],
+        tools=[
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                reserved,
+            )
+        ],
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+
+    class _ReleaseConflictOnce:
+        def __init__(self, repository):
+            self.repository = repository
+            self.fail_once = True
+            self.conflict_count = 0
+
+        async def get(self, investigation_id):
+            return await self.repository.get(investigation_id)
+
+        async def save_if_version(self, envelope, *, expected_version):
+            released = any(
+                item.status.value == "released" and dict(item.amounts) == reserved
+                for item in envelope.budget.reservations
+            )
+            if released and self.fail_once:
+                self.fail_once = False
+                self.conflict_count += 1
+                raise VersionConflictError("Simulated concurrent envelope update")
+            return await self.repository.save_if_version(
+                envelope, expected_version=expected_version
+            )
+
+    class _SnapshotConflictOnce:
+        def __init__(self, repository):
+            self.repository = repository
+            self.fail_release_once = False
+            self.conflict_count = 0
+
+        async def get(self, investigation_id):
+            return await self.repository.get(investigation_id)
+
+        async def save_if_version(self, snapshot, *, expected_version):
+            has_released_reservation = any(
+                item.status.value == "released" and dict(item.amounts) == reserved
+                for item in snapshot.budget.reservations
+            )
+            if has_released_reservation and self.fail_release_once:
+                self.fail_release_once = False
+                self.conflict_count += 1
+                raise VersionConflictError("Simulated concurrent budget snapshot update")
+            return await self.repository.save_if_version(
+                snapshot, expected_version=expected_version
+            )
+
+    snapshot_repository = InMemoryInvestigationBudgetRepository()
+    fixture.service._budget_snapshots = snapshot_repository
+    initial_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    await fixture.service._save_budget_snapshot(initial_envelope)
+    snapshots = _SnapshotConflictOnce(snapshot_repository)
+    fixture.service._budget_snapshots = snapshots
+    input_observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="a" * 64,
+        source="offline-test",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="test_input",
+        object_id="advisor-proof-multi-ref",
+    )
+    await fixture.observations.append_if_absent(input_observation)
+    adapter = fixture.tools["advisor.consult"]
+    _authorize_framework_refusal_proof_adapter(adapter)
+    adapter.after_execute = lambda: setattr(snapshots, "fail_release_once", True)
+    adapter.result = ToolResult(
+        ToolInvocationStatus.NEEDS_REVIEW,
+        observation_refs=(input_observation.id,),
+        error_code="advisor_preflight_refused",
+        output={
+            "advisor_status": "needs_review",
+            "confirmed_non_execution": True,
+            "bridge_turns_consumed": 0,
+            "failure_stage": "evidence_preflight",
+        },
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    fixture.service._envelopes = _ReleaseConflictOnce(fixture.envelopes)
+    service = _service(fixture)
+    request = {
+        "tool_name": "advisor.consult",
+        "schema_version": ADVISOR_SCHEMA_VERSION,
+        "arguments": {"consultation_type": "plan_investigation"},
+        "purpose": "Refuse before Bridge submission and release the budget.",
+        "expected_version": state.version,
+        "idempotency_key": "advisor-presend-release-once",
+    }
+
+    refused = await service.invoke(**request)
+
+    assert refused.invocation.status is ToolInvocationStatus.FAILED
+    assert fixture.bridge_transport.submission_count == 0
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item
+        for item in latest_envelope.budget.reservations
+        if item.operation_key == refused.invocation.operation_key
+    )
+    assert reservation.status.value == "released"
+    assert all(latest_envelope.budget.reserved[item] == 0 for item in reserved)
+    assert len(refused.invocation.response_refs) == 2
+    proof, rejection = await fixture.service._framework_pre_submission_proof(refused.invocation)
+    assert (
+        proof is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        and rejection is None
+    )
+    snapshot = await snapshots.get(fixture.investigation_id)
+    assert snapshot.budget == latest_envelope.budget
+    assert fixture.service._envelopes.conflict_count == 1
+    assert snapshots.conflict_count == 1
+
+    replay = await service.invoke(**request)
+    assert replay.idempotent_replay is True
+    assert replay.invocation.id == refused.invocation.id
+    assert (await snapshots.get(fixture.investigation_id)).version == snapshot.version
+
+    adapter.result = ToolResult(
+        ToolInvocationStatus.SUCCEEDED,
+        budget_consumed={BudgetDimension.BRIDGE_TURNS: 1},
+        output={"advisor_status": "succeeded", "usable": True},
+    )
+    latest_state = await fixture.states.get(fixture.investigation_id)
+    retried = await service.invoke(
+        **{
+            **request,
+            "expected_version": latest_state.version,
+            "idempotency_key": "advisor-presend-release-corrected-retry",
+        }
+    )
+    assert retried.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert len(adapter.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_advisor_ambiguous_external_result_keeps_reservation_and_needs_review() -> None:
+    reserved = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 3_600,
+        BudgetDimension.CONTEXT_BYTES: 16_384,
+        BudgetDimension.CONTEXT_TOKENS: 4_096,
+    }
+    fixture = _Fixture(
+        responses=[],
+        tools=[
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                reserved,
+            )
+        ],
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+
+    snapshots = InMemoryInvestigationBudgetRepository()
+    fixture.service._budget_snapshots = snapshots
+    await fixture.service._save_budget_snapshot(
+        await fixture.envelopes.get(fixture.investigation_id)
+    )
+    adapter = fixture.tools["advisor.consult"]
+    _authorize_framework_refusal_proof_adapter(adapter)
+    adapter.result = ToolResult(
+        ToolInvocationStatus.NEEDS_REVIEW,
+        budget_consumed={BudgetDimension.BRIDGE_TURNS: 1},
+        error_code="advisor_timeout_or_ambiguous",
+        output={
+            "advisor_status": "needs_review",
+            "confirmed_non_execution": False,
+            "bridge_turns_consumed": 1,
+        },
+    )
+    service = _service(fixture)
+
+    result = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={"consultation_type": "plan_investigation"},
+        purpose="Preserve budget after ambiguous Bridge handoff.",
+        expected_version=state.version,
+        idempotency_key="advisor-ambiguous-postsend",
+    )
+
+    assert result.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert len(adapter.calls) == 1
+    assert fixture.bridge_transport.submission_count == 0
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == result.invocation.operation_key
+    )
+    assert reservation.status.value == "reserved"
+    assert dict(reservation.amounts) == reserved
+    snapshot = await snapshots.get(fixture.investigation_id)
+    assert snapshot.budget == envelope.budget
+
+
+@pytest.mark.asyncio
+async def test_advisor_presend_proof_releases_budget_if_diagnostic_archive_fails() -> None:
+    reserved = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 3_600,
+    }
+    fixture = _Fixture(
+        responses=[],
+        tools=[
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                reserved,
+            )
+        ],
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    snapshots = InMemoryInvestigationBudgetRepository()
+    fixture.service._budget_snapshots = snapshots
+    await fixture.service._save_budget_snapshot(
+        await fixture.envelopes.get(fixture.investigation_id)
+    )
+
+    class _FailingObservationWriter:
+        async def archive(self, _invocation, _result):
+            raise RuntimeError("offline proof archive failure")
+
+    fixture.service._observation_writer = _FailingObservationWriter()
+    adapter = fixture.tools["advisor.consult"]
+    _authorize_framework_refusal_proof_adapter(adapter)
+    adapter.result = ToolResult(
+        ToolInvocationStatus.NEEDS_REVIEW,
+        error_code="advisor_preflight_refused",
+        output={"advisor_status": "needs_review", "bridge_turns_consumed": 0},
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    service = _service(fixture)
+
+    result = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={"consultation_type": "plan_investigation"},
+        purpose="Release a framework-proven local refusal.",
+        expected_version=state.version,
+        idempotency_key="advisor-presend-archive-failure",
+    )
+
+    assert result.invocation.status is ToolInvocationStatus.FAILED
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == result.invocation.operation_key
+    )
+    assert reservation.status.value == "released"
+    assert (await snapshots.get(fixture.investigation_id)).budget == envelope.budget
