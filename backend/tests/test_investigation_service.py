@@ -18,6 +18,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
+from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_composition import (
     build_investigation_composition,
     investigation_tool_dependencies_from_settings,
@@ -609,16 +610,36 @@ class _Fixture:
             )
             tool = _FakeTool(name, self.execution_order)
             self.tools[name] = tool
+            schema_version = "1"
             properties = {"query": {"type": "string", "maxLength": 500}}
-            if name == "sample.analyze":
+            required = ["query"]
+            if name == "advisor.consult":
+                schema_version = ADVISOR_SCHEMA_VERSION
+                properties = {
+                    "consultation_type": {
+                        "type": "string",
+                        "enum": [
+                            "plan_investigation",
+                            "pivot_strategy",
+                            "yara_draft",
+                            "review_text",
+                            "draft_text",
+                            "suricata_draft",
+                            "figure_plan",
+                        ],
+                    },
+                    "question": {"type": "string"},
+                }
+                required = ["consultation_type"]
+            elif name == "sample.analyze":
                 properties["association_id"] = {"type": "string", "minLength": 36, "maxLength": 36}
             definition = ToolDefinition(
                 name=name,
-                schema_version="1",
+                schema_version=schema_version,
                 input_schema={
                     "type": "object",
                     "properties": properties,
-                    "required": ["query"],
+                    "required": required,
                     "additionalProperties": False,
                 },
                 effect=effect,

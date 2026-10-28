@@ -2751,8 +2751,7 @@ async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry() -
     assert len(refused.invocation.response_refs) == 2
     proof, rejection = await fixture.service._framework_pre_submission_proof(refused.invocation)
     assert (
-        proof is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
-        and rejection is None
+        proof is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL and rejection is None
     )
     snapshot = await snapshots.get(fixture.investigation_id)
     assert snapshot.budget == latest_envelope.budget

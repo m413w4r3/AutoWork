@@ -390,9 +390,7 @@ class InvestigationAdvisorTool:
                 return self._finish(
                     context,
                     _attest_advisor_pre_submission(
-                        _advisor_budget_refusal(
-                            "execution_window_below_minimum_before_preparation"
-                        )
+                        _advisor_budget_refusal("execution_window_below_minimum_before_preparation")
                     ),
                 )
             bridge_turns_remaining = (
