@@ -149,7 +149,7 @@ async def test_note_rejects_unlisted_anchor_and_synthetic_observed_note() -> Non
 
 
 @pytest.mark.asyncio
-async def test_opinion_revise_attaches_clear_implant_text_with_bridge_refs() -> None:
+async def test_plain_text_implant_block_requires_typed_implant_materials_field() -> None:
     investigation_id = uuid4()
     opinion = current_opinion(investigation_id)
     service = OpinionService(opinion)
@@ -195,16 +195,56 @@ async def test_opinion_revise_attaches_clear_implant_text_with_bridge_refs() -> 
         context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert service.revision is not None
-    block = service.revision[2].blocks[0]
-    assert block.block_type.value == "implant_materials"
-    assert block.text == text
-    assert block.bridge_authored is True
-    assert block.bridge_draft_ref.invocation_id == draft_invocation_id
-    assert block.bridge_draft_ref.text_sha256 == text_sha256
-    assert block.bridge_review_ref.invocation_id == review_invocation_id
-    assert block.bridge_review_ref.output_sha256 == review_output_sha256
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "implant_materials_required"
+    assert result.output == {
+        "error_code": "implant_materials_required",
+        "field": "implant_materials",
+    }
+    assert "implant_materials" in result.message
+    assert service.revision is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_implant_material_row_returns_typed_field_path() -> None:
+    investigation_id = uuid4()
+    opinion = current_opinion(investigation_id)
+    service = OpinionService(opinion)
+    adapter = OperatorOpinionToolAdapter(
+        service=service,
+        investigations=SimpleNamespace(),
+        article_snapshots=ArticleSnapshots(()),
+    )
+
+    result = await adapter.execute(
+        {
+            "action": "revise",
+            "opinion_id": str(opinion.id),
+            "expected_opinion_version": opinion.version,
+            "expected_opinion_sha256": opinion.content_sha256,
+            "blocks": [],
+            "unresolved_points": [],
+            "implant_materials": [
+                {
+                    "type": "attacker_github_c2_token",
+                    "value": "ghp_" + "f" * 36,
+                    "role": "C2 token",
+                    "sample_location": "offset 0x120",
+                    "sample_sha256": "not-a-sha256",
+                    "evidence_observation_id": str(uuid4()),
+                }
+            ],
+        },
+        context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "invalid_implant_materials"
+    assert result.output == {
+        "error_code": "invalid_implant_materials",
+        "field": "implant_materials[0].sample_sha256",
+    }
+    assert service.revision is None
 
 
 def async_get(value):
@@ -280,6 +320,26 @@ def test_compose_and_revise_schemas_describe_bounded_protocol_figure_selection()
             "reviewed_text_sha256": text_sha256,
         },
     }
+    typed_row = {
+        "type": "attacker_github_c2_token",
+        "value": "ghp_" + "e" * 36,
+        "role": "C2 token",
+        "sample_location": "offset 0x120",
+        "sample_sha256": "c" * 64,
+        "evidence_observation_id": str(uuid4()),
+    }
+    for definition in definitions.values():
+        material_schema = definition.input_schema["properties"]["implant_materials"]
+        assert material_schema["maxItems"] == 100
+        assert "evidence_observation_id" in material_schema["items"]["required"]
+        validate_json_schema(
+            {"implant_materials": [typed_row]},
+            {
+                "type": "object",
+                "properties": {"implant_materials": material_schema},
+                "additionalProperties": False,
+            },
+        )
     revise_schema = definitions["opinion.revise"].input_schema
     revise_payload = {
         "action": "revise",
@@ -288,12 +348,13 @@ def test_compose_and_revise_schemas_describe_bounded_protocol_figure_selection()
         "expected_opinion_sha256": "a" * 64,
         "blocks": [implant_block],
         "unresolved_points": [],
+        "implant_materials": [typed_row],
     }
     validate_json_schema(revise_payload, revise_schema)
     compose_payload = {
         "action": "compose",
         "selection": {"finding_ids": [], "claim_ids": [], "block_types": []},
         "blocks": [implant_block],
+        "implant_materials": [typed_row],
     }
-    with pytest.raises(ValueError):
-        validate_json_schema(compose_payload, definitions["opinion.compose"].input_schema)
+    validate_json_schema(compose_payload, definitions["opinion.compose"].input_schema)

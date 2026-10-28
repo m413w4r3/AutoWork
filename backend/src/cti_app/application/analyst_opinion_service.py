@@ -10,6 +10,9 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid5
 
+from pydantic import ValidationError
+
+from cti_app.application.analyst_opinion_inputs import ImplantMaterialEdit
 from cti_app.application.investigation_contracts import (
     OperatorOpinionProtocolFigureSelectionV1,
     OperatorOpinionProtocolFiguresV1,
@@ -34,7 +37,9 @@ from cti_app.domain.analyst_opinion import (
     BridgeDraftReferenceV1,
     BridgeReviewReferenceV1,
     CitationViolation,
+    CitationViolationCode,
     ImplantMaterialEditorialV1,
+    ImplantMaterialType,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
@@ -117,10 +122,19 @@ class OpinionError(ValueError):
         code: OpinionErrorCode,
         *,
         citation_violations: tuple[CitationViolation, ...] = (),
+        field_path: str | None = None,
     ) -> None:
         self.code = code
         self.citation_violations = citation_violations
+        self.field_path = field_path
         super().__init__(code.value)
+
+
+class _OperatorOpinionInputError(ValueError):
+    def __init__(self, code: str, field_path: str) -> None:
+        self.code = code
+        self.field_path = field_path
+        super().__init__(f"{code}: {field_path}")
 
 
 class ClaimKnowledgeView(Protocol):
@@ -289,6 +303,7 @@ class AnalystOpinionService:
         *,
         protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
         draft_blocks: tuple[OpinionBlock, ...] | None = None,
+        implant_materials: tuple[ImplantMaterialEditorialV1, ...] | None = None,
     ) -> AnalystOpinionV1:
         normalized = self._normalize_selection(selection)
         opinion_id = uuid5(_OPINION_NAMESPACE, str(investigation_id))
@@ -334,6 +349,30 @@ class AnalystOpinionService:
                 if any(not isinstance(item, OpinionBlock) for item in blocks):
                     raise OpinionError(OpinionErrorCode.INVALID_SELECTION)
                 unresolved = ()
+            composed_materials = (
+                implant_materials
+                if implant_materials is not None
+                else current.implant_materials
+                if current is not None
+                else ()
+            )
+            material_section = next(
+                (
+                    block
+                    for block in blocks
+                    if block.block_type is OpinionBlockType.IMPLANT_MATERIALS
+                ),
+                None,
+            )
+            if (
+                material_section is None
+                and current is not None
+                and (implant_materials is None or composed_materials == current.implant_materials)
+            ):
+                material_section = current.implant_materials_section
+            blocks = opinion_blocks_with_implant_materials(
+                blocks, composed_materials, section=material_section
+            )
             next_version = (current.version if current else 0) + 1
             opinion = AnalystOpinionV1(
                 id=opinion_id,
@@ -363,12 +402,7 @@ class AnalystOpinionService:
             ):
                 return current
             await self._validate_bridge_provenance(uow, opinion)
-            violations = verify_opinion_citations(opinion, findings, observations)
-            if violations:
-                raise OpinionError(
-                    OpinionErrorCode.CITATIONS_INVALID,
-                    citation_violations=violations,
-                )
+            await self._validate_citations(uow, opinion)
             appended = await uow.analyst_opinions.append_version(
                 opinion, expected_version=current.version if current else 0
             )
@@ -869,6 +903,15 @@ class AnalystOpinionService:
             item.evidence_observation_id for item in opinion.implant_materials
         }
         missing_material_evidence = material_observation_refs - observation_by_id.keys()
+        invalid_material_index = next(
+            (
+                index
+                for index, item in enumerate(opinion.implant_materials)
+                if (observation := observation_by_id.get(item.evidence_observation_id)) is None
+                or observation.investigation_id != opinion.investigation_id
+            ),
+            None,
+        )
         foreign = (
             any(
                 (finding := finding_by_id.get(ref)) is not None
@@ -889,9 +932,25 @@ class AnalystOpinionService:
             )
         )
         if violations or foreign or missing_material_evidence:
+            citation_violations = violations
+            field_path = None
+            if invalid_material_index is not None:
+                invalid_item = opinion.implant_materials[invalid_material_index]
+                citation_violations = (
+                    *violations,
+                    CitationViolation(
+                        CitationViolationCode.OBSERVATION_NOT_FOUND,
+                        OpinionBlockType.IMPLANT_MATERIALS,
+                        invalid_item.evidence_observation_id,
+                        "The cited implant-material observation does not exist "
+                        "in this investigation.",
+                    ),
+                )
+                field_path = f"implant_materials[{invalid_material_index}].evidence_observation_id"
             raise OpinionError(
                 OpinionErrorCode.CITATIONS_INVALID,
-                citation_violations=violations,
+                citation_violations=citation_violations,
+                field_path=field_path,
             )
         if opinion.observations:
             base = await uow.production_artifacts.get(opinion.base_publication_artifact_id)
@@ -1480,8 +1539,12 @@ class OperatorOpinionToolAdapter:
             if action == "revise":
                 return await self._revise(arguments, context)
             return await self._note(arguments, context)
+        except _OperatorOpinionInputError as exc:
+            return _operator_opinion_input_failure(exc.code, exc.field_path)
         except OpinionError as exc:
             code = exc.code.value
+            if exc.field_path is not None:
+                return _operator_opinion_input_failure(code, exc.field_path)
             return ToolResult(
                 ToolInvocationStatus.FAILED,
                 error_code=code,
@@ -1503,6 +1566,7 @@ class OperatorOpinionToolAdapter:
         current = (await self._service.get_draft(context.investigation_id)).opinion
         if current is not None and current.status is not AnalystOpinionStatus.DRAFT:
             return _operator_opinion_failure("opinion_draft_required")
+        materials = _operator_implant_materials(arguments.get("implant_materials"))
         raw = arguments["selection"]
         if not isinstance(raw, Mapping):
             return _operator_opinion_failure("invalid_opinion_selection")
@@ -1515,15 +1579,29 @@ class OperatorOpinionToolAdapter:
             context.investigation_id, arguments.get("protocol_figures")
         )
         draft_blocks = (
-            tuple(_operator_opinion_block(item) for item in arguments["blocks"])
+            tuple(
+                _operator_opinion_block(item, allow_implant_materials=True)
+                for item in arguments["blocks"]
+            )
             if "blocks" in arguments
             else None
         )
+        if (
+            draft_blocks is not None
+            and any(
+                block.block_type is OpinionBlockType.IMPLANT_MATERIALS for block in draft_blocks
+            )
+            and not (
+                materials if materials is not None else getattr(current, "implant_materials", ())
+            )
+        ):
+            raise _OperatorOpinionInputError("implant_materials_required", "implant_materials")
         opinion = await self._service.compose_from_findings(
             context.investigation_id,
             selection,
             protocol_figures=protocol_figures,
             draft_blocks=draft_blocks,
+            implant_materials=materials,
         )
         return _operator_opinion_result(
             opinion,
@@ -1542,6 +1620,7 @@ class OperatorOpinionToolAdapter:
             or current.status is not AnalystOpinionStatus.DRAFT
         ):
             return _operator_opinion_failure("opinion_draft_required")
+        materials = _operator_implant_materials(arguments.get("implant_materials"))
         protocol_figures, figure_observation_refs = await self._protocol_figures(
             context.investigation_id, arguments.get("protocol_figures")
         )
@@ -1549,10 +1628,15 @@ class OperatorOpinionToolAdapter:
             _operator_opinion_block(item, allow_implant_materials=True)
             for item in arguments["blocks"]
         )
+        if any(block.block_type is OpinionBlockType.IMPLANT_MATERIALS for block in blocks) and not (
+            materials if materials is not None else getattr(current, "implant_materials", ())
+        ):
+            raise _OperatorOpinionInputError("implant_materials_required", "implant_materials")
         edits = OpinionRevisionEdits(
             blocks=blocks,
             unresolved_points=tuple(str(item) for item in arguments["unresolved_points"]),
             protocol_figures=protocol_figures,
+            implant_materials=materials,
         )
         opinion = await self._service.revise(
             opinion_id,
@@ -1733,15 +1817,53 @@ def register_operator_opinion_tools(
             "additionalProperties": False,
         },
     }
-    revision_blocks_schema = cast(dict[str, Any], json.loads(json.dumps(blocks_schema)))
-    revision_items = cast(dict[str, Any], revision_blocks_schema["items"])
-    revision_properties = cast(dict[str, Any], revision_items["properties"])
-    revision_properties["block_type"] = {
-        "type": "string",
-        "enum": [
-            *(item.value for item in _OPERATOR_BLOCK_TYPES),
-            OpinionBlockType.IMPLANT_MATERIALS.value,
-        ],
+
+    def editorial_blocks_schema() -> dict[str, Any]:
+        schema = cast(dict[str, Any], json.loads(json.dumps(blocks_schema)))
+        items = cast(dict[str, Any], schema["items"])
+        properties = cast(dict[str, Any], items["properties"])
+        properties["block_type"] = {
+            "type": "string",
+            "enum": [
+                *(item.value for item in _OPERATOR_BLOCK_TYPES),
+                OpinionBlockType.IMPLANT_MATERIALS.value,
+            ],
+        }
+        return schema
+
+    composition_blocks_schema = editorial_blocks_schema()
+    revision_blocks_schema = editorial_blocks_schema()
+    implant_materials_schema = {
+        "type": "array",
+        "maxItems": 100,
+        "description": (
+            "Lignes typées des matériaux d'implant. Chaque evidence_observation_id doit désigner "
+            "une observation enregistrée dans cette enquête. Fournissez ces lignes pour tout "
+            "bloc implant_materials; un bloc de texte seul ne crée pas de ligne typée."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": [item.value for item in ImplantMaterialType],
+                },
+                "value": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "role": {"type": "string", "minLength": 1, "maxLength": 300},
+                "sample_location": {"type": "string", "minLength": 1, "maxLength": 500},
+                "sample_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                "evidence_observation_id": uuid_schema,
+            },
+            "required": [
+                "type",
+                "value",
+                "role",
+                "sample_location",
+                "sample_sha256",
+                "evidence_observation_id",
+            ],
+            "additionalProperties": False,
+        },
     }
     protocol_figures_schema = {
         "type": "array",
@@ -1785,7 +1907,8 @@ def register_operator_opinion_tools(
                 "properties": {
                     "action": {"const": "compose"},
                     "protocol_figures": protocol_figures_schema,
-                    "blocks": blocks_schema,
+                    "implant_materials": implant_materials_schema,
+                    "blocks": composition_blocks_schema,
                     "selection": {
                         "type": "object",
                         "properties": {
@@ -1827,6 +1950,7 @@ def register_operator_opinion_tools(
                     "expected_opinion_version": {"type": "integer", "minimum": 1},
                     "expected_opinion_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
                     "blocks": revision_blocks_schema,
+                    "implant_materials": implant_materials_schema,
                     "unresolved_points": {
                         "type": "array",
                         "maxItems": 128,
@@ -1928,6 +2052,30 @@ def _operator_opinion_block(
     )
 
 
+def _operator_implant_materials(
+    value: object,
+) -> tuple[ImplantMaterialEditorialV1, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise _OperatorOpinionInputError("invalid_implant_materials", "implant_materials")
+    if len(value) > 100:
+        raise _OperatorOpinionInputError("invalid_implant_materials", "implant_materials")
+    result: list[ImplantMaterialEditorialV1] = []
+    for index, item in enumerate(value):
+        try:
+            validated = ImplantMaterialEdit.model_validate(item)
+        except ValidationError as exc:
+            errors = exc.errors(include_input=False)
+            suffix = ".".join(str(part) for part in errors[0]["loc"]) if errors else ""
+            field_path = f"implant_materials[{index}]"
+            if suffix:
+                field_path = f"{field_path}.{suffix}"
+            raise _OperatorOpinionInputError("invalid_implant_materials", field_path) from exc
+        result.append(validated.to_domain())
+    return tuple(result)
+
+
 def _operator_bridge_draft_ref(value: object) -> BridgeDraftReferenceV1 | None:
     if value is None:
         return None
@@ -1957,6 +2105,15 @@ def _operator_opinion_failure(code: str) -> ToolResult:
         output={"error_code": code},
         error_code=code,
         message=code,
+    )
+
+
+def _operator_opinion_input_failure(code: str, field_path: str) -> ToolResult:
+    return ToolResult(
+        ToolInvocationStatus.FAILED,
+        output={"error_code": code, "field": field_path},
+        error_code=code,
+        message=f"{code}: {field_path}",
     )
 
 
