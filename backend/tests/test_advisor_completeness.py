@@ -137,7 +137,7 @@ def test_general_contradiction_search_is_informational_without_a_targeted_claim(
     assert "Aucune réfutation connue" in dossier.text
 
 
-def test_contradiction_assertion_with_a_cited_finding_still_requires_refutation() -> None:
+def test_contradiction_assertion_with_a_cited_finding_is_informational_not_blocking() -> None:
     finding_id = str(uuid4())
     question = "Review the contradiction attached to this finding."
     data = _planning_data(question=question, evidence=[], findings=[])
@@ -152,12 +152,9 @@ def test_contradiction_assertion_with_a_cited_finding_still_requires_refutation(
     dossier = build_advisor_dossier(data)
     preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
 
-    assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
-    contradiction = _item(
-        preflight, "contradiction", f"required-contradiction:finding:{finding_id}"
-    )
-    assert contradiction["required"] is True
-    assert any(finding_id in row["ref"] for row in preflight["missing_refs"])
+    # A refutation is never a hard prerequisite: the consultation proceeds and says so.
+    assert preflight["status"] == "READY"
+    assert preflight["missing_refs"] == []
 
 
 def test_canonical_contradiction_omitted_from_dossier_requests_retrieval() -> None:
