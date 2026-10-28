@@ -26,6 +26,7 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import (
+    RAW_SAMPLE_BYTES_OMISSION_REASON,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -103,7 +104,7 @@ ADVISOR_RESPONSE_SCHEMA = ADVISOR_RESPONSE_SCHEMA_V2
 _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
-MAX_ADVISOR_TOOL_SECONDS = 3_600
+MAX_ADVISOR_TRANSPORT_TIMEOUT_SECONDS = 7_200
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
 # the archive timeout and the 35s advisor preparation/scheduling margin. This
@@ -411,7 +412,6 @@ class InvestigationAdvisorTool:
                     editorial_units,
                     maximum_units=len(editorial_units),
                     execution_timeout_seconds=execution_timeout_seconds,
-                    execution_deadline_monotonic=execution_deadline_monotonic,
                     bridge_turns_remaining=bridge_turns_remaining,
                 )
             pacing_result = await self._check_advisor_limits(
@@ -557,6 +557,16 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            encoded_source_findings = tuple(prompt_data.pop("_encoded_secret_findings", ()))
+            if encoded_source_findings:
+                return await self._persist_preflight_refusal(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    reason="autowork_credential_or_signed_url_detected",
+                    redacted_secret_count=len(encoded_source_findings),
+                    secret_findings=encoded_source_findings,
+                )
             if restricted_sample_hashes:
                 resolved_evidence_ref_values: list[UUID] = []
                 for item in prompt_data.get("evidence", ()):
@@ -1183,10 +1193,6 @@ class InvestigationAdvisorTool:
                     BudgetDimension.BRIDGE_TURNS: consumed_turns,
                     BudgetDimension.CONTEXT_BYTES: len(encoded),
                     BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
-                    BudgetDimension.TOOL_SECONDS: min(
-                        execution_timeout_seconds,
-                        max(1, math.ceil(time.monotonic() - started_at)),
-                    ),
                 },
                 error_code="advisor_output_persistence_uncertain",
                 output={
@@ -1212,10 +1218,6 @@ class InvestigationAdvisorTool:
                     BudgetDimension.BRIDGE_TURNS: consumed_turns,
                     BudgetDimension.CONTEXT_BYTES: len(encoded),
                     BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
-                    BudgetDimension.TOOL_SECONDS: min(
-                        execution_timeout_seconds,
-                        max(1, math.ceil(time.monotonic() - started_at)),
-                    ),
                 },
                 error_code="advisor_output_object_limit_exceeded",
                 output={
@@ -1241,7 +1243,6 @@ class InvestigationAdvisorTool:
                 advisor_source_refs,
                 len(encoded),
                 consultation_type,
-                min(execution_timeout_seconds, math.ceil(time.monotonic() - started_at)),
                 {item.name: item.schema_version for item in available_tool_definitions},
                 {
                     item.name: item.input_schema
@@ -1249,7 +1250,6 @@ class InvestigationAdvisorTool:
                     if isinstance(getattr(item, "input_schema", None), Mapping)
                 },
                 prompt_data=prompt_data,
-                execution_timeout_seconds=execution_timeout_seconds,
             )
         if submission_proves_no_execution:
             result = _attest_advisor_pre_submission(result)
@@ -1596,16 +1596,13 @@ class InvestigationAdvisorTool:
         units: list[Any] | tuple[Any, ...],
         *,
         maximum_units: int,
-        execution_timeout_seconds: int = MAX_ADVISOR_TOOL_SECONDS,
-        execution_deadline_monotonic: float | None = None,
+        execution_timeout_seconds: int = MAX_ADVISOR_TRANSPORT_TIMEOUT_SECONDS,
         bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         units = list(units)
         chunks = [
             units[index : index + maximum_units] for index in range(0, len(units), maximum_units)
         ]
-        if execution_deadline_monotonic is None:
-            execution_deadline_monotonic = time.monotonic() + execution_timeout_seconds
         available_bridge_turns = (
             bridge_turns_remaining
             if bridge_turns_remaining is not None
@@ -1633,7 +1630,6 @@ class InvestigationAdvisorTool:
             )
         results: list[ToolResult] = []
         unprocessed_units: list[str] = []
-        consumed_execution_seconds = 0
         minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
         if minimum_execution_seconds is None:
             return self._finish(
@@ -1643,52 +1639,6 @@ class InvestigationAdvisorTool:
                 ),
             )
         for index, chunk in enumerate(chunks, start=1):
-            deadline_remaining_seconds = math.floor(execution_deadline_monotonic - time.monotonic())
-            remaining_execution_seconds = min(
-                execution_timeout_seconds - consumed_execution_seconds,
-                deadline_remaining_seconds,
-            )
-            if remaining_execution_seconds < minimum_execution_seconds:
-                prior_batch_was_submitted = bool(results)
-                budget_refusal = _advisor_budget_refusal(
-                    "execution_window_below_minimum_before_next_batch"
-                )
-                results.append(
-                    budget_refusal
-                    if prior_batch_was_submitted
-                    else _attest_advisor_pre_submission(budget_refusal)
-                )
-                combined = _combine_editorial_batch_results(results)
-                # This is a mixed outcome: earlier batches already reached Bridge,
-                # while the next batch was refused locally. Preserve their usage
-                # and never let the local refusal clear the whole operation's charge.
-                status = (
-                    ToolInvocationStatus.PARTIAL
-                    if prior_batch_was_submitted
-                    else ToolInvocationStatus.NEEDS_REVIEW
-                )
-                return self._finish(
-                    context,
-                    replace(
-                        combined,
-                        status=status,
-                        output={
-                            **combined.output,
-                            "advisor_status": (
-                                "partial" if prior_batch_was_submitted else "needs_review"
-                            ),
-                            "failure_stage": "budget_admission",
-                            "failure_reason": "execution_window_below_minimum_before_next_batch",
-                            "confirmed_non_execution": not prior_batch_was_submitted,
-                            "unprocessed_unit_ids": [
-                                str(item.get("id"))
-                                for later_chunk in chunks[index - 1 :]
-                                for item in later_chunk
-                                if isinstance(item, Mapping)
-                            ],
-                        },
-                    ),
-                )
             child_arguments = dict(arguments)
             child_arguments["units"] = chunk
             child_arguments.pop("assertions", None)
@@ -1706,16 +1656,21 @@ class InvestigationAdvisorTool:
                 child_arguments,
                 child_context,
                 _editorial_batch_child=True,
-                _execution_timeout_seconds=remaining_execution_seconds,
-                _execution_deadline_monotonic=execution_deadline_monotonic,
+                _execution_timeout_seconds=execution_timeout_seconds,
                 # The outer plan allocates one reserved Bridge turn to each
                 # child. A child cannot recursively multiply that allowance.
                 _bridge_turns_remaining=1,
                 _reservation_operation_key=context.idempotency_key,
             )
-            consumed_execution_seconds += batch_result.budget_consumed.get(
-                BudgetDimension.TOOL_SECONDS, 0
-            )
+            if BudgetDimension.TOOL_SECONDS in batch_result.budget_consumed:
+                batch_result = replace(
+                    batch_result,
+                    budget_consumed={
+                        dimension: amount
+                        for dimension, amount in batch_result.budget_consumed.items()
+                        if dimension is not BudgetDimension.TOOL_SECONDS
+                    },
+                )
             batch_result = replace(
                 batch_result,
                 output={
@@ -1904,6 +1859,47 @@ class InvestigationAdvisorTool:
             result.append(item)
         return tuple(result)
 
+    async def _omit_raw_sample_byte_observations(
+        self, evidence: Sequence[EvidenceObservation]
+    ) -> tuple[tuple[EvidenceObservation, ...], tuple[dict[str, str], ...]]:
+        safe: list[EvidenceObservation] = []
+        omitted: list[dict[str, str]] = []
+        blob_reader = getattr(self._blobs, "get", None)
+        for item in evidence:
+            try:
+                blob = await blob_reader(item.blob_id) if callable(blob_reader) else None
+            except Exception:
+                blob = None
+            descriptor = getattr(blob, "descriptor", None)
+            logical_bucket = getattr(descriptor, "logical_bucket", None)
+            object_type = item.object_type.casefold().replace("-", "_")
+            source = item.source.casefold().replace("-", "_")
+            explicitly_raw_sample = object_type in {
+                "sample_bytes",
+                "raw_sample_bytes",
+                "sample_binary",
+                "raw_sample",
+            }
+            acquisition_sample_blob = object_type in {"sample", "sample_blob"} and source in {
+                "virustotal.sample_download",
+                "investigation.subject_sample_reuse",
+            }
+            verified_quarantined_blob = (
+                getattr(descriptor, "sha256", None) == item.sha256
+                and logical_bucket == "samples-quarantine"
+            )
+            if explicitly_raw_sample or acquisition_sample_blob or verified_quarantined_blob:
+                omitted.append(
+                    {
+                        "evidence_id": str(item.id),
+                        "sha256": item.sha256,
+                    }
+                )
+            else:
+                safe.append(item)
+        omitted.sort(key=lambda row: row["evidence_id"])
+        return tuple(safe), tuple(omitted)
+
     async def _validated_assertions(
         self, investigation_id: UUID, raw_assertions: object
     ) -> list[dict[str, Any]]:
@@ -2053,8 +2049,11 @@ class InvestigationAdvisorTool:
             "candidate_rules": [],
             "gaps": [],
             "truncation": {},
+            "_encoded_secret_findings": [],
         }
         editorial = consultation_type in {"draft_text", "review_text"}
+        evidence, omitted_raw_sample_bytes = await self._omit_raw_sample_byte_observations(evidence)
+        base["omitted_raw_sample_byte_observations"] = list(omitted_raw_sample_bytes)
         if editorial:
             # Local availability state is not an investigation fact Bridge can verify.
             base.pop("gaps")
@@ -2283,6 +2282,13 @@ class InvestigationAdvisorTool:
                 evidence=evidence,
                 prompt_data=base,
             )
+            editorial_omissions = base.get("omitted_raw_sample_byte_observations", ())
+            base["omitted_raw_sample_byte_observations"] = list(
+                {
+                    item["evidence_id"]: item
+                    for item in (*omitted_raw_sample_bytes, *editorial_omissions)
+                }.values()
+            )
             base["evidence"] = evidence_payload
             base["measured_facts"] = measured_facts
             base["findings"] = finding_payload
@@ -2445,9 +2451,11 @@ class InvestigationAdvisorTool:
                 (
                     row["content_excerpts"],
                     row["blob_read_verified"],
+                    encoded_secret_findings,
                 ) = await self._observation_content_projection(
                     item, include_unclassified=str(item.id) in explicit_observation_ids
                 )
+                base["_encoded_secret_findings"].extend(encoded_secret_findings)
                 try:
                     measured_rows = await self._measurement_rows(item)
                 except _AdvisorInputValidationError:
@@ -2554,6 +2562,7 @@ class InvestigationAdvisorTool:
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
+            encoded_secret_findings = base["_encoded_secret_findings"]
             base = {
                 "investigation_id": str(investigation_id),
                 "consultation_type": consultation_type,
@@ -2568,6 +2577,7 @@ class InvestigationAdvisorTool:
                 "gaps": base["gaps"],
                 "limitation": "These measured fields are untrusted and may be incomplete.",
                 "truncation": {},
+                "_encoded_secret_findings": encoded_secret_findings,
             }
         elif consultation_type == "suricata_draft":
             network_facts: list[dict[str, Any]] = []
@@ -2642,6 +2652,8 @@ class InvestigationAdvisorTool:
                 for index, measurement in enumerate(measurements, start=1)
             ]
         sample_rows = await self._sample_inventory(investigation_id, evidence)
+        for row in sample_rows:
+            base["_encoded_secret_findings"].extend(row.pop("_encoded_secret_findings", ()))
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
         mime_types_by_evidence: dict[str, list[str]] = {}
@@ -2693,6 +2705,7 @@ class InvestigationAdvisorTool:
                 if missing_provenance:
                     excerpt["title"] = title + "; " + "; ".join(missing_provenance)
         compacted = _compact_advisor_data(base, consultation_type)
+        compacted["_encoded_secret_findings"] = base.get("_encoded_secret_findings", [])
         if consultation_type in {"draft_text", "yara_draft", "suricata_draft", "figure_plan"}:
             compacted["transmitted_refs"] = _typed_transmitted_refs(compacted, snapshot)
         return compacted
@@ -2702,7 +2715,7 @@ class InvestigationAdvisorTool:
         *,
         investigation_id: UUID,
         evidence: tuple[EvidenceObservation, ...],
-        prompt_data: Mapping[str, Any],
+        prompt_data: dict[str, Any],
     ) -> tuple[
         tuple[EvidenceObservation, ...],
         list[dict[str, Any]],
@@ -2788,6 +2801,11 @@ class InvestigationAdvisorTool:
                     raise _AdvisorInputValidationError("editorial_reference_unavailable")
                 finding_items.append(item)
 
+        safe_observations, omitted_raw_sample_bytes = await self._omit_raw_sample_byte_observations(
+            observation_items
+        )
+        observation_items = list(safe_observations)
+
         observation_payload: list[dict[str, Any]] = []
         measured_payload: list[dict[str, Any]] = []
         for item in observation_items:
@@ -2801,9 +2819,11 @@ class InvestigationAdvisorTool:
             (
                 row["content_excerpts"],
                 row["blob_read_verified"],
+                encoded_secret_findings,
             ) = await self._observation_content_projection(
                 item, include_unclassified=item.id in explicit_observation_refs
             )
+            prompt_data.setdefault("_encoded_secret_findings", []).extend(encoded_secret_findings)
             observation_payload.append(row)
 
             try:
@@ -2922,6 +2942,13 @@ class InvestigationAdvisorTool:
             }
             for item in finding_items
         ]
+        existing_omissions = prompt_data.get("omitted_raw_sample_byte_observations", ())
+        prompt_data["omitted_raw_sample_byte_observations"] = list(
+            {
+                item["evidence_id"]: item
+                for item in (*existing_omissions, *omitted_raw_sample_bytes)
+            }.values()
+        )
         return tuple(observation_items), observation_payload, measured_payload, finding_payload
 
     async def _sample_inventory(
@@ -2977,79 +3004,71 @@ class InvestigationAdvisorTool:
             sample_state = getattr(sample_state, "value", sample_state)
             sample_origin = getattr(sample, "origin_kind", getattr(sample, "origin", "unknown"))
             sample_origin = getattr(sample_origin, "value", sample_origin)
-            blob_content: bytes | None = None
-            content_status = "verified"
-            try:
-                blob_content = await self._artifact_store.read_bytes(
-                    blob_id, max_bytes=descriptor.size
-                )
-                if (
-                    len(blob_content) != descriptor.size
-                    or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
-                ):
-                    blob_content = None
-                    content_status = "blob_content_verification_failed"
-            except Exception:
-                content_status = "blob_content_unavailable"
             raw_mime_type = getattr(descriptor, "mime_type", "application/octet-stream")
             mime_type = (
                 raw_mime_type.strip()
                 if isinstance(raw_mime_type, str) and raw_mime_type.strip()
                 else "application/octet-stream"
             )
-            rows.append(
-                {
-                    "verified": True,
-                    "sample_id": str(getattr(sample, "id", "unknown")),
-                    "association_id": str(getattr(association, "id", "unknown")),
-                    "sha256": association.sample_sha256,
-                    "blob_id": str(blob_id),
-                    "blob_sha256": descriptor.sha256,
-                    "expected_hash": getattr(sample, "expected_hash", None),
-                    "source_object_id": getattr(sample, "source_object_id", None),
-                    "evidence_ids": [str(item.id) for item in associated_observations],
-                    "evidence_blob_ids": [str(item.blob_id) for item in associated_observations],
-                    "evidence_sha256s": [item.sha256 for item in associated_observations],
-                    "mime_type": mime_type,
-                    "byte_length": descriptor.size,
-                    "encoding": "base64",
-                    "content_base64": (
-                        base64.b64encode(blob_content).decode("ascii")
-                        if blob_content is not None
-                        else ""
+            row = {
+                "verified": True,
+                "sample_id": str(getattr(sample, "id", "unknown")),
+                "association_id": str(getattr(association, "id", "unknown")),
+                "sha256": association.sample_sha256,
+                "blob_id": str(blob_id),
+                "blob_sha256": descriptor.sha256,
+                "expected_hash": getattr(sample, "expected_hash", None),
+                "source_object_id": getattr(sample, "source_object_id", None),
+                "evidence_ids": [str(item.id) for item in associated_observations],
+                "evidence_blob_ids": [str(item.blob_id) for item in associated_observations],
+                "evidence_sha256s": [item.sha256 for item in associated_observations],
+                "mime_type": mime_type,
+                "byte_length": descriptor.size,
+                "content_status": "omitted_by_policy",
+                "content_omission_reason": RAW_SAMPLE_BYTES_OMISSION_REASON,
+                "association_status": _safe_text(
+                    getattr(
+                        getattr(association, "qualification", "unknown"),
+                        "value",
+                        getattr(association, "qualification", "unknown"),
                     ),
-                    "content_status": content_status,
-                    "association_status": _safe_text(
-                        getattr(
-                            getattr(association, "qualification", "unknown"),
-                            "value",
-                            getattr(association, "qualification", "unknown"),
-                        ),
-                        32,
+                    32,
+                ),
+                "analysis_engines": engines,
+                "analysis_status_by_engine": [
+                    {"engine": engine, "status": "evidence_recorded"} for engine in engines
+                ],
+                "related_sample_sha256": list(getattr(association, "related_sample_sha256", ())),
+                "state": _safe_text(sample_state, 32),
+                "origin": _safe_text(sample_origin, 64),
+                "original_name": _safe_text(getattr(sample, "original_name", ""), 256),
+                "source_service": _safe_text(getattr(sample, "source_service", ""), 64),
+                "tlp": _safe_text(
+                    getattr(
+                        getattr(sample, "tlp", "unknown"),
+                        "value",
+                        getattr(sample, "tlp", "unknown"),
                     ),
-                    "analysis_engines": engines,
-                    "analysis_status_by_engine": [
-                        {"engine": engine, "status": "evidence_recorded"} for engine in engines
-                    ],
-                    "related_sample_sha256": list(
-                        getattr(association, "related_sample_sha256", ())
-                    ),
-                    "state": _safe_text(sample_state, 32),
-                    "origin": _safe_text(sample_origin, 64),
-                    "original_name": _safe_text(getattr(sample, "original_name", ""), 256),
-                    "source_service": _safe_text(getattr(sample, "source_service", ""), 64),
-                    "tlp": _safe_text(
-                        getattr(
-                            getattr(sample, "tlp", "unknown"),
-                            "value",
-                            getattr(sample, "tlp", "unknown"),
-                        ),
-                        16,
-                    ),
-                    "do_not_submit": bool(getattr(sample, "do_not_submit", False)),
-                    "external_llm_allowed": bool(getattr(sample, "external_llm_allowed", True)),
-                }
-            )
+                    16,
+                ),
+                "do_not_submit": bool(getattr(sample, "do_not_submit", False)),
+                "external_llm_allowed": bool(getattr(sample, "external_llm_allowed", True)),
+            }
+            try:
+                blob_content = await self._artifact_store.read_bytes(
+                    blob_id, max_bytes=descriptor.size
+                )
+            except Exception:
+                blob_content = None
+            if (
+                blob_content is not None
+                and len(blob_content) == descriptor.size
+                and hashlib.sha256(blob_content).hexdigest() == association.sample_sha256
+            ):
+                row["_encoded_secret_findings"] = list(
+                    _contains_encoded_operational_secrets(blob_content, settings=self._settings)
+                )
+            rows.append(row)
         return rows
 
     async def _measured_protocol_facts(
@@ -3272,20 +3291,27 @@ class InvestigationAdvisorTool:
         self, observation: EvidenceObservation
     ) -> list[dict[str, str]]:
         """Read only integrity-verified JSON evidence and retain its content facts."""
-        excerpts, _read_verified = await self._observation_content_projection(observation)
+        excerpts, _read_verified, _secret_findings = await self._observation_content_projection(
+            observation
+        )
         return excerpts
 
     async def _observation_content_projection(
         self, observation: EvidenceObservation, *, include_unclassified: bool = False
-    ) -> tuple[list[dict[str, str]], bool]:
+    ) -> tuple[list[dict[str, str]], bool, tuple[PublicationSecretFinding, ...]]:
         """Return extracted facts and whether the canonical blob read verified."""
         try:
             payload = await self._measurement_payload(observation)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             payload = None
         if payload is None:
-            return [], False
-        return extract_content_excerpts(payload, include_unclassified=include_unclassified), True
+            return [], False, ()
+        secret_findings = _contains_encoded_operational_secrets(payload, settings=self._settings)
+        return (
+            extract_content_excerpts(payload, include_unclassified=include_unclassified),
+            True,
+            secret_findings,
+        )
 
     async def _measurement_payload(
         self, observation: EvidenceObservation
@@ -3664,12 +3690,10 @@ class InvestigationAdvisorTool:
         source_refs: tuple[str, ...],
         input_bytes: int,
         consultation_type: str,
-        elapsed_seconds: int,
         available_tools: Mapping[str, str],
         available_tool_schemas: Mapping[str, Mapping[str, Any]],
         *,
         prompt_data: Mapping[str, Any],
-        execution_timeout_seconds: int | None = None,
     ) -> ToolResult:
         code = (submission.error_code or "").casefold()
         bridge_turns_consumed = _bridge_turns_consumed(submission)
@@ -3677,14 +3701,10 @@ class InvestigationAdvisorTool:
         failure_reason = (
             submission.failure_reason or submission.error_code or submission.status.value
         )
-        tool_seconds_ceiling = _advisor_tool_seconds_limit(self._settings)
-        if execution_timeout_seconds is not None:
-            tool_seconds_ceiling = min(tool_seconds_ceiling, execution_timeout_seconds)
         usage = {
             BudgetDimension.BRIDGE_TURNS: bridge_turns_consumed,
             BudgetDimension.CONTEXT_BYTES: input_bytes,
             BudgetDimension.CONTEXT_TOKENS: max(1, (input_bytes + 3) // 4),
-            BudgetDimension.TOOL_SECONDS: min(tool_seconds_ceiling, max(1, elapsed_seconds)),
         }
         if submission.status is TurnSubmissionStatus.BLOCKED:
             return ToolResult(
@@ -3874,7 +3894,6 @@ class InvestigationAdvisorTool:
                 BudgetDimension.BRIDGE_TURNS: 1,
                 BudgetDimension.CONTEXT_BYTES: input_bytes,
                 BudgetDimension.CONTEXT_TOKENS: max(1, (input_bytes + 3) // 4),
-                BudgetDimension.TOOL_SECONDS: usage[BudgetDimension.TOOL_SECONDS],
             },
             output=advisor_output,
             message="Bridge returned an untrusted advisory.",
@@ -3985,7 +4004,6 @@ def register_investigation_advisor_tool(
     adapter: InvestigationAdvisorTool,
 ) -> None:
     _authorize_framework_refusal_proof_adapter(adapter)
-    max_tool_seconds = _advisor_tool_seconds_limit(adapter._settings)
     uuid_schema = {
         "type": "string",
         "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
@@ -4119,10 +4137,7 @@ def register_investigation_advisor_tool(
                 "additionalProperties": False,
             },
             effect=ToolEffect.EXTERNAL_READ,
-            cost_model={
-                BudgetDimension.BRIDGE_TURNS: 1,
-                BudgetDimension.TOOL_SECONDS: max_tool_seconds,
-            },
+            cost_model={BudgetDimension.BRIDGE_TURNS: 1},
             confidentiality=ToolConfidentiality.CONFIDENTIAL,
             limitations=(
                 "Returns untrusted typed proposals only; no tool execution or canonical mutation.",
@@ -4955,11 +4970,6 @@ def _advisor_reserved_budget(
     return {}
 
 
-def _advisor_tool_seconds_limit(settings: Any) -> int:
-    value = getattr(settings, "investigation_max_tool_seconds", MAX_ADVISOR_TOOL_SECONDS)
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 3_600
-
-
 def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
     """Attach typed proof only when advisor code has a zero-turn no-send result."""
     if result.framework_pre_submission_proof is not None:
@@ -5037,11 +5047,7 @@ def _advisor_execution_timeout(
     context: ToolExecutionContext,
     settings: Any,
 ) -> tuple[int, ToolResult | None]:
-    """Return the hard call cap from this operation's live G2 reservation.
-
-    Duration-based cost estimation from ModelRun.duration_ms is DEFERred; this
-    enforces only the hard execution bound and never predicts provider cost.
-    """
+    """Return a per-call transport hang guard, independent of budget accounting."""
     reservation = next(
         (
             item
@@ -5051,18 +5057,17 @@ def _advisor_execution_timeout(
         None,
     )
     if reservation is None or reservation.status is not BudgetReservationStatus.RESERVED:
-        reason = "tool_seconds_reservation_missing_or_inactive"
-        return 0, _advisor_budget_refusal(reason)
+        return 0, _advisor_budget_refusal("bridge_turn_reservation_missing_or_inactive")
     if reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0) < 1:
         return 0, _advisor_budget_refusal("bridge_turn_reservation_missing_or_insufficient")
     minimum_execution_seconds = _advisor_minimum_execution_seconds(settings)
     if minimum_execution_seconds is None:
         return 0, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
-    reserved_seconds = reservation.amounts.get(BudgetDimension.TOOL_SECONDS, 0)
-    if reserved_seconds < minimum_execution_seconds:
-        return 0, _advisor_budget_refusal("tool_seconds_reservation_below_minimum")
-
-    role_timeout = getattr(settings, "openai_bridge_wait_timeout_research_seconds", 7_200.0)
+    role_timeout = getattr(
+        settings,
+        "openai_bridge_wait_timeout_research_seconds",
+        MAX_ADVISOR_TRANSPORT_TIMEOUT_SECONDS,
+    )
     if (
         isinstance(role_timeout, bool)
         or not isinstance(role_timeout, int | float)
@@ -5070,7 +5075,7 @@ def _advisor_execution_timeout(
         or role_timeout <= 0
     ):
         return 0, _advisor_budget_refusal("research_role_timeout_invalid")
-    effective_timeout = math.floor(min(reserved_seconds, role_timeout))
+    effective_timeout = math.floor(min(role_timeout, MAX_ADVISOR_TRANSPORT_TIMEOUT_SECONDS))
     if effective_timeout < minimum_execution_seconds:
         return 0, _advisor_budget_refusal("effective_execution_timeout_below_minimum")
     return effective_timeout, None
@@ -5106,7 +5111,7 @@ def _advisor_budget_refusal(reason: str) -> ToolResult:
             "bridge_turns_consumed": 0,
             "retry": False,
         },
-        budget_consumed={dimension: 0 for dimension in BudgetDimension},
+        budget_consumed={BudgetDimension.BRIDGE_TURNS: 0},
     )
 
 
@@ -5461,6 +5466,8 @@ def _transmitted_refs_for_dossier(
     """Limit attached provenance to facts that the text dossier actually sends."""
     selected: set[tuple[str, str]] = set()
     for item in manifest:
+        if item.get("omitted") is True:
+            continue
         kind = item.get("kind")
         identifier = item.get("id")
         if isinstance(kind, str) and isinstance(identifier, str):
