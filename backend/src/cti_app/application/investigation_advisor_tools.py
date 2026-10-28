@@ -11,11 +11,14 @@ import binascii
 import copy
 import hashlib
 import json
+import logging
 import math
 import re
 import time
+import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -123,6 +126,21 @@ _SECRET = re.compile(
     r"authorization|credential|password|secret)\s*[:=]\s*[^\s,;]+"
 )
 _REDACTED_SECRET = "[clé masquée]"
+
+
+logger = logging.getLogger(__name__)
+
+
+def _internal_failure_detail(exc: BaseException) -> dict[str, str | int]:
+    """Bounded, code-only description of an unexpected local preparation error."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    last = frames[-1] if frames else None
+    location = f"{Path(last.filename).name}:{last.lineno} {last.name}" if last else "unknown"
+    return {
+        "exception_class": type(exc).__name__,
+        "location": location,
+        "message": " ".join(str(exc).split())[:160],
+    }
 
 
 class _AdvisorInputValidationError(ValueError):
@@ -1042,11 +1060,17 @@ class InvestigationAdvisorTool:
                 observation_refs=tuple(item.id for item in evidence),
                 measurement_errors=exc.measurement_errors,
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "advisor dossier preparation raised %s",
+                type(exc).__name__,
+                exc_info=True,
+            )
             return await self._input_failure(
                 context,
                 "advisor_input_rejected",
                 observation_refs=tuple(item.id for item in evidence),
+                internal_detail=_internal_failure_detail(exc),
             )
         except Exception as exc:
             return await self._persist_preflight_failure(
@@ -1794,6 +1818,7 @@ class InvestigationAdvisorTool:
         *,
         observation_refs: tuple[UUID, ...] = (),
         measurement_errors: tuple[dict[str, int | str], ...] = (),
+        internal_detail: Mapping[str, str | int] | None = None,
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
         message = (
@@ -1803,6 +1828,12 @@ class InvestigationAdvisorTool:
             )
             if measurement_errors
             else f"Advisor input rejected before Bridge submission: {reason_code}."
+            + (
+                f" ({internal_detail.get('exception_class')} at "
+                f"{internal_detail.get('location')}: {internal_detail.get('message')})"
+                if internal_detail
+                else ""
+            )
         )
         result = await self._persist_preflight_failure(
             context,
@@ -1817,6 +1848,7 @@ class InvestigationAdvisorTool:
                 "invocation_stage": "prevalidation",
                 "bridge_turns_consumed": 0,
                 **({"measurement_errors": list(measurement_errors)} if measurement_errors else {}),
+                **({"input_error_detail": dict(internal_detail)} if internal_detail else {}),
                 "bridge_invocation_id": None,
                 "provider_usage": {"status": "not_submitted"},
                 "context_estimate": {
