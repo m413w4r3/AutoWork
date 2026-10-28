@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -45,6 +46,11 @@ from cti_app.application.virustotal import (
     VirusTotalRoutingPolicy,
 )
 from cti_app.config import Settings
+from cti_app.domain.external_effects import (
+    EvidenceReference,
+    ExternalEffectAuthority,
+    ExternalEffectAuthorityKind,
+)
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
@@ -111,6 +117,98 @@ def _uow():
         sample_associations=InMemorySampleAssociationRepository(),
         analyst_opinions=InMemoryAnalystOpinionRepository(),
     )
+
+
+@pytest.mark.asyncio
+async def test_production_composition_builds_osint_policy_advisor_binding_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application import bridge_investigator as bridge_module
+    from cti_app.application.bridge_investigator import (
+        TurnSubmission,
+        TurnSubmissionStatus,
+        submit_bridge_consultation_once,
+    )
+    from cti_app.application.model_gateway import BridgeExternalEffectBinding
+    from cti_app.infrastructure.investigation_runtime_ports import (
+        build_investigation_runtime_composition_factory,
+    )
+    from tests.test_investigation_runtime_ports import _runtime_inputs
+
+    settings = Settings(
+        _env_file=None,
+        openai_bridge_base_url="https://bridge.test/v1",
+    )
+    runtime_inputs = _runtime_inputs(settings)
+    runtime_inputs["external_effect_coordinator"] = cast(Any, object())
+    runtime = build_investigation_runtime_composition_factory(**runtime_inputs)
+    composition = runtime.composition_factory.build(_uow(), uuid4(), operator_mode=True)
+
+    assert composition.advisor_tool is not None
+    transport = composition.advisor_tool._transport
+    submitted: dict[str, Any] = {}
+
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return True
+
+    async def fake_external_submission(**kwargs: Any) -> TurnSubmission:
+        submitted.update(kwargs)
+        return TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="synthetic")
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    monkeypatch.setattr(transport, "submit", fake_external_submission)
+    subject_id = uuid4()
+    authority = ExternalEffectAuthority(
+        investigation_id=uuid4(),
+        invocation_id=uuid4(),
+        operation_key="offline-advisor-binding",
+        reservation_amounts={
+            "bridge_turns": 1,
+            "tool_seconds": 120,
+            "context_bytes": 4096,
+            "context_tokens": 1024,
+        },
+        expected_envelope_version=1,
+        approval_decision_id=uuid4(),
+        invocation_arguments_sha256="e" * 64,
+        authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
+        policy_event_id=uuid4(),
+        policy_version="offline-policy-v1",
+        pinned_subject_id=subject_id,
+    )
+    evidence_refs = (
+        EvidenceReference(
+            kind="evidence_observation",
+            id=str(uuid4()),
+            version="offline-observation-v1",
+            sha256="f" * 64,
+        ),
+    )
+
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=authority.investigation_id,
+        subject_id=subject_id,
+        turn_index=1,
+        context_sha256="c" * 64,
+        prompt="Synthetic advisor request.",
+        external_llm_allowed=True,
+        settings=settings,
+        external_effect_binding_context={
+            "authority_context": authority,
+            "evidence_refs": evidence_refs,
+            "invocation_arguments": {"consultation_type": "review_text"},
+            "reservation_operation_key": authority.operation_key,
+        },
+    )
+
+    binding = submitted.get("bridge_external_effect_binding")
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert isinstance(binding, BridgeExternalEffectBinding)
+    assert binding.authority is authority
+    assert binding.family == "advisor.consultation.v1"
+    assert binding.evidence_refs == evidence_refs
 
 
 def test_composition_keeps_built_in_local_capability_without_optional_ports() -> None:

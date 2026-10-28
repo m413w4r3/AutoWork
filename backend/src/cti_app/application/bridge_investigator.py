@@ -362,8 +362,25 @@ async def submit_bridge_consultation_once(
         }
         binding_builder = getattr(transport, "build_external_effect_binding", None)
         binding: BridgeExternalEffectBinding | None = None
+        requires_authority = bool(getattr(transport, "requires_external_effect_authority", False))
+        builder_available = getattr(
+            transport,
+            "external_effect_binding_builder_available",
+            callable(binding_builder),
+        )
+        if requires_authority and (not callable(binding_builder) or builder_available is False):
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                idempotency_key=key,
+                conversation_id=conversation_id,
+                detail="Advisor external-effect authorization is required.",
+                error_code="external_effect_authority_required",
+                submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                failure_stage="external_effect_authority",
+                failure_reason="builder_missing",
+            )
+        binding_context = dict(external_effect_binding_context or {})
         if callable(binding_builder):
-            binding_context = dict(external_effect_binding_context or {})
             binding_context.update(
                 family="advisor.consultation.v1",
                 investigation_id=investigation_id,
@@ -388,7 +405,12 @@ async def submit_bridge_consultation_once(
                 )
         if binding is not None:
             submission_kwargs["bridge_external_effect_binding"] = binding
-        elif getattr(transport, "requires_external_effect_authority", False):
+        elif requires_authority:
+            failure_reason = (
+                "authority_context_missing"
+                if binding_context.get("authority_context") is None
+                else "builder_returned_none"
+            )
             return TurnSubmission(
                 TurnSubmissionStatus.UNAVAILABLE,
                 idempotency_key=key,
@@ -397,7 +419,7 @@ async def submit_bridge_consultation_once(
                 error_code="external_effect_authority_required",
                 submission_state=BridgeSubmissionState.PRE_SUBMISSION,
                 failure_stage="external_effect_authority",
-                failure_reason="authority_context_missing",
+                failure_reason=failure_reason,
             )
         if attempt == 0:
             return await transport.submit(
@@ -647,6 +669,10 @@ class ModelConversationTurnTransport:
         self.requires_external_effect_authority = (
             require_external_effect_authority or bridge_external_effect_binding_factory is not None
         )
+
+    @property
+    def external_effect_binding_builder_available(self) -> bool:
+        return self._bridge_external_effect_binding_factory is not None
 
     async def build_external_effect_binding(
         self, *, family: str, **attempt: Any

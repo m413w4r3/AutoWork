@@ -732,6 +732,13 @@ class _PermissionAwareInvestigationTransport:
             getattr(transport, "requires_external_effect_authority", False)
         )
 
+    @property
+    def external_effect_binding_builder_available(self) -> bool:
+        availability = getattr(self._transport, "external_effect_binding_builder_available", None)
+        if isinstance(availability, bool):
+            return availability
+        return callable(getattr(self._transport, "build_external_effect_binding", None))
+
     async def build_external_effect_binding(
         self, *, family: str, **attempt: Any
     ) -> BridgeExternalEffectBinding | None:
