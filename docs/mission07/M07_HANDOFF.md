@@ -1,5 +1,65 @@
 # Mission 07 — handoff / registre (orchestrateur)
 
+> **Relève analyste CTI — 2026-10-28 08:18 UTC.** Cette section remplace
+> les consignes de reprise plus bas pour l'état courant de la phase C.
+
+## État final de l'essai Bridge
+
+- Investigation `a8845772-5025-4702-8850-2b6be776855b`, run
+  `27478dcc-69d6-4593-89fb-7bd45e9c3537`, toujours `running`. Dernier état
+  canonique connu : working-state v69, SHA-256
+  `e96388f985db93e098fcd5700b04606faac9c5871ea94f7f06f441b3f302af88`.
+- L'essai `e015-bridge-plan-corrected` a atteint `preflight_status=READY`
+  (65/65 preuves présentes, trois preuves omises), puis s'est arrêté avant
+  transport sur `external_effect_authority_required`. Invocation
+  `11db4592-7107-47e5-955d-e78c27ecd0e1`; observation
+  `e384ca82-4535-514a-a61d-3c78faa1b240`, SHA-256
+  `c5b659ab36fc262bcbebcb6c55207e69edda6bed9aece6588f282fb677d52e55`.
+  `confirmed_non_execution=true`, aucun `bridge_invocation_id`, zéro tour et
+  zéro octet de réponse. Aucun conseil Bridge n'a été reçu.
+- Le premier dossier `e009` était incomplet car trois blobs d'observation
+  n'avaient pas de capacité de lecture/métadonnées vérifiables. Le dossier
+  corrigé les a omis; le contrôle de complétude est alors passé. Le préflight
+  a aussi créé l'artefact interne `b23aa970-ef0f-4a92-b698-b69f07704ff1`
+  (353 028 octets, SHA-256
+  `b4b1777f56db5ebe33b2136e35d2bb62a543402933724a3c6156e16561bb0a85`). Son
+  manifeste indique des samples encodés en Base64. Le blob n'a pas été lu ni
+  envoyé au fournisseur; ne pas le récupérer ou le supprimer pendant l'audit.
+- **Suite demandée par l'utilisateur :** audit externe de la régression si le
+  blocage persiste. N'émettre aucune nouvelle consultation Bridge avant ce
+  diagnostic ou une nouvelle instruction. Ne pas présenter le refus comme un
+  avis analytique.
+
+## Conclusions et artefacts de l'enquête
+
+- Findings courants : H1 `f6f0a34e-8207-5e1c-9040-b17cb49b95d8`, H2
+  `2b02047e-949e-500f-97ce-dc52a2f41ac2`, H3
+  `dd157c98-921e-5194-b863-f00fc899ebc8` et H4
+  `746907e4-ccde-53a5-b073-0e189976758c`, tous `qualified`; aucun
+  `confirmed`.
+- L'avis interne `128f991d-09c9-5cb5-905c-d0c044bfff00` est v1, SHA-256
+  `6a7529373a213b5b263a6aa06a8304e4519bb9862cb64f23c3a4ef9ba410dcbd`.
+  Son contenu n'a pas été vérifié phrase par phrase; les trois révisions
+  échouèrent `citations_invalid`. Il n'est ni Bridge-révisé, ni approuvé, ni
+  publié. Aucun PDF n'a été produit.
+- Le journal détaillé et le checkpoint opérateur restent en local, ignorés par
+  Git : `.autowork-runs/m07/analyst_log.md`,
+  `.autowork-runs/m07/checkpoint.md` et `.autowork-runs/m07/journal.jsonl`.
+  Ils contiennent les références d'observations et les décisions d'analyse.
+
+## État Git et reprise
+
+- Avant ce handoff, `main` était propre à `225fb684`, avec `origin/main` à
+  `22d03e22` et 33 commits d'avance (29 fichiers, 3103 insertions, 249
+  suppressions). L'utilisateur a explicitement demandé de committer le
+  handoff sur `main`, pousser `main`, puis arrêter. Le push publie donc aussi
+  ces 33 commits antérieurs. Pas de force-push ni de rebase.
+- Aucun test n'a été exécuté pour ce handoff documentaire. La reprise de
+  l'analyse dépend du résultat de l'audit externe et d'une instruction
+  ultérieure de l'utilisateur.
+
+---
+
 Parent : Claude Code `claude-opus-5-5` (non Luna). Enfants Paseo
 `codex/gpt-6-luna`, `auto-review`, `xhigh`, une session neuve par cycle.
 Les enfants n'atteignent pas PostgreSQL : le parent exécute tous les tests PG
