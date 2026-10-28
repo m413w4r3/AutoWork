@@ -924,8 +924,6 @@ def _policy_states(
     tlp = envelope.disclosure.tlp.value if envelope.disclosure.tlp is not None else ""
     allowed = (
         allows_vt
-        and not envelope.disclosure.do_not_submit
-        and not snapshot.do_not_submit
         and tlp not in {"amber", "red"}
         and (snapshot.tlp or "").strip().casefold().removeprefix("tlp:") not in {"amber", "red"}
     )

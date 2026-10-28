@@ -187,7 +187,7 @@ def test_envelope_reduction_uses_only_domain_fields() -> None:
     assert _envelope_reduced_since(baseline, reduced) is True
     assert _envelope_reduced_since(baseline, extended) is False
     assert _envelope_reduced_since(baseline, do_not_submit_only, family="bridge.turn") is False
-    assert _envelope_reduced_since(baseline, do_not_submit_only, family="vt.file_report") is True
+    assert _envelope_reduced_since(baseline, do_not_submit_only, family="vt.file_report") is False
     assert _envelope_reduced_since(baseline, None) is True
 
 
@@ -4424,7 +4424,7 @@ async def test_claim_verification_requires_non_claim_source_evidence() -> None:
     assert any("observation de preuve" in item for item in findings[0].limitations)
 
 
-def test_vt_read_ignores_source_do_not_submit_but_keeps_envelope_veto() -> None:
+def test_vt_read_ignores_source_and_envelope_do_not_submit() -> None:
     fixture = _Fixture(responses=[], tools=())
     source_flagged_snapshot = replace(fixture.snapshot, do_not_submit=True)
     restricted_envelope = replace(
@@ -4435,7 +4435,7 @@ def test_vt_read_ignores_source_do_not_submit_but_keeps_envelope_veto() -> None:
     assert InvestigationService.vt_external_disclosure_allowed(
         source_flagged_snapshot, fixture.envelope, "vt.file_report"
     )
-    assert not InvestigationService.vt_external_disclosure_allowed(
+    assert InvestigationService.vt_external_disclosure_allowed(
         fixture.snapshot, restricted_envelope, "vt.file_report"
     )
     assert InvestigationService.bridge_disclosure_allowed(source_flagged_snapshot, fixture.envelope)

@@ -413,7 +413,6 @@ class InvestigationService:
         return bool(
             snapshot.external_llm_allowed
             and envelope.disclosure.external_llm_allowed
-            and not envelope.disclosure.do_not_submit
             and not external_effect_source_do_not_submit_blocks(family, snapshot.do_not_submit)
         )
 
@@ -4223,7 +4222,7 @@ def _envelope_reduced_since(
     if (
         previous.disclosure.do_not_submit is False
         and current.disclosure.do_not_submit
-        and not (family or "").startswith(("bridge.", "advisor."))
+        and not (family or "").startswith(("bridge.", "advisor.", "vt."))
     ):
         return True
     if previous.disclosure.external_llm_allowed and not current.disclosure.external_llm_allowed:
@@ -4248,7 +4247,10 @@ def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope |
         if (
             provider not in envelope.allowed_providers
             or (envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red")
-            or (envelope.disclosure.do_not_submit and provider not in {"bridge", "advisor"})
+            or (
+                envelope.disclosure.do_not_submit
+                and provider not in {"bridge", "advisor", "vt", "virustotal"}
+            )
         ):
             return False
         if definition.effect is ToolEffect.ACQUIRE and not envelope.acquire_hits_allowed:

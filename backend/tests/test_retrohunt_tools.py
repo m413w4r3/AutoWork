@@ -448,13 +448,13 @@ def test_retrohunt_quality_gate_still_requires_a_confirmed_positive_match() -> N
     assert not _quality_report_qualifies(payload, {"known_false_positives": []})
 
 
-def _envelope(investigation_id: UUID) -> InvestigationEnvelope:
+def _envelope(investigation_id: UUID, *, do_not_submit: bool = False) -> InvestigationEnvelope:
     return InvestigationEnvelope(
         investigation_id=investigation_id,
         allowed_providers=("vt",),
         budget=InvestigationBudget(),
         acquire_hits_allowed=False,
-        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN),
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN, do_not_submit=do_not_submit),
         approval_decision_id=uuid4(),
         approval_actor_id="analyst@example.test",
     )
@@ -489,6 +489,7 @@ async def _submit(
     *,
     corpus: str = "corpus-a",
     parameters: dict[str, Any] | None = None,
+    do_not_submit: bool = False,
 ):
     return await service.submit(
         investigation_id=investigation_id,
@@ -497,7 +498,7 @@ async def _submit(
         corpus_id=corpus,
         corpus_sha256=hashlib.sha256(corpus.encode()).hexdigest(),
         parameters=parameters or {"family": "test"},
-        envelope=_envelope(investigation_id),
+        envelope=_envelope(investigation_id, do_not_submit=do_not_submit),
     )
 
 
@@ -583,6 +584,24 @@ async def test_submit_is_idempotent_by_exact_rule_corpus_and_parameters() -> Non
     assert replay.reservation.id == first.reservation.id
     assert replay.slots_consumed == 1
     assert replay.slots_remaining == 1
+    assert len(provider.submit_calls) == 1
+    assert await repo.count_for_subject(SUBJECT_ID) == 1
+
+
+@pytest.mark.asyncio
+async def test_retrohunt_submit_ignores_do_not_submit() -> None:
+    service, repo, _, sources, provider, _ = _service()
+    investigation_id, version_id, source_sha256 = sources[0]
+
+    outcome = await _submit(
+        service,
+        investigation_id,
+        version_id,
+        source_sha256,
+        do_not_submit=True,
+    )
+
+    assert outcome.reservation.state is RetrohuntReservationState.SUBMITTED
     assert len(provider.submit_calls) == 1
     assert await repo.count_for_subject(SUBJECT_ID) == 1
 

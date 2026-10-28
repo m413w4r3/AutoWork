@@ -502,7 +502,6 @@ async def test_same_bytes_under_a_different_hash_family_reuse_the_existing_sampl
             tlp=TLP.AMBER_STRICT, do_not_submit=False, external_llm_allowed=True
         ),
         SampleAcquisitionPolicy(tlp=TLP.RED, do_not_submit=False, external_llm_allowed=True),
-        SampleAcquisitionPolicy(tlp=TLP.CLEAR, do_not_submit=True, external_llm_allowed=True),
     ],
 )
 async def test_policy_denies_disclosure_before_budget_or_network(
@@ -528,6 +527,30 @@ async def test_policy_denies_disclosure_before_budget_or_network(
     failure_events = [e for e in db.provenance if e.aggregate_id == investigation.id]
     assert len(failure_events) == 1
     assert failure_events[0].payload["error_code"] == "sample_acquisition_policy_denied"
+
+
+@pytest.mark.asyncio
+async def test_do_not_submit_does_not_block_vt_sample_acquisition(tmp_path: Path) -> None:
+    db = _FakeDatabase()
+    investigation = _investigation()
+    db.investigations[investigation.id] = investigation
+    content = b"synthetic quarantined sample"
+    port = _FakePort(content=content)
+    service = _service(tmp_path, db, port)
+
+    result = await service.acquire(
+        investigation_id=investigation.id,
+        subject_id=investigation.subject_id,
+        requested_hash=hashlib.sha256(content).hexdigest(),
+        reason=SampleAcquisitionReason.SEED,
+        policy=SampleAcquisitionPolicy(
+            tlp=TLP.CLEAR, do_not_submit=True, external_llm_allowed=True
+        ),
+    )
+
+    assert result.outcome is SampleAcquisitionOutcome.SUCCESS
+    assert port.calls == 1
+    assert db.samples[result.sample_id].do_not_submit is True
 
 
 @pytest.mark.asyncio

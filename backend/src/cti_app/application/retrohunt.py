@@ -121,7 +121,6 @@ class RetrohuntService:
         if (
             envelope is None
             or "vt" not in envelope.allowed_providers
-            or envelope.disclosure.do_not_submit
             or envelope.disclosure.tlp in {TLPLevel.AMBER, TLPLevel.RED}
         ):
             raise RetrohuntError(

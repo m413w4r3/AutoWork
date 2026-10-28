@@ -900,7 +900,7 @@ def test_approved_envelope_states_apply_to_derived_nodes() -> None:
         allowed_providers=("virustotal",),
         budget=InvestigationBudget(),
         acquire_hits_allowed=True,
-        disclosure=DisclosureBounds(),
+        disclosure=DisclosureBounds(do_not_submit=True),
         approval_decision_id=uuid4(),
         approval_actor_id="analyst-1",
     )
@@ -913,7 +913,7 @@ def test_approved_envelope_states_apply_to_derived_nodes() -> None:
 
     frontier = build_pivot_frontier(
         investigation_id=str(observation.investigation_id),
-        snapshot=replace(_snapshot(article_hash), do_not_submit=False),
+        snapshot=replace(_snapshot(article_hash), do_not_submit=True),
         observations=(observation,),
         observation_payloads={str(observation.id): summary},
         envelope=envelope,

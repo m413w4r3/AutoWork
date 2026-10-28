@@ -63,10 +63,10 @@ provenance and idempotence; a large prompt is a transport concern.
 
 Only explicit rules bind: AutoWork operational credentials (provider/service
 keys, tokens, passwords, signed URLs), action-specific `do_not_submit` guards
-(including public sample submissions and VT read/download),
+(for actions other than VT and Bridge/advisor operations),
 `external_llm_allowed=false`, TLP RED, sample-level licence restrictions and a
 denied external call. A stored `do_not_submit` flag does not veto an otherwise
-authorized Bridge/advisor or external LLM consultation.
+authorized VT or Bridge/advisor operation.
 CTI-internal secrets that are part of the evidence (implant
 keys, attacker tokens, published material) are evidence, not AutoWork
 credentials. Every omission must be observable with its reason. P10 has no

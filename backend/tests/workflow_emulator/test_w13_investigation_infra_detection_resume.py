@@ -1389,7 +1389,7 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
                     tool_call=_call("vt.file_report", {"file_hash": policy_material.seed_hash}),
                 ),
                 decision(
-                    "do_not_submit blocks the selected acquisition, but the Shodan path remains "
+                    "G2 does not authorize the selected acquisition, but the Shodan path remains "
                     "available.",
                     next_action="continue",
                 ),
@@ -1446,10 +1446,8 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
                     "shodan_credits": 2,
                     "downloads": 1,
                 },
-                # The envelope grants passive reads but **not** sample acquisition: only the
+                # The envelope grants passive reads but **not** sample acquisition, so the
                 # attempted download is denied locally while VT/Shodan reads continue.
-                # (do_not_submit instead withholds the whole context from the Bridge and
-                # yields model_unavailable; that gate is covered by the loop unit tests.)
                 acquire=False,
                 max_volume=0,
             )

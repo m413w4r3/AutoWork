@@ -180,9 +180,9 @@ class SampleAcquisitionPolicy:
     """The investigation's persisted disclosure policy, exactly as handed off.
 
     A successfully acquired sample is recorded with ``external_llm_allowed=True``
-    and remains independently locked down by ``do_not_submit=True``. This policy
-    governs whether VirusTotal may be asked for the bytes; it does not override
-    the sample's submission veto or the investigation's current authorization.
+    and stores its provenance flags on the resulting Sample. This policy
+    governs whether VirusTotal may be asked for the bytes; its
+    ``do_not_submit`` flag does not veto this VT acquisition path.
     """
 
     tlp: TLP
@@ -316,7 +316,7 @@ class VirusTotalSampleAcquisitionService:
             # 3. canonical object: the normalized hash *is* the canonical
             # seed/graine acquired — nothing further to derive here.
             # 4. policy
-            if policy.do_not_submit or policy.tlp not in _DISCLOSURE_ALLOWED_TLP:
+            if policy.tlp not in _DISCLOSURE_ALLOWED_TLP:
                 raise SampleAcquisitionPolicyDeniedError(
                     "La politique de diffusion interdit l'acquisition VirusTotal."
                 )

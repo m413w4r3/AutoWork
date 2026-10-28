@@ -547,21 +547,17 @@ async def test_quarantine_blob_without_sample_is_not_reused_or_downloaded_again(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("tlp", "do_not_submit"),
-    ((TLPLevel.AMBER, False), (TLPLevel.CLEAR, True)),
-)
-async def test_tlp_and_do_not_submit_prohibit_vt_download(tlp, do_not_submit) -> None:
+async def test_tlp_prohibits_vt_download() -> None:
     database = FakeDatabase()
     investigation = make_investigation()
     database.investigations[investigation.id] = investigation
     content = b"policy fixture"
     envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
     await envelope_service.approve(
-        make_approved_proposal(investigation, tlp=tlp, do_not_submit=do_not_submit),
+        make_approved_proposal(investigation, tlp=TLPLevel.AMBER),
         actor_id="analyst:alice",
         reason="The policy boundary is deliberate.",
-        correlation_id=f"g2:policy:{tlp.value}:{do_not_submit}",
+        correlation_id="g2:policy:amber",
     )
     port = FakeVirusTotalPort(content)
     hits = HitAcquisitionService(
@@ -579,6 +575,37 @@ async def test_tlp_and_do_not_submit_prohibit_vt_download(tlp, do_not_submit) ->
 
     assert result.status is ToolInvocationStatus.POLICY_DENIED
     assert port.download_calls == []
+
+
+@pytest.mark.asyncio
+async def test_do_not_submit_does_not_prohibit_vt_download() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    content = b"sample remains quarantined after VT download"
+    envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    await envelope_service.approve(
+        make_approved_proposal(investigation, tlp=TLPLevel.CLEAR, do_not_submit=True),
+        actor_id="analyst:alice",
+        reason="Allow this G2 VT acquisition.",
+        correlation_id="g2:policy:do-not-submit",
+    )
+    port = FakeVirusTotalPort(content)
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    association = await hits.register_hit(
+        investigation.id,
+        hashlib.sha256(content).hexdigest(),
+        SampleOrigin.BEHAVIOR,
+    )
+
+    result = await hits.acquire_hit(association.id, purpose="VT DnS bypass check")
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert port.download_calls == [hashlib.sha256(content).hexdigest()]
 
 
 @pytest.mark.asyncio

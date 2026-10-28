@@ -1611,7 +1611,7 @@ async def test_vt_file_report_ignores_sample_flags_but_keeps_tlp_veto(
 
 
 @pytest.mark.asyncio
-async def test_inherited_envelope_do_not_submit_blocks_before_external_vt_read(
+async def test_inherited_envelope_do_not_submit_allows_bridge_and_external_vt_read(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
     sample_bytes = f"synthetic envelope-restricted VT source {uuid4()}".encode()
@@ -1642,18 +1642,14 @@ async def test_inherited_envelope_do_not_submit_blocks_before_external_vt_read(
         assert result["envelope"].authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
         assert result["envelope"].disclosure.do_not_submit is True
         assert result["state"] is not None
-        assert result["state"].stop_reason is StopReason.MODEL_UNAVAILABLE
-        assert any(
-            action.startswith("bridge_submission_blocked:external_llm_policy:")
-            and "envelope_do_not_submit=1" in action
-            for action in result["state"].recent_actions
-        )
-        assert result["turn_transport"].attempt_count == 0
-        assert result["turn_transport"].submission_count == 0
+        assert result["state"].stop_reason is StopReason.AGENT_FINISHED
+        assert result["turn_transport"].attempt_count == 1
+        assert result["turn_transport"].submission_count == 1
         assert result["human_decisions"] == []
-        assert physical_requests == []
-        assert result["claims"] == []
-        assert result["invocations"] == []
+        assert len(physical_requests) == 1
+        assert len(result["claims"]) == 1
+        assert len(result["invocations"]) == 1
+        assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()

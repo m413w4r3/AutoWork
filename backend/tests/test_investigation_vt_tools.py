@@ -795,16 +795,23 @@ def test_content_search_validation_enforces_the_2000_character_limit() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tlp", "do_not_submit"),
-    [(TLPLevel.RED, False), (TLPLevel.AMBER, False), (TLPLevel.GREEN, True)],
+    ("tlp", "do_not_submit", "expected_status", "expected_calls"),
+    [
+        (TLPLevel.RED, False, ToolInvocationStatus.POLICY_DENIED, 0),
+        (TLPLevel.AMBER, False, ToolInvocationStatus.POLICY_DENIED, 0),
+        (TLPLevel.GREEN, True, ToolInvocationStatus.SUCCEEDED, 1),
+    ],
 )
-async def test_disclosure_bounds_deny_external_vt_without_a_call(
-    tlp: TLPLevel, do_not_submit: bool
+async def test_disclosure_bounds_allow_do_not_submit_but_deny_tlp(
+    tlp: TLPLevel,
+    do_not_submit: bool,
+    expected_status: ToolInvocationStatus,
+    expected_calls: int,
 ) -> None:
     tools = _tool_set(tlp=tlp, do_not_submit=do_not_submit)
     result = await _dispatch(tools, "vt.file_report", {"file_hash": _SEED_HASH})
-    assert result.status is ToolInvocationStatus.POLICY_DENIED
-    assert tools.vt.calls["file_report"] == 0
+    assert result.status is expected_status
+    assert tools.vt.calls["file_report"] == expected_calls
 
 
 @pytest.mark.asyncio

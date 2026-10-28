@@ -1222,7 +1222,7 @@ async def test_external_llm_disclosure_is_required_for_operator_client() -> None
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "policy",
-    ("red_tlp", "envelope_do_not_submit", "external_llm_denied"),
+    ("red_tlp", "external_llm_denied"),
 )
 async def test_vt_disclosure_controls_block_context_before_external_tool_dispatch(
     policy: str,
@@ -1233,10 +1233,7 @@ async def test_vt_disclosure_controls_block_context_before_external_tool_dispatc
         article_port.snapshot = replace(article_port.snapshot, tlp="RED")
     else:
         envelope = fixture.envelopes._items[fixture.investigation_id]
-        if policy == "envelope_do_not_submit":
-            disclosure = replace(envelope.disclosure, do_not_submit=True)
-        else:
-            disclosure = replace(envelope.disclosure, external_llm_allowed=False)
+        disclosure = replace(envelope.disclosure, external_llm_allowed=False)
         fixture.envelopes._items[fixture.investigation_id] = replace(
             envelope, disclosure=disclosure
         )
@@ -1257,7 +1254,7 @@ async def test_vt_disclosure_controls_block_context_before_external_tool_dispatc
 
 
 @pytest.mark.asyncio
-async def test_vt_report_read_keeps_existing_source_do_not_submit_behavior() -> None:
+async def test_vt_report_read_ignores_source_do_not_submit_behavior() -> None:
     fixture, state, service = await _fixture()
     article_port = fixture.context_builder.article_snapshots
     article_port.snapshot = replace(article_port.snapshot, do_not_submit=True)
@@ -1269,6 +1266,28 @@ async def test_vt_report_read_keeps_existing_source_do_not_submit_behavior() -> 
         purpose="read a public VirusTotal report without sending source bytes",
         expected_version=state.version,
         idempotency_key="vt-source-do-not-submit",
+    )
+
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert len(fixture.tools["vt.file_report"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_vt_report_read_ignores_envelope_do_not_submit() -> None:
+    fixture, state, service = await _fixture()
+    envelope = fixture.envelopes._items[fixture.investigation_id]
+    fixture.envelopes._items[fixture.investigation_id] = replace(
+        envelope,
+        disclosure=replace(envelope.disclosure, do_not_submit=True),
+    )
+
+    result = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "sample hash"},
+        purpose="read a VirusTotal report under a do_not_submit envelope",
+        expected_version=state.version,
+        idempotency_key="vt-envelope-do-not-submit",
     )
 
     assert result.invocation.status is ToolInvocationStatus.SUCCEEDED

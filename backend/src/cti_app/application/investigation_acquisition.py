@@ -291,11 +291,11 @@ class HitAcquisitionService:
             )
 
         acquisition_tlp = _sample_tlp(active_envelope)
-        if active_envelope.disclosure.do_not_submit or acquisition_tlp is None:
+        if acquisition_tlp is None:
             return HitAcquisitionResult(
                 status=ToolInvocationStatus.POLICY_DENIED,
                 association=association,
-                message="TLP or do_not_submit bounds prohibit VirusTotal acquisition.",
+                message="TLP bounds prohibit VirusTotal acquisition.",
                 suggested_alternatives=_SUGGESTED_ALTERNATIVES,
                 budget_consumed={},
             )
@@ -843,12 +843,6 @@ def _subject_sample_policy_conflict(sample: Sample, envelope: InvestigationEnvel
         return (
             f"The quarantined Sample is classified {sample.tlp.value}, above this investigation's "
             f"{target_level.value} disclosure bound; align the approved TLP before reuse."
-        )
-    if envelope.disclosure.do_not_submit and not sample.do_not_submit:
-        return (
-            "The Sample's source policy is incompatible: it does not prohibit submission while "
-            "this investigation "
-            "requires do_not_submit; reconcile the disclosure bounds before reuse."
         )
     if not envelope.disclosure.external_llm_allowed and sample.external_llm_allowed:
         return (
