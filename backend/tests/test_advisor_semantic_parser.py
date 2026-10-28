@@ -44,6 +44,29 @@ def _prompt_data() -> dict:
     }
 
 
+def _review_prompt_data() -> dict:
+    return {
+        "consultation_type": "review_text",
+        "question": "Review the synthetic editorial units.",
+        "units": [
+            {
+                "unit_id": "U1",
+                "block_type": "key_findings",
+                "form": "body",
+                "anchor": None,
+                "text": "A synthetic observation.",
+            },
+            {
+                "unit_id": "U2",
+                "block_type": "additional_samples",
+                "form": "body",
+                "anchor": None,
+                "text": "A second synthetic observation.",
+            },
+        ],
+    }
+
+
 def _response(
     *,
     status: str = "succeeded",
@@ -268,6 +291,47 @@ def test_versioned_opinion_source_ref_is_exact() -> None:
             "validated": False,
         }
     ]
+
+
+def test_review_reparse_recovers_unstructured_overall_without_source_aliases() -> None:
+    raw = "A readable review: separate the measured claim from its interpretation."
+
+    result = parse_advisor_semantic_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_review_prompt_data(),
+    )
+
+    assert result["schema"] == ADVISOR_RESPONSE_SCHEMA_V4
+    assert result["status"] == "partial"
+    assert result["usable"] is True
+    assert result["unit_assignment_status"] == "unstructured_overall"
+    assert result["raw_output"] == raw
+    assert {item["unit_id"] for item in result["reviews"]} == {"U1", "U2"}
+    assert all(item["assignment"] == "unstructured_overall" for item in result["reviews"])
+
+
+def test_review_reparse_redacts_secret_and_keeps_adjacent_advice_usable() -> None:
+    token = "synthetic-v4-token-for-redaction"
+    raw = json.dumps(
+        {
+            "summary": "Clarify which observations support this conclusion.",
+            "service_password": token,
+        }
+    )
+    result = parse_advisor_semantic_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_review_prompt_data(),
+        operational_secret_values=(token,),
+    )
+
+    assert result["status"] == "partial"
+    assert result["usable"] is True
+    assert "secret_redacted" in result["warnings"]
+    assert token not in result["raw_output"]
+    assert "[clé masquée]" in result["raw_output"]
+    assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def test_wire_handles_unicode_crlf_whitespace_and_json_content_as_evidence() -> None:

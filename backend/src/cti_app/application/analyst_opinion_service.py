@@ -1095,7 +1095,10 @@ class AnalystOpinionService:
         if call.get("output_sha256") != review_ref.output_sha256:
             return False
         output = call.get("output")
-        if not isinstance(output, Mapping) or output.get("schema") != "advisor-response.v3":
+        if not isinstance(output, Mapping) or output.get("schema") not in {
+            "advisor-response.v3",
+            "advisor-response.v4",
+        }:
             return False
         expected_form = "analyst_note" if anchor is not None else "body"
         review_units = call.get("review_units")

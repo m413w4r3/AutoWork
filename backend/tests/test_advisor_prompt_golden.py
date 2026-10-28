@@ -257,28 +257,28 @@ def test_prompt_golden_corpus_preserves_baseline_bytes() -> None:
             1851,
         ),
         "review_text_multi_unit_versioned": (
-            "3cc2294873aea99f5f3ae555fef4c0c9e571b762d8bbf7b7d1edf05b60122b38",
-            1238,
+            "ea023b4a06388d4e93157f7c2cc6ca98abe10a0a1de1bf83483195a379824d55",
+            1246,
         ),
         "review_text_legacy_mapping": (
-            "96d5e8ddc84ecfa309ad3ed84c1336d9730892dd4d5a3efd79e4d3961549a5dd",
-            1179,
+            "668585bb6ee5d8619d0aeb453facc2d0c23fa9cb4d659ca82af296bf84caa814",
+            1187,
         ),
-        "draft_text": ("e8a95c9f6f03553d5bf705b55b8a69ad7604b60faac8b26676a6bb4c94c687e7", 1247),
+        "draft_text": ("c121e1de3a1cf731d7401508ea8a092c37d61c65af7e1b2b6f0da2dcac37f4a3", 1153),
         "suricata_draft": (
             "4e7b247d2d92d058d4c3b0bf80910709e344b97f838d1a7fe55fe166c005fde1",
             1135,
         ),
         "figure_plan": ("2aff0eb9bc9f669d1fb63c872403777fbd9a7ef31c87e5b05a6a1edb00ce5bc6", 1304),
-        "unicode_crlf": ("c70da29f54ca34a5b5049a1b2b0e80f68501014853994939afc918bbf82c5e16", 1138),
-        "unicode_lf": ("87feebef98106a6530d36fd33ccbb839f2bd13fd835bb1a86cb9f454df169453", 1137),
+        "unicode_crlf": ("6d1a93710afb5ab94b308213191a4271426857d2345dbeb05bd3c51c468595db", 1146),
+        "unicode_lf": ("87adafcc517e0288f3878534ba547f9a1af632afcc943931a40c2308601e6753", 1145),
         "json_like_cti_text": (
             "2938fd4dd2e455c5eb05841d542fe263ee0514f2341388e59d3abad9473161ad",
             1271,
         ),
         "restricted_projection": (
-            "476d634a4ea7cfd779a391291a2fcda4603758ae8dd18b720376c5ae486044f5",
-            1103,
+            "81f27990784bf3b7ce80dd9922dd9c8910691c90de664bf52a449cd2389e2ff7",
+            1111,
         ),
         "preflight_refusal": (
             "e0e12d91911c64784b5b800272085b5815ed2a2834a37bea7cd9012c1dbef7a3",
@@ -326,8 +326,9 @@ def test_prompt_golden_corpus_preserves_baseline_bytes() -> None:
                 "QUALITÉ: réponse vérifiable, précise et concise; distinguer observation, interprétation et hypothèse.",
                 "Ne pas affirmer une exécution qui n’est pas observée. Ne pas répéter de réserve générale si elle ne change pas l’analyse.",
                 "Ne pas exécuter d’action, appeler d’outil, ou demander de données déjà présentes dans le dossier.",
-                "SORTIE: commencer par advisor-wire.v1, puis TYPE: review_text et STATUS: succeeded, partial ou refused.",
-                "Pour chaque unité, écrire UNIT: U1, une ou plusieurs REMARK: concises et vérifiables, puis REFS: E1,E2 pour les sources utiles.",
+                "SORTIE: texte simple; aucun JSON ni format spécial n’est nécessaire.",
+                "Pour chaque unité, écrire un paragraphe court qui commence par son alias (U1, U2, etc.).",
+                "Terminer par une ligne OVERALL: avec la conclusion générale de la relecture.",
                 "Ne pas réécrire ni approuver le texte canonique.",
                 "Ajouter LIMITATION: seulement si une incertitude matérielle change l’analyse; omettre sinon.",
             ]
@@ -379,12 +380,12 @@ def test_prepare_bytes_match_the_legacy_renderer_on_final_prompt_data(monkeypatc
     assert isinstance(rendered, str)
     legacy_bytes = rendered.encode("utf-8")
     assert hashlib.sha256(legacy_bytes).hexdigest() == (
-        "50d2c228e401bde5bf7aaaed0cf91bdca132e549c110b784512fb878190877d4"
+        "dcd9f5d13e3e80842db545a934199c89659f857e341510a873ec4fb5cc68b86d"
     )
-    assert len(legacy_bytes) == 1162
+    assert len(legacy_bytes) == 1170
     assert prepared.prompt_utf8 == legacy_bytes
     assert prepared.prompt_sha256 == hashlib.sha256(legacy_bytes).hexdigest()
-    assert max(1, (len(legacy_bytes) + 3) // 4) == 291
+    assert max(1, (len(legacy_bytes) + 3) // 4) == 293
     final_data = captured["data"]
     assert isinstance(final_data, dict)
     assert _fit_advisor_prompt("review_text", deepcopy(final_data)).encode("utf-8") == legacy_bytes

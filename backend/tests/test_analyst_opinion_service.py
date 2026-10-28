@@ -64,6 +64,60 @@ from tests.test_publication_builder_v4 import _canonical_inputs
 from tests.test_publication_document_v6 import _base_v5
 
 
+def test_unstructured_v4_review_remains_attachable_with_real_bridge_provenance() -> None:
+    invocation_id = str(uuid4())
+    output_sha256 = "a" * 64
+    reviewed_text_sha256 = "b" * 64
+    input_refs: list[dict[str, str]] = []
+    output = {
+        "schema": "advisor-response.v4",
+        "output_sha256": output_sha256,
+        "usable": True,
+        "unit_assignment_status": "unstructured_overall",
+        "warnings": ["unstructured_overall"],
+        "reviews": [
+            {
+                "unit_id": "U1",
+                "remarks": ["Keep the measured claim separate from interpretation."],
+                "usable": True,
+                "assignment": "unstructured_overall",
+            }
+        ],
+        "bridge_provenance": {
+            "bridge_invocation_id": invocation_id,
+            "bridge_invocation_id_kind": "conversation_turn",
+            "output_sha256": output_sha256,
+            "input_refs": input_refs,
+        },
+    }
+    call = {
+        "consultation_type": "review_text",
+        "advisor_status": "partial",
+        "bridge_invocation_id": invocation_id,
+        "bridge_invocation_id_kind": "conversation_turn",
+        "output_sha256": output_sha256,
+        "input_refs": input_refs,
+        "review_units": [
+            {
+                "unit_id": "U1",
+                "reviewed_text_sha256": reviewed_text_sha256,
+                "form": "body",
+                "block_type": "key_findings",
+                "anchor": None,
+            }
+        ],
+        "output": output,
+    }
+
+    assert AnalystOpinionService._bridge_call_reviews_text(
+        call,
+        review_ref=BridgeReviewReferenceV1(invocation_id, output_sha256, reviewed_text_sha256),
+        text_sha256=reviewed_text_sha256,
+        block_type="key_findings",
+        anchor=None,
+    )
+
+
 class _OpinionRepository:
     def __init__(self) -> None:
         self.items: dict[UUID, list[AnalystOpinionV1]] = {}

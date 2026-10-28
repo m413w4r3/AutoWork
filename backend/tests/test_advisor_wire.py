@@ -1250,6 +1250,190 @@ LIMITATION: none"""
     assert all(item["usable"] for item in parsed["reviews"])
 
 
+def _tolerant_review_prompt_data() -> dict[str, object]:
+    return {
+        "units": [
+            {"unit_id": "U1", "block_type": "key_findings", "form": "body", "anchor": None},
+            {
+                "unit_id": "U2",
+                "block_type": "additional_samples",
+                "form": "body",
+                "anchor": None,
+            },
+            {
+                "unit_id": "U3",
+                "block_type": "infection_chain_and_capabilities",
+                "form": "body",
+                "anchor": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "Voici mon retour :\n```json\n"
+            '{"units":[{"alias":"U1","verdict":"Distinguer le fait de son interprétation."}]}'
+            "\n```",
+            {"U1": "Distinguer le fait de son interprétation."},
+        ),
+        (
+            '{"reviews":{"U2":{"recommendations":["Préciser la source."]},'
+            '"U3":{"issues":"Ajouter la limite observée."}}}',
+            {"U2": "Préciser la source.", "U3": "Ajouter la limite observée."},
+        ),
+        (
+            '{"issues":{"U1":"Distinguer mesure et interprétation.",'
+            '"U2":"Préciser la période observée."}}',
+            {"U1": "Distinguer mesure et interprétation.", "U2": "Préciser la période observée."},
+        ),
+        (
+            '{"recommendations":[{"unit":"U2","text":"Préciser la source."},'
+            '{"unit":"U1","text":"Séparer le fait de son interprétation."}]}',
+            {"U2": "Préciser la source.", "U1": "Séparer le fait de son interprétation."},
+        ),
+        (
+            "{'units': [{'unit': 'U1', 'recommendations': ['Ajouter une réserve.'],},],}",
+            {"U1": "Ajouter une réserve."},
+        ),
+        (
+            "U1: Distinguer observation et hypothèse.\nUnit 2: Préciser le contexte.",
+            {"U1": "Distinguer observation et hypothèse.", "U2": "Préciser le contexte."},
+        ),
+        (
+            "- **U1:** Séparer le fait de l'interprétation.\n"
+            "- Unit 2 — Ajouter la période observée.",
+            {"U1": "Séparer le fait de l'interprétation.", "U2": "Ajouter la période observée."},
+        ),
+    ],
+)
+def test_review_text_recovers_bridge_json_and_labelled_prose(
+    raw: str, expected: dict[str, str]
+) -> None:
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["status"] == "partial"
+    assert {item["unit_id"]: item["remarks"][0] for item in parsed["reviews"]} == expected
+    assert "heuristic_unit_assignment" in parsed["warnings"]
+
+
+def test_review_text_attaches_unstructured_overall_to_each_requested_unit() -> None:
+    raw = "The review is readable, but keep the measured claim separate from interpretation."
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["status"] == "partial"
+    assert parsed["usable"] is True
+    assert parsed["unit_assignment_status"] == "unstructured_overall"
+    assert "unstructured_overall" in parsed["warning_classification"]["informative"]
+    assert {item["unit_id"] for item in parsed["reviews"]} == {"U1", "U2", "U3"}
+    assert all(item["remarks"] == [raw] for item in parsed["reviews"])
+    assert all(item["assignment"] == "unstructured_overall" for item in parsed["reviews"])
+    assert parsed["raw_output"] == raw
+
+
+def test_review_text_keeps_advice_while_redacting_operational_secret_fields() -> None:
+    token = "synthetic-advisor-token-for-redaction"
+    raw = json.dumps(
+        {
+            "summary": "Clarify the scope of the observation.",
+            "openai_bridge_api_key": token,
+        }
+    )
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+        operational_secret_values=(token,),
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert token not in parsed["raw_output"]
+    assert token not in repr(parsed["reviews"])
+    assert "[clé masquée]" in parsed["raw_output"]
+    assert "secret_redacted" in parsed["warnings"]
+
+
+@pytest.mark.parametrize("raw", ["", " \n ", "{}", "JSON", "...", "{} {}"])
+def test_review_text_empty_or_garbage_remains_unusable(raw: str) -> None:
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is False
+
+
+def test_draft_text_recovers_labelled_bridge_prose_by_unit() -> None:
+    parsed = parse_typed_advisor_response(
+        "U1: La méthode confirme l'ordre des transformations observées.\n"
+        "Unit 2 — Le contexte temporel reste à préciser.",
+        consultation_type="draft_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["status"] == "partial"
+    assert parsed["unit_assignment_status"] == "heuristic"
+    assert [block["unit_id"] for block in parsed["blocks"]] == ["U1", "U2"]
+    assert [block["sentences"][0]["text"] for block in parsed["blocks"]] == [
+        "La méthode confirme l'ordre des transformations observées.",
+        "Le contexte temporel reste à préciser.",
+    ]
+    assert all(block["sentences"][0]["assertion_ids"] == [] for block in parsed["blocks"])
+    assert "unstructured_draft" in parsed["warning_classification"]["informative"]
+
+
+def test_draft_text_keeps_unstructured_overall_without_per_unit_blocks() -> None:
+    raw = "The observations support a staged execution sequence, with timing still uncertain."
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="draft_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["unit_assignment_status"] == "unstructured_overall"
+    assert parsed["summary"] == raw
+    assert "blocks" not in parsed
+    assert "unstructured_overall" in parsed["warning_classification"]["informative"]
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "{}", "...", "null"])
+def test_draft_text_empty_or_garbage_remains_unusable(raw: str) -> None:
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="draft_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is None or parsed["usable"] is False
+
+
 def test_review_wire_keeps_complete_unit_usable_in_partial_lot() -> None:
     prompt_data = {
         "units": [
@@ -1278,6 +1462,34 @@ REMARK: La remarque cite R2 en prose, sans ajouter de référence.
     assert "source_alias_in_prose" in parsed["warning_classification"]["informative"]
     assert "limitations_missing" not in parsed["warnings"]
     assert "review_unit_missing" in parsed["warning_classification"]["blocking"]
+
+
+def test_partial_reference_list_does_not_downgrade_usable_review_advice() -> None:
+    parsed = parse_typed_advisor_response(
+        """advisor-wire.v1
+TYPE: review_text
+STATUS: succeeded
+UNIT: U1
+REMARK: Clarifier la portée de l'observation.
+REFS: R99
+""",
+        consultation_type="review_text",
+        prompt_data={
+            "units": [{"unit_id": "U1", "block_type": "key_findings"}],
+            "dossier_manifest": [],
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["status"] == "succeeded"
+    assert parsed["normalization_status"] == "complete"
+    assert parsed["usable"] is True
+    assert parsed["reviews"][0]["usable"] is True
+    assert "reference_alias_unknown" in parsed["warning_classification"]["informative"]
+    assert "reference_list_partial" in parsed["warning_classification"]["informative"]
+    assert "reference_alias_unknown" not in parsed["warning_classification"]["blocking"]
+    assert "reference_list_partial" not in parsed["warning_classification"]["blocking"]
 
 
 def test_review_wire_omits_empty_limitation_without_warning() -> None:

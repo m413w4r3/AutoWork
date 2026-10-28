@@ -585,6 +585,31 @@ def test_advisor_response_json_extraction_is_single_block_and_never_repairs() ->
     assert extract_json_object('{"value":NaN}') is None
 
 
+def test_legacy_review_json_redacts_secrets_before_legacy_normalization() -> None:
+    token = "synthetic-legacy-review-token-for-redaction"
+    payload = json.loads(advisor_response("Clarify the observation's scope.", []))
+    payload["openai_bridge_api_key"] = token
+    result = _parse_advisor_output(
+        json.dumps(payload),
+        prompt="",
+        available_tools={},
+        available_tool_schemas={},
+        evidence_refs=(),
+        source_refs=(),
+        consultation_type="review_text",
+        prompt_data={
+            "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}]
+        },
+        operational_secret_values=(token,),
+    )
+
+    assert result is not None
+    assert result["usable"] is True
+    assert result["status"] == "partial"
+    assert token not in repr(result)
+    assert "secret_redacted" in result["warnings"]
+
+
 def test_advisor_timeout_budgets_allow_slow_bridge_responses() -> None:
     assert MAX_ADVISOR_TOOL_SECONDS >= 200
 
