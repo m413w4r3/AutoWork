@@ -37,28 +37,16 @@ from cti_app.domain.external_effects import (
     validate_prepared_request,
 )
 
-_VT_FAMILIES_WITHOUT_SOURCE_UPLOAD = frozenset(
-    {
-        "vt.file_report",
-        "vt.object_report",
-        "vt.relationships",
-        "vt.intelligence_search",
-        "vt.behaviour",
-        "vt.behaviour_pcap",
-        "vt.download_sample",
-    }
-)
+_BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
 
 
 def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool) -> bool:
     """Return whether a source flag blocks this external effect family.
 
-    VT reports, metadata reads, and downloads do not send source bytes out of
-    AutoWork. Other external effects retain the
-    source ``do_not_submit`` veto; Bridge consume exempts itself (user decision
-    2026-10-27).
+    VT and Bridge/advisor effects ignore this metadata flag. Other external
+    effect families retain the source ``do_not_submit`` veto.
     """
-    return do_not_submit and family not in _VT_FAMILIES_WITHOUT_SOURCE_UPLOAD
+    return do_not_submit and not family.startswith(("vt.", *_BRIDGE_FAMILY_PREFIXES))
 
 
 def osint_vt_search_may_cite_unassociated_observation_hash(

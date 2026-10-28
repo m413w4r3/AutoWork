@@ -89,6 +89,33 @@ async def test_g2_approval_persists_actor_reason_and_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_g2_allows_external_llm_when_do_not_submit_is_true() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation(max_hits=1, max_vt_units=1)
+    database.investigations[investigation.id] = investigation
+    service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    proposal = make_approved_proposal(
+        investigation,
+        allowed_providers=("bridge",),
+        acquire_hits_allowed=False,
+        do_not_submit=True,
+        external_llm_allowed=True,
+        vt_units=0,
+        downloads=0,
+    )
+
+    envelope = await service.approve(
+        proposal,
+        actor_id="analyst:alice",
+        reason="Approve a bounded Bridge consultation.",
+        correlation_id="g2:alice:dns-bridge",
+    )
+
+    assert envelope.disclosure.do_not_submit is True
+    assert envelope.disclosure.external_llm_allowed is True
+
+
+@pytest.mark.asyncio
 async def test_budget_extension_is_a_distinct_cas_g2_decision() -> None:
     database = FakeDatabase()
     investigation = make_investigation(max_hits=1, max_vt_units=1)

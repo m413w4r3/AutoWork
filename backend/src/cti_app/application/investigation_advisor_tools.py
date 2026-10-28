@@ -516,7 +516,7 @@ class InvestigationAdvisorTool:
                         "advisor_status": "disclosure_restricted",
                         "preflight_status": "POLICY_BLOCKED",
                         "failure_stage": "sample_disclosure_restricted",
-                        "failure_reason": "explicit_sample_restriction",
+                        "failure_reason": "sample_disclosure_policy",
                         "disclosure_restricted_refs": [
                             str(item) for item in restricted_evidence_refs
                         ],
@@ -645,7 +645,7 @@ class InvestigationAdvisorTool:
                             "advisor_status": "disclosure_restricted",
                             "preflight_status": "POLICY_BLOCKED",
                             "failure_stage": "sample_disclosure_restricted",
-                            "failure_reason": "explicit_sample_restriction",
+                            "failure_reason": "sample_disclosure_policy",
                             "disclosure_restricted_refs": [
                                 str(item) for item in restricted_resolved_refs
                             ],
@@ -694,7 +694,7 @@ class InvestigationAdvisorTool:
                         "advisor_status": "disclosure_restricted",
                         "preflight_status": "POLICY_BLOCKED",
                         "failure_stage": "finding_disclosure_restricted",
-                        "failure_reason": "explicit_sample_restriction",
+                        "failure_reason": "sample_disclosure_policy",
                         "disclosure_restricted_finding_refs": list(restricted_finding_refs),
                         "missing_refs": list(restricted_finding_refs),
                         "confirmed_non_execution": True,
@@ -3194,7 +3194,6 @@ class InvestigationAdvisorTool:
                         ),
                         16,
                     ),
-                    "do_not_submit": bool(getattr(sample, "do_not_submit", False)),
                     "external_llm_allowed": bool(getattr(sample, "external_llm_allowed", True)),
                     "license_restricted": bool(
                         str(getattr(sample, "license_restriction", "") or "").strip()

@@ -1,12 +1,35 @@
 from __future__ import annotations
 
-from cti_app.domain.investigation import SampleAssociation, SampleOrigin
+from types import SimpleNamespace
+
+from cti_app.api.investigation import EnvelopeDisclosureRequest, _disclosure_from_request
+from cti_app.domain.investigation import SampleAssociation, SampleOrigin, TLPLevel
 from tests.test_investigation_api import (
     INVESTIGATION_ID,
     SUBJECT_ID,
     _client,
     _start_body,
 )
+
+
+def test_g2_request_allows_bridge_when_do_not_submit_is_true() -> None:
+    snapshot = SimpleNamespace(
+        tlp="GREEN",
+        do_not_submit=True,
+        external_llm_allowed=True,
+    )
+
+    disclosure = _disclosure_from_request(
+        EnvelopeDisclosureRequest(
+            tlp=TLPLevel.GREEN,
+            do_not_submit=True,
+            external_llm_allowed=True,
+        ),
+        snapshot,
+    )
+
+    assert disclosure.do_not_submit is True
+    assert disclosure.external_llm_allowed is True
 
 
 def test_g2_rejects_unavailable_provider_and_g3_writes_human_decision() -> None:

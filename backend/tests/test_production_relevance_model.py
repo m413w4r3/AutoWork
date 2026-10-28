@@ -1030,7 +1030,7 @@ async def test_unintelligible_and_ambiguous_model_results_require_review_without
         ("unintelligible", "relevance_classifier_unintelligible_response", 1),
         ("no_valid_blocks", "relevance_classifier_no_valid_blocks", 1),
         ("policy", "relevance_classifier_policy_blocked", 0),
-        ("do_not_submit", "relevance_classifier_policy_blocked", 0),
+        ("do_not_submit", "relevance_classifier_unintelligible_response", 1),
         ("auth", "relevance_classifier_model_call_failed", 1),
         ("access_policy", "relevance_classifier_access_policy_unavailable", 0),
     ],

@@ -1497,9 +1497,7 @@ class ProductionEditorialEnrichmentRevisionService:
         evidence_pack_hash = fence.evidence_pack_hash
         inventory_hash = fence.inventory_hash
         input_hash = fence.input_hash
-        if (access_policy.do_not_submit or not access_policy.external_llm_allowed) and not (
-            is_targeted_delete
-        ):
+        if not access_policy.external_llm_allowed and not is_targeted_delete:
             if targeted_request is not None:
                 return self._targeted_refusal(
                     "The current source access policy does not permit an editorial model call.",
@@ -2437,8 +2435,7 @@ class ProductionEditorialEnrichmentRevisionService:
             prompt_template_id="production-editorial-enrichment",
             prompt_template_version=EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
             evidence_pack_hash=evidence_pack_hash,
-            external_llm_allowed=access_policy.external_llm_allowed
-            and not access_policy.do_not_submit,
+            external_llm_allowed=access_policy.external_llm_allowed,
             routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
             sensitivity=access_policy.effective_tlp.value,
             web_search=False,

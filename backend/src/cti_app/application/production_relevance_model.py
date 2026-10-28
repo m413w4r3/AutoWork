@@ -475,9 +475,7 @@ def build_relevance_classifier_model_request(
         prompt_template_id="production-relevance-classifier",
         prompt_template_version=selected_prompt,
         evidence_pack_hash=pack.evidence_pack_hash,
-        external_llm_allowed=(
-            access_policy.external_llm_allowed and not access_policy.do_not_submit
-        ),
+        external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
         sensitivity=access_policy.effective_tlp.value,
         metadata={

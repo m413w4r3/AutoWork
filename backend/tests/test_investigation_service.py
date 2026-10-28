@@ -177,10 +177,17 @@ def test_envelope_reduction_uses_only_domain_fields() -> None:
             }
         ),
     )
+    do_not_submit_only = replace(
+        baseline,
+        version=baseline.version + 1,
+        disclosure=replace(baseline.disclosure, do_not_submit=True),
+    )
 
     assert _envelope_reduced_since(baseline, identical) is False
     assert _envelope_reduced_since(baseline, reduced) is True
     assert _envelope_reduced_since(baseline, extended) is False
+    assert _envelope_reduced_since(baseline, do_not_submit_only, family="bridge.turn") is False
+    assert _envelope_reduced_since(baseline, do_not_submit_only, family="vt.file_report") is False
     assert _envelope_reduced_since(baseline, None) is True
 
 
@@ -1205,7 +1212,7 @@ async def test_secret_refused_advisor_question_is_redacted_and_retry_limited() -
 
 
 @pytest.mark.asyncio
-async def test_sample_disclosure_refusal_stops_actions_and_redacts_later_context() -> None:
+async def test_sample_external_llm_refusal_stops_actions_and_redacts_later_context() -> None:
     refused_call = _advisor_tool_call("Review the restricted sample metadata.")
     later_call = _tool_call("vt.search", "synthetic:later", "search after advisor refusal")
     sample_id = str(uuid4())
@@ -1242,7 +1249,7 @@ async def test_sample_disclosure_refusal_stops_actions_and_redacts_later_context
         output={
             "advisor_status": "disclosure_restricted",
             "failure_stage": "sample_disclosure_restricted",
-            "failure_reason": "explicit_sample_restriction",
+            "failure_reason": "external_llm_disallowed",
             "confirmed_non_execution": True,
             "bridge_turns_consumed": 0,
             "disclosure_restricted_sample_associations": [
@@ -1251,6 +1258,7 @@ async def test_sample_disclosure_refusal_stops_actions_and_redacts_later_context
                     "association_id": association_id,
                     "sample_sha256": sample_sha256,
                     "byte_size": 12345,
+                    "restriction_sources": ["external_llm_disallowed"],
                 }
             ],
         },
@@ -4416,7 +4424,7 @@ async def test_claim_verification_requires_non_claim_source_evidence() -> None:
     assert any("observation de preuve" in item for item in findings[0].limitations)
 
 
-def test_vt_read_ignores_source_do_not_submit_but_keeps_envelope_veto() -> None:
+def test_vt_read_ignores_source_and_envelope_do_not_submit() -> None:
     fixture = _Fixture(responses=[], tools=())
     source_flagged_snapshot = replace(fixture.snapshot, do_not_submit=True)
     restricted_envelope = replace(
@@ -4427,18 +4435,22 @@ def test_vt_read_ignores_source_do_not_submit_but_keeps_envelope_veto() -> None:
     assert InvestigationService.vt_external_disclosure_allowed(
         source_flagged_snapshot, fixture.envelope, "vt.file_report"
     )
-    assert not InvestigationService.vt_external_disclosure_allowed(
+    assert InvestigationService.vt_external_disclosure_allowed(
         fixture.snapshot, restricted_envelope, "vt.file_report"
     )
     assert InvestigationService.bridge_disclosure_allowed(source_flagged_snapshot, fixture.envelope)
+    assert InvestigationService.bridge_disclosure_allowed(fixture.snapshot, restricted_envelope)
+    assert not InvestigationService.bridge_disclosure_allowed(
+        replace(fixture.snapshot, external_llm_allowed=False), fixture.envelope
+    )
+    assert InvestigationService.external_llm_allowed(source_flagged_snapshot, restricted_envelope)
 
 
 @pytest.mark.asyncio
-async def test_bridge_submits_when_source_permission_flags_are_false() -> None:
+async def test_bridge_submits_when_source_do_not_submit_is_true() -> None:
     fixture = _Fixture(
         responses=[_decision(goal="finish", next_action="finish")],
         tools=(),
-        external_allowed=False,
     )
     fixture.snapshot = replace(fixture.snapshot, do_not_submit=True)
     fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
@@ -4452,13 +4464,29 @@ async def test_bridge_submits_when_source_permission_flags_are_false() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["external_llm_allowed", "do_not_submit"])
-async def test_bridge_does_not_submit_when_envelope_disclosure_denies(policy: str) -> None:
+async def test_bridge_does_not_submit_when_source_external_llm_is_false() -> None:
     fixture = _Fixture(
         responses=[_decision(goal="finish", next_action="finish")],
         tools=(),
     )
-    disclosure = replace(fixture.envelope.disclosure, **{policy: policy == "do_not_submit"})
+    fixture.snapshot = replace(fixture.snapshot, external_llm_allowed=False)
+    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.MODEL_UNAVAILABLE
+    assert fixture.bridge_transport.attempt_count == 0
+    assert fixture.bridge_transport.submission_count == 0
+
+
+@pytest.mark.asyncio
+async def test_bridge_does_not_submit_when_envelope_external_llm_is_false() -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="finish", next_action="finish")],
+        tools=(),
+    )
+    disclosure = replace(fixture.envelope.disclosure, external_llm_allowed=False)
     fixture.envelope = replace(fixture.envelope, disclosure=disclosure)
     state = await fixture.start()
 
@@ -4467,6 +4495,25 @@ async def test_bridge_does_not_submit_when_envelope_disclosure_denies(policy: st
     assert result.stop_reason is StopReason.MODEL_UNAVAILABLE
     assert fixture.bridge_transport.attempt_count == 0
     assert fixture.bridge_transport.submission_count == 0
+
+
+@pytest.mark.asyncio
+async def test_bridge_submits_when_envelope_do_not_submit_is_true() -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="finish", next_action="finish")],
+        tools=(),
+    )
+    fixture.envelope = replace(
+        fixture.envelope,
+        disclosure=replace(fixture.envelope.disclosure, do_not_submit=True),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.attempt_count == 1
+    assert fixture.bridge_transport.submission_count == 1
 
 
 @pytest.mark.asyncio

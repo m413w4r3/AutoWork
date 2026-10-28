@@ -953,7 +953,8 @@ class RegistryToolDispatcher:
             if provider not in envelope.allowed_providers:
                 return ToolInvocationStatus.POLICY_DENIED
             if envelope.disclosure.tlp is TLPLevel.RED or (
-                envelope.disclosure.do_not_submit and definition.name != "advisor.consult"
+                envelope.disclosure.do_not_submit
+                and provider not in {"bridge", "advisor", "vt", "virustotal"}
             ):
                 return ToolInvocationStatus.POLICY_DENIED
             if definition.effect is ToolEffect.ACQUIRE and not envelope.acquire_hits_allowed:

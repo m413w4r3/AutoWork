@@ -66,12 +66,16 @@ dédoublonnage est par SHA-256 dans l'enquête. Les autres familles
 d'empreintes ne sont pas acceptées comme identité d'association par cette API.
 
 **acquire_hit(association_id, purpose, evidence_refs, operation_key, envelope)**
-vérifie le G2 courant, TLP, **do_not_submit**, les budgets, les références et
+vérifie le G2 courant, TLP, les budgets, les références et
 l'idempotence, puis délègue exclusivement à
 **VirusTotalSampleAcquisitionService**. Celui-ci vérifie le hash du contenu,
 stocke le blob dans le bucket de quarantaine et crée une tentative
 **HIT_REVIEW**. Le résultat reste **candidate**; acquisition ou analyse ne
 constituent jamais une validation G3.
+
+Le champ **do_not_submit** reste stocké, mais ne bloque ni les opérations VT ni
+une consultation Bridge/advisor autorisée par le G2, le TLP et
+**external_llm_allowed**.
 
 **LocalSampleAnalysisService** ne lit qu'un échantillon quarantiné dont le blob
 correspond au SHA-256 de l'association. Il compose les services existants

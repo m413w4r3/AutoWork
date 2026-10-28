@@ -3855,7 +3855,7 @@ def _advisor_sample_refusal_context_summary(
     return {
         "advisor_status": "disclosure_restricted",
         "failure_stage": "sample_disclosure_restricted",
-        "failure_reason": "explicit_sample_restriction",
+        "failure_reason": "sample_disclosure_policy",
         "confirmed_non_execution": True,
         "bridge_turns_consumed": 0,
     }

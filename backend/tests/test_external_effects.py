@@ -154,10 +154,24 @@ def test_vt_consume_source_refs_keep_md5_and_sha1_outside_sample_hash_policy(
 
 @pytest.mark.parametrize(
     "family",
-    ["bridge.investigation_turn.v1", "advisor.consultation.v1", "other.upload"],
+    ["other.upload"],
 )
 def test_source_do_not_submit_blocks_external_upload_families(family: str) -> None:
     assert external_effect_source_do_not_submit_blocks(family, True)
+    assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize(
+    "family",
+    [
+        "bridge.investigation_turn.v1",
+        "advisor.consultation.v1",
+        "vt.file_upload",
+        "vt.retrohunt",
+    ],
+)
+def test_source_do_not_submit_does_not_block_vt_or_bridge_effects(family: str) -> None:
+    assert not external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
 
 
@@ -173,7 +187,7 @@ def test_source_do_not_submit_blocks_external_upload_families(family: str) -> No
         ("other.upload", False, True, False),
     ],
 )
-def test_osint_policy_guard_source_flags_exempt_bridge_from_do_not_submit_only(
+def test_source_flags_ignore_do_not_submit_for_vt_and_bridge_but_keep_bridge_external_llm_veto(
     family: str, do_not_submit: bool, external_llm_allowed: bool, blocks: bool
 ) -> None:
     # Acquired samples are stored do_not_submit/external_llm_allowed: Bridge may

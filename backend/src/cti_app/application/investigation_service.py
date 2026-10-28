@@ -413,7 +413,6 @@ class InvestigationService:
         return bool(
             snapshot.external_llm_allowed
             and envelope.disclosure.external_llm_allowed
-            and not envelope.disclosure.do_not_submit
             and not external_effect_source_do_not_submit_blocks(family, snapshot.do_not_submit)
         )
 
@@ -424,9 +423,7 @@ class InvestigationService:
         if not InvestigationService._external_tlp_allowed(snapshot, envelope):
             return False
         assert envelope is not None
-        return bool(
-            envelope.disclosure.external_llm_allowed and not envelope.disclosure.do_not_submit
-        )
+        return bool(snapshot.external_llm_allowed and envelope.disclosure.external_llm_allowed)
 
     @staticmethod
     def unapproved_budget_for(investigation: AnalystInvestigation) -> InvestigationBudget:
@@ -1113,7 +1110,7 @@ class InvestigationService:
                     await self._commit_current_uow()
                     state = updated
             latest_envelope = await self._envelopes.get(investigation_id)
-            if _envelope_reduced_since(envelope, latest_envelope):
+            if _envelope_reduced_since(envelope, latest_envelope, family="bridge.turn"):
                 await self._record_policy_reduction(
                     investigation_id=investigation_id,
                     attempted_operation="bridge.turn",
@@ -1729,7 +1726,7 @@ class InvestigationService:
             if (
                 current_envelope is None
                 or current_envelope.approval_decision_id != envelope.approval_decision_id
-                or _envelope_reduced_since(envelope, current_envelope)
+                or _envelope_reduced_since(envelope, current_envelope, family=tool_name)
             ):
                 return FrameworkPreSubmissionProof.ENVELOPE_REVOKED
             if reservation_persisted:
@@ -2603,7 +2600,9 @@ class InvestigationService:
             current_envelope = envelope
             if external_effect:
                 current_envelope = await self._envelopes.get(investigation.id)
-                if _envelope_reduced_since(turn_envelope, current_envelope):
+                if _envelope_reduced_since(
+                    turn_envelope, current_envelope, family=proposed.tool_name
+                ):
                     denied_key = (
                         f"{operation_key}:g2-denied:"
                         f"{current_envelope.version if current_envelope is not None else 'revoked'}"
@@ -2716,7 +2715,9 @@ class InvestigationService:
             if stopped is not None:
                 return stopped, stopped.stop_reason
             latest_envelope = await self._envelopes.get(investigation.id)
-            if external_effect and _envelope_reduced_since(turn_envelope, latest_envelope):
+            if external_effect and _envelope_reduced_since(
+                turn_envelope, latest_envelope, family=proposed.tool_name
+            ):
                 await self._record_g2_blocked_calls(
                     investigation_id=investigation.id,
                     proposed_calls=decision.proposed_tool_calls[proposed_index + 1 :],
@@ -3688,12 +3689,7 @@ class InvestigationService:
         if not InvestigationService._external_tlp_allowed(snapshot, envelope):
             return False
         assert envelope is not None
-        return bool(
-            snapshot.external_llm_allowed
-            and envelope.disclosure.external_llm_allowed
-            and not snapshot.do_not_submit
-            and not envelope.disclosure.do_not_submit
-        )
+        return bool(snapshot.external_llm_allowed and envelope.disclosure.external_llm_allowed)
 
     @staticmethod
     def _external_tlp_allowed(
@@ -3734,7 +3730,6 @@ class InvestigationService:
         details = [
             f"turn={turn_index}",
             f"snapshot_external_allowed={int(snapshot.external_llm_allowed)}",
-            f"snapshot_do_not_submit={int(snapshot.do_not_submit)}",
             f"snapshot_tlp_red={int(tlp == 'red')}",
         ]
         if envelope is None:
@@ -3746,7 +3741,6 @@ class InvestigationService:
             details.extend(
                 (
                     f"envelope_external_allowed={int(envelope.disclosure.external_llm_allowed)}",
-                    f"envelope_do_not_submit={int(envelope.disclosure.do_not_submit)}",
                     f"envelope_tlp_red={int(envelope_tlp_red)}",
                 )
             )
@@ -3903,7 +3897,7 @@ class InvestigationService:
         if await self._requested_stop(investigation_id) is not None:
             return False
         current_envelope = await self._envelopes.get(investigation_id)
-        if _envelope_reduced_since(approved_envelope, current_envelope):
+        if _envelope_reduced_since(approved_envelope, current_envelope, family="bridge.turn"):
             return False
         if (
             approved_envelope is None
@@ -4204,6 +4198,8 @@ def _operation_key_matches(existing_key: str, current_key: str) -> bool:
 def _envelope_reduced_since(
     previous: InvestigationEnvelope | None,
     current: InvestigationEnvelope | None,
+    *,
+    family: str | None = None,
 ) -> bool:
     if previous is None:
         return False
@@ -4223,7 +4219,11 @@ def _envelope_reduced_since(
             and current_limit < previous_limit
         ):
             return True
-    if previous.disclosure.do_not_submit is False and current.disclosure.do_not_submit:
+    if (
+        previous.disclosure.do_not_submit is False
+        and current.disclosure.do_not_submit
+        and not (family or "").startswith(("bridge.", "advisor.", "vt."))
+    ):
         return True
     if previous.disclosure.external_llm_allowed and not current.disclosure.external_llm_allowed:
         return True
@@ -4247,7 +4247,10 @@ def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope |
         if (
             provider not in envelope.allowed_providers
             or (envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red")
-            or (envelope.disclosure.do_not_submit and definition.name != "advisor.consult")
+            or (
+                envelope.disclosure.do_not_submit
+                and provider not in {"bridge", "advisor", "vt", "virustotal"}
+            )
         ):
             return False
         if definition.effect is ToolEffect.ACQUIRE and not envelope.acquire_hits_allowed:

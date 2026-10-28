@@ -320,8 +320,6 @@ def intersect_disclosure(
         external_llm_allowed=(
             source_external_llm_allowed
             and policy.external_llm_allowed
-            and not source_do_not_submit
-            and not policy.do_not_submit
             and source_level is not TLPLevel.RED
             and policy_level is not TLPLevel.RED
         ),

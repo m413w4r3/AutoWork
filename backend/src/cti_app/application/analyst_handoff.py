@@ -62,9 +62,7 @@ def analyst_handoff_policy_from_sources(sources: Iterable[object]) -> AnalystHan
     items = tuple(sources)
     do_not_submit = any(bool(getattr(item, "do_not_submit", False)) for item in items)
     external_llm_allowed = not any(
-        bool(getattr(item, "do_not_submit", False))
-        or not bool(getattr(item, "external_llm_allowed", True))
-        for item in items
+        not bool(getattr(item, "external_llm_allowed", True)) for item in items
     )
     tlps = {getattr(item, "tlp", None) for item in items if getattr(item, "tlp", None)}
     return AnalystHandoffPolicy(

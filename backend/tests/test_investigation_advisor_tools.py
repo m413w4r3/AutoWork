@@ -2362,13 +2362,12 @@ async def test_generic_api_key_in_cti_evidence_is_not_an_autowork_secret() -> No
 @pytest.mark.parametrize(
     "restriction",
     [
-        {"do_not_submit": True},
         {"external_llm_allowed": False},
         {"tlp": TLP.RED},
         {"license_restriction": "Owner prohibits external disclosure"},
     ],
 )
-async def test_sample_disclosure_flags_veto_bridge(restriction) -> None:
+async def test_sample_disclosure_keeps_real_explicit_vetoes(restriction) -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     observation, raw = make_observation(
@@ -2379,7 +2378,14 @@ async def test_sample_disclosure_flags_veto_bridge(restriction) -> None:
             "hex": [{"offset": 0, "value": "41" * 600}],
         },
     )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The measured sample is available.", [str(observation.id)]
+            ),
+        )
+    )
     tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -2518,8 +2524,8 @@ async def test_restriction_trace_aggregates_conflicting_sample_records() -> None
         do_not_submit=True,
         external_llm_allowed=True,
     )
-    # Every explicit restriction on a record sharing the cited sample hash
-    # vetoes disclosure and appears in the refusal trace by policy name.
+    # Every remaining explicit restriction on a record sharing the cited
+    # sample hash vetoes disclosure and appears in the refusal trace.
     tool._samples = _Samples([allowed_sample, restricted_sample, submit_blocked_sample])
 
     result = await tool.execute(
@@ -2536,7 +2542,7 @@ async def test_restriction_trace_aggregates_conflicting_sample_records() -> None
     assert result.output["disclosure_restricted_sample_count"] == 1
     rows = result.output["disclosure_restricted_sample_associations"]
     assert len(rows) == 1
-    assert tuple(rows[0]["restriction_sources"]) == ("do_not_submit", "license_restriction")
+    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
     assert restriction_text not in repr(result.output)
 
 
@@ -2766,7 +2772,6 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         f"related_sample_sha256={contradictory_source_hash}",
         f"source_object_id={contradictory_source_hash}",
         f"length={len(raw_sample)}",
-        "do_not_submit=false",
         "external_llm_allowed=true",
     ):
         assert required in prompt
@@ -2978,16 +2983,25 @@ async def test_osint_policy_allows_cited_do_not_submit_sample_bytes() -> None:
         do_not_submit=True,
     )
 
+    context = make_osint_policy_context(
+        investigation_id,
+        key="operator:advisor:osint-do-not-submit-sample",
+    )
+    assert context.envelope is not None
+    context = replace(
+        context,
+        envelope=replace(
+            context.envelope,
+            disclosure=replace(context.envelope.disclosure, do_not_submit=True),
+        ),
+    )
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
             "question": "Use the cited raw sample bytes.",
             "evidence_refs": [str(observation.id)],
         },
-        make_osint_policy_context(
-            investigation_id,
-            key="operator:advisor:osint-do-not-submit-sample",
-        ),
+        context,
     )
 
     assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
@@ -2997,7 +3011,7 @@ async def test_osint_policy_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"association_id={association_id}" in prompt
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
-    assert "do_not_submit=true" in prompt
+    assert "do_not_submit" not in prompt
     assert "length=4096" in prompt
     assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
     advisor_observation = next(
@@ -3030,7 +3044,7 @@ async def test_osint_policy_keeps_external_llm_veto_for_do_not_submit_sample() -
         _sample_hash,
     ) = _make_downloaded_sample_fixture(
         investigation_id,
-        bytes(range(256)),
+        bytes(range(256)) * 40,
         do_not_submit=True,
         external_llm_allowed=False,
     )
@@ -3049,14 +3063,60 @@ async def test_osint_policy_keeps_external_llm_veto_for_do_not_submit_sample() -
 
     assert transport.calls == []
     assert result.output["advisor_status"] == "disclosure_restricted"
-    assert result.output["failure_reason"] == "explicit_sample_restriction"
+    assert result.output["failure_reason"] == "sample_disclosure_policy"
     rows = result.output["disclosure_restricted_sample_associations"]
     assert len(rows) == 1
     assert tuple(rows[0]["restriction_sources"]) == ("external_llm_disallowed",)
 
 
 @pytest.mark.asyncio
-async def test_human_g2_keeps_sample_do_not_submit_refusal() -> None:
+async def test_human_g2_allows_cited_do_not_submit_sample_bytes() -> None:
+    investigation_id = uuid4()
+    sample_content = bytes(range(256)) * 40
+    (
+        tool,
+        transport,
+        observation,
+        sample_id,
+        association_id,
+        blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        sample_content,
+        do_not_submit=True,
+    )
+    context = make_context(
+        investigation_id,
+        key="operator:advisor:human-g2-do-not-submit-sample",
+    )
+    assert context.envelope is not None
+    assert context.envelope.authority_kind is EnvelopeAuthorityKind.HUMAN_G2
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert f"sample_id={sample_id}" in prompt
+    assert f"association_id={association_id}" in prompt
+    assert f"blob_id={blob_id}" in prompt
+    assert f"sample_sha256={sample_hash}" in prompt
+    assert "do_not_submit" not in prompt
+    assert "length=4096" in prompt
+    assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+
+
+@pytest.mark.asyncio
+async def test_human_g2_envelope_do_not_submit_allows_cited_sample_bytes() -> None:
     investigation_id = uuid4()
     (
         tool,
@@ -3071,6 +3131,19 @@ async def test_human_g2_keeps_sample_do_not_submit_refusal() -> None:
         bytes(range(256)),
         do_not_submit=True,
     )
+    context = make_context(
+        investigation_id,
+        key="operator:advisor:human-g2-envelope-do-not-submit",
+    )
+    assert context.envelope is not None
+    assert context.envelope.authority_kind is EnvelopeAuthorityKind.HUMAN_G2
+    context = replace(
+        context,
+        envelope=replace(
+            context.envelope,
+            disclosure=replace(context.envelope.disclosure, do_not_submit=True),
+        ),
+    )
 
     result = await tool.execute(
         {
@@ -3078,17 +3151,84 @@ async def test_human_g2_keeps_sample_do_not_submit_refusal() -> None:
             "question": "Use the cited raw sample bytes.",
             "evidence_refs": [str(observation.id)],
         },
-        make_context(
-            investigation_id,
-            key="operator:advisor:human-g2-do-not-submit-sample",
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "do_not_submit" not in prompt
+    assert "length=256" in prompt
+    assert base64.b64encode(bytes(range(256))).decode("ascii") in prompt
+
+
+@pytest.mark.asyncio
+async def test_human_g2_allows_cited_do_not_submit_sample_vt_report() -> None:
+    investigation_id = uuid4()
+    (
+        tool,
+        transport,
+        observation,
+        _sample_id,
+        _association_id,
+        _blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        bytes(range(256)),
+        do_not_submit=True,
+    )
+    report_payload = {
+        "schema": "virustotal-file-report.v1",
+        "attributes": {"meaningful_name": "synthetic-report-marker"},
+    }
+    report_raw = json.dumps(report_payload, separators=(",", ":")).encode()
+    report_blob_id = uuid4()
+    tool._blobs.add(
+        report_blob_id,
+        sha256=hashlib.sha256(report_raw).hexdigest(),
+        size=len(report_raw),
+        logical_bucket="evidence",
+    )
+    tool._artifact_store.values[report_blob_id] = report_raw
+    report_observation = replace(
+        observation,
+        blob_id=report_blob_id,
+        sha256=hashlib.sha256(report_raw).hexdigest(),
+        source="virustotal.file_report",
+        source_version="vt-v3",
+        object_type="sha256",
+        object_id=sample_hash,
+    )
+    tool._observations = ObservationRepository((report_observation,))
+    context = make_context(
+        investigation_id,
+        key="operator:advisor:human-g2-do-not-submit-vt-report",
+    )
+    assert context.envelope is not None
+    assert context.envelope.authority_kind is EnvelopeAuthorityKind.HUMAN_G2
+    context = replace(
+        context,
+        envelope=replace(
+            context.envelope,
+            disclosure=replace(context.envelope.disclosure, do_not_submit=True),
         ),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted"
-    rows = result.output["disclosure_restricted_sample_associations"]
-    assert len(rows) == 1
-    assert tuple(rows[0]["restriction_sources"]) == ("do_not_submit",)
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the cited VirusTotal report observation.",
+            "evidence_refs": [str(report_observation.id)],
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert result.output["preflight_status"] == "READY"
+    assert len(transport.calls) == 1
+    assert report_observation.id in result.observation_refs
+    assert "synthetic-report-marker" in transport.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -3152,7 +3292,6 @@ async def test_downloaded_sample_blob_read_failures_refuse_with_precise_reason(
 @pytest.mark.parametrize(
     "restriction",
     [
-        {"do_not_submit": True},
         {"external_llm_allowed": False},
         {"tlp": TLP.RED},
         {"license_restriction": "Owner prohibits external disclosure"},
@@ -3188,7 +3327,7 @@ async def test_disclosure_restricted_downloaded_sample_bytes_refuse_before_bridg
     assert transport.calls == []
     assert result.output["advisor_status"] == "disclosure_restricted"
     assert result.output["preflight_status"] == "POLICY_BLOCKED"
-    assert result.output["failure_reason"] == "explicit_sample_restriction"
+    assert result.output["failure_reason"] == "sample_disclosure_policy"
     assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
     if "license_restriction" in restriction:
         assert restriction["license_restriction"] not in repr(result.output)
@@ -3330,7 +3469,7 @@ async def test_unreferenced_restricted_sample_does_not_block_unrelated_consultat
 
 
 @pytest.mark.asyncio
-async def test_dotnet_analysis_of_do_not_submit_sample_is_refused() -> None:
+async def test_dotnet_analysis_of_do_not_submit_sample_is_allowed_for_bridge() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     observation, raw = make_observation(
@@ -3352,7 +3491,12 @@ async def test_dotnet_analysis_of_do_not_submit_sample_is_refused() -> None:
         object_type="dotnet_analysis",
         object_id=f"{sample_hash}:decompile:{'f' * 16}",
     )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The cited analysis is available.", [str(observation.id)]),
+        )
+    )
     tool, _sample_blob = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -3382,13 +3526,13 @@ async def test_dotnet_analysis_of_do_not_submit_sample_is_refused() -> None:
         make_context(investigation_id, key="operator:advisor:restricted-dotnet"),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted"
-    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert result.output["preflight_status"] == "READY"
 
 
 @pytest.mark.asyncio
-async def test_do_not_submit_sample_inventory_refuses_linked_finding() -> None:
+async def test_do_not_submit_sample_inventory_allows_linked_finding_for_bridge() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     restricted, restricted_raw = make_observation(
@@ -3416,7 +3560,9 @@ async def test_do_not_submit_sample_inventory_refuses_linked_finding() -> None:
     transport = Transport(
         TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text=advisor_response("The permitted observation supports this plan.", ()),
+            output_text=advisor_response(
+                "The sample-linked finding supports this plan.", [str(restricted.id)]
+            ),
         )
     )
     tool, _sample_blob = make_tool(
@@ -3453,14 +3599,15 @@ async def test_do_not_submit_sample_inventory_refuses_linked_finding() -> None:
             "consultation_type": "plan_investigation",
             "question": "Plan the next pivot.",
             "evidence_refs": [str(permitted.id)],
+            "finding_refs": [str(finding.id)],
         },
         make_context(investigation_id, key="operator:advisor:restricted-finding"),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted"
-    assert result.output["preflight_status"] == "POLICY_BLOCKED"
-    assert "RESTRICTED_FINDING_MARKER" not in repr(result.output)
+    assert result.status is ToolInvocationStatus.PARTIAL, result.output
+    assert len(transport.calls) == 1
+    assert result.output["preflight_status"] == "READY"
+    assert "RESTRICTED_FINDING_MARKER" in transport.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -4985,7 +5132,7 @@ def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> No
         "tlp_red",
     ],
 )
-async def test_bridge_source_flags_are_permissive_but_envelope_policy_is_enforced(policy) -> None:
+async def test_bridge_ignores_do_not_submit_and_enforces_external_policy(policy) -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
@@ -5043,7 +5190,7 @@ async def test_bridge_source_flags_are_permissive_but_envelope_policy_is_enforce
         context,
     )
 
-    if policy in {"envelope_external_disabled", "envelope_do_not_submit", "tlp_red"}:
+    if policy in {"source_external_disabled", "envelope_external_disabled", "tlp_red"}:
         assert result.status is ToolInvocationStatus.POLICY_DENIED
         assert result.error_code == "POLICY_DENIED"
         assert result.output["advisor_status"] == "policy_denied"

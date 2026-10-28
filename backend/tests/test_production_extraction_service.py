@@ -2092,7 +2092,7 @@ async def test_non_core_failure_is_a_controlled_omission() -> None:
     assert failed_core["failure_code"] == "core_source_extraction_failed"
 
 
-async def test_do_not_submit_policy_is_never_overridden() -> None:
+async def test_external_llm_disabled_policy_is_never_overridden() -> None:
     world = _World()
     subject_id = uuid4()
     snapshot = _snapshot(subject_id)

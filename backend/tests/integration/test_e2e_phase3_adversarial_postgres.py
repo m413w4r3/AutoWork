@@ -783,7 +783,6 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             assert envelope is not None and composition.advisor_tool is not None
             for label, policy in (
                 ("external-disabled", {"external_llm_allowed": False}),
-                ("do-not-submit", {"do_not_submit": True}),
                 ("tlp-red", {"tlp": TLPLevel.RED}),
             ):
                 blocked_budget = InvestigationBudget(limits=envelope.budget.limits)
@@ -1152,7 +1151,7 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
             assert advisor_output["advisor_status"] == "disclosure_restricted"
             assert advisor_output["preflight_status"] == "POLICY_BLOCKED"
             assert advisor_output["failure_stage"] == "sample_disclosure_restricted"
-            assert advisor_output["failure_reason"] == "explicit_sample_restriction"
+            assert advisor_output["failure_reason"] == "sample_disclosure_policy"
             trace = next(
                 item
                 for item in advisor_output["disclosure_restricted_sample_associations"]

@@ -1821,7 +1821,7 @@ def register_virustotal_tools(
 
 
 def _external_disclosure_allowed(envelope: InvestigationEnvelope) -> bool:
-    return not envelope.disclosure.do_not_submit and envelope.disclosure.tlp not in {
+    return envelope.disclosure.tlp not in {
         TLPLevel.AMBER,
         TLPLevel.RED,
     }

@@ -132,7 +132,7 @@ ce compte de 5 à 6.
   dans un nouveau manifeste qui retient l'article, sans brouillon ni v1 bruitée.
   D7 rejoue le même `ToolInvocation` sans second téléchargement, simule une
   soumission Bridge ambiguë et vérifie que la reprise ne la resoumet pas ; le
-  budget téléchargements et `do_not_submit` bloquent seulement l'acquisition
+  budget téléchargements et l'absence de droit G2 bloquent seulement l'acquisition
   visée, tandis que Shodan continue. Un quota VT produit un résultat local
   `unavailable` et n'empêche pas la piste Shodan.
 - `investigation-opinion-repin.spec.ts` (`test-workflow-browser-investigation`) :

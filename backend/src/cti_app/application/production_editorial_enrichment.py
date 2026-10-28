@@ -1508,7 +1508,7 @@ def build_semantic_annotation_model_request(
         prompt_template_id="production-semantic-annotation",
         prompt_template_version=SEMANTIC_ANNOTATION_PROMPT_VERSION,
         evidence_pack_hash=evidence_hash,
-        external_llm_allowed=access_policy.external_llm_allowed and not access_policy.do_not_submit,
+        external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
         web_search=False,
@@ -4789,9 +4789,7 @@ def build_editorial_resource_proposal_model_request(
         prompt_template_id="production-editorial-resource-proposals",
         prompt_template_version=EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
         evidence_pack_hash=evidence_pack_hash,
-        external_llm_allowed=(
-            access_policy.external_llm_allowed and not access_policy.do_not_submit
-        ),
+        external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
         web_search=True,
@@ -5316,7 +5314,7 @@ def build_editorial_enrichment_model_request(
         prompt_template_id="production-editorial-enrichment",
         prompt_template_version=EDITORIAL_ENRICHMENT_PROMPT_VERSION,
         evidence_pack_hash=pack_hash,
-        external_llm_allowed=access_policy.external_llm_allowed and not access_policy.do_not_submit,
+        external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
         # The model must look at the live article's images to pick figures.
@@ -6471,13 +6469,13 @@ class ProductionEditorialEnrichmentService:
         )
         if reused is not None:
             return reused
-        if access_policy.do_not_submit or not access_policy.external_llm_allowed:
+        if not access_policy.external_llm_allowed:
             return self._needs_review(
                 input_hash=input_hash,
                 model_run_id=None,
                 model_calls=0,
                 error_code=EditorialEnrichmentStageErrorCode.POLICY_BLOCKED,
-                error_message="The source access policy forbids any model submission.",
+                error_message="The source access policy forbids external LLM access.",
                 details={
                     "do_not_submit": access_policy.do_not_submit,
                     "external_llm_allowed": access_policy.external_llm_allowed,
@@ -6672,7 +6670,7 @@ class ProductionEditorialEnrichmentService:
             ]
             if not self._resource_search_enabled:
                 wire_details["resource_proposal_search"] = {"status": "disabled_by_configuration"}
-            elif not access_policy.external_llm_allowed or access_policy.do_not_submit:
+            elif not access_policy.external_llm_allowed:
                 wire_details["resource_proposal_search"] = {"status": "blocked_by_access_policy"}
             else:
                 (

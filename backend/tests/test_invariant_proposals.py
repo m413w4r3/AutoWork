@@ -986,13 +986,14 @@ async def test_external_forbidden_policy_never_reaches_external_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_do_not_submit_never_reaches_external_p10_call() -> None:
+async def test_do_not_submit_does_not_block_external_p10_call() -> None:
     state = _State(samples=[_sample(uuid4(), external=True, do_not_submit=True)])
     service, _, conversation, _ = _service(state)
-    await service.propose(investigation_id=INVESTIGATION_ID)
-    assert conversation.external_calls == 0
-    assert conversation.local_calls == 1
-    assert conversation.external_allowed == [False]
+    result = await service.propose(investigation_id=INVESTIGATION_ID)
+    assert conversation.external_calls == 1
+    assert conversation.local_calls == 0
+    assert conversation.external_allowed == [True]
+    assert "do_not_submit" not in result.snapshot.context["origin_samples"][0]
 
 
 @pytest.mark.asyncio
