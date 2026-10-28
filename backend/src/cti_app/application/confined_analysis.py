@@ -32,6 +32,9 @@ class ConfinedAnalysisTool(StrEnum):
     TSHARK = "tshark"
     CAPINFOS = "capinfos"
     LOCAL_COMMAND = "local_command"
+    ZIP_MEMBERS = "zip_members"
+    ARCHIVE_LIST = "archive_list"
+    ARCHIVE_EXTRACT_HASH = "archive_extract_hash"
     FLOSS = "floss"
     MWCP = "mwcp"
     YARA = "yara"
@@ -112,6 +115,17 @@ class ConfinedAnalysisRequest:
                 "offset",
                 "length",
             },
+            ConfinedAnalysisTool.ZIP_MEMBERS: {"member_prefix", "max_members"},
+            ConfinedAnalysisTool.ARCHIVE_LIST: {
+                "member_prefix",
+                "max_members",
+                "archive_preset",
+            },
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH: {
+                "member_prefix",
+                "max_members",
+                "archive_preset",
+            },
             ConfinedAnalysisTool.FLOSS: {"max_strings"},
             ConfinedAnalysisTool.MWCP: {"parser_id", "parser_version"},
             ConfinedAnalysisTool.YARA: {"rule_source"},
@@ -135,6 +149,12 @@ class ConfinedAnalysisRequest:
         }.get(self.tool, set())
         if set(self.analysis_parameters) - allowed_parameters:
             raise ValueError("analysis parameters are not supported for this tool")
+        if self.tool in {
+            ConfinedAnalysisTool.ZIP_MEMBERS,
+            ConfinedAnalysisTool.ARCHIVE_LIST,
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+        }:
+            validate_archive_tool_request(self.tool, self.arguments, self.analysis_parameters)
         if self.tool is ConfinedAnalysisTool.DOTNET_ILSPY:
             parameters = self.analysis_parameters
             if self.arguments:
@@ -323,6 +343,39 @@ class ConfinedAnalysisRequest:
                     raise ValueError("Suricata candidate identity is invalid")
                 if not rule_source.strip():
                     raise ValueError("Suricata candidate source is empty")
+
+
+def validate_archive_tool_request(
+    tool: ConfinedAnalysisTool,
+    arguments: tuple[str, ...] | list[str],
+    parameters: Mapping[str, str],
+) -> None:
+    """Validate options at both the API and confined-worker boundaries."""
+    if arguments:
+        raise ValueError("archive tools do not accept command arguments")
+    allowed = {"member_prefix", "max_members"}
+    if tool in {
+        ConfinedAnalysisTool.ARCHIVE_LIST,
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+    }:
+        allowed.add("archive_preset")
+    if set(parameters) - allowed:
+        raise ValueError("archive tool parameters are invalid")
+    member_prefix = parameters.get("member_prefix")
+    if member_prefix is not None and (
+        not isinstance(member_prefix, str)
+        or not 1 <= len(member_prefix) <= 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in member_prefix)
+    ):
+        raise ValueError("archive member prefix is invalid")
+    max_members = parameters.get("max_members", "2000")
+    if not isinstance(max_members, str) or not _bounded_decimal(max_members, 1, 2000):
+        raise ValueError("archive member limit is invalid")
+    archive_preset = parameters.get("archive_preset", "none")
+    if archive_preset not in {"none", "infected", "malware"}:
+        raise ValueError("archive preset is not allowlisted")
+    if tool is ConfinedAnalysisTool.ZIP_MEMBERS and "archive_preset" in parameters:
+        raise ValueError("zip_members does not accept passwords")
 
 
 @dataclass(frozen=True, slots=True)

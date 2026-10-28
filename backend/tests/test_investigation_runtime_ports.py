@@ -40,6 +40,7 @@ from cti_app.application.virustotal import (
 )
 from cti_app.config import Settings
 from cti_app.domain.investigation import SampleAssociation, SampleOrigin
+from cti_app.domain.local_analysis import LocalCommandId
 from cti_app.domain.native_analysis import NativeAnalysisOperation, NativeAnalysisRequestV1
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -497,6 +498,26 @@ def test_inventory_separates_unmeasured_local_confinement_from_worker_attestatio
     assert inventory_families["analysis_worker_mwcp"]["available_reason"] == (
         "no_authorized_parser"
     )
+
+
+def test_archive_commands_are_projected_only_from_matching_worker_attestations() -> None:
+    settings = Settings(_env_file=None, local_analysis_enabled=True)
+    families = {
+        "zip_members": ConfinedAnalysisFamilyStatus("zip_members", True, "autowork-zip-members-v1"),
+        "archive_tools": ConfinedAnalysisFamilyStatus(
+            "archive_tools", False, None, "analysis_tool_version_unattested"
+        ),
+    }
+    catalog = runtime_ports._local_command_catalog(settings, family_statuses=families)
+
+    assert catalog.get(LocalCommandId.ZIP_MEMBERS).available is True  # type: ignore[union-attr]
+    assert catalog.get(LocalCommandId.ARCHIVE_LIST).available is False  # type: ignore[union-attr]
+    assert catalog.get(LocalCommandId.ARCHIVE_EXTRACT_HASH).available is False  # type: ignore[union-attr]
+
+    families["archive_tools"] = ConfinedAnalysisFamilyStatus("archive_tools", True, "16.02")
+    catalog = runtime_ports._local_command_catalog(settings, family_statuses=families)
+    assert catalog.get(LocalCommandId.ARCHIVE_LIST).available is True  # type: ignore[union-attr]
+    assert catalog.get(LocalCommandId.ARCHIVE_EXTRACT_HASH).available is True  # type: ignore[union-attr]
 
 
 def test_configured_extraction_ports_require_worker_attestations() -> None:

@@ -16,6 +16,9 @@ class LocalCommandId(StrEnum):
     OBJDUMP = "objdump"
     MONODIS = "monodis"
     YARA = "yara"
+    ZIP_MEMBERS = "zip_members"
+    ARCHIVE_LIST = "archive_list"
+    ARCHIVE_EXTRACT_HASH = "archive_extract_hash"
     # L4: optional extractors remain outside the generic local.run_command catalogue.
     FLOSS = "floss"
     MWCP = "mwcp"
@@ -54,6 +57,10 @@ class LocalOptionKind(StrEnum):
 LOCAL_COMMAND_MAX_RANGE_BYTES = 1 * 1024 * 1024
 LOCAL_COMMAND_MAX_XXD_RANGE_BYTES = 4096
 LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES = 8 * 1024
+LOCAL_ARCHIVE_MAX_MEMBERS = 2_000
+LOCAL_ARCHIVE_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+LOCAL_ARCHIVE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+LOCAL_ARCHIVE_MAX_COMPRESSION_RATIO = 1_000
 
 
 @dataclass(frozen=True, slots=True)

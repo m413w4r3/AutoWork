@@ -321,7 +321,16 @@ async def test_extraction_specs_require_filesystem_confinement_and_skip_version_
                 assert result.detail_code == "filesystem_confinement_required"
             assert not version_marker.exists()
             assert all(
-                spec.requires_filesystem_confinement is (spec.id is LocalCommandId.MONODIS)
+                spec.requires_filesystem_confinement
+                is (
+                    spec.id
+                    in {
+                        LocalCommandId.MONODIS,
+                        LocalCommandId.ZIP_MEMBERS,
+                        LocalCommandId.ARCHIVE_LIST,
+                        LocalCommandId.ARCHIVE_EXTRACT_HASH,
+                    }
+                )
                 for spec in default_local_command_specs()
             )
     finally:
@@ -558,6 +567,17 @@ def test_typed_catalog_includes_bounded_hex_and_hash_commands() -> None:
     assert xxd_options["offset"].minimum == 0
     assert sha256_options["offset"].optional is True
     assert sha256_options["length"].optional is True
+
+    zip_options = {
+        option.name: option for option in specs[LocalCommandId.ZIP_MEMBERS].allowed_options
+    }
+    archive_options = {
+        option.name: option for option in specs[LocalCommandId.ARCHIVE_EXTRACT_HASH].allowed_options
+    }
+    assert specs[LocalCommandId.ZIP_MEMBERS].requires_filesystem_confinement is True
+    assert zip_options["max_members"].maximum == 2000
+    assert zip_options["member_prefix"].max_item_length == 1024
+    assert archive_options["archive_preset"].allowed_values == ("none", "infected", "malware")
 
 
 @pytest.mark.asyncio

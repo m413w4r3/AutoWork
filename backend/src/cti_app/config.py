@@ -351,6 +351,7 @@ class Settings(BaseSettings):
     analysis_local_coreutils_expected_version: str = Field(
         default="9.1", min_length=1, max_length=64
     )
+    analysis_local_7z_expected_version: str = Field(default="16.02", min_length=1, max_length=64)
     analysis_local_command_max_range_bytes: int = Field(default=1_048_576, gt=0, le=1_048_576)
     analysis_suricata_expected_version: str = Field(default="7.0.10", min_length=1, max_length=64)
     analysis_suricata_rules_path: Path = Path("/app/rules/suricata")

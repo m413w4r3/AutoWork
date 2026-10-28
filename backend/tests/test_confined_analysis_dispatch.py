@@ -450,6 +450,8 @@ def _worker_probe_payload(
         "floss": "3.1.1",
         "mwcp": "3.16.1",
         "yara": "4.5.0",
+        "zip_members": "autowork-zip-members-v1",
+        "local_7z": "16.02",
     }
     if parser_version is not None:
         versions["mwcp_parser:AutoworkSafeFixture"] = parser_version
@@ -469,6 +471,8 @@ def _worker_probe_payload(
             "floss",
             "mwcp",
             "yara",
+            "zip_members",
+            "archive_tools",
         ],
         "versions": versions,
     }
@@ -730,6 +734,26 @@ def test_mwcp_family_and_parser_attestations_are_honest() -> None:
     assert registered.families["mwcp_parser:AutoworkSafeFixture"] == (
         ConfinedAnalysisFamilyStatus("mwcp_parser:AutoworkSafeFixture", True, "fixture-v1")
     )
+
+
+def test_archive_capabilities_require_worker_and_7z_attestations() -> None:
+    settings = Settings(_env_file=None)
+    payload = _worker_probe_payload(settings)
+    attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+    assert attestation.families["zip_members"].available is True
+    assert attestation.families["archive_tools"].available is True
+    assert attestation.versions["local_7z"] == "16.02"
+
+    payload["supported_families"] = [
+        item
+        for item in payload["supported_families"]
+        if item not in {"zip_members", "archive_tools"}
+    ]
+    payload["versions"].pop("zip_members")
+    payload["versions"].pop("local_7z")
+    old_worker = _attestation_from_response(json.dumps(payload).encode(), settings)
+    assert old_worker.families["zip_members"].available is False
+    assert old_worker.families["archive_tools"].available is False
 
 
 @pytest.mark.asyncio
