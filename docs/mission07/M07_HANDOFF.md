@@ -1,5 +1,14 @@
 # Mission 07 — handoff / registre (orchestrateur)
 
+> **ÉTAT 2026-10-28 ~16:50 UTC — orchestrateur #5 (Sonnet 5.5 medium).** Cette section prime sur les suivantes.
+> - Déployé : `main@3fe9d015` (empreinte `eb9c8a5362c21eb0` identique sur backend/worker/analysis-worker/job-recovery), Alembic `0006_tool_seconds_accounting` (tool_seconds = comptabilité seule, jamais un plafond ; sauvegarde `../AutoWork-backups/live-pre-0006-20261028T154437Z.dump`).
+> - Correctifs intégrés cette session : 2 tests CI (refus advisor prétransport = FAILED/tool_failed), merge integ-d17 (libération de réservation sur refus prouvé avant envoi, raisons S3 conservées, secret/échantillon restreint, evidence_preflight), correction de régression `TOOL_UNAVAILABLE` vide, bug API `/osint-open-policy/extend` avec Shodan (500). Lot `m07/bridge-simplify` ANNULÉ volontairement (supprimait les octets bruts des dossiers Bridge, conçus pour les inclure) ; reste ouvert : citer une observation d'octets bruts d'échantillon bloque le préflight (contournement : citer rapports VT / analyses).
+> - Outils vérifiés en réel : VT lecture + téléchargement, Bridge (review_text inv f0e868e4 ; plan_investigation inv a2531b85), shell (local.run_command), ILSpy/monodis, Ghidra 12.1.4 (service `ghidra` profil compose `ghidra`, sonde au démarrage : redémarrer backend/worker si le service démarre après), capa/FLOSS sur PE. Shodan : compte `oss` sans crédit ⇒ `SHODAN_*_ENABLED=false` dans `.env` (fait par l'utilisateur). Politique OSINT_OPEN v2 (Shodan 1000, activée par l'utilisateur) + enveloppe `human_g2` v156 (étendue par l'utilisateur).
+> - Enquête `a8845772` : analyste #6 = Paseo `b30ae970-ef0f…` (voir list_agents ; Luna xhigh), relais `.autowork-runs/m07/relay.py` vivant. Smokes orchestrateur (agent ORCHESTRATOR dans le journal) : RuntimeBroker.dll téléchargé (assoc f6436c9e…), sample.analyze inv 57584a2b, Ghidra, Shodan host refusé 403 plan oss (needs_review, 1 crédit réservé), shodan.count OK.
+> - Réservations Bridge historiques fuitées (16 tours, 57 840 s) non libérées (réconciliation humaine) ; sans effet vu l'absence de plafond temps.
+> - À venir : AUDIT-OBSERVER #2 (lecture seule) pendant/après l'analyste, BRIDGE-EVALUATOR, EDITOR + TYPST-PDF (refs `docs/references/CN2609_typ`, `docs/references/chpTypst`), FINAL-REVIEW, COMPARISON (après gel, avec 5f66ebfb), verdicts §16.
+> - Rotation des secrets recommandée (valeurs opérationnelles imprimées dans une transcription antérieure).
+
 > **Relève analyste CTI — 2026-10-28 08:18 UTC.** Cette section remplace
 > les consignes de reprise plus bas pour l'état courant de la phase C.
 
