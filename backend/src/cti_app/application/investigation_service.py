@@ -3143,6 +3143,13 @@ class InvestigationService:
             ToolEffect.EXTERNAL_ACTIVE,
             ToolEffect.EXTERNAL_SUBMIT,
         }
+        if (
+            result.framework_pre_submission_proof is FrameworkPreSubmissionProof.TOOL_UNAVAILABLE
+            and not result.output
+        ):
+            # A registry-level capability miss is fully represented by the terminal
+            # UNAVAILABLE invocation and has no tool result payload to archive.
+            return ()
         has_framework_proof = external_effect and result.framework_pre_submission_proof is not None
         if (
             result.error_code == "invalid_tool_arguments"
