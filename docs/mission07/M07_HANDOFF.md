@@ -166,3 +166,8 @@ SHA déployé (`22d03e22`, empreinte `239f62da6a38b8ea`), Alembic, contrôles de
 - Non fait volontairement : générer des jetons éphémères (changerait les identifiants de l'utilisateur), lire `.env`.
 - Reprise : l'utilisateur relance `make up` (même image, schéma 0005) depuis un shell exportant ses deux jetons ; puis vérifier `len>0` dans backend/worker/job-recovery, puis ratification ou ré-activation de la politique sous identité vérifiée (voir rapport).
 - Lacune de contrôle à ajouter à toute redéploiement : vérifier la présence des jetons AVANT et APRÈS.
+
+### ÉTAT 2026-10-28 ~08:00 UTC — orchestrateur #4
+- TECH-FIX `2f45949c` terminé : seulement un test de régression (bd99f2ad), aucun défaut de câblage trouvé offline. Diagnostic live (lecture SQL) : réservation de `e015` (11db4592) `reserved`, montants == reserved_budget ⇒ l'autorité d'effet est probablement construite ; c'est le builder de binding du transport qui renvoie None/refuse.
+- Fuite de réservations CONFIRMÉE (inv a8845772) : `reserved` bridge_turns 13, tool_seconds 47040, context_bytes 1378325, context_tokens 344586, vt_units 13 (2 ops) ; refus advisor pré-envoi ne libèrent pas.
+- Fixers lancés (Luna xhigh, worktrees neufs base main@7dd4ac18) : `5aa341be` branche m07/advisor-binding-live-diagnosis (prédicat live du binding) ; `67aee1fe` branche m07/advisor-preflight-release-reservation (libération unique des réservations sur refus advisor pré-envoi). Suite : tests PG par moi, revue Luna neuve, merge --no-ff, gates, make up (jetons vérifiés avant/après), empreinte, analyste #6.
