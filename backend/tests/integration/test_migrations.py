@@ -1157,8 +1157,10 @@ def test_tool_seconds_migration_updates_the_existing_reservation_check(
         _check_constraints(temporary_postgres_url, "investigation_budget_reservation_amounts")
     )
     tool_seconds_check = checks["ck_budget_reservation_amounts_values"]
-    assert "dimension = 'tool_seconds'" in tool_seconds_check
-    assert "committed_amount <= coalesce" in tool_seconds_check
+    normalized = tool_seconds_check.lower()
+    # PostgreSQL may render the comparison as ``dimension::text = 'tool_seconds'::text``.
+    assert "'tool_seconds'" in normalized
+    assert "committed_amount <= coalesce" in normalized
 
 
 def _assert_c2_absent(database_url: str) -> None:
