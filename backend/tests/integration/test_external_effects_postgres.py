@@ -1897,6 +1897,134 @@ async def test_bridge_attempt_request_id_mismatch_refuses_without_send_or_increm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalidity", "expected_reason"),
+    [
+        ("missing_reservation", "reservation_not_reserved"),
+        ("model_run_identity", "bridge_turn_not_eligible"),
+    ],
+)
+async def test_bridge_lineage_refusals_do_not_send(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    invalidity: str,
+    expected_reason: str,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        authority,
+        prepared,
+        _unused_store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    additional_engine: AsyncEngine | None = None
+    if invalidity == "missing_reservation":
+        authority = replace(authority, operation_key=f"missing-reservation:{uuid4()}")
+    elif invalidity == "model_run_identity":
+        (
+            _additional_factory,
+            additional_engine,
+            _additional_investigation_id,
+            additional_authority,
+            _additional_prepared,
+            _additional_store,
+            _additional_run_id,
+        ) = await _prepare_model_submission_case(
+            migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+        )
+        assert additional_authority.model_run_id is not None
+        authority = replace(authority, model_run_id=additional_authority.model_run_id)
+    else:
+        pytest.fail(f"unknown invalidity: {invalidity}")
+
+    transport = _CountingTransport()
+    store = SqlAlchemyExternalEffectClaimStore(
+        session_factory,
+        family_bindings={
+            "bridge.investigation_turn.v1": ExternalEffectFamilyBinding(
+                provider="bridge",
+                provider_scopes=frozenset({"bridge-test"}),
+                normalizer_versions=frozenset({"bridge.turn.v1"}),
+                invocation_tool_binding=(_FAMILY, "v1"),
+                model_submission=True,
+                requires_model_lineage=True,
+                model_run_provider="openai",
+            )
+        },
+    )
+    try:
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == expected_reason
+        assert transport.calls == 0
+        async with session_factory() as session:
+            run = await session.get(ModelRunRow, run_id)
+            claim_count = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(ExternalEffectClaimRow.investigation_id == investigation_id)
+            )
+        assert run is not None and run.submission_state == "external_state_unknown"
+        assert claim_count == 0
+    finally:
+        await engine.dispose()
+        if additional_engine is not None:
+            await additional_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_authority_cannot_use_another_investigations_invocation(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    (
+        first_factory,
+        first_engine,
+        _first_investigation_id,
+        first_authority,
+        first_prepared,
+        _first_store,
+        _first_run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    (
+        _second_factory,
+        second_engine,
+        _second_investigation_id,
+        second_authority,
+        _second_prepared,
+        _second_store,
+        _second_run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    foreign_authority = replace(
+        first_authority,
+        investigation_id=second_authority.investigation_id,
+        operation_key=second_authority.operation_key,
+        reservation_amounts=second_authority.reservation_amounts,
+        expected_envelope_version=second_authority.expected_envelope_version,
+        approval_decision_id=second_authority.approval_decision_id,
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(
+            _bridge_model_lineage_store(first_factory)
+        ).send_one(foreign_authority, first_prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "invocation_investigation_mismatch"
+        assert transport.calls == 0
+    finally:
+        await first_engine.dispose()
+        await second_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crash_before_bridge_consume_keeps_unknown_attempt_for_reconciliation(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:

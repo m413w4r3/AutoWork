@@ -30,17 +30,26 @@ import pytest
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.bridge_investigator import ModelConversationTurnTransport
-from cti_app.application.external_effects import ExternalEffectCoordinator
+from cti_app.application.external_effects import (
+    ExternalEffectCoordinator,
+    FrameworkNoSendProof,
+    Refused,
+)
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
+    BridgeExternalEffectBinding,
     ConversationResult,
     ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
     ModelRouter,
     SafeModelRequest,
+)
+from cti_app.domain.external_effects import (
+    ExternalEffectAuthority,
+    ExternalEffectAuthorityKind,
 )
 from cti_app.domain.model_conversations import (
     ConversationMode,
@@ -362,6 +371,119 @@ async def test_investigation_bridge_turn_without_binding_is_refused_before_http_
     assert result.status.value == "unavailable"
     assert result.error_code == "external_effect_authority_required"
     assert posts == []
+
+
+@pytest.mark.asyncio
+async def test_coordinator_consume_refusal_keeps_its_reason_before_http_send(
+    tmp_path: Path,
+) -> None:
+    posts: list[httpx.Request] = []
+    consumed: list[tuple[ExternalEffectAuthority, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"id": "unused", "status": "completed", "output_text": "unused"},
+        )
+
+    class RefusingCoordinator:
+        async def send_one(self, authority, prepared, _transport):
+            consumed.append((authority, prepared))
+            return Refused(
+                reason="reservation_not_reserved",
+                framework_no_send_proof=FrameworkNoSendProof(
+                    "PRE_CONSUME", "reservation_not_reserved"
+                ),
+            )
+
+    bridge_transport = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key=None,
+        coordinator=cast(ExternalEffectCoordinator, RefusingCoordinator()),
+        http_transport=httpx.MockTransport(handler),
+    )
+    bridge_transport._last_capabilities_check = time.monotonic()
+    adapter = OpenAIResearchAdapter(bridge_transport, model="test-model")
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    invocation_id = uuid4()
+    conversation_uow = InMemoryConversationUnitOfWorkFactory(known_subject_ids={subject_id})
+    blob_store = FilesystemBlobStore(tmp_path)
+    output_store = BlobModelOutputStore(
+        BlobCatalogService(blob_store, conversation_uow)  # type: ignore[arg-type]
+    )
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        conversation_uow,
+        output_store,
+    )
+    service = ModelConversationService(
+        conversation_uow,  # type: ignore[arg-type]
+        gateway,
+        blob_store,
+    )
+    authority = ExternalEffectAuthority(
+        investigation_id=investigation_id,
+        invocation_id=invocation_id,
+        operation_key="advisor-consume-refusal",
+        reservation_amounts={"bridge_turns": 1},
+        expected_envelope_version=1,
+        approval_decision_id=uuid4(),
+        invocation_arguments_sha256=hashlib.sha256(b"{}").hexdigest(),
+        authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
+        policy_event_id=uuid4(),
+        policy_version="1",
+        pinned_subject_id=subject_id,
+    )
+    turns = ModelConversationTurnTransport(service, require_external_effect_authority=True)
+
+    result = await turns.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=1,
+        context_sha256=hashlib.sha256(b"synthetic advisor context").hexdigest(),
+        prompt="Synthetic advisor request",
+        external_llm_allowed=True,
+        bridge_external_effect_binding=BridgeExternalEffectBinding(
+            authority=authority,
+            family="advisor.consultation.v1",
+            provider_scope="bridge",
+            normalizer_version="advisor.consultation.v1",
+        ),
+    )
+
+    assert result.status.value == "unavailable"
+    assert result.error_code == "external_effect_authority_required"
+    assert result.failure_stage == "coordinator_consume_refused"
+    assert result.failure_reason == "reservation_not_reserved"
+    assert result.submission_state == "pre_submission"
+    assert posts == []
+    assert len(consumed) == 1
+    assert consumed[0][0].invocation_id == invocation_id
+    assert consumed[0][0].bridge_turn_id is not None
+    assert consumed[0][0].model_run_id is not None
+    assert len(consumed[0][1].application_request_sha256) == 64
+    assert len(conversation_uow.model_runs) == 1
+    model_run = next(iter(conversation_uow.model_runs.values()))
+    assert model_run.error_details is not None
+    bridge_diagnostics = model_run.error_details["bridge_diagnostics"]
+    assert bridge_diagnostics["family"] == "advisor.consultation.v1"
+    assert bridge_diagnostics["failure_stage"] == "coordinator_consume_refused"
+    assert bridge_diagnostics["failure_reason"] == "reservation_not_reserved"
+    assert bridge_diagnostics["invocation_id"] == str(invocation_id)
+    assert bridge_diagnostics["bridge_turn_id"] == str(consumed[0][0].bridge_turn_id)
+    assert bridge_diagnostics["model_run_id"] == str(model_run.id)
+    assert len(bridge_diagnostics["prepared_request_sha256"]) == 64
+    assert len(bridge_diagnostics["physical_request_sha256"]) == 64
+    assert "prompt" not in bridge_diagnostics
 
 
 class _CrashesBeforeGatewayClaimsTheRun(ModelGateway):

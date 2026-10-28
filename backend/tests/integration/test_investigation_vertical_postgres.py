@@ -38,6 +38,7 @@ from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualifi
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     DisclosureBounds,
     EnvelopeAuthorityKind,
     FindingAssessment,
@@ -1881,6 +1882,61 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 )
                 == audit_before_replay
             )
+
+            refusal_key = f"m07.operator.advisor-presend-refusal:{investigation_id}"
+            posts_before_refusal = bridge_http_calls.count(("POST", "/v1/responses"))
+            pretransport_refusal = await invoke_operator_tool(
+                "advisor.consult",
+                "advisor-consult.v1",
+                {
+                    "consultation_type": "plan_investigation",
+                    "evidence_refs": [str(analysis_observation_id), str(uuid4())],
+                },
+                key=refusal_key,
+                purpose="Verify durable budget release after a local pre-transport refusal.",
+            )
+            assert_tool_status("advisor.consult", pretransport_refusal, "failed")
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
+            refusal_invocation_id = UUID(pretransport_refusal["invocation"]["id"])
+            async with uow_factory() as uow:
+                refusal_invocation = await uow.tool_invocations.get(refusal_invocation_id)
+                latest_envelope = await uow.investigation_envelopes.get(investigation_id)
+                budget_snapshot = await uow.investigation_budgets.get(investigation_id)
+                refusal_observations = tuple(
+                    await uow.evidence_observations.list_for_investigation(investigation_id)
+                )
+            assert refusal_invocation is not None
+            assert latest_envelope is not None and budget_snapshot is not None
+            refusal_reservation = next(
+                item
+                for item in latest_envelope.budget.reservations
+                if item.operation_key == refusal_invocation.operation_key
+            )
+            assert refusal_reservation.amounts[BudgetDimension.BRIDGE_TURNS] > 0
+            assert refusal_reservation.amounts[BudgetDimension.TOOL_SECONDS] > 0
+            assert refusal_reservation.status is BudgetReservationStatus.RELEASED
+            assert refusal_invocation.consumed_budget == {}
+            assert budget_snapshot.budget == latest_envelope.budget
+            refusal_proof = next(
+                item
+                for item in refusal_observations
+                if item.invocation_ref == refusal_invocation_id
+                and item.object_type
+                == FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL.value
+            )
+            assert refusal_proof.object_id == refusal_invocation.operation_key
+            refusal_request = next(
+                request for name, key, request in operator_requests if key == refusal_key
+            )
+            replay_refusal = await client.post(
+                f"/api/investigations/{investigation_id}/operator/tools/advisor.consult",
+                headers={"Idempotency-Key": refusal_key},
+                json=refusal_request,
+            )
+            assert replay_refusal.status_code == 200, replay_refusal.text
+            assert replay_refusal.json()["idempotent_replay"] is True
+            assert replay_refusal.json()["invocation"]["id"] == str(refusal_invocation_id)
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
     finally:
         await vt_adapter._client.aclose()
         await effect_engine.dispose()

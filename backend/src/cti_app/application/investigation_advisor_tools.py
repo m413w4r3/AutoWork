@@ -63,6 +63,7 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolRegistry,
     ToolResult,
+    _authorize_framework_refusal_proof_adapter,
     validate_json_schema,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -85,6 +86,7 @@ from cti_app.domain.investigation import (
     BudgetReservationStatus,
     EvidenceKind,
     EvidenceObservation,
+    FrameworkPreSubmissionProof,
     ToolInvocationStatus,
     canonical_json_bytes,
     thaw_json,
@@ -1127,6 +1129,7 @@ class InvestigationAdvisorTool:
                 "reservation_operation_key": reservation_key,
             },
         )
+        submission_proves_no_execution = _submission_proves_no_execution(submission)
         evidence_preflight = evaluate_advisor_evidence_preflight(
             prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)
         )
@@ -1235,6 +1238,8 @@ class InvestigationAdvisorTool:
                 prompt_data=prompt_data,
                 execution_timeout_seconds=execution_timeout_seconds,
             )
+        if submission_proves_no_execution:
+            result = _attest_advisor_pre_submission(result)
         parse_elapsed_ms = round((time.perf_counter() - parse_started_at) * 1000)
         input_refs = tuple(persisted_input_refs)
         input_sha256 = hashlib.sha256(encoded).hexdigest()
@@ -1432,6 +1437,7 @@ class InvestigationAdvisorTool:
                 message=result.message,
                 exception_class=result.exception_class,
                 error_code=result.error_code,
+                framework_pre_submission_proof=result.framework_pre_submission_proof,
             )
             persistence_elapsed_ms = round((time.perf_counter() - persistence_started_at) * 1000)
             result = replace(
@@ -1474,6 +1480,11 @@ class InvestigationAdvisorTool:
                     error_code="advisor_result_persistence_uncertain",
                     output={"advisor_status": "needs_review", "retry": False},
                     exception_class=type(exc).__name__,
+                    framework_pre_submission_proof=(
+                        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+                        if submission_proves_no_execution
+                        else None
+                    ),
                 ),
             )
         return self._finish(context, result)
@@ -3654,8 +3665,13 @@ class InvestigationAdvisorTool:
             return ToolResult(
                 ToolInvocationStatus.POLICY_DENIED,
                 observation_refs=evidence_refs,
+                budget_consumed=usage,
                 error_code="POLICY_DENIED",
-                output={"advisor_status": "policy_denied"},
+                output={
+                    "advisor_status": "policy_denied",
+                    "prior_submission_made": submission.prior_submission_made,
+                    "bridge_turns_consumed": bridge_turns_consumed,
+                },
             )
         if submission.status is TurnSubmissionStatus.NEEDS_REVIEW:
             return ToolResult(
@@ -3670,6 +3686,7 @@ class InvestigationAdvisorTool:
                     "failure_reason": failure_reason,
                     "confirmed_non_execution": False,
                     "bridge_turns_consumed": bridge_turns_consumed,
+                    "prior_submission_made": submission.prior_submission_made,
                 },
             )
         if submission.output_text is None and (
@@ -3692,6 +3709,7 @@ class InvestigationAdvisorTool:
                     "failure_reason": failure_reason,
                     "confirmed_non_execution": False,
                     "bridge_turns_consumed": bridge_turns_consumed,
+                    "prior_submission_made": submission.prior_submission_made,
                 },
             )
         if submission.output_text is None and any(
@@ -3705,11 +3723,12 @@ class InvestigationAdvisorTool:
                 output={
                     "advisor_status": "rate_limited",
                     "retry": False,
-                    "confirmed_non_execution": True,
+                    "confirmed_non_execution": not submission.prior_submission_made,
                     "retry_after_seconds": None,
                     "failure_stage": failure_stage,
                     "failure_reason": failure_reason,
                     "bridge_turns_consumed": bridge_turns_consumed,
+                    "prior_submission_made": submission.prior_submission_made,
                 },
             )
         if submission.status is not TurnSubmissionStatus.SUCCEEDED:
@@ -3729,8 +3748,12 @@ class InvestigationAdvisorTool:
                     "retry": False,
                     "failure_stage": failure_stage,
                     "failure_reason": failure_reason,
-                    "confirmed_non_execution": submission.submission_state == "pre_submission",
+                    "confirmed_non_execution": (
+                        not submission.prior_submission_made
+                        and submission.submission_state == "pre_submission"
+                    ),
                     "bridge_turns_consumed": bridge_turns_consumed,
+                    "prior_submission_made": submission.prior_submission_made,
                 },
             )
         if submission.output_text is None and submission.status is TurnSubmissionStatus.SUCCEEDED:
@@ -3910,6 +3933,7 @@ class InvestigationAdvisorTool:
         return self._finish(context, result)
 
     def _finish(self, context: ToolExecutionContext, result: ToolResult) -> ToolResult:
+        result = _attest_advisor_pre_submission(result)
         self._results[context.idempotency_key] = result
         if len(self._results) > 128:
             self._results.pop(next(iter(self._results)))
@@ -3921,6 +3945,7 @@ def register_investigation_advisor_tool(
     *,
     adapter: InvestigationAdvisorTool,
 ) -> None:
+    _authorize_framework_refusal_proof_adapter(adapter)
     max_tool_seconds = _advisor_tool_seconds_limit(adapter._settings)
     uuid_schema = {
         "type": "string",
@@ -4789,22 +4814,35 @@ def _advisor_unit_provenance(
 
 
 def _bridge_turns_consumed(submission: TurnSubmission) -> int:
+    prior_consumed = int(submission.prior_submission_made)
     if submission.status is TurnSubmissionStatus.BLOCKED:
-        return 0
+        return prior_consumed
     if submission.submission_state == "pre_submission":
-        return 0
+        return prior_consumed
     if submission.status in {
         TurnSubmissionStatus.SUCCEEDED,
         TurnSubmissionStatus.NEEDS_REVIEW,
     }:
-        return 1
-    return int(
+        return prior_consumed + 1
+    return prior_consumed + int(
         submission.submission_state
         in {"submission_attempted", "post_submission", "external_state_unknown"}
     )
 
 
+def _submission_proves_no_execution(submission: TurnSubmission) -> bool:
+    return (
+        not submission.prior_submission_made
+        and submission.submission_state == "pre_submission"
+        and _bridge_turns_consumed(submission) == 0
+        and submission.status is not TurnSubmissionStatus.SUCCEEDED
+        and submission.output_text is None
+    )
+
+
 def _advisor_payload_was_submitted(submission: TurnSubmission) -> bool:
+    if submission.prior_submission_made:
+        return True
     if (
         submission.status
         in {
@@ -4821,6 +4859,8 @@ def _advisor_payload_was_submitted(submission: TurnSubmission) -> bool:
 
 
 def _advisor_invocation_stage(submission: TurnSubmission) -> str:
+    if submission.prior_submission_made:
+        return "submitted"
     if submission.status is TurnSubmissionStatus.BLOCKED:
         return "prevalidation"
     if submission.output_text is not None:
@@ -4879,6 +4919,41 @@ def _advisor_reserved_budget(
 def _advisor_tool_seconds_limit(settings: Any) -> int:
     value = getattr(settings, "investigation_max_tool_seconds", MAX_ADVISOR_TOOL_SECONDS)
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 3_600
+
+
+def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
+    """Attach typed proof only when advisor code has a zero-turn no-send result."""
+    if result.framework_pre_submission_proof is not None:
+        return result
+    if (
+        result.status
+        not in {
+            ToolInvocationStatus.FAILED,
+            ToolInvocationStatus.UNAVAILABLE,
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }
+        or result.output.get("confirmed_non_execution") is not True
+        or result.output.get("bridge_turns_consumed", 0) != 0
+        or result.budget_consumed.get(BudgetDimension.BRIDGE_TURNS, 0) != 0
+        or result.output.get("prior_submission_made") is True
+        or result.output.get("failure_stage")
+        not in {
+            "pre_transport_validation",
+            "external_effect_authority",
+            "binding_missing",
+            "binding_invalid",
+            "coordinator_validation_refused",
+            "coordinator_consume_refused",
+        }
+    ):
+        return result
+    return replace(
+        result,
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
 
 
 def _advisor_minimum_execution_seconds(settings: Any) -> int | None:

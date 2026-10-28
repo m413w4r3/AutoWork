@@ -6823,3 +6823,38 @@ async def test_cross_investigation_evidence_reference_is_rejected_before_bridge(
     assert result.output["failure_stage"] == "pre_transport_validation"
     assert result.output["confirmed_non_execution"] is True
     assert transport.calls == []
+
+
+def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+    )
+    submission = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        error_code="external_effect_authority_required",
+        submission_state="pre_submission",
+        failure_stage="external_effect_authority",
+        prior_submission_made=True,
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic bounded consultation prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=256,
+        consultation_type="review_text",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={},
+    )
+    result = tool._finish(make_context(investigation_id, key="advisor:retry-refusal"), result)
+
+    assert result.output["prior_submission_made"] is True
+    assert result.output["confirmed_non_execution"] is False
+    assert result.output["bridge_turns_consumed"] == 1
+    assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert result.framework_pre_submission_proof is None

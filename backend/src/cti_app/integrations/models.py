@@ -123,7 +123,10 @@ class HttpResponsesTransport:
     ) -> dict[str, Any]:
         if self._external_effect_coordinator is not None:
             if bridge_external_effect_binding is None:
-                raise _bridge_external_effect_refusal()
+                raise _bridge_external_effect_refusal(
+                    failure_stage="binding_missing",
+                    failure_reason="bridge_external_effect_binding_missing",
+                )
             return await self._coordinated_create(
                 payload,
                 idempotency_key=idempotency_key,
@@ -131,7 +134,10 @@ class HttpResponsesTransport:
                 binding=bridge_external_effect_binding,
             )
         if bridge_external_effect_binding is not None:
-            raise _bridge_external_effect_refusal()
+            raise _bridge_external_effect_refusal(
+                failure_stage="binding_invalid",
+                failure_reason="coordinator_unavailable_for_binding",
+            )
         return await self._request(
             "POST",
             "/responses",
@@ -250,17 +256,56 @@ class HttpResponsesTransport:
     ) -> dict[str, Any]:
         coordinator = self._external_effect_coordinator
         if coordinator is None:
-            raise _bridge_external_effect_refusal()
-        if (
-            not idempotency_key
-            or binding.bridge_turn_id is None
-            or binding.model_run_id is None
-            or binding.model_input_sha256 is None
-            or binding.authorized_input_hash is None
-            or binding.authority.bridge_turn_id != binding.bridge_turn_id
-            or binding.authority.model_run_id != binding.model_run_id
-        ):
-            raise _bridge_external_effect_refusal()
+            raise _bridge_external_effect_refusal(
+                failure_stage="binding_invalid",
+                failure_reason="coordinator_unavailable_for_binding",
+                diagnostics=_bridge_external_effect_diagnostic(
+                    binding,
+                    failure_stage="binding_invalid",
+                    failure_reason="coordinator_unavailable_for_binding",
+                ),
+            )
+        if not idempotency_key:
+            raise _bridge_external_effect_refusal(
+                failure_stage="binding_invalid",
+                failure_reason="idempotency_key_missing",
+                diagnostics=_bridge_external_effect_diagnostic(
+                    binding,
+                    failure_stage="binding_invalid",
+                    failure_reason="idempotency_key_missing",
+                ),
+            )
+        invalid_binding_reason = next(
+            (
+                reason
+                for condition, reason in (
+                    (binding.bridge_turn_id is None, "bridge_turn_id_missing"),
+                    (binding.model_run_id is None, "model_run_id_missing"),
+                    (binding.model_input_sha256 is None, "model_input_sha256_missing"),
+                    (binding.authorized_input_hash is None, "authorized_input_hash_missing"),
+                    (
+                        binding.authority.bridge_turn_id != binding.bridge_turn_id,
+                        "authority_turn_id_mismatch",
+                    ),
+                    (
+                        binding.authority.model_run_id != binding.model_run_id,
+                        "authority_model_run_id_mismatch",
+                    ),
+                )
+                if condition
+            ),
+            None,
+        )
+        if invalid_binding_reason is not None:
+            raise _bridge_external_effect_refusal(
+                failure_stage="binding_invalid",
+                failure_reason=invalid_binding_reason,
+                diagnostics=_bridge_external_effect_diagnostic(
+                    binding,
+                    failure_stage="binding_invalid",
+                    failure_reason=invalid_binding_reason,
+                ),
+            )
 
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         headers["X-Idempotency-Key"] = idempotency_key
@@ -269,12 +314,13 @@ class HttpResponsesTransport:
             headers["X-Correlation-ID"] = correlation_id
         read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
         timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                transport=self._http_transport,
-            ) as client:
+        request: httpx.Request | None = None
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            transport=self._http_transport,
+        ) as client:
+            try:
                 request = client.build_request(
                     "POST",
                     f"{self._base_url}/responses",
@@ -302,16 +348,52 @@ class HttpResponsesTransport:
                     evidence_refs=binding.evidence_refs,
                     credential_parameter_names=binding.credential_parameter_names,
                 )
-                physical_transport = _CoordinatedResponsesPoster(client, request)
+            except (ExternalEffectValidationError, TypeError, ValueError) as exc:
+                reason = type(exc).__name__
+                raise _bridge_external_effect_refusal(
+                    failure_stage="coordinator_validation_refused",
+                    failure_reason=reason,
+                    diagnostics=_bridge_external_effect_diagnostic(
+                        binding,
+                        failure_stage="coordinator_validation_refused",
+                        failure_reason=reason,
+                        request_sha256=(
+                            hashlib.sha256(request.content).hexdigest()
+                            if request is not None
+                            else None
+                        ),
+                    ),
+                ) from None
+            except Exception as exc:
+                reason = type(exc).__name__
+                raise _bridge_external_effect_refusal(
+                    failure_stage="coordinator_validation_refused",
+                    failure_reason=reason,
+                    diagnostics=_bridge_external_effect_diagnostic(
+                        binding,
+                        failure_stage="coordinator_validation_refused",
+                        failure_reason=reason,
+                    ),
+                ) from None
+
+            physical_transport = _CoordinatedResponsesPoster(client, request)
+            try:
                 outcome = await coordinator.send_one(
                     binding.authority,
                     prepared,
                     physical_transport,
                 )
-        except (ExternalEffectValidationError, TypeError, ValueError):
-            raise _bridge_external_effect_refusal() from None
-        except Exception:
-            raise _bridge_submission_reconciliation_error() from None
+            except Exception as exc:
+                reason = type(exc).__name__
+                raise _bridge_submission_reconciliation_error(
+                    failure_reason=reason,
+                    diagnostics=_bridge_external_effect_diagnostic(
+                        binding,
+                        failure_stage="provider_submission_ambiguous",
+                        failure_reason=reason,
+                        prepared=prepared,
+                    ),
+                ) from None
 
         if isinstance(outcome, Completed):
             if outcome.outcome_code in {"bridge_rate_limited", "bridge_rejected"}:
@@ -342,7 +424,25 @@ class HttpResponsesTransport:
                 submission_state="pre_submission",
             )
         if isinstance(outcome, Refused):
-            raise _bridge_external_effect_refusal()
+            proof = outcome.framework_no_send_proof
+            failure_stage = (
+                "coordinator_consume_refused"
+                if proof.kind == "PRE_CONSUME"
+                else "coordinator_validation_refused"
+            )
+            failure_reason = _safe_external_effect_reason(outcome.reason)
+            raise _bridge_external_effect_refusal(
+                failure_stage=failure_stage,
+                failure_reason=failure_reason,
+                diagnostics=_bridge_external_effect_diagnostic(
+                    binding,
+                    failure_stage=failure_stage,
+                    failure_reason=failure_reason,
+                    prepared=prepared,
+                    claim_id=getattr(outcome, "claim_id", None),
+                    proof_kind=proof.kind,
+                ),
+            )
         if isinstance(outcome, Reused):
             resolver = binding.reused_result_resolver
             if resolver is not None:
@@ -354,8 +454,25 @@ class HttpResponsesTransport:
                     return archived_response
             raise _bridge_submission_reconciliation_error()
         if isinstance(outcome, Ambiguous):
-            raise _bridge_submission_reconciliation_error()
-        raise _bridge_submission_reconciliation_error()
+            raise _bridge_submission_reconciliation_error(
+                failure_reason="coordinator_returned_ambiguous",
+                diagnostics=_bridge_external_effect_diagnostic(
+                    binding,
+                    failure_stage="provider_submission_ambiguous",
+                    failure_reason="coordinator_returned_ambiguous",
+                    prepared=prepared,
+                    claim_id=outcome.claim_id,
+                ),
+            )
+        raise _bridge_submission_reconciliation_error(
+            failure_reason="coordinator_returned_unknown_outcome",
+            diagnostics=_bridge_external_effect_diagnostic(
+                binding,
+                failure_stage="provider_submission_ambiguous",
+                failure_reason="coordinator_returned_unknown_outcome",
+                prepared=prepared,
+            ),
+        )
 
 
 class BridgeTransportError(ModelGatewayError):
@@ -379,6 +496,8 @@ class BridgeTransportError(ModelGatewayError):
         reason: str | None = None,
         verified_no_answer: bool = False,
         completed_response: bool = False,
+        failure_stage: str | None = None,
+        failure_reason: str | None = None,
     ) -> None:
         super().__init__(safe_description)
         self.code = code
@@ -395,6 +514,8 @@ class BridgeTransportError(ModelGatewayError):
         self.reason = reason
         self.verified_no_answer = verified_no_answer
         self.completed_response = completed_response
+        self.failure_stage = failure_stage
+        self.failure_reason = failure_reason
 
 
 class _CoordinatedResponsesPoster:
@@ -459,13 +580,21 @@ def _freeze_httpx_request(request: httpx.Request) -> FrozenWireRequest:
     )
 
 
-def _bridge_external_effect_refusal() -> BridgeTransportError:
+def _bridge_external_effect_refusal(
+    *,
+    failure_stage: str = "binding_invalid",
+    failure_reason: str = "external_effect_authority_required",
+    diagnostics: dict[str, Any] | None = None,
+) -> BridgeTransportError:
     return BridgeTransportError(
         "external_effect_authority_required",
         "Bridge submission was refused because external-effect authorization is unavailable.",
         retryable=False,
         phase="preflight",
         submission_state="pre_submission",
+        failure_stage=failure_stage,
+        failure_reason=failure_reason,
+        diagnostics=diagnostics,
     )
 
 
@@ -478,14 +607,67 @@ def _is_responses_submission_path(base_url: str, path: str) -> bool:
     return actual_path == responses_path
 
 
-def _bridge_submission_reconciliation_error() -> BridgeTransportError:
+def _bridge_submission_reconciliation_error(
+    *,
+    failure_reason: str = "model_submission_reconciliation_required",
+    diagnostics: dict[str, Any] | None = None,
+) -> BridgeTransportError:
     return BridgeTransportError(
         "model_submission_reconciliation_required",
         "Bridge submission may have reached the provider and requires reconciliation.",
         retryable=False,
         phase="reconciliation",
         submission_state="external_state_unknown",
+        failure_stage="provider_submission_ambiguous",
+        failure_reason=failure_reason,
+        diagnostics=diagnostics,
     )
+
+
+def _safe_external_effect_reason(value: object) -> str:
+    """Keep internal refusal codes while excluding arbitrary exception text."""
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", value):
+        return value
+    return "unclassified_refusal"
+
+
+def _bridge_external_effect_diagnostic(
+    binding: BridgeExternalEffectBinding,
+    *,
+    failure_stage: str,
+    failure_reason: str,
+    prepared: PreparedExternalRequest | None = None,
+    request_sha256: str | None = None,
+    claim_id: object = None,
+    proof_kind: str | None = None,
+) -> dict[str, Any]:
+    authority = binding.authority
+    diagnostic: dict[str, Any] = {
+        "family": binding.family,
+        "failure_stage": failure_stage,
+        "failure_reason": _safe_external_effect_reason(failure_reason),
+        "submission_state": (
+            "external_state_unknown"
+            if failure_stage == "provider_submission_ambiguous"
+            else "pre_submission"
+        ),
+    }
+    for name, value in (
+        ("invocation_id", authority.invocation_id),
+        ("bridge_turn_id", binding.bridge_turn_id),
+        ("model_run_id", binding.model_run_id),
+        ("claim_id", claim_id),
+    ):
+        if isinstance(value, UUID):
+            diagnostic[name] = str(value)
+    if prepared is not None:
+        diagnostic["prepared_request_sha256"] = prepared.application_request_sha256
+        diagnostic["physical_request_sha256"] = prepared.physical_request_sha256
+    elif request_sha256 is not None and re.fullmatch(r"[a-f0-9]{64}", request_sha256):
+        diagnostic["request_sha256"] = request_sha256
+    if proof_kind is not None and re.fullmatch(r"[A-Z_]{1,32}", proof_kind):
+        diagnostic["framework_no_send_proof_kind"] = proof_kind
+    return diagnostic
 
 
 def _safe_bridge_rejection_message(code: str) -> str:

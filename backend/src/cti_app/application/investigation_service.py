@@ -215,6 +215,7 @@ class ProductionArtifactObservationWriter:
     async def archive(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
+        framework_proof = result.framework_pre_submission_proof
         reason = result.output.get("reason")
         provider_auth_refusal = (
             result.status is ToolInvocationStatus.UNAVAILABLE
@@ -239,21 +240,20 @@ class ProductionArtifactObservationWriter:
             and invocation.tool_name not in {"vt.download_sample", "sample.analyze"}
             and not provider_auth_refusal
             and not provider_download_refusal
+            and framework_proof is None
         ):
             return ()
         safe_result = _sanitize_json(thaw_json(result.output))
         if not safe_result:
-            if result.framework_pre_submission_proof is None:
+            if framework_proof is None:
                 return ()
             safe_result = {}
-        if result.framework_pre_submission_proof is None:
+        if framework_proof is None:
             # An adapter response is untrusted and cannot attest that the
             # framework rejected an operation before submission.
             safe_result.pop("framework_pre_submission_proof", None)
         else:
-            safe_result["framework_pre_submission_proof"] = {
-                "object_type": result.framework_pre_submission_proof.value
-            }
+            safe_result["framework_pre_submission_proof"] = {"object_type": framework_proof.value}
         payload = {
             "schema": "investigation-tool-observation.v1",
             "tool_name": invocation.tool_name,
@@ -268,8 +268,8 @@ class ProductionArtifactObservationWriter:
             source=invocation.tool_name,
             source_version=invocation.schema_version,
             object_type=(
-                result.framework_pre_submission_proof.value
-                if result.framework_pre_submission_proof is not None
+                framework_proof.value
+                if framework_proof is not None
                 else PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
                 if provider_auth_refusal
                 else download_refusal_object_type
@@ -281,7 +281,7 @@ class ProductionArtifactObservationWriter:
             ),
             object_id=(
                 invocation.operation_key
-                if result.framework_pre_submission_proof is not None
+                if framework_proof is not None
                 else invocation.tool_name
                 if invocation.tool_name in {"vt.download_sample", "sample.analyze"}
                 else invocation.operation_key
@@ -637,11 +637,11 @@ class InvestigationService:
         envelope = await self._envelopes.get(invocation.investigation_id)
         if envelope is None:
             return None, None
-        if len(invocation.response_refs) != 1:
-            return (
-                None,
-                "framework_proof_reference_count_mismatch" if invocation.response_refs else None,
-            )
+        if not invocation.response_refs:
+            return None, None
+        multiple_refs = len(invocation.response_refs) > 1
+        if multiple_refs and invocation.tool_name != "advisor.consult":
+            return None, "framework_proof_reference_count_mismatch"
         reservation = next(
             (
                 item
@@ -676,10 +676,14 @@ class InvestigationService:
                     observation.object_type not in {"tool_call", "tool_result"}
                     or invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
                     or invocation.consumed_budget
-                    or len(invocation.response_refs) != 1
                 ):
                     continue
                 proof = FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            if (
+                multiple_refs
+                and proof is not FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            ):
+                continue
             rejection = await self._verify_framework_pre_submission_proof(
                 invocation, observation, proof
             )
@@ -1765,6 +1769,19 @@ class InvestigationService:
             # The coordinator repeats the authoritative checks under its consume lock.
             pre_dispatch_check=check_current_admission,
         )
+        if (
+            tool_name == "advisor.consult"
+            and result.framework_pre_submission_proof
+            is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ):
+            output = dict(result.output)
+            if output.get("advisor_status") == "needs_review":
+                output["advisor_status"] = "refused"
+            result = replace(
+                result,
+                status=ToolInvocationStatus.FAILED,
+                output=output,
+            )
         framework_proves_non_execution = _confirmed_external_non_execution(result)
         unproven_external_failure = (
             external_effect
@@ -1811,6 +1828,36 @@ class InvestigationService:
             valid_refs = await self._valid_observation_refs(
                 investigation.id, result.observation_refs
             )
+            if (
+                tool_name == "advisor.consult"
+                and framework_proves_non_execution
+                and result.framework_pre_submission_proof
+                is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            ):
+                failed = invocation.transition(
+                    ToolInvocationStatus.FAILED,
+                    response_refs=valid_refs,
+                    consumed_budget={},
+                )
+                invocation = await self._invocations.update_if_version(
+                    failed, expected_version=invocation.version
+                )
+                await self._complete_tool_reservation(
+                    investigation_id=investigation.id,
+                    operation_key=operation_key,
+                    result=result,
+                    reserved_amounts=invocation.reserved_budget,
+                    uncertain=False,
+                    external_effect=True,
+                )
+                await self._commit_current_uow()
+                _log_terminal_tool_failure(
+                    invocation,
+                    result,
+                    exception_class=type(exc).__name__,
+                    error_code="tool_observation_persistence_failed",
+                )
+                return invocation, result, valid_refs, False
             reviewed = invocation.transition(
                 ToolInvocationStatus.NEEDS_REVIEW,
                 response_refs=valid_refs,
@@ -3031,6 +3078,10 @@ class InvestigationService:
     async def _persist_result_observations(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
+        external_refusal_proof = (
+            result.framework_pre_submission_proof
+            is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        )
         if (
             result.error_code == "invalid_tool_arguments"
             or result.output.get("error_code") == "invalid_tool_arguments"
@@ -3050,11 +3101,12 @@ class InvestigationService:
                 "provider_download_authorization_refused",
             }
         )
-        if not result.output or (
+        if (not result.output and not external_refusal_proof) or (
             result.observation_refs
             and invocation.tool_name not in {"vt.download_sample", "sample.analyze"}
             and not provider_auth_refusal
             and not provider_download_refusal
+            and not external_refusal_proof
         ):
             return ()
         if self._observation_writer is None:

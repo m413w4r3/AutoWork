@@ -832,14 +832,25 @@ class RegistryToolDispatcher:
             )
             self._completed[operation_key] = (identity, result)
             return result
-        # Adapters may return arbitrary ToolResult fields. Preserve only the
-        # typed coordinator refusal emitted by the built-in VT tools; every
-        # other proof must come from a dispatcher-owned pre-adapter check.
+        # Adapters may return arbitrary ToolResult fields. Preserve only typed
+        # refusals from explicitly trusted built-in adapters. The advisor
+        # adapter attests a pre-send refusal only with zero Bridge turns.
+        advisor_pre_submission_refusal = (
+            definition.name == "advisor.consult"
+            and result.status
+            in {
+                ToolInvocationStatus.FAILED,
+                ToolInvocationStatus.UNAVAILABLE,
+                ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.NEEDS_REVIEW,
+            }
+            and result.budget_consumed.get(BudgetDimension.BRIDGE_TURNS, 0) == 0
+        )
         coordinator_refusal_proof = (
             result.framework_pre_submission_proof
             if (
                 adapter in _FRAMEWORK_REFUSAL_PROOF_ADAPTERS
-                and definition.name.startswith("vt.")
+                and (definition.name.startswith("vt.") or advisor_pre_submission_refusal)
                 and definition.effect
                 in {
                     ToolEffect.EXTERNAL_READ,
