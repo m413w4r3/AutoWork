@@ -27,17 +27,6 @@
   }
 }
 
-#let render-opinion-text(spans, fallback) = block(width: 100%)[
-  #set par(justify: false)
-  #if spans == none [#text(fallback)] else [
-    #for span in spans [
-      #if span.at("technical", default: false) [
-        #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
-      ] else [#text(span.text)]
-    ]
-  ]
-]
-
 #let publication-detection-code-line(item) = {
   let chunks = item.at("break_chunks", default: ())
   let break-after = item.at("break_after", default: ())
@@ -253,6 +242,65 @@
   }
 }
 
+#let render-opinion-pipe-cell(cell) = {
+  for segment in cell.segments {
+    if segment.code {
+      text(font: code-font-families, size: 8pt, hyphenate: false)[
+        #publication-display-text(segment.display)
+      ]
+    } else {
+      text(size: 8pt)[#publication-display-text(segment.display)]
+    }
+  }
+}
+
+#let render-opinion-pipe-table(pipe-table) = {
+  let columns = pipe-table.column_weights.map(weight => weight * 1fr)
+  let cell-align = pipe-table.alignment.map(value => {
+    if value == "right" { right } else if value == "center" { center } else { left }
+  })
+  let header = pipe-table.header.map(cell => render-opinion-pipe-cell(cell))
+  let rows = pipe-table.rows.map(row => row.map(cell => render-opinion-pipe-cell(cell))).flatten()
+  publication-styled-table(
+    columns,
+    cell-align: cell-align,
+    breakable: true,
+    inset: (x: 4pt, y: 4pt),
+    ..(header + rows),
+  )
+}
+
+#let render-opinion-text(spans, fallback, pipe-table: none) = {
+  if pipe-table != none {
+    let prefix = pipe-table.at("prefix", default: "")
+    let suffix = pipe-table.at("suffix", default: "")
+    if pipe-table.wide [
+      #if prefix != "" [#text(prefix) #parbreak()]
+      #pagebreak(weak: true)
+      #set page(flipped: true)
+      #render-opinion-pipe-table(pipe-table)
+      #pagebreak(weak: true)
+      #set page(flipped: false)
+      #if suffix != "" [#parbreak() #text(suffix)]
+    ] else [
+      #if prefix != "" [#text(prefix) #parbreak()]
+      #render-opinion-pipe-table(pipe-table)
+      #if suffix != "" [#parbreak() #text(suffix)]
+    ]
+  } else {
+    block(width: 100%)[
+      #set par(justify: false)
+      #if spans == none [#text(fallback)] else [
+        #for span in spans [
+          #if span.at("technical", default: false) [
+            #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
+          ] else [#text(span.text)]
+        ]
+      ]
+    ]
+  }
+}
+
 #let render-table(item) = {
   let title = if has-text(item.title) {
     [#text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]]
@@ -352,6 +400,21 @@
     ] else [#str(source-number)]
   ]
 }
+
+#let render-publication-provenance(document-label) = block(
+  width: 100%,
+  above: 6pt,
+  below: 0pt,
+  fill: rgb("#F8FAFC"),
+  stroke: 0.4pt + rgb("#D0D5DD"),
+  inset: 6pt,
+  radius: 3pt,
+  breakable: false,
+)[
+  #text(size: 8pt, weight: "bold", fill: accent)[PROVENANCE DE PUBLICATION]
+  #linebreak()
+  #text(size: 7.5pt, fill: grey)[Identité complète : #document-label]
+]
 
 #let render-ioc-table(groups, reference-scope: "") = {
   for group in groups {
@@ -897,15 +960,26 @@
       #section-title[LIMITES DES PREUVES]
       #for item in content_section.items [
         #render-opinion-text(item.at("text_spans", default: none), item.text)
-        #if item.source_urls.len() > 0 [
+        #let source-refs = item.at("source_refs", default: ())
+        #if source-refs.len() > 0 [
           #parbreak()
-          #text(size: 8pt, fill: grey)[Sources : ]
-          #for (index, url) in item.source_urls.enumerate() [
+          #text(size: 7.5pt, fill: grey)[Sources : ]
+          #for (index, source-ref) in source-refs.enumerate() [
             #if index > 0 [ · ]
-            #link(url)[#url]
+            #link(source-ref.url)[#str(source-ref.number)]
           ]
         ]
         #parbreak()
+      ]
+      #let source-list = content_section.at("source_list", default: ())
+      #if source-list.len() > 0 [
+        #v(3pt)
+        #text(size: 8pt, weight: "bold")[Sources]
+        #for source in source-list [
+          #linebreak()
+          #text(size: 7pt, fill: grey)[#str(source.number) · ]
+          #link(source.url)[#text(size: 7pt, fill: grey)[#source.url]]
+        ]
       ]
     ] else if content_section.type == "analyst_opinion" [
       #let opinion-blocks = content_section.at("blocks", default: ())
@@ -929,7 +1003,11 @@
         #h(1em)
         #text(size: 8pt)[Confiance : #item.certainty_percent%]
         #parbreak()
-        #text(item.text)
+        #render-opinion-text(
+          none,
+          item.text,
+          pipe-table: item.at("pipe_table", default: none),
+        )
         #parbreak()
         #if item.finding_refs.len() > 0 or item.evidence_refs.len() > 0 [
           #text(size: 7pt, fill: grey)[Références : ]
@@ -965,7 +1043,6 @@
     ] else if content_section.type == "technical_materials" [
       #v(12pt)
       #section-title[#text(content_section.heading)]
-      #text(size: 8pt, weight: "bold")[#text(content_section.tlp_label)]
       #text(size: 8pt)[ · Valeurs reproduites en clair telles qu’observées dans l’échantillon.]
       #if content_section.editorial_text != none [
         #v(5pt)
@@ -1082,6 +1159,8 @@
         #text(size: 8pt, fill: grey)[#content_section.omitted_invalid_url_count URL non valide(s) omise(s) des listes.]
       ]
     ] else if content_section.type == "technical_annex" [
+      #pagebreak(weak: true)
+      #set page(flipped: true)
       #let ioc_rows = content_section.at("ioc_rows", default: ())
       #let ioc_row_groups = content_section.at("ioc_row_groups", default: ())
       #let legacy_indicators = content_section.at("indicators", default: none)
@@ -1192,6 +1271,8 @@
           ]
         ]
       ]
+      #render-publication-provenance(publication.at("document_label"))
+      #set page(flipped: false)
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
     }
@@ -1203,18 +1284,45 @@
   if not has-text(document-label) {
     panic("publication render-data requires document_label")
   }
+  let has-technical-annex = publication.content_sections.any(
+    content-section => content-section.type == "technical_annex",
+  )
   [
     #render-target(
       publication.at("article_title_target_id", default: none),
       heading(level: 1)[#publication.title],
     )
-    #block(above: 2pt, below: 8pt)[
-      #text(size: 8pt, weight: "bold", fill: grey)[#publication.at("document_header", default: "Publication")]
+    #let overview = publication.at("overview", default: none)
+    #if overview != none [
+      #block(
+        width: 100%,
+        above: 2pt,
+        below: 8pt,
+        fill: rgb("#F1F6F5"),
+        stroke: 0.5pt + rgb("#CAD8D6"),
+        inset: (x: 9pt, y: 7pt),
+        radius: 4pt,
+        breakable: false,
+      )[
+        #grid(
+          columns: (1fr, auto),
+          column-gutter: 12pt,
+          [
+            #text(size: 7pt, weight: "bold", fill: accent)[STATUT]
+            #linebreak()
+            #text(size: 8.5pt)[#overview.status_label]
+          ],
+          [
+            #text(size: 7pt, weight: "bold", fill: accent)[SOURCES]
+            #linebreak()
+            #text(size: 8.5pt)[#str(overview.source_count)]
+          ],
+        )
+      ]
     ]
     #render-publication-body(publication)
-    #pagebreak()
-    #section-title[PROVENANCE DE PUBLICATION]
-    #v(5pt)
-    #text(size: 7.5pt, fill: grey)[Identité complète : #document-label]
+    #if not has-technical-annex [
+      #render-publication-provenance(document-label)
+    ]
   ]
 }

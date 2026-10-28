@@ -77,9 +77,9 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-# v28 adds compact editorial traceability and an explicit document label.
+# v31 adds template-driven editorial layout metadata and opinion pipe tables.
 # Canonical V5/V6 publication data remains unchanged.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v30-contiguous-protocol-figure-captions"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v31-editorial-layout-metadata"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -177,11 +177,35 @@ def _breakable_typst_display_text(
     chunks: list[str] = []
     break_after: list[bool] = []
     for token in tokens:
-        pieces = (
-            [token[index : index + interval] for index in range(0, len(token), interval)]
-            if should_break(token)
-            else [token]
-        )
+        if should_break(token):
+            pieces = []
+            start = 0
+            while start < len(token):
+                end = min(start + interval, len(token))
+                if break_at_technical_separators and end < len(token):
+                    separators = [
+                        index + 1
+                        for index in range(start, end)
+                        if token[index] in _TECHNICAL_BREAK_SEPARATORS
+                    ]
+                    if separators:
+                        end = separators[-1]
+                    else:
+                        lookahead_end = min(start + interval + 4, len(token))
+                        next_separator = next(
+                            (
+                                index + 1
+                                for index in range(end, lookahead_end)
+                                if token[index] in _TECHNICAL_BREAK_SEPARATORS
+                            ),
+                            None,
+                        )
+                        if next_separator is not None:
+                            end = next_separator
+                pieces.append(token[start:end])
+                start = end
+        else:
+            pieces = [token]
         for index, piece in enumerate(pieces):
             if chunks:
                 break_after.append(index > 0)
@@ -574,6 +598,8 @@ _OPINION_TECHNICAL_TOKEN = re.compile(
     r"[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
 )
+_PIPE_TABLE_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
+_PIPE_TABLE_SHA256 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE)
 
 
 def _opinion_text_spans(value: str) -> list[dict[str, Any]]:
@@ -595,6 +621,99 @@ def _opinion_text_spans(value: str) -> list[dict[str, Any]]:
     if cursor < len(value) or not spans:
         spans.append({"text": value[cursor:], "technical": False})
     return spans
+
+
+def _pipe_table_cell(text: str) -> dict[str, Any] | None:
+    """Project a strict inline-code subset without turning cell data into markup."""
+    pieces = text.split("`")
+    if len(pieces) % 2 == 0:
+        return None
+    segments: list[dict[str, Any]] = []
+    for index, piece in enumerate(pieces):
+        is_code = index % 2 == 1
+        if is_code and not piece:
+            return None
+        if piece:
+            segments.append(
+                {
+                    "text": piece,
+                    "code": is_code,
+                    "display": _breakable_typst_display_text(
+                        piece,
+                        interval=12,
+                        break_at_technical_separators=True,
+                    ),
+                }
+            )
+    return {"segments": segments, "text": text}
+
+
+def _opinion_pipe_table(value: str) -> dict[str, Any] | None:
+    """Parse a bounded GitHub-style pipe table; malformed input stays plain text."""
+    original_lines = value.splitlines(keepends=True)
+    lines = [line.removesuffix("\n").removesuffix("\r") for line in original_lines]
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for index, line in enumerate(lines):
+        is_pipe_line = line.startswith("|") and line.endswith("|")
+        if is_pipe_line and run_start is None:
+            run_start = index
+        elif not is_pipe_line and run_start is not None:
+            runs.append((run_start, index))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(lines)))
+    if len(runs) != 1:
+        return None
+    start, end = runs[0]
+    table_lines = lines[start:end]
+    if len(table_lines) < 2:
+        return None
+
+    rows = [[cell.strip() for cell in line[1:-1].split("|")] for line in table_lines]
+    column_count = len(rows[0])
+    if not 1 <= column_count <= 8 or any(len(row) != column_count for row in rows):
+        return None
+    if len(rows) - 2 > 200:
+        return None
+
+    alignment: list[str] = []
+    for cell in rows[1]:
+        if not _PIPE_TABLE_SEPARATOR_CELL.fullmatch(cell):
+            return None
+        has_left = cell.startswith(":")
+        has_right = cell.endswith(":")
+        alignment.append("center" if has_left and has_right else "right" if has_right else "left")
+
+    projected_rows: list[list[dict[str, Any]]] = []
+    for row in (rows[0], *rows[2:]):
+        projected_row = [_pipe_table_cell(cell) for cell in row]
+        if any(cell is None for cell in projected_row):
+            return None
+        projected_rows.append([cell for cell in projected_row if cell is not None])
+
+    hash_columns = {
+        column_index
+        for column_index in range(column_count)
+        if any(_PIPE_TABLE_SHA256.search(row[column_index]) for row in rows)
+    }
+    has_sha256 = bool(hash_columns)
+    column_weights = [
+        5.0
+        if index in hash_columns
+        else max(0.75, min(3.0, max(len(row[index]) for row in rows) / 15))
+        for index in range(column_count)
+    ]
+    return {
+        "column_count": column_count,
+        "column_weights": column_weights,
+        "alignment": alignment,
+        "header": projected_rows[0],
+        "rows": projected_rows[1:],
+        "wide": column_count >= 4 or has_sha256,
+        "prefix": "".join(original_lines[:start]),
+        "suffix": "".join(original_lines[end:]),
+    }
 
 
 def _bounded_ioc_context(value: str, limit: int = 320) -> str:
@@ -842,6 +961,13 @@ class TypstRenderer:
             "document_header": _publication_document_header(document),
             "language": document.publication_language,
             "title": model.title,
+            "overview": {
+                "status_label": model.draft_watermark or _publication_document_header(document),
+                "source_count": len(document.sources),
+            },
+            "brand_logo_available": any(
+                file.relative_path == "UTILS/chap.png" for file in template_bundle.files
+            ),
             "content_sections": model.content_sections,
         }
         if article_title_target_id is not None:
@@ -2242,7 +2368,7 @@ def project_publication_to_typst_model(
                 raise ValueError("Infrastructure graph media path is not canonical")
             infrastructure_graph_figure["media_path"] = resolved_graph_media_ref.media_path
             infrastructure_graph_figure["svg_sha256"] = resolved_graph_media_ref.expected_sha256
-    limitations = (
+    limitations: list[dict[str, Any]] = (
         [
             {
                 "text": uncertainty.text,
@@ -2259,9 +2385,28 @@ def project_publication_to_typst_model(
         if draft_preview is not None and draft_preview.synthesis is not None
         else []
     )
+    limitation_source_urls = sorted(
+        {url for limitation_item in limitations for url in limitation_item["source_urls"]}
+    )
+    limitation_source_numbers = {
+        url: index for index, url in enumerate(limitation_source_urls, start=1)
+    }
+    for limitation_item in limitations:
+        limitation_item["source_refs"] = [
+            {"number": limitation_source_numbers[url], "url": url}
+            for url in limitation_item["source_urls"]
+        ]
     if "limitations" in expected_section_types:
         content_sections.append(
-            {"type": "limitations", "heading": "Limites des preuves", "items": limitations}
+            {
+                "type": "limitations",
+                "heading": "Limites des preuves",
+                "items": limitations,
+                "source_list": [
+                    {"number": index, "url": url}
+                    for index, url in enumerate(limitation_source_urls, start=1)
+                ],
+            }
         )
     projected_opinion_section: dict[str, Any] | None = None
     opinion_figure_provenance: list[dict[str, Any]] = []
@@ -2358,6 +2503,7 @@ def project_publication_to_typst_model(
                     "heading": heading,
                     "text": text,
                     "text_spans": _opinion_text_spans(text),
+                    "pipe_table": _opinion_pipe_table(text),
                     "qualification": qualification,
                     "qualification_label": qualification_labels[qualification],
                     "certainty_percent": round(certainty * 100),
@@ -2518,7 +2664,6 @@ def project_publication_to_typst_model(
             {
                 "type": "technical_materials",
                 "heading": "Matériel cryptographique et identifiants de l'implant",
-                "tlp_label": "TLP:CLEAR",
                 "attacker_identifier_note": (
                     "Les identifiants C2 de l'attaquant sont des observables passifs; "
                     "ils ne servent jamais à l'authentification."
