@@ -633,6 +633,16 @@ def _service_dsn_has_credentials(dsn: str) -> bool:
     return any(name.casefold() in credential_query_names for name, value in query if value)
 
 
+def _host_path_pattern(value: str) -> str:
+    """Match a configured host path only on path boundaries (``/app`` is not ``/AppDomain``)."""
+    return r"(?<![\w.~\-])" + re.escape(value) + r"(?![\w\-])"
+
+
+def _host_path_in_text(value: str, text: str, case_insensitive: bool) -> bool:
+    flags = re.IGNORECASE if case_insensitive else 0
+    return re.search(_host_path_pattern(value), text, flags) is not None
+
+
 def _operational_secret_type(
     text: str,
     field_name: str,
@@ -648,7 +658,11 @@ def _operational_secret_type(
                 candidate_index == 0 and not percent_decoded_text
             )
             found = raw_match_allowed and (
-                value.casefold() in candidate.casefold() if case_insensitive else value in candidate
+                _host_path_in_text(value, candidate, case_insensitive)
+                if secret_type == "host_path"
+                else value.casefold() in candidate.casefold()
+                if case_insensitive
+                else value in candidate
             )
             encoded_match = False
             if not found:
@@ -756,9 +770,12 @@ def _redact_operational_text_with_types(
             {value, *_encoded_secret_representations(value)}, key=len, reverse=True
         )
         for representation in representations:
-            cleaned, replacements = re.subn(
-                re.escape(representation), _SECRET_REDACTION, cleaned, flags=flags
+            pattern = (
+                _host_path_pattern(representation)
+                if secret_type == "host_path" and representation == value
+                else re.escape(representation)
             )
+            cleaned, replacements = re.subn(pattern, _SECRET_REDACTION, cleaned, flags=flags)
             finding_type = (
                 "encoded_credential"
                 if representation != value and "%" not in representation

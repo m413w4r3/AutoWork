@@ -519,3 +519,21 @@ def test_guard_allows_compact_uuid_ids_in_narrative_text() -> None:
 def test_guard_allows_internal_uuid_hrefs() -> None:
     reference = uuid4()
     guard_publication_render_data({"href": f"autowork://finding/{reference}"})
+
+
+def test_configured_host_path_is_matched_on_path_boundaries_only() -> None:
+    from pathlib import Path
+
+    from cti_app.application.publication_secret_guard import (
+        redact_operational_secrets_with_findings,
+    )
+    from cti_app.config import Settings
+
+    settings = Settings(_env_file=None, goodware_cache_root=Path("/app"))  # type: ignore[call-arg]
+    clean = {"text": "la configuration .NET/AppDomainManager associée à RuntimeBroker"}
+    cleaned, findings = redact_operational_secrets_with_findings(clean, settings=settings)
+    assert findings == () and cleaned == clean
+
+    leaked = {"text": "fichier chargé depuis /app/src/secret.py puis /app"}
+    cleaned, findings = redact_operational_secrets_with_findings(leaked, settings=settings)
+    assert findings and "/app" not in cleaned["text"]
