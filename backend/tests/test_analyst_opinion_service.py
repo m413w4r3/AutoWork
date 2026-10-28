@@ -19,6 +19,7 @@ from cti_app.application.analyst_opinion_service import (
     OpinionRevisionEdits,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -47,6 +48,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     NoveltyClass,
     TLPLevel,
+    ToolInvocationStatus,
 )
 from cti_app.domain.production import (
     AnalystInvestigation,
@@ -778,6 +780,112 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
     assert revised.implant_materials_section.text == material_text
     assert revised.implant_materials_section.bridge_draft_ref == material_section.bridge_draft_ref
     assert revised.implant_materials_section.bridge_review_ref == material_section.bridge_review_ref
+
+
+@pytest.mark.asyncio
+async def test_operator_compose_and_revise_persist_typed_implant_materials() -> None:
+    harness = make_opinion_harness()
+    adapter = OperatorOpinionToolAdapter(
+        service=harness.service,
+        investigations=SimpleNamespace(),
+        article_snapshots=SimpleNamespace(),
+    )
+    tool_context = ToolExecutionContext(
+        investigation_id=harness.investigation.id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="operator-opinion-materials",
+    )
+    ordinary_block = {
+        "block_type": "key_findings",
+        "text": "The fixture has a supported finding.",
+        "finding_refs": [str(harness.finding.id)],
+        "evidence_refs": [str(harness.observation.id)],
+        "qualification": "fact",
+        "certainty": 0.9,
+    }
+    material_block = {
+        "block_type": "implant_materials",
+        "text": "An attacker-controlled C2 token was recovered from the sample.",
+        "finding_refs": [],
+        "evidence_refs": [],
+        "qualification": "fact",
+        "certainty": 1.0,
+    }
+    initial_row = {
+        "type": "attacker_github_c2_token",
+        "value": "ghp_" + "a" * 36,
+        "role": "C2 token",
+        "sample_location": "offset 0x120",
+        "sample_sha256": "a" * 64,
+        "evidence_observation_id": str(harness.observation.id),
+    }
+    compose_arguments = {
+        "action": "compose",
+        "selection": {"finding_ids": [], "claim_ids": [], "block_types": []},
+        "blocks": [ordinary_block, material_block],
+        "implant_materials": [initial_row],
+    }
+
+    composed_result = await adapter.execute(compose_arguments, tool_context)
+    assert composed_result.status is ToolInvocationStatus.SUCCEEDED
+    composed = (await harness.service.get_draft(harness.investigation.id)).opinion
+    assert composed is not None
+    assert composed.implant_materials[0].value == initial_row["value"]
+    assert composed.implant_materials_section is not None
+    assert composed.implant_materials_section.text == material_block["text"]
+    assert any(
+        block.block_type is OpinionBlockType.KEY_FINDINGS and block.text == ordinary_block["text"]
+        for block in composed.blocks
+    )
+    assert composed.content_sha256 == composed_result.output["content_sha256"]
+
+    repeated_compose = await adapter.execute(compose_arguments, tool_context)
+    assert repeated_compose.status is ToolInvocationStatus.SUCCEEDED
+    assert repeated_compose.output["opinion_version"] == composed.version
+    assert repeated_compose.output["content_sha256"] == composed.content_sha256
+
+    revised_row = {**initial_row, "value": "ghp_" + "b" * 36}
+    revise_result = await adapter.execute(
+        {
+            "action": "revise",
+            "opinion_id": str(composed.id),
+            "expected_opinion_version": composed.version,
+            "expected_opinion_sha256": composed.content_sha256,
+            "blocks": [ordinary_block, material_block],
+            "unresolved_points": [],
+            "implant_materials": [revised_row],
+        },
+        tool_context,
+    )
+    assert revise_result.status is ToolInvocationStatus.SUCCEEDED
+    revised = (await harness.service.get_draft(harness.investigation.id)).opinion
+    assert revised is not None
+    assert revised.version == composed.version + 1
+    assert revised.content_sha256 != composed.content_sha256
+    assert revised.implant_materials[0].value == revised_row["value"]
+    assert revised.implant_materials_section is not None
+    assert revised.implant_materials_section.text == material_block["text"]
+    assert any(
+        block.block_type is OpinionBlockType.KEY_FINDINGS and block.text == ordinary_block["text"]
+        for block in revised.blocks
+    )
+
+    invalid_citation = await adapter.execute(
+        {
+            "action": "revise",
+            "opinion_id": str(revised.id),
+            "expected_opinion_version": revised.version,
+            "expected_opinion_sha256": revised.content_sha256,
+            "blocks": [ordinary_block, material_block],
+            "unresolved_points": [],
+            "implant_materials": [{**revised_row, "evidence_observation_id": str(uuid4())}],
+        },
+        tool_context,
+    )
+    assert invalid_citation.status is ToolInvocationStatus.FAILED
+    assert invalid_citation.error_code == "citations_invalid"
+    assert invalid_citation.output["field"] == "implant_materials[0].evidence_observation_id"
 
 
 @pytest.mark.asyncio

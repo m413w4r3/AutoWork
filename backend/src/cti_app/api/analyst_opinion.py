@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
+from cti_app.application.analyst_opinion_inputs import ImplantMaterialEdit
 from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import (
     AnalystOpinionDraftView,
@@ -43,8 +44,6 @@ from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
     BridgeDraftReferenceV1,
     BridgeReviewReferenceV1,
-    ImplantMaterialEditorialV1,
-    ImplantMaterialType,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
@@ -146,27 +145,6 @@ class OpinionBlockEdit(BaseModel):
         )
 
 
-class ImplantMaterialEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: ImplantMaterialType
-    value: str = Field(min_length=1, max_length=4096)
-    role: str = Field(min_length=1, max_length=300)
-    sample_location: str = Field(min_length=1, max_length=500)
-    sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    evidence_observation_id: UUID
-
-    def to_domain(self) -> ImplantMaterialEditorialV1:
-        return ImplantMaterialEditorialV1(
-            type=self.type,
-            value=self.value,
-            role=self.role,
-            sample_location=self.sample_location,
-            sample_sha256=self.sample_sha256,
-            evidence_observation_id=self.evidence_observation_id,
-        )
-
-
 class OpinionObservationEdit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -198,7 +176,7 @@ class ReviseOpinionPayload(BaseModel):
     blocks: tuple[OpinionBlockEdit, ...]
     unresolved_points: tuple[str, ...] = ()
     observations: tuple[OpinionObservationEdit, ...] | None = None
-    implant_materials: tuple[ImplantMaterialEdit, ...] | None = None
+    implant_materials: tuple[ImplantMaterialEdit, ...] | None = Field(default=None, max_length=100)
     protocol_model_blob_id: UUID | None = None
     protocol_views: tuple[ProtocolDiagramKind, ...] | None = Field(default=None, max_length=3)
 
