@@ -641,6 +641,8 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         byte_length = sample.get("byte_length")
         mime_type = _as_text(sample.get("mime_type"))
         content = _as_text(sample.get("content_base64"))
+        fragment_length = sample.get("fragment_length", byte_length)
+        omitted_range = _as_text(sample.get("omitted_range"))
         lines = [
             "Verified sample provenance:",
             f"sample_id={sample_id}",
@@ -651,7 +653,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             f"expected_hash={_as_text(sample.get('expected_hash'))}",
             f"source_object_id={_as_text(sample.get('source_object_id'))}",
             f"encoding=base64; byte_length={byte_length}; offset=0; "
-            f"length={byte_length}; mime_type={mime_type}",
+            f"length={fragment_length}; mime_type={mime_type}",
             f"association_status={_as_text(sample.get('association_status'))}",
             f"content_status={_as_text(sample.get('content_status'))}",
             f"state={_as_text(sample.get('state'))}",
@@ -691,6 +693,8 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             )
         if content:
             lines.extend(["encoding=base64", "content_base64:", content])
+        if omitted_range:
+            lines.append(f"omitted_range={omitted_range}")
         omission_reason = sample.get("content_omission_reason")
         if isinstance(omission_reason, str) and omission_reason:
             lines.append(f"content_omission_reason={omission_reason}")
@@ -712,9 +716,12 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     if isinstance(evidence_ids, (list, tuple))
                     else [],
                     "offset": 0,
-                    "length": byte_length,
+                    "length": fragment_length,
+                    "byte_length": byte_length,
                     "mime_type": mime_type,
                     "encoding": "base64",
+                    "fragment_sha256": _as_text(sample.get("fragment_sha256")),
+                    "omitted_range": omitted_range,
                     "content_status": _as_text(sample.get("content_status")),
                     "content_omission_reason": _as_text(omission_reason),
                 },
@@ -1660,6 +1667,7 @@ def evaluate_advisor_evidence_preflight(
                 else [],
                 verified=bool(re.fullmatch(r"[0-9a-f]{64}", sha)),
                 blob_read_verified=item.get("blob_read_verified"),
+                blob_read_failure_reason=_as_text(item.get("blob_read_failure_reason")),
                 retrieval_available=(
                     kind == "observation"
                     and bool(identifier)
@@ -2187,7 +2195,8 @@ def evaluate_advisor_evidence_preflight(
             missing_refs.append(
                 {
                     "ref": _display_source_ref(item["source_ref"] or item["id"]),
-                    "reason": (
+                    "reason": item.get("blob_read_failure_reason")
+                    or (
                         "Required canonical blob is unreadable or its read capability was not "
                         "verified."
                     ),
@@ -2200,8 +2209,10 @@ def evaluate_advisor_evidence_preflight(
                     "reason": item["reason"],
                 }
             )
-        if item["required"] and any(
-            row["status"] == AdvisorEvidenceStatus.NOT_VERIFIED.value for row in statuses
+        if (
+            item["required"]
+            and not item.get("blob_read_failure_reason")
+            and any(row["status"] == AdvisorEvidenceStatus.NOT_VERIFIED.value for row in statuses)
         ):
             missing_refs.append(
                 {

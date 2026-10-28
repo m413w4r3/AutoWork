@@ -104,6 +104,9 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_TOOL_SECONDS = 3_600
+# Verify each complete quarantine blob, then include at most this many prefix bytes.
+# The dossier records any omitted range explicitly.
+MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES = 4_096
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
 # the archive timeout and the 35s advisor preparation/scheduling margin. This
@@ -2667,6 +2670,65 @@ class InvestigationAdvisorTool:
             observation = observations_by_id.get(evidence_id)
             if observation is None:
                 continue
+            if _is_downloaded_sample_bytes_observation(observation):
+                matching_sample = next(
+                    (
+                        sample
+                        for sample in sample_rows
+                        if sample.get("sha256") == observation.sha256
+                        and evidence_id in sample.get("evidence_ids", ())
+                    ),
+                    None,
+                )
+                if matching_sample is not None:
+                    if matching_sample.get("content_status") == "verified":
+                        encoded_fragment = matching_sample.get("content_base64")
+                        if isinstance(encoded_fragment, str):
+                            try:
+                                fragment = base64.b64decode(encoded_fragment, validate=True)
+                            except (ValueError, binascii.Error):
+                                fragment = b""
+                        else:
+                            fragment = b""
+                        if fragment:
+                            fragment_length = len(fragment)
+                            sample_sha256 = str(matching_sample["sha256"])
+                            fragment_sha256 = hashlib.sha256(fragment).hexdigest()
+                            omitted_range = matching_sample.get("omitted_range")
+                            provenance = [
+                                "encoding=base64",
+                                "offset=0",
+                                f"length={fragment_length}",
+                                f"byte_length={matching_sample['byte_length']}",
+                                f"sha256={sample_sha256}",
+                                f"fragment_sha256={fragment_sha256}",
+                                f"sample_sha256={sample_sha256}",
+                                f"sample_id={matching_sample['sample_id']}",
+                                f"association_id={matching_sample['association_id']}",
+                                f"sample_blob_id={matching_sample['blob_id']}",
+                                f"evidence_id={evidence_id}",
+                                f"evidence_sha256={observation.sha256}",
+                                f"mime_type={matching_sample['mime_type']}",
+                            ]
+                            if isinstance(omitted_range, str) and omitted_range:
+                                provenance.append(f"omitted_range={omitted_range}")
+                            excerpts.append(
+                                {
+                                    "kind": "base64",
+                                    "title": "Vérification des octets échantillon; "
+                                    + "; ".join(provenance),
+                                    "text": encoded_fragment,
+                                }
+                            )
+                            evidence_row["blob_read_verified"] = True
+                            matching_sample["content_base64"] = ""
+                            matching_sample["content_omission_reason"] = (
+                                "included_as_cited_observation_fragment"
+                            )
+                    else:
+                        evidence_row["blob_read_failure_reason"] = _sample_blob_failure_reason(
+                            matching_sample.get("content_status")
+                        )
             provenance = [
                 f"evidence_id={evidence_id}",
                 f"blob_id={observation.blob_id}",
@@ -2961,16 +3023,66 @@ class InvestigationAdvisorTool:
             if not associated_observations:
                 continue
             blob_id = getattr(sample, "blob_id", None)
+            sample_id = str(getattr(sample, "id", "unknown"))
+            association_id = str(getattr(association, "id", "unknown"))
+            evidence_ids = [str(item.id) for item in associated_observations]
+            evidence_blob_ids = [str(item.blob_id) for item in associated_observations]
+            evidence_sha256s = [item.sha256 for item in associated_observations]
+
+            def append_unreadable(
+                reason: str,
+                *,
+                descriptor: Any | None = None,
+                sample_id: str = sample_id,
+                association_id: str = association_id,
+                sample_hash: str = association.sample_sha256,
+                blob_id: object = blob_id,
+                evidence_ids: list[str] = evidence_ids,
+                evidence_blob_ids: list[str] = evidence_blob_ids,
+                evidence_sha256s: list[str] = evidence_sha256s,
+            ) -> None:
+                rows.append(
+                    {
+                        "verified": False,
+                        "sample_id": sample_id,
+                        "association_id": association_id,
+                        "sha256": sample_hash,
+                        "blob_id": str(blob_id) if isinstance(blob_id, UUID) else "",
+                        "blob_sha256": getattr(descriptor, "sha256", ""),
+                        "evidence_ids": evidence_ids,
+                        "evidence_blob_ids": evidence_blob_ids,
+                        "evidence_sha256s": evidence_sha256s,
+                        "content_status": reason,
+                        "content_base64": "",
+                    }
+                )
+
             if not isinstance(blob_id, UUID):
+                append_unreadable("sample_blob_unavailable")
                 continue
             blob = await self._blobs.get(blob_id)
             descriptor = getattr(blob, "descriptor", None)
-            if (
-                descriptor is None
-                or descriptor.sha256 != association.sample_sha256
-                or descriptor.logical_bucket
-                not in {"samples-quarantine", "network-captures-quarantine"}
-            ):
+            if descriptor is None:
+                append_unreadable("sample_blob_unavailable")
+                continue
+            if descriptor.sha256 != association.sample_sha256:
+                append_unreadable("sample_blob_hash_mismatch", descriptor=descriptor)
+                continue
+            raw_sample_observation = any(
+                _is_downloaded_sample_bytes_observation(item)
+                and item.sha256 == association.sample_sha256
+                for item in associated_observations
+            )
+            allowed_buckets = (
+                {"samples-quarantine"}
+                if raw_sample_observation
+                else {"samples-quarantine", "network-captures-quarantine"}
+            )
+            if descriptor.logical_bucket not in allowed_buckets:
+                append_unreadable("sample_blob_wrong_bucket", descriptor=descriptor)
+                continue
+            if type(descriptor.size) is not int or descriptor.size < 0:
+                append_unreadable("sample_blob_metadata_invalid", descriptor=descriptor)
                 continue
             engines = sorted({_safe_text(item.source, 48) for item in associated_observations})
             sample_state = getattr(sample, "state", "unknown")
@@ -2984,40 +3096,60 @@ class InvestigationAdvisorTool:
                     blob_id, max_bytes=descriptor.size
                 )
                 if (
-                    len(blob_content) != descriptor.size
+                    not isinstance(blob_content, bytes)
+                    or len(blob_content) != descriptor.size
                     or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
                 ):
                     blob_content = None
-                    content_status = "blob_content_verification_failed"
+                    content_status = "sample_content_hash_mismatch"
             except Exception:
-                content_status = "blob_content_unavailable"
+                content_status = "sample_blob_unreadable"
             raw_mime_type = getattr(descriptor, "mime_type", "application/octet-stream")
             mime_type = (
                 raw_mime_type.strip()
                 if isinstance(raw_mime_type, str) and raw_mime_type.strip()
                 else "application/octet-stream"
             )
+            fragment = (
+                blob_content[:MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES]
+                if blob_content is not None
+                else b""
+            )
+            omitted_range = (
+                f"[{len(fragment)},{descriptor.size})"
+                if blob_content is not None and len(fragment) < descriptor.size
+                else ""
+            )
+            content_omission_reason = (
+                f"sample_fragment_truncated:{omitted_range}" if omitted_range else ""
+            )
             rows.append(
                 {
                     "verified": True,
-                    "sample_id": str(getattr(sample, "id", "unknown")),
-                    "association_id": str(getattr(association, "id", "unknown")),
+                    "sample_id": sample_id,
+                    "association_id": association_id,
                     "sha256": association.sample_sha256,
                     "blob_id": str(blob_id),
                     "blob_sha256": descriptor.sha256,
                     "expected_hash": getattr(sample, "expected_hash", None),
                     "source_object_id": getattr(sample, "source_object_id", None),
-                    "evidence_ids": [str(item.id) for item in associated_observations],
-                    "evidence_blob_ids": [str(item.blob_id) for item in associated_observations],
-                    "evidence_sha256s": [item.sha256 for item in associated_observations],
+                    "evidence_ids": evidence_ids,
+                    "evidence_blob_ids": evidence_blob_ids,
+                    "evidence_sha256s": evidence_sha256s,
                     "mime_type": mime_type,
                     "byte_length": descriptor.size,
                     "encoding": "base64",
                     "content_base64": (
-                        base64.b64encode(blob_content).decode("ascii")
+                        base64.b64encode(fragment).decode("ascii")
                         if blob_content is not None
                         else ""
                     ),
+                    "fragment_length": len(fragment),
+                    "fragment_sha256": (
+                        hashlib.sha256(fragment).hexdigest() if blob_content is not None else ""
+                    ),
+                    "omitted_range": omitted_range,
+                    "content_omission_reason": content_omission_reason,
                     "content_status": content_status,
                     "association_status": _safe_text(
                         getattr(
@@ -3568,6 +3700,11 @@ class InvestigationAdvisorTool:
         self, observation: EvidenceObservation, sample_hash: str
     ) -> bool:
         """Match direct object IDs or a verified nested sample_sha256 field."""
+        if (
+            _is_downloaded_sample_bytes_observation(observation)
+            and observation.sha256 == sample_hash
+        ):
+            return True
         if _object_id_references_sample(observation.object_id, {sample_hash}):
             return True
         if not re.fullmatch(r"[0-9a-f]{64}", sample_hash):
@@ -6823,6 +6960,36 @@ def _required_argument_names(tool: Any) -> list[str]:
     return [_safe_text(name, 64) for name in required if isinstance(name, str)]
 
 
+def _is_downloaded_sample_bytes_observation(observation: EvidenceObservation) -> bool:
+    return observation.source.casefold() in {
+        "vt.download_sample",
+        "virustotal.sample_download",
+        "investigation.subject_sample_reuse",
+    } and observation.object_type.casefold() in {"binary_or_non_json", "sample"}
+
+
+def _sample_blob_failure_reason(value: object) -> str:
+    reasons = {
+        "sample_blob_unavailable": (
+            "Required quarantined sample blob is missing from the blob catalog."
+        ),
+        "sample_blob_hash_mismatch": "Required quarantined sample blob has the wrong SHA-256.",
+        "sample_blob_wrong_bucket": (
+            "Required sample blob is outside the samples quarantine bucket."
+        ),
+        "sample_blob_metadata_invalid": (
+            "Required quarantined sample blob has invalid size metadata."
+        ),
+        "sample_blob_unreadable": "Required quarantined sample bytes could not be read.",
+        "sample_content_hash_mismatch": (
+            "Required quarantined sample bytes do not match the declared size or SHA-256."
+        ),
+    }
+    if isinstance(value, str) and value in reasons:
+        return reasons[value]
+    return "Required canonical blob is unreadable or its read capability was not verified."
+
+
 def _object_id_references_sample(object_id: object, sample_hashes: set[str]) -> bool:
     """Match exact sample hashes and sample-prefixed analysis object ids."""
     if not isinstance(object_id, str):
@@ -6872,7 +7039,7 @@ def _drop_findings_linked_to_restricted_evidence(
 
 
 def _sample_policy_allows_external(sample: object) -> bool:
-    """Apply TLP and license restrictions before disclosing associated sample data.
+    """Apply the sample's explicit disclosure rules before sending its data.
 
     D7 maps every non-empty license_restriction to an explicit owner/source
     veto when sample metadata or content would be sent externally. This
@@ -6886,6 +7053,8 @@ def _sample_policy_allows_external(sample: object) -> bool:
     )
     return not (
         (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
+        or bool(getattr(sample, "do_not_submit", False))
+        or getattr(sample, "external_llm_allowed", True) is False
         or has_license_restriction
     )
 
@@ -6899,6 +7068,10 @@ def _sample_restriction_sources(sample: object | None) -> list[str]:
     tlp_value = getattr(tlp, "value", tlp)
     if isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold():
         sources.append("tlp_red")
+    if bool(getattr(sample, "do_not_submit", False)):
+        sources.append("do_not_submit")
+    if getattr(sample, "external_llm_allowed", True) is False:
+        sources.append("external_llm_disallowed")
     license_restriction = getattr(sample, "license_restriction", None)
     if license_restriction is not None and bool(str(license_restriction).strip()):
         sources.append("license_restriction")

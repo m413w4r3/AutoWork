@@ -320,6 +320,68 @@ def _attach_sample_policy(tool, sample_blob_id, sample_hash, **flags):
     tool._samples = _Samples([SimpleNamespace(**sample)])
 
 
+def _make_downloaded_sample_fixture(investigation_id, sample_content, **sample_flags):
+    sample_content = bytes(sample_content)
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    blob_id = uuid4()
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=sample_hash,
+        source="virustotal.sample_download",
+        source_version="sample-acquisition.v1",
+        observed_at=datetime.now(UTC),
+        object_type="binary_or_non_json",
+        object_id=sample_hash,
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The cited sample bytes were available.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+    )
+    tool._observations = ObservationRepository((observation,))
+    tool._blobs.add(
+        blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._blobs.descriptors[blob_id].descriptor.mime_type = "application/x-synthetic-sample"
+    tool._artifact_store.values[blob_id] = sample_content
+    sample_id = uuid4()
+    association_id = uuid4()
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    sample = {
+        "id": sample_id,
+        "expected_hash": sample_hash,
+        "source_object_id": None,
+        "state": "quarantined",
+        "blob_id": blob_id,
+        "origin_kind": "source_seed",
+        "original_name": "synthetic-sample.bin",
+        "source_service": "fixture",
+        "tlp": TLP.GREEN,
+        "do_not_submit": False,
+        "external_llm_allowed": True,
+        "license_restriction": None,
+    }
+    sample.update(sample_flags)
+    tool._samples = _Samples((SimpleNamespace(**sample),))
+    return tool, transport, observation, sample_id, association_id, blob_id, sample_hash
+
+
 def make_context(
     investigation_id,
     key="operator:advisor:test",
@@ -2293,7 +2355,7 @@ async def test_generic_api_key_in_cti_evidence_is_not_an_autowork_secret() -> No
         {"license_restriction": "Owner prohibits external disclosure"},
     ],
 )
-async def test_sample_flags_do_not_veto_bridge_but_red_and_license_do(restriction) -> None:
+async def test_sample_disclosure_flags_veto_bridge(restriction) -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     observation, raw = make_observation(
@@ -2322,17 +2384,13 @@ async def test_sample_flags_do_not_veto_bridge_but_red_and_license_do(restrictio
         make_context(investigation_id, key="operator:advisor:restricted-sample"),
     )
 
-    if restriction.get("do_not_submit") or restriction.get("external_llm_allowed") is False:
-        assert len(transport.calls) == 1
-        assert result.output.get("advisor_status") != "disclosure_restricted"
-    else:
-        assert transport.calls == []
-        assert result.output["advisor_status"] == "disclosure_restricted"
-        assert result.output["preflight_status"] == "POLICY_BLOCKED"
-        assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
-        assert result.output["confirmed_non_execution"] is True
-        if restriction.get("license_restriction"):
-            assert restriction["license_restriction"] not in repr(result.output)
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+    assert result.output["confirmed_non_execution"] is True
+    if restriction.get("license_restriction"):
+        assert restriction["license_restriction"] not in repr(result.output)
 
 
 @pytest.mark.asyncio
@@ -2447,8 +2505,8 @@ async def test_restriction_trace_aggregates_conflicting_sample_records() -> None
         do_not_submit=True,
         external_llm_allowed=True,
     )
-    # Records sharing a hash may disagree; only a license restriction vetoes
-    # Bridge disclosure and appears in this refusal trace.
+    # Every explicit restriction on a record sharing the cited sample hash
+    # vetoes disclosure and appears in the refusal trace by policy name.
     tool._samples = _Samples([allowed_sample, restricted_sample, submit_blocked_sample])
 
     result = await tool.execute(
@@ -2465,7 +2523,7 @@ async def test_restriction_trace_aggregates_conflicting_sample_records() -> None
     assert result.output["disclosure_restricted_sample_count"] == 1
     rows = result.output["disclosure_restricted_sample_associations"]
     assert len(rows) == 1
-    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
+    assert tuple(rows[0]["restriction_sources"]) == ("do_not_submit", "license_restriction")
     assert restriction_text not in repr(result.output)
 
 
@@ -2831,7 +2889,169 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
 
 
 @pytest.mark.asyncio
-async def test_sample_blob_bytes_are_included_without_a_size_ceiling() -> None:
+async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest_status() -> None:
+    investigation_id = uuid4()
+    sample_content = bytes(range(256)) * 40
+    (
+        tool,
+        transport,
+        observation,
+        sample_id,
+        association_id,
+        blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        sample_content,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:raw-sample-observation"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert f"sample_id={sample_id}" in prompt
+    assert f"association_id={association_id}" in prompt
+    assert f"blob_id={blob_id}" in prompt
+    assert f"sample_sha256={sample_hash}" in prompt
+    assert "mime_type=application/x-synthetic-sample" in prompt
+    assert "encoding=base64" in prompt
+    assert "offset=0" in prompt
+    assert "length=4096" in prompt
+    assert "byte_length=10240" in prompt
+    assert "omitted_range=[4096,10240)" in prompt
+    fragment = base64.b64encode(sample_content[:4096]).decode("ascii")
+    assert fragment in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
+    )
+    item = next(
+        row
+        for row in persisted["completeness_manifest"]
+        if row["kind"] == "observation" and row["id"] == str(observation.id)
+    )
+    statuses = {row["status"] for row in item["statuses"]}
+    assert {"PRESENT_IN_CANONICAL", "IN_DOSSIER", "SENT_TO_BRIDGE"} <= statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    [
+        ("unreadable", "Required quarantined sample bytes could not be read."),
+        (
+            "mismatched_bytes",
+            "Required quarantined sample bytes do not match the declared size or SHA-256.",
+        ),
+    ],
+)
+async def test_downloaded_sample_blob_read_failures_refuse_with_precise_reason(
+    failure, expected_reason
+) -> None:
+    investigation_id = uuid4()
+    sample_content = bytes(range(128)) * 8
+    (
+        tool,
+        transport,
+        observation,
+        _sample_id,
+        _association_id,
+        blob_id,
+        _sample_hash,
+    ) = _make_downloaded_sample_fixture(investigation_id, sample_content)
+    if failure == "unreadable":
+        original_read_bytes = tool._artifact_store.read_bytes
+
+        async def fail_sample_read(requested_blob_id, *, max_bytes):
+            if requested_blob_id == blob_id:
+                raise OSError("synthetic quarantined blob read failure")
+            return await original_read_bytes(requested_blob_id, max_bytes=max_bytes)
+
+        tool._artifact_store.read_bytes = fail_sample_read
+    else:
+        tool._artifact_store.values[blob_id] = bytes(reversed(sample_content))
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:raw-sample-{failure}"),
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["advisor_status"] == "technical_blocked"
+    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
+    assert result.output["failure_reason"] == "required_canonical_evidence_not_in_payload"
+    assert len(result.output["missing_refs"]) == 1
+    missing = result.output["missing_refs"][0]
+    assert str(observation.id) in missing["ref"]
+    assert missing["reason"] == expected_reason
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"do_not_submit": True},
+        {"external_llm_allowed": False},
+        {"tlp": TLP.RED},
+        {"license_restriction": "Owner prohibits external disclosure"},
+    ],
+)
+async def test_disclosure_restricted_downloaded_sample_bytes_refuse_before_bridge(
+    restriction,
+) -> None:
+    investigation_id = uuid4()
+    (
+        tool,
+        transport,
+        observation,
+        _sample_id,
+        _association_id,
+        _blob_id,
+        _sample_hash,
+    ) = _make_downloaded_sample_fixture(
+        investigation_id,
+        bytes(range(256)),
+        **restriction,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited raw sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-raw-sample"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert result.output["failure_reason"] == "explicit_sample_restriction"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+    if "license_restriction" in restriction:
+        assert restriction["license_restriction"] not in repr(result.output)
+
+
+@pytest.mark.asyncio
+async def test_sample_blob_bytes_are_included_when_they_fit_the_fragment_bound() -> None:
     investigation_id = uuid4()
     sample_content = b"synthetic sample content above the configured test bound"
     sample_hash = hashlib.sha256(sample_content).hexdigest()
@@ -2966,7 +3186,7 @@ async def test_unreferenced_restricted_sample_does_not_block_unrelated_consultat
 
 
 @pytest.mark.asyncio
-async def test_dotnet_analysis_of_do_not_submit_sample_reaches_bridge() -> None:
+async def test_dotnet_analysis_of_do_not_submit_sample_is_refused() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     observation, raw = make_observation(
@@ -3018,12 +3238,13 @@ async def test_dotnet_analysis_of_do_not_submit_sample_reaches_bridge() -> None:
         make_context(investigation_id, key="operator:advisor:restricted-dotnet"),
     )
 
-    assert len(transport.calls) == 1
-    assert result.output.get("advisor_status") != "disclosure_restricted"
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
 
 
 @pytest.mark.asyncio
-async def test_do_not_submit_sample_inventory_sends_linked_finding_to_bridge() -> None:
+async def test_do_not_submit_sample_inventory_refuses_linked_finding() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     restricted, restricted_raw = make_observation(
@@ -3092,9 +3313,10 @@ async def test_do_not_submit_sample_inventory_sends_linked_finding_to_bridge() -
         make_context(investigation_id, key="operator:advisor:restricted-finding"),
     )
 
-    assert len(transport.calls) == 1
-    assert result.output.get("advisor_status") != "disclosure_restricted"
-    assert "RESTRICTED_FINDING_MARKER" in transport.calls[0]["prompt"]
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert "RESTRICTED_FINDING_MARKER" not in repr(result.output)
 
 
 @pytest.mark.asyncio
@@ -5870,7 +6092,6 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     operation_key = "operator:advisor:d7-large-sample-context"
     sample_bytes = bytes(index % 251 for index in range(3_200_000))
     sample_sha256 = hashlib.sha256(sample_bytes).hexdigest()
-    sample_base64 = base64.b64encode(sample_bytes).decode("ascii")
     sample_id = uuid4()
     association_id = uuid4()
     blob_id = uuid4()
@@ -5988,14 +6209,18 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert uncertain is False
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
-    assert len(prompt.encode("utf-8")) > 4_000_000
-    assert sample_base64 in prompt
+    assert len(prompt.encode("utf-8")) < 20_000
+    assert base64.b64encode(sample_bytes[:4096]).decode("ascii") in prompt
+    assert "omitted_range=[4096,3200000)" in prompt
+    assert "length=4096" in prompt
+    assert "byte_length=3200000" in prompt
+    assert base64.b64encode(sample_bytes).decode("ascii") not in prompt
     assert sample_sha256 in prompt
     assert str(sample_id) in prompt
     assert str(association_id) in prompt
     assert str(blob_id) in prompt
     assert "mime_type=application/x-synthetic-sample; fixture=large" in prompt
-    assert f"length={len(sample_bytes)}" in prompt
+    assert "length=4096" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
