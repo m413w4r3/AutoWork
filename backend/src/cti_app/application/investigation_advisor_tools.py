@@ -367,13 +367,16 @@ class InvestigationAdvisorTool:
                     context, self._settings
                 )
                 if budget_refusal is not None:
-                    return self._finish(context, budget_refusal)
+                    return self._finish(context, _attest_advisor_pre_submission(budget_refusal))
             else:
                 execution_timeout_seconds = _execution_timeout_seconds
             minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
             if minimum_execution_seconds is None:
                 return self._finish(
-                    context, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+                    context,
+                    _attest_advisor_pre_submission(
+                        _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+                    ),
                 )
             execution_deadline_monotonic = (
                 _execution_deadline_monotonic
@@ -386,7 +389,9 @@ class InvestigationAdvisorTool:
             ):
                 return self._finish(
                     context,
-                    _advisor_budget_refusal("execution_window_below_minimum_before_preparation"),
+                    _attest_advisor_pre_submission(
+                        _advisor_budget_refusal("execution_window_below_minimum_before_preparation")
+                    ),
                 )
             bridge_turns_remaining = (
                 _bridge_turns_remaining
@@ -416,7 +421,7 @@ class InvestigationAdvisorTool:
                 ),
             )
             if pacing_result is not None:
-                return self._finish(context, pacing_result)
+                return self._finish(context, _attest_advisor_pre_submission(pacing_result))
             evidence = await self._load_evidence(
                 context.investigation_id,
                 evidence_refs,
@@ -464,10 +469,12 @@ class InvestigationAdvisorTool:
             if investigation is None:
                 return self._finish(
                     context,
-                    ToolResult(
-                        ToolInvocationStatus.UNAVAILABLE,
-                        error_code="advisor_investigation_not_found",
-                        output={"advisor_status": "unavailable"},
+                    _attest_advisor_pre_submission(
+                        ToolResult(
+                            ToolInvocationStatus.UNAVAILABLE,
+                            error_code="advisor_investigation_not_found",
+                            output={"advisor_status": "unavailable"},
+                        )
                     ),
                 )
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
@@ -526,16 +533,18 @@ class InvestigationAdvisorTool:
             if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return self._finish(
                     context,
-                    ToolResult(
-                        ToolInvocationStatus.POLICY_DENIED,
-                        observation_refs=evidence_refs,
-                        error_code="POLICY_DENIED",
-                        output={
-                            "advisor_status": "policy_denied",
-                            "preflight_status": "POLICY_BLOCKED",
-                            "missing_refs": [],
-                        },
-                        message="External disclosure policy denied this Bridge consultation.",
+                    _attest_advisor_pre_submission(
+                        ToolResult(
+                            ToolInvocationStatus.POLICY_DENIED,
+                            observation_refs=evidence_refs,
+                            error_code="POLICY_DENIED",
+                            output={
+                                "advisor_status": "policy_denied",
+                                "preflight_status": "POLICY_BLOCKED",
+                                "missing_refs": [],
+                            },
+                            message="External disclosure policy denied this Bridge consultation.",
+                        )
                     ),
                 )
             prompt_data = await self._consultation_data(
@@ -852,16 +861,20 @@ class InvestigationAdvisorTool:
             if consultation_type == "suricata_draft" and not prompt_data.get("network_facts"):
                 return self._finish(
                     context,
-                    ToolResult(
-                        ToolInvocationStatus.FAILED,
-                        observation_refs=tuple(item.id for item in evidence),
-                        error_code="suricata_network_evidence_required",
-                        output={
-                            "advisor_status": "refused",
-                            "usable": False,
-                            "refusal_code": "SURICATA_NOT_JUSTIFIED",
-                            "refusal_reason": "Aucune mesure réseau observée n'a été transmise.",
-                        },
+                    _attest_advisor_pre_submission(
+                        ToolResult(
+                            ToolInvocationStatus.FAILED,
+                            observation_refs=tuple(item.id for item in evidence),
+                            error_code="suricata_network_evidence_required",
+                            output={
+                                "advisor_status": "refused",
+                                "usable": False,
+                                "refusal_code": "SURICATA_NOT_JUSTIFIED",
+                                "refusal_reason": (
+                                    "Aucune mesure réseau observée n'a été transmise."
+                                ),
+                            },
+                        )
                     ),
                 )
             transmitted_refs = _prompt_transmitted_refs(prompt_data)
@@ -1558,6 +1571,7 @@ class InvestigationAdvisorTool:
                 error_code=result.error_code,
                 message=result.message,
                 output=result.output,
+                framework_pre_submission_proof=result.framework_pre_submission_proof,
             )
         except Exception as exc:
             return self._finish(
@@ -1568,9 +1582,12 @@ class InvestigationAdvisorTool:
                     error_code="advisor_result_persistence_uncertain",
                     output={"advisor_status": "needs_review", "retry": False},
                     exception_class=type(exc).__name__,
+                    framework_pre_submission_proof=(
+                        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+                    ),
                 ),
             )
-        return self._finish(context, result)
+        return self._finish(context, _attest_advisor_pre_submission(result))
 
     async def _execute_editorial_batches(
         self,
@@ -1620,7 +1637,10 @@ class InvestigationAdvisorTool:
         minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
         if minimum_execution_seconds is None:
             return self._finish(
-                context, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+                context,
+                _attest_advisor_pre_submission(
+                    _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+                ),
             )
         for index, chunk in enumerate(chunks, start=1):
             deadline_remaining_seconds = math.floor(execution_deadline_monotonic - time.monotonic())
@@ -1630,8 +1650,13 @@ class InvestigationAdvisorTool:
             )
             if remaining_execution_seconds < minimum_execution_seconds:
                 prior_batch_was_submitted = bool(results)
+                budget_refusal = _advisor_budget_refusal(
+                    "execution_window_below_minimum_before_next_batch"
+                )
                 results.append(
-                    _advisor_budget_refusal("execution_window_below_minimum_before_next_batch")
+                    budget_refusal
+                    if prior_batch_was_submitted
+                    else _attest_advisor_pre_submission(budget_refusal)
                 )
                 combined = _combine_editorial_batch_results(results)
                 # This is a mixed outcome: earlier batches already reached Bridge,
@@ -3877,6 +3902,7 @@ class InvestigationAdvisorTool:
             exception_class=exception_class,
             output=safe_output,
         )
+        result = _attest_advisor_pre_submission(result)
         try:
             observation = await ProductionEvidenceRecorder(
                 self._artifact_store,
@@ -3928,6 +3954,9 @@ class InvestigationAdvisorTool:
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
                     },
+                    framework_pre_submission_proof=(
+                        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+                    ),
                 ),
             )
         return self._finish(context, result)
@@ -4945,6 +4974,8 @@ def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
             "binding_invalid",
             "coordinator_validation_refused",
             "coordinator_consume_refused",
+            "secret_preflight",
+            "sample_disclosure_restricted",
         }
     ):
         return result
@@ -5323,6 +5354,20 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
             budget[dimension] = budget.get(dimension, 0) + amount
     observations = tuple(dict.fromkeys(ref for item in results for ref in item.observation_refs))
     error_code = next((item.error_code for item in results if item.error_code), None)
+    all_batches_pre_submission = (
+        status
+        not in {
+            ToolInvocationStatus.SUCCEEDED,
+            ToolInvocationStatus.EMPTY,
+            ToolInvocationStatus.PARTIAL,
+        }
+        and budget.get(BudgetDimension.BRIDGE_TURNS, 0) == 0
+        and all(
+            item.framework_pre_submission_proof
+            is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            for item in results
+        )
+    )
     return ToolResult(
         status,
         observation_refs=observations,
@@ -5330,6 +5375,11 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
         output=output,
         error_code=error_code,
         message="Bridge editorial batches completed with per-unit provenance.",
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            if all_batches_pre_submission
+            else None
+        ),
     )
 
 
@@ -5525,6 +5575,7 @@ def _attach_advisor_provenance(result: ToolResult, provenance: Mapping[str, Any]
         message=result.message,
         exception_class=result.exception_class,
         error_code=result.error_code,
+        framework_pre_submission_proof=result.framework_pre_submission_proof,
     )
 
 

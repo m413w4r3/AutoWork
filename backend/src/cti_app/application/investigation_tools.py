@@ -833,8 +833,9 @@ class RegistryToolDispatcher:
             self._completed[operation_key] = (identity, result)
             return result
         # Adapters may return arbitrary ToolResult fields. Preserve only typed
-        # refusals from explicitly trusted built-in adapters. The advisor
-        # adapter attests a pre-send refusal only with zero Bridge turns.
+        # refusals from explicitly trusted built-in adapters. The advisor adapter
+        # attests only local preflight refusals and explicit Bridge pre-submission
+        # refusals with zero consumed turns; all other adapter proofs are discarded.
         advisor_pre_submission_refusal = (
             definition.name == "advisor.consult"
             and result.status

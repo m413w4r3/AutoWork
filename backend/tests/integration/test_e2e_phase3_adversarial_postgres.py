@@ -1146,8 +1146,8 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
             )
             assert refused.status_code == 200, refused.text
             body = refused.json()
-            assert body["invocation"]["status"] == ToolInvocationStatus.NEEDS_REVIEW.value
-            assert body["invocation"]["error_code"] == "invocation_needs_review"
+            assert body["invocation"]["status"] == ToolInvocationStatus.FAILED.value
+            assert body["invocation"]["error_code"] == "tool_failed"
             advisor_output = body["advisor_output"]
             assert advisor_output["advisor_status"] == "disclosure_restricted"
             assert advisor_output["preflight_status"] == "POLICY_BLOCKED"

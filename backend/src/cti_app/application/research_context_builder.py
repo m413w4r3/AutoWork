@@ -2791,6 +2791,8 @@ class ResearchContextBuilder:
                     _download_sample_result_facts(summary) if isinstance(summary, Mapping) else None
                 )
             if isinstance(summary, Mapping):
+                summary = _advisor_sample_refusal_context_summary(observation, summary)
+            if isinstance(summary, Mapping):
                 raw_text = json.dumps(_sanitize(summary), ensure_ascii=False)
             elif isinstance(summary, str):
                 raw_text = summary
@@ -2894,7 +2896,9 @@ class ResearchContextBuilder:
             except Exception:
                 continue
             if isinstance(summary, Mapping):
-                facts.append((observation, summary))
+                facts.append(
+                    (observation, _advisor_sample_refusal_context_summary(observation, summary))
+                )
         return tuple(facts)
 
     async def _sample_index(
@@ -3800,6 +3804,11 @@ def provider_download_blocked_capabilities(
 
 
 def _coverage_parameter_key(invocation: ToolInvocation) -> str:
+    if (
+        invocation.tool_name == "advisor.consult"
+        and invocation.status is ToolInvocationStatus.FAILED
+    ):
+        return "advisor arguments withheld after local refusal"
     parameters = thaw_json(invocation.normalized_parameters)
     if not isinstance(parameters, Mapping):
         return "parameters: unavailable"
@@ -3823,6 +3832,33 @@ def _coverage_parameter_key(invocation: ToolInvocation) -> str:
             return f"{name}: {safe_value}"
     encoded = json.dumps(_sanitize(parameters), ensure_ascii=False, sort_keys=True)
     return f"parameters: {_truncate(_safe_untrusted(encoded), 240)}"
+
+
+def _advisor_sample_refusal_context_summary(
+    observation: EvidenceObservation, summary: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Keep restricted-sample refusal telemetry out of later Bridge contexts."""
+    if observation.source != "advisor.consult":
+        return summary
+    candidates: list[Mapping[str, Any]] = [summary]
+    for key in ("result", "output"):
+        nested = summary.get(key)
+        if isinstance(nested, Mapping):
+            candidates.append(nested)
+            output = nested.get("output")
+            if isinstance(output, Mapping):
+                candidates.append(output)
+    if not any(
+        candidate.get("failure_stage") == "sample_disclosure_restricted" for candidate in candidates
+    ):
+        return summary
+    return {
+        "advisor_status": "disclosure_restricted",
+        "failure_stage": "sample_disclosure_restricted",
+        "failure_reason": "explicit_sample_restriction",
+        "confirmed_non_execution": True,
+        "bridge_turns_consumed": 0,
+    }
 
 
 def _tool_coverage_summary(
