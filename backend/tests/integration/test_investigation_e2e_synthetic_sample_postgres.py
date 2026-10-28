@@ -877,11 +877,11 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 key=f"m05c-advisor-veto:missing-ref:{investigation_id}",
             )
             assert len(transport.calls) == before
-            # Adapter self-attestation is not framework submission proof, so the
-            # operator journal remains NEEDS_REVIEW while the Advisor output records
-            # the typed pre-transport refusal.
-            assert incomplete["invocation"]["status"] == "needs_review"
-            assert incomplete["invocation"]["error_code"] == "invocation_needs_review"
+            # The registered Advisor adapter supplies accepted typed pre-submission
+            # proof (pre_transport_validation), so the refusal is a FAILED
+            # non-execution and the reservation is released.
+            assert incomplete["invocation"]["status"] == "failed"
+            assert incomplete["invocation"]["error_code"] == "tool_failed"
             incomplete_output = incomplete["advisor_output"]
             assert incomplete_output["advisor_status"] == "invalid_input"
             assert incomplete_output["input_error_code"] == "advisor_input_rejected"

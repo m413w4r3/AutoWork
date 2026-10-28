@@ -899,8 +899,9 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         )
         assert missing_ref.status_code == 200, missing_ref.text
         missing_payload = missing_ref.json()
-        assert missing_payload["invocation"]["status"] == ToolInvocationStatus.NEEDS_REVIEW.value
-        assert missing_payload["invocation"]["error_code"] == "invocation_needs_review"
+        # Typed pre-transport proof (confirmed non-execution) => FAILED, not NEEDS_REVIEW.
+        assert missing_payload["invocation"]["status"] == ToolInvocationStatus.FAILED.value
+        assert missing_payload["invocation"]["error_code"] == "tool_failed"
         assert missing_payload["advisor_output"]["advisor_status"] == "invalid_input"
         assert missing_payload["advisor_output"]["confirmed_non_execution"] is True
         assert missing_payload["advisor_output"]["provider_usage"] == {"status": "not_submitted"}
