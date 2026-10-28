@@ -5428,6 +5428,10 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_secret_field_remaining"
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
     assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
     assert result.output["redacted_secret_count"] == 1
     assert [dict(item) for item in result.output["secret_findings"]] == [
@@ -5705,6 +5709,7 @@ async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_
     assert result.output["failure_stage"] == "budget_admission"
     assert result.output["failure_reason"] == "execution_window_below_minimum_before_next_batch"
     assert result.output["confirmed_non_execution"] is False
+    assert result.framework_pre_submission_proof is None
     assert result.output["unprocessed_unit_ids"] == ("U2",)
 
 
@@ -6450,6 +6455,15 @@ async def test_confirmed_rate_limit_does_not_consume_advisor_bridge_turn_budget(
             "advisor_rate_limited",
         ),
         (
+            TurnSubmission(
+                TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED,
+                error_code="bridge_pre_submission_retry_exhausted",
+                submission_state="pre_submission",
+            ),
+            ToolInvocationStatus.UNAVAILABLE,
+            "advisor_unavailable",
+        ),
+        (
             TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=""),
             ToolInvocationStatus.PARTIAL,
             None,
@@ -6484,6 +6498,14 @@ async def test_advisor_transport_failures_are_explicit_and_never_retried(
 
     assert result.status is expected_status
     assert result.error_code == expected_code
+    if submission.submission_state == "pre_submission":
+        assert (
+            result.framework_pre_submission_proof
+            is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        )
+        assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    else:
+        assert result.framework_pre_submission_proof is None
     assert len(transport.calls) == 1
 
 
@@ -6734,6 +6756,10 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
     )
     assert result.output["bridge_turns_consumed"] == 0
     assert result.output["usable"] is False
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
     assert transport.calls == []
 
 
@@ -6795,6 +6821,10 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     assert result.output["failure_stage"] == "pre_transport_validation"
     assert result.output["confirmed_non_execution"] is True
     assert result.output["provider_usage"] == {"status": "not_submitted"}
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
     assert transport.calls == []
 
 
