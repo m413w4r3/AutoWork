@@ -28,7 +28,6 @@ from cti_app.application.bridge_investigator import (
 from cti_app.application.content_pivot_candidates import verify_content_pattern_candidates
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
-    MAX_ADVISOR_TOOL_SECONDS,
     InvestigationAdvisorTool,
     _advisor_dossier_opinion_source_refs,
     _contains_encoded_operational_secrets,
@@ -323,16 +322,12 @@ def make_context(
     key="operator:advisor:test",
     capabilities=(),
     *,
-    tool_seconds=3_600,
     bridge_turns=1,
 ):
     budget = InvestigationBudget(limits={})
     budget.reserve(
         key,
-        {
-            BudgetDimension.BRIDGE_TURNS: bridge_turns,
-            BudgetDimension.TOOL_SECONDS: tool_seconds,
-        },
+        {BudgetDimension.BRIDGE_TURNS: bridge_turns},
     )
     envelope = InvestigationEnvelope(
         investigation_id=investigation_id,
@@ -508,8 +503,21 @@ def test_advisor_response_json_extraction_is_single_block_and_never_repairs() ->
     assert extract_json_object('{"value":NaN}') is None
 
 
-def test_advisor_timeout_budgets_allow_slow_bridge_responses() -> None:
-    assert MAX_ADVISOR_TOOL_SECONDS >= 200
+def test_advisor_budget_cost_is_not_charged_for_elapsed_tool_seconds() -> None:
+    investigation_id = uuid4()
+    tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
+
+    class CaptureRegistry:
+        def __init__(self):
+            self.definitions = []
+
+        def register(self, definition, adapter):
+            self.definitions.append(definition)
+
+    registry = CaptureRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+
+    assert registry.definitions[0].cost_model == {BudgetDimension.BRIDGE_TURNS: 1}
 
 
 def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> None:
@@ -2562,7 +2570,9 @@ async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transport() -> None:
+async def test_sample_byte_content_is_omitted_but_analysis_metadata_reaches_fake_transport() -> (
+    None
+):
     investigation_id = uuid4()
     attacker_token = "ghp_" + "a" * 36
     raw_sample = bytes((0x90, 0x90, 0xC3, 0x41, 0x42)) + b" " + attacker_token.encode()
@@ -2667,15 +2677,7 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
     assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
-    expected_bytes_label = f"encoding=base64; byte_length={len(raw_sample)}; sha256={sample_sha256}"
     for required in (
-        base64_content,
-        raw_sample.hex(),
-        expected_bytes_label,
-        "offset 37",
-        "offset 38",
-        "offset 91",
-        f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}",
         "status=clean",
         "analysis_status=malicious",
         "EngineAlpha",
@@ -2692,31 +2694,121 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         f"evidence_sha256s={observation.sha256}",
         f"related_sample_sha256={contradictory_source_hash}",
         f"source_object_id={contradictory_source_hash}",
-        f"length={len(raw_sample)}",
+        "content_omission_reason=raw sample bytes are never transmitted",
         "do_not_submit=false",
         "external_llm_allowed=true",
     ):
         assert required in prompt
-    assert attacker_token in base64.b64decode(base64_content).decode("latin-1")
+    assert base64_content not in prompt
+    assert raw_sample.hex() not in prompt
+    assert attacker_token not in prompt
     assert result.output["bridge_provenance"]["redacted_secret_count"] == 0
-    assert any(
-        all(
-            value in line
-            for value in (
-                f"evidence_id={observation.id}",
-                f"blob_id={observation.blob_id}",
-                f"association_id={association_id}",
-            )
+
+
+@pytest.mark.asyncio
+async def test_raw_sample_byte_observation_is_omitted_without_blocking_analysis_evidence() -> None:
+    investigation_id = uuid4()
+    sample_bytes = b"\x00\xffraw-sample-fixture"
+    sample_sha256 = hashlib.sha256(sample_bytes).hexdigest()
+    raw_blob_id = uuid4()
+    raw_observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=raw_blob_id,
+        sha256=sample_sha256,
+        source="virustotal.sample_download",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id=sample_sha256,
+    )
+    analysis_observation, analysis_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_sha256,
+            "strings": [{"value": "SyntheticAnalysisMarker", "offset": 32}],
+        },
+    )
+    analysis_observation = replace(
+        analysis_observation,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        object_type="binary_analysis",
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The analysis evidence supports the review.", [str(analysis_observation.id)]
+            ),
         )
-        for line in prompt.splitlines()
-        if "Octets observés" in line
     )
-    fragment_line = next(
-        line for line in prompt.splitlines() if "Octets observés" in line and "offset 91" in line
+    tool, _ = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=raw_observation,
+        raw=sample_bytes,
     )
-    assert f"mime_type={mime_type}" in fragment_line
-    assert f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}" in fragment_line
-    assert f"; sha256={sample_sha256}" not in fragment_line
+    original_blob_reader = tool._blobs.get
+
+    async def raw_sample_blob_is_unavailable(blob_id):
+        if blob_id == raw_blob_id:
+            return None
+        return await original_blob_reader(blob_id)
+
+    tool._blobs.get = raw_sample_blob_is_unavailable
+    tool._observations.observations[analysis_observation.id] = analysis_observation
+    tool._artifact_store.values[analysis_observation.blob_id] = analysis_raw
+    tool._blobs.add(
+        analysis_observation.blob_id,
+        sha256=analysis_observation.sha256,
+        size=len(analysis_raw),
+        logical_bucket="evidence",
+    )
+    tool._sample_associations = _SampleAssociations([sample_sha256])
+    tool._samples = _Samples(
+        [
+            SimpleNamespace(
+                id=uuid4(),
+                expected_hash=sample_sha256,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=raw_blob_id,
+                tlp=TLP.GREEN,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                license_restriction=None,
+            )
+        ]
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the analysis and preserve its useful evidence.",
+            "evidence_refs": [str(raw_observation.id), str(analysis_observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:raw-sample-omission"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert result.output["bridge_provenance"]["preflight_status"] == "READY"
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "SyntheticAnalysisMarker" in prompt
+    assert sample_bytes.hex() not in prompt
+    assert base64.b64encode(sample_bytes).decode("ascii") not in prompt
+    dossier_manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    omitted = next(row for row in dossier_manifest if row.get("id") == str(raw_observation.id))
+    assert omitted["kind"] == "observation"
+    assert omitted["omitted"] is True
+    assert omitted["reason"] == "raw sample bytes are never transmitted"
+    completeness = next(
+        row
+        for row in result.output["bridge_provenance"]["completeness_manifest"]
+        if row["kind"] == "observation" and row["id"] == str(raw_observation.id)
+    )
+    assert "INTENTIONALLY_OMITTED" in {item["status"] for item in completeness["statuses"]}
 
 
 @pytest.mark.asyncio
@@ -2829,7 +2921,7 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
 
 
 @pytest.mark.asyncio
-async def test_sample_blob_bytes_are_included_without_a_size_ceiling() -> None:
+async def test_sample_blob_bytes_are_omitted_but_verified_metadata_is_available() -> None:
     investigation_id = uuid4()
     sample_content = b"synthetic sample content above the configured test bound"
     sample_hash = hashlib.sha256(sample_content).hexdigest()
@@ -2914,8 +3006,9 @@ async def test_sample_blob_bytes_are_included_without_a_size_ceiling() -> None:
     prompt = transport.calls[0]["prompt"]
     assert f"sample_id={sample_id}" in prompt
     assert f"association_id={association_id}" in prompt
-    assert "content_status=verified" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "content_status=omitted_by_policy" in prompt
+    assert "content_omission_reason=raw sample bytes are never transmitted" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
 
 
 @pytest.mark.asyncio
@@ -5676,7 +5769,7 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
 
 
 @pytest.mark.asyncio
-async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_too_small() -> None:
+async def test_editorial_batch_ignores_legacy_tool_seconds_consumption() -> None:
     investigation_id = uuid4()
     tool, _sample_blob = make_tool(
         investigation_id=investigation_id,
@@ -5720,20 +5813,16 @@ async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_
         ),
         units,
         maximum_units=1,
-        execution_timeout_seconds=3_600,
+        execution_timeout_seconds=7_200,
     )
 
-    assert len(submitted) == 1
-    assert submitted[0][0]["units"] == [units[0]]
-    assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3_541
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
-    assert result.output["advisor_status"] == "partial"
-    assert result.output["failure_stage"] == "budget_admission"
-    assert result.output["failure_reason"] == "execution_window_below_minimum_before_next_batch"
-    assert result.output["confirmed_non_execution"] is False
+    assert len(submitted) == 2
+    assert [item[0]["units"] for item in submitted] == [[units[0]], [units[1]]]
+    assert [item[1] for item in submitted] == [7_200, 7_200]
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
+    assert result.output["advisor_status"] == "succeeded"
     assert result.framework_pre_submission_proof is None
-    assert result.output["unprocessed_unit_ids"] == ("U2",)
 
 
 @pytest.mark.asyncio
@@ -5850,7 +5939,7 @@ async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> No
 
 
 @pytest.mark.asyncio
-async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> None:
+async def test_large_sample_bytes_are_omitted_and_prompt_reservation_is_persisted() -> None:
     try:
         from tests.test_investigation_service import _Fixture
     except ImportError as exc:
@@ -5986,8 +6075,8 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert uncertain is False
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
-    assert len(prompt.encode("utf-8")) > 4_000_000
-    assert sample_base64 in prompt
+    assert len(prompt.encode("utf-8")) < 4_000_000
+    assert sample_base64 not in prompt
     assert sample_sha256 in prompt
     assert str(sample_id) in prompt
     assert str(association_id) in prompt
@@ -6909,7 +6998,6 @@ def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
         source_refs=(),
         input_bytes=256,
         consultation_type="review_text",
-        elapsed_seconds=1,
         available_tools={},
         available_tool_schemas={},
         prompt_data={},

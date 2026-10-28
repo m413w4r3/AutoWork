@@ -36,6 +36,7 @@ _STOP = frozenset(
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
     "ses from that this those have with which what where when then than into over under".split()
 )
+RAW_SAMPLE_BYTES_OMISSION_REASON = "raw sample bytes are never transmitted"
 
 
 _DEFAULT_TASKS = {
@@ -72,6 +73,24 @@ _CONTENT_KEYS = frozenset(
         "byte",
         "base64",
         "base64_bytes",
+    }
+)
+_RAW_SAMPLE_BYTE_KEYS = frozenset(
+    {
+        "raw_bytes",
+        "raw_sample_bytes",
+        "sample_bytes",
+        "bytes",
+        "byte",
+        "hex",
+        "hex_bytes",
+        "bytes_hex",
+        "hexdump",
+        "base64",
+        "base64_bytes",
+        "base64_content",
+        "content_base64",
+        "binary_content",
     }
 )
 _OMIT_KEYS = frozenset(
@@ -438,6 +457,18 @@ def extract_content_excerpts(
                     # Never project an AutoWork operational credential into a
                     # dossier, even when it is nested under a neutral label.
                     continue
+                if sample_context and key in _RAW_SAMPLE_BYTE_KEYS:
+                    continue
+                if sample_context and key in {"value", "content", "data"}:
+                    encoding = value.get("encoding")
+                    if isinstance(encoding, str) and encoding.casefold() in {
+                        "raw",
+                        "bytes",
+                        "hex",
+                        "hexdump",
+                        "base64",
+                    }:
+                        continue
                 if sample_context and key in _CTI_METADATA_KEYS:
                     if isinstance(child, (Mapping, list, tuple)):
                         metadata_value = json.dumps(
@@ -640,7 +671,6 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         blob_id = _as_text(sample.get("blob_id"))
         byte_length = sample.get("byte_length")
         mime_type = _as_text(sample.get("mime_type"))
-        content = _as_text(sample.get("content_base64"))
         lines = [
             "Verified sample provenance:",
             f"sample_id={sample_id}",
@@ -650,8 +680,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             f"sha256={sample_sha256}",
             f"expected_hash={_as_text(sample.get('expected_hash'))}",
             f"source_object_id={_as_text(sample.get('source_object_id'))}",
-            f"encoding=base64; byte_length={byte_length}; offset=0; "
-            f"length={byte_length}; mime_type={mime_type}",
+            f"byte_length={byte_length}; offset=0; length={byte_length}; mime_type={mime_type}",
             f"association_status={_as_text(sample.get('association_status'))}",
             f"content_status={_as_text(sample.get('content_status'))}",
             f"state={_as_text(sample.get('state'))}",
@@ -689,8 +718,6 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     if isinstance(item, Mapping)
                 )
             )
-        if content:
-            lines.extend(["encoding=base64", "content_base64:", content])
         omission_reason = sample.get("content_omission_reason")
         if isinstance(omission_reason, str) and omission_reason:
             lines.append(f"content_omission_reason={omission_reason}")
@@ -714,8 +741,8 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     "offset": 0,
                     "length": byte_length,
                     "mime_type": mime_type,
-                    "encoding": "base64",
                     "content_status": _as_text(sample.get("content_status")),
+                    "content_omitted": bool(omission_reason),
                     "content_omission_reason": _as_text(omission_reason),
                 },
             )
@@ -1425,6 +1452,28 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         )
         rendered.append(piece)
 
+    raw_sample_omissions = [
+        item
+        for item in prompt_data.get("omitted_raw_sample_byte_observations", ())
+        if isinstance(item, Mapping)
+    ]
+    for item in sorted(raw_sample_omissions, key=lambda row: _as_text(row.get("evidence_id"))):
+        identifier = _as_text(item.get("evidence_id"))
+        if not identifier:
+            continue
+        unavailable_observations.discard(identifier)
+        manifest.append(
+            {
+                "kind": "observation",
+                "id": identifier,
+                "sha256": _as_text(item.get("sha256")),
+                "source_ref": {"kind": "observation", "id": identifier},
+                "origin": "intentionally_omitted",
+                "omitted": True,
+                "reason": RAW_SAMPLE_BYTES_OMISSION_REASON,
+            }
+        )
+
     lines = ["DOSSIER DE FAITS"]
     if rendered:
         lines.extend(rendered)
@@ -1436,6 +1485,11 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         lines.append(
             "Limite pertinente: contenu lisible indisponible pour "
             f"{len(unavailable_observations)} observation(s) citée(s)."
+        )
+    if raw_sample_omissions:
+        lines.append(
+            f"{len(raw_sample_omissions)} observation(s) omise(s): "
+            f"{RAW_SAMPLE_BYTES_OMISSION_REASON}."
         )
 
     if contradiction_requested:
@@ -2028,6 +2082,28 @@ def evaluate_advisor_evidence_preflight(
                     informational=True,
                 )
 
+    raw_sample_omissions = [
+        item
+        for item in prompt_data.get("omitted_raw_sample_byte_observations", ())
+        if isinstance(item, Mapping)
+    ]
+    for item in raw_sample_omissions:
+        identifier = _as_text(item.get("evidence_id"))
+        sha256 = _as_text(item.get("sha256"))
+        if not identifier:
+            continue
+        add(
+            "observation",
+            identifier,
+            sha256,
+            {"kind": "observation", "id": identifier, "sha256": sha256},
+            False,
+            False,
+            RAW_SAMPLE_BYTES_OMISSION_REASON,
+            verified=True,
+            intentionally_omitted=True,
+        )
+
     known = {(item["kind"], item["id"]) for item in records}
     for kind, identifier in sorted(references - known):
         add(
@@ -2068,6 +2144,7 @@ def evaluate_advisor_evidence_preflight(
                 or (item["kind"] == "fact" and row.get("fact_id") == item["id"])
             )
             and (not item.get("claim_id") or row.get("claim_id") == item.get("claim_id"))
+            and row.get("omitted") is not True
         ]
         statuses: list[dict[str, str]] = []
 
@@ -2083,6 +2160,10 @@ def evaluate_advisor_evidence_preflight(
             mark(AdvisorEvidenceStatus.REQUIRED, item["reason"])
         elif item.get("informational"):
             mark(AdvisorEvidenceStatus.INFORMATIONAL, item["reason"])
+        if item.get("intentionally_omitted"):
+            mark(AdvisorEvidenceStatus.INTENTIONALLY_OMITTED, item["reason"])
+            item["statuses"] = statuses
+            continue
         verified = item.get("verified", True)
         if item["body_present"] and sha_valid and verified:
             mark(

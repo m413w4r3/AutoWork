@@ -25,7 +25,6 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     DisclosureBounds,
-    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     TLPLevel,
@@ -54,16 +53,17 @@ class FakeClock:
         self.advance(seconds)
 
 
-def _context(investigation_id, *, key: str, tool_seconds: int) -> ToolExecutionContext:
+def _context(
+    investigation_id, *, key: str, tool_seconds: int | None = None
+) -> ToolExecutionContext:
     budget = InvestigationBudget(limits={})
+    reservation = {BudgetDimension.BRIDGE_TURNS: 1}
+    if tool_seconds is not None:
+        # Historical advisor reservations may still include TOOL_SECONDS.
+        reservation[BudgetDimension.TOOL_SECONDS] = tool_seconds
     budget.reserve(
         key,
-        {
-            # Direct tool execution bypasses the dispatcher's measured prompt
-            # reservation; reserve only the dimensions under test here.
-            BudgetDimension.BRIDGE_TURNS: 1,
-            BudgetDimension.TOOL_SECONDS: tool_seconds,
-        },
+        reservation,
     )
     envelope = InvestigationEnvelope(
         investigation_id=investigation_id,
@@ -108,7 +108,7 @@ def _evidence_payload(sample_sha256: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_3600_second_reservation_bounds_7200_role_and_late_response_is_ambiguous(
+async def test_historical_tool_seconds_reservation_does_not_cap_or_consume_advisor_time(
     monkeypatch,
 ) -> None:
     clock = FakeClock()
@@ -125,18 +125,17 @@ async def test_3600_second_reservation_bounds_7200_role_and_late_response_is_amb
     )
     assert await tool._measurement_payload(observation) is not None
 
-    context = _context(investigation_id, key="bounded-3600-late", tool_seconds=3_600)
+    context = _context(investigation_id, key="legacy-tool-seconds", tool_seconds=3_600)
     result = await tool.execute(
         {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
         context,
     )
 
     assert transport.calls, dict(result.output)
-    assert [call["timeout_seconds"] for call in transport.calls] == [3_600]
+    assert [call["timeout_seconds"] for call in transport.calls] == [7_200]
     assert len(transport.calls) == 1
-    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.output["advisor_status"] == "needs_review"
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
     assert "blocks" not in result.output
     # Direct execution bypasses the dispatcher's measured context reservation;
     # commit only the dimensions this test actually reserved.
@@ -153,14 +152,11 @@ async def test_3600_second_reservation_bounds_7200_role_and_late_response_is_amb
             if dimension in reserved_dimensions
         },
     )
-    assert (
-        reservation.committed_amounts[BudgetDimension.TOOL_SECONDS]
-        <= reservation.amounts[BudgetDimension.TOOL_SECONDS]
-    )
+    assert reservation.committed_amounts.get(BudgetDimension.TOOL_SECONDS, 0) == 0
 
 
 @pytest.mark.asyncio
-async def test_9000_second_reservation_is_bounded_by_7200_role_timeout(monkeypatch) -> None:
+async def test_larger_legacy_seconds_reservation_does_not_extend_hard_timeout(monkeypatch) -> None:
     clock = FakeClock()
     monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
     investigation_id = uuid4()
@@ -182,10 +178,11 @@ async def test_9000_second_reservation_is_bounded_by_7200_role_timeout(monkeypat
     assert [call["timeout_seconds"] for call in transport.calls] == [7_200]
     assert len(transport.calls) == 1
     assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
 
 
 @pytest.mark.asyncio
-async def test_response_at_3599_seconds_succeeds_within_3600_reservation(monkeypatch) -> None:
+async def test_advisor_without_seconds_reservation_uses_hard_timeout(monkeypatch) -> None:
     clock = FakeClock()
     monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
     investigation_id = uuid4()
@@ -201,13 +198,13 @@ async def test_response_at_3599_seconds_succeeds_within_3600_reservation(monkeyp
 
     result = await tool.execute(
         {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
-        _context(investigation_id, key="bounded-3599", tool_seconds=3_600),
+        _context(investigation_id, key="without-tool-seconds"),
     )
 
-    assert [call["timeout_seconds"] for call in transport.calls] == [3_600]
+    assert [call["timeout_seconds"] for call in transport.calls] == [7_200]
     assert len(transport.calls) == 1
     assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3_599
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
 
 
 @pytest.mark.asyncio
@@ -233,7 +230,7 @@ async def test_role_timeout_below_reservation_is_propagated(monkeypatch) -> None
     assert [call["timeout_seconds"] for call in transport.calls] == [1_800]
     assert len(transport.calls) == 1
     assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 1_799
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
 
 
 def test_minimum_execution_window_tracks_bridge_phase_limits_and_boundaries() -> None:
@@ -248,15 +245,14 @@ def test_minimum_execution_window_tracks_bridge_phase_limits_and_boundaries() ->
     minimum = advisor_tools._advisor_minimum_execution_seconds(settings)
     assert minimum == 65
 
-    too_small_context = _context(uuid4(), key="minimum-64", tool_seconds=minimum - 1)
-    timeout, refusal = advisor_tools._advisor_execution_timeout(too_small_context, settings)
-    assert timeout == 0
-    assert refusal is not None
-    assert refusal.output["failure_reason"] == "tool_seconds_reservation_below_minimum"
+    legacy_small_context = _context(uuid4(), key="legacy-minimum-64", tool_seconds=minimum - 1)
+    timeout, refusal = advisor_tools._advisor_execution_timeout(legacy_small_context, settings)
+    assert timeout == 7_200
+    assert refusal is None
 
-    exact_context = _context(uuid4(), key="minimum-65", tool_seconds=minimum)
-    timeout, refusal = advisor_tools._advisor_execution_timeout(exact_context, settings)
-    assert timeout == minimum
+    no_seconds_context = _context(uuid4(), key="no-tool-seconds")
+    timeout, refusal = advisor_tools._advisor_execution_timeout(no_seconds_context, settings)
+    assert timeout == 7_200
     assert refusal is None
 
     settings.openai_bridge_connect_timeout_seconds = 4
@@ -273,7 +269,7 @@ async def test_response_at_exact_deadline_is_ambiguous(monkeypatch) -> None:
     monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
     investigation_id = uuid4()
     observation, raw = make_observation(investigation_id, _evidence_payload("0" * 64))
-    transport = _valid_submission(clock, 3_600, observation.id)
+    transport = _valid_submission(clock, 7_200, observation.id)
     tool, _ = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -283,13 +279,13 @@ async def test_response_at_exact_deadline_is_ambiguous(monkeypatch) -> None:
 
     result = await tool.execute(
         {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
-        _context(investigation_id, key="exact-deadline", tool_seconds=3_600),
+        _context(investigation_id, key="exact-deadline"),
     )
 
     assert len(transport.calls) == 1
     assert result.status is ToolInvocationStatus.NEEDS_REVIEW
     assert result.output["failure_reason"] == "execution_deadline_exceeded"
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3_600
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
 
 
 @pytest.mark.asyncio
@@ -325,19 +321,18 @@ async def test_pacer_and_preparation_are_inside_the_hard_deadline(monkeypatch) -
     tool._load_evidence = load_evidence
     result = await tool.execute(
         {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
-        _context(investigation_id, key="pacing-and-prep-deadline", tool_seconds=3_600),
+        _context(investigation_id, key="pacing-and-prep-deadline"),
     )
 
     assert len(transport.calls) == 1
-    assert transport.calls[0]["timeout_seconds"] == 3_570
+    assert transport.calls[0]["timeout_seconds"] == 7_170
     assert clock() == 3_601
-    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.output["failure_reason"] == "execution_deadline_exceeded"
-    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert BudgetDimension.TOOL_SECONDS not in result.budget_consumed
 
 
 @pytest.mark.asyncio
-async def test_planned_pacing_past_deadline_refuses_before_transport(monkeypatch) -> None:
+async def test_planned_pacing_within_hard_timeout_proceeds_to_transport(monkeypatch) -> None:
     clock = FakeClock()
     monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
     pacer = BridgeSubmissionPacer(
@@ -362,13 +357,12 @@ async def test_planned_pacing_past_deadline_refuses_before_transport(monkeypatch
 
     result = await tool.execute(
         {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
-        _context(investigation_id, key="pacer-exceeds-deadline", tool_seconds=65),
+        _context(investigation_id, key="pacer-within-hard-timeout"),
     )
 
-    assert len(transport.calls) == 0
-    assert result.output["failure_stage"] == "budget_admission"
-    assert result.output["failure_reason"] == "pacing_exceeds_execution_deadline"
-    assert result.output["confirmed_non_execution"] is True
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["timeout_seconds"] == 7_134
+    assert result.status is ToolInvocationStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -425,19 +419,22 @@ async def test_ambiguous_bounded_timeout_keeps_reservation_and_blocks_fresh_key(
 
 
 @pytest.mark.asyncio
-async def test_remaining_capacity_below_minimum_is_refused_before_reservation_or_transport() -> (
-    None
-):
+async def test_advisor_ignores_remaining_tool_seconds_capacity() -> None:
     investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, _evidence_payload("9" * 64))
     transport = Transport(
         advisor_tools.TurnSubmission(
             advisor_tools.TurnSubmissionStatus.SUCCEEDED,
-            output_text="never reached",
+            output_text=advisor_response(
+                "The verified evidence supports the review.", [str(observation.id)]
+            ),
         )
     )
     tool, _ = make_tool(
         investigation_id=investigation_id,
         transport=transport,
+        observation=observation,
+        raw=raw,
         role_timeout_seconds=7_200,
     )
     budget = InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 3_659})
@@ -468,18 +465,21 @@ async def test_remaining_capacity_below_minimum_is_refused_before_reservation_or
         context,
         tool_name=ADVISOR_TOOL_NAME,
         schema_version=ADVISOR_SCHEMA_VERSION,
-        arguments={"consultation_type": "plan_investigation"},
+        arguments={
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
         purpose="test bounded advisor admission",
         operation_key=context.idempotency_key,
     )
 
-    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.BUDGET_REJECTED
-    assert "pre_submission_reason" not in result.output
-    assert result.output["request_permission"] is True
-    assert "tool_seconds" in result.message
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.framework_pre_submission_proof is None
     assert budget.consumed[BudgetDimension.TOOL_SECONDS] == 3_600
-    assert len(transport.calls) == 0
-    assert all(
-        reservation.operation_key != context.idempotency_key for reservation in budget.reservations
+    assert len(transport.calls) == 1
+    advisor_reservation = next(
+        reservation
+        for reservation in budget.reservations
+        if reservation.operation_key == context.idempotency_key
     )
+    assert BudgetDimension.TOOL_SECONDS not in advisor_reservation.amounts

@@ -645,7 +645,7 @@ async def test_operator_dispatcher_sends_advisor_when_source_flags_are_false():
             assert kwargs["external_llm_allowed"] is True
             assert isinstance(kwargs["timeout_seconds"], int | float)
             assert not isinstance(kwargs["timeout_seconds"], bool)
-            assert 0 < kwargs["timeout_seconds"] <= 3_600
+            assert 0 < kwargs["timeout_seconds"] <= 7_200
             assert len(kwargs["prompt"].encode()) <= 32 * 1024 * 1024
             self.calls.append(kwargs)
             article_ref = next(
