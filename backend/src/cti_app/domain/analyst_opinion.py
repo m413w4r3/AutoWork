@@ -107,6 +107,28 @@ class ImplantMaterialEditorialV1:
         )
 
 
+def render_implant_materials_text(
+    materials: Iterable[ImplantMaterialEditorialV1], *, editorial_text: str | None = None
+) -> str:
+    """Render canonical implant-material fields as bounded plain text, never serialized JSON."""
+    parts = [editorial_text] if editorial_text else []
+    for index, material in enumerate(materials, start=1):
+        parts.append(
+            "\n".join(
+                (
+                    f"Implant material {index}:",
+                    f"Type: {material.type.value}",
+                    f"Value: {material.value}",
+                    f"Role: {material.role}",
+                    f"Sample location: {material.sample_location}",
+                    f"Sample SHA-256: {material.sample_sha256}",
+                    f"Evidence observation: {material.evidence_observation_id}",
+                )
+            )
+        )
+    return "\n\n".join(parts)
+
+
 class OpinionClaimQualification(StrEnum):
     FACT = "fact"
     INFERENCE = "inference"

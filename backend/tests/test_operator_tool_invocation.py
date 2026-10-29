@@ -66,10 +66,13 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationState,
     AnalystObservationV1,
     AnalystOpinionV1,
+    ImplantMaterialEditorialV1,
+    ImplantMaterialType,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
     investigation_opinion_id,
+    opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
 )
 from cti_app.domain.investigation import (
@@ -136,6 +139,15 @@ async def test_current_opinion_section_returns_block_pages_bound_to_opinion_cas(
     fixture, state, service = await _fixture()
     finding_ref = uuid4()
     evidence_ref = uuid4()
+    material_evidence_ref = uuid4()
+    material = ImplantMaterialEditorialV1(
+        type=ImplantMaterialType.OTHER,
+        value="synthetic-material-value",
+        role="configuration marker",
+        sample_location=".data/config.bin+0x18",
+        sample_sha256="d" * 64,
+        evidence_observation_id=material_evidence_ref,
+    )
     note = AnalystObservationV1(
         id=uuid4(),
         anchor="review_scope",
@@ -151,24 +163,27 @@ async def test_current_opinion_section_returns_block_pages_bound_to_opinion_cas(
         synthesis_sha256="a" * 64,
         base_publication_artifact_id=uuid4(),
         base_publication_sha256="b" * 64,
-        blocks=opinion_blocks_with_observations(
-            (
-                OpinionBlock(
-                    block_type=OpinionBlockType.KEY_FINDINGS,
-                    text="Canonical key finding text.",
-                    finding_refs=(uuid4(),),
-                    evidence_refs=(uuid4(),),
-                    qualification=OpinionClaimQualification.FACT,
+        blocks=opinion_blocks_with_implant_materials(
+            opinion_blocks_with_observations(
+                (
+                    OpinionBlock(
+                        block_type=OpinionBlockType.KEY_FINDINGS,
+                        text="Canonical key finding text.",
+                        finding_refs=(uuid4(),),
+                        evidence_refs=(uuid4(),),
+                        qualification=OpinionClaimQualification.FACT,
+                    ),
+                    OpinionBlock(
+                        block_type=OpinionBlockType.CLAIM_VERIFICATION,
+                        text="Canonical claim verification text.",
+                        finding_refs=(uuid4(),),
+                        evidence_refs=(uuid4(),),
+                        qualification=OpinionClaimQualification.FACT,
+                    ),
                 ),
-                OpinionBlock(
-                    block_type=OpinionBlockType.CLAIM_VERIFICATION,
-                    text="Canonical claim verification text.",
-                    finding_refs=(uuid4(),),
-                    evidence_refs=(uuid4(),),
-                    qualification=OpinionClaimQualification.FACT,
-                ),
+                (note,),
             ),
-            (note,),
+            (material,),
         ),
         author_id="synthetic-operator",
         id=investigation_opinion_id(fixture.investigation_id),
@@ -186,7 +201,7 @@ async def test_current_opinion_section_returns_block_pages_bound_to_opinion_cas(
     assert first.model_dump(mode="json", by_alias=True)["schema"] == (
         "investigation-operator-context-section.v1"
     )
-    assert first.total == 3
+    assert first.total == 4
     assert first_item["id"] == OpinionBlockType.KEY_FINDINGS.value
     assert first_item["anchor"] is None
     assert first_item["title"] == "Apports de l'enquête"
@@ -230,12 +245,40 @@ async def test_current_opinion_section_returns_block_pages_bound_to_opinion_cas(
         expected_sha256=state.sha256,
         cursor=second.next_cursor,
     )
-    assert third.items[0]["id"] == str(note.id)
-    assert third.items[0]["anchor"] == note.anchor
-    assert third.items[0]["form"] == "analyst_note"
-    assert third.items[0]["text"] == note.text
-    assert third.items[0]["finding_refs"] == [str(finding_ref)]
-    assert third.items[0]["evidence_refs"] == [str(evidence_ref)]
+    material_page = third
+    material_item = material_page.items[0]
+    assert material_item["id"] == "implant_materials:1"
+    assert material_item["form"] == "implant_material"
+    assert material_item["block_type"] == OpinionBlockType.IMPLANT_MATERIALS.value
+    assert material_item["text"] == (
+        "Implant material 1:\n"
+        "Type: other\n"
+        "Value: synthetic-material-value\n"
+        "Role: configuration marker\n"
+        "Sample location: .data/config.bin+0x18\n"
+        f"Sample SHA-256: {'d' * 64}\n"
+        f"Evidence observation: {material_evidence_ref}"
+    )
+    assert material_item["implant_material"] == material.to_payload()
+    assert material_item["qualification"] == OpinionClaimQualification.FACT.value
+    assert material_item["finding_refs"] == []
+    assert material_item["evidence_refs"] == [str(material_evidence_ref)]
+    assert "implant-materials.v1" not in material_item["text"]
+    assert material_item["opinion_sha256"] == opinion.content_sha256
+
+    fourth = await service.get_context_section(
+        "current_opinion",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=material_page.next_cursor,
+    )
+    assert fourth.items[0]["id"] == str(note.id)
+    assert fourth.items[0]["anchor"] == note.anchor
+    assert fourth.items[0]["form"] == "analyst_note"
+    assert fourth.items[0]["text"] == note.text
+    assert fourth.items[0]["finding_refs"] == [str(finding_ref)]
+    assert fourth.items[0]["evidence_refs"] == [str(evidence_ref)]
 
     app = FastAPI()
     app.include_router(router)

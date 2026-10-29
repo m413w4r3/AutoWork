@@ -75,7 +75,9 @@ from cti_app.config import get_settings
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
     OpinionBlockType,
+    OpinionClaimQualification,
     investigation_opinion_id,
+    render_implant_materials_text,
 )
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -2544,14 +2546,12 @@ class ResearchContextBuilder:
         }
         items: list[dict[str, Any]] = []
         for source_block in opinion.blocks:
-            if source_block.block_type is OpinionBlockType.ANALYST_OBSERVATIONS:
+            if source_block.block_type in {
+                OpinionBlockType.ANALYST_OBSERVATIONS,
+                OpinionBlockType.IMPLANT_MATERIALS,
+            }:
                 continue
             block = source_block
-            if source_block.block_type is OpinionBlockType.IMPLANT_MATERIALS:
-                implant_section = opinion.implant_materials_section
-                if implant_section is None:
-                    continue
-                block = implant_section
             block_type = block.block_type.value
             items.append(
                 {
@@ -2567,6 +2567,46 @@ class ResearchContextBuilder:
                     "certainty": block.certainty,
                     "finding_refs": [str(item) for item in block.finding_refs],
                     "evidence_refs": [str(item) for item in block.evidence_refs],
+                }
+            )
+        implant_section = opinion.implant_materials_section
+        if implant_section is not None:
+            items.append(
+                {
+                    **common,
+                    "id": OpinionBlockType.IMPLANT_MATERIALS.value,
+                    "anchor": None,
+                    "title": _OPERATOR_OPINION_BLOCK_TITLES[OpinionBlockType.IMPLANT_MATERIALS],
+                    "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
+                    "form": "body",
+                    "text": implant_section.text,
+                    "text_sha256": hashlib.sha256(implant_section.text.encode("utf-8")).hexdigest(),
+                    "qualification": implant_section.qualification.value,
+                    "certainty": implant_section.certainty,
+                    "finding_refs": [str(item) for item in implant_section.finding_refs],
+                    "evidence_refs": [str(item) for item in implant_section.evidence_refs],
+                }
+            )
+        for index, material in enumerate(opinion.implant_materials, start=1):
+            material_text = render_implant_materials_text((material,))
+            items.append(
+                {
+                    **common,
+                    "id": f"{OpinionBlockType.IMPLANT_MATERIALS.value}:{index}",
+                    "anchor": None,
+                    "title": (
+                        f"{_OPERATOR_OPINION_BLOCK_TITLES[OpinionBlockType.IMPLANT_MATERIALS]} "
+                        f"— élément {index}"
+                    ),
+                    "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
+                    "form": "implant_material",
+                    "text": material_text,
+                    "text_sha256": hashlib.sha256(material_text.encode("utf-8")).hexdigest(),
+                    "qualification": OpinionClaimQualification.FACT.value,
+                    "certainty": 1.0,
+                    "finding_refs": [],
+                    "evidence_refs": [str(material.evidence_observation_id)],
+                    "implant_material": material.to_payload(),
                 }
             )
         for note in opinion.observations:

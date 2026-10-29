@@ -82,7 +82,11 @@ from cti_app.application.publication_secret_guard import (
 )
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
-from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
+from cti_app.domain.analyst_opinion import (
+    OpinionBlockType,
+    investigation_opinion_id,
+    render_implant_materials_text,
+)
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -2181,10 +2185,7 @@ class InvestigationAdvisorTool:
                         "anchor": arguments.get("anchor"),
                     }
                 ]
-                if (
-                    requested_units[0]["form"] == "body"
-                    and requested_units[0]["block_type"] is not None
-                ):
+                if requested_units[0]["form"] == "body":
                     _validate_editorial_unit_targets(
                         requested_units,
                         valid_targets=valid_targets,
@@ -2267,6 +2268,36 @@ class InvestigationAdvisorTool:
                         ) from None
                     if block_type is OpinionBlockType.IMPLANT_MATERIALS:
                         block = getattr(opinion, "implant_materials_section", None)
+                        materials = tuple(getattr(opinion, "implant_materials", ()))
+                        if block is None and not materials:
+                            raise _AdvisorInputValidationError(
+                                "opinion_target_invalid",
+                                valid_targets=valid_targets,
+                            )
+                        review_value = {
+                            "block_type": block_type.value,
+                            "anchor": None,
+                            "text": render_implant_materials_text(
+                                materials,
+                                editorial_text=(
+                                    getattr(block, "text", None) if block is not None else None
+                                ),
+                            ),
+                            "finding_refs": [
+                                str(item) for item in getattr(block, "finding_refs", ())
+                            ],
+                            "evidence_refs": list(
+                                dict.fromkeys(
+                                    [
+                                        *(
+                                            str(item)
+                                            for item in getattr(block, "evidence_refs", ())
+                                        ),
+                                        *(str(item.evidence_observation_id) for item in materials),
+                                    ]
+                                )
+                            ),
+                        }
                     else:
                         block = next(
                             (
@@ -2281,18 +2312,18 @@ class InvestigationAdvisorTool:
                             ),
                             None,
                         )
-                    if block is None:
-                        raise _AdvisorInputValidationError(
-                            "opinion_target_invalid",
-                            valid_targets=valid_targets,
-                        )
-                    review_value = {
-                        "block_type": block.block_type.value,
-                        "anchor": None,
-                        "text": block.text,
-                        "finding_refs": [str(item) for item in block.finding_refs],
-                        "evidence_refs": [str(item) for item in block.evidence_refs],
-                    }
+                        if block is None:
+                            raise _AdvisorInputValidationError(
+                                "opinion_target_invalid",
+                                valid_targets=valid_targets,
+                            )
+                        review_value = {
+                            "block_type": block.block_type.value,
+                            "anchor": None,
+                            "text": block.text,
+                            "finding_refs": [str(item) for item in block.finding_refs],
+                            "evidence_refs": [str(item) for item in block.evidence_refs],
+                        }
                 reviewed_text = review_value["text"]
                 assert isinstance(reviewed_text, str)
                 if _safe_text(reviewed_text, len(reviewed_text) + 1) != reviewed_text:
@@ -2317,8 +2348,21 @@ class InvestigationAdvisorTool:
             reviewed_texts = {
                 str(item.get("text", "")) for item in review_units if isinstance(item, Mapping)
             }
+            reviewed_block_types = {
+                str(item.get("block_type"))
+                for item in review_units
+                if isinstance(item, Mapping) and item.get("block_type") is not None
+            }
             opinion_sections: list[dict[str, Any]] = []
-            all_sections = [*getattr(opinion, "blocks", ())]
+            all_sections = [
+                section
+                for section in getattr(opinion, "blocks", ())
+                if getattr(section, "block_type", None)
+                not in {
+                    OpinionBlockType.ANALYST_OBSERVATIONS,
+                    OpinionBlockType.IMPLANT_MATERIALS,
+                }
+            ]
             implant_section = getattr(opinion, "implant_materials_section", None)
             if implant_section is not None:
                 all_sections.append(implant_section)
@@ -2333,6 +2377,8 @@ class InvestigationAdvisorTool:
                 block_type = getattr(
                     getattr(section, "block_type", None), "value", "implant_materials"
                 )
+                if str(block_type) in reviewed_block_types:
+                    continue
                 opinion_sections.append(
                     {
                         "title": _humanize_advisor_label(str(block_type))
@@ -5061,7 +5107,8 @@ def _opinion_review_targets(opinion: Any) -> tuple[dict[str, Any], ...]:
             }
         )
     implant_section = getattr(opinion, "implant_materials_section", None)
-    if implant_section is not None and not any(
+    implant_materials = tuple(getattr(opinion, "implant_materials", ()))
+    if (implant_section is not None or implant_materials) and not any(
         target["block_type"] == OpinionBlockType.IMPLANT_MATERIALS.value
         and target["form"] == "body"
         for target in targets
