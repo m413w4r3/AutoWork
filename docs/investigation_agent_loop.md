@@ -10,21 +10,17 @@ actions récentes et hypothèses stables. Le contexte est canonique, borné et
 rejette les octets, secrets et URL signées. Les valeurs d’article, de binaire ou
 de fournisseur sont marquées comme données non fiables.
 
-Juste avant la construction du prompt Bridge, le payload complet du contexte est
-parcouru récursivement, y compris les clés, mappings et listes. Pour chaque
-échantillon restreint par TLP RED, une borne TLP dépassée,
-`external_llm_allowed=false` ou une licence non vide, ses SHA-256 et MD5/SHA-1
-connus, ses identifiants d’échantillon et d’association, son nom et son chemin
-sont remplacés par `[restricted sample]`. Les préfixes de hash d’au moins huit
-caractères sont aussi remplacés, avec ou sans libellé de hash et sans tenir
-compte de la casse. Les pivots qui ciblent un hash restreint sont retirés.
-L’UUID de chaque observation concernée reste visible avec le motif
-`sample_disclosure_restricted` et le libellé « content restricted (sample
-policy) ». Une référence sans association restreinte et une référence liée à
-une politique autorisant l’envoi restent inchangées. Un inventaire résolu vide
-indique qu’aucun échantillon n’est associé. Une erreur ou une résolution
-partielle de la politique interrompt la construction du contexte Bridge avec
-une erreur explicite ; elle n’est jamais interprétée comme un inventaire vide.
+Avant la sérialisation Bridge, les observations, résultats d’outils et deltas
+d’échantillons portant une référence d’échantillon sont rapprochés des
+associations de l’enquête et des échantillons canoniques du sujet. TLP RED, une
+borne TLP dépassée, `external_llm_allowed=false` ou une licence non vide masque
+les identifiants d’échantillon et le contenu qui lui est lié. L’UUID de chaque
+observation concernée reste visible avec le motif `sample_disclosure_restricted`
+et le libellé « contenu restreint par la politique d’échantillon ». Une référence
+sans association échantillon et une
+référence liée à une politique autorisant l’envoi restent visibles.
+Lorsqu’une association est non résolue ou ambiguë, seuls les identifiants
+d’échantillon ambigus sont masqués ; le contenu de l’observation reste visible.
 `do_not_submit` ne bloque pas un envoi Bridge.
 
 `BridgeInvestigator` n’a pas de client fournisseur. Son transport de production

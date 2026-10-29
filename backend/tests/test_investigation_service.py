@@ -1027,9 +1027,6 @@ def _compose_fixture_service(fixture: _Fixture) -> Any:
         tool_dependencies=dependencies,
         turn_transport=fixture.bridge_transport,
     )
-    # These service scenarios contain no associated samples; use their fixture
-    # evidence summaries' empty inventory instead of an unavailable DB catalog.
-    composition.service._context_builder._evidence_summaries = fixture.proof_artifacts
     composition.service.post_synthesis = fixture.handoff
     composition.service._context_snapshots = fixture.context_snapshots
     return composition.service

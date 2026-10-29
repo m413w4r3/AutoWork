@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, ClassVar, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from cti_app.application.context_pagination import ContextOmissionManifestEntryV1
 from cti_app.application.investigation_tools import ToolEffect
@@ -291,8 +291,6 @@ class AdvisorGuidanceV1(_StrictContract):
 
 class InvestigationContextV1(_StrictContract):
     SCHEMA: ClassVar[Literal["investigation-context.v1"]] = "investigation-context.v1"
-    _restricted_sample_values: tuple[str, ...] = PrivateAttr(default=())
-    _restricted_sample_hashes: tuple[str, ...] = PrivateAttr(default=())
 
     schema_version: Literal["investigation-context.v1"] = Field(default=SCHEMA, alias="schema")
     view: Literal["full", "delta"]

@@ -106,11 +106,6 @@ class _VirusTotalObservations:
         raise AssertionError("The test only inspects registration and prompt context")
 
 
-class _NoSamplePolicyPort:
-    async def sample_disclosure_inventory(self, _investigation_id):
-        return ()
-
-
 def _uow():
     return SimpleNamespace(
         analyst_investigations=SimpleNamespace(),
@@ -355,7 +350,6 @@ async def test_vt_registry_operator_status_and_prompt_share_the_same_tool_names(
         investigation_id=investigation_id,
         tool_dependencies=dependencies,
     )
-    composition.service._context_builder._evidence_summaries = _NoSamplePolicyPort()
     budget = InvestigationBudget(limits={})
     tool_context = ToolExecutionContext(
         investigation_id=investigation_id,
@@ -473,7 +467,6 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
     uow = _uow()
     uow.detection_candidates = SimpleNamespace()
     composition = runtime.composition_factory.build(uow, investigation_id)
-    composition.service._context_builder._evidence_summaries = _NoSamplePolicyPort()
     assert runtime.ports.optional_tool_ports.confined_analysis_execution is worker.port
     runtime_families = {item.family: item for item in runtime.ports.statuses}
     assert runtime_families["local_filesystem_confinement"].state.value == "unavailable"
@@ -580,7 +573,6 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
     unavailable_composition = unavailable_runtime.composition_factory.build(
         unavailable_uow, investigation_id
     )
-    unavailable_composition.service._context_builder._evidence_summaries = _NoSamplePolicyPort()
     assert set(expected_families) <= set(unavailable_composition.unavailable_tools)
     for name, family in expected_families.items():
         assert unavailable_composition.unavailable_tool_reasons[name] == (
