@@ -40,6 +40,7 @@ from cti_app.application.investigation_persistence import (
     VersionConflictError,
 )
 from cti_app.application.investigation_service import (
+    _VT_PASSIVE_READ_TOOLS,
     _VT_SOURCE_REFS_PARAMETER,
     InvestigationService,
 )
@@ -53,6 +54,7 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
 )
+from cti_app.application.investigation_vt_tools import is_trusted_vt_passive_read_adapter
 from cti_app.application.operator_context_summary import (
     OperatorContextItemPageV1,
 )
@@ -63,6 +65,7 @@ from cti_app.application.research_context_builder import (
 )
 from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.investigation import (
+    BudgetReservationStatus,
     FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -873,6 +876,65 @@ class OperatorToolInvocationService:
         )
         return definitions[0].schema_version if len(definitions) == 1 else schema_version
 
+    @staticmethod
+    def _is_trusted_passive_read(
+        tool_name: str,
+        definition: Any,
+        registered: tuple[Any, Any] | None,
+    ) -> bool:
+        return (
+            definition is not None
+            and tool_name in _VT_PASSIVE_READ_TOOLS
+            and definition.effect is ToolEffect.EXTERNAL_READ
+            and registered is not None
+            and is_trusted_vt_passive_read_adapter(tool_name, registered[1])
+        )
+
+    async def _settle_passive_read_reservation(self, invocation: ToolInvocation) -> ToolInvocation:
+        """Close an uncertain passive GET reservation before a fresh retry."""
+        envelope = await self._envelopes.get(self._investigation_id)
+        reservation = (
+            next(
+                (
+                    item
+                    for item in envelope.budget.reservations
+                    if item.operation_key == invocation.operation_key
+                ),
+                None,
+            )
+            if envelope is not None
+            else None
+        )
+        if reservation is not None and reservation.status is not BudgetReservationStatus.RESERVED:
+            return invocation
+        consumed = dict(invocation.consumed_budget) or dict(invocation.reserved_budget)
+        reviewed = invocation
+        if (
+            invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
+            or dict(invocation.consumed_budget) != consumed
+        ):
+            reviewed = invocation.transition(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                consumed_budget=consumed,
+            )
+            reviewed = await self._invocations.update_if_version(
+                reviewed, expected_version=invocation.version
+            )
+        await self._execution._complete_tool_reservation(
+            investigation_id=self._investigation_id,
+            operation_key=reviewed.operation_key,
+            result=ToolResult(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                budget_consumed=consumed,
+            ),
+            reserved_amounts=reviewed.reserved_budget,
+            uncertain=True,
+            external_effect=True,
+            retryable_external_read=True,
+        )
+        await self._execution.commit_current_uow()
+        return reviewed
+
     async def _framework_pre_submission_proof(
         self, invocation: ToolInvocation
     ) -> tuple[FrameworkPreSubmissionProof | None, str | None]:
@@ -951,6 +1013,12 @@ class OperatorToolInvocationService:
                     reviewed, expected_version=existing.version
                 )
                 await self._execution.commit_current_uow()
+            if existing.status in {
+                ToolInvocationStatus.PENDING,
+                ToolInvocationStatus.RUNNING,
+                ToolInvocationStatus.NEEDS_REVIEW,
+            } and self._is_trusted_passive_read(tool_name, definition, registered):
+                existing = await self._settle_passive_read_reservation(existing)
             return await self._result(existing, state.version, replay=True)
 
         semantic_parameters = _semantic_parameters_fingerprint(
@@ -970,6 +1038,38 @@ class OperatorToolInvocationService:
             ):
                 continue
             proof, proof_rejection = await self._framework_pre_submission_proof(existing)
+            if existing.status is ToolInvocationStatus.RUNNING and self._is_trusted_passive_read(
+                tool_name, definition, registered
+            ):
+                reviewed = existing.transition(ToolInvocationStatus.NEEDS_REVIEW)
+                existing = await self._invocations.update_if_version(
+                    reviewed, expected_version=existing.version
+                )
+                if proof is not None:
+                    resolved = existing.resolve_pre_submission_failure()
+                    existing = await self._invocations.update_if_version(
+                        resolved, expected_version=existing.version
+                    )
+                    failure = ToolResult(
+                        ToolInvocationStatus.FAILED,
+                        error_code=proof.value,
+                        message=(
+                            "Persisted evidence proves the prior invocation did not reach "
+                            "external submission."
+                        ),
+                        framework_pre_submission_proof=proof,
+                    )
+                    await self._execution._complete_tool_reservation(
+                        investigation_id=self._investigation_id,
+                        operation_key=existing.operation_key,
+                        result=failure,
+                        reserved_amounts=existing.reserved_budget,
+                        uncertain=False,
+                    )
+                    await self._execution.commit_current_uow()
+                else:
+                    existing = await self._settle_passive_read_reservation(existing)
+                continue
             if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
                 existing = await self._invocations.update_if_version(
@@ -993,12 +1093,48 @@ class OperatorToolInvocationService:
                 )
                 await self._execution.commit_current_uow()
                 continue
+            if (
+                existing.status is ToolInvocationStatus.NEEDS_REVIEW
+                and self._is_trusted_passive_read(tool_name, definition, registered)
+            ):
+                # A passive VT GET can safely be attempted under a fresh
+                # invocation even if canonical result archival failed; the
+                # coordinator still checks current authority, disclosure and
+                # budget before each physical request.
+                await self._settle_passive_read_reservation(existing)
+                continue
             details: dict[str, Any] = {"existing_invocation_id": str(existing.id)}
             if proof_rejection is not None:
                 details["framework_proof_rejection"] = proof_rejection
             raise OperatorToolInvocationError(
                 "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
             )
+
+        # Settling an orphaned passive-read reservation advances the approved
+        # envelope. Reload it and repeat disclosure checks before reserving the
+        # fresh invocation so dispatch uses the current budget and authority.
+        envelope = await self._envelopes.get(self._investigation_id)
+        advisor_external_allowed = InvestigationService.bridge_disclosure_allowed(
+            snapshot, envelope
+        )
+        if requires_external_disclosure and not await self._policy_envelope_authorized(envelope):
+            self._require_external_disclosure(snapshot, None)
+        if requires_external_disclosure and envelope is None:
+            self._require_external_disclosure(snapshot, envelope)
+        if (
+            requires_external_disclosure
+            and tool_name != "advisor.consult"
+            and not InvestigationService.external_llm_allowed(snapshot, envelope)
+        ):
+            self._require_external_disclosure(snapshot, envelope)
+        if (
+            requires_external_disclosure
+            and tool_name.startswith("vt.")
+            and not InvestigationService.vt_external_disclosure_allowed(
+                snapshot, envelope, tool_name
+            )
+        ):
+            raise OperatorToolInvocationError("external_disclosure_denied", 403)
 
         if state.version != expected_version:
             raise OperatorToolInvocationError("stale_working_state", 409)

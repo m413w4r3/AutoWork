@@ -533,7 +533,7 @@ async def test_retry_after_http_date_and_invalid_json_and_size_limit() -> None:
         httpx.ProxyError("proxy"),
     ],
 )
-async def test_post_handoff_transport_errors_need_review_and_are_not_resent(
+async def test_post_handoff_transport_errors_get_one_bounded_passive_retry(
     transport_error: Exception,
 ) -> None:
     calls = 0
@@ -547,12 +547,40 @@ async def test_post_handoff_transport_errors_need_review_and_are_not_resent(
     try:
         with pytest.raises(VirusTotalExternalEffectNeedsReviewError) as caught:
             await value.file_report(SHA256)
-        with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
-            await value.file_report(SHA256)
+        with authorized_vt_read():
+            with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
+                await value.file_report(SHA256)
     finally:
         await client.aclose()
     assert caught.value.code == "virustotal_external_effect_needs_review"
-    assert calls == 1
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_passive_read_transport_retry_uses_a_fresh_coordinator_claim() -> None:
+    calls = 0
+    body = json.dumps({"data": {"id": SHA256.lower(), "type": "file", "attributes": {}}}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("synthetic timeout")
+        return httpx.Response(200, content=body, request=request)
+
+    value, client = adapter(handler)
+    try:
+        result = await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert result.raw_json == body
+    assert calls == 2
+    assert len(claims) == 2
+    assert [claim.state.value for claim in claims].count("NEEDS_REVIEW") == 1
+    assert [claim.state.value for claim in claims].count("COMPLETED") == 1
+    assert cast(Any, value)._test_external_effect_store.invocation_review_marks == [False]
 
 
 @pytest.mark.asyncio
@@ -600,7 +628,7 @@ async def test_completed_read_replay_resolves_verified_archive_without_a_second_
 
 
 @pytest.mark.asyncio
-async def test_missing_replay_archive_needs_review_without_a_second_send() -> None:
+async def test_missing_replay_archive_is_recovered_by_a_fresh_passive_read() -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -622,11 +650,11 @@ async def test_missing_replay_archive_needs_review_without_a_second_send() -> No
         archive = cast(Any, value)._test_vt_response_archive
         del archive.items[claim.result_ref]
         with authorized_vt_read(invocation_id=second_id):
-            with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
-                await value.file_report(SHA256)
+            recovered = await value.file_report(SHA256)
     finally:
         await client.aclose()
-    assert calls == 1
+    assert recovered.file.lookup_value == SHA256.lower()
+    assert calls == 2
 
 
 @pytest.mark.asyncio

@@ -264,6 +264,7 @@ class FakeStore:
         self.completed_outcomes: list[str | None] = []
         self.completed_result_refs: list[str | None] = []
         self.sealed: list[tuple[str, str]] = []
+        self.invocation_review_updates = 0
         self.reuse_id: UUID | None = uuid4()
         self.reuse_calls: list[ReuseDecision] = []
         self.refused_reuse_reservations: list[str] = []
@@ -372,8 +373,11 @@ class FakeStore:
         self.claim_state = EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
         return True
 
-    async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool:
+    async def needs_review(
+        self, claim_id: UUID, *, reason_code: str, mark_invocation: bool = True
+    ) -> bool:
         self.sealed.append(("needs_review", reason_code))
+        self.invocation_review_updates += int(mark_invocation)
         if self.claim_state is EffectClaimState.CONSUMED:
             self.claim_state = EffectClaimState.NEEDS_REVIEW
         return True
@@ -1073,6 +1077,25 @@ async def test_consumed_claim_replay_is_sealed_needs_review_without_send() -> No
 
 
 @pytest.mark.asyncio
+async def test_passive_read_retry_api_rejects_sample_download_family() -> None:
+    store = FakeStore()
+    transport = FakeTransport()
+    coordinator = _coordinator(store)
+
+    outcome = await coordinator.send_passive_read(
+        _authority(),
+        _prepared(family="vt.download_sample", provider="vt"),
+        transport,
+        defer_invocation_needs_review=False,
+    )
+
+    assert isinstance(outcome, Refused)
+    assert outcome.reason == "passive_read_retry_not_allowed"
+    assert transport.physical_calls == 0
+    assert store.events == []
+
+
+@pytest.mark.asyncio
 async def test_transport_payload_is_carried_in_memory_and_hidden_from_repr() -> None:
     payload = b"model response bytes that stay in memory"
     store = FakeStore()
@@ -1623,7 +1646,10 @@ def test_no_handoff_proofs_are_opaque_bound_and_one_use(
                 captured.append(proof)
                 return False
 
-            async def needs_review(self, claim: UUID, *, reason_code: str) -> bool:
+            async def needs_review(
+                self, claim: UUID, *, reason_code: str, mark_invocation: bool = True
+            ) -> bool:
+                del claim, reason_code, mark_invocation
                 return True
 
         coordinator = ExternalEffectCoordinator(  # type: ignore[arg-type]
