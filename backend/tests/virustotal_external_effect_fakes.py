@@ -74,6 +74,7 @@ class InMemoryExternalEffectClaimStore:
 
     def __init__(self) -> None:
         self.claims: dict[str, ExternalEffectClaim] = {}
+        self.consumed_operation_keys: list[str] = []
         self.gate_nonces: set[UUID] = set()
         self.reuse_count = 0
         self.invocation_review_marks: list[bool] = []
@@ -94,6 +95,7 @@ class InMemoryExternalEffectClaimStore:
         occurrence_digest: str,
     ) -> ConsumeCommitted | ExistingClaim:
         del occurrence_digest
+        self.consumed_operation_keys.append(authority.operation_key)
         existing = self.claims.get(effect_key)
         if existing is not None:
             return ExistingClaim(existing)
