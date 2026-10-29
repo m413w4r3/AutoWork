@@ -23,6 +23,10 @@ OBSERVATION_ID = "56a906d5-943b-4dae-a3c8-867d730e2229"
             "GET",
             f"/api/investigations/{INVESTIGATION_ID}/operator/context/section/budget_remaining",
         ),
+        (
+            "GET",
+            f"/api/investigations/{INVESTIGATION_ID}/operator/context/section/current_opinion",
+        ),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/pivots"),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/experiments"),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/envelope"),

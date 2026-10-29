@@ -129,7 +129,6 @@ _ADDITIONAL_CONTEXT_ITEM_SECTIONS = frozenset(
         "advisor_guidance",
         "unavailable_tools",
         "indicator_inventory",
-        "current_opinion",
         "truncation",
         "source",
     }
@@ -1783,11 +1782,6 @@ def _additional_context_items(
         "advisor_guidance": (context.advisor_guidance,),
         "unavailable_tools": context.unavailable_tools,
         "indicator_inventory": context.indicator_inventory.items,
-        "current_opinion": (
-            (operator_context.current_opinion,)
-            if operator_context.current_opinion is not None
-            else ()
-        ),
         "truncation": (
             {
                 "flags": operator_context.truncation,

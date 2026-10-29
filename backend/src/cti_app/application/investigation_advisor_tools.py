@@ -153,9 +153,11 @@ class _AdvisorInputValidationError(ValueError):
         reason_code: str,
         *,
         measurement_errors: tuple[dict[str, int | str], ...] = (),
+        valid_targets: tuple[dict[str, Any], ...] = (),
     ) -> None:
         self.reason_code = reason_code
         self.measurement_errors = measurement_errors
+        self.valid_targets = valid_targets
         super().__init__(reason_code)
 
 
@@ -390,9 +392,14 @@ class InvestigationAdvisorTool:
                     raise _AdvisorInputValidationError("editorial_units_not_supported")
                 if not isinstance(raw_units, (tuple, list)) or not raw_units:
                     raise _AdvisorInputValidationError("editorial_units_out_of_bounds")
-                _validate_editorial_unit_targets(raw_units)
+                if consultation_type == "draft_text":
+                    _validate_editorial_unit_targets(raw_units)
         except _AdvisorInputValidationError as exc:
-            return await self._input_failure(context, exc.reason_code)
+            return await self._input_failure(
+                context,
+                exc.reason_code,
+                valid_targets=exc.valid_targets,
+            )
         except (KeyError, TypeError, ValueError):
             return await self._input_failure(context, "advisor_arguments_invalid")
         evidence: tuple[EvidenceObservation, ...] = ()
@@ -1071,6 +1078,7 @@ class InvestigationAdvisorTool:
                 exc.reason_code,
                 observation_refs=tuple(item.id for item in evidence),
                 measurement_errors=exc.measurement_errors,
+                valid_targets=exc.valid_targets,
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(
@@ -1831,6 +1839,7 @@ class InvestigationAdvisorTool:
         observation_refs: tuple[UUID, ...] = (),
         measurement_errors: tuple[dict[str, int | str], ...] = (),
         internal_detail: Mapping[str, str | int] | None = None,
+        valid_targets: tuple[dict[str, Any], ...] = (),
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
         message = (
@@ -1847,6 +1856,10 @@ class InvestigationAdvisorTool:
                 else ""
             )
         )
+        if valid_targets:
+            message += " Valid opinion targets: " + "; ".join(
+                _format_opinion_review_target(item) for item in valid_targets
+            )
         result = await self._persist_preflight_failure(
             context,
             consultation_type="unknown",
@@ -1860,6 +1873,7 @@ class InvestigationAdvisorTool:
                 "invocation_stage": "prevalidation",
                 "bridge_turns_consumed": 0,
                 **({"measurement_errors": list(measurement_errors)} if measurement_errors else {}),
+                **({"valid_targets": list(valid_targets)} if valid_targets else {}),
                 **({"input_error_detail": dict(internal_detail)} if internal_detail else {}),
                 "bridge_invocation_id": None,
                 "provider_usage": {"status": "not_submitted"},
@@ -2147,12 +2161,19 @@ class InvestigationAdvisorTool:
             opinion_version = int(raw_version) if raw_version is not None else None
             opinion = await self._opinions.get(opinion_id, version=opinion_version)
             if opinion is None or opinion.investigation_id != investigation_id:
-                raise ValueError("Opinion reference is absent or belongs to another case")
+                raise _AdvisorInputValidationError("opinion_not_found")
+            valid_targets = _opinion_review_targets(opinion)
             raw_units = arguments.get("units")
-            requested_units = (
-                list(raw_units)
-                if isinstance(raw_units, (list, tuple))
-                else [
+            review_all_units = False
+            if isinstance(raw_units, (list, tuple)):
+                _validate_editorial_unit_targets(raw_units, valid_targets=valid_targets)
+                requested_units = list(raw_units)
+            elif (
+                "block_type" in arguments
+                or "anchor" in arguments
+                or arguments.get("form", "body") != "body"
+            ):
+                requested_units = [
                     {
                         "id": "U1",
                         "block_type": arguments.get("block_type"),
@@ -2160,31 +2181,73 @@ class InvestigationAdvisorTool:
                         "anchor": arguments.get("anchor"),
                     }
                 ]
-            )
+                if (
+                    requested_units[0]["form"] == "body"
+                    and requested_units[0]["block_type"] is not None
+                ):
+                    _validate_editorial_unit_targets(
+                        requested_units,
+                        valid_targets=valid_targets,
+                    )
+            else:
+                review_all_units = True
+                requested_units = [
+                    {
+                        "id": f"U{index}",
+                        "block_type": target["block_type"],
+                        "form": "body",
+                        "anchor": None,
+                    }
+                    for index, target in enumerate(
+                        (item for item in valid_targets if item["form"] == "body"),
+                        start=1,
+                    )
+                ]
+                if not requested_units:
+                    raise _AdvisorInputValidationError(
+                        "opinion_review_targets_unavailable",
+                        valid_targets=valid_targets,
+                    )
             review_units: list[dict[str, Any]] = []
             for requested in requested_units:
-                assert isinstance(requested, Mapping)
-                unit_id = str(requested["id"])
+                if not isinstance(requested, Mapping):
+                    raise _AdvisorInputValidationError(
+                        "editorial_unit_invalid",
+                        valid_targets=valid_targets,
+                    )
+                unit_id = str(requested.get("id", ""))
                 form = str(requested.get("form", "body"))
                 anchor = requested.get("anchor")
                 requested_type = requested.get("block_type")
                 if form not in {"body", "analyst_note"}:
-                    raise ValueError("Review form is invalid")
+                    raise _AdvisorInputValidationError(
+                        "editorial_unit_target_invalid",
+                        valid_targets=valid_targets,
+                    )
                 if form == "analyst_note":
                     if not isinstance(anchor, str):
-                        raise ValueError("Analyst note review requires an anchor")
+                        raise _AdvisorInputValidationError(
+                            "editorial_unit_target_invalid",
+                            valid_targets=valid_targets,
+                        )
                     note = next(
                         (item for item in opinion.observations if item.anchor == anchor), None
                     )
                     if note is None:
-                        raise ValueError("Anchored analyst note does not exist")
+                        raise _AdvisorInputValidationError(
+                            "opinion_target_invalid",
+                            valid_targets=valid_targets,
+                        )
                     block_type = (
                         note.bridge_block_type.value
                         if note.bridge_block_type is not None
                         else str(requested_type or OpinionBlockType.ANALYST_OBSERVATIONS.value)
                     )
                     if requested_type is not None and str(requested_type) != block_type:
-                        raise ValueError("Analyst note block type does not match its anchor")
+                        raise _AdvisorInputValidationError(
+                            "opinion_target_invalid",
+                            valid_targets=valid_targets,
+                        )
                     review_value = {
                         "block_type": block_type,
                         "anchor": note.anchor,
@@ -2193,7 +2256,15 @@ class InvestigationAdvisorTool:
                         "evidence_refs": [str(item) for item in note.evidence_refs],
                     }
                 else:
-                    block_type = OpinionBlockType(str(requested_type)) if requested_type else None
+                    try:
+                        block_type = (
+                            OpinionBlockType(str(requested_type)) if requested_type else None
+                        )
+                    except ValueError:
+                        raise _AdvisorInputValidationError(
+                            "opinion_target_invalid",
+                            valid_targets=valid_targets,
+                        ) from None
                     if block_type is OpinionBlockType.IMPLANT_MATERIALS:
                         block = getattr(opinion, "implant_materials_section", None)
                     else:
@@ -2211,7 +2282,10 @@ class InvestigationAdvisorTool:
                             None,
                         )
                     if block is None:
-                        raise ValueError("Opinion block does not exist")
+                        raise _AdvisorInputValidationError(
+                            "opinion_target_invalid",
+                            valid_targets=valid_targets,
+                        )
                     review_value = {
                         "block_type": block.block_type.value,
                         "anchor": None,
@@ -2236,7 +2310,7 @@ class InvestigationAdvisorTool:
                         ).hexdigest(),
                     }
                 )
-            if isinstance(raw_units, (list, tuple)):
+            if isinstance(raw_units, (list, tuple)) or review_all_units:
                 base["units"] = review_units
             elif len(review_units) == 1:
                 base["review_text"] = dict(review_units[0])
@@ -4897,12 +4971,28 @@ def _critical_prompt_data_was_truncated(
     return bool(truncation.get("brief")) or any(truncation.get(item) for item in required)
 
 
-def _validate_editorial_unit_targets(units: list[Any] | tuple[Any, ...]) -> None:
+def _validate_editorial_unit_targets(
+    units: list[Any] | tuple[Any, ...],
+    *,
+    valid_targets: tuple[dict[str, Any], ...] | None = None,
+) -> None:
     seen: set[str] = set()
     seen_targets: set[tuple[Any, Any, Any]] = set()
+    valid_unit_targets = (
+        {
+            (target["block_type"], target["form"], target["anchor"])
+            for target in valid_targets
+            if target.get("request_shape") == "units"
+        }
+        if valid_targets is not None
+        else None
+    )
     for unit in units:
         if not isinstance(unit, Mapping):
-            raise _AdvisorInputValidationError("editorial_unit_invalid")
+            raise _AdvisorInputValidationError(
+                "editorial_unit_invalid",
+                valid_targets=valid_targets or (),
+            )
         unit_id = unit.get("id")
         form = unit.get("form")
         anchor = unit.get("anchor")
@@ -4927,12 +5017,92 @@ def _validate_editorial_unit_targets(units: list[Any] | tuple[Any, ...]) -> None
                 )
             )
         ):
-            raise _AdvisorInputValidationError("editorial_unit_target_invalid")
+            raise _AdvisorInputValidationError(
+                "editorial_unit_target_invalid",
+                valid_targets=valid_targets or (),
+            )
         target = (block_type, form, anchor)
+        if valid_unit_targets is not None and target not in valid_unit_targets:
+            raise _AdvisorInputValidationError(
+                "editorial_unit_target_invalid",
+                valid_targets=valid_targets or (),
+            )
         if target in seen_targets:
-            raise _AdvisorInputValidationError("editorial_unit_target_duplicate")
+            raise _AdvisorInputValidationError(
+                "editorial_unit_target_duplicate",
+                valid_targets=valid_targets or (),
+            )
         seen.add(unit_id)
         seen_targets.add(target)
+
+
+def _opinion_review_targets(opinion: Any) -> tuple[dict[str, Any], ...]:
+    targets: list[dict[str, Any]] = []
+    for source_block in getattr(opinion, "blocks", ()):
+        block_type = getattr(source_block, "block_type", None)
+        if block_type in {
+            OpinionBlockType.ANALYST_OBSERVATIONS,
+            OpinionBlockType.IMPLANT_MATERIALS,
+        }:
+            if block_type is OpinionBlockType.ANALYST_OBSERVATIONS:
+                continue
+            block = getattr(opinion, "implant_materials_section", None)
+            if block is None:
+                continue
+            block_type = getattr(block, "block_type", block_type)
+        title = getattr(block_type, "value", str(block_type))
+        targets.append(
+            {
+                "block_type": title,
+                "form": "body",
+                "anchor": None,
+                "title": title,
+                "request_shape": "units",
+            }
+        )
+    implant_section = getattr(opinion, "implant_materials_section", None)
+    if implant_section is not None and not any(
+        target["block_type"] == OpinionBlockType.IMPLANT_MATERIALS.value
+        and target["form"] == "body"
+        for target in targets
+    ):
+        targets.append(
+            {
+                "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
+                "form": "body",
+                "anchor": None,
+                "title": OpinionBlockType.IMPLANT_MATERIALS.value,
+                "request_shape": "units",
+            }
+        )
+    for note in getattr(opinion, "observations", ()):
+        note_block_type = getattr(note, "bridge_block_type", None)
+        targets.append(
+            {
+                "block_type": (
+                    getattr(note_block_type, "value", None) if note_block_type is not None else None
+                ),
+                "form": "analyst_note",
+                "anchor": getattr(note, "anchor", None),
+                "title": (
+                    getattr(note_block_type, "value", "analyst_observations")
+                    if note_block_type is not None
+                    else "analyst_observations"
+                ),
+                "request_shape": "units" if note_block_type is not None else "top_level",
+            }
+        )
+    return tuple(targets)
+
+
+def _format_opinion_review_target(target: Mapping[str, Any]) -> str:
+    block_type = target.get("block_type") or "untyped analyst note"
+    anchor = target.get("anchor")
+    anchor_text = "null" if anchor is None else str(anchor)
+    target_text = f"{block_type}/{target.get('form')} (anchor={anchor_text})"
+    if target.get("request_shape") == "top_level":
+        return target_text + " [top-level selectors]"
+    return target_text
 
 
 def _redact_advisor_payload(

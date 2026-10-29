@@ -6718,7 +6718,7 @@ async def test_draft_text_preserves_bridge_output_above_legacy_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_text_batches_selected_opinion_units_with_individual_hashes() -> None:
+async def test_review_text_without_targets_reviews_all_canonical_opinion_units() -> None:
     investigation_id = uuid4()
     opinion_id = uuid4()
     opinion_sha = "b" * 64
@@ -6774,30 +6774,12 @@ async def test_review_text_batches_selected_opinion_units_with_individual_hashes
         return opinion if version in (None, 27) else None
 
     tool._opinions.get = get_opinion
-    units = [
-        {
-            "id": f"U{index}",
-            "block_type": block_type.value,
-            "form": "body",
-            "anchor": None,
-        }
-        for index, block_type in enumerate(block_types, start=1)
-    ]
-    units.append(
-        {
-            "id": "U8",
-            "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
-            "form": "body",
-            "anchor": None,
-        }
-    )
-
     result = await tool.execute(
         {
             "consultation_type": "review_text",
+            "question": "Review the whole current opinion and identify specific gaps.",
             "opinion_id": str(opinion_id),
             "opinion_version": 27,
-            "units": units,
         },
         make_context(investigation_id, key="operator:advisor:review-text-batch"),
     )
@@ -6814,6 +6796,107 @@ async def test_review_text_batches_selected_opinion_units_with_individual_hashes
     implant_unit = next(item for item in final_payload["units"] if item["unit_id"] == "U8")
     assert implant_unit["block_type"] == "Matériel d\u2019implant"
     assert implant_unit["text"] == implant_text
+    assert '"consultation_type"' not in transport.calls[0]["prompt"]
+
+    targeted = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": 27,
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "form": "body",
+                    "anchor": None,
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:review-text-targeted"),
+    )
+    assert targeted.status is ToolInvocationStatus.SUCCEEDED
+    assert len(transport.calls) == 2
+    targeted_payload = typed_prompt_payload(transport.calls[1]["prompt"])
+    assert len(targeted_payload["units"]) == 1
+    assert targeted_payload["units"][0]["text"] == blocks[0].text
+
+
+@pytest.mark.asyncio
+async def test_review_text_invalid_target_lists_valid_units_before_transport() -> None:
+    investigation_id = uuid4()
+    opinion_id = uuid4()
+    opinion = SimpleNamespace(
+        id=opinion_id,
+        investigation_id=investigation_id,
+        version=3,
+        content_sha256="c" * 64,
+        blocks=(
+            SimpleNamespace(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text="The sole canonical body block.",
+                finding_refs=(),
+                evidence_refs=(),
+            ),
+        ),
+        implant_materials_section=None,
+        observations=(),
+    )
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+
+    async def get_opinion(_opinion_id, *, version=None):
+        return opinion if version in (None, opinion.version) else None
+
+    tool._opinions.get = get_opinion
+    result = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": opinion.version,
+            "block_type": OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS.value,
+        },
+        make_context(investigation_id, key="operator:advisor:invalid-opinion-target"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "editorial_unit_target_invalid"
+    assert result.output["valid_targets"] == (
+        {
+            "block_type": OpinionBlockType.KEY_FINDINGS.value,
+            "form": "body",
+            "anchor": None,
+            "title": OpinionBlockType.KEY_FINDINGS.value,
+            "request_shape": "units",
+        },
+    )
+    assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["provider_usage"] == {"status": "not_submitted"}
+    assert "key_findings" in result.message
+    assert transport.calls == []
+
+    invalid_unit = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": opinion.version,
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "form": "body",
+                    "anchor": "S2P2.1",
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:invalid-unit-anchor"),
+    )
+    assert invalid_unit.status is ToolInvocationStatus.FAILED
+    assert invalid_unit.output["input_error_code"] == "editorial_unit_target_invalid"
+    assert invalid_unit.output["valid_targets"] == result.output["valid_targets"]
+    assert invalid_unit.output["failure_stage"] == "pre_transport_validation"
+    assert transport.calls == []
 
 
 @pytest.mark.asyncio

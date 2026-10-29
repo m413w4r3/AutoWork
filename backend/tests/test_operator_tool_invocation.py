@@ -61,6 +61,17 @@ from cti_app.application.operator_tool_invocation import (
 )
 from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
 from cti_app.config import Settings
+from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
+    AnalystOpinionV1,
+    OpinionBlock,
+    OpinionBlockType,
+    OpinionClaimQualification,
+    investigation_opinion_id,
+    opinion_blocks_with_observations,
+)
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
@@ -118,6 +129,153 @@ async def _fixture(
     )
     state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
     return fixture, state, _service(fixture)
+
+
+@pytest.mark.asyncio
+async def test_current_opinion_section_returns_block_pages_bound_to_opinion_cas() -> None:
+    fixture, state, service = await _fixture()
+    finding_ref = uuid4()
+    evidence_ref = uuid4()
+    note = AnalystObservationV1(
+        id=uuid4(),
+        anchor="review_scope",
+        text="An anchored analyst note.",
+        state=AnalystObservationState.INFERRED,
+        relation=AnalystObservationRelation.QUALIFIES,
+        finding_refs=(finding_ref,),
+        evidence_refs=(evidence_ref,),
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=fixture.investigation_id,
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256="b" * 64,
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    block_type=OpinionBlockType.KEY_FINDINGS,
+                    text="Canonical key finding text.",
+                    finding_refs=(uuid4(),),
+                    evidence_refs=(uuid4(),),
+                    qualification=OpinionClaimQualification.FACT,
+                ),
+                OpinionBlock(
+                    block_type=OpinionBlockType.CLAIM_VERIFICATION,
+                    text="Canonical claim verification text.",
+                    finding_refs=(uuid4(),),
+                    evidence_refs=(uuid4(),),
+                    qualification=OpinionClaimQualification.FACT,
+                ),
+            ),
+            (note,),
+        ),
+        author_id="synthetic-operator",
+        id=investigation_opinion_id(fixture.investigation_id),
+    )
+    await fixture.opinions.append_version(opinion, expected_version=0)
+
+    first = await service.get_context_section(
+        "current_opinion",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+
+    first_item = first.items[0]
+    assert first.model_dump(mode="json", by_alias=True)["schema"] == (
+        "investigation-operator-context-section.v1"
+    )
+    assert first.total == 3
+    assert first_item["id"] == OpinionBlockType.KEY_FINDINGS.value
+    assert first_item["anchor"] is None
+    assert first_item["title"] == "Apports de l'enquête"
+    assert first_item["text"] == "Canonical key finding text."
+    assert first_item["qualification"] == OpinionClaimQualification.FACT.value
+    assert first_item["finding_refs"] == [str(opinion.blocks[0].finding_refs[0])]
+    assert first_item["evidence_refs"] == [str(opinion.blocks[0].evidence_refs[0])]
+    assert first_item["opinion_version"] == opinion.version
+    assert first_item["opinion_sha256"] == opinion.content_sha256
+    assert first.next_cursor is not None
+    assert verify_page_sha256(
+        claimed_sha256=first.page_sha256,
+        section="current_opinion",
+        investigation_id=fixture.investigation_id,
+        items=first.items,
+        previous_page_sha256="0" * 64,
+        context_sha256=first.context_sha256,
+        cursor=first.cursor,
+        pivot=first.pivot,
+        descending=first.descending,
+        limit=first.limit,
+        total=first.total,
+        has_more=first.has_more,
+        omission_manifest=first.omission_manifest,
+        next_cursor=first.next_cursor,
+    )
+
+    second = await service.get_context_section(
+        "current_opinion",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=first.next_cursor,
+    )
+    assert second.items[0]["id"] == OpinionBlockType.CLAIM_VERIFICATION.value
+    assert second.context_sha256 == first.context_sha256
+    third = await service.get_context_section(
+        "current_opinion",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=second.next_cursor,
+    )
+    assert third.items[0]["id"] == str(note.id)
+    assert third.items[0]["anchor"] == note.anchor
+    assert third.items[0]["form"] == "analyst_note"
+    assert third.items[0]["text"] == note.text
+    assert third.items[0]["finding_refs"] == [str(finding_ref)]
+    assert third.items[0]["evidence_refs"] == [str(evidence_ref)]
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = lambda: _Uow(fixture)
+    app.state.investigation_composition_factory = _CompositionFactory(service, fixture=fixture)
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator/context/section/current_opinion",
+            params={
+                "limit": 1,
+                "expected_version": state.version,
+                "expected_sha256": state.sha256,
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["schema"] == "investigation-operator-context-section.v1"
+    assert response.json()["items"][0]["text"] == "Canonical key finding text."
+
+    revised = replace(
+        opinion,
+        version=2,
+        blocks=(
+            replace(opinion.blocks[0], text="Revised canonical text."),
+            opinion.blocks[1],
+        ),
+        content_sha256="",
+    )
+    await fixture.opinions.append_version(revised, expected_version=1)
+    with pytest.raises(OperatorToolInvocationError) as stale_cursor:
+        await service.get_context_section(
+            "current_opinion",
+            limit=1,
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+            cursor=first.next_cursor,
+        )
+    assert stale_cursor.value.code == "operator_context_cursor_stale"
 
 
 @pytest.mark.asyncio
