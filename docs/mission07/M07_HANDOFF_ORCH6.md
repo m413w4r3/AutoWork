@@ -1,3 +1,5 @@
+> **Remplacé pour l'état courant par `M07_HANDOFF_ORCH7.md` et `M07_ORCH6_REPORT.md` (2026-10-30).**
+
 # Mission 07 — handoff à l'orchestrateur #6 (Sonnet 5.5 medium)
 
 Rédigé le 2026-10-29 par l'orchestrateur #5. **Fait autorité sur `M07_HANDOFF.md`** (historique) pour l'état courant.
