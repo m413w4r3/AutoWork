@@ -20,6 +20,7 @@ from cti_app.application.typst_rendering import (
     TypstMediaRef,
     TypstRenderSource,
     TypstTemplateBundle,
+    _breakable_typst_display_text,
     instrument_publication_targets,
     project_publication_to_typst_model,
 )
@@ -166,9 +167,15 @@ class EditionTypstRenderer:
                 item["article_title_target_id"] = article_title_target_id
             publications.append(item)
 
+        normalized_document_label = document_label.strip()
         render_data = {
             "schema_version": _EDITION_RENDER_DATA_SCHEMA_VERSION,
-            "document_label": document_label.strip(),
+            "document_label": normalized_document_label,
+            "document_label_display": _breakable_typst_display_text(
+                normalized_document_label,
+                interval=8,
+                break_at_technical_separators=True,
+            ),
             "document_header": f"Bulletin de veille CTI — édition v{edition['bulletin_number']}",
             "edition": edition,
             "publications": publications,

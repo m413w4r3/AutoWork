@@ -294,7 +294,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert data["overview"] == {"status_label": "Publication", "source_count": 1}
     assert data["brand_logo_available"] is False
     assert "classification_label" not in data
-    references, synthesis = data["content_sections"]
+    synthesis, references = data["content_sections"]
     assert references["type"] == "references"
     assert len(references["entries"]) == 1
     assert references["entries"][0]["source_urls"] == ["https://example.test/1"]
@@ -373,6 +373,13 @@ def test_opinion_github_tokens_and_typed_rc4_material_reach_publication_render_d
                     f"L'implant contient les jetons {ghp_token} et {fine_grained_token} "
                     "pour son canal C2.",
                 ),
+                OpinionBlock(
+                    OpinionBlockType.NETWORK_AND_INFRASTRUCTURE,
+                    "Run `token`.",
+                    finding_refs=(uuid4(),),
+                    evidence_refs=(observation_id,),
+                    certainty=0.9,
+                ),
             ),
             materials,
         ),
@@ -384,10 +391,22 @@ def test_opinion_github_tokens_and_typed_rc4_material_reach_publication_render_d
     data = json.loads(rendered.render_data_bytes)
     sections = {item["type"]: item for item in data["content_sections"]}
     opinion_text = sections["analyst_opinion"]["blocks"][0]["text"]
+    code_block = next(
+        item for item in sections["analyst_opinion"]["blocks"] if item["text"] == "Run `token`."
+    )
     material_items = sections["technical_materials"]["items"]
 
     assert ghp_token in opinion_text
     assert fine_grained_token in opinion_text
+    assert code_block["text_spans"] == [
+        {"text": "Run ", "technical": False},
+        {"text": "token", "break_chunks": [], "technical": True},
+        {"text": ".", "technical": False},
+    ]
+    assert code_block["qualification_label"] == "Fait étayé"
+    assert code_block["finding_refs"][0]["label"] == "[F1]"
+    assert code_block["evidence_refs"][0]["label"] == "[E1]"
+    assert "certainty_percent" not in code_block
     assert material_items[0]["value"] == rc4_key
     assert material_items[0]["type_label"] == "Clé RC4"
     assert material_items[0]["role"] == "Déchiffrement des données de configuration"
@@ -1038,9 +1057,9 @@ def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(
     paragraphs = [block["text"] for block in synthesis["blocks"] if block["type"] == "paragraph"]
 
     assert [section["type"] for section in data["content_sections"]] == [
+        "synthesis",
         "references",
         "chronology",
-        "synthesis",
         "ioc",
         "technical_annex",
     ]
