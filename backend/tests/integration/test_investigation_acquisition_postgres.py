@@ -12,6 +12,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.blobs import BlobCatalogService
@@ -70,6 +71,7 @@ from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Sample, SampleState, Subject
+from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
@@ -94,6 +96,9 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.repositories.investigation import (
+    SqlAlchemyInvestigationEnvelopeRepository,
+)
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.confined_worker_harness import build_confined_worker_harness
@@ -1114,12 +1119,32 @@ async def _make_investigation_for_subject(
 async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres(
     migrated_postgres_url: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
     uow_factory = cast(UnitOfWorkFactory, lambda: SqlAlchemyUnitOfWork(session_factory))
     try:
         investigation = await _make_investigation(session_factory)
+        envelope_service = InvestigationEnvelopeService(uow_factory)
+        approved = await envelope_service.approve(
+            InvestigationEnvelopeProposal(
+                investigation_id=investigation.id,
+                allowed_providers=("vt",),
+                budget=InvestigationBudget(
+                    limits={BudgetDimension.VT_UNITS: 2, BudgetDimension.DOWNLOADS: 1}
+                ),
+                acquire_hits_allowed=True,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.CLEAR,
+                    do_not_submit=False,
+                    external_llm_allowed=False,
+                ),
+            ),
+            actor_id="analyst:integration",
+            reason="Approve bounded local archive extraction for the test.",
+            correlation_id=f"archive-member-g2:{investigation.id}",
+        )
         catalog = BlobCatalogService(
             FilesystemBlobStore(tmp_path / "archive-member-blobs"), uow_factory
         )
@@ -1147,7 +1172,7 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
                 tlp=TLP.AMBER,
                 do_not_submit=True,
                 external_llm_allowed=False,
-                origin_kind=SampleOrigin.MANUAL,
+                origin_kind=EntitySampleOrigin.MANUAL,
                 state=SampleState.QUARANTINED,
                 source_service="operator_import",
                 source_object_id=parent_sha256,
@@ -1190,10 +1215,10 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
                 origin="operator_import",
                 acquired_at=datetime.now(UTC),
                 license_restriction=None,
-                tlp=TLP.CLEAR,
+                tlp=TLP.RED,
                 do_not_submit=False,
                 external_llm_allowed=True,
-                origin_kind=SampleOrigin.MANUAL,
+                origin_kind=EntitySampleOrigin.MANUAL,
                 state=SampleState.QUARANTINED,
                 source_service="operator_import",
                 source_object_id=member_sha256,
@@ -1231,7 +1256,7 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         assert "member_path" in definition.input_schema["properties"]
         context = ToolExecutionContext(
             investigation_id=investigation.id,
-            envelope=None,
+            envelope=approved,
             budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1}),
             idempotency_key="archive-member-postgres-first",
             available_capabilities=frozenset({ARCHIVE_EXTRACT_MEMBER_CAPABILITY}),
@@ -1291,6 +1316,7 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         ]
         assert len(derivations) == 1
         assert derivations[0].payload["parent_sha256"] == parent_sha256
+        assert derivations[0].tlp is TLP.RED
         assert derivations[0].payload["member_path"] == "bin/loader.dll"
         assert derivations[0].actor_id == "analyst:integration"
         assert derivations[0].payload["reason"] == arguments["reason"]
@@ -1319,13 +1345,25 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
                 tlp=TLP.AMBER,
                 do_not_submit=False,
                 external_llm_allowed=True,
-                origin_kind=SampleOrigin.MANUAL,
+                origin_kind=EntitySampleOrigin.MANUAL,
                 state=SampleState.QUARANTINED,
                 source_service="operator_import",
                 source_object_id=foreign_member_sha256,
                 expected_hash=foreign_member_sha256,
             )
             await uow.samples.add(foreign_sample)
+            foreign_association = SampleAssociation(
+                id=sample_association_id(foreign_investigation.id, foreign_member_sha256),
+                investigation_id=foreign_investigation.id,
+                sample_sha256=foreign_member_sha256,
+                origin=SampleOrigin.RELATIONSHIP,
+            )
+            await uow.sample_associations.append_version(foreign_association, expected_version=0)
+            await uow.sample_associations.link_sample(
+                foreign_association.id,
+                foreign_sample.id,
+                expected_sha256=foreign_member_sha256,
+            )
             await uow.commit()
         foreign_worker = _ArchiveMemberIntegrationWorker(catalog, foreign_member)
         foreign_extractor = ArchiveExtractMemberAdapter(
@@ -1368,5 +1406,166 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         )
         assert resolved_foreign.sample_id == foreign_derived_id
         assert resolved_foreign.sha256 == foreign_member_sha256
+
+        foreign_worker_calls = len(foreign_worker.requests)
+        cross_investigation_result = await RegistryToolDispatcher(foreign_registry).dispatch(
+            replace(
+                context,
+                envelope=None,
+                idempotency_key="archive-member-postgres-cross-investigation",
+            ),
+            tool_name="archive.extract_member",
+            schema_version="1",
+            arguments={
+                **arguments,
+                "association_id": str(foreign_association.id),
+                "member_path": "bin/cross-investigation.dll",
+                "reason": "Refuse an association owned by investigation B.",
+            },
+            purpose="Verify archive association scope.",
+            operation_key="archive-member-postgres:cross-investigation",
+        )
+        assert cross_investigation_result.status is ToolInvocationStatus.FAILED
+        assert (
+            cross_investigation_result.error_code
+            == "archive_extract_member_association_not_in_investigation"
+        )
+        assert len(foreign_worker.requests) == foreign_worker_calls
+
+        race_member = b"member whose commit is serialized with G2 revocation"
+        race_worker = _ArchiveMemberIntegrationWorker(catalog, race_member)
+        race_extractor = ArchiveExtractMemberAdapter(
+            hits=hits,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            execution=cast(Any, race_worker),
+            timeout_seconds=20,
+            max_output_bytes=4096,
+        )
+        race_registry = InMemoryToolRegistry()
+        register_acquisition_tools(
+            race_registry,
+            hits=hits,
+            qualifications=SampleQualificationService(uow_factory),
+            archive_extractor=race_extractor,
+        )
+        lock_acquired = asyncio.Event()
+        release_archive_commit = asyncio.Event()
+        revoke_save_attempted = asyncio.Event()
+        archive_backend_pid: int | None = None
+        revoke_backend_pid: int | None = None
+        original_get_for_update = SqlAlchemyInvestigationEnvelopeRepository.get_for_update
+        original_save_if_version = SqlAlchemyInvestigationEnvelopeRepository.save_if_version
+
+        async def pause_after_envelope_lock(
+            repository: SqlAlchemyInvestigationEnvelopeRepository,
+            investigation_id: UUID,
+        ) -> Any:
+            nonlocal archive_backend_pid
+            result = await original_get_for_update(repository, investigation_id)
+            task = asyncio.current_task()
+            if (
+                investigation_id == investigation.id
+                and task is not None
+                and task.get_name() == "archive-extract-awaiting-revoke"
+            ):
+                archive_backend_pid = await repository._session.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                lock_acquired.set()
+                await release_archive_commit.wait()
+            return result
+
+        async def observe_revoke_save(
+            repository: SqlAlchemyInvestigationEnvelopeRepository,
+            envelope: Any,
+            *,
+            expected_version: int | None,
+        ) -> Any:
+            nonlocal revoke_backend_pid
+            if envelope.investigation_id == investigation.id:
+                revoke_backend_pid = await repository._session.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                revoke_save_attempted.set()
+            return await original_save_if_version(
+                repository, envelope, expected_version=expected_version
+            )
+
+        monkeypatch.setattr(
+            SqlAlchemyInvestigationEnvelopeRepository,
+            "get_for_update",
+            pause_after_envelope_lock,
+        )
+        monkeypatch.setattr(
+            SqlAlchemyInvestigationEnvelopeRepository,
+            "save_if_version",
+            observe_revoke_save,
+        )
+        race_context = replace(
+            context,
+            idempotency_key="archive-member-postgres-revoke-race",
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1}),
+        )
+        race_task = asyncio.create_task(
+            RegistryToolDispatcher(race_registry).dispatch(
+                race_context,
+                tool_name="archive.extract_member",
+                schema_version="1",
+                arguments={
+                    **arguments,
+                    "member_path": "bin/revoke-race.dll",
+                    "reason": "Serialize this commit with a concurrent envelope revocation.",
+                },
+                purpose="Exercise the PostgreSQL envelope row lock.",
+                operation_key="archive-member-postgres:revoke-race",
+            ),
+            name="archive-extract-awaiting-revoke",
+        )
+        revoke_task: asyncio.Task[Any] | None = None
+        try:
+            await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+            revoke_task = asyncio.create_task(
+                envelope_service.revoke(
+                    investigation.id,
+                    expected_version=approved.version,
+                    actor_id="analyst:integration-revoker",
+                    reason="Revoke while archive derivation is committing.",
+                    correlation_id=f"archive-member-revoke:{investigation.id}",
+                )
+            )
+            await asyncio.wait_for(revoke_save_attempted.wait(), timeout=5)
+            assert archive_backend_pid is not None
+            assert revoke_backend_pid is not None
+            loop = asyncio.get_running_loop()
+            lock_wait_deadline = loop.time() + 5
+            async with session_factory() as observer:
+                blocking_pids: list[int] = []
+                while (
+                    archive_backend_pid not in blocking_pids
+                    and loop.time() < lock_wait_deadline
+                    and not revoke_task.done()
+                ):
+                    blocking_pids = list(
+                        await observer.scalar(
+                            text("SELECT pg_blocking_pids(:pid)"),
+                            {"pid": revoke_backend_pid},
+                        )
+                        or []
+                    )
+                    if archive_backend_pid not in blocking_pids:
+                        await asyncio.sleep(0.01)
+            assert archive_backend_pid in blocking_pids
+            assert not revoke_task.done()
+        finally:
+            release_archive_commit.set()
+            pending_tasks = [race_task]
+            if revoke_task is not None:
+                pending_tasks.append(revoke_task)
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        assert race_task.result().status is ToolInvocationStatus.SUCCEEDED
+        assert revoke_task is not None
+        assert revoke_task.result().version == approved.version + 1
     finally:
         await engine.dispose()

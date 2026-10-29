@@ -21,7 +21,8 @@ from cti_app.domain.local_analysis import (
 
 CONFINED_ANALYSIS_JOB_KIND = "sample.confined_analysis.v1"
 CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v2"
-ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX = "confined-analysis-archive-member"
+ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX = "archive-member"
+_ARCHIVE_MEMBER_TRANSFER_BUCKET_MAX_LENGTH = 63
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -416,7 +417,12 @@ def validate_archive_tool_request(
 def archive_member_transfer_bucket(transfer_nonce: str) -> str:
     if not _SHA256.fullmatch(transfer_nonce):
         raise ValueError("archive transfer nonce is invalid")
-    return f"{ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX}-{transfer_nonce}"
+    # Logical blob buckets are limited to 63 characters. The nonce is already a
+    # SHA-256 digest, so retaining 192 bits keeps transfer buckets collision-resistant.
+    nonce_chars = (
+        _ARCHIVE_MEMBER_TRANSFER_BUCKET_MAX_LENGTH - len(ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX) - 1
+    )
+    return f"{ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX}-{transfer_nonce[:nonce_chars]}"
 
 
 def _valid_archive_member_path(value: str) -> bool:

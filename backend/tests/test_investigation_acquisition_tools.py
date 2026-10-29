@@ -5,11 +5,13 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4, uuid5
 
 import pytest
 
+from cti_app.application import investigation_acquisition_tools as acquisition_tools
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisFamilyStatus,
     ConfinedAnalysisRequest,
@@ -45,15 +47,17 @@ from cti_app.application.investigation_tools import (
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.virustotal import VirusTotalHttpError
+from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.classification import TLP
-from cti_app.domain.entities import Sample
+from cti_app.domain.entities import Sample, SampleState
+from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     EvidenceKind,
+    InvestigationBudget,
     SampleAssociation,
     SampleOrigin,
-    SampleState,
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_state import StopReason
@@ -153,6 +157,27 @@ class _ArchiveMemberWorker:
             request.sha256,
             payload=payload,
         )
+
+
+class _RaisingArchiveMemberWorker:
+    async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
+        del request
+        raise RuntimeError("synthetic worker failure")
+
+
+def test_archive_member_transfer_bucket_fits_blob_address_limit() -> None:
+    bucket = archive_member_transfer_bucket("a" * 64)
+
+    assert len(bucket) <= 63
+    assert (
+        BlobDescriptor(
+            sha256="b" * 64,
+            size=1,
+            mime_type="application/octet-stream",
+            logical_bucket=bucket,
+        ).logical_bucket
+        == bucket
+    )
 
 
 class _FakeQuarantineArtifactStore:
@@ -349,7 +374,9 @@ async def test_tool_capabilities_and_unavailable_analysis_are_explicit() -> None
 
 
 @pytest.mark.asyncio
-async def test_archive_member_registration_is_candidate_and_resolves_for_sample_analysis() -> None:
+async def test_archive_member_registration_is_candidate_and_resolves_for_sample_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     database = FakeDatabase()
     investigation = make_investigation()
     database.investigations[investigation.id] = investigation
@@ -377,7 +404,7 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
         tlp=TLP.AMBER,
         do_not_submit=True,
         external_llm_allowed=False,
-        origin_kind=SampleOrigin.MANUAL,
+        origin_kind=EntitySampleOrigin.MANUAL,
         state=SampleState.QUARANTINED,
         source_service="operator_import",
         source_object_id=parent_sha256,
@@ -391,10 +418,38 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
     )
     database.associations[parent_association.id] = parent_association
 
+    member_bytes = b"static member fixture bytes"
+    member_sha256 = hashlib.sha256(member_bytes).hexdigest()
+    preexisting_child_blob_id = uuid5(
+        UUID("6c3db404-61fe-4d1f-b1eb-638aa7b15b0a"),
+        f"{SAMPLES_QUARANTINE_BUCKET}:{member_sha256}",
+    )
+    database.blobs[preexisting_child_blob_id] = FakeBlob(
+        preexisting_child_blob_id,
+        FakeBlobDescriptor(SAMPLES_QUARANTINE_BUCKET, member_sha256, len(member_bytes)),
+    )
+    database.blob_bytes[preexisting_child_blob_id] = member_bytes
+    preexisting_child = Sample(
+        subject_id=investigation.subject_id,
+        blob_id=preexisting_child_blob_id,
+        original_name="preexisting-red-child.bin",
+        origin="operator_import",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.RED,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        origin_kind=EntitySampleOrigin.MANUAL,
+        state=SampleState.QUARANTINED,
+        source_service="operator_import",
+        source_object_id=member_sha256,
+        expected_hash=member_sha256,
+    )
+    database.samples[preexisting_child.id] = preexisting_child
+
     hits = HitAcquisitionService(
         lambda: FakeUow(database), acquisition=None, recorder=make_evidence_recorder(database)
     )
-    member_bytes = b"static member fixture bytes"
     worker = _ArchiveMemberWorker(database, member_bytes)
     store = _FakeQuarantineArtifactStore(database)
     extractor = ArchiveExtractMemberAdapter(
@@ -486,6 +541,7 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
     assert len(derived_associations) == 1
     derived_sample = database.samples[UUID(str(first.output["sample_id"]))]
     assert derived_sample.state is SampleState.QUARANTINED
+    assert derived_sample.tlp is TLP.RED
     assert derived_sample.do_not_submit is True
     assert derived_sample.external_llm_allowed is False
     assert derived_sample.license_restriction == "internal-only"
@@ -496,6 +552,7 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
         and item.event_type == "sample_derived_from_archive_member"
     ]
     assert len(provenance) == 2
+    assert all(item.tlp is TLP.RED for item in provenance)
     assert all(item.payload["parent_sha256"] == parent_sha256 for item in provenance)
     assert all(item.payload["member_path"] == "bin/loader.dll" for item in provenance)
     assert {(item.actor_id, item.payload["reason"]) for item in provenance} == {
@@ -552,6 +609,104 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
     assert analyzed.status is ToolInvocationStatus.SUCCEEDED
     assert analyzer.resolved is not None
     assert analyzer.resolved.sha256 == derived_sha256
+
+    other_investigation = make_investigation()
+    database.investigations[other_investigation.id] = other_investigation
+    other_parent_bytes = b"parent sample owned by investigation B"
+    other_parent_sha256 = hashlib.sha256(other_parent_bytes).hexdigest()
+    other_parent_blob_id = uuid4()
+    database.blobs[other_parent_blob_id] = FakeBlob(
+        other_parent_blob_id,
+        FakeBlobDescriptor(
+            SAMPLES_QUARANTINE_BUCKET,
+            other_parent_sha256,
+            len(other_parent_bytes),
+        ),
+    )
+    database.blob_bytes[other_parent_blob_id] = other_parent_bytes
+    other_parent_sample = Sample(
+        subject_id=other_investigation.subject_id,
+        blob_id=other_parent_blob_id,
+        original_name="other-parent.zip",
+        origin="operator_import",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.CLEAR,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        origin_kind=EntitySampleOrigin.MANUAL,
+        state=SampleState.QUARANTINED,
+        source_service="operator_import",
+        source_object_id=other_parent_sha256,
+        expected_hash=other_parent_sha256,
+    )
+    database.samples[other_parent_sample.id] = other_parent_sample
+    other_parent_association = SampleAssociation(
+        investigation_id=other_investigation.id,
+        sample_sha256=other_parent_sha256,
+        origin=SampleOrigin.RELATIONSHIP,
+    )
+    database.associations[other_parent_association.id] = other_parent_association
+    cross_investigation_context = replace(
+        context,
+        envelope=None,
+        idempotency_key="archive-member-cross-investigation",
+        budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1}),
+    )
+    worker_calls_before_cross_investigation = len(worker.requests)
+    cross_investigation_result = await dispatcher.dispatch(
+        cross_investigation_context,
+        tool_name="archive.extract_member",
+        schema_version="1",
+        arguments={**arguments, "association_id": str(other_parent_association.id)},
+        purpose="Reject an association owned by another investigation.",
+        operation_key="archive-member:cross-investigation",
+    )
+    assert cross_investigation_result.status is ToolInvocationStatus.FAILED
+    assert (
+        cross_investigation_result.error_code
+        == "archive_extract_member_association_not_in_investigation"
+    )
+    assert len(worker.requests) == worker_calls_before_cross_investigation
+
+    failing_extractor = ArchiveExtractMemberAdapter(
+        hits=hits,
+        uow_factory=lambda: FakeUow(database),
+        artifact_store=cast(ProductionArtifactStore, store),
+        execution=cast(Any, _RaisingArchiveMemberWorker()),
+        timeout_seconds=20,
+        max_output_bytes=4096,
+    )
+    failing_registry = InMemoryToolRegistry()
+    register_acquisition_tools(
+        failing_registry,
+        hits=hits,
+        qualifications=SampleQualificationService(lambda: FakeUow(database)),
+        archive_extractor=failing_extractor,
+    )
+    monotonic_values = iter((100.0, 102.1))
+    monkeypatch.setattr(
+        acquisition_tools,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    failure_budget = InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1})
+    failure_result = await RegistryToolDispatcher(failing_registry).dispatch(
+        replace(
+            context,
+            envelope=None,
+            budget=failure_budget,
+            idempotency_key="archive-member-worker-failure",
+        ),
+        tool_name="archive.extract_member",
+        schema_version="1",
+        arguments=arguments,
+        purpose="Account for worker time when execution raises.",
+        operation_key="archive-member:worker-failure",
+    )
+    assert failure_result.status is ToolInvocationStatus.FAILED
+    assert failure_result.exception_class == "RuntimeError"
+    assert failure_budget.reservations[0].committed_amounts[BudgetDimension.TOOL_SECONDS] == 3
 
 
 @pytest.mark.asyncio

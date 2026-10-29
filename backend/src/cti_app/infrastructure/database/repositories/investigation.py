@@ -1479,6 +1479,15 @@ class SqlAlchemyInvestigationEnvelopeRepository:
         )
         return _envelope_from_row(row) if row is not None else None
 
+    async def get_for_update(self, investigation_id: UUID) -> InvestigationEnvelope | None:
+        row = await self._session.scalar(
+            select(InvestigationEnvelopeRow)
+            .where(InvestigationEnvelopeRow.investigation_id == investigation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return _envelope_from_row(row) if row is not None else None
+
     async def save_if_version(
         self, envelope: InvestigationEnvelope, *, expected_version: int | None
     ) -> InvestigationEnvelope:

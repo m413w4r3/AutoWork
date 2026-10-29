@@ -166,6 +166,8 @@ class AnalystOpinionRepository(Protocol):
 class InvestigationEnvelopeRepository(Protocol):
     async def get(self, investigation_id: UUID) -> InvestigationEnvelope | None: ...
 
+    async def get_for_update(self, investigation_id: UUID) -> InvestigationEnvelope | None: ...
+
     async def save_if_version(
         self, envelope: InvestigationEnvelope, *, expected_version: int | None
     ) -> InvestigationEnvelope: ...
@@ -609,6 +611,9 @@ class InMemoryInvestigationEnvelopeRepository:
 
     async def get(self, investigation_id: UUID) -> InvestigationEnvelope | None:
         return self._items.get(investigation_id)
+
+    async def get_for_update(self, investigation_id: UUID) -> InvestigationEnvelope | None:
+        return await self.get(investigation_id)
 
     async def save_if_version(
         self, envelope: InvestigationEnvelope, *, expected_version: int | None
