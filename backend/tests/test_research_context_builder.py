@@ -1397,17 +1397,7 @@ async def test_context_exposes_exact_registered_tool_argument_schema() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("sample_tlp", "external_llm_allowed", "expected_allowed"),
-    (
-        (TLPLevel.GREEN, True, True),
-        (TLPLevel.RED, True, False),
-        (TLPLevel.GREEN, False, False),
-    ),
-)
-async def test_context_indexes_acquired_samples_and_recent_tool_results(
-    sample_tlp: TLPLevel, external_llm_allowed: bool, expected_allowed: bool
-) -> None:
+async def test_context_indexes_acquired_samples_and_recent_tool_results() -> None:
     investigation_id = uuid4()
     synthesis_artifact_id = uuid4()
     sample_sha256 = "a" * 64
@@ -1457,25 +1447,8 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         object_type="tool_result",
         object_id="sample.analyze",
     )
-    comparison_result = EvidenceObservation(
-        investigation_id=investigation_id,
-        kind=EvidenceKind.BINARY_ANALYSIS,
-        blob_id=uuid4(),
-        sha256="f" * 64,
-        source="sample_similarity",
-        source_version="family-feature-comparison-v1",
-        observed_at=datetime.now(UTC),
-        object_type="family_feature_comparison",
-        object_id="e" * 64,
-    )
     observations = InMemoryEvidenceObservationRepository()
-    for observation in (
-        downloaded_sample,
-        download_result,
-        analysis_observation,
-        analysis_result,
-        comparison_result,
-    ):
+    for observation in (downloaded_sample, download_result, analysis_observation, analysis_result):
         await observations.append_if_absent(observation)
     download_invocation = ToolInvocation(
         investigation_id=investigation_id,
@@ -1520,28 +1493,12 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
                     "sample_sha256": sample_sha256,
                     "extractors": {"static": {"version": "static-v1", "status": "succeeded"}},
                 }
-            if observation.id == comparison_result.id:
-                return {"comparison_sample_sha256s": [sample_sha256]}
             return None
 
         async def blob_metadata(self, blob_id):
             if blob_id == downloaded_sample.blob_id:
                 return {"byte_size": 8_487_424, "mime_type": "application/octet-stream"}
             return None
-
-        async def sample_disclosure_inventory(self, _investigation_id):
-            return (
-                {
-                    "association_id": str(association_id),
-                    "sample_id": str(sample_id),
-                    "sample_sha256": sample_sha256,
-                    "tlp": sample_tlp,
-                    "do_not_submit": True,
-                    "external_llm_allowed": external_llm_allowed,
-                    "license_restriction": None,
-                    "resolution_status": "resolved",
-                },
-            )
 
     snapshot = ArticleSnapshot(
         subject_id=uuid4(),
@@ -1580,41 +1537,23 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
     result = context.investigation.latest_tool_results[-1]
     prompt = render_investigation_prompt(context)
 
+    assert sample["association_id"] == str(association_id)
+    assert sample["sample_id"] == str(sample_id)
+    assert sample["sha256"] == sample_sha256
+    assert sample["sha256_short"] == sample_sha256[:12]
+    assert sample["byte_size"] == 8_487_424
+    assert sample["provenance"] == "vt_download"
+    assert sample["qualification"] == "candidate"
+    assert sample["analysis_status"] == "analyzed"
+    assert sample["analysis_engines"] == ["static@static-v1"]
+    assert str(analysis_observation.id) in sample["observation_ids"]
     assert result.tool_name == "sample.analyze"
     assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output_ids["association_id"] == str(association_id)
+    assert analysis_result.id in result.observation_ids
     assert "ÉCHANTILLONS ACQUIS" in prompt
     assert "DERNIERS RÉSULTATS D'OUTILS" in prompt
     assert "must-not-reach-the-prompt" not in prompt
-    if expected_allowed:
-        assert sample["association_id"] == str(association_id)
-        assert sample["sample_id"] == str(sample_id)
-        assert sample["sha256"] == sample_sha256
-        assert sample["sha256_short"] == sample_sha256[:12]
-        assert sample["byte_size"] == 8_487_424
-        assert sample["provenance"] == "vt_download"
-        assert sample["qualification"] == "candidate"
-        assert sample["analysis_status"] == "analyzed"
-        assert sample["analysis_engines"] == ["static@static-v1"]
-        assert str(analysis_observation.id) in sample["observation_ids"]
-        assert result.output_ids["association_id"] == str(association_id)
-        assert analysis_result.id in result.observation_ids
-    else:
-        assert sample == {"restricted": True, "reason": "sample_disclosure_restricted"}
-        assert result.output_ids == {"restricted_sample": "restricted"}
-        assert result.observation_ids == ()
-        analysis_coverage = next(
-            item
-            for item in context.investigation.tool_coverage
-            if item.invocation_id == analysis_invocation.id
-        )
-        assert analysis_coverage.parameter_key == "restricted_sample"
-        assert analysis_coverage.observation_id is None
-        assert "Restricted sample evidence omitted" in analysis_coverage.summary
-        assert all(pivot.indicator_value != sample_sha256 for pivot in context.available_pivots)
-        assert str(association_id) not in prompt
-        assert str(sample_id) not in prompt
-        assert sample_sha256 not in prompt
-        assert context.investigation.truncation_counts["restricted_sample_evidence"] > 0
 
 
 @pytest.mark.asyncio
@@ -1653,20 +1592,6 @@ async def test_context_indexes_canonical_operator_imports_before_analysis() -> N
                     "detected_type": "application/vnd.tcpdump.pcap",
                     "provenance": "operator_import",
                     "qualification": "candidate",
-                },
-            )
-
-        async def sample_disclosure_inventory(self, requested_investigation_id):
-            assert requested_investigation_id == investigation_id
-            return (
-                {
-                    "association_id": str(association_id),
-                    "sample_id": str(sample_id),
-                    "sample_sha256": sample_sha256,
-                    "tlp": TLPLevel.GREEN,
-                    "external_llm_allowed": True,
-                    "license_restriction": None,
-                    "resolution_status": "resolved",
                 },
             )
 
@@ -2898,19 +2823,6 @@ async def test_large_operator_led_context_is_preserved_deterministically() -> No
                     "sha256": "c" * 64,
                     "provenance": "operator_import",
                     "qualification": "confirmed",
-                },
-            )
-
-        async def sample_disclosure_inventory(self, _investigation_id):
-            return (
-                {
-                    "association_id": str(UUID(int=90_001)),
-                    "sample_id": str(UUID(int=90_002)),
-                    "sample_sha256": "c" * 64,
-                    "tlp": TLPLevel.GREEN,
-                    "external_llm_allowed": True,
-                    "license_restriction": None,
-                    "resolution_status": "resolved",
                 },
             )
 

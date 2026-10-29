@@ -12,7 +12,6 @@ from typing import Any, Literal, Protocol, TypeGuard, cast
 from uuid import UUID
 
 from cti_app.application.advisor_checkpoint import advisor_checkpoint_summary
-from cti_app.application.advisor_dossier import _sample_disclosure_restriction_sources
 from cti_app.application.context_pagination import (
     NULL_SORT_KEY,
     ContextOmissionManifestEntryV1,
@@ -197,22 +196,6 @@ class EvidenceSummaryPort(Protocol):
     async def summary(self, observation: EvidenceObservation) -> Mapping[str, Any] | str | None: ...
 
 
-@dataclass(frozen=True, slots=True)
-class _SampleDisclosureIndex:
-    available: bool
-    allowed_references: frozenset[str] = frozenset()
-    restricted_references: frozenset[str] = frozenset()
-
-    def restricts(self, key: str, value: object) -> bool:
-        reference = _sample_disclosure_reference(key, value)
-        return (
-            not self.available
-            or reference is None
-            or reference in self.restricted_references
-            or reference not in self.allowed_references
-        )
-
-
 class RuleCorpusContextInventoryPort(Protocol):
     async def manual_rule_corpus_imports(self, investigation_id: UUID) -> Sequence[Any]: ...
 
@@ -312,56 +295,6 @@ class CanonicalEvidenceSummaryPort:
                                 else "vt_download"
                             ),
                             "qualification": association.qualification.value,
-                        }
-                    )
-                return tuple(rows)
-        except Exception:
-            return ()
-
-    async def sample_disclosure_inventory(
-        self, investigation_id: UUID
-    ) -> tuple[Mapping[str, Any], ...]:
-        """Resolve sample identities and current disclosure controls for one investigation."""
-        catalog = getattr(self._artifact_store, "_catalog", None)
-        uow_factory = getattr(catalog, "_uow_factory", None)
-        if not callable(uow_factory):
-            return ()
-        try:
-            async with uow_factory() as uow:
-                investigation = await uow.analyst_investigations.get(investigation_id)
-                if investigation is None:
-                    return ()
-                associations = tuple(
-                    await uow.sample_associations.list_for_investigation(investigation_id)
-                )
-                samples = tuple(await uow.samples.list_for_subject(investigation.subject_id))
-                rows: list[Mapping[str, Any]] = []
-                for association in associations:
-                    matches = tuple(
-                        sample
-                        for sample in samples
-                        if sample.expected_hash == association.sample_sha256
-                        or sample.source_object_id == association.sample_sha256
-                    )
-                    if len(matches) != 1:
-                        rows.append(
-                            {
-                                "association_id": str(association.id),
-                                "sample_sha256": association.sample_sha256,
-                                "resolution_status": "unresolved",
-                            }
-                        )
-                        continue
-                    sample = matches[0]
-                    rows.append(
-                        {
-                            "association_id": str(association.id),
-                            "sample_id": str(sample.id),
-                            "sample_sha256": association.sample_sha256,
-                            "tlp": sample.tlp,
-                            "external_llm_allowed": sample.external_llm_allowed,
-                            "license_restriction": sample.license_restriction,
-                            "resolution_status": "resolved",
                         }
                     )
                 return tuple(rows)
@@ -1142,9 +1075,6 @@ class ResearchContextBuilder:
             position=lambda item: (item.observed_at, item.id),
         )
         observations = tuple(reversed(observation_source_page.items))
-        sample_disclosure = await self._sample_disclosure_index(
-            investigation_id, tool_context.envelope
-        )
         finding_source_page = await self._page_source(
             self._findings,
             investigation_id=investigation_id,
@@ -1161,6 +1091,11 @@ class ResearchContextBuilder:
             - finding_source_page.total,
         )
         findings = finding_source_page.items
+        all_observation_ids = {item.id for item in observations}
+        all_finding_ids = {item.id for item in findings}
+        # Every Bridge turn is an independent Temporary Chat. Include the newest
+        # bounded evidence on every turn so the prompt remains self-contained.
+        evidence_summary = await self._evidence_context(tuple(reversed(observations)))
         invocation_source_page = (
             await self._page_source(
                 self._invocations,
@@ -1179,68 +1114,13 @@ class ResearchContextBuilder:
             if invocation_source_page is not None
             else ()
         )
-        (
-            latest_tool_results,
-            restricted_sample_invocation_observation_ids,
-        ) = await self._latest_tool_results(tool_invocations, observations, sample_disclosure)
-        # Every Bridge turn is an independent Temporary Chat. Include the newest
-        # bounded evidence on every turn so the prompt remains self-contained.
-        evidence_summary, restricted_sample_observation_ids = await self._evidence_context(
-            tuple(reversed(observations)), sample_disclosure
-        )
-        restricted_sample_observation_ids = set(
-            restricted_sample_observation_ids | restricted_sample_invocation_observation_ids
-        )
-        restricted_sample_observation_ids.update(
-            item.id
-            for item in observations
-            if _observation_references_sample_disclosure(item, sample_disclosure)
-        )
-        pivot_candidates = tuple(
-            item
-            for item in observations
-            if item.id not in restricted_sample_observation_ids
-            and (
-                item.kind is EvidenceKind.VT_RELATIONSHIP
-                or item.source == "sample_similarity"
-                or item.source.startswith("network.capture.")
-            )
-        )
-        pivot_observations_truncated = len(pivot_candidates) > MAX_PIVOT_SOURCE_OBSERVATIONS
-        pivot_candidates = pivot_candidates[-MAX_PIVOT_SOURCE_OBSERVATIONS:]
-        pivot_observations: list[EvidenceObservation] = []
-        pivot_payloads: dict[str, Mapping[str, Any] | None] = {}
-        for observation in pivot_candidates:
-            summary = (
-                await self._evidence_summaries.summary(observation)
-                if self._evidence_summaries is not None
-                else None
-            )
-            if isinstance(summary, Mapping) and any(
-                sample_disclosure.restricts(key, value)
-                for key, value in _sample_disclosure_references(summary)
-            ):
-                restricted_sample_observation_ids.add(observation.id)
-                continue
-            pivot_observations.append(observation)
-            pivot_payloads[str(observation.id)] = summary if isinstance(summary, Mapping) else None
-        restricted_sample_observation_ids = frozenset(restricted_sample_observation_ids)
-        context_observations = tuple(
-            item for item in observations if item.id not in restricted_sample_observation_ids
-        )
-        context_findings = tuple(
-            item
-            for item in findings
-            if not set(item.observation_refs).intersection(restricted_sample_observation_ids)
-        )
-        all_observation_ids = {item.id for item in context_observations}
-        all_finding_ids = {item.id for item in context_findings}
         tool_coverage, tool_coverage_truncated = await self._tool_coverage(
-            tool_invocations, observations, sample_disclosure
+            tool_invocations, observations
         )
         sample_deltas, sample_deltas_truncated, sample_deltas_total = await self._sample_index(
-            investigation_id, tool_invocations, observations, sample_disclosure
+            investigation_id, tool_invocations, observations
         )
+        latest_tool_results = await self._latest_tool_results(tool_invocations, observations)
         all_blocked = await blocked_capabilities_from_history(
             investigation_id=investigation_id,
             invocations=tool_invocations,
@@ -1255,32 +1135,22 @@ class ResearchContextBuilder:
             ),
         )
         finding_summary, findings_truncated = self._finding_context(
-            context_findings,
+            findings,
             observation_ids=all_observation_ids,
         )
-        evidence_index, evidence_index_truncated = self._evidence_index(context_observations)
+        evidence_index, evidence_index_truncated = self._evidence_index(observations)
         current_opinion = (
             await self._opinions.get(investigation_opinion_id(investigation_id))
             if self._opinions is not None
-            else None
-        )
-        safe_opinion_notes = (
-            tuple(
-                note
-                for note in current_opinion.observations
-                if not set(note.evidence_refs).intersection(restricted_sample_observation_ids)
-            )
-            if current_opinion is not None
             else None
         )
         opinion_notes, opinion_notes_truncated = self._opinion_note_index(
             current_opinion,
             finding_ids=all_finding_ids,
             observation_ids=all_observation_ids,
-            ordered_notes=safe_opinion_notes,
         )
         rule_corpus_deltas = await self._rule_corpus_inventory_context(
-            investigation_id, context_observations
+            investigation_id, observations
         )
         availability_context = replace(tool_context, blocked_capabilities=all_blocked)
         selected_registry = registry or self._registry
@@ -1318,6 +1188,22 @@ class ResearchContextBuilder:
             for item in state.hypotheses[:MAX_CONTEXT_HYPOTHESES]
         )
         indicator_inventory = self._indicator_inventory(snapshot)
+        pivot_observations = tuple(
+            item
+            for item in observations
+            if item.kind is EvidenceKind.VT_RELATIONSHIP
+            or item.source == "sample_similarity"
+            or item.source.startswith("network.capture.")
+        )
+        pivot_observations_truncated = len(pivot_observations) > MAX_PIVOT_SOURCE_OBSERVATIONS
+        pivot_observations = pivot_observations[-MAX_PIVOT_SOURCE_OBSERVATIONS:]
+        pivot_payloads: dict[str, Mapping[str, Any] | None] = {}
+        if self._evidence_summaries is not None:
+            for observation in pivot_observations:
+                summary = await self._evidence_summaries.summary(observation)
+                pivot_payloads[str(observation.id)] = (
+                    summary if isinstance(summary, Mapping) else None
+                )
         discovered_inventory = discovered_indicator_values(pivot_observations, pivot_payloads)
         available_pivots, pivots_truncated = available_investigation_pivots(
             inventory=indicator_inventory.items,
@@ -1325,7 +1211,7 @@ class ResearchContextBuilder:
             tools=tools,
             tool_coverage=tool_coverage,
             invocations=tool_invocations,
-            observations=context_observations,
+            observations=observations,
         )
         available_pivots_truncated = pivots_truncated or pivot_observations_truncated
         user_requests = self._user_requests_from_actions(state.recent_actions)
@@ -1344,8 +1230,6 @@ class ResearchContextBuilder:
             truncation_counts["evidence_index"] = observation_source_page.total - len(
                 evidence_index
             )
-        if restricted_sample_observation_ids:
-            truncation_counts["restricted_sample_evidence"] = len(restricted_sample_observation_ids)
         if finding_source_page.total > len(finding_summary):
             truncation_counts["findings"] = finding_source_page.total - len(finding_summary)
         if superseded_finding_count:
@@ -1497,7 +1381,7 @@ class ResearchContextBuilder:
             advisor_guidance=AdvisorGuidanceV1.model_validate(
                 await build_advisor_guidance(
                     invocations=tool_invocations,
-                    observations=context_observations,
+                    observations=observations,
                     evidence_summaries=self._evidence_summaries,
                     available_tools=tuple(item.name for item in tools),
                     checkpoint_tool_threshold=get_settings().operator_advisor_checkpoint_tool_threshold,
@@ -2176,23 +2060,15 @@ class ResearchContextBuilder:
 
         if section == "new_evidence":
             new_evidence_observations = observations[page_slice]
-            sample_disclosure = await self._sample_disclosure_index(investigation_id, None)
-            new_evidence_items, _restricted = await self._evidence_context(
-                new_evidence_observations, sample_disclosure
-            )
+            new_evidence_items = await self._evidence_context(new_evidence_observations)
             return len(observations), tuple(
                 evidence_item.model_dump(mode="json") for evidence_item in new_evidence_items
             )
         if section == "evidence_index":
             evidence_index_observations = observations[page_slice]
-            sample_disclosure = await self._sample_disclosure_index(investigation_id, None)
-            _summaries, restricted_observation_ids = await self._evidence_context(
-                evidence_index_observations, sample_disclosure
-            )
             evidence_index_items = tuple(
                 self._evidence_index((observation,))[0][0]
                 for observation in evidence_index_observations
-                if observation.id not in restricted_observation_ids
             )
             return len(observations), tuple(
                 evidence_item.model_dump(mode="json") for evidence_item in evidence_index_items
@@ -2310,12 +2186,10 @@ class ResearchContextBuilder:
                 if self._invocations is not None
                 else ()
             )
-            sample_disclosure = await self._sample_disclosure_index(investigation_id, None)
             sample_rows, _truncated, sample_total = await self._sample_index(
                 investigation_id,
                 sample_invocations,
                 observations,
-                sample_disclosure,
                 offset=offset,
                 limit=limit,
             )
@@ -2417,22 +2291,14 @@ class ResearchContextBuilder:
             )
             if section == "new_evidence":
                 serialized_items: list[dict[str, Any]] = []
-                sample_disclosure = await self._sample_disclosure_index(investigation_id, None)
                 for observation in source_page.items:
-                    summaries, _restricted = await self._evidence_context(
-                        (observation,), sample_disclosure
-                    )
+                    summaries = await self._evidence_context((observation,))
                     serialized_items.extend(item.model_dump(mode="json") for item in summaries)
                 items = tuple(serialized_items)
             else:
-                sample_disclosure = await self._sample_disclosure_index(investigation_id, None)
-                _summaries, restricted_observation_ids = await self._evidence_context(
-                    source_page.items, sample_disclosure
-                )
                 items = tuple(
                     self._evidence_index((observation,))[0][0].model_dump(mode="json")
                     for observation in source_page.items
-                    if observation.id not in restricted_observation_ids
                 )
             return self._project_source_page(
                 section=section,
@@ -2908,18 +2774,10 @@ class ResearchContextBuilder:
         return IndicatorInventoryV1(items=tuple(items), truncated=truncated)
 
     async def _evidence_context(
-        self,
-        observations: tuple[EvidenceObservation, ...],
-        sample_disclosure: _SampleDisclosureIndex | None = None,
-    ) -> tuple[tuple[EvidenceSummaryV1, ...], frozenset[UUID]]:
+        self, observations: tuple[EvidenceObservation, ...]
+    ) -> tuple[EvidenceSummaryV1, ...]:
         result = []
-        restricted_observation_ids: set[UUID] = set()
         for observation in observations[:MAX_CONTEXT_EVIDENCE]:
-            if sample_disclosure is not None and _observation_references_sample_disclosure(
-                observation, sample_disclosure
-            ):
-                restricted_observation_ids.add(observation.id)
-                continue
             summary: Mapping[str, Any] | str | None = None
             if self._evidence_summaries is not None:
                 summary = await self._evidence_summaries.summary(observation)
@@ -2934,12 +2792,6 @@ class ResearchContextBuilder:
                 )
             if isinstance(summary, Mapping):
                 summary = _advisor_sample_refusal_context_summary(observation, summary)
-                if sample_disclosure is not None and any(
-                    sample_disclosure.restricts(key, value)
-                    for key, value in _sample_disclosure_references(summary)
-                ):
-                    restricted_observation_ids.add(observation.id)
-                    continue
             if isinstance(summary, Mapping):
                 raw_text = json.dumps(_sanitize(summary), ensure_ascii=False)
             elif isinstance(summary, str):
@@ -2958,7 +2810,7 @@ class ResearchContextBuilder:
                 )
             )
         # Reserve room for contradictions before confirming findings are added.
-        return tuple(result), frozenset(restricted_observation_ids)
+        return tuple(result)
 
     @staticmethod
     def _evidence_index(
@@ -3054,7 +2906,6 @@ class ResearchContextBuilder:
         investigation_id: UUID,
         invocations: Sequence[ToolInvocation],
         observations: Sequence[EvidenceObservation],
-        sample_disclosure: _SampleDisclosureIndex,
         *,
         offset: int = 0,
         limit: int = MAX_CONTEXT_ACQUIRED_SAMPLES,
@@ -3289,85 +3140,21 @@ class ResearchContextBuilder:
                 {*row["observation_ids"], *(str(item.id) for item in analysis_observations)}
             )[:8]
 
-        visible_rows: list[dict[str, Any]] = []
-        restricted_sample_seen = False
-        for row in rows.values():
-            references = (
-                ("association_id", row.get("association_id")),
-                ("sample_id", row.get("sample_id")),
-                ("sample_sha256", row.get("sha256")),
-            )
-            if any(
-                value is not None and sample_disclosure.restricts(key, value)
-                for key, value in references
-            ):
-                restricted_sample_seen = True
-                continue
-            visible_rows.append(row)
-        ordered = sorted(visible_rows, key=lambda item: (item["sha256"], item["association_id"]))
-        if restricted_sample_seen and offset == 0:
-            ordered.insert(
-                0,
-                {"restricted": True, "reason": "sample_disclosure_restricted"},
-            )
+        ordered = sorted(rows.values(), key=lambda item: (item["sha256"], item["association_id"]))
         return (
             tuple(ordered[offset : offset + limit]),
             len(ordered) > MAX_CONTEXT_ACQUIRED_SAMPLES,
             len(ordered),
         )
 
-    async def _sample_disclosure_index(
-        self, investigation_id: UUID, envelope: Any
-    ) -> _SampleDisclosureIndex:
-        inventory_reader = getattr(self._evidence_summaries, "sample_disclosure_inventory", None)
-        if not callable(inventory_reader):
-            return _SampleDisclosureIndex(available=False)
-        try:
-            inventory = await inventory_reader(investigation_id)
-        except Exception:
-            return _SampleDisclosureIndex(available=False)
-        if not isinstance(inventory, Sequence) or isinstance(inventory, str | bytes):
-            return _SampleDisclosureIndex(available=False)
-
-        allowed: set[str] = set()
-        restricted: set[str] = set()
-        for item in inventory:
-            if not isinstance(item, Mapping):
-                continue
-            references = {
-                reference
-                for key in ("association_id", "sample_id", "sample_sha256")
-                if (reference := _sample_disclosure_reference(key, item.get(key))) is not None
-            }
-            policy_complete = (
-                item.get("resolution_status") == "resolved"
-                and _safe_uuid_string(item.get("association_id")) is not None
-                and _safe_uuid_string(item.get("sample_id")) is not None
-                and _is_sample_hash(item.get("sample_sha256"))
-                and isinstance(getattr(item.get("tlp"), "value", item.get("tlp")), str)
-                and type(item.get("external_llm_allowed")) is bool
-                and "license_restriction" in item
-            )
-            if not policy_complete or _sample_disclosure_restriction_sources(item, envelope):
-                restricted.update(references)
-            else:
-                allowed.update(references)
-        return _SampleDisclosureIndex(
-            available=True,
-            allowed_references=frozenset(allowed),
-            restricted_references=frozenset(restricted),
-        )
-
     async def _latest_tool_results(
         self,
         invocations: Sequence[ToolInvocation],
         observations: Sequence[EvidenceObservation],
-        sample_disclosure: _SampleDisclosureIndex,
-    ) -> tuple[tuple[LatestToolResultV1, ...], frozenset[UUID]]:
+    ) -> tuple[LatestToolResultV1, ...]:
         observation_by_id = {item.id: item for item in observations}
         ordered = sorted(invocations, key=lambda item: (item.created_at, item.id.hex))
         results: list[LatestToolResultV1] = []
-        restricted_sample_observation_ids: set[UUID] = set()
         for invocation in ordered[-MAX_CONTEXT_LATEST_TOOL_RESULTS:]:
             facts = await self._invocation_facts(invocation, observation_by_id)
             output_ids: dict[str, str] = {}
@@ -3401,25 +3188,6 @@ class ResearchContextBuilder:
                     ToolInvocationStatus.UNAVAILABLE: "tool_unavailable",
                     ToolInvocationStatus.NEEDS_REVIEW: "needs_review",
                 }[invocation.status]
-            invocation_parameters = thaw_json(invocation.normalized_parameters)
-            references = _sample_disclosure_references(invocation_parameters)
-            references.extend(
-                reference
-                for _observation, result in facts
-                for reference in _sample_disclosure_references(result)
-            )
-            sample_restricted = any(
-                sample_disclosure.restricts(key, value) for key, value in references
-            ) or any(
-                _observation_references_sample_disclosure(observation, sample_disclosure)
-                for observation_id in invocation.response_refs[-4:]
-                if (observation := observation_by_id.get(observation_id)) is not None
-            )
-            observation_ids = invocation.response_refs[-4:]
-            if sample_restricted:
-                output_ids = {"restricted_sample": "restricted"}
-                observation_ids = ()
-                restricted_sample_observation_ids.update(invocation.response_refs[-4:])
             results.append(
                 LatestToolResultV1(
                     invocation_id=invocation.id,
@@ -3430,17 +3198,16 @@ class ResearchContextBuilder:
                     ),
                     status=invocation.status,
                     output_ids=output_ids,
-                    observation_ids=observation_ids,
+                    observation_ids=invocation.response_refs[-4:],
                     error_code=error_code,
                 )
             )
-        return tuple(results), frozenset(restricted_sample_observation_ids)
+        return tuple(results)
 
     async def _tool_coverage(
         self,
         invocations: tuple[ToolInvocation, ...],
         observations: tuple[EvidenceObservation, ...],
-        sample_disclosure: _SampleDisclosureIndex,
     ) -> tuple[tuple[ToolCoverageEntryV1, ...], bool]:
         if not invocations:
             return (), False
@@ -3449,12 +3216,6 @@ class ResearchContextBuilder:
         truncated = len(invocations) > len(candidates)
         entries: list[ToolCoverageEntryV1] = []
         for invocation in reversed(candidates):
-            restricted_sample = any(
-                sample_disclosure.restricts(key, value)
-                for key, value in _sample_disclosure_references(
-                    thaw_json(invocation.normalized_parameters)
-                )
-            )
             linked_observations = tuple(
                 observation_by_id[ref]
                 for ref in reversed(invocation.response_refs[-4:])
@@ -3462,38 +3223,13 @@ class ResearchContextBuilder:
             )
             observation = linked_observations[0] if linked_observations else None
             facts: Mapping[str, Any] | str | None = None
-            safe_observations: list[EvidenceObservation] = []
-            for candidate_observation in linked_observations:
-                if _observation_references_sample_disclosure(
-                    candidate_observation, sample_disclosure
-                ):
-                    restricted_sample = True
-                else:
-                    safe_observations.append(candidate_observation)
-            if self._evidence_summaries is not None:
-                for candidate_observation in safe_observations:
+            if observation is not None and self._evidence_summaries is not None:
+                for candidate_observation in linked_observations:
                     candidate_facts = await self._evidence_summaries.summary(candidate_observation)
-                    if isinstance(candidate_facts, Mapping) and any(
-                        sample_disclosure.restricts(key, value)
-                        for key, value in _sample_disclosure_references(candidate_facts)
-                    ):
-                        restricted_sample = True
-                        continue
-                    if candidate_facts is not None and facts is None:
+                    if candidate_facts is not None:
                         observation = candidate_observation
                         facts = candidate_facts
-            if restricted_sample:
-                entries.append(
-                    ToolCoverageEntryV1(
-                        invocation_id=invocation.id,
-                        tool_name=_truncate(_safe_untrusted(invocation.tool_name), 128),
-                        parameter_key="restricted_sample",
-                        status=invocation.status,
-                        observation_id=None,
-                        summary="Restricted sample evidence omitted.",
-                    )
-                )
-                continue
+                        break
             summary = _tool_coverage_summary(invocation, observation, facts)
             checkpoint_summary = advisor_checkpoint_summary(invocation)
             if checkpoint_summary:
@@ -3841,57 +3577,6 @@ def _safe_uuid_string(value: Any) -> str | None:
         return str(UUID(str(value)))
     except (TypeError, ValueError, AttributeError):
         return None
-
-
-def _sample_disclosure_reference(key: str, value: Any) -> str | None:
-    normalized_key = key.casefold()
-    if _is_sample_hash_reference_key(normalized_key):
-        return value.lower() if _is_sample_hash(value) else None
-    if normalized_key in {"sample_id", "association_id"}:
-        return _safe_uuid_string(value)
-    return None
-
-
-def _sample_disclosure_references(value: Any) -> list[tuple[str, Any]]:
-    references: list[tuple[str, Any]] = []
-    if isinstance(value, Mapping):
-        for raw_key, item in value.items():
-            key = raw_key.casefold() if isinstance(raw_key, str) else ""
-            if _is_sample_hash_reference_key(key):
-                values = (
-                    item
-                    if isinstance(item, Sequence) and not isinstance(item, str | bytes)
-                    else (item,)
-                )
-                references.extend(("sample_sha256", sample_hash) for sample_hash in values)
-            elif key in {"sample_id", "association_id"}:
-                references.append((key, item))
-            else:
-                references.extend(_sample_disclosure_references(item))
-    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
-        for item in value:
-            references.extend(_sample_disclosure_references(item))
-    return references
-
-
-def _is_sample_hash_reference_key(key: str) -> bool:
-    parts = key.casefold().split("_")
-    return "sample" in parts and any(
-        part in {"sha256", "sha256s", "hash", "hashes"} for part in parts
-    )
-
-
-def _observation_references_sample_disclosure(
-    observation: EvidenceObservation, sample_disclosure: _SampleDisclosureIndex
-) -> bool:
-    object_type = observation.object_type.casefold()
-    if object_type not in {"sample", "file", "sha256", "sample_observation"}:
-        return False
-    if _is_sample_hash(observation.object_id):
-        return sample_disclosure.restricts("sample_sha256", observation.object_id)
-    if _safe_uuid_string(observation.object_id) is not None:
-        return sample_disclosure.restricts("sample_id", observation.object_id)
-    return True
 
 
 def _is_sample_hash(value: Any) -> TypeGuard[str]:
