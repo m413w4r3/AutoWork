@@ -171,6 +171,7 @@ from cti_app.application.sample_extraction_ports import (
 from cti_app.application.sample_similarity import (
     CorpusSnapshotPort,
     GoodwarePrevalencePort,
+    SampleAcquisitionStatusPort,
     SampleSimilarityService,
     SimilarityArtifactStorePort,
 )
@@ -304,7 +305,7 @@ FAMILY_CAPABILITY_KEYS = frozenset(
 )
 
 
-class SampleFeaturePackReader(SampleFeaturePackPort):
+class SampleFeaturePackReader(SampleFeaturePackPort, SampleAcquisitionStatusPort):
     """Read feature packs through the selected adapter when one is configured."""
 
     def __init__(self, reader: SampleFeaturePackPort | None = None) -> None:
@@ -314,6 +315,15 @@ class SampleFeaturePackReader(SampleFeaturePackPort):
         if self._reader is None:
             return None
         return await self._reader.get_feature_pack(sample_sha256)
+
+    async def is_sample_acquired(self, sample_sha256: str) -> bool | None:
+        if self._reader is None:
+            return None
+        acquisition_status = getattr(self._reader, "is_sample_acquired", None)
+        if not callable(acquisition_status):
+            return None
+        acquired = await acquisition_status(sample_sha256)
+        return acquired if isinstance(acquired, bool) else None
 
 
 class QuarantineSampleBytesAdapter(SampleBytesForAnalysisPort):
@@ -336,7 +346,7 @@ class QuarantineSampleBytesAdapter(SampleBytesForAnalysisPort):
         return payload
 
 
-class RepositorySampleFeaturePackReader(SampleFeaturePackPort):
+class RepositorySampleFeaturePackReader(SampleFeaturePackPort, SampleAcquisitionStatusPort):
     """Resolve an indexed feature pack through sample and blob identities."""
 
     def __init__(self, uow: UnitOfWork, investigation_id: UUID) -> None:
@@ -344,14 +354,7 @@ class RepositorySampleFeaturePackReader(SampleFeaturePackPort):
         self._investigation_id = investigation_id
 
     async def get_feature_pack(self, sample_sha256: str) -> Mapping[str, Any] | None:
-        investigation = await self._uow.analyst_investigations.get(self._investigation_id)
-        if investigation is None:
-            return None
-        sample_ids: list[UUID] = []
-        for sample in await self._uow.samples.list_for_subject(investigation.subject_id):
-            blob = await self._uow.blobs.get(sample.blob_id)
-            if blob is not None and blob.descriptor.sha256 == sample_sha256:
-                sample_ids.append(sample.id)
+        sample_ids = await self._subject_sample_ids_for_hash(sample_sha256)
         if not sample_ids:
             return None
         feature_sets = await self._uow.sample_feature_sets.list_for_samples(sample_ids)
@@ -372,6 +375,20 @@ class RepositorySampleFeaturePackReader(SampleFeaturePackPort):
             "parameters_sha256": item.get("parameters_sha256"),
             "features": payload,
         }
+
+    async def is_sample_acquired(self, sample_sha256: str) -> bool | None:
+        return bool(await self._subject_sample_ids_for_hash(sample_sha256))
+
+    async def _subject_sample_ids_for_hash(self, sample_sha256: str) -> list[UUID]:
+        investigation = await self._uow.analyst_investigations.get(self._investigation_id)
+        if investigation is None:
+            return []
+        sample_ids: list[UUID] = []
+        for sample in await self._uow.samples.list_for_subject(investigation.subject_id):
+            blob = await self._uow.blobs.get(sample.blob_id)
+            if blob is not None and blob.descriptor.sha256 == sample_sha256:
+                sample_ids.append(sample.id)
+        return sample_ids
 
 
 class RepositoryCorpusSnapshotReader(CorpusSnapshotPort):

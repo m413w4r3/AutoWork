@@ -25,6 +25,7 @@ from cti_app.application.sample_similarity import SampleSimilarityService
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.investigation import (
     BudgetDimension,
+    EvidenceKind,
     InvestigationBudget,
     SampleAssociation,
     SampleOrigin,
@@ -140,11 +141,19 @@ def _corpus_snapshot() -> CorpusSnapshot:
 
 
 class _FeaturePackReader:
-    def __init__(self, packs: Mapping[str, Mapping[str, object]]) -> None:
+    def __init__(
+        self,
+        packs: Mapping[str, Mapping[str, object]],
+        acquisition_status: Mapping[str, bool | None] | None = None,
+    ) -> None:
         self.packs = packs
+        self.acquisition_status = acquisition_status or {}
 
     async def get_feature_pack(self, sample_sha256: str) -> Mapping[str, object] | None:
         return self.packs.get(sample_sha256)
+
+    async def is_sample_acquired(self, sample_sha256: str) -> bool | None:
+        return self.acquisition_status.get(sample_sha256)
 
 
 class _CorpusSnapshotReader:
@@ -199,9 +208,13 @@ class _ArtifactStore:
         )
 
 
-def _service(packs: Mapping[str, Mapping[str, object]]) -> SampleSimilarityService:
+def _service(
+    packs: Mapping[str, Mapping[str, object]],
+    *,
+    acquisition_status: Mapping[str, bool | None] | None = None,
+) -> SampleSimilarityService:
     return SampleSimilarityService(
-        feature_packs=_FeaturePackReader(packs),  # type: ignore[arg-type]
+        feature_packs=_FeaturePackReader(packs, acquisition_status),  # type: ignore[arg-type]
         corpus_snapshots=_CorpusSnapshotReader(),
         artifacts=_ArtifactStore(),
         goodware=_GoodwareReader(),  # type: ignore[arg-type]
@@ -471,11 +484,208 @@ class _AssociationReader:
 class _EvidenceRecorder:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.json_calls: list[dict[str, Any]] = []
         self.observation_id = UUID("c83b70e4-adba-4cfd-9c53-6d507754f467")
+        self.json_observation_id = UUID("6bb1c6e9-e0f2-4be2-9cd0-01a338a7549d")
 
     async def record_existing_blob(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
         return SimpleNamespace(id=self.observation_id)
+
+    async def record_json(self, **kwargs: Any) -> SimpleNamespace:
+        self.json_calls.append(kwargs)
+        return SimpleNamespace(id=self.json_observation_id)
+
+
+class _NoInvestigationAssociations:
+    async def list_for_investigation(self, _investigation_id: UUID) -> tuple[()]:
+        return ()
+
+
+class _SimilarityMustNotRun:
+    async def compare(self, **_kwargs: Any) -> None:
+        raise AssertionError("unassociated samples must be rejected before comparison")
+
+
+@pytest.mark.asyncio
+async def test_unassociated_hashes_return_persisted_unavailable_for_both_tools() -> None:
+    recorder = _EvidenceRecorder()
+    registry = InMemoryToolRegistry()
+    register_similarity_tools(
+        registry,
+        service=cast(SampleSimilarityService, _SimilarityMustNotRun()),
+        sample_associations=cast(SampleAssociationRepository, _NoInvestigationAssociations()),
+        recorder=cast(EvidenceRecorder, recorder),
+    )
+
+    for index, tool_name in enumerate(("samples.compare", "features.common"), start=1):
+        registration = registry.get(tool_name, "1")
+        assert registration is not None
+        _definition, adapter = registration
+        result = await adapter.execute(
+            {"sample_sha256s": [_SAMPLE_A]},
+            ToolExecutionContext(
+                investigation_id=_INVESTIGATION_ID,
+                envelope=None,
+                budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 30}),
+                idempotency_key=f"unassociated-similarity-{index}",
+                available_capabilities=frozenset(SIMILARITY_TOOL_NAMES),
+            ),
+        )
+
+        assert result.status is ToolInvocationStatus.UNAVAILABLE
+        assert result.budget_consumed == {BudgetDimension.TOOL_SECONDS: 0}
+        assert result.observation_refs == (recorder.json_observation_id,)
+        assert result.output["schema_version"] == "investigation-similarity-tool-output-v1"
+        availability = result.output["availability"]
+        assert availability["state"] == "unavailable"
+        assert availability["interpretation"] == "not_a_negative_result"
+        reason = availability["reasons_by_sample_sha256"][_SAMPLE_A]
+        assert reason["reason"] == "not_associated_to_investigation"
+        assert reason["next_action"]["code"] == "verify_investigation_association"
+
+    assert recorder.calls == []
+    assert len(recorder.json_calls) == 2
+    assert all(call["kind"] is EvidenceKind.OTHER for call in recorder.json_calls)
+    assert all("not a negative result" in call["limitations"][0] for call in recorder.json_calls)
+    for call in recorder.json_calls:
+        payload = call["payload"]
+        assert payload["schema"] == "investigation-tool-observation.v1"
+        assert payload["result"]["availability"]["interpretation"] == "not_a_negative_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("acquired", "expected_reason", "expected_action"),
+    (
+        (False, "sample_not_acquired", "acquire_sample_if_authorized"),
+        (True, "feature_pack_missing", "verify_acquisition_or_extract_features"),
+    ),
+)
+async def test_missing_selected_pack_is_partial_with_hash_reason_and_next_action(
+    acquired: bool,
+    expected_reason: str,
+    expected_action: str,
+) -> None:
+    packs = _fixture_packs()
+    del packs[_SAMPLE_C]
+    recorder = _EvidenceRecorder()
+    registry = InMemoryToolRegistry()
+    register_similarity_tools(
+        registry,
+        service=_service(packs, acquisition_status={_SAMPLE_C: acquired}),
+        sample_associations=cast(SampleAssociationRepository, _AssociationReader()),
+        recorder=cast(EvidenceRecorder, recorder),
+    )
+    registration = registry.get("features.common", "1")
+    assert registration is not None
+    _definition, adapter = registration
+
+    result = await adapter.execute(
+        {"sample_sha256s": [_SAMPLE_A, _SAMPLE_B, _SAMPLE_C]},
+        ToolExecutionContext(
+            investigation_id=_INVESTIGATION_ID,
+            envelope=None,
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 30}),
+            idempotency_key="missing-feature-pack",
+            available_capabilities=frozenset(SIMILARITY_TOOL_NAMES),
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["schema_version"] == "investigation-similarity-tool-output-v1"
+    availability = result.output["availability"]
+    assert availability["state"] == "partial"
+    assert availability["interpretation"] == "not_a_negative_result"
+    assert "empty" not in result.output
+    reason = availability["reasons_by_sample_sha256"][_SAMPLE_C]
+    assert reason["reason"] == expected_reason
+    assert reason["next_action"]["code"] == expected_action
+    assert result.observation_refs == (
+        recorder.observation_id,
+        recorder.json_observation_id,
+    )
+    assert len(recorder.calls) == len(recorder.json_calls) == 1
+    assert BudgetDimension.VT_UNITS not in result.budget_consumed
+    assert BudgetDimension.DOWNLOADS not in result.budget_consumed
+
+
+@pytest.mark.asyncio
+async def test_all_unacquired_selected_samples_are_unavailable_not_empty() -> None:
+    recorder = _EvidenceRecorder()
+    registry = InMemoryToolRegistry()
+    register_similarity_tools(
+        registry,
+        service=_service(
+            {},
+            acquisition_status={
+                _SAMPLE_A: False,
+                _SAMPLE_B: False,
+                _SAMPLE_C: False,
+            },
+        ),
+        sample_associations=cast(SampleAssociationRepository, _AssociationReader()),
+        recorder=cast(EvidenceRecorder, recorder),
+    )
+    registration = registry.get("samples.compare", "1")
+    assert registration is not None
+    _definition, adapter = registration
+
+    result = await adapter.execute(
+        {"sample_sha256s": [_SAMPLE_A, _SAMPLE_B, _SAMPLE_C]},
+        ToolExecutionContext(
+            investigation_id=_INVESTIGATION_ID,
+            envelope=None,
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 30}),
+            idempotency_key="all-samples-unacquired",
+            available_capabilities=frozenset(SIMILARITY_TOOL_NAMES),
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["availability"]["state"] == "unavailable"
+    assert result.output["availability"]["interpretation"] == "not_a_negative_result"
+    assert "empty" not in result.output
+    reasons = result.output["availability"]["reasons_by_sample_sha256"]
+    for sample_hash in (_SAMPLE_A, _SAMPLE_B, _SAMPLE_C):
+        assert reasons[sample_hash]["reason"] == "sample_not_acquired"
+        assert reasons[sample_hash]["next_action"]["code"] == "acquire_sample_if_authorized"
+    assert BudgetDimension.VT_UNITS not in result.budget_consumed
+    assert BudgetDimension.DOWNLOADS not in result.budget_consumed
+
+
+@pytest.mark.asyncio
+async def test_invalid_acquired_feature_pack_remains_a_real_failure() -> None:
+    packs = _fixture_packs()
+    packs[_SAMPLE_A] = {"sample_sha256": _SAMPLE_A, "features": []}
+    recorder = _EvidenceRecorder()
+    registry = InMemoryToolRegistry()
+    register_similarity_tools(
+        registry,
+        service=_service(packs),
+        sample_associations=cast(SampleAssociationRepository, _AssociationReader()),
+        recorder=cast(EvidenceRecorder, recorder),
+    )
+    registration = registry.get("samples.compare", "1")
+    assert registration is not None
+    _definition, adapter = registration
+
+    result = await adapter.execute(
+        {"sample_sha256s": [_SAMPLE_A, _SAMPLE_B]},
+        ToolExecutionContext(
+            investigation_id=_INVESTIGATION_ID,
+            envelope=None,
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 30}),
+            idempotency_key="invalid-feature-pack",
+            available_capabilities=frozenset(SIMILARITY_TOOL_NAMES),
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.message == "similarity_comparison_failed:SampleSimilarityError"
+    assert result.output == {}
+    assert recorder.calls == []
+    assert recorder.json_calls == []
 
 
 @pytest.mark.asyncio

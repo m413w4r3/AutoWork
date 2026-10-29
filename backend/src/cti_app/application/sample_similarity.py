@@ -21,6 +21,7 @@ from cti_app.domain.sample_similarity import (
     FeatureLoss,
     FeatureSource,
     MeasuredFeature,
+    SimilarityAvailabilityReason,
     SimilarityFeatureKind,
     SimilarityLimits,
     SimilarityPolicy,
@@ -58,6 +59,12 @@ class SimilarityArtifactStorePort(Protocol):
     ) -> BlobRecord: ...
 
 
+class SampleAcquisitionStatusPort(Protocol):
+    """Optionally report acquisition using the current investigation's subject scope."""
+
+    async def is_sample_acquired(self, sample_sha256: str) -> bool | None: ...
+
+
 class SampleSimilarityError(RuntimeError):
     """A frozen-snapshot, feature-pack, or artifact contract failed."""
 
@@ -68,6 +75,7 @@ class StoredFamilyFeatureComparison:
     artifact_blob_id: UUID
     artifact_sha256: str
     artifact_size: int
+    missing_sample_reasons: tuple[tuple[str, SimilarityAvailabilityReason], ...] = ()
 
 
 class SampleSimilarityService:
@@ -118,6 +126,7 @@ class SampleSimilarityService:
 
         sample_inputs: list[SimilaritySampleInput] = []
         missing: list[str] = []
+        missing_reasons: list[tuple[str, SimilarityAvailabilityReason]] = []
         per_sample_limits: list[str] = []
         feature_loss_counts: dict[str, int] = {}
         feature_sets_by_sample: dict[str, tuple[MeasuredFeature, ...]] = {}
@@ -128,6 +137,9 @@ class SampleSimilarityService:
                     SimilaritySampleInput(sample_sha256=sample_hash, measured=False)
                 )
                 missing.append(sample_hash)
+                missing_reasons.append(
+                    (sample_hash, await self._missing_sample_reason(sample_hash))
+                )
                 continue
             if not isinstance(raw_pack, Mapping):
                 raise SampleSimilarityError(
@@ -233,7 +245,14 @@ class SampleSimilarityService:
             artifact_blob_id=blob.id,
             artifact_sha256=blob_descriptor.sha256,
             artifact_size=blob_descriptor.size,
+            missing_sample_reasons=tuple(sorted(missing_reasons)),
         )
+
+    async def _missing_sample_reason(self, sample_sha256: str) -> SimilarityAvailabilityReason:
+        acquisition_status = getattr(self._feature_packs, "is_sample_acquired", None)
+        if callable(acquisition_status) and await acquisition_status(sample_sha256) is False:
+            return SimilarityAvailabilityReason.SAMPLE_NOT_ACQUIRED
+        return SimilarityAvailabilityReason.FEATURE_PACK_MISSING
 
     async def _prepare_goodware(
         self, snapshot: CorpusSnapshot
@@ -834,6 +853,7 @@ def _measured_sort_key(item: MeasuredFeature) -> tuple[str, ...]:
 __all__ = [
     "CorpusSnapshotPort",
     "GoodwarePrevalencePort",
+    "SampleAcquisitionStatusPort",
     "SampleSimilarityError",
     "SampleSimilarityService",
     "SimilarityArtifactStorePort",
