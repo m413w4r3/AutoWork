@@ -1271,7 +1271,9 @@
           ]
         ]
       ]
-      #render-publication-provenance(publication.at("document_label"))
+      #if publication.at("document_label", default: none) != none [
+        #render-publication-provenance(publication.at("document_label"))
+      ]
       #set page(flipped: false)
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
