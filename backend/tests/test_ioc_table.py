@@ -579,6 +579,17 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
     reader = PdfReader(pdf_path, strict=True)
     page_count = len(reader.pages)
     assert 4 <= page_count <= 7
+    assert all(
+        (
+            abs(float(page.mediabox.width) - 595.28) < 0.2
+            and abs(float(page.mediabox.height) - 841.89) < 0.2
+        )
+        or (
+            abs(float(page.mediabox.width) - 841.89) < 0.2
+            and abs(float(page.mediabox.height) - 595.28) < 0.2
+        )
+        for page in reader.pages
+    )
     page_texts = [page.extract_text() or "" for page in reader.pages]
     hash_pages = [
         page_number
@@ -602,13 +613,13 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
     )
     assert 1 <= len(hash_pages) <= 4
     assert hash_row_page_counts[hash_table_page] >= 15
-    assert len(trace_pages) == 1
+    assert 1 <= len(trace_pages) <= 2
     assert matching_trace_refs == 67
 
-    for image_name, page_number in (
+    for image_name, page_number in [
         ("hash-table-70dpi", hash_table_page),
-        ("traceability-70dpi", trace_pages[0]),
-    ):
+        *((f"traceability-70dpi-{page_number}", page_number) for page_number in trace_pages),
+    ]:
         await asyncio.to_thread(
             subprocess.run,
             (

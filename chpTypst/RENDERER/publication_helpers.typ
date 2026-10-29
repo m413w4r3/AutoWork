@@ -650,32 +650,38 @@
 
 // Preserve intrinsic dimensions and scale down to the printable frame before
 // laying out the image with its caption and source note.
-#let render-publication-image(media-path, caption, annotation: [], max-height-fraction: 0.82) = layout(size => {
-  let natural-image = image(media-path)
-  let natural-size = measure(natural-image)
-  let following-content = [
-    #if caption != none [
-      #v(4pt)
-      #caption
+#let render-publication-image(media-path, caption, annotation: [], max-height-fraction: 0.82) = block(
+  breakable: false,
+  width: 100%,
+  below: 10pt,
+)[
+  #layout(size => {
+    let natural-image = image(media-path)
+    let natural-size = measure(natural-image)
+    let following-content = [
+      #if caption != none [
+        #v(4pt)
+        #caption
+      ]
+      #annotation
     ]
-    #annotation
-  ]
-  let max-image-height = calc.max(1pt, size.height * max-height-fraction)
-  let scale = calc.min(
-    1,
-    calc.min(size.width / natural-size.width, max-image-height / natural-size.height),
-  )
-  let rendered-image = if scale < 1 {
-    image(media-path, width: natural-size.width * scale)
-  } else {
-    natural-image
-  }
+    let max-image-height = calc.max(1pt, size.height * max-height-fraction)
+    let scale = calc.min(
+      1,
+      calc.min(size.width / natural-size.width, max-image-height / natural-size.height),
+    )
+    let rendered-image = if scale < 1 {
+      image(media-path, width: natural-size.width * scale)
+    } else {
+      natural-image
+    }
 
-  block(breakable: false, width: 100%)[
-    #align(center)[#rendered-image]
-    #following-content
-  ]
-})
+    block(breakable: false, width: 100%)[
+      #align(center)[#rendered-image]
+      #following-content
+    ]
+  })
+]
 
 #let render-diagram(item) = {
   let legacy-renderer = item.at("legacy_renderer", default: false)

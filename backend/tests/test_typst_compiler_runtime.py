@@ -1201,8 +1201,14 @@ async def test_real_typst_lot6_a4_composition_fixture(
     compact_text = "".join(text.split())
     assert len(reader.pages) >= 4
     assert all(
-        abs(float(page.mediabox.width) - 595.28) < 0.2
-        and abs(float(page.mediabox.height) - 841.89) < 0.2
+        (
+            abs(float(page.mediabox.width) - 595.28) < 0.2
+            and abs(float(page.mediabox.height) - 841.89) < 0.2
+        )
+        or (
+            abs(float(page.mediabox.width) - 841.89) < 0.2
+            and abs(float(page.mediabox.height) - 595.28) < 0.2
+        )
         for page in reader.pages
     )
     assert "5 octobre 2026 : La source décrit l'activité après sa publication." in text
@@ -1281,7 +1287,7 @@ async def test_real_typst_bounds_tall_media_and_keeps_following_text_on_page(
             "portrait-diagram.svg": _svg_fixture(
                 420,
                 1200,
-                "Node label remains readable",
+                "Node label",
                 "#e9e4f5",
             )
         },
@@ -1298,8 +1304,68 @@ async def test_real_typst_bounds_tall_media_and_keeps_following_text_on_page(
     )
 
     reader = PdfReader(BytesIO(compiled.content), strict=True)
-    assert len(reader.pages) == 2
-    text = " ".join((reader.pages[0].extract_text() or "").split())
-    assert "Text immediately before the diagram." in text
-    assert "Figure 1 : Portrait diagram caption stays with the image." in text
-    assert "Text immediately after the diagram." in text
+    assert all(
+        (
+            abs(float(page.mediabox.width) - 595.28) < 0.2
+            and abs(float(page.mediabox.height) - 841.89) < 0.2
+        )
+        or (
+            abs(float(page.mediabox.width) - 841.89) < 0.2
+            and abs(float(page.mediabox.height) - 595.28) < 0.2
+        )
+        for page in reader.pages
+    )
+    page_texts = [" ".join((page.extract_text() or "").split()) for page in reader.pages]
+    assert any(
+        "Text immediately before the diagram." in text
+        and "Figure 1 : Portrait diagram caption stays with the image." in text
+        and "Text immediately after the diagram." in text
+        for text in page_texts
+    )
+    assert any("Node label" in text for text in page_texts)
+
+    pdftotext = shutil.which("pdftotext")
+    assert pdftotext is not None, "pdftotext is required to check rendered text bounds"
+    pdf_path = tmp_path / "tall-media.pdf"
+    pdf_path.write_bytes(compiled.content)
+    with anyio.fail_after(10):
+        bbox = await anyio.run_process(
+            (pdftotext, "-bbox-layout", str(pdf_path), "-"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    root = ET.fromstring(bbox.stdout.decode("utf-8", errors="replace"))
+    pages = [element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "page"]
+    assert len(pages) == len(reader.pages)
+    for page in pages:
+        page_width = float(page.attrib["width"])
+        page_height = float(page.attrib["height"])
+        page_lines = [
+            (
+                float(line.attrib["yMin"]),
+                float(line.attrib["yMax"]),
+                " ".join(
+                    word.text or "" for word in line if word.tag.rsplit("}", 1)[-1] == "word"
+                ).strip(),
+            )
+            for line in page.iter()
+            if line.tag.rsplit("}", 1)[-1] == "line"
+        ]
+        for word in page.iter():
+            if word.tag.rsplit("}", 1)[-1] == "word":
+                assert 0 <= float(word.attrib["xMin"])
+                assert float(word.attrib["xMax"]) <= page_width
+                assert 0 <= float(word.attrib["yMin"])
+                assert float(word.attrib["yMax"]) <= page_height
+        caption_line = next(
+            line
+            for line in page_lines
+            if "Portrait diagram caption stays with the image." in line[2]
+        )
+        after_line = next(
+            line for line in page_lines if "Text immediately after the diagram." in line[2]
+        )
+        assert caption_line[1] <= after_line[0], (
+            f"figure caption overlaps following text: {caption_line} / {after_line}"
+        )

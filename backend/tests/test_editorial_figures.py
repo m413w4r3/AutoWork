@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -663,15 +664,15 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         legend_start = next(
             i for i, (_, _, text) in enumerate(legend_page) if text.startswith("Légende :")
         )
-        legend_end = (
-            next(
-                i
-                for i, (_, _, text) in enumerate(legend_page)
-                if i > legend_start and text.strip() == "IOC"
-            )
-            - 1
-        )
-        legend_lines = legend_page[legend_start : legend_end + 1]
+        # The technical annex now starts on a new landscape page, so there is
+        # no next-section heading on the legend page to use as a boundary.
+        # Keep the footer out of the body spacing check.
+        legend_lines = [
+            line
+            for line in legend_page[legend_start:]
+            if line[2] != "BROUILLON NON APPROUVÉ"
+            and re.fullmatch(r"\d+\s*/\s*\d+", line[2]) is None
+        ]
         for previous, current in pairwise(legend_lines):
             assert previous[1] <= current[0], f"graph legend lines overlap: {previous} / {current}"
         return page_index
