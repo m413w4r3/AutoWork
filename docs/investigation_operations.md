@@ -148,3 +148,19 @@ pour le Bridge ; elle ne gouverne pas cet appel.
 - **Aucun tour Bridge n'arrive après une demande** : vérifiez le job durable,
   son état et la génération suivante. Les replays de `Idempotency-Key`
   renvoient la demande/job existants.
+
+## Known gap — restricted sample identifiers in Bridge context (M07, 2026-10-29)
+
+The Bridge/advisor prompt builders do not re-evaluate the *effective policy of each sample*
+(TLP RED, `external_llm_allowed=false`, restrictive licence) before serializing sample hashes
+or identifiers taken from recent tool results, article-derived `documented_samples`, IOC pivots
+or free text. The send gate checks the investigation envelope and the synthesis snapshot only.
+This pre-dates `archive.extract_member`; derived members inherit the parent's restrictive policy
+but their hashes flow like any other sample hash. A central redaction pass was attempted in
+branches `m07/bridge-context-sample-policy*`, `m07/bridge-context-keep-observation-ids` and
+`m07/bridge-central-redaction`; code review kept finding bypasses (absent resolver fail-open,
+resumed turns losing redaction metadata, advisor/plan prompts built outside the central
+renderer, UUID prefix collisions) and the series was reverted before deployment. A correct fix
+must redact at the final prompt of **every** Bridge transport caller, fail closed when sample
+policy is unresolved, and bound the redaction set. Until then, run restricted samples (RED or
+`external_llm_allowed=false`) with Bridge disabled for that investigation.
