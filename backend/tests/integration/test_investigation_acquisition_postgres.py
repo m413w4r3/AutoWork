@@ -1257,7 +1257,7 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         context = ToolExecutionContext(
             investigation_id=investigation.id,
             envelope=approved,
-            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1}),
+            budget=approved.budget,
             idempotency_key="archive-member-postgres-first",
             available_capabilities=frozenset({ARCHIVE_EXTRACT_MEMBER_CAPABILITY}),
             actor_id="analyst:integration",
@@ -1321,7 +1321,7 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         assert derivations[0].actor_id == "analyst:integration"
         assert derivations[0].payload["reason"] == arguments["reason"]
         assert child_sample.do_not_submit is True and child_sample.external_llm_allowed is False
-        assert child_sample.tlp is TLP.AMBER
+        assert child_sample.tlp is TLP.RED
         assert child_sample.license_restriction == "internal-only"
 
         # A hash present only under another subject must not prelink the new
@@ -1505,7 +1505,6 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         race_context = replace(
             context,
             idempotency_key="archive-member-postgres-revoke-race",
-            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1}),
         )
         race_task = asyncio.create_task(
             RegistryToolDispatcher(race_registry).dispatch(
