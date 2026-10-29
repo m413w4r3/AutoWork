@@ -27,7 +27,8 @@ Décisions et préférences de l'utilisateur (à respecter, elles priment sur le
 
 ## 1. État vérifié au moment du handoff
 
-- Dépôt : `main` local = voir `git log -1` (merges M07 jusqu'au rendu Typst `m07/typst-opinion-layout`) ;
+- Dépôt : `main` local = `d2d22da0` au moment du handoff (suite de gates verte : ruff/format sur tout `backend/` migrations incluses, mypy 427 fichiers,
+  5 346 tests unitaires dont rendus Typst réels, 460 tests PG) ;
   **`origin/main` = `2ea40d4f`, ~47 commits de retard** (rien n'a été poussé après `4a18e688` ; la CI GitHub n'a pas été relancée
   sur ces commits ; deux tests PG qui échouaient en CI sont corrigés localement, cf. §3).
 - Déployé : vérifier avec `docs/mission07/tools/container_fingerprint.py` (dans chaque conteneur) == `git_fingerprint.py`.
@@ -47,9 +48,15 @@ Décisions et préférences de l'utilisateur (à respecter, elles priment sur le
   statique restent `qualified` ; aucun IOC réseau, aucune exécution, aucune attribution indépendante, pas de constante crypto observée.
   Avis `128f991d-09c9-5cb5-905c-d0c044bfff00` **v9 DRAFT** SHA `cedb2157e6bfd06f0bfd8b61765e9e1b183e9dc76d43e5be6ae6e6b6e80047c8`
   (non approuvé, non publié ; relecture Bridge valide `8a15ea8a-7f7d-468f-84aa-d658ad3b122b`, 7 unités). Verdicts de remarques : `analyst_log.md`.
-- PDF : `.autowork-runs/m07/editorial/opinion-v8-draft.pdf` (18 p., QA FAIL mise en page : `pdf_qa_001.md`). Le correctif de rendu
-  (paysage IOC, tableaux pipe, logo, sources consolidées, provenance compacte, carte de synthèse) est mergé ; **le PDF v9 avec le nouveau
-  rendu reste à produire et à inspecter** (cf. §5).
+- PDF : v8 (ancien moteur, 18 p.) = QA FAIL (`pdf_qa_001.md`). **v9 rendu avec le nouveau moteur** (déployé, `main@d2d22da0`, empreinte
+  `9c99e611cbca43ec` vérifiée sur les 4 services, Alembic 0006) : `.autowork-runs/m07/editorial/opinion-v9-draft.pdf` (22 p., 816 Ko, SHA-256
+  `ba8157515326e6f76e864b782ee8413f6450c4bb534f1a6ade4abb6654888d33`, pages PNG dans `pages-v9/`). Constaté à vue (pages 1, 9, 10) : logo
+  Chaps Vision en en-tête, carte de synthèse (statut/sources), sources consolidées, tableau d'inventaire réel en page paysage avec hashes
+  complets (sur 2 lignes), pages d'annexe paysage. **Défauts restants repérés, non encore traités** : (a) les accents graves des paragraphes
+  d'analyste s'impriment littéralement (`` `Resources/PsProxy.dll` ``) : rendre les spans de code inline hors tableaux ; (b) « Confiance : 90 % »
+  affiche les `certainty` des blocs comme des probabilités (non calibrées, l'éditeur l'a déconseillé) : remplacer par un libellé qualitatif ou
+  masquer ; (c) page 9 à moitié vide, ouverture (références/chronologie avant synthèse, p.1-2) ; (d) pas de bandeau TLP (aucun TLP canonique) ;
+  (e) la QA TYPST-PDF n'a pas encore été refaite sur v9 ; (f) `pdfinfo` signale « Suspects object wrong type » (aussi sur la référence).
 - Invocations `needs_review` (toutes avant-envoi ou ambiguës, **ne pas rejouer à l'aveugle**) : `9aaec14d` (vt.file_report du ZIP, humain seul),
   `36114580` (vt.relationships bundled_files), ~18 `advisor.consult` (refus avant envoi anciens, `c9-049` ambigu 0 octet, etc.),
   `4a59599e` (shodan.host refusé 403). Elles gardent des réservations (Bridge 19 réservés) : sans effet (200 tours) mais à réconcilier
