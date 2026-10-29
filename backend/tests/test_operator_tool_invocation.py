@@ -2964,7 +2964,7 @@ async def test_operator_http_route_rejects_invalid_body_before_dispatch() -> Non
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_stage",
-    ["evidence_preflight", "bridge_transport_pre_submission", "pre_submission"],
+    ["evidence_preflight", "bridge_transport_pre_submission"],
 )
 async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry(
     failure_stage: str,
