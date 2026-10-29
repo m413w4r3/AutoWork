@@ -294,7 +294,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert data["overview"] == {"status_label": "Publication", "source_count": 1}
     assert data["brand_logo_available"] is False
     assert "classification_label" not in data
-    synthesis, references = data["content_sections"]
+    references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert len(references["entries"]) == 1
     assert references["entries"][0]["source_urls"] == ["https://example.test/1"]
@@ -1057,9 +1057,9 @@ def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(
     paragraphs = [block["text"] for block in synthesis["blocks"] if block["type"] == "paragraph"]
 
     assert [section["type"] for section in data["content_sections"]] == [
-        "synthesis",
         "references",
         "chronology",
+        "synthesis",
         "ioc",
         "technical_annex",
     ]
