@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -37,6 +38,11 @@ _STOP = frozenset(
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
     "ses from that this those have with which what where when then than into over under".split()
 )
+_ADVISOR_DOSSIER_SOFT_LIMIT_BYTES = 400_000
+_ADVISOR_DOSSIER_HARD_LIMIT_BYTES = 2_000_000
+_ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES = 12 * 1024
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/]{64,}={0,2}")
+logger = logging.getLogger(__name__)
 
 
 _DEFAULT_TASKS = {
@@ -1427,8 +1433,8 @@ def build_advisor_dossier(
                 candidates = [item for item in candidates if item not in fallback_proofs]
                 candidates.append(best_fallback)
 
-    # Keep only task-relevant facts. Every explicitly cited source retains its
-    # best available content card; there is no byte-based clipping here.
+    # Keep task-relevant facts first; explicit size limits are applied after
+    # this relevance selection so ordinary small dossiers retain full bodies.
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in sorted(
@@ -1451,88 +1457,180 @@ def build_advisor_dossier(
         elif kind == "observation":
             unavailable_observations.add(identifier)
 
-    # Keep a stable alias for each displayed fact. The mapping stays local and
-    # carries only the data needed by output validation and provenance.
-    manifest: list[dict[str, Any]] = []
-    rendered: list[str] = []
-    review_target_index = 0
-    evidence_index = 0
-    for item in selected:
-        if item["origin"] == "versioned_review_target":
-            review_target_index += 1
-            alias = f"T{review_target_index}"
-        else:
-            evidence_index += 1
-            alias = f"E{evidence_index}"
-        piece = f"[{alias}] {item['label']}\n{_quote(item['body'])}"
-        body_bytes = item["body"].encode("utf-8")
-        piece_bytes = piece.encode("utf-8")
-        manifest.append(
-            {
-                "alias": alias,
-                "kind": item["kind"],
-                "id": item["id"],
-                "sha256": item["sha256"],
-                "label": item["label"],
-                "origin": item["origin"],
-                **(
-                    {"opinion_version": item["opinion_version"]}
-                    if item.get("opinion_version")
-                    else {}
-                ),
-                **item.get("extra", {}),
-                "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
-                "body_bytes": len(body_bytes),
-                "rendered_sha256": hashlib.sha256(piece_bytes).hexdigest(),
-                "rendered_bytes": len(piece_bytes),
-            }
+    dossier = _render_advisor_dossier(
+        selected,
+        unavailable_observations=unavailable_observations,
+        contradiction_requested=contradiction_requested,
+        explicit_claims=explicit_claims,
+        prompt_data=prompt_data,
+    )
+    initial_dossier_bytes = dossier.byte_size
+    compacted_body_count = 0
+    reference_only_body_count = 0
+    hard_omitted_count = 0
+
+    if initial_dossier_bytes <= _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES and any(
+        item.get("kind") in {"observation", "measurement"}
+        and len(_as_text(item.get("body")).encode("utf-8")) > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES
+        for item in selected
+    ):
+        selected = _compact_advisor_candidates(selected, only_large_observation_bodies=True)
+        dossier = _render_advisor_dossier(
+            selected,
+            unavailable_observations=unavailable_observations,
+            contradiction_requested=contradiction_requested,
+            explicit_claims=explicit_claims,
+            prompt_data=prompt_data,
         )
-        rendered.append(piece)
-
-    lines = ["DOSSIER DE FAITS"]
-    if rendered:
-        lines.extend(rendered)
-    else:
-        lines.append("Aucun fait source pertinent n\u2019a été chargé pour cette tâche.")
-
-    # One precise note replaces one placeholder card per unavailable source.
-    if unavailable_observations:
-        lines.append(
-            "Limite pertinente: contenu lisible indisponible pour "
-            f"{len(unavailable_observations)} observation(s) citée(s)."
+        compacted_body_count = sum(
+            bool(item.get("_compaction", {}).get("body_truncated")) for item in selected
         )
 
-    if contradiction_requested:
-        selected_claims = {
-            _as_text(item.get("extra", {}).get("claim_id")).casefold()
-            for item in selected
-            if item["kind"] == "article" and _as_text(item.get("extra", {}).get("claim_id"))
-        }
-        contradiction_claims = explicit_claims or selected_claims
-        refuted_claims = {
-            _as_text(claim_id).casefold()
-            for item in prompt_data.get("findings", ())
-            if isinstance(item, Mapping) and _as_text(item.get("assessment")) == "refuted"
-            for claim_id in item.get("claim_refs", ())
-        }
-        uncovered_claims = sorted(contradiction_claims - refuted_claims)
-        if uncovered_claims:
-            lines.append(
-                "Aucune réfutation connue pour les passages "
-                f"{', '.join(uncovered_claims)} ; la recherche de contradictions fait l'objet "
-                "de cette consultation. Cette absence ne prouve pas qu'aucune contradiction "
-                "n'existe."
+    if initial_dossier_bytes > _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES:
+        selected = _compact_advisor_candidates(selected)
+        volume_note = (
+            "TRONQUÉ explicitement par la limite volumétrique du dossier: "
+            f"taille initiale={initial_dossier_bytes} octets; contenu et références conservés."
+        )
+        dossier = _render_advisor_dossier(
+            selected,
+            unavailable_observations=unavailable_observations,
+            contradiction_requested=contradiction_requested,
+            explicit_claims=explicit_claims,
+            prompt_data=prompt_data,
+            volume_note=volume_note,
+        )
+        compacted_body_count = sum(
+            bool(item.get("_compaction", {}).get("body_truncated")) for item in selected
+        )
+
+        estimated_bytes = dossier.byte_size
+        reference_candidates = sorted(
+            (
+                item
+                for item in selected
+                if not item.get("_compaction", {}).get("body_reused_from_alias")
+            ),
+            key=lambda item: len(_advisor_candidate_piece(item).encode("utf-8")),
+            reverse=True,
+        )
+        for item in reference_candidates:
+            if estimated_bytes <= _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES - 1_024:
+                break
+            previous_size = len(_advisor_candidate_piece(item).encode("utf-8"))
+            previous_meta = dict(item.get("_compaction", {}))
+            referenced_body, reference_meta = _reference_advisor_body(
+                item, alias=None, reason="limite souple de 400 Ko"
             )
-        elif not any(
-            item["kind"] == "finding" and item.get("assessment") == "refuted" for item in selected
-        ):
-            lines.append(
-                "Aucun finding évalué comme réfuté n'a été chargé dans le dossier ; la recherche "
-                "de contradictions fait l'objet de cette consultation. Cette absence ne prouve "
-                "pas qu'aucune contradiction n'existe."
+            reference_size = len(
+                _advisor_candidate_piece({**item, "body": referenced_body}).encode("utf-8")
+            )
+            if reference_size >= previous_size:
+                continue
+            item["body"] = referenced_body
+            _carry_advisor_compaction_provenance(reference_meta, previous_meta)
+            item["_compaction"] = reference_meta
+            estimated_bytes -= previous_size - reference_size
+            reference_only_body_count += 1
+        if reference_only_body_count:
+            volume_note = (
+                "TRONQUÉ explicitement par la limite volumétrique du dossier: "
+                f"taille initiale={initial_dossier_bytes} octets; "
+                f"{reference_only_body_count} corps remplacé(s) par des références."
+            )
+            dossier = _render_advisor_dossier(
+                selected,
+                unavailable_observations=unavailable_observations,
+                contradiction_requested=contradiction_requested,
+                explicit_claims=explicit_claims,
+                prompt_data=prompt_data,
+                volume_note=volume_note,
             )
 
-    return AdvisorDossier(text="\n\n".join(lines), manifest=tuple(manifest))
+        while dossier.byte_size > _ADVISOR_DOSSIER_HARD_LIMIT_BYTES:
+            changed = False
+            for item in selected:
+                if (
+                    item.get("_hard_reference_only")
+                    or item.get("_compaction", {}).get("reference_only")
+                    or item.get("_compaction", {}).get("body_reused_from_alias")
+                ):
+                    continue
+                previous_meta = dict(item.get("_compaction", {}))
+                referenced_body, reference_meta = _reference_advisor_body(
+                    item, alias=None, reason="limite dure de 2 Mo"
+                )
+                if len(referenced_body.encode("utf-8")) >= len(
+                    _as_text(item.get("body")).encode("utf-8")
+                ):
+                    continue
+                item["body"] = referenced_body
+                _carry_advisor_compaction_provenance(reference_meta, previous_meta)
+                item["_compaction"] = reference_meta
+                item["_hard_reference_only"] = True
+                reference_only_body_count += 1
+                changed = True
+            if not changed:
+                # Extremely high card counts are bounded by shortening labels;
+                # IDs, source hashes, and full-body references remain in each card.
+                for item in selected:
+                    label = _as_text(item.get("label"))
+                    if len(label) > 64:
+                        item["label"] = _clip_utf8(label, 64) + "…"
+                        changed = True
+                if not changed:
+                    break
+            volume_note = (
+                "TRONQUÉ explicitement par la limite dure de 2 Mo: "
+                f"taille initiale={initial_dossier_bytes} octets; "
+                f"{reference_only_body_count} corps remplacé(s) par des références."
+            )
+            dossier = _render_advisor_dossier(
+                selected,
+                unavailable_observations=unavailable_observations,
+                contradiction_requested=contradiction_requested,
+                explicit_claims=explicit_claims,
+                prompt_data=prompt_data,
+                volume_note=volume_note,
+            )
+
+        if dossier.byte_size > _ADVISOR_DOSSIER_HARD_LIMIT_BYTES:
+            selected, dossier, hard_omitted_count = _trim_advisor_dossier_to_limit(
+                selected,
+                limit_bytes=_ADVISOR_DOSSIER_HARD_LIMIT_BYTES,
+                unavailable_observations=unavailable_observations,
+                contradiction_requested=contradiction_requested,
+                explicit_claims=explicit_claims,
+                prompt_data=prompt_data,
+                initial_bytes=initial_dossier_bytes,
+                required_references=explicitly_referenced,
+            )
+
+    logger.info(
+        "Advisor dossier volume",
+        extra={
+            "advisor_dossier_input_bytes": initial_dossier_bytes,
+            "advisor_dossier_output_bytes": dossier.byte_size,
+            "advisor_dossier_candidate_count": len(selected),
+            "advisor_dossier_compacted_body_count": compacted_body_count,
+            "advisor_dossier_reference_only_body_count": reference_only_body_count,
+            "advisor_dossier_hard_omitted_candidate_count": hard_omitted_count,
+            "advisor_dossier_hard_limit_reached": (
+                dossier.byte_size >= _ADVISOR_DOSSIER_HARD_LIMIT_BYTES
+            ),
+        },
+    )
+    if dossier.byte_size > _ADVISOR_DOSSIER_HARD_LIMIT_BYTES:
+        logger.error(
+            "Advisor dossier remains above hard byte limit",
+            extra={
+                "advisor_dossier_input_bytes": initial_dossier_bytes,
+                "advisor_dossier_output_bytes": dossier.byte_size,
+                "advisor_dossier_hard_limit_bytes": _ADVISOR_DOSSIER_HARD_LIMIT_BYTES,
+                "advisor_dossier_candidate_count": len(selected),
+            },
+        )
+    return dossier
 
 
 def evaluate_advisor_evidence_preflight(
@@ -2378,6 +2476,724 @@ def _candidate(
         "opinion_version": opinion_version,
         "extra": dict(extra or {}),
     }
+
+
+def _advisor_source_body_ref(item: Mapping[str, Any]) -> str:
+    kind = _as_text(item.get("kind"))
+    identifier = _as_text(item.get("id"))
+    extra = item.get("extra")
+    if kind == "observation":
+        return f"observation {identifier}"
+    if isinstance(extra, Mapping):
+        observation_id = _as_text(extra.get("evidence_id"))
+        if observation_id:
+            return f"observation {observation_id}"
+        source_ref = extra.get("source_ref")
+        if isinstance(source_ref, Mapping):
+            source_kind = _as_text(source_ref.get("kind"))
+            source_id = _as_text(source_ref.get("id"))
+            if source_kind and source_id:
+                return f"{source_kind} {source_id}"
+    return f"{kind or 'source'} {identifier}".strip()
+
+
+def _advisor_base64_payload(body: str) -> tuple[str, bytes] | None:
+    if "base64" not in body.casefold():
+        return None
+    matches = _BASE64_RUN.findall(body)
+    for payload in sorted(matches, key=len, reverse=True):
+        try:
+            return payload, base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error):
+            continue
+    return None
+
+
+def _clip_utf8(value: str, max_bytes: int, *, tail: bool = False) -> str:
+    encoded = value.encode("utf-8")
+    selected = encoded[-max_bytes:] if tail else encoded[:max_bytes]
+    return selected.decode("utf-8", errors="ignore")
+
+
+def _compact_advisor_body(
+    item: Mapping[str, Any], body: str, *, max_bytes: int
+) -> tuple[str, dict[str, Any]]:
+    """Return an explicit, source-addressable excerpt of a large dossier body."""
+    encoded = body.encode("utf-8")
+    body_sha256 = hashlib.sha256(encoded).hexdigest()
+    source_sha256 = _as_text(item.get("sha256")) or "UNKNOWN"
+    source_ref = _advisor_source_body_ref(item)
+    extra = item.get("extra")
+    source_offset = extra.get("offset") if isinstance(extra, Mapping) else None
+    source_length = (
+        extra.get("byte_length", extra.get("length")) if isinstance(extra, Mapping) else None
+    )
+    if source_offset is None:
+        offset_match = re.search(r"\boffset(?:_bytes)?\s*(?:=|:|\s)\s*(\d+)", body, re.I)
+        source_offset = int(offset_match.group(1)) if offset_match else None
+    if source_length is None:
+        length_match = re.search(r"\bbyte_length\s*=\s*(\d+)", body, re.I)
+        source_length = int(length_match.group(1)) if length_match else None
+    source_location = (
+        f"; source byte offset={source_offset}"
+        if type(source_offset) is int and source_offset >= 0
+        else ""
+    )
+    if type(source_length) is int and source_length >= 0:
+        source_location += f"; source byte length={source_length}"
+    marker = (
+        f"TRONQUÉ explicitement: offset UTF-8 0..{len(encoded)}, longueur={len(encoded)} octets; "
+        f"sha256_corps={body_sha256}; sha256={source_sha256}; "
+        f"sha256_source={source_sha256}{source_location}; "
+        f"corps complet : {source_ref}"
+    )
+
+    base64_payload = _advisor_base64_payload(body)
+    if base64_payload is not None:
+        payload, raw_payload = base64_payload
+        payload_matches = _BASE64_RUN.findall(body)
+        decoded_bytes = 0
+        for match in payload_matches:
+            try:
+                decoded_bytes += len(base64.b64decode(match, validate=True))
+            except (ValueError, binascii.Error):
+                continue
+        payload_sha256 = hashlib.sha256(raw_payload).hexdigest()
+        sample_size = min(192, max(32, max_bytes // 48), len(payload) // 2)
+        prefix = payload[:sample_size]
+        suffix = payload[-sample_size:]
+        payload_start_char = body.find(payload)
+        payload_start = len(body[:payload_start_char].encode("utf-8"))
+        payload_end = payload_start + len(payload.encode("ascii"))
+        fixed_text = (
+            f"Bruit base64 résumé: {len(payload_matches)} occurrence(s), "
+            f"{sum(len(value) for value in payload_matches)} caractères base64, "
+            f"{decoded_bytes} octets décodés au total; "
+            f"sha256_payload_échantillonné={payload_sha256}."
+        )
+        payload_matches_with_offsets = list(_BASE64_RUN.finditer(body))
+        context_segments: list[tuple[str, int, int]] = []
+        cursor = 0
+        cursor_bytes = 0
+        for match in payload_matches_with_offsets:
+            if match.start() > cursor:
+                segment = body[cursor : match.start()]
+                start_byte = cursor_bytes
+                segment_bytes = len(segment.encode("utf-8"))
+                context_segments.append((segment, start_byte, start_byte + segment_bytes))
+                cursor_bytes += segment_bytes
+            cursor_bytes += len(match.group().encode("ascii"))
+            cursor = match.end()
+        if cursor < len(body):
+            segment = body[cursor:]
+            start_byte = cursor_bytes
+            context_segments.append(
+                (segment, start_byte, start_byte + len(segment.encode("utf-8")))
+            )
+        fixed_bytes = (
+            len(fixed_text.encode("utf-8"))
+            + len(prefix.encode("ascii"))
+            + len(suffix.encode("ascii"))
+            + len(marker.encode("utf-8"))
+            + 512
+        )
+        context_budget = max(0, max_bytes - fixed_bytes)
+        context_size = sum(
+            len(segment.encode("utf-8")) for segment, _start, _end in context_segments
+        )
+        context_was_truncated = context_size > context_budget
+        shown_context: list[tuple[str, int, int]] = []
+        if not context_was_truncated:
+            shown_context = context_segments
+        elif context_segments:
+            first_text, first_start, _first_end = context_segments[0]
+            last_text, _last_start, last_end = context_segments[-1]
+            side = max(0, context_budget // 2)
+            first_excerpt = _clip_utf8(first_text, side)
+            last_excerpt = _clip_utf8(last_text, side, tail=True)
+            first_excerpt_bytes = len(first_excerpt.encode("utf-8"))
+            last_excerpt_bytes = len(last_excerpt.encode("utf-8"))
+            if first_excerpt:
+                shown_context.append(
+                    (first_excerpt, first_start, first_start + first_excerpt_bytes)
+                )
+            if last_excerpt:
+                last_excerpt_start = last_end - last_excerpt_bytes
+                if shown_context and last_excerpt_start < shown_context[-1][2]:
+                    shown_context[-1] = (
+                        first_excerpt,
+                        first_start,
+                        first_start + first_excerpt_bytes,
+                    )
+                else:
+                    shown_context.append((last_excerpt, last_excerpt_start, last_end))
+        lines = [fixed_text]
+        ranges: list[list[int]] = []
+        for context, context_start, context_end in shown_context:
+            lines.append(f"Contexte UTF-8 {context_start}..{context_end}:")
+            lines.append(context)
+            ranges.append([context_start, context_end])
+        if context_was_truncated:
+            lines.append(
+                "Contexte adjacent tronqué explicitement; les autres séquences base64 "
+                "sont résumées par les statistiques ci-dessus."
+            )
+        if prefix == suffix:
+            sample_lines = [
+                f"Échantillon début/fin identique (offsets UTF-8 "
+                f"{payload_start}..{payload_start + len(prefix)} et "
+                f"{payload_start + len(payload) - len(suffix)}..{payload_end}): {prefix}"
+            ]
+        else:
+            sample_lines = [
+                f"Échantillon début (offset UTF-8 "
+                f"{payload_start}..{payload_start + len(prefix)}): {prefix}",
+                f"Échantillon fin (offset UTF-8 "
+                f"{payload_start + len(payload) - len(suffix)}..{payload_end}): {suffix}",
+            ]
+        lines.extend(sample_lines)
+        lines.append(marker)
+        body = "\n".join(lines)
+        ranges.extend(
+            [
+                [payload_start, payload_start + len(prefix)],
+                [payload_start + len(payload) - len(suffix), payload_end],
+            ]
+        )
+        if len(body.encode("utf-8")) > max_bytes:
+            lines = [
+                fixed_text,
+                "Contexte adjacent tronqué explicitement pour respecter la taille maximale "
+                "de l'extrait; les séquences base64 supplémentaires sont résumées ci-dessus.",
+                *sample_lines,
+                marker,
+            ]
+            body = "\n".join(lines)
+            ranges = [
+                [payload_start, payload_start + len(prefix)],
+                [payload_start + len(payload) - len(suffix), payload_end],
+            ]
+        return body, {
+            "body_truncated": True,
+            "source_body_sha256": body_sha256,
+            "source_body_bytes": len(encoded),
+            "displayed_excerpt_ranges_utf8": ranges,
+            "full_body_ref": source_ref,
+            "payload_sha256": payload_sha256,
+            "payload_bytes": len(raw_payload),
+        }
+
+    folded = f"{_as_text(item.get('label'))} {body}".casefold()
+    if any(
+        token in folded for token in ("strings", "decoded", "décod", "chaînes", "valeurs décodées")
+    ):
+        unique_line_digests: set[bytes] = set()
+        line_count = 0
+        longest_line = 0
+        unique_count_capped = False
+        for match in re.finditer(r"[^\n]+", body):
+            line = match.group().strip().removeprefix("|").strip()
+            if not line:
+                continue
+            line_count += 1
+            longest_line = max(longest_line, len(line.encode("utf-8")))
+            if len(unique_line_digests) < 8_192:
+                unique_line_digests.add(hashlib.sha256(line.encode("utf-8")).digest())
+            else:
+                unique_count_capped = True
+        if line_count >= 5:
+            indices = {
+                0,
+                line_count // 4,
+                line_count // 2,
+                (3 * line_count) // 4,
+                line_count - 1,
+            }
+            samples: list[str] = []
+            position = 0
+            for match in re.finditer(r"[^\n]+", body):
+                line = match.group().strip().removeprefix("|").strip()
+                if line:
+                    if position in indices:
+                        samples.append(_clip_utf8(line, min(384, max_bytes // 32)))
+                    position += 1
+            distinct = (
+                f">={len(unique_line_digests)}"
+                if unique_count_capped
+                else str(len(unique_line_digests))
+            )
+            compacted = "\n".join(
+                (
+                    f"Sortie strings résumée: {line_count} ligne(s), {distinct} distincte(s), "
+                    f"{len(encoded)} octets UTF-8, ligne maximale={longest_line} octets; "
+                    f"sha256_corps={body_sha256}.",
+                    "Échantillon de lignes (positions réparties):",
+                    *(f"- {sample}" for sample in samples),
+                    marker,
+                )
+            )
+            return compacted, {
+                "body_truncated": True,
+                "source_body_sha256": body_sha256,
+                "source_body_bytes": len(encoded),
+                "displayed_excerpt_ranges_utf8": [],
+                "full_body_ref": source_ref,
+                "sampled_line_count": len(samples),
+                "unique_line_count": distinct,
+            }
+
+    marker_bytes = len(marker.encode("utf-8")) + 4
+    side_bytes = max(64, (max_bytes - marker_bytes) // 2)
+    head = _clip_utf8(body, side_bytes)
+    tail = _clip_utf8(body, side_bytes, tail=True)
+    head_bytes = len(head.encode("utf-8"))
+    tail_start = max(0, len(encoded) - len(tail.encode("utf-8")))
+    compacted = f"{head}\n\n[{marker}]\n\n{tail}"
+    return compacted, {
+        "body_truncated": True,
+        "source_body_sha256": body_sha256,
+        "source_body_bytes": len(encoded),
+        "displayed_excerpt_ranges_utf8": [[0, head_bytes], [tail_start, len(encoded)]],
+        "full_body_ref": source_ref,
+    }
+
+
+def _reference_advisor_body(
+    item: Mapping[str, Any], *, alias: str | None, reason: str
+) -> tuple[str, dict[str, Any]]:
+    original = _as_text(item.get("body"))
+    encoded = original.encode("utf-8")
+    body_sha256 = hashlib.sha256(encoded).hexdigest()
+    source_ref = _advisor_source_body_ref(item)
+    identity = f"{_as_text(item.get('kind'))} {_as_text(item.get('id'))}".strip()
+    reference = f" déjà présenté sous [{alias}]" if alias else " non recopié"
+    body = (
+        f"CORPS TRONQUÉ explicitement:{reference}; {reason}; "
+        f"identité={identity}; "
+        f"longueur={len(encoded)} octets UTF-8; sha256_corps={body_sha256}; "
+        f"sha256_source={_as_text(item.get('sha256')) or 'UNKNOWN'}; "
+        f"corps complet : {source_ref}"
+    )
+    return body, {
+        "body_truncated": True,
+        "reference_only": True,
+        "source_body_sha256": body_sha256,
+        "source_body_bytes": len(encoded),
+        "displayed_excerpt_ranges_utf8": [],
+        "full_body_ref": source_ref,
+        **({"body_reused_from_alias": alias} if alias else {}),
+    }
+
+
+def _advisor_candidate_piece(item: Mapping[str, Any]) -> str:
+    alias = _as_text(item.get("_alias")) or "E"
+    return f"[{alias}] {_as_text(item.get('label'))}\n{_quote(_as_text(item.get('body')))}"
+
+
+def _carry_advisor_compaction_provenance(
+    target: dict[str, Any], previous: Mapping[str, Any]
+) -> None:
+    for key in (
+        "source_body_sha256",
+        "source_body_bytes",
+        "full_body_ref",
+        "payload_sha256",
+        "payload_bytes",
+    ):
+        if key in previous:
+            target[key] = previous[key]
+
+
+def _reuse_duplicate_payload_body(
+    item: Mapping[str, Any],
+    original_body: str,
+    payload: tuple[str, bytes],
+    *,
+    alias: str,
+    max_bytes: int,
+) -> tuple[str, dict[str, Any]]:
+    payload_text, raw_payload = payload
+    payload_start_char = original_body.find(payload_text)
+    payload_end_char = payload_start_char + len(payload_text)
+    payload_start = len(original_body[:payload_start_char].encode("utf-8"))
+    payload_end = payload_start + len(payload_text.encode("ascii"))
+    body_bytes = original_body.encode("utf-8")
+    body_sha256 = hashlib.sha256(body_bytes).hexdigest()
+    payload_sha256 = hashlib.sha256(raw_payload).hexdigest()
+    source_ref = _advisor_source_body_ref(item)
+    source_sha256 = _as_text(item.get("sha256")) or "UNKNOWN"
+    identity = f"{_as_text(item.get('kind'))} {_as_text(item.get('id'))}".strip()
+    prefix = original_body[:payload_start_char]
+    suffix = original_body[payload_end_char:]
+    marker = (
+        f"PAYLOAD TRONQUÉ explicitement: base64 déjà présenté sous [{alias}]; "
+        f"offset UTF-8 {payload_start}..{payload_end}; "
+        f"longueur du corps={len(body_bytes)} octets; {len(raw_payload)} octets décodés; "
+        f"sha256_payload={payload_sha256}; "
+        f"identité={identity}; sha256_corps={body_sha256}; sha256_source={source_sha256}; "
+        f"corps complet : {source_ref}"
+    )
+    available_bytes = max(0, max_bytes - len(marker.encode("utf-8")) - 8)
+    prefix_bytes = len(prefix.encode("utf-8"))
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if prefix_bytes + suffix_bytes > available_bytes:
+        side = max(0, available_bytes // 2 - 64)
+        shown_prefix = _clip_utf8(prefix, side)
+        shown_suffix = _clip_utf8(suffix, side, tail=True)
+        prefix_shown_bytes = len(shown_prefix.encode("utf-8"))
+        suffix_shown_bytes = len(shown_suffix.encode("utf-8"))
+        prefix_range = [0, prefix_shown_bytes]
+        suffix_start = payload_end + suffix_bytes - suffix_shown_bytes
+        suffix_range = [suffix_start, payload_end + suffix_bytes]
+        context_note = (
+            f"Contexte autour du payload également tronqué: offsets UTF-8 "
+            f"{prefix_range[0]}..{prefix_range[1]} et "
+            f"{suffix_range[0]}..{suffix_range[1]}; corps={len(body_bytes)} octets."
+        )
+        body = f"{shown_prefix}\n[{context_note}]\n{marker}\n{shown_suffix}"
+        ranges = [prefix_range, suffix_range]
+    else:
+        body = f"{prefix}\n[{marker}]\n{suffix}"
+        ranges = [[0, prefix_bytes], [payload_end, payload_end + suffix_bytes]]
+    return body, {
+        "body_truncated": True,
+        "source_body_sha256": body_sha256,
+        "source_body_bytes": len(body_bytes),
+        "displayed_excerpt_ranges_utf8": ranges,
+        "full_body_ref": source_ref,
+        "payload_sha256": payload_sha256,
+        "payload_bytes": len(raw_payload),
+        "body_reused_from_alias": alias,
+    }
+
+
+def _advisor_hard_limit_note(
+    initial_bytes: int, omitted: Sequence[Mapping[str, Any]], *, index_limit_bytes: int = 450_000
+) -> str:
+    ref_lines = [
+        f"{_as_text(item.get('kind'))} {_as_text(item.get('id'))} "
+        f"sha256={_as_text(item.get('sha256'))}"
+        for item in omitted
+    ]
+    digest = hashlib.sha256("\n".join(ref_lines).encode("utf-8")).hexdigest()
+    index_lines: list[str] = []
+    index_bytes = 0
+    included = 0
+    for line in ref_lines:
+        size = len((line + "\n").encode("utf-8"))
+        if index_bytes + size > index_limit_bytes:
+            break
+        index_lines.append(line)
+        index_bytes += size
+        included += 1
+    omitted_from_index = len(ref_lines) - included
+    note = (
+        "TRONQUÉ explicitement par la limite dure de 2 Mo: "
+        f"taille initiale={initial_bytes} octets; {len(omitted)} carte(s) résumée(s) "
+        f"dans l'index des sources ci-dessous; sha256_liste_sources={digest}."
+    )
+    if index_lines:
+        note += "\nRéférences canoniques résumées (kind id sha256):\n" + "\n".join(index_lines)
+    if omitted_from_index:
+        note += (
+            f"\n{omitted_from_index} référence(s) supplémentaires non détaillées dans l'index; "
+            f"elles sont comprises dans sha256_liste_sources={digest}."
+        )
+    return note
+
+
+def _trim_advisor_dossier_to_limit(
+    selected: list[dict[str, Any]],
+    *,
+    limit_bytes: int,
+    unavailable_observations: set[str],
+    contradiction_requested: bool,
+    explicit_claims: set[str],
+    prompt_data: Mapping[str, Any],
+    initial_bytes: int,
+    required_references: set[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], AdvisorDossier, int]:
+    """Keep a bounded, source-addressable dossier when card overhead dominates."""
+    required_indices = {
+        index
+        for index, item in enumerate(selected)
+        if (item.get("kind"), item.get("id")) in required_references
+    }
+    alias_indices = {
+        _as_text(item.get("_alias")): index
+        for index, item in enumerate(selected)
+        if _as_text(item.get("_alias"))
+    }
+    pending = list(required_indices)
+    while pending:
+        index = pending.pop()
+        metadata = selected[index].get("_compaction")
+        reused_alias = (
+            _as_text(metadata.get("body_reused_from_alias"))
+            if isinstance(metadata, Mapping)
+            else ""
+        )
+        dependency = alias_indices.get(reused_alias)
+        if dependency is not None and dependency not in required_indices:
+            required_indices.add(dependency)
+            pending.append(dependency)
+
+    def render(indices: set[int], omitted: list[dict[str, Any]]) -> AdvisorDossier:
+        rows = [item for index, item in enumerate(selected) if index in indices]
+        note = _advisor_hard_limit_note(initial_bytes, omitted)
+        return _render_advisor_dossier(
+            rows,
+            unavailable_observations=unavailable_observations,
+            contradiction_requested=contradiction_requested,
+            explicit_claims=explicit_claims,
+            prompt_data=prompt_data,
+            volume_note=note,
+        )
+
+    optional_indices = [index for index in range(len(selected)) if index not in required_indices]
+    base_dossier = render(required_indices, [selected[index] for index in optional_indices])
+    if base_dossier.byte_size > limit_bytes:
+        # If mandatory references alone exceed the transport cap, keep the cap
+        # and let completeness preflight report the omitted required proof.
+        required_indices = set()
+        optional_indices = list(range(len(selected)))
+
+    low = 0
+    high = len(optional_indices)
+    best_indices: set[int] = set(required_indices)
+    best_omitted = [selected[index] for index in range(len(selected)) if index not in best_indices]
+    best_dossier = render(best_indices, best_omitted)
+    while low <= high:
+        count = (low + high) // 2
+        indices = set(required_indices)
+        indices.update(optional_indices[:count])
+        omitted = [item for index, item in enumerate(selected) if index not in indices]
+        dossier = render(indices, omitted)
+        if dossier.byte_size <= limit_bytes:
+            best_indices = indices
+            best_omitted = omitted
+            best_dossier = dossier
+            low = count + 1
+        else:
+            high = count - 1
+
+    if best_dossier.byte_size > limit_bytes:
+        best_indices = set()
+        best_omitted = list(selected)
+        note = (
+            "TRONQUÉ explicitement par la limite dure de 2 Mo: "
+            f"taille initiale={initial_bytes} octets; toutes les cartes sont représentées "
+            "par un index de références borné et une empreinte de la liste complète."
+        )
+        best_dossier = _render_advisor_dossier(
+            [],
+            unavailable_observations=unavailable_observations,
+            contradiction_requested=contradiction_requested,
+            explicit_claims=explicit_claims,
+            prompt_data=prompt_data,
+            volume_note=note,
+        )
+    return (
+        [item for index, item in enumerate(selected) if index in best_indices],
+        best_dossier,
+        len(best_omitted),
+    )
+
+
+def _advisor_candidate_aliases(selected: Sequence[Mapping[str, Any]]) -> list[str]:
+    aliases: list[str] = []
+    review_target_index = 0
+    evidence_index = 0
+    for item in selected:
+        if item.get("origin") == "versioned_review_target":
+            review_target_index += 1
+            aliases.append(f"T{review_target_index}")
+        else:
+            evidence_index += 1
+            aliases.append(f"E{evidence_index}")
+    return aliases
+
+
+def _compact_advisor_candidates(
+    selected: Sequence[dict[str, Any]], *, only_large_observation_bodies: bool = False
+) -> list[dict[str, Any]]:
+    """Deduplicate repeated observation content, then cap each displayed body."""
+    grouped: list[dict[str, Any]] = []
+    observation_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    for original in selected:
+        item = dict(original)
+        item["extra"] = dict(item.get("extra", {}))
+        item["_compact_eligible"] = not item.get("_compaction") and (
+            not only_large_observation_bodies
+            or (
+                item.get("kind") in {"observation", "measurement"}
+                and len(_as_text(item.get("body")).encode("utf-8"))
+                > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES
+            )
+        )
+        if not item["_compact_eligible"]:
+            grouped.append(item)
+            continue
+        if item.get("kind") == "observation":
+            key = (_as_text(item.get("id")), _as_text(item.get("sha256")))
+            existing = observation_by_identity.get(key)
+            if existing is not None:
+                if item["body"] != existing["body"]:
+                    existing["body"] = f"{existing['body']}\n\n{item['body']}"
+                existing["score"] = max(existing["score"], item["score"])
+                continue
+            observation_by_identity[key] = item
+        grouped.append(item)
+
+    grouped = [
+        item
+        for _index, item in sorted(
+            enumerate(grouped),
+            key=lambda pair: (
+                -pair[1]["score"],
+                0 if pair[1].get("kind") == "observation" else 1,
+                pair[0],
+            ),
+        )
+    ]
+    aliases = _advisor_candidate_aliases(grouped)
+    payload_groups: dict[str, list[int]] = {}
+    exact_body_groups: dict[str, list[int]] = {}
+    for index, item in enumerate(grouped):
+        if not item.get("_compact_eligible"):
+            continue
+        payload = _advisor_base64_payload(_as_text(item.get("body")))
+        if payload is not None:
+            payload_sha256 = hashlib.sha256(payload[1]).hexdigest()
+            payload_groups.setdefault(payload_sha256, []).append(index)
+        body_sha256 = hashlib.sha256(_as_text(item.get("body")).encode("utf-8")).hexdigest()
+        exact_body_groups.setdefault(body_sha256, []).append(index)
+
+    canonical_index_by_payload: dict[str, int] = {}
+    for payload_sha256, indices in payload_groups.items():
+        canonical_index_by_payload[payload_sha256] = indices[0]
+    canonical_index_by_body = {
+        body_sha256: indices[0] for body_sha256, indices in exact_body_groups.items()
+    }
+
+    for index, item in enumerate(grouped):
+        if not item.get("_compact_eligible"):
+            continue
+        original_body = _as_text(item.get("body"))
+        item["_original_body"] = original_body
+        payload = _advisor_base64_payload(original_body)
+        duplicate_payload_index: int | None = None
+        if payload is not None:
+            payload_sha256 = hashlib.sha256(payload[1]).hexdigest()
+            canonical_index = canonical_index_by_payload[payload_sha256]
+            if canonical_index != index:
+                duplicate_payload_index = canonical_index
+        body_sha256 = hashlib.sha256(original_body.encode("utf-8")).hexdigest()
+        duplicate_body_index = canonical_index_by_body[body_sha256]
+        if duplicate_body_index != index:
+            item["body"], item["_compaction"] = _reference_advisor_body(
+                item,
+                alias=aliases[duplicate_body_index],
+                reason=f"contenu identique à l'alias [{aliases[duplicate_body_index]}]",
+            )
+            continue
+        if duplicate_payload_index is not None and payload is not None:
+            item["body"], item["_compaction"] = _reuse_duplicate_payload_body(
+                item,
+                original_body,
+                payload,
+                alias=aliases[duplicate_payload_index],
+                max_bytes=_ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES,
+            )
+            continue
+        if len(original_body.encode("utf-8")) > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES:
+            item["body"], item["_compaction"] = _compact_advisor_body(
+                item,
+                original_body,
+                max_bytes=_ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES,
+            )
+    for item, alias in zip(grouped, aliases, strict=True):
+        item.pop("_compact_eligible", None)
+        item["_alias"] = alias
+    return grouped
+
+
+def _render_advisor_dossier(
+    selected: Sequence[dict[str, Any]],
+    *,
+    unavailable_observations: set[str],
+    contradiction_requested: bool,
+    explicit_claims: set[str],
+    prompt_data: Mapping[str, Any],
+    volume_note: str = "",
+) -> AdvisorDossier:
+    manifest: list[dict[str, Any]] = []
+    rendered: list[str] = []
+    aliases = _advisor_candidate_aliases(selected)
+    for item, alias in zip(selected, aliases, strict=True):
+        alias = _as_text(item.get("_alias")) or alias
+        piece = f"[{alias}] {item['label']}\n{_quote(item['body'])}"
+        body_bytes = item["body"].encode("utf-8")
+        piece_bytes = piece.encode("utf-8")
+        row = {
+            "alias": alias,
+            "kind": item["kind"],
+            "id": item["id"],
+            "sha256": item["sha256"],
+            "label": item["label"],
+            "origin": item["origin"],
+            **({"opinion_version": item["opinion_version"]} if item.get("opinion_version") else {}),
+            **item.get("extra", {}),
+            "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
+            "body_bytes": len(body_bytes),
+            "rendered_sha256": hashlib.sha256(piece_bytes).hexdigest(),
+            "rendered_bytes": len(piece_bytes),
+        }
+        if isinstance(item.get("_compaction"), Mapping):
+            row.update(item["_compaction"])
+        manifest.append(row)
+        rendered.append(piece)
+
+    lines = ["DOSSIER DE FAITS"]
+    lines.extend(rendered or ["Aucun fait source pertinent n\u2019a été chargé pour cette tâche."])
+    if volume_note:
+        lines.append(volume_note)
+    if unavailable_observations:
+        lines.append(
+            "Limite pertinente: contenu lisible indisponible pour "
+            f"{len(unavailable_observations)} observation(s) citée(s)."
+        )
+
+    if contradiction_requested:
+        selected_claims = {
+            _as_text(item.get("extra", {}).get("claim_id")).casefold()
+            for item in selected
+            if item["kind"] == "article" and _as_text(item.get("extra", {}).get("claim_id"))
+        }
+        contradiction_claims = explicit_claims or selected_claims
+        refuted_claims = {
+            _as_text(claim_id).casefold()
+            for item in prompt_data.get("findings", ())
+            if isinstance(item, Mapping) and _as_text(item.get("assessment")) == "refuted"
+            for claim_id in item.get("claim_refs", ())
+        }
+        uncovered_claims = sorted(contradiction_claims - refuted_claims)
+        if uncovered_claims:
+            lines.append(
+                "Aucune réfutation connue pour les passages "
+                f"{', '.join(uncovered_claims)} ; la recherche de contradictions fait l'objet "
+                "de cette consultation. Cette absence ne prouve pas qu'aucune contradiction "
+                "n'existe."
+            )
+        elif not any(
+            item["kind"] == "finding" and item.get("assessment") == "refuted" for item in selected
+        ):
+            lines.append(
+                "Aucun finding évalué comme réfuté n'a été chargé dans le dossier ; la recherche "
+                "de contradictions fait l'objet de cette consultation. Cette absence ne prouve "
+                "pas qu'aucune contradiction n'existe."
+            )
+    return AdvisorDossier(text="\n\n".join(lines), manifest=tuple(manifest))
 
 
 def _target_rows(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
