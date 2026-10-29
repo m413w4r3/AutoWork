@@ -194,7 +194,13 @@ class ExternalEffectClaimStore(Protocol):
 
     def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None: ...
 
-    async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool: ...
+    async def needs_review(
+        self,
+        claim_id: UUID,
+        *,
+        reason_code: str,
+        mark_invocation: bool = True,
+    ) -> bool: ...
 
     async def record_reuse(
         self,
@@ -432,6 +438,7 @@ class _PreHandoffGateRefused(HandoffGateRefused):
 class Ambiguous:
     claim_id: UUID | None
     state: EffectClaimState = EffectClaimState.NEEDS_REVIEW
+    retryable: bool = True
 
 
 ExternalEffectOutcome = Completed | Reused | Refused | DefinitelyNotSubmitted | Ambiguous
@@ -668,7 +675,11 @@ class ExternalEffectCoordinator:
             return response
 
         async def seal_zero_handoff(
-            claim_id: UUID, *, reason_code: str, kind: NoSubmissionProofKind
+            claim_id: UUID,
+            *,
+            reason_code: str,
+            kind: NoSubmissionProofKind,
+            mark_invocation_on_ambiguity: bool,
         ) -> DefinitelyNotSubmitted | Ambiguous:
             proof = issue_no_handoff_proof(claim_id, kind)
             try:
@@ -679,13 +690,19 @@ class ExternalEffectCoordinator:
                 changed = False
             if changed:
                 return DefinitelyNotSubmitted(claim_id)
-            await self._seal_needs_review(claim_id, "zero_handoff_seal_failed")
+            await self._seal_needs_review(
+                claim_id,
+                "zero_handoff_seal_failed",
+                mark_invocation=mark_invocation_on_ambiguity,
+            )
             return Ambiguous(claim_id)
 
         async def send_one(
             authority: ExternalEffectAuthority,
             prepared: PreparedExternalRequest,
             transport: PermitAwareTransport,
+            *,
+            mark_invocation_on_ambiguity: bool = True,
         ) -> ExternalEffectOutcome:
             try:
                 validate_prepared_request(prepared)
@@ -748,6 +765,7 @@ class ExternalEffectCoordinator:
                     consume.claim_id,
                     reason_code="permit_validation_failed",
                     kind=NoSubmissionProofKind.BEFORE_HANDOFF,
+                    mark_invocation_on_ambiguity=mark_invocation_on_ambiguity,
                 )
 
             handoff_state: dict[str, Any] = {"entered": False}
@@ -757,22 +775,35 @@ class ExternalEffectCoordinator:
                 )
             except asyncio.CancelledError:
                 await self._seal_needs_review(consume.claim_id, "cancelled_during_transport")
-                return Ambiguous(consume.claim_id)
+                return Ambiguous(consume.claim_id, retryable=False)
             except _PreHandoffGateRefused:
                 if handoff_state["entered"]:
-                    await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
+                    await self._seal_needs_review(
+                        consume.claim_id,
+                        "transport_outcome_unknown",
+                        mark_invocation=mark_invocation_on_ambiguity,
+                    )
                     return Ambiguous(consume.claim_id)
                 return await seal_zero_handoff(
                     consume.claim_id,
                     reason_code="pre_handoff_gate_refused",
                     kind=NoSubmissionProofKind.BEFORE_HANDOFF,
+                    mark_invocation_on_ambiguity=mark_invocation_on_ambiguity,
                 )
             except Exception:
-                await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
+                await self._seal_needs_review(
+                    consume.claim_id,
+                    "transport_outcome_unknown",
+                    mark_invocation=mark_invocation_on_ambiguity,
+                )
                 return Ambiguous(consume.claim_id)
 
             if not isinstance(response, TransportResponse):
-                await self._seal_needs_review(consume.claim_id, "invalid_transport_response")
+                await self._seal_needs_review(
+                    consume.claim_id,
+                    "invalid_transport_response",
+                    mark_invocation=mark_invocation_on_ambiguity,
+                )
                 return Ambiguous(consume.claim_id)
             try:
                 completed = await claim_store.complete(
@@ -784,7 +815,11 @@ class ExternalEffectCoordinator:
             except Exception:
                 completed = False
             if not completed:
-                await self._seal_needs_review(consume.claim_id, "outcome_persist_failed")
+                await self._seal_needs_review(
+                    consume.claim_id,
+                    "outcome_persist_failed",
+                    mark_invocation=mark_invocation_on_ambiguity,
+                )
                 return Ambiguous(consume.claim_id)
             return Completed(
                 consume.claim_id,
@@ -799,6 +834,27 @@ class ExternalEffectCoordinator:
             [ExternalEffectAuthority, PreparedExternalRequest, PermitAwareTransport],
             Awaitable[ExternalEffectOutcome],
         ] = send_one
+
+        async def send_passive_read(
+            authority: ExternalEffectAuthority,
+            prepared: PreparedExternalRequest,
+            transport: PermitAwareTransport,
+            *,
+            defer_invocation_needs_review: bool,
+        ) -> ExternalEffectOutcome:
+            if not _is_retryable_vt_passive_read(prepared):
+                return Refused(
+                    "passive_read_retry_not_allowed",
+                    FrameworkNoSendProof("PREPARATION", "passive_read_retry_not_allowed"),
+                )
+            return await send_one(
+                authority,
+                prepared,
+                transport,
+                mark_invocation_on_ambiguity=not defer_invocation_needs_review,
+            )
+
+        self.send_passive_read = send_passive_read
 
     async def _handle_existing(
         self,
@@ -889,9 +945,20 @@ class ExternalEffectCoordinator:
             # remains the correct result and recovery can reconcile the reservation.
             return
 
-    async def _seal_needs_review(self, claim_id: UUID, reason_code: str) -> None:
+    async def _seal_needs_review(
+        self,
+        claim_id: UUID,
+        reason_code: str,
+        *,
+        mark_invocation: bool = True,
+    ) -> None:
         try:
-            await self._claim_store.needs_review(claim_id, reason_code=reason_code)
+            if mark_invocation:
+                await self._claim_store.needs_review(claim_id, reason_code=reason_code)
+            else:
+                await self._claim_store.needs_review(
+                    claim_id, reason_code=reason_code, mark_invocation=False
+                )
         except Exception:
             # The durable CONSUMED row remains a no-resend barrier if sealing
             # itself is unavailable.
@@ -905,6 +972,26 @@ del _bind_capability_init
 
 def _is_safe_outcome_code(value: str) -> bool:
     return isinstance(value, str) and value in {"bridge_rate_limited", "bridge_rejected"}
+
+
+_RETRYABLE_VT_READ_FAMILIES = frozenset(
+    {
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    }
+)
+
+
+def _is_retryable_vt_passive_read(prepared: PreparedExternalRequest) -> bool:
+    return (
+        prepared.provider == "vt"
+        and prepared.family in _RETRYABLE_VT_READ_FAMILIES
+        and prepared.application_request.method.upper() == b"GET"
+    )
 
 
 __all__ = [

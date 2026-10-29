@@ -76,20 +76,27 @@ _external_effect_evidence_refs: ContextVar[tuple[EvidenceReference, ...]] = Cont
 _external_effect_counts: ContextVar[tuple[int, int] | None] = ContextVar(
     "virustotal_external_effect_counts", default=None
 )
+_external_effect_read_retries: ContextVar[int | None] = ContextVar(
+    "virustotal_external_effect_read_retries", default=None
+)
 
 
 @contextmanager
 def virustotal_external_effect_scope(
     authority: ExternalEffectAuthority | None,
     evidence_refs: tuple[EvidenceReference, ...] = (),
+    *,
+    passive_read_retries: int = 0,
 ) -> Iterator[None]:
     """Bind a dispatcher-provided authority to one async VT tool call."""
     token = _external_effect_authority.set(authority)
     evidence_token = _external_effect_evidence_refs.set(tuple(evidence_refs))
     counts_token = _external_effect_counts.set((0, 0))
+    retries_token = _external_effect_read_retries.set(passive_read_retries)
     try:
         yield
     finally:
+        _external_effect_read_retries.reset(retries_token)
         _external_effect_counts.reset(counts_token)
         _external_effect_evidence_refs.reset(evidence_token)
         _external_effect_authority.reset(token)
@@ -106,7 +113,7 @@ def current_virustotal_external_effect_evidence_refs() -> tuple[EvidenceReferenc
 
 
 def record_virustotal_external_effect(*, reused: bool) -> None:
-    """Record one successful physical-send or completed-claim reuse in this tool call."""
+    """Record a possible physical send or a completed-claim reuse in this tool call."""
     counts = _external_effect_counts.get()
     if counts is None:
         return
@@ -115,8 +122,17 @@ def record_virustotal_external_effect(*, reused: bool) -> None:
 
 
 def virustotal_external_effect_counts() -> tuple[int, int] | None:
-    """Return successful VT send and reuse counts for the active tool call."""
+    """Return possible VT sends and reuse counts for the active tool call."""
     return _external_effect_counts.get()
+
+
+def consume_virustotal_passive_read_retry() -> bool:
+    """Consume one bounded retry slot for the active passive-read tool call."""
+    remaining = _external_effect_read_retries.get()
+    if remaining is None or remaining <= 0:
+        return False
+    _external_effect_read_retries.set(remaining - 1)
+    return True
 
 
 class VirusTotalError(RuntimeError):

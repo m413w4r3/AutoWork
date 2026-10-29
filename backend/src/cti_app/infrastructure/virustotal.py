@@ -11,7 +11,7 @@ import struct
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
@@ -78,6 +78,7 @@ from cti_app.application.virustotal import (
     VirusTotalSignedUrlExpiredError,
     VirusTotalTransportError,
     VirusTotalUnexpectedRedirectError,
+    consume_virustotal_passive_read_retry,
     current_virustotal_external_effect_authority,
     current_virustotal_external_effect_evidence_refs,
     file_hash_family,
@@ -298,6 +299,9 @@ class _VirusTotalPermitAwareTransport(PermitAwareTransport):
         if request is not self.__frozen_request or _freeze_httpx_request(self.__request) != request:
             raise HandoffGateRefused("prepared VT request changed before physical send")
         capability(request)
+        # Once the coordinator burns the one-use capability, account for the
+        # request even if transport or archival later fails ambiguously.
+        record_virustotal_external_effect(reused=False)
         response = await self.__client.send(
             self.__request,
             follow_redirects=False,
@@ -2024,88 +2028,144 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             evidence_refs=current_virustotal_external_effect_evidence_refs(),
             credential_parameter_names=("apikey",),
         )
-        transport = _VirusTotalPermitAwareTransport(
-            client=client,
-            request=request,
-            frozen_request=frozen_request,
-            archive=archive,
-            max_response_bytes=(
-                self._max_response_bytes if max_response_bytes is None else max_response_bytes
-            ),
-        )
-        try:
-            outcome = await coordinator.send_one(authority, prepared, transport)
-        except Exception:
+        maximum_attempts = 2
+        for attempt_index in range(maximum_attempts):
+            attempt_prepared = (
+                prepared if attempt_index == 0 else replace(prepared, occurrence_id=uuid4())
+            )
+            attempt_transport = _VirusTotalPermitAwareTransport(
+                client=client,
+                request=request,
+                frozen_request=frozen_request,
+                archive=archive,
+                max_response_bytes=(
+                    self._max_response_bytes if max_response_bytes is None else max_response_bytes
+                ),
+            )
+            final_attempt = attempt_index == maximum_attempts - 1
+            try:
+                passive_read_sender = getattr(coordinator, "send_passive_read", None)
+                if callable(passive_read_sender):
+                    outcome = await passive_read_sender(
+                        authority,
+                        attempt_prepared,
+                        attempt_transport,
+                        defer_invocation_needs_review=not final_attempt,
+                    )
+                else:
+                    outcome = await coordinator.send_one(
+                        authority, attempt_prepared, attempt_transport
+                    )
+            except VirusTotalExternalEffectNeedsReviewError:
+                if not final_attempt and consume_virustotal_passive_read_retry():
+                    continue
+                raise
+            except VirusTotalExternalEffectRefusedError:
+                raise
+            except Exception:
+                if not final_attempt and consume_virustotal_passive_read_retry():
+                    continue
+                raise VirusTotalExternalEffectNeedsReviewError(
+                    "The VirusTotal effect outcome could not be confirmed after its retry."
+                ) from None
+
+            if isinstance(outcome, Ambiguous):
+                if (
+                    outcome.retryable
+                    and not final_attempt
+                    and consume_virustotal_passive_read_retry()
+                ):
+                    continue
+                raise VirusTotalExternalEffectNeedsReviewError(
+                    "The VirusTotal request outcome remains unconfirmed after its retry."
+                )
+
+            if isinstance(outcome, (Refused, DefinitelyNotSubmitted)):
+                refusal_code = (
+                    f"virustotal_external_effect_refused_{outcome.reason}"
+                    if isinstance(outcome, Refused)
+                    else "virustotal_external_effect_not_submitted"
+                )
+                raise VirusTotalExternalEffectRefusedError(
+                    "The coordinator refused the VirusTotal request before a new send.",
+                    code=refusal_code,
+                    framework_no_send_proof=(
+                        outcome.framework_no_send_proof if isinstance(outcome, Refused) else None
+                    ),
+                )
+
+            try:
+                if isinstance(outcome, Completed):
+                    envelope = outcome.payload
+                    decoded = (
+                        _decode_vt_transient_response(envelope)
+                        if isinstance(envelope, bytes)
+                        else None
+                    )
+                    reference = _one_raw_response_reference(outcome.evidence_refs)
+                    if reference is None or outcome.result_ref != reference.id:
+                        raise VirusTotalExternalEffectNeedsReviewError(
+                            "The completed VirusTotal response has no raw archive reference."
+                        )
+                    archived = await _read_vt_archive(
+                        archive,
+                        reference,
+                        max(
+                            (
+                                self._max_response_bytes
+                                if max_response_bytes is None
+                                else max_response_bytes
+                            )
+                            + 1,
+                            _MAX_ERROR_BODY_BYTES,
+                        ),
+                    )
+                    archived_transient = _transient_from_archive(archived)
+                    if decoded is None:
+                        decoded = archived_transient
+                    elif decoded != archived_transient:
+                        raise VirusTotalExternalEffectNeedsReviewError(
+                            "The completed VirusTotal response does not match its raw archive."
+                        )
+                    if outcome.payload is None:
+                        record_virustotal_external_effect(reused=True)
+                    return _httpx_response_from_transient(request, decoded)
+
+                if isinstance(outcome, Reused):
+                    reference = _one_raw_response_reference(outcome.observation_refs)
+                    if reference is None:
+                        raise VirusTotalExternalEffectNeedsReviewError(
+                            "The reused VirusTotal effect has no raw response archive."
+                        )
+                    archived = await _read_vt_archive(
+                        archive,
+                        reference,
+                        max(
+                            (
+                                self._max_response_bytes
+                                if max_response_bytes is None
+                                else max_response_bytes
+                            )
+                            + 1,
+                            _MAX_ERROR_BODY_BYTES,
+                        ),
+                    )
+                    record_virustotal_external_effect(reused=True)
+                    return _httpx_response_from_transient(
+                        request, _transient_from_archive(archived)
+                    )
+            except VirusTotalExternalEffectNeedsReviewError:
+                if not final_attempt and consume_virustotal_passive_read_retry():
+                    continue
+                raise
+
+            if not final_attempt and consume_virustotal_passive_read_retry():
+                continue
             raise VirusTotalExternalEffectNeedsReviewError(
-                "The VirusTotal effect outcome could not be confirmed; it will not be resent."
-            ) from None
-
-        if isinstance(outcome, Completed):
-            envelope = outcome.payload
-            decoded = (
-                _decode_vt_transient_response(envelope) if isinstance(envelope, bytes) else None
-            )
-            reference = _one_raw_response_reference(outcome.evidence_refs)
-            if reference is None or outcome.result_ref != reference.id:
-                raise VirusTotalExternalEffectNeedsReviewError(
-                    "The completed VirusTotal response has no raw archive reference."
-                )
-            archived = await _read_vt_archive(
-                archive,
-                reference,
-                max(
-                    (self._max_response_bytes if max_response_bytes is None else max_response_bytes)
-                    + 1,
-                    _MAX_ERROR_BODY_BYTES,
-                ),
-            )
-            archived_transient = _transient_from_archive(archived)
-            if decoded is None:
-                decoded = archived_transient
-            elif decoded != archived_transient:
-                raise VirusTotalExternalEffectNeedsReviewError(
-                    "The completed VirusTotal response does not match its raw archive."
-                )
-            record_virustotal_external_effect(reused=outcome.payload is None)
-            return _httpx_response_from_transient(request, decoded)
-
-        if isinstance(outcome, Reused):
-            reference = _one_raw_response_reference(outcome.observation_refs)
-            if reference is None:
-                raise VirusTotalExternalEffectNeedsReviewError(
-                    "The reused VirusTotal effect has no raw response archive."
-                )
-            archived = await _read_vt_archive(
-                archive,
-                reference,
-                max(
-                    (self._max_response_bytes if max_response_bytes is None else max_response_bytes)
-                    + 1,
-                    _MAX_ERROR_BODY_BYTES,
-                ),
-            )
-            record_virustotal_external_effect(reused=True)
-            return _httpx_response_from_transient(request, _transient_from_archive(archived))
-
-        if isinstance(outcome, Ambiguous):
-            raise VirusTotalExternalEffectNeedsReviewError(
-                "The VirusTotal request outcome is ambiguous; it will not be resent."
-            )
-        if isinstance(outcome, (Refused, DefinitelyNotSubmitted)):
-            refusal_code = (
-                f"virustotal_external_effect_refused_{outcome.reason}"
-                if isinstance(outcome, Refused)
-                else "virustotal_external_effect_not_submitted"
-            )
-            raise VirusTotalExternalEffectRefusedError(
-                "The coordinator refused the VirusTotal request before a new send.",
-                code=refusal_code,
-                framework_no_send_proof=(
-                    outcome.framework_no_send_proof if isinstance(outcome, Refused) else None
-                ),
+                "The coordinator returned an unknown VirusTotal outcome."
             )
         raise VirusTotalExternalEffectNeedsReviewError(
-            "The coordinator returned an unknown VirusTotal outcome."
+            "The VirusTotal request outcome remains unconfirmed after its retry."
         )
 
     async def _coordinated_download_response(

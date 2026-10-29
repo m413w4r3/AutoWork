@@ -101,13 +101,18 @@ d'enquête poursuivre avec une autre stratégie.
 ## Idempotence et budget
 
 Le `ToolDispatcher` réserve les coûts maximaux du `ToolDefinition` avant
-l'adaptateur : un `VT_UNITS` pour `vt.file_report`, jusqu'à `max_pages` pour
-les outils paginés, et `TOOL_SECONDS` selon la borne configurée. Le résultat
-rend les unités/pages et secondes réellement consommées. La boucle B calcule
+l'adaptateur : les unités prévues pour les routes et pages configurées, plus
+une unité de reprise passive pour un GET non confirmé. L'adaptateur intégré
+peut retenter une fois dans la même invocation. Si le résultat reste
+`needs_review`, une nouvelle invocation équivalente est permise pour ces GET,
+après les contrôles courants d'autorité, divulgation et budget. L'incertitude
+consomme les unités réellement tentées et clôt la réservation. `TOOL_SECONDS`
+reste borné par la limite configurée. Le résultat rend les unités/pages et
+secondes réellement consommées. La boucle B calcule
 `tool_operation_key` à partir des paramètres normalisés ; son dépôt relit une
 invocation terminée sans réexécuter l'adaptateur. Le dispatcher garde aussi le
 résultat d'une clé rejouée en mémoire et refuse de réutiliser cette clé avec
 des arguments différents.
 
 `vt.download_sample` reste hors de ce module ; l'acquisition dépend de
-l'enveloppe C2/G2/G3.
+l'enveloppe C2/G2/G3 et ne bénéficie d'aucune reprise de lecture passive.

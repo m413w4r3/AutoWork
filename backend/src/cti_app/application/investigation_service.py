@@ -66,7 +66,10 @@ from cti_app.application.investigation_tools import (
     ToolResult,
     tool_operation_cache_identity,
 )
-from cti_app.application.investigation_vt_tools import _normalize_object_id
+from cti_app.application.investigation_vt_tools import (
+    _normalize_object_id,
+    is_trusted_vt_passive_read_adapter,
+)
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInvestigationRepository,
@@ -176,6 +179,7 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
         "vt.download_sample",
     }
 )
+_VT_PASSIVE_READ_TOOLS = _VT_COORDINATED_READ_TOOLS - {"vt.download_sample"}
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER = "_advisor_preflight_refusal_expected"
 
@@ -1838,16 +1842,30 @@ class InvestigationService:
         ambiguous_adapter_response = (
             unproven_external_failure and result.framework_pre_submission_proof is None
         )
+        trusted_vt_passive_read = (
+            tool_name in _VT_PASSIVE_READ_TOOLS
+            and definition is not None
+            and definition.effect is ToolEffect.EXTERNAL_READ
+            and registered is not None
+            and is_trusted_vt_passive_read_adapter(tool_name, registered[1])
+        )
         if unproven_external_failure and result.status is not ToolInvocationStatus.NEEDS_REVIEW:
             result = replace(
                 result,
                 status=ToolInvocationStatus.NEEDS_REVIEW,
                 message=(
-                    "The external operation returned without a confirmed outcome; "
-                    "reconcile it before resuming. " + result.message
+                    (
+                        "The passive VirusTotal read returned without a confirmed outcome; "
+                        "a fresh invocation can retry under current admission checks. "
+                        if trusted_vt_passive_read
+                        else "The external operation returned without a confirmed outcome; "
+                        "reconcile it before resuming. "
+                    )
+                    + result.message
                 )[:2_000],
             )
         uncertain_external = unproven_external_failure
+        retryable_vt_read_uncertainty = uncertain_external and trusted_vt_passive_read
         if framework_proves_non_execution:
             budget.release_confirmed_non_submission(operation_key)
         elif not uncertain_external and result.status in {
@@ -1904,11 +1922,23 @@ class InvestigationService:
             reviewed = invocation.transition(
                 ToolInvocationStatus.NEEDS_REVIEW,
                 response_refs=valid_refs,
-                consumed_budget={},
+                consumed_budget=(
+                    dict(result.budget_consumed) if retryable_vt_read_uncertainty else {}
+                ),
             )
             invocation = await self._invocations.update_if_version(
                 reviewed, expected_version=invocation.version
             )
+            if retryable_vt_read_uncertainty:
+                await self._complete_tool_reservation(
+                    investigation_id=investigation.id,
+                    operation_key=operation_key,
+                    result=result,
+                    reserved_amounts=invocation.reserved_budget,
+                    uncertain=True,
+                    external_effect=True,
+                    retryable_external_read=True,
+                )
             await self._commit_current_uow()
             _log_terminal_tool_failure(
                 invocation,
@@ -1937,7 +1967,10 @@ class InvestigationService:
             response_refs=valid_refs,
             consumed_budget=(
                 {}
-                if uncertain_external or _confirmed_external_non_execution(result)
+                if (
+                    (uncertain_external and not retryable_vt_read_uncertainty)
+                    or _confirmed_external_non_execution(result)
+                )
                 else _actual_tool_consumption(tool_context.budget, operation_key, result)
             ),
         )
@@ -1951,6 +1984,7 @@ class InvestigationService:
             reserved_amounts=invocation.reserved_budget,
             uncertain=uncertain_external,
             external_effect=external_effect,
+            retryable_external_read=retryable_vt_read_uncertainty,
         )
         await self._commit_current_uow()
         _log_terminal_tool_failure(invocation, result)
@@ -3981,6 +4015,7 @@ class InvestigationService:
         reserved_amounts: Mapping[BudgetDimension, int],
         uncertain: bool,
         external_effect: bool = False,
+        retryable_external_read: bool = False,
     ) -> None:
         for _ in range(3):
             current_envelope = await self._envelopes.get(investigation_id)
@@ -4018,9 +4053,14 @@ class InvestigationService:
             if reservation.status is not BudgetReservationStatus.RESERVED:
                 await self._save_budget_snapshot(envelope)
                 return
-            if uncertain:
+            if retryable_external_read:
+                # Idempotent VT reads can be retried as a new invocation. Close
+                # this reservation at the adapter's conservative attempted cost
+                # so the unused page and time allowance does not remain locked.
+                envelope.budget.commit(operation_key, dict(result.budget_consumed))
+            elif uncertain:
                 return
-            if (
+            elif (
                 external_effect
                 and result.status
                 in {

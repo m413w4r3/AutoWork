@@ -467,6 +467,10 @@ class _VirusTotalAdapter:
         max_file_report_requests = getattr(self.virustotal, "maximum_file_report_requests", None)
         if self.name == "vt.file_report" and callable(max_file_report_requests):
             units = max(1, int(max_file_report_requests()))
+        # One extra unit covers the single bounded retry for passive reads.
+        # Downloading a sample is not idempotent and has no retry allowance.
+        if is_trusted_vt_passive_read_adapter(self.name, self):
+            units += 1
         return {BudgetDimension.VT_UNITS: units}
 
     def _reserved_vt_units_for(self, context: ToolExecutionContext) -> int:
@@ -502,6 +506,7 @@ class _VirusTotalAdapter:
         with virustotal_external_effect_scope(
             context.external_effect_authority,
             context.external_effect_evidence_refs,
+            passive_read_retries=1,
         ):
             try:
                 result = await operation(state)
@@ -522,7 +527,7 @@ class _VirusTotalAdapter:
                     ToolInvocationStatus.NEEDS_REVIEW,
                     reason="external_effect_needs_review",
                     message=(
-                        "The VirusTotal request outcome needs reconciliation; it was not resent."
+                        "The VirusTotal read outcome remains unconfirmed after its bounded retry."
                     ),
                     error_code=_safe_external_effect_error_code(exc),
                 )
@@ -763,6 +768,11 @@ class _VirusTotalAdapter:
             )
             if sent == 0:
                 consumed[BudgetDimension.TOOL_SECONDS] = 0
+            else:
+                consumed[BudgetDimension.TOOL_SECONDS] = min(
+                    math.ceil(max(0.0, time.monotonic() - state.started_at)),
+                    self.max_tool_seconds,
+                )
         alternatives: tuple[str, ...] = ()
         if status in {
             ToolInvocationStatus.EMPTY,
@@ -789,6 +799,31 @@ class _VirusTotalAdapter:
             for name in _ALTERNATIVE_CAPABILITIES[self.name]
             if name in state.available_capabilities
         )
+
+
+def is_trusted_vt_passive_read_adapter(tool_name: str, adapter: object) -> bool:
+    """Identify the built-in VT GET adapters that may be safely retried."""
+    allowed_adapters = (
+        _FileReportAdapter,
+        _ObjectReportAdapter,
+        _RelationshipsAdapter,
+        _IntelligenceSearchAdapter,
+        _BehaviourAdapter,
+        _BehaviourPcapAdapter,
+    )
+    return (
+        tool_name
+        in {
+            "vt.file_report",
+            "vt.object_report",
+            "vt.relationships",
+            "vt.intelligence_search",
+            "vt.behaviour",
+            "vt.behaviour_pcap",
+        }
+        and type(adapter) in allowed_adapters
+        and getattr(adapter, "name", None) == tool_name
+    )
 
 
 class _FileReportAdapter(_VirusTotalAdapter):

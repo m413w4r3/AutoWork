@@ -780,17 +780,22 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
     effect_sessions = create_session_factory(effect_engine)
     effect_coordinator = create_external_effect_coordinator(effect_sessions)
     vt_http_calls: list[tuple[str, str, str]] = []
+    candidate_report_timeouts_remaining = 2
     signed_url = (
         "https://vtsamples.commondatastorage.googleapis.com/synthetic-sample?signature=synthetic"
     )
 
     def mock_vt(request: httpx.Request) -> httpx.Response:
+        nonlocal candidate_report_timeouts_remaining
         host_path = (request.url.host or "", request.url.path)
         vt_http_calls.append((request.method, host_path[0], host_path[1]))
         if host_path == (
             "www.virustotal.com",
             f"/api/v3/files/{candidate_hash}",
         ):
+            if candidate_report_timeouts_remaining > 0:
+                candidate_report_timeouts_remaining -= 1
+                raise httpx.ReadTimeout("synthetic passive VT read timeout", request=request)
             return httpx.Response(
                 200,
                 json={
@@ -1071,7 +1076,29 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 key=f"m07.operator.file-report-arbitrary:{investigation_id}",
                 purpose="Read a synthetic hash that has not been observed or associated.",
             )
-            assert_tool_status("vt.file_report", arbitrary_report_result, "succeeded")
+            assert_tool_status("vt.file_report", arbitrary_report_result, "needs_review")
+            first_read_invocation_id = UUID(arbitrary_report_result["invocation"]["id"])
+            async with uow_factory() as uow:
+                first_read_invocation = await uow.tool_invocations.get(first_read_invocation_id)
+                first_read_envelope = await uow.investigation_envelopes.get(investigation_id)
+            assert first_read_invocation is not None and first_read_envelope is not None
+            first_read_reservation = next(
+                item
+                for item in first_read_envelope.budget.reservations
+                if item.operation_key == first_read_invocation.operation_key
+            )
+            assert first_read_reservation.status is BudgetReservationStatus.COMMITTED
+            assert first_read_reservation.committed_amounts[BudgetDimension.VT_UNITS] == 2
+
+            arbitrary_report_retry = await invoke_operator_tool(
+                "vt.file_report",
+                "1",
+                {"file_hash": candidate_hash},
+                key=f"m07.operator.file-report-arbitrary-retry:{investigation_id}",
+                purpose="Retry the same passive VT read after an unconfirmed response.",
+            )
+            assert_tool_status("vt.file_report", arbitrary_report_retry, "succeeded")
+            assert arbitrary_report_retry["invocation"]["id"] != str(first_read_invocation_id)
             async with uow_factory() as uow:
                 arbitrary_report_observation = next(
                     (
@@ -1614,6 +1641,8 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert version_rows[0].version == supported_finding.version == 1
             assert bridge_http_calls.count(("POST", "/v1/responses")) == 1
             assert [item[2] for item in vt_http_calls] == [
+                f"/api/v3/files/{candidate_hash}",
+                f"/api/v3/files/{candidate_hash}",
                 f"/api/v3/files/{candidate_hash}",
                 f"/api/v3/files/{_SEED_HASH}",
                 "/api/v3/intelligence/search",

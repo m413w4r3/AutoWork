@@ -14,6 +14,7 @@ from httpx import ASGITransport
 from pydantic import ValidationError
 
 import cti_app.api.investigation as investigation_api
+import cti_app.application.operator_tool_invocation as operator_tool_invocation
 from cti_app.api.investigation import router
 from cti_app.application.advisor_checkpoint import (
     advisor_checkpoint_summary,
@@ -1364,6 +1365,73 @@ async def test_replay_after_persisted_running_marks_review_without_redispatch() 
 
 
 @pytest.mark.asyncio
+async def test_fresh_passive_read_settles_orphaned_running_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture, state, service = await _fixture()
+    old_key = "orphaned-passive-read"
+    arguments = {"query": "hash"}
+    purpose = "recover an interrupted passive read"
+    payload = canonical_json_bytes(
+        {
+            "tool_name": "vt.file_report",
+            "schema_version": "1",
+            "arguments": arguments,
+            "purpose": purpose,
+            "expected_version": state.version,
+        }
+    )
+    key_digest = hashlib.sha256(f"{fixture.investigation_id}\0{old_key}".encode()).hexdigest()
+    operation_key = f"operator:{key_digest}:{hashlib.sha256(payload).hexdigest()}"
+    reserved = {
+        BudgetDimension.VT_UNITS: 2,
+        BudgetDimension.TOOL_SECONDS: 30,
+    }
+    old_invocation = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key=operation_key,
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters=arguments,
+        purpose=purpose,
+        reserved_budget=reserved,
+    ).transition(ToolInvocationStatus.RUNNING)
+    await fixture.invocations.add_if_absent(old_invocation)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+    monkeypatch.setattr(
+        operator_tool_invocation,
+        "is_trusted_vt_passive_read_adapter",
+        lambda _name, _adapter: True,
+    )
+
+    retry = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments=arguments,
+        purpose=purpose,
+        expected_version=state.version,
+        idempotency_key="fresh-after-orphaned-passive-read",
+    )
+
+    latest = await fixture.invocations.get(old_invocation.id)
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert latest is not None and latest_envelope is not None
+    old_reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert retry.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert latest.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert latest.consumed_budget == reserved
+    assert old_reservation.status.value == "committed"
+    assert old_reservation.committed_amounts == reserved
+
+
+@pytest.mark.asyncio
 async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() -> None:
     fixture, state, _ = await _fixture()
     idempotency_key = "legacy-invalid-advisor-input"
@@ -1559,11 +1627,20 @@ async def test_persisted_presend_refusal_does_not_block_equivalent_fresh_key_ret
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_external_result_still_blocks_equivalent_fresh_key_retry() -> None:
-    fixture, state, service = await _fixture()
+async def test_untrusted_adapter_cannot_unlock_equivalent_fresh_key_retry() -> None:
+    fixture, state, _service_without_summaries = await _fixture()
+    service = _service(
+        fixture,
+        observations=fixture.observations,
+        evidence_summaries=fixture.proof_artifacts,
+    )
     arguments = {"query": "ambiguous external effect"}
     fixture.tools["vt.file_report"].result = ToolResult(
         status=ToolInvocationStatus.NEEDS_REVIEW,
+        budget_consumed={
+            BudgetDimension.VT_UNITS: 1,
+            BudgetDimension.TOOL_SECONDS: 2,
+        },
         output={"outcome": "external_effect_unconfirmed", "adapter_output_archived": False},
     )
 
@@ -1575,6 +1652,16 @@ async def test_unconfirmed_external_result_still_blocks_equivalent_fresh_key_ret
         expected_version=state.version,
         idempotency_key="ambiguous-first-attempt",
     )
+
+    first_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert first_envelope is not None
+    first_reservation = next(
+        item
+        for item in first_envelope.budget.reservations
+        if item.operation_key == first.invocation.operation_key
+    )
+    assert first_reservation.status.value == "reserved"
+    assert first_reservation.committed_amounts == {}
 
     with pytest.raises(OperatorToolInvocationError) as error:
         await service.invoke(
@@ -1638,8 +1725,13 @@ async def test_proven_presend_refusal_releases_budget_and_allows_new_invocation(
 
 
 @pytest.mark.asyncio
-async def test_unregistered_vt_adapter_cannot_claim_coordinator_refusal_proof() -> None:
-    fixture, state, service = await _fixture()
+async def test_untrusted_adapter_cannot_claim_passive_read_retryability() -> None:
+    fixture, state, _service_without_summaries = await _fixture()
+    service = _service(
+        fixture,
+        observations=fixture.observations,
+        evidence_summaries=fixture.proof_artifacts,
+    )
     arguments = {"query": "untrusted adapter proof"}
     fixture.tools["vt.file_report"].result = ToolResult(
         status=ToolInvocationStatus.POLICY_DENIED,
@@ -1664,7 +1756,7 @@ async def test_unregistered_vt_adapter_cannot_claim_coordinator_refusal_proof() 
             tool_name="vt.file_report",
             schema_version="1",
             arguments=arguments,
-            purpose="An untrusted adapter cannot prove non-submission.",
+            purpose="Retry the unconfirmed passive read.",
             expected_version=first.working_state_version,
             idempotency_key="untrusted-vt-proof-retry",
         )
@@ -2058,7 +2150,12 @@ async def test_http_legacy_offset_after_content_change_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_operator_http_reports_invalid_framework_proof_and_keeps_retry_blocked() -> None:
-    fixture, state, service = await _fixture()
+    fixture, state, _service_without_summaries = await _fixture()
+    service = _service(
+        fixture,
+        observations=fixture.observations,
+        evidence_summaries=fixture.proof_artifacts,
+    )
     envelope = await fixture.envelopes.get(fixture.investigation_id)
     refused_budget = InvestigationBudget(
         limits={**envelope.budget.limits, BudgetDimension.VT_UNITS: 0}

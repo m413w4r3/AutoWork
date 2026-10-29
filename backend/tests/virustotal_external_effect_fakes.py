@@ -53,7 +53,7 @@ def make_test_authority(*, invocation_id: UUID | None = None) -> ExternalEffectA
 @contextmanager
 def authorized_vt_read(*, invocation_id: UUID | None = None) -> Iterator[ExternalEffectAuthority]:
     authority = make_test_authority(invocation_id=invocation_id)
-    with virustotal_external_effect_scope(authority):
+    with virustotal_external_effect_scope(authority, passive_read_retries=1):
         yield authority
 
 
@@ -76,6 +76,7 @@ class InMemoryExternalEffectClaimStore:
         self.claims: dict[str, ExternalEffectClaim] = {}
         self.gate_nonces: set[UUID] = set()
         self.reuse_count = 0
+        self.invocation_review_marks: list[bool] = []
         self._proof_verifier: _NoHandoffProofVerifier | None = None
 
     def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None:
@@ -164,8 +165,15 @@ class InMemoryExternalEffectClaimStore:
         self.claims[key] = replace(claim, state=EffectClaimState.DEFINITIVELY_NOT_SUBMITTED)
         return True
 
-    async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool:
+    async def needs_review(
+        self,
+        claim_id: UUID,
+        *,
+        reason_code: str,
+        mark_invocation: bool = True,
+    ) -> bool:
         del reason_code
+        self.invocation_review_marks.append(mark_invocation)
         key, claim = self._find(claim_id)
         self.claims[key] = replace(claim, state=EffectClaimState.NEEDS_REVIEW)
         return True

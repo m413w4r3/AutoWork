@@ -1014,7 +1014,7 @@ async def test_object_report_projection_retry_reserves_and_consumes_each_physica
     )
     budget = InvestigationBudget(
         limits={
-            dimension: 2 if dimension is BudgetDimension.VT_UNITS else 1_000
+            dimension: 3 if dimension is BudgetDimension.VT_UNITS else 1_000
             for dimension in BudgetDimension
         }
     )
@@ -1044,7 +1044,7 @@ async def test_object_report_projection_retry_reserves_and_consumes_each_physica
     assert len(claim_store.claims) == 2
     assert result.budget_consumed[BudgetDimension.VT_UNITS] == 2
     reservation = budget.reservations[0]
-    assert reservation.amounts[BudgetDimension.VT_UNITS] == 2
+    assert reservation.amounts[BudgetDimension.VT_UNITS] == 3
     assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 2
     assert reservation.status is BudgetReservationStatus.COMMITTED
 

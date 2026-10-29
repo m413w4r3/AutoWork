@@ -371,23 +371,22 @@ class _ObservationWriter:
         self.proof_artifacts = proof_artifacts
 
     async def archive(self, invocation, result):
-        encoded = canonical_json_bytes(dict(result.output))
+        safe_result = dict(result.output)
         blob_id = uuid5(_OBSERVATION_NAMESPACE, "blob:" + invocation.operation_key)
         if result.framework_pre_submission_proof is not None:
-            safe_result = dict(result.output)
             safe_result["framework_pre_submission_proof"] = {
                 "object_type": result.framework_pre_submission_proof.value
             }
-            payload = {
-                "schema": "investigation-tool-observation.v1",
-                "tool_name": invocation.tool_name,
-                "schema_version": invocation.schema_version,
-                "operation_key": invocation.operation_key,
-                "result": safe_result,
-            }
-            encoded = canonical_json_bytes(payload)
-            if self.proof_artifacts is not None:
-                self.proof_artifacts.store(blob_id, encoded)
+        payload = {
+            "schema": "investigation-tool-observation.v1",
+            "tool_name": invocation.tool_name,
+            "schema_version": invocation.schema_version,
+            "operation_key": invocation.operation_key,
+            "result": safe_result,
+        }
+        encoded = canonical_json_bytes(payload)
+        if self.proof_artifacts is not None:
+            self.proof_artifacts.store(blob_id, encoded)
         observation = EvidenceObservation(
             id=uuid5(_OBSERVATION_NAMESPACE, invocation.operation_key),
             investigation_id=invocation.investigation_id,

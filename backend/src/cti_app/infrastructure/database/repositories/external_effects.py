@@ -625,7 +625,13 @@ class SqlAlchemyExternalEffectClaimStore:
                     )
                 return True
 
-    async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool:
+    async def needs_review(
+        self,
+        claim_id: UUID,
+        *,
+        reason_code: str,
+        mark_invocation: bool = True,
+    ) -> bool:
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:
             async with session.begin():
@@ -652,7 +658,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 if changed_id is None:
                     return False
                 await self._set_dispatch_needs_review(session, claim_id, now)
-                if row.invocation_id is not None:
+                if mark_invocation and row.invocation_id is not None:
                     await session.execute(
                         update(ToolInvocationRow)
                         .where(

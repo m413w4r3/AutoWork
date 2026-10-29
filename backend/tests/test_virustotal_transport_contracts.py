@@ -22,6 +22,7 @@ from cti_app.application.virustotal import (
     VirusTotalDownloadHostNotAllowedError,
     VirusTotalDownloadTooLargeError,
     VirusTotalError,
+    VirusTotalExternalEffectNeedsReviewError,
     VirusTotalExternalEffectRefusedError,
     VirusTotalHttpError,
     VirusTotalOperationRoute,
@@ -613,6 +614,25 @@ async def test_download_limit_uses_streamed_bytes_and_hash_mismatch_is_typed() -
     finally:
         await _close(clients)
     assert caught.value.code == "virustotal_download_hash_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_sample_download_transport_error_is_not_retried_as_a_passive_read() -> None:
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadError("synthetic download interruption", request=request)
+
+    adapter, clients = _make_adapter(upstream)
+    try:
+        with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
+            await adapter.file_download(SHA256, sink=BytesIO())
+    finally:
+        await _close(clients)
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio
