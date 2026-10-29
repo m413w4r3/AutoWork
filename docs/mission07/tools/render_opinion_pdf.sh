@@ -3,9 +3,9 @@
 # Rend le PDF de la version courante de l'avis et l'ecrit dans .autowork-runs/m07/editorial/.
 # Le jeton humain est lu dans l'environnement du conteneur backend et n'est jamais affiche.
 mkdir -p "$(dirname "$0")/editorial"
-docker exec -i cti-bulletin-backend-1 python - <<'PY' > "$(dirname "$0")/editorial/.render.out"
+docker exec -i -e RENDER_INVESTIGATION_ID="${RENDER_INVESTIGATION_ID:-}" cti-bulletin-backend-1 python - <<'PY' > "$(dirname "$0")/editorial/.render.out"
 import os,json,urllib.request,urllib.error,sys,base64
-INV="a8845772-5025-4702-8850-2b6be776855b"
+INV=(os.environ.get("RENDER_INVESTIGATION_ID") or "a8845772-5025-4702-8850-2b6be776855b")
 tok=os.environ["OPERATOR_API_TOKEN"]
 def call(path):
     r=urllib.request.Request("http://127.0.0.1:8000"+path,headers={"Authorization":"Bearer "+tok})
