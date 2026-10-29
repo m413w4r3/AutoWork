@@ -10,6 +10,15 @@ actions récentes et hypothèses stables. Le contexte est canonique, borné et
 rejette les octets, secrets et URL signées. Les valeurs d’article, de binaire ou
 de fournisseur sont marquées comme données non fiables.
 
+Avant la sérialisation Bridge, les observations, résultats d’outils et deltas
+d’échantillons portant une référence d’échantillon sont rapprochés des
+associations de l’enquête et des échantillons canoniques du sujet. TLP RED, une
+borne TLP dépassée, `external_llm_allowed=false` ou une licence non vide masque
+les identifiants et observations concernés avec le motif
+`sample_disclosure_restricted`. Une association non résolue ou ambiguë est
+traitée de la même façon. Les références autorisées restent visibles.
+`do_not_submit` ne bloque pas un envoi Bridge.
+
 `BridgeInvestigator` n’a pas de client fournisseur. Son transport de production
 crée ou reprend une conversation `pivot_research` et soumet le JSON structuré
 uniquement par `ModelConversationService.add_turn`. La clé est déterministe par
