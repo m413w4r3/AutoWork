@@ -20,7 +20,6 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
-from cti_app.application.production_batch_repointing import _repoint_batch_item
 from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentRevisionConflictError,
     ProductionEditorialEnrichmentService,
@@ -1559,6 +1558,9 @@ _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
         "La reprise automatique n'est pas autorisée pour cet article."
     ),
     "production_batch_missing": "Le lot de production de cet article est introuvable.",
+    "production_run_superseded": (
+        "Une tentative plus récente existe pour cet article. Rechargez la revue."
+    ),
     "production_batch_cancelled": ("Le lot de production a été annulé : il n'est jamais rouvert."),
     "production_batch_superseded": (
         "Une production plus récente existe pour cette édition. Rechargez la revue."
@@ -1896,12 +1898,23 @@ async def restart_subject_with_new_sources(
         run, created = await service.create_run(
             subject_id=subject_id,
             edition_id=edition_id,
+            replaced_run_id=replaced_run_id,
         )
+    except ReviewRecoveryConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_retry_conflict_detail(exc),
+        ) from exc
     except ValueError as exc:
         if str(exc) in {"edition_archived", "production_edition_archived"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "production_edition_archived"},
+            ) from exc
+        if str(exc) == "production_run_superseded":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_retry_conflict_detail(exc),
             ) from exc
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1929,7 +1942,6 @@ async def restart_subject_with_new_sources(
                 raise ValueError("edition_not_found")
             if edition.state is EditionStatus.ARCHIVED:
                 raise ValueError("production_edition_archived")
-            await _repoint_batch_item(uow, replaced_run_id, run.id)
             await uow.commit()
     except ValueError as exc:
         if str(exc) in {"edition_archived", "production_edition_archived"}:

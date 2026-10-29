@@ -203,7 +203,7 @@ class Job:
 
     def request_cancellation(self, now: datetime | None = None) -> None:
         if self.is_terminal:
-            raise InvalidJobTransitionError(f"Cannot cancel a job in status {self.status.value}")
+            return
         timestamp = now or datetime.now(UTC)
         self.cancellation_requested_at = timestamp
         self.updated_at = timestamp

@@ -14,6 +14,7 @@ from cti_app.application.persistence import (
     ProductionUnitOfWork,
     ProductionUnitOfWorkFactory,
 )
+from cti_app.application.production_batch_repointing import _repoint_batch_item
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_resume import (
@@ -350,14 +351,18 @@ class SubjectProductionService:
         self,
         subject_id: UUID,
         edition_id: UUID,
+        *,
+        replaced_run_id: UUID | None = None,
     ) -> tuple[ProductionRun, bool]:
-        """Create one run outside a batch, for the repair restart path only.
+        """Create a manual replacement run for the repair restart path.
 
         Operator-initiated production always goes through
         ``ProductionBatchService.create``; both share the same eligibility
         checks and snapshot capture.  Returns the run and whether this call
         created it: an already active run is returned unchanged so two
-        concurrent restarts yield one logical run and one logical job.
+        concurrent restarts yield one logical run and one logical job. When
+        replacing a terminal run, reopen its review batch and repoint the item
+        in the same transaction as the replacement run.
         """
         try:
             async with self._uow_factory() as uow:
@@ -365,6 +370,13 @@ class SubjectProductionService:
                 existing = await _lock_subject_run_creation(uow, subject_id)
                 if existing is not None:
                     return existing, False
+                if replaced_run_id is not None:
+                    replaced = await uow.production_runs.get_current_for_subject(subject_id)
+                    if replaced is None or replaced.id != replaced_run_id:
+                        raise ValueError("production_run_superseded")
+                    if replaced.edition_id != edition_id:
+                        raise ValueError("production_run_edition_changed")
+                    await prepare_batch_for_recovery(uow, replaced, reopen=True)
                 run, snapshot = await _prepare_production_run(
                     uow,
                     edition_id=edition_id,
@@ -373,6 +385,8 @@ class SubjectProductionService:
                 )
                 await uow.production_runs.add(run)
                 await uow.production_input_snapshots.add(snapshot)
+                if replaced_run_id is not None:
+                    await _repoint_batch_item(uow, replaced_run_id, run.id)
                 await uow.commit()
                 return run, True
         except ActiveSubjectProductionRunConflictError:

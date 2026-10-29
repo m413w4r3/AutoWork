@@ -15,6 +15,8 @@ from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.diagram_compilation import DiagramCompiler
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import (
+    INTERNAL_ERROR_CODE,
+    INTERNAL_ERROR_MESSAGE,
     DuplicateJobError,
     JobCancelledError,
     JobDispatcher,
@@ -23,6 +25,7 @@ from cti_app.application.jobs import (
     JobParameters,
     JobRegistry,
     JobService,
+    JobWaitingHumanError,
 )
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_gateway import ModelGateway
@@ -267,9 +270,13 @@ class ProductionStageChain:
             if pause_check is not None and await pause_check():
                 return job.id
             cancel = getattr(self._jobs, "cancel", None)
-            if cancel is not None:
+            if cancel is not None and not job.is_terminal:
                 await cancel(job.id, actor_id=actor_id)
-            raise JobCancelledError
+            raise JobHandlerError(
+                code="production_stage_dispatch_rejected",
+                public_message="L'étape suivante ne peut pas être dispatchée.",
+                transient=False,
+            )
         await self._dispatcher.dispatch(
             job.id,
             delay_ms=(self._pacing.model_delay_ms(stage) if delay_ms is None else max(0, delay_ms)),
@@ -864,17 +871,66 @@ def register_production_jobs(
             )
         return f"production-stage://{parameters.run_id}/{stage.value}"
 
+    async def finalize_unexpected_stage_failure(
+        parameters: JobParameters,
+        context: JobExecutionContext,
+        *,
+        code: str,
+        message: str,
+    ) -> None:
+        if not isinstance(parameters, ProductionStageParameters):
+            return
+        await context.check_cancelled()
+        run_id = parameters.run_id
+        correlation_id = await context.correlation_id()
+        changed = False
+        async with uow_factory() as uow:
+            ending = await uow.production_runs.get_for_update(run_id)
+            if ending is not None and ending.status not in _TERMINAL_STATUSES:
+                ending.mark_failed(code=code, message=message)
+                await uow.production_runs.save(ending)
+                await uow.commit()
+                changed = True
+        if changed:
+            await advance_batch(run_id, correlation_id, context)
+
+    async def handle_stage_with_failure_finalization(
+        parameters: JobParameters,
+        context: JobExecutionContext,
+    ) -> str:
+        try:
+            return await handle_stage(parameters, context)
+        except JobHandlerError as exc:
+            if not exc.transient:
+                await finalize_unexpected_stage_failure(
+                    parameters,
+                    context,
+                    code=exc.code,
+                    message=exc.public_message,
+                )
+            raise
+        except (JobCancelledError, JobWaitingHumanError, ProductionBatchPausedError):
+            raise
+        except Exception:
+            await finalize_unexpected_stage_failure(
+                parameters,
+                context,
+                code=INTERNAL_ERROR_CODE,
+                message=INTERNAL_ERROR_MESSAGE,
+            )
+            raise
+
     for stage in production_stages():
         registry.register(
             stage_job_kind(stage),
             ProductionStageParameters,
-            handle_stage,
+            handle_stage_with_failure_finalization,
             resume_after_worker_loss=True,
         )
     registry.register(
         production_reconciliation_resume_job_kind(),
         ProductionReconciliationResumeParameters,
-        handle_stage,
+        handle_stage_with_failure_finalization,
         resume_after_worker_loss=True,
     )
     registry.register(
