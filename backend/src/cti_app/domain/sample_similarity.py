@@ -26,6 +26,24 @@ class SimilarityStatus(StrEnum):
     NO_COMPARABLE_FEATURES = "no_comparable_features"
 
 
+class SimilarityAvailabilityState(StrEnum):
+    AVAILABLE = "available"
+    PARTIAL = "partial"
+    UNAVAILABLE = "unavailable"
+
+
+class SimilarityAvailabilityReason(StrEnum):
+    SAMPLE_NOT_ACQUIRED = "sample_not_acquired"
+    NOT_ASSOCIATED_TO_INVESTIGATION = "not_associated_to_investigation"
+    FEATURE_PACK_MISSING = "feature_pack_missing"
+
+
+class SimilarityAvailabilityNextAction(StrEnum):
+    ACQUIRE_SAMPLE_IF_AUTHORIZED = "acquire_sample_if_authorized"
+    VERIFY_INVESTIGATION_ASSOCIATION = "verify_investigation_association"
+    VERIFY_ACQUISITION_OR_EXTRACT_FEATURES = "verify_acquisition_or_extract_features"
+
+
 class FamilyFeatureClass(StrEnum):
     CORE_STRONGLY_SHARED = "core_strongly_shared"
     SUBFAMILY_DISCRIMINANT = "subfamily_discriminant"
@@ -1126,6 +1144,9 @@ __all__ = [
     "SampleFeaturePresence",
     "SignatureCandidate",
     "SignatureMotifKind",
+    "SimilarityAvailabilityNextAction",
+    "SimilarityAvailabilityReason",
+    "SimilarityAvailabilityState",
     "SimilarityFeatureKind",
     "SimilarityLimits",
     "SimilarityPolicy",

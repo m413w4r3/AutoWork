@@ -11,7 +11,7 @@ Les appels passifs VT, les analyses locales et Bridge sont autorisés seulement 
 ## Démarrage et état canonique
 
 1. Lis une fois `GET /operator-status`, puis `GET /operator/context?view=summary`. Note le statut, `working_state_version`, `working_state_sha256`, les budgets consommés/réservés/restants, les invocations actives ou ambiguës, les capacités offertes et la version courante de l’avis.
-2. Consulte `available_tools` avant de choisir un outil. Les noms et versions réellement annoncés font foi; une capacité absente est `unavailable`, pas un résultat négatif.
+2. Consulte `available_tools` avant de choisir un outil. Les noms et versions réellement annoncés font foi. `unavailable ≠ négatif` : vérifie la raison structurée et l’action suivante; une association absente ou un feature pack manquant laisse la comparaison inconnue.
 `archive.extract_member` dérive un candidat quarantiné depuis `association_id` et `member_path`; vérifie le SHA attendu si connu, puis passe l'association retournée à `sample.analyze`.
 3. Si tu reprends une enquête, demande le delta depuis la dernière version connue lorsque l’API le permet. Lis uniquement les sections, observations et pages nécessaires au prochain pivot. Une page suivante utilise le curseur renvoyé par le serveur, la limite annoncée et le CAS correspondant. Ne remplace pas un curseur par un offset inventé.
 4. Garde dans le contexte un résumé, les références et les faits discriminants. Ne recopie pas le statut complet, les réponses API entières ou les mêmes observations à chaque tour.

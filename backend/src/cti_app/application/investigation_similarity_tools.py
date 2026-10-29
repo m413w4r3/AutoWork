@@ -24,11 +24,18 @@ from cti_app.application.sample_similarity import (
     SampleSimilarityService,
     StoredFamilyFeatureComparison,
 )
-from cti_app.domain.investigation import BudgetDimension, EvidenceKind, ToolInvocationStatus
+from cti_app.domain.investigation import (
+    BudgetDimension,
+    EvidenceKind,
+    ToolInvocationStatus,
+)
 from cti_app.domain.sample_similarity import (
     FeatureComparison,
     SampleFeaturePresence,
     SignatureCandidate,
+    SimilarityAvailabilityNextAction,
+    SimilarityAvailabilityReason,
+    SimilarityAvailabilityState,
 )
 
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -198,11 +205,31 @@ class _SimilarityToolAdapter(ToolAdapter):
                 message="invalid_sample_hashes",
             )
         try:
-            await self._require_investigation_samples(
+            unassociated_hashes = await self._unassociated_investigation_samples(
                 sample_associations,
                 context.investigation_id,
                 sample_hashes,
             )
+            if unassociated_hashes:
+                output = _availability_tool_output(
+                    tool_name,
+                    sample_hashes=unassociated_hashes,
+                    state=SimilarityAvailabilityState.UNAVAILABLE,
+                    reason=SimilarityAvailabilityReason.NOT_ASSOCIATED_TO_INVESTIGATION,
+                )
+                observation_id = await self._record_availability_observation(
+                    recorder,
+                    context,
+                    tool_name,
+                    output,
+                )
+                return ToolResult(
+                    status=ToolInvocationStatus.UNAVAILABLE,
+                    observation_refs=(observation_id,),
+                    budget_consumed={BudgetDimension.TOOL_SECONDS: 0},
+                    output=output,
+                    message="similarity_samples_unavailable",
+                )
             stored = await service.compare(
                 investigation_id=context.investigation_id,
                 sample_sha256s=sample_hashes,
@@ -226,6 +253,41 @@ class _SimilarityToolAdapter(ToolAdapter):
                     f"similarity:{context.idempotency_key}:{tool_name}:{stored.comparison.sha256}"
                 )[:512],
             )
+            output = _tool_output(
+                tool_name,
+                stored,
+                feature_key=arguments.get("feature_key"),
+                limit=min(_requested_limit(arguments), self.max_result_items),
+            )
+            missing_hashes = set(stored.comparison.limits.packs_missing)
+            if missing_hashes:
+                output.pop("empty", None)
+                requested_hashes = set(stored.comparison.comparison_sample_sha256s)
+                availability_state = (
+                    SimilarityAvailabilityState.UNAVAILABLE
+                    if requested_hashes.issubset(missing_hashes)
+                    else SimilarityAvailabilityState.PARTIAL
+                )
+                missing_reasons = dict(stored.missing_sample_reasons)
+                output["availability"] = _availability_report(
+                    reasons_by_sample_sha256={
+                        sample_hash: missing_reasons.get(
+                            sample_hash,
+                            SimilarityAvailabilityReason.FEATURE_PACK_MISSING,
+                        )
+                        for sample_hash in missing_hashes
+                    },
+                    state=availability_state,
+                )
+                availability_observation_id = await self._record_availability_observation(
+                    recorder,
+                    context,
+                    tool_name,
+                    output,
+                )
+            else:
+                availability_state = SimilarityAvailabilityState.AVAILABLE
+                availability_observation_id = None
         except (SampleSimilarityError, ValueError) as exc:
             return ToolResult(
                 status=ToolInvocationStatus.FAILED,
@@ -236,20 +298,25 @@ class _SimilarityToolAdapter(ToolAdapter):
                 status=ToolInvocationStatus.FAILED,
                 message=f"similarity_evidence_failed:{type(exc).__name__}",
             )
-        output = _tool_output(
-            tool_name,
-            stored,
-            feature_key=arguments.get("feature_key"),
-            limit=min(_requested_limit(arguments), self.max_result_items),
-        )
-        status = (
-            ToolInvocationStatus.EMPTY
-            if output.get("empty") is True
-            else ToolInvocationStatus.SUCCEEDED
-        )
+        if availability_state is SimilarityAvailabilityState.UNAVAILABLE:
+            status = ToolInvocationStatus.UNAVAILABLE
+            message = "similarity_feature_packs_unavailable"
+        elif availability_state is SimilarityAvailabilityState.PARTIAL:
+            status = ToolInvocationStatus.PARTIAL
+            message = "similarity_feature_coverage_partial"
+        else:
+            status = (
+                ToolInvocationStatus.EMPTY
+                if output.get("empty") is True
+                else ToolInvocationStatus.SUCCEEDED
+            )
+            message = "sample_similarity_comparison_recorded"
+        observation_refs: tuple[UUID, ...] = (observation.id,)
+        if availability_observation_id is not None:
+            observation_refs = (*observation_refs, availability_observation_id)
         return ToolResult(
             status=status,
-            observation_refs=(observation.id,),
+            observation_refs=observation_refs,
             budget_consumed={
                 BudgetDimension.TOOL_SECONDS: min(
                     self.reserved_seconds,
@@ -257,15 +324,15 @@ class _SimilarityToolAdapter(ToolAdapter):
                 )
             },
             output=output,
-            message="sample_similarity_comparison_recorded",
+            message=message,
         )
 
-    async def _require_investigation_samples(
+    async def _unassociated_investigation_samples(
         self,
         associations_port: SampleAssociationRepository,
         investigation_id: UUID,
         sample_hashes: Sequence[Any],
-    ) -> None:
+    ) -> tuple[str, ...]:
         if not sample_hashes:
             raise ValueError("at least one exact sample hash is required")
         hashes: set[str] = set()
@@ -275,10 +342,36 @@ class _SimilarityToolAdapter(ToolAdapter):
             hashes.add(value)
         associations = await associations_port.list_for_investigation(investigation_id)
         associated = {item.sample_sha256 for item in associations}
-        if not hashes.issubset(associated):
-            raise SampleSimilarityError(
-                "sample hashes are not all associated with this investigation"
-            )
+        return tuple(sorted(hashes - associated))
+
+    async def _record_availability_observation(
+        self,
+        recorder: EvidenceRecorder,
+        context: ToolExecutionContext,
+        tool_name: str,
+        output: Mapping[str, Any],
+    ) -> UUID:
+        observation = await recorder.record_json(
+            investigation_id=context.investigation_id,
+            kind=EvidenceKind.OTHER,
+            payload={
+                "schema": "investigation-tool-observation.v1",
+                "tool_name": tool_name,
+                "schema_version": "1",
+                "operation_key": context.idempotency_key,
+                "result": dict(output),
+            },
+            source=tool_name,
+            source_version="1",
+            object_type="tool_result",
+            object_id=context.idempotency_key,
+            limitations=(
+                "This records tool availability only; it is not a negative result.",
+                "A missing feature pack leaves feature absence unmeasured.",
+            ),
+            idempotency_key=f"similarity-availability:{context.idempotency_key}"[:512],
+        )
+        return observation.id
 
 
 def _tool_output(
@@ -363,6 +456,65 @@ def _tool_output(
             "reason": None,
         }
     return {**base, "empty": True, "reason": "unsupported_similarity_tool"}
+
+
+def _availability_tool_output(
+    tool_name: str,
+    *,
+    sample_hashes: Sequence[str],
+    state: SimilarityAvailabilityState,
+    reason: SimilarityAvailabilityReason,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "investigation-similarity-tool-output-v1",
+        "status": state.value,
+        "sample_sha256s": list(sorted(set(sample_hashes))),
+        "availability": _availability_report(
+            reasons_by_sample_sha256={sample_hash: reason for sample_hash in sample_hashes},
+            state=state,
+        ),
+        "tool_name": tool_name,
+    }
+
+
+def _availability_report(
+    *,
+    reasons_by_sample_sha256: Mapping[str, SimilarityAvailabilityReason],
+    state: SimilarityAvailabilityState,
+) -> dict[str, Any]:
+    def reason_details(reason: SimilarityAvailabilityReason) -> dict[str, Any]:
+        if reason is SimilarityAvailabilityReason.NOT_ASSOCIATED_TO_INVESTIGATION:
+            action = SimilarityAvailabilityNextAction.VERIFY_INVESTIGATION_ASSOCIATION
+            description = (
+                "Verify or establish this hash's association with the current investigation. "
+                "If acquisition is still needed, use vt.download_sample only when current "
+                "authorization permits it."
+            )
+        elif reason is SimilarityAvailabilityReason.SAMPLE_NOT_ACQUIRED:
+            action = SimilarityAvailabilityNextAction.ACQUIRE_SAMPLE_IF_AUTHORIZED
+            description = (
+                "Acquire this sample with vt.download_sample only when current authorization "
+                "permits it; otherwise keep the sample unavailable."
+            )
+        else:
+            action = SimilarityAvailabilityNextAction.VERIFY_ACQUISITION_OR_EXTRACT_FEATURES
+            description = (
+                "Verify acquisition and association. If already acquired, check that "
+                "sample.analyze is available and run it to create the feature pack."
+            )
+        return {
+            "reason": reason.value,
+            "next_action": {"code": action.value, "description": description},
+        }
+
+    return {
+        "state": state.value,
+        "interpretation": "not_a_negative_result",
+        "reasons_by_sample_sha256": {
+            sample_hash: reason_details(reason)
+            for sample_hash, reason in sorted(reasons_by_sample_sha256.items())
+        },
+    }
 
 
 def _bounded_feature(feature: FeatureComparison | None) -> dict[str, Any]:
