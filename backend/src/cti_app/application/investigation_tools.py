@@ -234,6 +234,8 @@ class ToolExecutionContext:
     unavailable_tool_reasons: Mapping[str, str] = field(default_factory=dict)
     external_effect_authority: ExternalEffectAuthority | None = None
     external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
+    actor_id: str | None = None
+    purpose: str | None = None
     pre_transport_check: (
         Callable[[ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]] | None
     ) = None
@@ -241,6 +243,8 @@ class ToolExecutionContext:
     def __post_init__(self) -> None:
         if not self.idempotency_key.strip():
             raise ValueError("Tool execution context requires an idempotency key")
+        if self.actor_id is not None and not self.actor_id.strip():
+            raise ValueError("Tool execution actor identity must not be empty")
         if self.envelope is not None:
             if self.investigation_id != self.envelope.investigation_id:
                 raise ValueError("Tool execution context and envelope investigations must match")
@@ -684,6 +688,7 @@ class RegistryToolDispatcher:
                 replace(
                     registry_tool_context(self._registry, context),
                     idempotency_key=operation_key,
+                    purpose=purpose,
                 ),
                 tool_name=tool_name,
                 schema_version=schema_version,

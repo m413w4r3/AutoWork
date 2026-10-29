@@ -45,6 +45,8 @@ class _ArchiveEntry(TypedDict):
     is_dir: bool
     encrypted: bool
     method: str | None
+    attributes: str | None
+    is_link: bool
 
 
 async def run_zip_members(
@@ -267,8 +269,14 @@ async def run_7z_archive_command(
     timeout_seconds: float,
     memory_limit_bytes: int,
     tool_version: str | None,
+    member_path: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
-    if tool not in {ConfinedAnalysisTool.ARCHIVE_LIST, ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH}:
+    if tool not in {
+        ConfinedAnalysisTool.ARCHIVE_LIST,
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+    }:
         raise ValueError("7z archive command is invalid")
     executable = "/usr/bin/7z"
     password_arg = "-p" if archive_preset == "none" else f"-p{archive_preset}"
@@ -309,7 +317,10 @@ async def run_7z_archive_command(
             }
             text, truncated = _encode_report(report, (), max_output_bytes, (), 0)
             return _worker_result(text, truncated, tool.value, tool_version)
-        if listing_truncated and tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH:
+        if listing_truncated and tool in {
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        }:
             report = {
                 "schema_version": _ARCHIVE_OUTPUT_SCHEMA,
                 "archive_status": "listing_output_limit",
@@ -321,6 +332,23 @@ async def run_7z_archive_command(
                 report, (), max_output_bytes, ("listing_output_limit",), 0
             )
             return _worker_result(text, True, tool.value, tool_version)
+
+        if tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER:
+            if member_path is None:
+                raise ValueError("archive member path is required")
+            return await _extract_7z_archive_member(
+                executable=executable,
+                sample_path=sample_path,
+                entries=entries,
+                member_path=member_path,
+                expected_sha256=expected_sha256,
+                archive_preset=archive_preset,
+                password_arg=password_arg,
+                deadline=deadline,
+                timeout_seconds=timeout_seconds,
+                memory_limit_bytes=memory_limit_bytes,
+                tool_version=tool_version,
+            )
 
         matched = [
             entry
@@ -462,9 +490,143 @@ def _parse_7z_listing(
                 is_dir=fields.get("Folder") == "+",
                 encrypted=fields.get("Encrypted", "-") in {"+", "1", "true"},
                 method=fields.get("Method"),
+                attributes=fields.get("Attributes"),
+                is_link=_is_7z_link_entry(fields),
             )
         )
     return archive_type, entries
+
+
+def _is_7z_link_entry(fields: Mapping[str, str]) -> bool:
+    if any(fields.get(key) for key in ("Symbolic Link", "Hard Link", "Link")):
+        return True
+    return any(
+        re.fullmatch(r"l[rwxStT-]{9}", token, re.I)
+        for token in fields.get("Attributes", "").split()
+    )
+
+
+async def _extract_7z_archive_member(
+    *,
+    executable: str,
+    sample_path: Path,
+    entries: list[_ArchiveEntry],
+    member_path: str,
+    expected_sha256: str | None,
+    archive_preset: str,
+    password_arg: str,
+    deadline: float,
+    timeout_seconds: float,
+    memory_limit_bytes: int,
+    tool_version: str | None,
+) -> dict[str, Any]:
+    def refusal(status: str) -> dict[str, Any]:
+        result = _worker_result(
+            json.dumps(
+                {"schema_version": _ARCHIVE_OUTPUT_SCHEMA, "status": status},
+                separators=(",", ":"),
+            ),
+            False,
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER.value,
+            tool_version,
+        )
+        result["member_status"] = status
+        return result
+
+    if not _safe_archive_member_path(member_path):
+        return refusal("invalid_member_name")
+    matches = [entry for entry in entries if entry["name"] == member_path]
+    if not matches:
+        return refusal("member_not_found")
+    if len(matches) != 1:
+        return refusal("duplicate_name_ambiguous")
+    entry = matches[0]
+    if entry["is_dir"]:
+        return refusal("directory")
+    if entry["is_link"]:
+        return refusal("link_not_allowed")
+    if entry["encrypted"] and archive_preset == "none":
+        return refusal("encrypted_password_required")
+    size = entry["size"]
+    packed_size = entry["packed_size"]
+    if size is None or size < 0:
+        return refusal("invalid_size_metadata")
+    if size > LOCAL_ARCHIVE_MAX_MEMBER_BYTES:
+        return refusal("declared_member_size_limit")
+    if size > LOCAL_ARCHIVE_MAX_TOTAL_BYTES:
+        return refusal("declared_total_size_limit")
+    if size > max(1, packed_size or 0) * LOCAL_ARCHIVE_MAX_COMPRESSION_RATIO:
+        return refusal("compression_ratio_limit")
+    remaining_timeout = deadline - time.monotonic()
+    if remaining_timeout <= 0:
+        return refusal("timeout")
+    extracted = await run_analysis_subprocess(
+        [
+            executable,
+            "x",
+            "-so",
+            "-y",
+            "-bd",
+            "-spd",
+            "-sccUTF-8",
+            password_arg,
+            "--",
+            str(sample_path),
+            member_path,
+        ],
+        timeout_seconds=min(remaining_timeout, timeout_seconds, 30),
+        output_limit=max(1, size),
+        memory_limit_bytes=memory_limit_bytes,
+        environment={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+    )
+    data = extracted.stdout
+    if extracted.status is AnalysisSubprocessStatus.TIMED_OUT:
+        return refusal("timeout")
+    if extracted.status is AnalysisSubprocessStatus.FAILED_TO_START:
+        return refusal("7z_unavailable")
+    if extracted.status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
+        return refusal("actual_size_or_member_limit")
+    if extracted.status is not AnalysisSubprocessStatus.SUCCEEDED:
+        return refusal(_member_failure_status(extracted.stderr, entry))
+    if len(data) != size or len(data) > LOCAL_ARCHIVE_MAX_MEMBER_BYTES:
+        return refusal("actual_size_mismatch")
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        return refusal("expected_sha256_mismatch")
+    result = _worker_result(
+        json.dumps(
+            {
+                "schema_version": _ARCHIVE_OUTPUT_SCHEMA,
+                "member_path": member_path,
+                "member_size": len(data),
+                "member_sha256": digest,
+                "status": "extracted",
+            },
+            separators=(",", ":"),
+        ),
+        False,
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER.value,
+        tool_version,
+    )
+    result["member_status"] = "extracted"
+    result["member_path"] = member_path
+    result["member_size"] = len(data)
+    result["member_sha256"] = digest
+    result["_member_bytes"] = data
+    return result
+
+
+def _safe_archive_member_path(value: str) -> bool:
+    if (
+        not value
+        or len(value) > 1024
+        or value.startswith("/")
+        or "\\" in value
+        or ":" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    return all(part not in {"", ".", ".."} for part in value.split("/"))
 
 
 def _archive_entry_record(entry: _ArchiveEntry) -> dict[str, object]:

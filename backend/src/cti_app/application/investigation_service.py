@@ -1410,6 +1410,7 @@ class InvestigationService:
         arguments: Mapping[str, Any],
         purpose: str,
         operation_key: str,
+        actor_id: str | None = None,
         check_stop_before_dispatch: bool = True,
     ) -> tuple[ToolInvocation, ToolResult, tuple[UUID, ...], bool]:
         """Persist budget and RUNNING invocation before using the shared dispatcher."""
@@ -1715,6 +1716,8 @@ class InvestigationService:
             available_capabilities=self._available_capabilities,
             external_effect_authority=external_effect_authority,
             external_effect_evidence_refs=external_effect_evidence_refs,
+            actor_id=actor_id or "agent:bridge-investigator",
+            purpose=purpose,
         )
 
         async def check_current_admission(

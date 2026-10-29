@@ -19,6 +19,7 @@ class LocalCommandId(StrEnum):
     ZIP_MEMBERS = "zip_members"
     ARCHIVE_LIST = "archive_list"
     ARCHIVE_EXTRACT_HASH = "archive_extract_hash"
+    ARCHIVE_EXTRACT_MEMBER = "archive_extract_member"
     # L4: optional extractors remain outside the generic local.run_command catalogue.
     FLOSS = "floss"
     MWCP = "mwcp"

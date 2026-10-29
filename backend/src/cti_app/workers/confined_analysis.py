@@ -27,6 +27,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisArtifactKind,
     ConfinedAnalysisJobParameters,
     ConfinedAnalysisTool,
+    archive_member_transfer_bucket,
     validate_archive_tool_request,
 )
 from cti_app.application.evidence_recorder import sanitize_evidence_text
@@ -40,6 +41,7 @@ from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySet
 from cti_app.domain.code_features import CodeFeatureSet, CodeFeatureStatus, build_code_ngrams
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.local_analysis import (
+    LOCAL_ARCHIVE_MAX_MEMBER_BYTES,
     LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES,
     LOCAL_COMMAND_MAX_RANGE_BYTES,
     LOCAL_COMMAND_MAX_XXD_RANGE_BYTES,
@@ -144,6 +146,7 @@ async def execute_confined_analysis_job(
             ConfinedAnalysisTool.ZIP_MEMBERS,
             ConfinedAnalysisTool.ARCHIVE_LIST,
             ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
         }:
             validate_archive_tool_request(
                 parameters.tool, parameters.arguments, parameters.analysis_parameters
@@ -204,6 +207,34 @@ async def execute_confined_analysis_job(
                 uow_factory=uow_factory,
                 settings=settings,
             )
+        if parameters.tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER:
+            member_bytes = result_data.pop("_member_bytes", None)
+            if member_bytes is not None:
+                if not isinstance(member_bytes, bytes):
+                    raise ValueError("archive member transfer is not bytes")
+                member_sha256 = hashlib.sha256(member_bytes).hexdigest()
+                if (
+                    len(member_bytes) > LOCAL_ARCHIVE_MAX_MEMBER_BYTES
+                    or member_sha256 != result_data.get("member_sha256")
+                    or len(member_bytes) != result_data.get("member_size")
+                ):
+                    raise ConfinedAnalysisArtifactMismatch("archive_member_transfer_mismatch")
+                transfer_nonce = parameters.analysis_parameters.get("transfer_nonce")
+                if transfer_nonce is None:
+                    transfer_nonce = hashlib.sha256(parameters.operation_key.encode()).hexdigest()
+                transfer_bucket = archive_member_transfer_bucket(transfer_nonce)
+                transfer_blob = await blobs.ingest(
+                    BytesIO(member_bytes),
+                    logical_bucket=transfer_bucket,
+                    mime_type="application/octet-stream",
+                )
+                if (
+                    transfer_blob.descriptor.sha256 != member_sha256
+                    or transfer_blob.descriptor.size != len(member_bytes)
+                    or transfer_blob.descriptor.logical_bucket != transfer_bucket
+                ):
+                    raise ConfinedAnalysisArtifactMismatch("archive_member_transfer_mismatch")
+                result_data["transfer_blob_id"] = str(transfer_blob.id)
         result_payload = {
             "schema": CONFINED_ANALYSIS_RESULT_SCHEMA,
             "operation_key": parameters.operation_key,
@@ -291,6 +322,15 @@ async def _resolve_input(
         or association.sample_sha256 != descriptor.sha256
     ):
         raise ConfinedAnalysisArtifactMismatch("analysis_artifact_identity_mismatch")
+    if parameters.tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER and (
+        sample is None
+        or sample.subject_id != investigation.subject_id
+        or descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+        or association is None
+        or association.investigation_id != parameters.investigation_id
+        or association.sample_sha256 != descriptor.sha256
+    ):
+        raise ConfinedAnalysisArtifactMismatch("analysis_archive_parent_not_quarantined")
     if parameters.artifact_kind is ConfinedAnalysisArtifactKind.CAPTURE and (
         descriptor.logical_bucket != _NETWORK_CAPTURE_BUCKET
         or not any(
@@ -383,6 +423,7 @@ async def _execute_tool(
     if tool in {
         ConfinedAnalysisTool.ARCHIVE_LIST,
         ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
     }:
         return await run_7z_archive_command(
             tool,
@@ -396,6 +437,8 @@ async def _execute_tool(
             ),
             memory_limit_bytes=settings.local_analysis_memory_limit_bytes,
             tool_version=settings.analysis_local_7z_expected_version,
+            member_path=parameters.analysis_parameters.get("member_path"),
+            expected_sha256=parameters.analysis_parameters.get("expected_sha256"),
         )
     if tool is ConfinedAnalysisTool.DOTNET_ILSPY:
         if sample is None:

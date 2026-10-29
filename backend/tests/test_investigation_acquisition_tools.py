@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -15,13 +16,17 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisResult,
     ConfinedAnalysisTool,
     ConfinedAnalysisWorkerAttestation,
+    archive_member_transfer_bucket,
 )
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_acquisition_tools import (
+    ARCHIVE_EXTRACT_MEMBER_CAPABILITY,
     LOCAL_ANALYSIS_CAPABILITY,
     LOCAL_QUALIFICATION_CAPABILITY,
     VT_FILE_DOWNLOAD_CAPABILITY,
+    ArchiveExtractMemberAdapter,
     LocalSampleAnalysisService,
+    SampleAnalysisOutcome,
     register_acquisition_tools,
 )
 from cti_app.application.investigation_governance import (
@@ -37,16 +42,24 @@ from cti_app.application.investigation_tools import (
     ToolResult,
     validate_json_schema,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.virustotal import VirusTotalHttpError
+from cti_app.domain.classification import TLP
+from cti_app.domain.entities import Sample
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     EvidenceKind,
+    SampleAssociation,
     SampleOrigin,
+    SampleState,
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_state import StopReason
 from tests.investigation_c2_fakes import (
+    FakeBlob,
+    FakeBlobDescriptor,
     FakeDatabase,
     FakeUow,
     FakeVirusTotalPort,
@@ -94,6 +107,102 @@ class _AttestedAnalysisWorker:
             result_blob_id=uuid4(),
             result_sha256=hashlib.sha256(encoded).hexdigest(),
             payload={"result": self.worker_result},
+        )
+
+
+class _ArchiveMemberWorker:
+    def __init__(self, database: FakeDatabase, member: bytes) -> None:
+        self.database = database
+        self.member = member
+        self.requests: list[ConfinedAnalysisRequest] = []
+        self.transfer_blob_ids: list[UUID] = []
+
+    def seed_blob(self, content: bytes, bucket: str) -> UUID:
+        blob_id = uuid4()
+        self.database.blobs[blob_id] = FakeBlob(
+            blob_id,
+            FakeBlobDescriptor(bucket, hashlib.sha256(content).hexdigest(), len(content)),
+        )
+        self.database.blob_bytes[blob_id] = content
+        return blob_id
+
+    async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
+        self.requests.append(request)
+        transfer_nonce = request.analysis_parameters["transfer_nonce"]
+        transfer_bucket = archive_member_transfer_bucket(transfer_nonce)
+        transfer_blob_id = self.seed_blob(self.member, transfer_bucket)
+        self.transfer_blob_ids.append(transfer_blob_id)
+        child_sha256 = hashlib.sha256(self.member).hexdigest()
+        payload = {
+            "investigation_id": str(request.investigation_id),
+            "association_id": str(request.association_id),
+            "sample_id": str(request.sample_id),
+            "artifact_sha256": request.sha256,
+            "result": {
+                "member_status": "extracted",
+                "member_path": request.analysis_parameters["member_path"],
+                "member_sha256": child_sha256,
+                "member_size": len(self.member),
+                "transfer_blob_id": str(transfer_blob_id),
+            },
+        }
+        return ConfinedAnalysisResult(
+            ToolInvocationStatus.SUCCEEDED,
+            "confined-analysis:archive-member",
+            request.artifact_id,
+            request.sha256,
+            payload=payload,
+        )
+
+
+class _FakeQuarantineArtifactStore:
+    def __init__(
+        self, database: FakeDatabase, *, after_put: Callable[[], None] | None = None
+    ) -> None:
+        self.database = database
+        self.after_put = after_put
+
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        content = self.database.blob_bytes[blob_id]
+        if len(content) > max_bytes:
+            raise ValueError("blob exceeds requested test bound")
+        return content
+
+    async def put_bytes(self, content: bytes, *, bucket: str, mime_type: str) -> UUID:
+        del mime_type
+        blob_id = uuid5(
+            UUID("6c3db404-61fe-4d1f-b1eb-638aa7b15b0a"),
+            f"{bucket}:{hashlib.sha256(content).hexdigest()}",
+        )
+        self.database.blobs[blob_id] = FakeBlob(
+            blob_id,
+            FakeBlobDescriptor(bucket, hashlib.sha256(content).hexdigest(), len(content)),
+        )
+        self.database.blob_bytes[blob_id] = content
+        if self.after_put is not None:
+            self.after_put()
+        return blob_id
+
+    async def delete_unreferenced(self, blob_id: UUID) -> None:
+        self.database.blobs.pop(blob_id, None)
+        self.database.blob_bytes.pop(blob_id, None)
+
+
+class _ResolvingSampleAnalyzer:
+    def __init__(self, hits: HitAcquisitionService) -> None:
+        self.hits = hits
+        self.resolved = None
+
+    async def analyze(
+        self, *, association_id: UUID, invocation_ref: UUID | None
+    ) -> SampleAnalysisOutcome:
+        del invocation_ref
+        self.resolved = await self.hits.resolve_quarantined_sample(association_id)
+        return SampleAnalysisOutcome(
+            ToolInvocationStatus.SUCCEEDED,
+            (),
+            {"sample_sha256": self.resolved.sha256},
+            "Resolved quarantined sample for analysis.",
         )
 
 
@@ -237,6 +346,212 @@ async def test_tool_capabilities_and_unavailable_analysis_are_explicit() -> None
         operation_key="op:sample:analyze:missing-capability",
     )
     assert missing_capability_result.status is ToolInvocationStatus.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_archive_member_registration_is_candidate_and_resolves_for_sample_analysis() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    envelope = await InvestigationEnvelopeService(lambda: FakeUow(database)).approve(
+        make_approved_proposal(investigation),
+        actor_id="analyst:archive-test",
+        reason="Approve bounded local archive analysis.",
+        correlation_id="g2:archive-member",
+    )
+    parent_bytes = b"quarantined archive fixture"
+    parent_sha256 = hashlib.sha256(parent_bytes).hexdigest()
+    parent_blob_id = uuid4()
+    database.blobs[parent_blob_id] = FakeBlob(
+        parent_blob_id,
+        FakeBlobDescriptor(SAMPLES_QUARANTINE_BUCKET, parent_sha256, len(parent_bytes)),
+    )
+    database.blob_bytes[parent_blob_id] = parent_bytes
+    parent_sample = Sample(
+        subject_id=investigation.subject_id,
+        blob_id=parent_blob_id,
+        original_name="parent.zip",
+        origin="operator_import",
+        acquired_at=datetime.now(UTC),
+        license_restriction="internal-only",
+        tlp=TLP.AMBER,
+        do_not_submit=True,
+        external_llm_allowed=False,
+        origin_kind=SampleOrigin.MANUAL,
+        state=SampleState.QUARANTINED,
+        source_service="operator_import",
+        source_object_id=parent_sha256,
+        expected_hash=parent_sha256,
+    )
+    database.samples[parent_sample.id] = parent_sample
+    parent_association = SampleAssociation(
+        investigation_id=investigation.id,
+        sample_sha256=parent_sha256,
+        origin=SampleOrigin.RELATIONSHIP,
+    )
+    database.associations[parent_association.id] = parent_association
+
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database), acquisition=None, recorder=make_evidence_recorder(database)
+    )
+    member_bytes = b"static member fixture bytes"
+    worker = _ArchiveMemberWorker(database, member_bytes)
+    store = _FakeQuarantineArtifactStore(database)
+    extractor = ArchiveExtractMemberAdapter(
+        hits=hits,
+        uow_factory=lambda: FakeUow(database),
+        artifact_store=cast(ProductionArtifactStore, store),
+        execution=cast(Any, worker),
+        timeout_seconds=20,
+        max_output_bytes=4096,
+    )
+    analyzer = _ResolvingSampleAnalyzer(hits)
+    registry = InMemoryToolRegistry()
+    register_acquisition_tools(
+        registry,
+        hits=hits,
+        qualifications=SampleQualificationService(lambda: FakeUow(database)),
+        analyzer=analyzer,
+        archive_extractor=extractor,
+    )
+    definition, _ = registry.get("archive.extract_member", "1")
+    assert definition.schema_version == "1"
+    assert definition.capability_key == ARCHIVE_EXTRACT_MEMBER_CAPABILITY
+    assert definition.effect is ToolEffect.LOCAL_COMPUTE
+    assert set(definition.input_schema["required"]) == {
+        "association_id",
+        "member_path",
+        "reason",
+    }
+
+    dispatcher = RegistryToolDispatcher(registry)
+    context = ToolExecutionContext(
+        investigation_id=investigation.id,
+        envelope=envelope,
+        budget=envelope.budget,
+        idempotency_key="archive-member-first",
+        available_capabilities=frozenset(
+            {ARCHIVE_EXTRACT_MEMBER_CAPABILITY, LOCAL_ANALYSIS_CAPABILITY}
+        ),
+        actor_id="analyst:archive-test",
+    )
+    arguments = {
+        "association_id": str(parent_association.id),
+        "member_path": "bin/loader.dll",
+        "reason": "Inspect the archive member as a static candidate.",
+        "expected_sha256": hashlib.sha256(member_bytes).hexdigest(),
+    }
+    first = await dispatcher.dispatch(
+        context,
+        tool_name="archive.extract_member",
+        schema_version="1",
+        arguments=arguments,
+        purpose="Inspect the member without execution.",
+        operation_key="archive-member:first",
+    )
+    second = await dispatcher.dispatch(
+        replace(
+            context,
+            idempotency_key="archive-member-second",
+            actor_id="analyst:archive-reviewer",
+        ),
+        tool_name="archive.extract_member",
+        schema_version="1",
+        arguments={
+            **arguments,
+            "reason": "Compare the same member against a separate analyst question.",
+        },
+        purpose="Retry the same deterministic extraction.",
+        operation_key="archive-member:second",
+    )
+
+    assert first.status is ToolInvocationStatus.SUCCEEDED
+    assert second.status is ToolInvocationStatus.SUCCEEDED
+    assert first.output["qualification"] == "candidate"
+    assert second.output["association_id"] == first.output["association_id"]
+    assert second.output["sample_id"] == first.output["sample_id"]
+    assert second.output["reused_association"] is True
+    assert (
+        worker.requests[0].analysis_parameters["transfer_nonce"]
+        != (worker.requests[1].analysis_parameters["transfer_nonce"])
+    )
+    assert all(blob_id not in database.blobs for blob_id in worker.transfer_blob_ids)
+    assert len(set(worker.transfer_blob_ids)) == 2
+    derived_sha256 = hashlib.sha256(member_bytes).hexdigest()
+    derived_associations = [
+        item
+        for item in database.associations.values()
+        if item.investigation_id == investigation.id and item.sample_sha256 == derived_sha256
+    ]
+    assert len(derived_associations) == 1
+    derived_sample = database.samples[UUID(str(first.output["sample_id"]))]
+    assert derived_sample.state is SampleState.QUARANTINED
+    assert derived_sample.do_not_submit is True
+    assert derived_sample.external_llm_allowed is False
+    assert derived_sample.license_restriction == "internal-only"
+    provenance = [
+        item
+        for item in database.provenance
+        if item.aggregate_id == derived_sample.id
+        and item.event_type == "sample_derived_from_archive_member"
+    ]
+    assert len(provenance) == 2
+    assert all(item.payload["parent_sha256"] == parent_sha256 for item in provenance)
+    assert all(item.payload["member_path"] == "bin/loader.dll" for item in provenance)
+    assert {(item.actor_id, item.payload["reason"]) for item in provenance} == {
+        ("analyst:archive-test", arguments["reason"]),
+        (
+            "analyst:archive-reviewer",
+            "Compare the same member against a separate analyst question.",
+        ),
+    }
+
+    failed_member = b"member invalidated by a changed envelope"
+    failed_worker = _ArchiveMemberWorker(database, failed_member)
+    failed_store = _FakeQuarantineArtifactStore(
+        database,
+        after_put=lambda: database.envelopes.__setitem__(
+            investigation.id, replace(envelope, version=envelope.version + 1)
+        ),
+    )
+    failing_extractor = ArchiveExtractMemberAdapter(
+        hits=hits,
+        uow_factory=lambda: FakeUow(database),
+        artifact_store=cast(ProductionArtifactStore, failed_store),
+        execution=cast(Any, failed_worker),
+        timeout_seconds=20,
+        max_output_bytes=4096,
+    )
+    failed_result = await failing_extractor.execute(
+        {
+            "association_id": str(parent_association.id),
+            "member_path": "bin/revoked.dll",
+            "reason": "This extraction must not persist after a policy change.",
+        },
+        replace(context, idempotency_key="archive-member-revoked"),
+    )
+    assert failed_result.status is ToolInvocationStatus.NEEDS_REVIEW
+    failed_quarantine_id = uuid5(
+        UUID("6c3db404-61fe-4d1f-b1eb-638aa7b15b0a"),
+        f"{SAMPLES_QUARANTINE_BUCKET}:{hashlib.sha256(failed_member).hexdigest()}",
+    )
+    assert failed_quarantine_id not in database.blobs
+
+    analyzed = await dispatcher.dispatch(
+        replace(context, idempotency_key="sample-analyze-derived"),
+        tool_name="sample.analyze",
+        schema_version="1",
+        arguments={
+            "association_id": str(first.output["association_id"]),
+            "purpose": "Resolve the derived sample through the analysis tool.",
+            "evidence_refs": [],
+        },
+        purpose="Resolve the derived sample through the analysis tool.",
+        operation_key="sample-analyze-derived",
+    )
+    assert analyzed.status is ToolInvocationStatus.SUCCEEDED
+    assert analyzer.resolved is not None
+    assert analyzer.resolved.sha256 == derived_sha256
 
 
 @pytest.mark.asyncio

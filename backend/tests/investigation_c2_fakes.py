@@ -288,6 +288,13 @@ class _Samples:
     async def add(self, sample: Sample) -> None:
         self.db.samples[sample.id] = sample
 
+    async def add_if_absent(self, sample: Sample) -> Sample:
+        existing = await self.get_by_subject_and_blob(sample.subject_id, sample.blob_id)
+        if existing is not None:
+            return existing
+        self.db.samples[sample.id] = sample
+        return sample
+
     async def save(self, sample: Sample) -> None:
         self.db.samples[sample.id] = sample
 

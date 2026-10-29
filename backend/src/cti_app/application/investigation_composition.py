@@ -34,7 +34,9 @@ from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.invariants import InvariantRegistryService
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_acquisition_tools import (
+    ARCHIVE_EXTRACT_MEMBER_CAPABILITY,
     SAMPLE_ANALYSIS_CAPABILITY,
+    ArchiveExtractMemberAdapter,
     LocalSampleAnalysisService,
     SampleAnalyzer,
     register_acquisition_tools,
@@ -242,6 +244,7 @@ OPTIONAL_TOOL_NAMES = (
     "shodan.domain",
     "shodan.count",
     "sample.analyze",
+    "archive.extract_member",
     "sample.set_qualification",
     "local.run_command",
     "ghidra.list_functions",
@@ -1344,6 +1347,26 @@ def build_investigation_composition(
             ),
         )
         analyzer: SampleAnalyzer | None = None
+        archive_extractor: ArchiveExtractMemberAdapter | None = None
+        confined_execution = dependencies.confined_analysis_execution
+        archive_family = (
+            confined_execution.family_statuses.get("archive_tools")
+            if confined_execution is not None
+            else None
+        )
+        if (
+            confined_execution is not None
+            and archive_family is not None
+            and archive_family.available
+        ):
+            archive_extractor = ArchiveExtractMemberAdapter(
+                hits=hits,
+                uow_factory=uow_factory,
+                artifact_store=artifact_store,
+                execution=confined_execution,
+                timeout_seconds=settings.analysis_worker_job_timeout_seconds,
+                max_output_bytes=settings.analysis_worker_result_max_bytes,
+            )
         worker_analysis_available = bool(
             dependencies.confined_analysis_execution is not None
             and (
@@ -1372,11 +1395,14 @@ def build_investigation_composition(
             hits=hits,
             qualifications=SampleQualificationService(uow_factory),
             analyzer=analyzer,
+            archive_extractor=archive_extractor,
         )
         if settings.virustotal_file_download_enabled and dependencies.acquisition is not None:
             enabled.add("vt.file_download")
         if analyzer is not None:
             enabled.add(SAMPLE_ANALYSIS_CAPABILITY)
+        if archive_extractor is not None:
+            enabled.add(ARCHIVE_EXTRACT_MEMBER_CAPABILITY)
 
     detection_candidates = getattr(uow, "detection_candidates", None)
     rule_get_ports_available = all(
@@ -1740,6 +1766,12 @@ def _unavailable_tool_reasons(
     for name in names:
         if name == "sample.analyze":
             reason = worker_reason("sample_analysis", "sample_analysis_unavailable")
+        elif name == "archive.extract_member":
+            reason = (
+                "sample_associations_unavailable"
+                if dependencies.sample_associations is None
+                else worker_reason("archive_tools", "archive_tools_unavailable")
+            )
         elif name == "sample.extract_obfuscated_strings":
             reason = worker_reason("floss", "floss_unavailable")
         elif name == "sample.extract_configuration":

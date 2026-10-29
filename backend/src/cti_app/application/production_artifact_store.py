@@ -58,6 +58,10 @@ class ProductionArtifactStore:
         )
         return record.id
 
+    async def delete_unreferenced(self, blob_id: UUID) -> None:
+        """Remove a temporary catalog blob after its verified transfer completes."""
+        await self._catalog.delete_unreferenced(blob_id)
+
     async def put_json(self, payload: dict[str, Any], *, bucket: str) -> UUID:
         encoded = self.canonical_json_bytes(payload)
         record = await self._catalog.ingest(

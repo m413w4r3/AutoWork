@@ -1537,7 +1537,7 @@ async def invoke_investigation_operator_tool(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> OperatorToolInvocationApiResponseV1:
-    await _require_operator_client(request)
+    identity = await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
@@ -1551,6 +1551,7 @@ async def invoke_investigation_operator_tool(
                 purpose=payload.purpose,
                 expected_version=payload.expected_version,
                 idempotency_key=idempotency_key,
+                actor_id=identity.actor_id,
             )
         except OperatorToolInvocationError as exc:
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
@@ -3947,10 +3948,11 @@ async def _identity(request: Request) -> Any:
     return await provider.current()
 
 
-async def _require_operator_client(request: Request) -> None:
+async def _require_operator_client(request: Request) -> Any:
     identity = await _identity(request)
     if not identity.has_scope(IdentityScope.OPERATOR_CLIENT):
         raise _http_error(403, "operator_client_scope_required")
+    return identity
 
 
 async def _require_article_claim_reader(request: Request, section: str) -> None:

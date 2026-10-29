@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from cti_app.application.capabilities import CapabilitiesService
 from cti_app.application.code_features import CodeFeatureService
@@ -16,6 +20,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisRequest,
     ConfinedAnalysisTool,
+    archive_member_transfer_bucket,
     confined_analysis_operation_cache_identity,
 )
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
@@ -24,6 +29,7 @@ from cti_app.application.investigation_acquisition import (
     HitAcquisitionError,
     HitAcquisitionResult,
     HitAcquisitionService,
+    sample_association_id,
 )
 from cti_app.application.investigation_governance import (
     InvestigationActor,
@@ -38,15 +44,22 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.static_analysis import StaticAnalysisService
+from cti_app.domain.classification import derived_policy
+from cti_app.domain.entities import ProvenanceEvent, Sample
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
     QualificationActorKind,
+    SampleAssociation,
     SampleOrigin,
     SampleQualification,
+    SampleState,
     ToolInvocationStatus,
 )
+from cti_app.domain.local_analysis import LOCAL_ARCHIVE_MAX_MEMBER_BYTES
 
 _ACQUISITION_COST = {
     BudgetDimension.VT_UNITS: 1,
@@ -55,6 +68,7 @@ _ACQUISITION_COST = {
 VT_FILE_DOWNLOAD_CAPABILITY = "vt.file_download"
 LOCAL_QUALIFICATION_CAPABILITY = "investigation.local_read"
 SAMPLE_ANALYSIS_CAPABILITY = "investigation.sample_analysis"
+ARCHIVE_EXTRACT_MEMBER_CAPABILITY = "investigation.archive_extract_member"
 LOCAL_ANALYSIS_CAPABILITY = SAMPLE_ANALYSIS_CAPABILITY
 _MAX_STRINGS = 128
 _MAX_STRING_CHARS = 512
@@ -94,6 +108,27 @@ SAMPLE_ANALYZE_SCHEMA: Mapping[str, Any] = {
     "required": ["association_id", "purpose", "evidence_refs"],
     "additionalProperties": False,
 }
+
+ARCHIVE_EXTRACT_MEMBER_SCHEMA: Mapping[str, Any] = {
+    "$schema": _SCHEMA_URI,
+    "type": "object",
+    "properties": {
+        "association_id": {"type": "string", "minLength": 36, "maxLength": 36},
+        "member_path": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "expected_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "minLength": 64,
+            "maxLength": 64,
+        },
+        "archive_preset": {"type": "string", "enum": ["none", "infected", "malware"]},
+    },
+    "required": ["association_id", "member_path", "reason"],
+    "additionalProperties": False,
+}
+
+_ARCHIVE_DERIVATION_NAMESPACE = UUID("98bfdf9a-1090-4c86-af32-e6d18c73502c")
 
 SAMPLE_SET_QUALIFICATION_SCHEMA: Mapping[str, Any] = {
     "$schema": _SCHEMA_URI,
@@ -188,7 +223,10 @@ class LocalSampleAnalysisService:
             else None
         )
         provenance = (
-            "operator_import"
+            "archive_extract_member"
+            if stored_sample is not None
+            and stored_sample.source_service == "archive_extract_member"
+            else "operator_import"
             if stored_sample is not None and stored_sample.source_service == "operator_import"
             else "vt_download"
         )
@@ -607,6 +645,350 @@ class _SampleAnalyzeAdapter:
         )
 
 
+class ArchiveExtractMemberAdapter:
+    """Extract one verified member in analysis-worker and ingest it to quarantine."""
+
+    def __init__(
+        self,
+        *,
+        hits: HitAcquisitionService,
+        uow_factory: UnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore,
+        execution: ConfinedAnalysisExecutionPort,
+        timeout_seconds: float,
+        max_output_bytes: int,
+    ) -> None:
+        self._hits = hits
+        self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
+        self._execution = execution
+        self._timeout_seconds = timeout_seconds
+        self._max_output_bytes = max_output_bytes
+
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        return confined_analysis_operation_cache_identity(self._execution)
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        started = time.monotonic()
+
+        def consumed() -> Mapping[BudgetDimension, int]:
+            return {BudgetDimension.TOOL_SECONDS: max(1, math.ceil(time.monotonic() - started))}
+
+        try:
+            parent_association_id = UUID(str(arguments["association_id"]))
+            parent = await self._hits.resolve_quarantined_sample(parent_association_id)
+            member_path = str(arguments["member_path"])
+            reason = str(arguments["reason"]).strip()
+            if not reason:
+                raise ValueError("reason must not be empty")
+        except (ValueError, HitAcquisitionError) as exc:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                message=f"Archive member extraction input was rejected ({type(exc).__name__}).",
+                exception_class=type(exc).__name__,
+                error_code="archive_extract_member_input_rejected",
+                budget_consumed=consumed(),
+            )
+
+        transfer_nonce = hashlib.sha256(context.idempotency_key.encode()).hexdigest()
+        parameters = {
+            "member_path": member_path,
+            "archive_preset": str(arguments.get("archive_preset", "none")),
+            "transfer_nonce": transfer_nonce,
+        }
+        transfer_bucket = archive_member_transfer_bucket(transfer_nonce)
+        expected_sha256 = arguments.get("expected_sha256")
+        if isinstance(expected_sha256, str):
+            parameters["expected_sha256"] = expected_sha256
+        request = ConfinedAnalysisRequest(
+            investigation_id=parent.investigation_id,
+            artifact_id=parent.blob_id,
+            sha256=parent.sha256,
+            tool=ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+            timeout_seconds=self._timeout_seconds,
+            max_output_bytes=self._max_output_bytes,
+            association_id=parent.association_id,
+            sample_id=parent.sample_id,
+            analysis_parameters=parameters,
+        )
+        result = await self._execution.execute(request)
+        if result.status is not ToolInvocationStatus.SUCCEEDED or result.payload is None:
+            return ToolResult(
+                result.status,
+                output={
+                    "parent_association_id": str(parent.association_id),
+                    "parent_sha256": parent.sha256,
+                    "available_reason": result.available_reason,
+                },
+                message=result.available_reason or "Confined archive extraction did not complete.",
+                error_code=result.available_reason or "archive_extract_member_failed",
+                budget_consumed=consumed(),
+            )
+        payload = result.payload
+        if (
+            payload.get("investigation_id") != str(parent.investigation_id)
+            or payload.get("association_id") != str(parent.association_id)
+            or payload.get("sample_id") != str(parent.sample_id)
+            or payload.get("artifact_sha256") != parent.sha256
+        ):
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                message="Confined archive extraction returned a mismatched parent identity.",
+                error_code="archive_extract_member_identity_mismatch",
+                budget_consumed=consumed(),
+            )
+        worker_result = payload.get("result")
+        if (
+            not isinstance(worker_result, Mapping)
+            or worker_result.get("member_status") != "extracted"
+        ):
+            status = (
+                str(worker_result.get("member_status", "extract_failed"))
+                if isinstance(worker_result, Mapping)
+                else "extract_failed"
+            )
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                output={"parent_sha256": parent.sha256, "member_path": member_path},
+                message=f"Archive member extraction failed ({status}).",
+                error_code=f"archive_member_{status}",
+                budget_consumed=consumed(),
+            )
+        quarantine_blob_id: UUID | None = None
+        try:
+            transfer_blob_id = UUID(str(worker_result["transfer_blob_id"]))
+            async with self._uow_factory() as uow:
+                transfer_blob = await uow.blobs.get(transfer_blob_id)
+                current_envelope = await uow.investigation_envelopes.get(parent.investigation_id)
+            if transfer_blob is None or transfer_blob.descriptor.logical_bucket != transfer_bucket:
+                raise ValueError("worker transfer blob identity mismatch")
+            try:
+                member_bytes = await self._artifact_store.read_bytes(
+                    transfer_blob_id, max_bytes=LOCAL_ARCHIVE_MAX_MEMBER_BYTES
+                )
+            finally:
+                await self._artifact_store.delete_unreferenced(transfer_blob_id)
+            member_sha256 = str(worker_result["member_sha256"])
+            member_size = int(worker_result["member_size"])
+            if (
+                worker_result.get("member_path") != member_path
+                or not re.fullmatch(r"[0-9a-f]{64}", member_sha256)
+                or not 0 <= member_size <= LOCAL_ARCHIVE_MAX_MEMBER_BYTES
+                or transfer_blob.descriptor.sha256 != member_sha256
+                or transfer_blob.descriptor.size != member_size
+                or len(member_bytes) != member_size
+                or hashlib.sha256(member_bytes).hexdigest() != member_sha256
+                or (isinstance(expected_sha256, str) and member_sha256 != expected_sha256)
+            ):
+                raise ValueError("worker transfer bytes failed SHA-256 verification")
+            if context.envelope is not None and (
+                current_envelope is None
+                or current_envelope.approval_decision_id != context.envelope.approval_decision_id
+                or current_envelope.version != context.envelope.version
+            ):
+                return ToolResult(
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                    message="The approved investigation envelope changed during extraction.",
+                    error_code="investigation_envelope_changed",
+                    budget_consumed=consumed(),
+                )
+            quarantine_blob_id = await self._artifact_store.put_bytes(
+                member_bytes,
+                bucket=SAMPLES_QUARANTINE_BUCKET,
+                mime_type="application/octet-stream",
+            )
+            async with self._uow_factory() as uow:
+                investigation = await uow.analyst_investigations.get(parent.investigation_id)
+                parent_association = await uow.sample_associations.get(parent.association_id)
+                parent_sample = await uow.samples.get(parent.sample_id)
+                parent_blob = (
+                    await uow.blobs.get(parent_sample.blob_id)
+                    if parent_sample is not None
+                    else None
+                )
+                quarantine_blob = await uow.blobs.get(quarantine_blob_id)
+                current_envelope = await uow.investigation_envelopes.get(parent.investigation_id)
+                if (
+                    investigation is None
+                    or parent_association is None
+                    or parent_association.investigation_id != parent.investigation_id
+                    or parent_association.sample_sha256 != parent.sha256
+                    or parent_sample is None
+                    or parent_sample.subject_id != investigation.subject_id
+                    or parent_sample.blob_id != parent.blob_id
+                    or parent_sample.state
+                    not in {SampleState.QUARANTINED, SampleState.REVIEW_CANDIDATE}
+                    or parent_blob is None
+                    or parent_blob.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+                    or parent_blob.descriptor.sha256 != parent.sha256
+                    or quarantine_blob is None
+                    or quarantine_blob.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+                    or quarantine_blob.descriptor.sha256 != member_sha256
+                    or quarantine_blob.descriptor.size != member_size
+                    or (
+                        context.envelope is not None
+                        and (
+                            current_envelope is None
+                            or current_envelope.approval_decision_id
+                            != context.envelope.approval_decision_id
+                            or current_envelope.version != context.envelope.version
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "The parent, quarantine blob or investigation policy changed "
+                        "during extraction"
+                    )
+                candidate_sample = Sample(
+                    subject_id=investigation.subject_id,
+                    blob_id=quarantine_blob_id,
+                    original_name=member_path[-512:],
+                    origin="archive_extract_member",
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=parent_sample.license_restriction,
+                    tlp=parent_sample.tlp,
+                    do_not_submit=parent_sample.do_not_submit,
+                    external_llm_allowed=parent_sample.external_llm_allowed,
+                    origin_kind=SampleOrigin.MANUAL,
+                    state=SampleState.QUARANTINED,
+                    source_service="archive_extract_member",
+                    source_object_id=member_sha256,
+                    expected_hash=member_sha256,
+                )
+                sample = await uow.samples.add_if_absent(candidate_sample)
+                if sample.state not in {SampleState.QUARANTINED, SampleState.REVIEW_CANDIDATE}:
+                    raise ValueError("derived sample already exists outside quarantine")
+                policy = derived_policy((sample, parent_sample))
+                policy_changed = (
+                    sample.tlp is not policy.tlp
+                    or sample.do_not_submit != policy.do_not_submit
+                    or sample.external_llm_allowed != policy.external_llm_allowed
+                )
+                if policy_changed:
+                    sample.tlp = policy.tlp
+                    sample.do_not_submit = policy.do_not_submit
+                    sample.external_llm_allowed = policy.external_llm_allowed
+                if (
+                    sample.license_restriction is None
+                    and parent_sample.license_restriction is not None
+                ):
+                    sample.license_restriction = parent_sample.license_restriction
+                    policy_changed = True
+                elif (
+                    sample.license_restriction is not None
+                    and parent_sample.license_restriction is not None
+                    and sample.license_restriction != parent_sample.license_restriction
+                ):
+                    raise ValueError("derived sample has conflicting license restrictions")
+                if policy_changed:
+                    await uow.samples.save(sample)
+
+                # Persist or lock the subject-scoped sample before creating the
+                # association. The SQL repository can otherwise prelink a new
+                # association to the only globally matching hash, even when that
+                # sample belongs to another subject. link_sample below binds this
+                # association explicitly to the validated subject sample.
+                associations = await uow.sample_associations.list_for_investigation(
+                    parent.investigation_id
+                )
+                association = next(
+                    (item for item in associations if item.sample_sha256 == member_sha256),
+                    None,
+                )
+                reused_association = association is not None
+                if association is None:
+                    association = await uow.sample_associations.append_version(
+                        SampleAssociation(
+                            id=sample_association_id(parent.investigation_id, member_sha256),
+                            investigation_id=parent.investigation_id,
+                            sample_sha256=member_sha256,
+                            origin=SampleOrigin.RELATIONSHIP,
+                        ),
+                        expected_version=0,
+                    )
+                else:
+                    association = await uow.sample_associations.append_version(
+                        association, expected_version=association.version
+                    )
+                await uow.sample_associations.link_sample(
+                    association.id, sample.id, expected_sha256=member_sha256
+                )
+                derivation_material = (
+                    f"{parent.investigation_id}\0{parent.sha256}\0{member_path}\0{member_sha256}"
+                )
+                derivation_id = hashlib.sha256(derivation_material.encode()).hexdigest()
+                actor_id = context.actor_id or "agent:investigation"
+                attribution_material = f"{derivation_id}\0{actor_id}\0{reason}"
+                attribution_id = hashlib.sha256(attribution_material.encode()).hexdigest()
+                existing_events = await uow.provenance.list_for_aggregate("sample", sample.id)
+                if not any(
+                    item.event_type == "sample_derived_from_archive_member"
+                    and item.payload.get("attribution_id") == attribution_id
+                    for item in existing_events
+                ):
+                    await uow.provenance.append(
+                        ProvenanceEvent(
+                            id=uuid5(_ARCHIVE_DERIVATION_NAMESPACE, attribution_id),
+                            aggregate_type="sample",
+                            aggregate_id=sample.id,
+                            subject_id=sample.subject_id,
+                            event_type="sample_derived_from_archive_member",
+                            actor_id=actor_id,
+                            tlp=parent_sample.tlp,
+                            payload={
+                                "provenance": "archive_extract_member",
+                                "derivation_id": derivation_id,
+                                "attribution_id": attribution_id,
+                                "investigation_id": str(parent.investigation_id),
+                                "association_id": str(association.id),
+                                "parent_sample_id": str(parent.sample_id),
+                                "parent_sha256": parent.sha256,
+                                "member_path": member_path,
+                                "member_sha256": member_sha256,
+                                "member_size": member_size,
+                                "actor_id": actor_id,
+                                "reason": reason,
+                                "purpose": context.purpose or "archive member extraction",
+                            },
+                        )
+                    )
+                await uow.commit()
+        except (ValueError, RuntimeError) as exc:
+            if quarantine_blob_id is not None:
+                try:
+                    await self._artifact_store.delete_unreferenced(quarantine_blob_id)
+                except Exception:
+                    # A concurrent derivation may already reference the content; the
+                    # catalog refuses deletion while any canonical reference exists.
+                    pass
+            return ToolResult(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                message=f"Derived sample could not be linked safely ({type(exc).__name__}).",
+                error_code="archive_extract_member_persistence_failed",
+                budget_consumed=consumed(),
+            )
+        return ToolResult(
+            ToolInvocationStatus.SUCCEEDED,
+            output={
+                "association_id": str(association.id),
+                "sample_id": str(sample.id),
+                "sample_sha256": member_sha256,
+                "parent_association_id": str(parent.association_id),
+                "parent_sha256": parent.sha256,
+                "member_path": member_path,
+                "size_bytes": member_size,
+                "qualification": association.qualification.value,
+                "reused_association": reused_association,
+                "quarantined": True,
+            },
+            message="Verified archive member was linked as a quarantined candidate sample.",
+            budget_consumed=consumed(),
+        )
+
+
 class _QualificationAdapter:
     def __init__(self, qualifications: SampleQualificationService) -> None:
         self._qualifications = qualifications
@@ -661,6 +1043,7 @@ def register_acquisition_tools(
     hits: HitAcquisitionService,
     qualifications: SampleQualificationService,
     analyzer: SampleAnalyzer | None = None,
+    archive_extractor: ArchiveExtractMemberAdapter | None = None,
 ) -> None:
     """Register the VT acquisition and local sample-analysis/qualification tools."""
     registry.register(
@@ -698,6 +1081,27 @@ def register_acquisition_tools(
         ),
         _SampleAnalyzeAdapter(hits, analyzer),
     )
+    if archive_extractor is not None:
+        registry.register(
+            ToolDefinition(
+                name="archive.extract_member",
+                schema_version="1",
+                input_schema=ARCHIVE_EXTRACT_MEMBER_SCHEMA,
+                effect=ToolEffect.LOCAL_COMPUTE,
+                cost_model={BudgetDimension.TOOL_SECONDS: 1},
+                confidentiality=ToolConfidentiality.RESTRICTED,
+                limitations=(
+                    "Accepts only a quarantined archive associated with the current investigation.",
+                    "Extraction is bounded, static and performed in analysis-worker "
+                    "without execution.",
+                    "The derived sample remains quarantined and in candidate qualification.",
+                    "The output association_id can be passed to sample.analyze and local "
+                    "analyzers.",
+                ),
+                capability_key=ARCHIVE_EXTRACT_MEMBER_CAPABILITY,
+            ),
+            archive_extractor,
+        )
     registry.register(
         ToolDefinition(
             name="sample.set_qualification",
