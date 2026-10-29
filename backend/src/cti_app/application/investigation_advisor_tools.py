@@ -113,9 +113,11 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_TOOL_SECONDS = 3_600
-# Verify each complete quarantine blob, then include at most this many prefix bytes.
+# Verify each complete quarantine blob, then bound automatic inclusion to this prefix.
 # The dossier records any omitted range explicitly.
 MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES = 4_096
+# Base64 expansion means larger raw fragments cannot fit in the 8 MiB dossier cap.
+MAX_ADVISOR_EXPLICIT_SAMPLE_FRAGMENT_BYTES = ((8 * 1024 * 1024 - 128 * 1024) * 3) // 4
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
 # the archive timeout and the 35s advisor preparation/scheduling margin. This
@@ -2850,7 +2852,15 @@ class InvestigationAdvisorTool:
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
-        sample_rows = await self._sample_inventory(investigation_id, evidence, context.envelope)
+        explicit_evidence_ids = frozenset(
+            item for item in arguments.get("evidence_refs", ()) if isinstance(item, str) and item
+        )
+        sample_rows = await self._sample_inventory(
+            investigation_id,
+            evidence,
+            context.envelope,
+            explicit_evidence_ids=explicit_evidence_ids,
+        )
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
         mime_types_by_evidence: dict[str, list[str]] = {}
@@ -2918,6 +2928,20 @@ class InvestigationAdvisorTool:
                             ]
                             if isinstance(omitted_range, str) and omitted_range:
                                 provenance.append(f"omitted_range={omitted_range}")
+                                omission_reason = matching_sample.get("content_omission_reason")
+                                if (
+                                    isinstance(omission_reason, str)
+                                    and "absolute_8MiB_dossier_guard" in omission_reason
+                                ):
+                                    provenance.append(
+                                        "TRONQUÉ explicitement par le garde-fou technique "
+                                        "absolu de 8 MiB"
+                                    )
+                                    provenance.extend(
+                                        f"corps complet : observation {source_id}"
+                                        for source_id in matching_sample.get("evidence_ids", ())
+                                        if isinstance(source_id, str) and source_id
+                                    )
                             excerpts.append(
                                 {
                                     "kind": "base64",
@@ -2928,9 +2952,10 @@ class InvestigationAdvisorTool:
                             )
                             evidence_row["blob_read_verified"] = True
                             matching_sample["content_base64"] = ""
-                            matching_sample["content_omission_reason"] = (
-                                "included_as_cited_observation_fragment"
-                            )
+                            if not matching_sample.get("omitted_range"):
+                                matching_sample["content_omission_reason"] = (
+                                    "included_as_cited_observation_fragment"
+                                )
                     else:
                         evidence_row["blob_read_failure_reason"] = _sample_blob_failure_reason(
                             matching_sample.get("content_status")
@@ -3199,6 +3224,8 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         observations: tuple[EvidenceObservation, ...],
         envelope: InvestigationEnvelope | None,
+        *,
+        explicit_evidence_ids: frozenset[str] = frozenset(),
     ) -> list[dict[str, Any]]:
         investigation = await self._investigations.get(investigation_id)
         if investigation is None:
@@ -3284,6 +3311,9 @@ class InvestigationAdvisorTool:
                 and item.sha256 == association.sample_sha256
                 for item in associated_observations
             )
+            explicitly_cited_sample_bytes = raw_sample_observation and any(
+                str(item.id) in explicit_evidence_ids for item in associated_observations
+            )
             allowed_buckets = (
                 {"samples-quarantine"}
                 if raw_sample_observation
@@ -3321,11 +3351,12 @@ class InvestigationAdvisorTool:
                 if isinstance(raw_mime_type, str) and raw_mime_type.strip()
                 else "application/octet-stream"
             )
-            fragment = (
-                blob_content[:MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES]
-                if blob_content is not None
-                else b""
+            fragment_limit = (
+                MAX_ADVISOR_EXPLICIT_SAMPLE_FRAGMENT_BYTES
+                if explicitly_cited_sample_bytes
+                else MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES
             )
+            fragment = blob_content[:fragment_limit] if blob_content is not None else b""
             omitted_range = (
                 f"[{len(fragment)},{descriptor.size})"
                 if blob_content is not None and len(fragment) < descriptor.size
@@ -3334,6 +3365,21 @@ class InvestigationAdvisorTool:
             content_omission_reason = (
                 f"sample_fragment_truncated:{omitted_range}" if omitted_range else ""
             )
+            if explicitly_cited_sample_bytes and omitted_range:
+                content_omission_reason = (
+                    f"sample_fragment_truncated_by_absolute_8MiB_dossier_guard:{omitted_range}"
+                )
+                logger.info(
+                    "Advisor explicit sample body reached dossier guardrail",
+                    extra={
+                        "advisor_explicit_sample_source_bytes": descriptor.size,
+                        "advisor_explicit_sample_included_bytes": len(fragment),
+                        "advisor_explicit_sample_included_base64_bytes": len(
+                            base64.b64encode(fragment)
+                        ),
+                        "advisor_dossier_hard_limit_bytes": 8 * 1024 * 1024,
+                    },
+                )
             rows.append(
                 {
                     "verified": True,
