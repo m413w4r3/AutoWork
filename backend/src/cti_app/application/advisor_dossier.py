@@ -782,6 +782,9 @@ def build_advisor_dossier(
                     "content_status": _as_text(sample.get("content_status")),
                     "content_omission_reason": _as_text(omission_reason),
                 },
+                body_occurrences=_body_occurrences_for_content(
+                    body, content, sample_id or association_id
+                ),
             )
         )
 
@@ -906,6 +909,7 @@ def build_advisor_dossier(
             if isinstance(row, Mapping) and str(row.get("evidence_id")) == identifier
         ]
         pieces: list[str] = []
+        piece_contents: list[tuple[int, str, str, str]] = []
         explicitly_referenced_observation = ("observation", identifier) in explicitly_referenced
         label = _human_evidence_label(item, excerpts)
         row_score = _relevance_score(task_terms, label)
@@ -914,7 +918,10 @@ def build_advisor_dossier(
             title = _as_text(excerpt.get("title")) or "Extrait"
             score = _relevance_score(task_terms, _excerpt_relevance_text(excerpt))
             if score > 0 or explicitly_referenced_observation:
-                pieces.append(f"{title}:\n{_quote(body)}")
+                quoted_body = _quote(body)
+                pieces.append(f"{title}:\n{quoted_body}")
+                if body:
+                    piece_contents.append((len(pieces) - 1, quoted_body, body, identifier))
                 row_score = max(row_score, score, 1 if explicitly_referenced_observation else 0)
         for fact in (*measurement_rows, *typed_measurements):
             raw_value = fact.get("sample_material", fact.get("value"))
@@ -990,14 +997,17 @@ def build_advisor_dossier(
                 score = 0
             if score > 0 or explicitly_referenced_observation:
                 pieces.append(f"Mesure observée: {fact_text}")
+                piece_contents.append((len(pieces) - 1, value, value, identifier))
                 row_score = max(row_score, score, 1)
         if explicitly_referenced_observation and not pieces and excerpts:
             best = max(
                 excerpts, key=lambda row: _relevance_score(task_terms, _as_text(row.get("text")))
             )
-            pieces.append(
-                f"{_as_text(best.get('title')) or 'Extrait'}:\n{_quote(_as_text(best.get('text')))}"
-            )
+            best_body = _as_text(best.get("text"))
+            quoted_body = _quote(best_body)
+            pieces.append(f"{_as_text(best.get('title')) or 'Extrait'}:\n{quoted_body}")
+            if best_body:
+                piece_contents.append((len(pieces) - 1, quoted_body, best_body, identifier))
         if pieces:
             candidates.append(
                 _candidate(
@@ -1017,6 +1027,7 @@ def build_advisor_dossier(
                             "sha256": _as_text(item.get("sha256")),
                         },
                     },
+                    body_occurrences=_joined_body_occurrences(pieces, piece_contents),
                 )
             )
         elif ("observation", identifier) in explicitly_referenced:
@@ -1043,6 +1054,20 @@ def build_advisor_dossier(
             and _finding_matches_requested_claims(item, explicit_claims)
         ):
             score += 100
+        finding_body = "\n".join(
+            part
+            for part in (
+                f"Évaluation: {assessment}" if assessment else "",
+                f"Claims: {claim_text}" if claim_text else "",
+                "Observations: "
+                + ", ".join(str(value) for value in item.get("observation_refs", ()))
+                if isinstance(item.get("observation_refs", ()), (list, tuple))
+                and item.get("observation_refs")
+                else "",
+                statement,
+            )
+            if part
+        )
         if score > 0 or ("finding", finding_id) in explicitly_referenced:
             candidates.append(
                 _candidate(
@@ -1054,20 +1079,7 @@ def build_advisor_dossier(
                         if assessment == "refuted"
                         else f"Constat — {_as_text(item.get('kind')) or 'observation'}"
                     ),
-                    body="\n".join(
-                        part
-                        for part in (
-                            f"Évaluation: {assessment}" if assessment else "",
-                            f"Claims: {claim_text}" if claim_text else "",
-                            "Observations: "
-                            + ", ".join(str(value) for value in item.get("observation_refs", ()))
-                            if isinstance(item.get("observation_refs", ()), (list, tuple))
-                            and item.get("observation_refs")
-                            else "",
-                            statement,
-                        )
-                        if part
-                    ),
+                    body=finding_body,
                     score=max(score, 1 if ("finding", finding_id) in explicitly_referenced else 0),
                     origin="finding_statement",
                     extra={
@@ -1084,6 +1096,9 @@ def build_advisor_dossier(
                             "sha256": _as_text(item.get("sha256")),
                         },
                     },
+                    body_occurrences=_body_occurrences_for_content(
+                        finding_body, statement, finding_id
+                    ),
                 )
             )
 
@@ -1213,6 +1228,9 @@ def build_advisor_dossier(
                             "sha256": measurement_sha,
                         },
                     },
+                    body_occurrences=_body_occurrences_for_content(
+                        body, value, evidence_id or measurement_id
+                    ),
                 )
             )
 
@@ -1312,6 +1330,9 @@ def build_advisor_dossier(
                             "sha256": _as_text(item.get("observation_sha256")),
                         },
                     },
+                    body_occurrences=_body_occurrences_for_content(
+                        body, value, evidence_id or fact_id
+                    ),
                 )
             )
 
@@ -1340,15 +1361,22 @@ def build_advisor_dossier(
                         row.get("kind") != "metadata",
                     ),
                 )
+                body = f"{_as_text(best.get('title'))}:\n{_quote(_as_text(best.get('text')))}"
                 candidates.append(
                     _candidate(
                         kind="observation",
                         identifier=identifier,
                         sha256=_as_text(item.get("sha256")),
                         label=_human_evidence_label(item, excerpts),
-                        body=f"{_as_text(best.get('title'))}:\n{_quote(_as_text(best.get('text')))}",
+                        body=body,
                         score=0,
                         origin="fallback_best_observation",
+                        body_occurrences=_body_occurrences_for_content(
+                            body,
+                            _as_text(best.get("text")),
+                            identifier,
+                            rendered_content=_quote(_as_text(best.get("text"))),
+                        ),
                     )
                 )
             else:
@@ -1384,6 +1412,15 @@ def build_advisor_dossier(
                         "evidence_id": _as_text(item.get("evidence_id")),
                         "evidence_sha256": _as_text(item.get("evidence_sha256")),
                     },
+                    body_occurrences=_body_occurrences_for_content(
+                        (
+                            f"{kind}, offset {offset}: {value}"
+                            if type(offset) is int
+                            else f"{kind}: {value}"
+                        ),
+                        value,
+                        _as_text(item.get("evidence_id")) or measurement_id,
+                    ),
                 )
             )
 
@@ -1409,6 +1446,11 @@ def build_advisor_dossier(
                         "evidence_id": _as_text(item.get("evidence_id")),
                         "evidence_sha256": _as_text(item.get("observation_sha256")),
                     },
+                    body_occurrences=_body_occurrences_for_content(
+                        f"{field}: {value}" if field else value,
+                        value,
+                        _as_text(item.get("evidence_id")) or fact_id,
+                    ),
                 )
             )
 
@@ -1453,10 +1495,12 @@ def build_advisor_dossier(
 
     # Keep a stable alias for each displayed fact. The mapping stays local and
     # carries only the data needed by output validation and provenance.
+    selected = _prioritize_duplicate_measurements(selected)
     manifest: list[dict[str, Any]] = []
     rendered: list[str] = []
     review_target_index = 0
     evidence_index = 0
+    seen_bodies: dict[str, list[tuple[str, str, str]]] = {}
     for item in selected:
         if item["origin"] == "versioned_review_target":
             review_target_index += 1
@@ -1464,8 +1508,9 @@ def build_advisor_dossier(
         else:
             evidence_index += 1
             alias = f"E{evidence_index}"
-        piece = f"[{alias}] {item['label']}\n{_quote(item['body'])}"
-        body_bytes = item["body"].encode("utf-8")
+        body, body_references = _render_deduplicated_body(item, alias, seen_bodies)
+        piece = f"[{alias}] {item['label']}\n{_quote(body)}"
+        body_bytes = body.encode("utf-8")
         piece_bytes = piece.encode("utf-8")
         manifest.append(
             {
@@ -1483,6 +1528,7 @@ def build_advisor_dossier(
                 **item.get("extra", {}),
                 "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
                 "body_bytes": len(body_bytes),
+                **({"body_references": body_references} if body_references else {}),
                 "rendered_sha256": hashlib.sha256(piece_bytes).hexdigest(),
                 "rendered_bytes": len(piece_bytes),
             }
@@ -2366,6 +2412,7 @@ def _candidate(
     origin: str,
     opinion_version: object = None,
     extra: Mapping[str, Any] | None = None,
+    body_occurrences: Sequence[tuple[int, int, str, str]] = (),
 ) -> dict[str, Any]:
     return {
         "kind": kind,
@@ -2377,7 +2424,150 @@ def _candidate(
         "origin": origin,
         "opinion_version": opinion_version,
         "extra": dict(extra or {}),
+        "body_occurrences": tuple(body_occurrences),
     }
+
+
+def _body_occurrences_for_content(
+    body: str,
+    content: str,
+    reference_id: str,
+    *,
+    rendered_content: str | None = None,
+) -> tuple[tuple[int, int, str, str], ...]:
+    if not content:
+        return ()
+    displayed = content if rendered_content is None else rendered_content
+    start = body.rfind(displayed)
+    if start < 0:
+        return ()
+    return ((start, start + len(displayed), content, reference_id),)
+
+
+def _joined_body_occurrences(
+    pieces: Sequence[str],
+    piece_contents: Sequence[tuple[int, str, str, str]],
+) -> tuple[tuple[int, int, str, str], ...]:
+    by_piece: dict[int, list[tuple[str, str, str]]] = {}
+    for index, rendered_content, body_content, reference_id in piece_contents:
+        by_piece.setdefault(index, []).append((rendered_content, body_content, reference_id))
+    occurrences: list[tuple[int, int, str, str]] = []
+    offset = 0
+    for index, piece in enumerate(pieces):
+        for rendered_content, body_content, reference_id in by_piece.get(index, ()):
+            start = piece.rfind(rendered_content)
+            if start >= 0:
+                absolute_start = offset + start
+                occurrences.append(
+                    (
+                        absolute_start,
+                        absolute_start + len(rendered_content),
+                        body_content,
+                        reference_id,
+                    )
+                )
+        offset += len(piece) + 2
+    return tuple(occurrences)
+
+
+def _render_deduplicated_body(
+    item: Mapping[str, Any],
+    alias: str,
+    seen_bodies: dict[str, list[tuple[str, str, str]]],
+) -> tuple[str, list[dict[str, str]]]:
+    body = _as_text(item.get("body"))
+    raw_occurrences = item.get("body_occurrences")
+    occurrences = (
+        list(raw_occurrences)
+        if isinstance(raw_occurrences, (list, tuple)) and raw_occurrences
+        else [(0, len(body), body, _body_reference_id(item))]
+        if body
+        else []
+    )
+    rendered: list[str] = []
+    references: list[dict[str, str]] = []
+    cursor = 0
+    for start, end, content, reference_id in sorted(occurrences):
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or start < cursor
+            or end <= start
+            or end > len(body)
+        ):
+            continue
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        prior = next(
+            (entry for entry in seen_bodies.get(digest, ()) if entry[0] == content),
+            None,
+        )
+        rendered.append(body[cursor:start])
+        if prior is None:
+            rendered.append(body[start:end])
+            seen_bodies.setdefault(digest, []).append((content, str(reference_id), alias))
+        else:
+            rendered.append(f"même corps que ci-dessus : {prior[2]}/{digest}")
+            references.append({"alias": prior[2], "id": prior[1], "sha256": digest})
+        cursor = end
+    rendered.append(body[cursor:])
+    return "".join(rendered), references
+
+
+def _body_reference_id(item: Mapping[str, Any]) -> str:
+    extra = item.get("extra")
+    if isinstance(extra, Mapping):
+        evidence_id = _as_text(extra.get("evidence_id"))
+        if evidence_id:
+            return evidence_id
+    return _as_text(item.get("id"))
+
+
+def _prioritize_duplicate_measurements(
+    selected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    first_non_measurement: dict[str, int] = {}
+    for index, item in enumerate(selected):
+        if item.get("kind") == "measurement":
+            continue
+        for content in _candidate_body_contents(item):
+            first_non_measurement.setdefault(content, index)
+
+    moved_before: dict[int, list[dict[str, Any]]] = {}
+    moved_ids: set[int] = set()
+    for index, item in enumerate(selected):
+        if item.get("kind") != "measurement":
+            continue
+        matching_indexes = [
+            first_non_measurement[content]
+            for content in _candidate_body_contents(item)
+            if content in first_non_measurement
+        ]
+        if matching_indexes and index > min(matching_indexes):
+            target_index = min(matching_indexes)
+            moved_before.setdefault(target_index, []).append(item)
+            moved_ids.add(id(item))
+
+    ordered: list[dict[str, Any]] = []
+    for index, item in enumerate(selected):
+        ordered.extend(moved_before.get(index, ()))
+        if id(item) not in moved_ids:
+            ordered.append(item)
+    return ordered
+
+
+def _candidate_body_contents(item: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_occurrences = item.get("body_occurrences")
+    if isinstance(raw_occurrences, (list, tuple)) and raw_occurrences:
+        return tuple(
+            occurrence[2]
+            for occurrence in raw_occurrences
+            if isinstance(occurrence, (list, tuple))
+            and len(occurrence) == 4
+            and isinstance(occurrence[2], str)
+            and occurrence[2]
+        )
+    body = _as_text(item.get("body"))
+    return (body,) if body else ()
 
 
 def _target_rows(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:

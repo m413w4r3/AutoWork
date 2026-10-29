@@ -2964,7 +2964,7 @@ async def test_operator_http_route_rejects_invalid_body_before_dispatch() -> Non
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_stage",
-    ["evidence_preflight", "bridge_transport_pre_submission"],
+    ["evidence_preflight", "bridge_transport_pre_submission", "pre_submission"],
 )
 async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry(
     failure_stage: str,
@@ -3064,9 +3064,17 @@ async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry(
     adapter.after_execute = lambda: setattr(snapshots, "fail_release_once", True)
     adapter.result = _attest_advisor_pre_submission(
         ToolResult(
-            ToolInvocationStatus.UNAVAILABLE,
+            (
+                ToolInvocationStatus.NEEDS_REVIEW
+                if failure_stage == "pre_submission"
+                else ToolInvocationStatus.UNAVAILABLE
+            ),
             observation_refs=(input_observation.id,),
-            error_code="advisor_preflight_refused",
+            error_code=(
+                "bridge_server_error"
+                if failure_stage == "pre_submission"
+                else "advisor_preflight_refused"
+            ),
             output={
                 "advisor_status": "technical_blocked",
                 "confirmed_non_execution": True,
@@ -3076,6 +3084,8 @@ async def test_advisor_presend_refusal_releases_budget_once_and_allows_retry(
                 "failure_reason": (
                     "required_canonical_evidence_not_in_payload"
                     if failure_stage == "evidence_preflight"
+                    else "bridge_server_error"
+                    if failure_stage == "pre_submission"
                     else "conversation_unavailable"
                 ),
             },
