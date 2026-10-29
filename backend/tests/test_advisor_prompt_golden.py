@@ -249,8 +249,8 @@ def test_prompt_golden_corpus_preserves_baseline_bytes() -> None:
             1300,
         ),
         "pivot_strategy": (
-            "8c8b829b6e59df332b228f9e3bfa0a66578b849f0003b924f8b269f89b7145e5",
-            1326,
+            "55ac3b7c0d324272987410f7c9b0ff342ed45935bbd2dca30ae9c15fc6f74774",
+            1397,
         ),
         "yara_draft_base64_hex": (
             "fbc7c28ede70e7a61d0773475742589588b6c6cfad2fda712097e9d3fdb49223",
@@ -269,7 +269,7 @@ def test_prompt_golden_corpus_preserves_baseline_bytes() -> None:
             "4e7b247d2d92d058d4c3b0bf80910709e344b97f838d1a7fe55fe166c005fde1",
             1135,
         ),
-        "figure_plan": ("2aff0eb9bc9f669d1fb63c872403777fbd9a7ef31c87e5b05a6a1edb00ce5bc6", 1304),
+        "figure_plan": ("c6750af02be9228c49bb226deb5de3f9b7dab1d21b9c3bc6762ed25b593a18d7", 1367),
         "unicode_crlf": ("028b460545b6148325549244d81a9a342f59b8d42ef9fbaea8eeb0dd86d59104", 1129),
         "unicode_lf": ("94a1327292ca3deaeab4d39366faaa2c8543b06c9fde617ca4c17c0a01f021d0", 1128),
         "json_like_cti_text": (

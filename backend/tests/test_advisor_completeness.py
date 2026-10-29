@@ -742,6 +742,76 @@ def test_equal_text_under_distinct_labels_is_not_deduplicated() -> None:
     ]
 
 
+def test_dossier_deduplicates_repeated_observation_body_without_losing_references() -> None:
+    content = "synthetic-marker " + ("x" * (1_048_576 - len("synthetic-marker ")))
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    evidence_id = "observation:dedupe-fixture"
+    data = _planning_data(
+        question="Inspect the synthetic-marker evidence.",
+        evidence=[
+            {
+                "evidence_id": evidence_id,
+                "sha256": "a" * 64,
+                "source": "synthetic.fixture",
+                "object_type": "observation",
+                "content_excerpts": [
+                    {"kind": "text", "title": "Synthetic observation", "text": content}
+                ],
+            }
+        ],
+        findings=[],
+    )
+    data["units"] = [
+        {
+            "unit_id": f"U{index}",
+            "text": "Review repeated synthetic-marker evidence.",
+            "evidence_refs": [evidence_id],
+        }
+        for index in range(1, 4)
+    ]
+    data["measured_facts"] = [
+        {"evidence_id": evidence_id, "kind": "text", "sample_material": content, "offset": 4}
+    ]
+    data["measurements"] = [
+        {
+            "measurement_id": f"measurement:{offset}",
+            "evidence_id": evidence_id,
+            "evidence_sha256": "a" * 64,
+            "kind": "text",
+            "value": content,
+            "offset": offset,
+        }
+        for offset in (8, 16)
+    ]
+
+    dossier = build_advisor_dossier(data)
+
+    assert dossier.text.count(content) == 1
+    assert dossier.text.count("même corps que ci-dessus :") == 5
+    assert dossier.byte_size < 1_200_000
+    assert "text, offset 4:" in dossier.text
+    assert "text, offset 8:" in dossier.text
+    assert "text, offset 16:" in dossier.text
+    assert {row.get("measurement_id") for row in dossier.manifest} >= {
+        "measurement:8",
+        "measurement:16",
+    }
+    body_references = [
+        reference for row in dossier.manifest for reference in row.get("body_references", ())
+    ]
+    assert len(body_references) == 5
+    assert all(
+        reference["id"] == evidence_id
+        and reference["sha256"] == content_sha256
+        and reference["alias"]
+        for reference in body_references
+    )
+    assert all(
+        f"même corps que ci-dessus : {reference['alias']}/{content_sha256}" in dossier.text
+        for reference in body_references
+    )
+
+
 def test_decoded_hex_ioc_is_not_mistaken_for_raw_bytes() -> None:
     from cti_app.application.advisor_dossier import extract_content_excerpts
 
