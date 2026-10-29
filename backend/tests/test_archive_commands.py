@@ -289,6 +289,27 @@ def test_archive_preset_and_member_options_are_strictly_allowlisted() -> None:
             (),
             {"member_prefix": "../\n", "max_members": "12"},
         )
+    validate_archive_tool_request(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        (),
+        {"member_path": "bin/loader.dll", "expected_sha256": "a" * 64},
+    )
+    for path in ("../loader.dll", "/loader.dll", "C:/loader.dll", "bin\\loader.dll", "a//b"):
+        with pytest.raises(ValueError, match="path"):
+            validate_archive_tool_request(
+                ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+                (),
+                {"member_path": path},
+            )
+    for parameters, message in (
+        ({"member_path": "file.bin", "expected_sha256": 42}, "SHA-256"),
+        ({"member_path": "file.bin", "transfer_nonce": []}, "nonce"),
+        ({"member_path": "file.bin", "archive_preset": {}}, "preset"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            validate_archive_tool_request(
+                ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER, (), parameters
+            )
 
 
 _SEVEN_Z_LISTING = (
@@ -345,6 +366,137 @@ async def test_7z_extract_hash_streams_member_to_stdout_with_no_path_extraction(
     assert not any("outside.dll" in path.name for path in tmp_path.iterdir())
     assert list(tmp_path.iterdir()) == []
     assert requested_tempdirs == ["/tmp"]
+
+
+@pytest.mark.asyncio
+async def test_7z_extract_member_returns_verified_bytes_without_writing_member(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    member = b"inert extracted member"
+    listing = (
+        "Path = sample.bin\nType = zip\nPhysical Size = 123\n\n----------\n"
+        f"Path = bin/loader.dll\nFolder = -\nSize = {len(member)}\n"
+        f"Packed Size = {len(member)}\nEncrypted = -\nMethod = Copy\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv[1] == "l":
+            stdout = listing.encode()
+        else:
+            stdout = member
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, stdout, b"")
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    requested_tempdirs = _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"archive bytes",
+        member_prefix=None,
+        max_members=1,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="bin/loader.dll",
+        expected_sha256=hashlib.sha256(member).hexdigest(),
+    )
+
+    assert result["member_status"] == "extracted"
+    assert result["_member_bytes"] == member
+    assert result["member_sha256"] == hashlib.sha256(member).hexdigest()
+    assert "-so" in calls[1] and "-spd" in calls[1]
+    assert calls[1][-1] == "bin/loader.dll"
+    assert list(tmp_path.iterdir()) == []
+    assert requested_tempdirs == ["/tmp"]
+
+
+@pytest.mark.asyncio
+async def test_7z_extract_member_rejects_symlink_without_running_extract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    listing = (
+        "Path = sample.bin\nType = 7z\nPhysical Size = 100\n\n----------\n"
+        "Path = link.dll\nFolder = -\nSize = 4\nPacked Size = 4\n"
+        "Attributes = lrwxrwxrwx\nSymbolic Link = target.dll\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"archive bytes",
+        member_prefix=None,
+        max_members=1,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="link.dll",
+    )
+
+    assert result["member_status"] == "link_not_allowed"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("size", "packed_size", "member_limit", "ratio_limit", "expected_status"),
+    (
+        (10, 1, 4, 1_000, "declared_member_size_limit"),
+        (10, 1, 64, 4, "compression_ratio_limit"),
+    ),
+)
+async def test_7z_extract_member_rejects_declared_bombs_before_extracting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    size: int,
+    packed_size: int,
+    member_limit: int,
+    ratio_limit: int,
+    expected_status: str,
+) -> None:
+    listing = (
+        "Path = sample.bin\nType = 7z\nPhysical Size = 100\n\n----------\n"
+        f"Path = bomb.bin\nFolder = -\nSize = {size}\nPacked Size = {packed_size}\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    monkeypatch.setattr(archive_commands, "LOCAL_ARCHIVE_MAX_MEMBER_BYTES", member_limit)
+    monkeypatch.setattr(archive_commands, "LOCAL_ARCHIVE_MAX_COMPRESSION_RATIO", ratio_limit)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"archive bytes",
+        member_prefix=None,
+        max_members=1,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="bomb.bin",
+    )
+
+    assert result["member_status"] == expected_status
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio

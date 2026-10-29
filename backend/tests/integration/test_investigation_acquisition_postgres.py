@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import struct
-from datetime import date
+from dataclasses import replace
+from datetime import UTC, date, datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -14,15 +17,23 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisRequest,
     ConfinedAnalysisResult,
+    ConfinedAnalysisWorkerAttestation,
+    archive_member_transfer_bucket,
 )
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.investigation_acquisition import HitAcquisitionService
+from cti_app.application.investigation_acquisition import (
+    HitAcquisitionService,
+    sample_association_id,
+)
 from cti_app.application.investigation_acquisition_tools import (
+    ARCHIVE_EXTRACT_MEMBER_CAPABILITY,
     LOCAL_QUALIFICATION_CAPABILITY,
     SAMPLE_ANALYSIS_CAPABILITY,
     VT_FILE_DOWNLOAD_CAPABILITY,
+    ArchiveExtractMemberAdapter,
     LocalSampleAnalysisService,
     register_acquisition_tools,
 )
@@ -49,6 +60,7 @@ from cti_app.application.research_context_builder import (
     ResearchContextBuilder,
 )
 from cti_app.application.sample_acquisition import (
+    SAMPLES_QUARANTINE_BUCKET,
     SampleAcquisitionCacheScope,
     SampleAcquisitionResponseOrigin,
     VirusTotalSampleAcquisitionService,
@@ -57,7 +69,7 @@ from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalHtt
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
-from cti_app.domain.entities import SampleState, Subject
+from cti_app.domain.entities import Sample, SampleState, Subject
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
@@ -66,6 +78,7 @@ from cti_app.domain.investigation import (
     InvestigationAgenda,
     InvestigationBudget,
     QualificationActorKind,
+    SampleAssociation,
     SampleOrigin,
     SampleQualification,
     TLPLevel,
@@ -182,6 +195,56 @@ class _PcapAnalysisWorker:
             result_blob_id=request.artifact_id,
             result_sha256=request.sha256,
             payload={"result": {"status": "SUCCEEDED", "families": {}}},
+        )
+
+
+class _ArchiveMemberIntegrationWorker:
+    def __init__(self, catalog: BlobCatalogService, member: bytes) -> None:
+        self.catalog = catalog
+        self.member = member
+        self.family_statuses = {
+            "archive_tools": ConfinedAnalysisFamilyStatus("archive_tools", True, "16.02")
+        }
+        self.attestation = ConfinedAnalysisWorkerAttestation(
+            reachable=True,
+            confined=True,
+            isolation_profile="analysis-worker-test-v1",
+            versions={"local_7z": "16.02"},
+            families=self.family_statuses,
+        )
+        self.available = True
+        self.available_reason = None
+        self.isolation_profile = "analysis-worker-test-v1"
+        self.requests: list[ConfinedAnalysisRequest] = []
+
+    async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
+        self.requests.append(request)
+        member_sha256 = hashlib.sha256(self.member).hexdigest()
+        transfer = await self.catalog.ingest(
+            BytesIO(self.member),
+            logical_bucket=archive_member_transfer_bucket(
+                request.analysis_parameters["transfer_nonce"]
+            ),
+            mime_type="application/octet-stream",
+        )
+        return ConfinedAnalysisResult(
+            status=ToolInvocationStatus.SUCCEEDED,
+            operation_key=f"confined-analysis:{member_sha256}",
+            artifact_id=request.artifact_id,
+            input_sha256=request.sha256,
+            payload={
+                "investigation_id": str(request.investigation_id),
+                "association_id": str(request.association_id),
+                "sample_id": str(request.sample_id),
+                "artifact_sha256": request.sha256,
+                "result": {
+                    "member_status": "extracted",
+                    "member_path": request.analysis_parameters["member_path"],
+                    "member_sha256": member_sha256,
+                    "member_size": len(self.member),
+                    "transfer_blob_id": str(transfer.id),
+                },
+            },
         )
 
 
@@ -1045,3 +1108,265 @@ async def _make_investigation_for_subject(
         await uow.analyst_investigations.add(investigation)
         await uow.commit()
     return investigation
+
+
+@pytest.mark.asyncio
+async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    uow_factory = cast(UnitOfWorkFactory, lambda: SqlAlchemyUnitOfWork(session_factory))
+    try:
+        investigation = await _make_investigation(session_factory)
+        catalog = BlobCatalogService(
+            FilesystemBlobStore(tmp_path / "archive-member-blobs"), uow_factory
+        )
+        artifact_store = ProductionArtifactStore(catalog)
+        hits = HitAcquisitionService(
+            uow_factory,
+            acquisition=None,
+            recorder=cast(Any, _PostgresEvidenceRecorder(uow_factory, artifact_store)),
+        )
+        parent_bytes = b"quarantined archive parent fixture"
+        parent_sha256 = hashlib.sha256(parent_bytes).hexdigest()
+        parent_blob = await catalog.ingest(
+            BytesIO(parent_bytes),
+            logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+            mime_type="application/octet-stream",
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            parent_sample = Sample(
+                subject_id=investigation.subject_id,
+                blob_id=parent_blob.id,
+                original_name="parent.zip",
+                origin="operator_import",
+                acquired_at=datetime.now(UTC),
+                license_restriction="internal-only",
+                tlp=TLP.AMBER,
+                do_not_submit=True,
+                external_llm_allowed=False,
+                origin_kind=SampleOrigin.MANUAL,
+                state=SampleState.QUARANTINED,
+                source_service="operator_import",
+                source_object_id=parent_sha256,
+                expected_hash=parent_sha256,
+            )
+            parent_association = SampleAssociation(
+                id=sample_association_id(investigation.id, parent_sha256),
+                investigation_id=investigation.id,
+                sample_sha256=parent_sha256,
+                origin=SampleOrigin.RELATIONSHIP,
+            )
+            await uow.samples.add(parent_sample)
+            await uow.sample_associations.append_version(parent_association, expected_version=0)
+            await uow.sample_associations.link_sample(
+                parent_association.id, parent_sample.id, expected_sha256=parent_sha256
+            )
+            await uow.commit()
+
+        member_bytes = b"static child member fixture"
+        member_sha256 = hashlib.sha256(member_bytes).hexdigest()
+        child_blob, duplicate_child_blob = await asyncio.gather(
+            catalog.ingest(
+                BytesIO(member_bytes),
+                logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+                mime_type="application/octet-stream",
+            ),
+            catalog.ingest(
+                BytesIO(member_bytes),
+                logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+                mime_type="application/octet-stream",
+            ),
+        )
+        assert child_blob.id == duplicate_child_blob.id
+
+        def candidate_sample() -> Sample:
+            return Sample(
+                subject_id=investigation.subject_id,
+                blob_id=child_blob.id,
+                original_name="preexisting-child.bin",
+                origin="operator_import",
+                acquired_at=datetime.now(UTC),
+                license_restriction=None,
+                tlp=TLP.CLEAR,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                origin_kind=SampleOrigin.MANUAL,
+                state=SampleState.QUARANTINED,
+                source_service="operator_import",
+                source_object_id=member_sha256,
+                expected_hash=member_sha256,
+            )
+
+        async def add_candidate(sample: Sample) -> Sample:
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                stored = await uow.samples.add_if_absent(sample)
+                await uow.commit()
+                return stored
+
+        sample_one, sample_two = await asyncio.gather(
+            add_candidate(candidate_sample()), add_candidate(candidate_sample())
+        )
+        assert sample_one.id == sample_two.id
+        worker = _ArchiveMemberIntegrationWorker(catalog, member_bytes)
+        extractor = ArchiveExtractMemberAdapter(
+            hits=hits,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            execution=cast(Any, worker),
+            timeout_seconds=20,
+            max_output_bytes=4096,
+        )
+        registry = InMemoryToolRegistry()
+        register_acquisition_tools(
+            registry,
+            hits=hits,
+            qualifications=SampleQualificationService(uow_factory),
+            archive_extractor=extractor,
+        )
+        definition, _ = registry.get("archive.extract_member", "1")
+        assert definition.schema_version == "1"
+        assert "member_path" in definition.input_schema["properties"]
+        context = ToolExecutionContext(
+            investigation_id=investigation.id,
+            envelope=None,
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 1}),
+            idempotency_key="archive-member-postgres-first",
+            available_capabilities=frozenset({ARCHIVE_EXTRACT_MEMBER_CAPABILITY}),
+            actor_id="analyst:integration",
+        )
+        arguments = {
+            "association_id": str(parent_association.id),
+            "member_path": "bin/loader.dll",
+            "reason": "Retain the extracted member as a static candidate.",
+        }
+        dispatcher = RegistryToolDispatcher(registry)
+        first = await dispatcher.dispatch(
+            context,
+            tool_name="archive.extract_member",
+            schema_version="1",
+            arguments=arguments,
+            purpose="Extract a member for static analysis.",
+            operation_key="archive-member-postgres:first",
+        )
+        second = await dispatcher.dispatch(
+            replace(context, idempotency_key="archive-member-postgres-second"),
+            tool_name="archive.extract_member",
+            schema_version="1",
+            arguments=arguments,
+            purpose="Retry extraction after a confirmed result.",
+            operation_key="archive-member-postgres:second",
+        )
+
+        child_sha256 = member_sha256
+        assert first.status is ToolInvocationStatus.SUCCEEDED, first
+        assert second.status is ToolInvocationStatus.SUCCEEDED, second
+        assert second.output["association_id"] == first.output["association_id"]
+        assert second.output["sample_id"] == first.output["sample_id"]
+        assert second.output["reused_association"] is True
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            child_sample = await uow.samples.get(UUID(str(first.output["sample_id"])))
+            child_blob = await uow.blobs.get(child_sample.blob_id) if child_sample else None
+            associations = await uow.sample_associations.list_for_investigation(investigation.id)
+            child_events = (
+                await uow.provenance.list_for_aggregate("sample", child_sample.id)
+                if child_sample is not None
+                else ()
+            )
+        resolved = await hits.resolve_quarantined_sample(UUID(str(first.output["association_id"])))
+        assert child_sample is not None and child_sample.state is SampleState.QUARANTINED
+        assert (
+            child_blob is not None
+            and child_blob.descriptor.logical_bucket == SAMPLES_QUARANTINE_BUCKET
+        )
+        assert child_blob.descriptor.sha256 == child_sha256
+        assert resolved.sha256 == child_sha256 and resolved.sample_id == child_sample.id
+        assert sum(item.sample_sha256 == child_sha256 for item in associations) == 1
+        derivations = [
+            event
+            for event in child_events
+            if event.event_type == "sample_derived_from_archive_member"
+        ]
+        assert len(derivations) == 1
+        assert derivations[0].payload["parent_sha256"] == parent_sha256
+        assert derivations[0].payload["member_path"] == "bin/loader.dll"
+        assert derivations[0].actor_id == "analyst:integration"
+        assert derivations[0].payload["reason"] == arguments["reason"]
+        assert child_sample.do_not_submit is True and child_sample.external_llm_allowed is False
+        assert child_sample.tlp is TLP.AMBER
+        assert child_sample.license_restriction == "internal-only"
+
+        # A hash present only under another subject must not prelink the new
+        # investigation association to that unrelated sample.
+        foreign_investigation = await _make_investigation(session_factory)
+        foreign_member = b"member initially known only to another subject"
+        foreign_member_sha256 = hashlib.sha256(foreign_member).hexdigest()
+        foreign_member_blob = await catalog.ingest(
+            BytesIO(foreign_member),
+            logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+            mime_type="application/octet-stream",
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            foreign_sample = Sample(
+                subject_id=foreign_investigation.subject_id,
+                blob_id=foreign_member_blob.id,
+                original_name="foreign-member.dll",
+                origin="operator_import",
+                acquired_at=datetime.now(UTC),
+                license_restriction=None,
+                tlp=TLP.AMBER,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                origin_kind=SampleOrigin.MANUAL,
+                state=SampleState.QUARANTINED,
+                source_service="operator_import",
+                source_object_id=foreign_member_sha256,
+                expected_hash=foreign_member_sha256,
+            )
+            await uow.samples.add(foreign_sample)
+            await uow.commit()
+        foreign_worker = _ArchiveMemberIntegrationWorker(catalog, foreign_member)
+        foreign_extractor = ArchiveExtractMemberAdapter(
+            hits=hits,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            execution=cast(Any, foreign_worker),
+            timeout_seconds=20,
+            max_output_bytes=4096,
+        )
+        foreign_registry = InMemoryToolRegistry()
+        register_acquisition_tools(
+            foreign_registry,
+            hits=hits,
+            qualifications=SampleQualificationService(uow_factory),
+            archive_extractor=foreign_extractor,
+        )
+        foreign_context = replace(context, idempotency_key="archive-member-postgres-foreign-hash")
+        foreign_result = await RegistryToolDispatcher(foreign_registry).dispatch(
+            foreign_context,
+            tool_name="archive.extract_member",
+            schema_version="1",
+            arguments={
+                **arguments,
+                "member_path": "bin/foreign-collision.dll",
+                "reason": "Associate the child with the current investigation subject.",
+            },
+            purpose="Extract a member whose hash exists for another subject.",
+            operation_key="archive-member-postgres:foreign-hash",
+        )
+        assert foreign_result.status is ToolInvocationStatus.SUCCEEDED, foreign_result
+        foreign_derived_id = UUID(str(foreign_result.output["sample_id"]))
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            foreign_derived_sample = await uow.samples.get(foreign_derived_id)
+        assert foreign_derived_sample is not None
+        assert foreign_derived_sample.subject_id == investigation.subject_id
+        assert foreign_derived_sample.id != foreign_sample.id
+        resolved_foreign = await hits.resolve_quarantined_sample(
+            UUID(str(foreign_result.output["association_id"]))
+        )
+        assert resolved_foreign.sample_id == foreign_derived_id
+        assert resolved_foreign.sha256 == foreign_member_sha256
+    finally:
+        await engine.dispose()

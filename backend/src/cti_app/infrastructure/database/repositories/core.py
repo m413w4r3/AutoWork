@@ -120,6 +120,29 @@ class SqlAlchemyBlobRepository:
         )
         await self._session.flush()
 
+    async def add_if_absent(self, blob: BlobRecord) -> BlobRecord:
+        descriptor = blob.descriptor
+        inserted_id = await self._session.scalar(
+            insert(BlobRow)
+            .values(
+                id=blob.id,
+                sha256=descriptor.sha256,
+                size=descriptor.size,
+                mime_type=descriptor.mime_type,
+                logical_bucket=descriptor.logical_bucket,
+                object_key=descriptor.object_key,
+                created_at=blob.created_at,
+            )
+            .on_conflict_do_nothing(index_elements=[BlobRow.logical_bucket, BlobRow.sha256])
+            .returning(BlobRow.id)
+        )
+        if inserted_id is not None:
+            return blob
+        existing = await self.get_by_address(descriptor.logical_bucket, descriptor.sha256)
+        if existing is None:
+            raise RuntimeError("Blob address was not visible after a concurrent insert")
+        return existing
+
     async def get(self, blob_id: UUID) -> BlobRecord | None:
         row = await self._session.get(BlobRow, blob_id)
         return _blob_from_row(row) if row else None
@@ -1201,6 +1224,27 @@ class SqlAlchemySampleRepository:
     async def add(self, sample: Sample) -> None:
         self._session.add(_sample_to_row(sample))
         await self._session.flush()
+
+    async def add_if_absent(self, sample: Sample) -> Sample:
+        row = _sample_to_row(sample)
+        values = {column.key: getattr(row, column.key) for column in SampleRow.__table__.columns}
+        inserted_id = await self._session.scalar(
+            insert(SampleRow)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[SampleRow.subject_id, SampleRow.blob_id])
+            .returning(SampleRow.id)
+        )
+        if inserted_id is not None:
+            return sample
+        existing = await self._session.scalar(
+            select(SampleRow)
+            .where(SampleRow.subject_id == sample.subject_id, SampleRow.blob_id == sample.blob_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if existing is None:
+            raise RuntimeError("Subject sample was not visible after a concurrent insert")
+        return _sample_from_row(existing)
 
     async def get(self, sample_id: UUID) -> Sample | None:
         row = await self._session.get(SampleRow, sample_id)

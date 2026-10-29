@@ -53,6 +53,11 @@ _HIT_ORIGINS = frozenset({SampleOrigin.VT_PIVOT, SampleOrigin.RELATIONSHIP, Samp
 _SUGGESTED_ALTERNATIVES = ("vt.file_report", "vt.relationships", "vt.intelligence_search")
 
 
+def sample_association_id(investigation_id: UUID, sample_sha256: str) -> UUID:
+    """Return the stable association identity shared by all sample hit sources."""
+    return uuid5(_ASSOCIATION_NAMESPACE, f"{investigation_id}:{_require_sha256(sample_sha256)}")
+
+
 class HitAcquisitionError(RuntimeError):
     """Base for typed hit-acquisition refusals."""
 
@@ -133,7 +138,7 @@ class HitAcquisitionService:
             if existing is not None:
                 return existing
             association = SampleAssociation(
-                id=uuid5(_ASSOCIATION_NAMESPACE, f"{investigation_id}:{normalized}"),
+                id=sample_association_id(investigation_id, normalized),
                 investigation_id=investigation_id,
                 sample_sha256=normalized,
                 origin=origin,

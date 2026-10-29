@@ -802,6 +802,7 @@ class OperatorToolInvocationService:
         purpose: str,
         expected_version: int,
         idempotency_key: str,
+        actor_id: str | None = None,
     ) -> OperatorToolInvocationResult:
         if not 1 <= len(idempotency_key) <= 255:
             raise OperatorToolInvocationError("idempotency_key_invalid", 422)
@@ -854,6 +855,7 @@ class OperatorToolInvocationService:
                 operation_prefix=operation_prefix,
                 operation_key=operation_key,
                 trace=trace,
+                actor_id=actor_id,
             )
 
     def _canonical_schema_version(self, tool_name: str, schema_version: str) -> str:
@@ -887,6 +889,7 @@ class OperatorToolInvocationService:
         operation_prefix: str,
         operation_key: str,
         trace: Mapping[str, Any] | None,
+        actor_id: str | None,
     ) -> OperatorToolInvocationResult:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -1172,6 +1175,7 @@ class OperatorToolInvocationService:
                 arguments=arguments,
                 purpose=record_purpose,
                 operation_key=operation_key,
+                actor_id=actor_id,
                 check_stop_before_dispatch=False,
             )
             if advisor_disclosure_denied:

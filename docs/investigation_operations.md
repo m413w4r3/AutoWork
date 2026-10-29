@@ -67,6 +67,25 @@ approbation pour une version et sa publication V6 sont des étapes distinctes;
 la publication crée un nouvel artefact sans modifier la publication de base ou
 la composition d'édition.
 
+`available_tools` publie `archive.extract_member` avec `schema_version: "1"`
+seulement lorsque la famille 7-Zip du worker confiné est attestée. Son schéma
+demande `association_id`, `member_path` et `reason`; `expected_sha256` et
+`archive_preset` sont facultatifs. Exemple d'arguments :
+
+```json
+{
+  "association_id": "fbc63a48-d06e-58ec-80fb-0fa318f70d57",
+  "member_path": "bin/loader.dll",
+  "reason": "Examiner statiquement le membre mentionné par l'observation.",
+  "expected_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+Le résultat reste en quarantaine et candidat; `association_id` peut ensuite
+être fourni à `sample.analyze` et aux outils locaux disponibles. Le worker
+refuse les chemins ambigus, liens, tailles ou ratios hors limites, sans écrire
+le membre sur le système de fichiers ni l'exécuter.
+
 ## Identité et déploiement
 
 Les décisions G2/G3, l'approbation d'avis et les décisions sur les règles

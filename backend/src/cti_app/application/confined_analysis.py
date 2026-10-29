@@ -21,6 +21,7 @@ from cti_app.domain.local_analysis import (
 
 CONFINED_ANALYSIS_JOB_KIND = "sample.confined_analysis.v1"
 CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v2"
+ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX = "confined-analysis-archive-member"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -35,6 +36,7 @@ class ConfinedAnalysisTool(StrEnum):
     ZIP_MEMBERS = "zip_members"
     ARCHIVE_LIST = "archive_list"
     ARCHIVE_EXTRACT_HASH = "archive_extract_hash"
+    ARCHIVE_EXTRACT_MEMBER = "archive_extract_member"
     FLOSS = "floss"
     MWCP = "mwcp"
     YARA = "yara"
@@ -126,6 +128,12 @@ class ConfinedAnalysisRequest:
                 "max_members",
                 "archive_preset",
             },
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER: {
+                "member_path",
+                "archive_preset",
+                "expected_sha256",
+                "transfer_nonce",
+            },
             ConfinedAnalysisTool.FLOSS: {"max_strings"},
             ConfinedAnalysisTool.MWCP: {"parser_id", "parser_version"},
             ConfinedAnalysisTool.YARA: {"rule_source"},
@@ -153,6 +161,7 @@ class ConfinedAnalysisRequest:
             ConfinedAnalysisTool.ZIP_MEMBERS,
             ConfinedAnalysisTool.ARCHIVE_LIST,
             ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+            ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
         }:
             validate_archive_tool_request(self.tool, self.arguments, self.analysis_parameters)
         if self.tool is ConfinedAnalysisTool.DOTNET_ILSPY:
@@ -353,6 +362,32 @@ def validate_archive_tool_request(
     """Validate options at both the API and confined-worker boundaries."""
     if arguments:
         raise ValueError("archive tools do not accept command arguments")
+    if tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER:
+        allowed = {"member_path", "archive_preset", "expected_sha256", "transfer_nonce"}
+        if set(parameters) - allowed:
+            raise ValueError("archive extraction parameters are invalid")
+        member_path = parameters.get("member_path")
+        if not isinstance(member_path, str) or not _valid_archive_member_path(member_path):
+            raise ValueError("archive member path is invalid")
+        expected_sha256 = parameters.get("expected_sha256")
+        if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str) or not _SHA256.fullmatch(expected_sha256)
+        ):
+            raise ValueError("expected member SHA-256 is invalid")
+        transfer_nonce = parameters.get("transfer_nonce")
+        if transfer_nonce is not None and (
+            not isinstance(transfer_nonce, str) or not _SHA256.fullmatch(transfer_nonce)
+        ):
+            raise ValueError("archive transfer nonce is invalid")
+        archive_preset = parameters.get("archive_preset", "none")
+        if not isinstance(archive_preset, str) or archive_preset not in {
+            "none",
+            "infected",
+            "malware",
+        }:
+            raise ValueError("archive preset is not allowlisted")
+        return
+
     allowed = {"member_prefix", "max_members"}
     if tool in {
         ConfinedAnalysisTool.ARCHIVE_LIST,
@@ -376,6 +411,25 @@ def validate_archive_tool_request(
         raise ValueError("archive preset is not allowlisted")
     if tool is ConfinedAnalysisTool.ZIP_MEMBERS and "archive_preset" in parameters:
         raise ValueError("zip_members does not accept passwords")
+
+
+def archive_member_transfer_bucket(transfer_nonce: str) -> str:
+    if not _SHA256.fullmatch(transfer_nonce):
+        raise ValueError("archive transfer nonce is invalid")
+    return f"{ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX}-{transfer_nonce}"
+
+
+def _valid_archive_member_path(value: str) -> bool:
+    if (
+        not value
+        or len(value) > 1024
+        or value.startswith("/")
+        or "\\" in value
+        or ":" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    return all(part not in {"", ".", ".."} for part in value.split("/"))
 
 
 @dataclass(frozen=True, slots=True)

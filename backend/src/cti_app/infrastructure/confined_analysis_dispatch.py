@@ -102,6 +102,7 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
             in {
                 ConfinedAnalysisTool.ARCHIVE_LIST,
                 ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+                ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
             }
             else "suricata"
             if request.tool
