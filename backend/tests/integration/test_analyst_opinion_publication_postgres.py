@@ -249,8 +249,9 @@ class _OperatorInvocationService:
         purpose: str,
         expected_version: int,
         idempotency_key: str,
+        actor_id: str | None = None,
     ):
-        del purpose
+        del purpose, actor_id
         result = await self._adapter.execute(
             arguments,
             ToolExecutionContext(
