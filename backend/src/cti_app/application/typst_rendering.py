@@ -2232,10 +2232,7 @@ def project_publication_to_typst_model(
         "blocks": reference_blocks,
         "sources": sources,
     }
-    content_sections: list[dict[str, Any]] = [
-        {"type": "synthesis", "blocks": body_blocks},
-        reference_section,
-    ]
+    content_sections: list[dict[str, Any]] = [reference_section]
     timeline_figure = (
         build_publication_timeline_figure(publication_v5)
         if isinstance(publication_v5, PublicationDocumentV5)
@@ -2316,6 +2313,7 @@ def project_publication_to_typst_model(
         if timeline_figure is not None:
             chronology_section["derived_timeline_figure"] = timeline_figure
         content_sections.append(chronology_section)
+    content_sections.append({"type": "synthesis", "blocks": body_blocks})
     investigation_chain_figure = (
         build_investigation_chain_figure(publication_v6) if publication_v6 is not None else None
     )
