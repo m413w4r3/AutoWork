@@ -17,9 +17,9 @@ Les appels passifs VT, les analyses locales et Bridge sont autorisés seulement 
 
 ## Relais et cadence
 
-Utilise le client ou les scripts de relais fournis pour l’enquête. Chaque demande reçoit un identifiant unique; récupère le résultat du même identifiant et rapproche-le de l’invocation canonique. Le relais traite les fichiers de demande dans une file sérielle : un POST Bridge peut retarder les GET suivants. Un GET en attente ou absent ne prouve pas que le POST n’est pas parti.
+Utilise le client ou les scripts de relais fournis pour l’enquête. Chaque demande reçoit un identifiant unique; récupère le résultat du même identifiant et rapproche-le de l’invocation canonique. Les GET peuvent s’exécuter en parallèle pendant un POST; les POST restent sérialisés. Pour vérifier une demande, lis `relay-status.json` dans le répertoire de travail du relais : `in_flight` liste les appels actifs et `queue` les demandes reçues qui attendent. `inflight/<id>.json` distingue `received` de `running`; `outbox/<id>.json` contient le résultat. Si l’identifiant ne figure dans aucun de ces emplacements, le relais ne l’a pas reçu. Un `transport_error` est ambigu : ne rejoue pas le POST sans réconciliation.
 
-Le bac à sable ne voit pas nécessairement les processus de l’hôte. Vérifie le relais par le résultat d’un GET autorisé ou l’état de la demande; `pgrep` et `ps` ne sont pas des contrôles de santé fiables. Ne démarre, n’arrête ni ne redémarre le relais.
+Le bac à sable ne voit pas nécessairement les processus de l’hôte. Lis `relay-status.json` plutôt que `pgrep` ou `ps` pour connaître le PID, le heartbeat et l’état des demandes. Ne démarre, n’arrête ni ne redémarre le relais.
 
 Envoie une seule demande à la fois. Pour une consultation longue, attends au moins 60 secondes avant une vérification; ne crée pas de POST identique et n’empile pas des GET de statut toutes les quelques secondes. Si la vérification est encore en attente derrière le POST, attends plusieurs minutes avant une seule nouvelle vérification de l’identifiant exact. Une demande `pending`, `needs_review` ou ambiguë reste à réconcilier : ne la rejoue pas à l’aveugle.
 
