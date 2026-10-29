@@ -199,18 +199,48 @@ class EvidenceSummaryPort(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _SampleDisclosureIndex:
-    available: bool
-    allowed_references: frozenset[str] = frozenset()
     restricted_references: frozenset[str] = frozenset()
+    ambiguous_references: frozenset[str] = frozenset()
 
     def restricts(self, key: str, value: object) -> bool:
         reference = _sample_disclosure_reference(key, value)
+        return reference is not None and reference in self.restricted_references
+
+    def is_ambiguous(self, key: str, value: object) -> bool:
+        reference = _sample_disclosure_reference(key, value)
         return (
-            not self.available
-            or reference is None
-            or reference in self.restricted_references
-            or reference not in self.allowed_references
+            reference is not None
+            and reference in self.ambiguous_references
+            and reference not in self.restricted_references
         )
+
+    def contains_restricted_reference(self, value: str) -> bool:
+        folded = value.casefold()
+        return any(reference in folded for reference in self.restricted_references)
+
+    def redact_ambiguous(self, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                self._redact_text(str(key)): self.redact_ambiguous(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            return [self.redact_ambiguous(item) for item in value]
+        if isinstance(value, str):
+            return self._redact_text(value)
+        return value
+
+    def _redact_text(self, value: str) -> str:
+        redacted = value
+        references = self.ambiguous_references - self.restricted_references
+        for reference in sorted(references, key=len, reverse=True):
+            redacted = re.sub(
+                re.escape(reference),
+                "[ambiguous sample identifier]",
+                redacted,
+                flags=re.IGNORECASE,
+            )
+        return redacted
 
 
 class RuleCorpusContextInventoryPort(Protocol):
@@ -348,6 +378,7 @@ class CanonicalEvidenceSummaryPort:
                             {
                                 "association_id": str(association.id),
                                 "sample_sha256": association.sample_sha256,
+                                "ambiguous_sample_ids": tuple(str(sample.id) for sample in matches),
                                 "resolution_status": "unresolved",
                             }
                         )
@@ -1185,11 +1216,11 @@ class ResearchContextBuilder:
         ) = await self._latest_tool_results(tool_invocations, observations, sample_disclosure)
         # Every Bridge turn is an independent Temporary Chat. Include the newest
         # bounded evidence on every turn so the prompt remains self-contained.
-        evidence_summary, restricted_sample_observation_ids = await self._evidence_context(
+        evidence_summary, evidence_restricted_observation_ids = await self._evidence_context(
             tuple(reversed(observations)), sample_disclosure
         )
         restricted_sample_observation_ids = set(
-            restricted_sample_observation_ids | restricted_sample_invocation_observation_ids
+            evidence_restricted_observation_ids | restricted_sample_invocation_observation_ids
         )
         restricted_sample_observation_ids.update(
             item.id
@@ -1224,7 +1255,6 @@ class ResearchContextBuilder:
                 continue
             pivot_observations.append(observation)
             pivot_payloads[str(observation.id)] = summary if isinstance(summary, Mapping) else None
-        restricted_sample_observation_ids = frozenset(restricted_sample_observation_ids)
         context_observations = tuple(
             item for item in observations if item.id not in restricted_sample_observation_ids
         )
@@ -1258,7 +1288,9 @@ class ResearchContextBuilder:
             context_findings,
             observation_ids=all_observation_ids,
         )
-        evidence_index, evidence_index_truncated = self._evidence_index(context_observations)
+        evidence_index, evidence_index_truncated = self._evidence_index(
+            context_observations, sample_disclosure
+        )
         current_opinion = (
             await self._opinions.get(investigation_opinion_id(investigation_id))
             if self._opinions is not None
@@ -2190,7 +2222,7 @@ class ResearchContextBuilder:
                 evidence_index_observations, sample_disclosure
             )
             evidence_index_items = tuple(
-                self._evidence_index((observation,))[0][0]
+                self._evidence_index((observation,), sample_disclosure)[0][0]
                 for observation in evidence_index_observations
                 if observation.id not in restricted_observation_ids
             )
@@ -2430,7 +2462,9 @@ class ResearchContextBuilder:
                     source_page.items, sample_disclosure
                 )
                 items = tuple(
-                    self._evidence_index((observation,))[0][0].model_dump(mode="json")
+                    self._evidence_index((observation,), sample_disclosure)[0][0].model_dump(
+                        mode="json"
+                    )
                     for observation in source_page.items
                     if observation.id not in restricted_observation_ids
                 )
@@ -2507,8 +2541,11 @@ class ResearchContextBuilder:
                     observation = await self._observations.get(observation_id)
                     if observation is not None:
                         observations_by_id[observation_id] = observation
+            sample_disclosure = await self._sample_disclosure_index(investigation_id, None)
             coverage_items, _ = await self._tool_coverage(
-                tuple(reversed(source_page.items)), tuple(observations_by_id.values())
+                tuple(reversed(source_page.items)),
+                tuple(observations_by_id.values()),
+                sample_disclosure,
             )
             items = tuple(item.model_dump(mode="json") for item in reversed(coverage_items))
             return self._project_source_page(
@@ -2940,15 +2977,30 @@ class ResearchContextBuilder:
                 ):
                     restricted_observation_ids.add(observation.id)
                     continue
+            elif (
+                isinstance(summary, str)
+                and sample_disclosure is not None
+                and sample_disclosure.contains_restricted_reference(summary)
+            ):
+                restricted_observation_ids.add(observation.id)
+                continue
             if isinstance(summary, Mapping):
+                if sample_disclosure is not None:
+                    summary = sample_disclosure.redact_ambiguous(summary)
                 raw_text = json.dumps(_sanitize(summary), ensure_ascii=False)
             elif isinstance(summary, str):
-                raw_text = summary
+                raw_text = (
+                    sample_disclosure.redact_ambiguous(summary)
+                    if sample_disclosure is not None
+                    else summary
+                )
             else:
                 raw_text = (
                     f"{observation.source} observed {observation.object_type} "
                     f"{observation.object_id}"
                 )
+                if sample_disclosure is not None:
+                    raw_text = sample_disclosure.redact_ambiguous(raw_text)
             text = _safe_untrusted(_truncate(raw_text, MAX_CONTEXT_EVIDENCE_CHARS))
             result.append(
                 EvidenceSummaryV1(
@@ -2963,6 +3015,7 @@ class ResearchContextBuilder:
     @staticmethod
     def _evidence_index(
         observations: tuple[EvidenceObservation, ...],
+        sample_disclosure: _SampleDisclosureIndex | None = None,
     ) -> tuple[tuple[EvidenceSummaryV1, ...], bool]:
         ordered = sorted(
             observations,
@@ -2974,13 +3027,13 @@ class ResearchContextBuilder:
         )
         result: list[EvidenceSummaryV1] = []
         for observation in ordered[:MAX_CONTEXT_EVIDENCE_INDEX]:
-            summary = _safe_untrusted(
-                _truncate(
-                    f"{observation.source} recorded {observation.kind.value} for "
-                    f"{observation.object_type} {observation.object_id}",
-                    96,
-                )
+            summary_text = (
+                f"{observation.source} recorded {observation.kind.value} for "
+                f"{observation.object_type} {observation.object_id}"
             )
+            if sample_disclosure is not None:
+                summary_text = sample_disclosure.redact_ambiguous(summary_text)
+            summary = _safe_untrusted(_truncate(summary_text, 96))
             item = EvidenceSummaryV1(
                 evidence_id=observation.id,
                 kind=observation.kind,
@@ -3007,7 +3060,16 @@ class ResearchContextBuilder:
             else tuple(sorted(opinion.observations, key=lambda item: (item.anchor, str(item.id))))
         )
         truncated = len(notes) > max_items
-        for note in notes:
+        if len(notes) <= max_items:
+            selected_notes = notes
+        elif max_items <= 0:
+            selected_notes = ()
+        elif max_items == 1:
+            selected_notes = notes[-1:]
+        else:
+            # Keep the opening note alongside the most recent notes within the budget.
+            selected_notes = (notes[0], *notes[-(max_items - 1) :])
+        for note in selected_notes:
             item = OpinionNoteSummaryV1(
                 note_id=note.id,
                 anchor=note.anchor,
@@ -3303,7 +3365,20 @@ class ResearchContextBuilder:
             ):
                 restricted_sample_seen = True
                 continue
-            visible_rows.append(row)
+            visible_row = cast(dict[str, Any], sample_disclosure.redact_ambiguous(row))
+            ambiguous_sample = any(
+                sample_disclosure.is_ambiguous(key, row.get(field))
+                for key, field in (
+                    ("association_id", "association_id"),
+                    ("sample_id", "sample_id"),
+                    ("sample_sha256", "sha256"),
+                )
+            )
+            if ambiguous_sample:
+                for field in ("sample_id", "sha256", "sha256_short"):
+                    if visible_row.get(field) is not None:
+                        visible_row[field] = "[ambiguous sample identifier]"
+            visible_rows.append(visible_row)
         ordered = sorted(visible_rows, key=lambda item: (item["sha256"], item["association_id"]))
         if restricted_sample_seen and offset == 0:
             ordered.insert(
@@ -3321,16 +3396,16 @@ class ResearchContextBuilder:
     ) -> _SampleDisclosureIndex:
         inventory_reader = getattr(self._evidence_summaries, "sample_disclosure_inventory", None)
         if not callable(inventory_reader):
-            return _SampleDisclosureIndex(available=False)
+            return _SampleDisclosureIndex()
         try:
             inventory = await inventory_reader(investigation_id)
         except Exception:
-            return _SampleDisclosureIndex(available=False)
+            return _SampleDisclosureIndex()
         if not isinstance(inventory, Sequence) or isinstance(inventory, str | bytes):
-            return _SampleDisclosureIndex(available=False)
+            return _SampleDisclosureIndex()
 
-        allowed: set[str] = set()
         restricted: set[str] = set()
+        ambiguous: set[str] = set()
         for item in inventory:
             if not isinstance(item, Mapping):
                 continue
@@ -3339,6 +3414,16 @@ class ResearchContextBuilder:
                 for key in ("association_id", "sample_id", "sample_sha256")
                 if (reference := _sample_disclosure_reference(key, item.get(key))) is not None
             }
+            ambiguous_sample_ids = item.get("ambiguous_sample_ids")
+            if isinstance(ambiguous_sample_ids, Sequence) and not isinstance(
+                ambiguous_sample_ids, str | bytes
+            ):
+                references.update(
+                    reference
+                    for sample_id in ambiguous_sample_ids
+                    if (reference := _sample_disclosure_reference("sample_id", sample_id))
+                    is not None
+                )
             policy_complete = (
                 item.get("resolution_status") == "resolved"
                 and _safe_uuid_string(item.get("association_id")) is not None
@@ -3348,14 +3433,14 @@ class ResearchContextBuilder:
                 and type(item.get("external_llm_allowed")) is bool
                 and "license_restriction" in item
             )
-            if not policy_complete or _sample_disclosure_restriction_sources(item, envelope):
+            restriction_sources = _sample_disclosure_restriction_sources(item, envelope)
+            if restriction_sources:
                 restricted.update(references)
-            else:
-                allowed.update(references)
+            elif not policy_complete:
+                ambiguous.update(references)
         return _SampleDisclosureIndex(
-            available=True,
-            allowed_references=frozenset(allowed),
             restricted_references=frozenset(restricted),
+            ambiguous_references=frozenset(ambiguous),
         )
 
     async def _latest_tool_results(
@@ -3420,6 +3505,8 @@ class ResearchContextBuilder:
                 output_ids = {"restricted_sample": "restricted"}
                 observation_ids = ()
                 restricted_sample_observation_ids.update(invocation.response_refs[-4:])
+            else:
+                output_ids = cast(dict[str, str], sample_disclosure.redact_ambiguous(output_ids))
             results.append(
                 LatestToolResultV1(
                     invocation_id=invocation.id,
@@ -3479,9 +3566,14 @@ class ResearchContextBuilder:
                     ):
                         restricted_sample = True
                         continue
+                    if isinstance(
+                        candidate_facts, str
+                    ) and sample_disclosure.contains_restricted_reference(candidate_facts):
+                        restricted_sample = True
+                        continue
                     if candidate_facts is not None and facts is None:
                         observation = candidate_observation
-                        facts = candidate_facts
+                        facts = sample_disclosure.redact_ambiguous(candidate_facts)
             if restricted_sample:
                 entries.append(
                     ToolCoverageEntryV1(
@@ -3494,7 +3586,9 @@ class ResearchContextBuilder:
                     )
                 )
                 continue
-            summary = _tool_coverage_summary(invocation, observation, facts)
+            summary = sample_disclosure.redact_ambiguous(
+                _tool_coverage_summary(invocation, observation, facts)
+            )
             checkpoint_summary = advisor_checkpoint_summary(invocation)
             if checkpoint_summary:
                 summary = _truncate(f"{summary} {checkpoint_summary}", 512)
@@ -3891,7 +3985,7 @@ def _observation_references_sample_disclosure(
         return sample_disclosure.restricts("sample_sha256", observation.object_id)
     if _safe_uuid_string(observation.object_id) is not None:
         return sample_disclosure.restricts("sample_id", observation.object_id)
-    return True
+    return False
 
 
 def _is_sample_hash(value: Any) -> TypeGuard[str]:
