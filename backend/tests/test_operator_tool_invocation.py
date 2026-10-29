@@ -189,7 +189,7 @@ async def test_advisor_validation_rejection_is_json_serializable_in_api_response
     )
 
     async def allow_operator_client(_request):
-        return None
+        return SimpleNamespace(actor_id="operator:client-test")
 
     monkeypatch.setattr(investigation_api, "_require_operator_client", allow_operator_client)
     app = FastAPI()
