@@ -48,7 +48,8 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.static_analysis import StaticAnalysisService
 from cti_app.domain.classification import derived_policy
-from cti_app.domain.entities import ProvenanceEvent, Sample
+from cti_app.domain.entities import ProvenanceEvent, Sample, SampleState
+from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
@@ -56,7 +57,6 @@ from cti_app.domain.investigation import (
     SampleAssociation,
     SampleOrigin,
     SampleQualification,
-    SampleState,
     ToolInvocationStatus,
 )
 from cti_app.domain.local_analysis import LOCAL_ARCHIVE_MAX_MEMBER_BYTES
@@ -852,7 +852,7 @@ class ArchiveExtractMemberAdapter:
                     tlp=parent_sample.tlp,
                     do_not_submit=parent_sample.do_not_submit,
                     external_llm_allowed=parent_sample.external_llm_allowed,
-                    origin_kind=SampleOrigin.MANUAL,
+                    origin_kind=EntitySampleOrigin.MANUAL,
                     state=SampleState.QUARANTINED,
                     source_service="archive_extract_member",
                     source_object_id=member_sha256,

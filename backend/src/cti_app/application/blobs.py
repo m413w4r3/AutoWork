@@ -30,7 +30,7 @@ class BlobCatalogService:
             blob = BlobRecord(descriptor=descriptor)
             add_if_absent = getattr(uow.blobs, "add_if_absent", None)
             if callable(add_if_absent):
-                stored = await add_if_absent(blob)
+                stored: BlobRecord = await add_if_absent(blob)
                 self._ensure_same_metadata(stored.descriptor, descriptor)
                 await uow.commit()
                 return stored
