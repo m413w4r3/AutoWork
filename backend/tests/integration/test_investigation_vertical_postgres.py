@@ -1636,9 +1636,11 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert all(
                 item.state == "COMPLETED" for item in claims if item.family != "vt.file_report"
             )
-            assert len(uses) == len(claims)
+            # Only completed claims were sent; NEEDS_REVIEW attempts (timeouts) have no use.
+            completed_claims = [item for item in claims if item.state == "COMPLETED"]
+            assert len(uses) == len(completed_claims)
             assert all(item.use_kind == "SENT" for item in uses)
-            assert {item.claim_id for item in uses} == {item.id for item in claims}
+            assert {item.claim_id for item in uses} == {item.id for item in completed_claims}
             assert len(dispatches) == 1
             assert dispatches[0].requested_hash == candidate_hash
             assert dispatches[0].state == "COMPLETED"

@@ -1456,6 +1456,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 "sample.extract_configuration",
             }
             partial_is_evidence = {
+                "samples.compare",
                 "sample.analyze",
                 "sample.extract_obfuscated_strings",
                 "network.protocol.verify",
@@ -1472,6 +1473,10 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             assert all(
                 item.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
                 for item in invocation_by_name["sample.analyze"]
+            )
+            assert all(
+                item.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+                for item in invocation_by_name["samples.compare"]
             )
             floss_statuses = {
                 item.status for item in invocation_by_name["sample.extract_obfuscated_strings"]
