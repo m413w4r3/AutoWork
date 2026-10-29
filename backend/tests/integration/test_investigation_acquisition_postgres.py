@@ -204,9 +204,16 @@ class _PcapAnalysisWorker:
 
 
 class _ArchiveMemberIntegrationWorker:
-    def __init__(self, catalog: BlobCatalogService, member: bytes) -> None:
+    def __init__(
+        self,
+        catalog: BlobCatalogService,
+        member: bytes,
+        *,
+        barrier: asyncio.Barrier | None = None,
+    ) -> None:
         self.catalog = catalog
         self.member = member
+        self.barrier = barrier
         self.family_statuses = {
             "archive_tools": ConfinedAnalysisFamilyStatus("archive_tools", True, "16.02")
         }
@@ -221,6 +228,7 @@ class _ArchiveMemberIntegrationWorker:
         self.available_reason = None
         self.isolation_profile = "analysis-worker-test-v1"
         self.requests: list[ConfinedAnalysisRequest] = []
+        self.transfer_blob_ids: list[UUID] = []
 
     async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
         self.requests.append(request)
@@ -232,6 +240,9 @@ class _ArchiveMemberIntegrationWorker:
             ),
             mime_type="application/octet-stream",
         )
+        self.transfer_blob_ids.append(transfer.id)
+        if self.barrier is not None:
+            await self.barrier.wait()
         return ConfinedAnalysisResult(
             status=ToolInvocationStatus.SUCCEEDED,
             operation_key=f"confined-analysis:{member_sha256}",
@@ -1323,6 +1334,121 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
         assert child_sample.do_not_submit is True and child_sample.external_llm_allowed is False
         assert child_sample.tlp is TLP.RED
         assert child_sample.license_restriction == "internal-only"
+
+        concurrent_investigation = await _make_investigation(session_factory)
+        concurrent_approved = await envelope_service.approve(
+            InvestigationEnvelopeProposal(
+                investigation_id=concurrent_investigation.id,
+                allowed_providers=("vt",),
+                budget=InvestigationBudget(
+                    limits={BudgetDimension.VT_UNITS: 2, BudgetDimension.DOWNLOADS: 1}
+                ),
+                acquire_hits_allowed=True,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.CLEAR,
+                    do_not_submit=False,
+                    external_llm_allowed=False,
+                ),
+            ),
+            actor_id="analyst:integration",
+            reason="Approve bounded local archive extraction for the test.",
+            correlation_id=f"archive-member-concurrent-g2:{concurrent_investigation.id}",
+        )
+        concurrent_parent_blob = await catalog.ingest(
+            BytesIO(parent_bytes),
+            logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+            mime_type="application/octet-stream",
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            concurrent_parent_sample = Sample(
+                subject_id=concurrent_investigation.subject_id,
+                blob_id=concurrent_parent_blob.id,
+                original_name="parent.zip",
+                origin="operator_import",
+                acquired_at=datetime.now(UTC),
+                license_restriction="internal-only",
+                tlp=TLP.AMBER,
+                do_not_submit=True,
+                external_llm_allowed=False,
+                origin_kind=EntitySampleOrigin.MANUAL,
+                state=SampleState.QUARANTINED,
+                source_service="operator_import",
+                source_object_id=parent_sha256,
+                expected_hash=parent_sha256,
+            )
+            concurrent_parent_association = SampleAssociation(
+                id=sample_association_id(concurrent_investigation.id, parent_sha256),
+                investigation_id=concurrent_investigation.id,
+                sample_sha256=parent_sha256,
+                origin=SampleOrigin.RELATIONSHIP,
+            )
+            await uow.samples.add(concurrent_parent_sample)
+            await uow.sample_associations.append_version(
+                concurrent_parent_association, expected_version=0
+            )
+            await uow.sample_associations.link_sample(
+                concurrent_parent_association.id,
+                concurrent_parent_sample.id,
+                expected_sha256=parent_sha256,
+            )
+            await uow.commit()
+
+        concurrent_worker = _ArchiveMemberIntegrationWorker(
+            catalog, member_bytes, barrier=asyncio.Barrier(2)
+        )
+        concurrent_extractor = ArchiveExtractMemberAdapter(
+            hits=hits,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            execution=cast(Any, concurrent_worker),
+            timeout_seconds=20,
+            max_output_bytes=4096,
+        )
+        concurrent_key = "archive-member-postgres-concurrent-same-content"
+        concurrent_results = await asyncio.gather(
+            concurrent_extractor.execute(
+                arguments,
+                replace(context, idempotency_key=concurrent_key),
+            ),
+            concurrent_extractor.execute(
+                {
+                    **arguments,
+                    "association_id": str(concurrent_parent_association.id),
+                },
+                replace(
+                    context,
+                    investigation_id=concurrent_investigation.id,
+                    envelope=concurrent_approved,
+                    budget=concurrent_approved.budget,
+                    idempotency_key=concurrent_key,
+                ),
+            ),
+        )
+        assert all(result.status is ToolInvocationStatus.SUCCEEDED for result in concurrent_results)
+        assert len(concurrent_worker.transfer_blob_ids) == 2
+        assert len(set(concurrent_worker.transfer_blob_ids)) == 1
+        shared_transfer_blob_id = concurrent_worker.transfer_blob_ids[0]
+        assert (
+            await artifact_store.read_bytes(shared_transfer_blob_id, max_bytes=len(member_bytes))
+            == member_bytes
+        )
+        for result in concurrent_results:
+            concurrent_sample_id = UUID(str(result.output["sample_id"]))
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                concurrent_sample = await uow.samples.get(concurrent_sample_id)
+                concurrent_child_blob = (
+                    await uow.blobs.get(concurrent_sample.blob_id)
+                    if concurrent_sample is not None
+                    else None
+                )
+            assert concurrent_sample is not None and concurrent_child_blob is not None
+            assert concurrent_child_blob.descriptor.sha256 == member_sha256
+            assert (
+                await artifact_store.read_bytes(
+                    concurrent_sample.blob_id, max_bytes=len(member_bytes)
+                )
+                == member_bytes
+            )
 
         # A hash present only under another subject must not prelink the new
         # investigation association to that unrelated sample.

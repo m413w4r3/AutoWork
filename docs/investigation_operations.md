@@ -86,6 +86,12 @@ Le résultat reste en quarantaine et candidat; `association_id` peut ensuite
 refuse les chemins ambigus, liens, tailles ou ratios hors limites, sans écrire
 le membre sur le système de fichiers ni l'exécuter.
 
+Les objets de transfert et les blobs de quarantaine laissés sans référence
+après un échec de liaison sont conservés pour éviter qu'un nettoyage concurrent
+ne rende illisible un objet réingéré à la même adresse. Leur expiration/GC est
+une dette connue; le catalogue fournit déjà l'opération générique de GC des
+blobs non référencés.
+
 ## Identité et déploiement
 
 Les décisions G2/G3, l'approbation d'avis et les décisions sur les règles

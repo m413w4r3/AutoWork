@@ -414,6 +414,44 @@ async def test_7z_extract_member_returns_verified_bytes_without_writing_member(
 
 
 @pytest.mark.asyncio
+async def test_7z_extract_member_allows_member_named_like_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    member = b"member with the archive basename"
+    listing = (
+        "Path = sample.bin\nType = zip\nPhysical Size = 123\n\n----------\n"
+        f"Path = sample.bin\nFolder = -\nSize = {len(member)}\n"
+        f"Packed Size = {len(member)}\nEncrypted = -\nMethod = Copy\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        stdout = listing.encode() if argv[1] == "l" else member
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, stdout, b"")
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"archive bytes",
+        member_prefix=None,
+        max_members=1,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="sample.bin",
+        expected_sha256=hashlib.sha256(member).hexdigest(),
+    )
+
+    assert result["member_status"] == "extracted"
+    assert result["_member_bytes"] == member
+    assert calls[1][-1] == "sample.bin"
+
+
+@pytest.mark.asyncio
 async def test_7z_extract_member_rejects_symlink_without_running_extract(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
