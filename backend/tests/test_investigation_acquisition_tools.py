@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Mapping
@@ -115,17 +116,25 @@ class _AttestedAnalysisWorker:
 
 
 class _ArchiveMemberWorker:
-    def __init__(self, database: FakeDatabase, member: bytes) -> None:
+    def __init__(
+        self,
+        database: FakeDatabase,
+        member: bytes,
+        *,
+        barrier: asyncio.Barrier | None = None,
+    ) -> None:
         self.database = database
         self.member = member
+        self.barrier = barrier
         self.requests: list[ConfinedAnalysisRequest] = []
         self.transfer_blob_ids: list[UUID] = []
 
     def seed_blob(self, content: bytes, bucket: str) -> UUID:
-        blob_id = uuid4()
+        digest = hashlib.sha256(content).hexdigest()
+        blob_id = uuid5(UUID("6c3db404-61fe-4d1f-b1eb-638aa7b15b0a"), f"{bucket}:{digest}")
         self.database.blobs[blob_id] = FakeBlob(
             blob_id,
-            FakeBlobDescriptor(bucket, hashlib.sha256(content).hexdigest(), len(content)),
+            FakeBlobDescriptor(bucket, digest, len(content)),
         )
         self.database.blob_bytes[blob_id] = content
         return blob_id
@@ -136,6 +145,8 @@ class _ArchiveMemberWorker:
         transfer_bucket = archive_member_transfer_bucket(transfer_nonce)
         transfer_blob_id = self.seed_blob(self.member, transfer_bucket)
         self.transfer_blob_ids.append(transfer_blob_id)
+        if self.barrier is not None:
+            await self.barrier.wait()
         child_sha256 = hashlib.sha256(self.member).hexdigest()
         payload = {
             "investigation_id": str(request.investigation_id),
@@ -186,6 +197,7 @@ class _FakeQuarantineArtifactStore:
     ) -> None:
         self.database = database
         self.after_put = after_put
+        self.deleted_blob_ids: list[UUID] = []
 
     async def read_bytes(self, blob_id: UUID, *, max_bytes: int) -> bytes:
         content = self.database.blob_bytes[blob_id]
@@ -209,6 +221,7 @@ class _FakeQuarantineArtifactStore:
         return blob_id
 
     async def delete_unreferenced(self, blob_id: UUID) -> None:
+        self.deleted_blob_ids.append(blob_id)
         self.database.blobs.pop(blob_id, None)
         self.database.blob_bytes.pop(blob_id, None)
 
@@ -450,7 +463,7 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
     hits = HitAcquisitionService(
         lambda: FakeUow(database), acquisition=None, recorder=make_evidence_recorder(database)
     )
-    worker = _ArchiveMemberWorker(database, member_bytes)
+    worker = _ArchiveMemberWorker(database, member_bytes, barrier=asyncio.Barrier(2))
     store = _FakeQuarantineArtifactStore(database)
     extractor = ArchiveExtractMemberAdapter(
         hits=hits,
@@ -496,28 +509,15 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
         "reason": "Inspect the archive member as a static candidate.",
         "expected_sha256": hashlib.sha256(member_bytes).hexdigest(),
     }
-    first = await dispatcher.dispatch(
-        context,
-        tool_name="archive.extract_member",
-        schema_version="1",
-        arguments=arguments,
-        purpose="Inspect the member without execution.",
-        operation_key="archive-member:first",
-    )
-    second = await dispatcher.dispatch(
-        replace(
-            context,
-            idempotency_key="archive-member-second",
-            actor_id="analyst:archive-reviewer",
+    first, second = await asyncio.gather(
+        extractor.execute(arguments, context),
+        extractor.execute(
+            {
+                **arguments,
+                "reason": "Compare the same member against a separate analyst question.",
+            },
+            replace(context, actor_id="analyst:archive-reviewer"),
         ),
-        tool_name="archive.extract_member",
-        schema_version="1",
-        arguments={
-            **arguments,
-            "reason": "Compare the same member against a separate analyst question.",
-        },
-        purpose="Retry the same deterministic extraction.",
-        operation_key="archive-member:second",
     )
 
     assert first.status is ToolInvocationStatus.SUCCEEDED
@@ -528,10 +528,13 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
     assert second.output["reused_association"] is True
     assert (
         worker.requests[0].analysis_parameters["transfer_nonce"]
-        != (worker.requests[1].analysis_parameters["transfer_nonce"])
+        == worker.requests[1].analysis_parameters["transfer_nonce"]
     )
-    assert all(blob_id not in database.blobs for blob_id in worker.transfer_blob_ids)
-    assert len(set(worker.transfer_blob_ids)) == 2
+    assert len(set(worker.transfer_blob_ids)) == 1
+    transfer_blob_id = worker.transfer_blob_ids[0]
+    assert transfer_blob_id in database.blobs
+    assert await store.read_bytes(transfer_blob_id, max_bytes=len(member_bytes)) == member_bytes
+    assert store.deleted_blob_ids == []
     derived_sha256 = hashlib.sha256(member_bytes).hexdigest()
     derived_associations = [
         item
@@ -592,7 +595,9 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
         UUID("6c3db404-61fe-4d1f-b1eb-638aa7b15b0a"),
         f"{SAMPLES_QUARANTINE_BUCKET}:{hashlib.sha256(failed_member).hexdigest()}",
     )
-    assert failed_quarantine_id not in database.blobs
+    assert failed_quarantine_id in database.blobs
+    assert database.blob_bytes[failed_quarantine_id] == failed_member
+    assert failed_quarantine_id not in failed_store.deleted_blob_ids
 
     analyzed = await dispatcher.dispatch(
         replace(context, idempotency_key="sample-analyze-derived"),

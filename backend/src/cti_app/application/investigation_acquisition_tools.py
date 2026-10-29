@@ -786,12 +786,9 @@ class ArchiveExtractMemberAdapter:
                 current_envelope = await uow.investigation_envelopes.get(parent.investigation_id)
             if transfer_blob is None or transfer_blob.descriptor.logical_bucket != transfer_bucket:
                 raise ValueError("worker transfer blob identity mismatch")
-            try:
-                member_bytes = await self._artifact_store.read_bytes(
-                    transfer_blob_id, max_bytes=LOCAL_ARCHIVE_MAX_MEMBER_BYTES
-                )
-            finally:
-                await self._artifact_store.delete_unreferenced(transfer_blob_id)
+            member_bytes = await self._artifact_store.read_bytes(
+                transfer_blob_id, max_bytes=LOCAL_ARCHIVE_MAX_MEMBER_BYTES
+            )
             member_sha256 = str(worker_result["member_sha256"])
             member_size = int(worker_result["member_size"])
             if (
@@ -982,13 +979,9 @@ class ArchiveExtractMemberAdapter:
                     )
                 await uow.commit()
         except (ValueError, RuntimeError) as exc:
-            if quarantine_blob_id is not None:
-                try:
-                    await self._artifact_store.delete_unreferenced(quarantine_blob_id)
-                except Exception:
-                    # A concurrent derivation may already reference the content; the
-                    # catalog refuses deletion while any canonical reference exists.
-                    pass
+            # Keep unlinked blobs for the generic orphan-GC path. A reference-count
+            # check followed by physical deletion can race with another ingestion of
+            # the same content-addressed object.
             return ToolResult(
                 ToolInvocationStatus.NEEDS_REVIEW,
                 message=f"Derived sample could not be linked safely ({type(exc).__name__}).",

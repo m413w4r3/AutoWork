@@ -469,7 +469,7 @@ def _parse_7z_listing(
         if block_index == 0:
             archive_type = fields.get("Type")
         name = fields.get("Path")
-        if not name or name == archive_basename:
+        if not name or (block_index == 0 and name == archive_basename):
             continue
         if "Size" not in fields and "Folder" not in fields:
             continue
