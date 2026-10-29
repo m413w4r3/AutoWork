@@ -1217,7 +1217,9 @@ class ResearchContextBuilder:
         # Every Bridge turn is an independent Temporary Chat. Include the newest
         # bounded evidence on every turn so the prompt remains self-contained.
         evidence_summary, evidence_restricted_observation_ids = await self._evidence_context(
-            tuple(reversed(observations)), sample_disclosure
+            tuple(reversed(observations)),
+            sample_disclosure,
+            known_restricted_observation_ids=restricted_sample_invocation_observation_ids,
         )
         restricted_sample_observation_ids = set(
             evidence_restricted_observation_ids | restricted_sample_invocation_observation_ids
@@ -2948,14 +2950,18 @@ class ResearchContextBuilder:
         self,
         observations: tuple[EvidenceObservation, ...],
         sample_disclosure: _SampleDisclosureIndex | None = None,
+        *,
+        known_restricted_observation_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[tuple[EvidenceSummaryV1, ...], frozenset[UUID]]:
         result = []
         restricted_observation_ids: set[UUID] = set()
         for observation in observations[:MAX_CONTEXT_EVIDENCE]:
-            if sample_disclosure is not None and _observation_references_sample_disclosure(
-                observation, sample_disclosure
+            if observation.id in known_restricted_observation_ids or (
+                sample_disclosure is not None
+                and _observation_references_sample_disclosure(observation, sample_disclosure)
             ):
                 restricted_observation_ids.add(observation.id)
+                result.append(_restricted_sample_evidence_summary(observation))
                 continue
             summary: Mapping[str, Any] | str | None = None
             if self._evidence_summaries is not None:
@@ -2976,6 +2982,7 @@ class ResearchContextBuilder:
                     for key, value in _sample_disclosure_references(summary)
                 ):
                     restricted_observation_ids.add(observation.id)
+                    result.append(_restricted_sample_evidence_summary(observation))
                     continue
             elif (
                 isinstance(summary, str)
@@ -2983,6 +2990,7 @@ class ResearchContextBuilder:
                 and sample_disclosure.contains_restricted_reference(summary)
             ):
                 restricted_observation_ids.add(observation.id)
+                result.append(_restricted_sample_evidence_summary(observation))
                 continue
             if isinstance(summary, Mapping):
                 if sample_disclosure is not None:
@@ -3503,7 +3511,6 @@ class ResearchContextBuilder:
             observation_ids = invocation.response_refs[-4:]
             if sample_restricted:
                 output_ids = {"restricted_sample": "restricted"}
-                observation_ids = ()
                 restricted_sample_observation_ids.update(invocation.response_refs[-4:])
             else:
                 output_ids = cast(dict[str, str], sample_disclosure.redact_ambiguous(output_ids))
@@ -3542,6 +3549,7 @@ class ResearchContextBuilder:
                     thaw_json(invocation.normalized_parameters)
                 )
             )
+            restricted_observation_id: UUID | None = None
             linked_observations = tuple(
                 observation_by_id[ref]
                 for ref in reversed(invocation.response_refs[-4:])
@@ -3555,6 +3563,7 @@ class ResearchContextBuilder:
                     candidate_observation, sample_disclosure
                 ):
                     restricted_sample = True
+                    restricted_observation_id = candidate_observation.id
                 else:
                     safe_observations.append(candidate_observation)
             if self._evidence_summaries is not None:
@@ -3565,24 +3574,34 @@ class ResearchContextBuilder:
                         for key, value in _sample_disclosure_references(candidate_facts)
                     ):
                         restricted_sample = True
+                        restricted_observation_id = candidate_observation.id
                         continue
                     if isinstance(
                         candidate_facts, str
                     ) and sample_disclosure.contains_restricted_reference(candidate_facts):
                         restricted_sample = True
+                        restricted_observation_id = candidate_observation.id
                         continue
                     if candidate_facts is not None and facts is None:
                         observation = candidate_observation
                         facts = sample_disclosure.redact_ambiguous(candidate_facts)
             if restricted_sample:
+                restricted_observation_id = restricted_observation_id or (
+                    observation.id if observation is not None else None
+                )
+                summary = (
+                    f"Observation {restricted_observation_id}: content restricted (sample policy)."
+                    if restricted_observation_id is not None
+                    else "Restricted sample evidence omitted."
+                )
                 entries.append(
                     ToolCoverageEntryV1(
                         invocation_id=invocation.id,
                         tool_name=_truncate(_safe_untrusted(invocation.tool_name), 128),
                         parameter_key="restricted_sample",
                         status=invocation.status,
-                        observation_id=None,
-                        summary="Restricted sample evidence omitted.",
+                        observation_id=restricted_observation_id,
+                        summary=summary,
                     )
                 )
                 continue
@@ -3972,6 +3991,16 @@ def _is_sample_hash_reference_key(key: str) -> bool:
     parts = key.casefold().split("_")
     return "sample" in parts and any(
         part in {"sha256", "sha256s", "hash", "hashes"} for part in parts
+    )
+
+
+def _restricted_sample_evidence_summary(
+    observation: EvidenceObservation,
+) -> EvidenceSummaryV1:
+    return EvidenceSummaryV1(
+        evidence_id=observation.id,
+        kind=observation.kind,
+        summary=f"Observation {observation.id}: content restricted (sample policy).",
     )
 
 
