@@ -1,3 +1,5 @@
+> **2026-10-29 — état courant et consignes : voir `docs/mission07/M07_HANDOFF_ORCH6.md` (fait autorité sur tout ce qui suit).**
+
 # Mission 07 — handoff / registre (orchestrateur)
 
 > **ÉTAT 2026-10-28 ~16:50 UTC — orchestrateur #5 (Sonnet 5.5 medium).** Cette section prime sur les suivantes.
