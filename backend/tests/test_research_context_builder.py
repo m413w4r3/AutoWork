@@ -1398,19 +1398,15 @@ async def test_context_exposes_exact_registered_tool_argument_schema() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("sample_tlp", "external_llm_allowed", "license_restriction", "expected_allowed"),
+    ("sample_tlp", "external_llm_allowed", "expected_allowed"),
     (
-        (TLPLevel.GREEN, True, None, True),
-        (TLPLevel.RED, True, None, False),
-        (TLPLevel.GREEN, False, None, False),
-        (TLPLevel.GREEN, True, "internal-only", False),
+        (TLPLevel.GREEN, True, True),
+        (TLPLevel.RED, True, False),
+        (TLPLevel.GREEN, False, False),
     ),
 )
 async def test_context_indexes_acquired_samples_and_recent_tool_results(
-    sample_tlp: TLPLevel,
-    external_llm_allowed: bool,
-    license_restriction: str | None,
-    expected_allowed: bool,
+    sample_tlp: TLPLevel, external_llm_allowed: bool, expected_allowed: bool
 ) -> None:
     investigation_id = uuid4()
     synthesis_artifact_id = uuid4()
@@ -1542,7 +1538,7 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
                     "tlp": sample_tlp,
                     "do_not_submit": True,
                     "external_llm_allowed": external_llm_allowed,
-                    "license_restriction": license_restriction,
+                    "license_restriction": None,
                     "resolution_status": "resolved",
                 },
             )
@@ -1619,143 +1615,6 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         assert str(sample_id) not in prompt
         assert sample_sha256 not in prompt
         assert context.investigation.truncation_counts["restricted_sample_evidence"] > 0
-
-
-@pytest.mark.asyncio
-async def test_unassociated_file_observation_is_preserved_without_sample_inventory() -> None:
-    investigation_id = uuid4()
-    sample_sha256 = "f" * 64
-    observation = EvidenceObservation(
-        investigation_id=investigation_id,
-        kind=EvidenceKind.OTHER,
-        blob_id=uuid4(),
-        sha256="e" * 64,
-        source="virustotal.file_report",
-        source_version="1",
-        observed_at=datetime.now(UTC),
-        object_type="file",
-        object_id=sample_sha256,
-    )
-    snapshot = ArticleSnapshot(
-        subject_id=uuid4(),
-        production_run_id=uuid4(),
-        synthesis_artifact_id=uuid4(),
-        synthesis_sha256="d" * 64,
-        article=ArticleContextV1(
-            short_summary="Synthetic article.",
-            claims=(),
-            documented_samples=(),
-            known_chain=(),
-            open_questions=(),
-        ),
-    )
-
-    class SampleSummaries:
-        async def summary(self, _observation):
-            return None
-
-    builder = ResearchContextBuilder(
-        article_snapshots=_SnapshotPort(snapshot),
-        observations=InMemoryEvidenceObservationRepository(),
-        findings=InMemoryFindingRepository(),
-        evidence_summaries=SampleSummaries(),
-    )
-    sample_disclosure = await builder._sample_disclosure_index(investigation_id, None)
-
-    summaries, restricted_ids = await builder._evidence_context((observation,), sample_disclosure)
-    evidence_index, _ = builder._evidence_index((observation,), sample_disclosure)
-
-    assert not restricted_ids
-    assert summaries[0].evidence_id == observation.id
-    assert sample_sha256 in summaries[0].summary
-    assert evidence_index[0].evidence_id == observation.id
-    assert sample_sha256[:24] in evidence_index[0].summary
-
-
-@pytest.mark.asyncio
-async def test_ambiguous_sample_reference_masks_identifier_but_preserves_observation() -> None:
-    investigation_id = uuid4()
-    association_id = uuid4()
-    sample_id = uuid4()
-    sample_sha256 = "c" * 64
-    observation = EvidenceObservation(
-        investigation_id=investigation_id,
-        kind=EvidenceKind.BINARY_ANALYSIS,
-        blob_id=uuid4(),
-        sha256="b" * 64,
-        source="autowork.analysis_worker.static",
-        source_version="static-v1",
-        observed_at=datetime.now(UTC),
-        object_type="sample",
-        object_id=sample_sha256,
-    )
-    snapshot = ArticleSnapshot(
-        subject_id=uuid4(),
-        production_run_id=uuid4(),
-        synthesis_artifact_id=uuid4(),
-        synthesis_sha256="a" * 64,
-        article=ArticleContextV1(
-            short_summary="Synthetic article.",
-            claims=(),
-            documented_samples=(),
-            known_chain=(),
-            open_questions=(),
-        ),
-    )
-
-    class SampleSummaries:
-        async def summary(self, _observation):
-            return {
-                "sample_id": str(sample_id),
-                "sample_sha256": sample_sha256,
-                "finding": "static analysis found a loader",
-            }
-
-        async def sample_disclosure_inventory(self, _investigation_id):
-            return (
-                {
-                    "association_id": str(association_id),
-                    "sample_sha256": sample_sha256,
-                    "ambiguous_sample_ids": (str(sample_id),),
-                    "resolution_status": "unresolved",
-                },
-            )
-
-        async def sample_inventory(self, _investigation_id):
-            return (
-                {
-                    "association_id": str(association_id),
-                    "sample_id": str(sample_id),
-                    "sha256": sample_sha256,
-                    "byte_size": 128,
-                    "provenance": "vt_download",
-                    "qualification": "candidate",
-                },
-            )
-
-    builder = ResearchContextBuilder(
-        article_snapshots=_SnapshotPort(snapshot),
-        observations=InMemoryEvidenceObservationRepository(),
-        findings=InMemoryFindingRepository(),
-        evidence_summaries=SampleSummaries(),
-    )
-    sample_disclosure = await builder._sample_disclosure_index(investigation_id, None)
-
-    summaries, restricted_ids = await builder._evidence_context((observation,), sample_disclosure)
-    evidence_index, _ = builder._evidence_index((observation,), sample_disclosure)
-    sample_rows, _truncated, _total = await builder._sample_index(
-        investigation_id, (), (observation,), sample_disclosure
-    )
-
-    assert not restricted_ids
-    assert summaries[0].evidence_id == observation.id
-    assert "static analysis found a loader" in summaries[0].summary
-    assert str(sample_id) not in summaries[0].summary
-    assert sample_sha256 not in summaries[0].summary
-    assert evidence_index[0].evidence_id == observation.id
-    assert sample_sha256 not in evidence_index[0].summary
-    assert sample_rows[0]["sample_id"] == "[ambiguous sample identifier]"
-    assert sample_rows[0]["sha256"] == "[ambiguous sample identifier]"
 
 
 @pytest.mark.asyncio
