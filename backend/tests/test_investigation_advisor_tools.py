@@ -2971,11 +2971,12 @@ async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest
     assert "mime_type=application/x-synthetic-sample" in prompt
     assert "encoding=base64" in prompt
     assert "offset=0" in prompt
-    assert "length=10240" in prompt
+    assert "length=4096" in prompt
     assert "byte_length=10240" in prompt
-    assert "omitted_range=" not in prompt
-    full_sample = base64.b64encode(sample_content).decode("ascii")
-    assert full_sample in prompt
+    assert "omitted_range=[4096,10240)" in prompt
+    fragment = base64.b64encode(sample_content[:4096]).decode("ascii")
+    assert fragment in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
     advisor_observation = next(
         item
         for item in tool._observations.observations.values()
@@ -3040,8 +3041,8 @@ async def test_osint_policy_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "do_not_submit" not in prompt
-    assert "length=10240" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "length=4096" in prompt
+    assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
     advisor_observation = next(
         item
         for item in tool._observations.observations.values()
@@ -3138,8 +3139,9 @@ async def test_human_g2_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "do_not_submit" not in prompt
-    assert "length=10240" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "length=4096" in prompt
+    assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
 
 
 @pytest.mark.asyncio

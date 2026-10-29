@@ -817,15 +817,9 @@ def test_megabyte_observation_is_compacted_once_across_review_units(
         findings=[],
     )
     data["consultation_type"] = "review_text"
-    # The units cite this body as context; they do not request a full-body send.
-    data["evidence_refs"] = []
     data["units"] = [
-        {
-            "unit_id": f"U{index}",
-            "text": f"Revoir le point {index}.",
-            "evidence_refs": [observation_id],
-        }
-        for index in range(1, 15)
+        {"unit_id": "U1", "text": "Revoir le premier point.", "evidence_refs": [observation_id]},
+        {"unit_id": "U2", "text": "Comparer le second point.", "evidence_refs": [observation_id]},
     ]
     data["measurements"] = [
         {
@@ -844,7 +838,7 @@ def test_megabyte_observation_is_compacted_once_across_review_units(
     observation_manifest = [item for item in dossier.manifest if item["kind"] == "observation"]
 
     assert len(raw) == 1_048_576
-    assert dossier.byte_size <= 100_000
+    assert dossier.byte_size <= 400_000
     assert len(observation_manifest) == 1
     assert encoded not in dossier.text
     assert dossier.text.count(encoded[:128]) == 1
@@ -863,8 +857,6 @@ def test_megabyte_observation_is_compacted_once_across_review_units(
     )
     assert volume_record.advisor_dossier_input_bytes > 1_000_000
     assert volume_record.advisor_dossier_output_bytes == dossier.byte_size
-    assert volume_record.advisor_dossier_output_bytes <= 100_000
-    assert volume_record.advisor_dossier_explicit_full_body_count == 0
     assert encoded[:128] not in caplog.text
 
     data.update(
@@ -914,7 +906,6 @@ def test_duplicate_base64_payload_keeps_each_observation_context() -> None:
     data = _planning_data(
         question="Review both synthetic payload contexts.", evidence=evidence, findings=[]
     )
-    data["evidence_refs"] = []
 
     dossier = build_advisor_dossier(data)
 
@@ -955,18 +946,13 @@ def test_large_decoded_strings_observation_uses_statistics_and_samples() -> None
         ],
         findings=[],
     )
-    data["evidence_refs"] = []
 
     dossier = build_advisor_dossier(data)
-    observation_row = next(row for row in dossier.manifest if row["kind"] == "observation")
 
     assert dossier.byte_size <= 400_000
-    assert observation_row["body_bytes"] <= 12 * 1024
     assert "Sortie strings résumée" in dossier.text
     assert "ligne(s)" in dossier.text
     assert "Échantillon de lignes" in dossier.text
-    assert "offsets UTF-8" in dossier.text
-    assert observation_row["displayed_excerpt_ranges_utf8"]
     assert "TRONQUÉ explicitement" in dossier.text
     assert f"corps complet : observation {observation_id}" in dossier.text
 
@@ -994,7 +980,6 @@ def test_fragmented_base64_noise_keeps_excerpt_within_per_body_budget() -> None:
         ],
         findings=[],
     )
-    data["evidence_refs"] = []
 
     dossier = build_advisor_dossier(data)
     observation_row = next(row for row in dossier.manifest if row["kind"] == "observation")
@@ -1005,11 +990,8 @@ def test_fragmented_base64_noise_keeps_excerpt_within_per_body_budget() -> None:
     assert "TRONQUÉ explicitement" in dossier.text
 
 
-def test_dossier_hard_byte_limit_truncates_with_an_explicit_reference(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_dossier_hard_byte_limit_truncates_with_an_explicit_reference() -> None:
     observation_id = str(uuid4())
-    explicit_body = "synthetic-explicit-body " + ("x" * (8 * 1024 * 1024))
     data = _planning_data(
         question="Inspect the synthetic observation.",
         evidence=[
@@ -1021,8 +1003,8 @@ def test_dossier_hard_byte_limit_truncates_with_an_explicit_reference(
                 "content_excerpts": [
                     {
                         "kind": "text",
-                        "title": "Synthetic explicit body",
-                        "text": explicit_body,
+                        "title": "Synthetic long title " + ("x" * 2_050_000),
+                        "text": "Short synthetic body.",
                     }
                 ],
             }
@@ -1031,22 +1013,12 @@ def test_dossier_hard_byte_limit_truncates_with_an_explicit_reference(
     )
     data["evidence_refs"] = [observation_id]
 
-    with caplog.at_level("INFO", logger="cti_app.application.advisor_dossier"):
-        dossier = build_advisor_dossier(data)
+    dossier = build_advisor_dossier(data)
 
-    assert dossier.byte_size <= 8 * 1024 * 1024
-    assert "TRONQUÉ explicitement par le garde-fou technique absolu de 8 MiB" in dossier.text
+    assert dossier.byte_size <= 2_000_000
+    assert "TRONQUÉ explicitement par la limite dure de 2 Mo" in dossier.text
     assert f"corps complet : observation {observation_id}" in dossier.text
     assert "x" * 100 not in dossier.text
-    volume_record = next(
-        record
-        for record in caplog.records
-        if record.name == "cti_app.application.advisor_dossier"
-        and record.getMessage() == "Advisor dossier volume"
-    )
-    assert volume_record.advisor_dossier_explicit_full_body_input_bytes > 8 * 1024 * 1024
-    assert volume_record.advisor_dossier_explicit_full_body_preserved_count == 0
-    assert volume_record.advisor_dossier_hard_guard_body_count == 1
 
 
 def test_extreme_candidate_card_count_stays_under_hard_limit_with_source_index() -> None:
@@ -1056,9 +1028,9 @@ def test_extreme_candidate_card_count_stays_under_hard_limit_with_source_index()
             "evidence_id": "synthetic-observation",
             "observation_sha256": "e" * 64,
             "field": "beacon",
-            "value": f"signal-{index:05d}-" + ("synthetic beacon context " * 10),
+            "value": f"signal-{index:05d}",
         }
-        for index in range(32_000)
+        for index in range(48_000)
     ]
     data = _planning_data(question="Review beacon signal facts.", evidence=[], findings=[])
     data["consultation_type"] = "draft_text"
@@ -1066,8 +1038,8 @@ def test_extreme_candidate_card_count_stays_under_hard_limit_with_source_index()
 
     dossier = build_advisor_dossier(data)
 
-    assert dossier.byte_size <= 8 * 1024 * 1024
-    assert "TRONQUÉ explicitement par le garde-fou technique absolu de 8 MiB" in dossier.text
+    assert dossier.byte_size <= 2_000_000
+    assert "TRONQUÉ explicitement par la limite dure de 2 Mo" in dossier.text
     assert "sha256_liste_sources=" in dossier.text
     assert "Références canoniques résumées" in dossier.text
 

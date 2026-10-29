@@ -39,7 +39,7 @@ _STOP = frozenset(
     "ses from that this those have with which what where when then than into over under".split()
 )
 _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES = 400_000
-_ADVISOR_DOSSIER_HARD_LIMIT_BYTES = 8 * 1024 * 1024
+_ADVISOR_DOSSIER_HARD_LIMIT_BYTES = 2_000_000
 _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES = 12 * 1024
 _BASE64_RUN = re.compile(r"[A-Za-z0-9+/]{64,}={0,2}")
 logger = logging.getLogger(__name__)
@@ -652,13 +652,6 @@ def build_advisor_dossier(
     explicit_claims = _requested_claim_ids(prompt_data, relevance_text)
     contradiction_requested = _contradiction_is_requested(prompt_data, relevance_text)
     explicitly_referenced = set(_explicit_reference_ids(prompt_data))
-    # Top-level evidence_refs come from the operator's direct tool arguments;
-    # refs carried only by units/assertions are citation context, not full-body requests.
-    explicitly_requested_bodies = {
-        identifier
-        for identifier in prompt_data.get("evidence_refs", ())
-        if isinstance(identifier, str) and identifier
-    }
     unavailable_observations: set[str] = set()
     candidates: list[dict[str, Any]] = []
 
@@ -1464,23 +1457,6 @@ def build_advisor_dossier(
         elif kind == "observation":
             unavailable_observations.add(identifier)
 
-    for item in selected:
-        extra = item.get("extra")
-        if item.get("kind") == "observation" and item.get("id") in explicitly_requested_bodies:
-            item["_explicit_full_body"] = True
-        elif (
-            item.get("kind") == "article"
-            and isinstance(extra, Mapping)
-            and _as_text(extra.get("claim_id")).casefold() in explicit_claims
-        ):
-            item["_explicit_full_body"] = True
-        elif (
-            item.get("kind") == "sample"
-            and isinstance(extra, Mapping)
-            and bool(set(extra.get("evidence_ids", ())) & explicitly_requested_bodies)
-        ):
-            item["_explicit_full_body"] = True
-
     dossier = _render_advisor_dossier(
         selected,
         unavailable_observations=unavailable_observations,
@@ -1492,37 +1468,29 @@ def build_advisor_dossier(
     compacted_body_count = 0
     reference_only_body_count = 0
     hard_omitted_count = 0
-    hard_guard_body_count = 0
-    explicit_body_count = sum(bool(item.get("_explicit_full_body")) for item in selected)
-    explicit_body_input_bytes = sum(
-        len(_as_text(item.get("body")).encode("utf-8"))
-        for item in selected
-        if item.get("_explicit_full_body")
-    )
 
-    # Always deduplicate repeated bodies. This pass bounds large automatic
-    # observation bodies while preserving complete explicitly requested bodies.
-    selected = _compact_advisor_candidates(selected, only_large_observation_bodies=True)
-    dossier = _render_advisor_dossier(
-        selected,
-        unavailable_observations=unavailable_observations,
-        contradiction_requested=contradiction_requested,
-        explicit_claims=explicit_claims,
-        prompt_data=prompt_data,
-    )
-    compacted_body_count = sum(
-        bool(item.get("_compaction", {}).get("body_truncated")) for item in selected
-    )
-    reference_only_body_count = sum(
-        bool(item.get("_compaction", {}).get("reference_only")) for item in selected
-    )
+    if initial_dossier_bytes <= _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES and any(
+        item.get("kind") in {"observation", "measurement"}
+        and len(_as_text(item.get("body")).encode("utf-8")) > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES
+        for item in selected
+    ):
+        selected = _compact_advisor_candidates(selected, only_large_observation_bodies=True)
+        dossier = _render_advisor_dossier(
+            selected,
+            unavailable_observations=unavailable_observations,
+            contradiction_requested=contradiction_requested,
+            explicit_claims=explicit_claims,
+            prompt_data=prompt_data,
+        )
+        compacted_body_count = sum(
+            bool(item.get("_compaction", {}).get("body_truncated")) for item in selected
+        )
 
     if initial_dossier_bytes > _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES:
         selected = _compact_advisor_candidates(selected)
         volume_note = (
-            "Compaction volumétrique automatique: "
-            f"taille initiale={initial_dossier_bytes} octets; les corps automatiques volumineux "
-            "sont présentés avec un extrait borné, un SHA-256 et leur référence complète."
+            "TRONQUÉ explicitement par la limite volumétrique du dossier: "
+            f"taille initiale={initial_dossier_bytes} octets; contenu et références conservés."
         )
         dossier = _render_advisor_dossier(
             selected,
@@ -1535,13 +1503,53 @@ def build_advisor_dossier(
         compacted_body_count = sum(
             bool(item.get("_compaction", {}).get("body_truncated")) for item in selected
         )
-        reference_only_body_count = sum(
-            bool(item.get("_compaction", {}).get("reference_only")) for item in selected
+
+        estimated_bytes = dossier.byte_size
+        reference_candidates = sorted(
+            (
+                item
+                for item in selected
+                if not item.get("_compaction", {}).get("body_reused_from_alias")
+            ),
+            key=lambda item: len(_advisor_candidate_piece(item).encode("utf-8")),
+            reverse=True,
         )
+        for item in reference_candidates:
+            if estimated_bytes <= _ADVISOR_DOSSIER_SOFT_LIMIT_BYTES - 1_024:
+                break
+            previous_size = len(_advisor_candidate_piece(item).encode("utf-8"))
+            previous_meta = dict(item.get("_compaction", {}))
+            referenced_body, reference_meta = _reference_advisor_body(
+                item, alias=None, reason="limite souple de 400 Ko"
+            )
+            reference_size = len(
+                _advisor_candidate_piece({**item, "body": referenced_body}).encode("utf-8")
+            )
+            if reference_size >= previous_size:
+                continue
+            item["body"] = referenced_body
+            _carry_advisor_compaction_provenance(reference_meta, previous_meta)
+            item["_compaction"] = reference_meta
+            estimated_bytes -= previous_size - reference_size
+            reference_only_body_count += 1
+        if reference_only_body_count:
+            volume_note = (
+                "TRONQUÉ explicitement par la limite volumétrique du dossier: "
+                f"taille initiale={initial_dossier_bytes} octets; "
+                f"{reference_only_body_count} corps remplacé(s) par des références."
+            )
+            dossier = _render_advisor_dossier(
+                selected,
+                unavailable_observations=unavailable_observations,
+                contradiction_requested=contradiction_requested,
+                explicit_claims=explicit_claims,
+                prompt_data=prompt_data,
+                volume_note=volume_note,
+            )
 
         while dossier.byte_size > _ADVISOR_DOSSIER_HARD_LIMIT_BYTES:
             changed = False
-            for item in sorted(selected, key=lambda row: bool(row.get("_explicit_full_body"))):
+            for item in selected:
                 if (
                     item.get("_hard_reference_only")
                     or item.get("_compaction", {}).get("reference_only")
@@ -1550,7 +1558,7 @@ def build_advisor_dossier(
                     continue
                 previous_meta = dict(item.get("_compaction", {}))
                 referenced_body, reference_meta = _reference_advisor_body(
-                    item, alias=None, reason="garde-fou technique absolu de 8 MiB"
+                    item, alias=None, reason="limite dure de 2 Mo"
                 )
                 if len(referenced_body.encode("utf-8")) >= len(
                     _as_text(item.get("body")).encode("utf-8")
@@ -1561,7 +1569,6 @@ def build_advisor_dossier(
                 item["_compaction"] = reference_meta
                 item["_hard_reference_only"] = True
                 reference_only_body_count += 1
-                hard_guard_body_count += 1
                 changed = True
             if not changed:
                 # Extremely high card counts are bounded by shortening labels;
@@ -1574,7 +1581,7 @@ def build_advisor_dossier(
                 if not changed:
                     break
             volume_note = (
-                "TRONQUÉ explicitement par le garde-fou technique absolu de 8 MiB: "
+                "TRONQUÉ explicitement par la limite dure de 2 Mo: "
                 f"taille initiale={initial_dossier_bytes} octets; "
                 f"{reference_only_body_count} corps remplacé(s) par des références."
             )
@@ -1599,11 +1606,6 @@ def build_advisor_dossier(
                 required_references=explicitly_referenced,
             )
 
-    explicit_body_preserved_count = sum(
-        bool(item.get("_explicit_full_body"))
-        and not item.get("_compaction", {}).get("body_truncated")
-        for item in selected
-    )
     logger.info(
         "Advisor dossier volume",
         extra={
@@ -1613,11 +1615,6 @@ def build_advisor_dossier(
             "advisor_dossier_compacted_body_count": compacted_body_count,
             "advisor_dossier_reference_only_body_count": reference_only_body_count,
             "advisor_dossier_hard_omitted_candidate_count": hard_omitted_count,
-            "advisor_dossier_hard_limit_bytes": _ADVISOR_DOSSIER_HARD_LIMIT_BYTES,
-            "advisor_dossier_hard_guard_body_count": hard_guard_body_count,
-            "advisor_dossier_explicit_full_body_count": explicit_body_count,
-            "advisor_dossier_explicit_full_body_preserved_count": explicit_body_preserved_count,
-            "advisor_dossier_explicit_full_body_input_bytes": explicit_body_input_bytes,
             "advisor_dossier_hard_limit_reached": (
                 dossier.byte_size >= _ADVISOR_DOSSIER_HARD_LIMIT_BYTES
             ),
@@ -2713,27 +2710,13 @@ def _compact_advisor_body(
                 line_count - 1,
             }
             samples: list[str] = []
-            sampled_ranges: list[list[int]] = []
             position = 0
-            previous_end = 0
-            byte_cursor = 0
             for match in re.finditer(r"[^\n]+", body):
-                byte_cursor += len(body[previous_end : match.start()].encode("utf-8"))
-                line_start = byte_cursor
-                line_end = line_start + len(match.group().encode("utf-8"))
                 line = match.group().strip().removeprefix("|").strip()
                 if line:
                     if position in indices:
-                        sample = _clip_utf8(line, min(384, max_bytes // 32))
-                        sample_bytes = len(sample.encode("utf-8"))
-                        samples.append(
-                            f"- ligne {position + 1}, offsets UTF-8 "
-                            f"{line_start}..{line_start + sample_bytes}: {sample}"
-                        )
-                        sampled_ranges.append([line_start, line_start + sample_bytes])
+                        samples.append(_clip_utf8(line, min(384, max_bytes // 32)))
                     position += 1
-                byte_cursor = line_end
-                previous_end = match.end()
             distinct = (
                 f">={len(unique_line_digests)}"
                 if unique_count_capped
@@ -2745,7 +2728,7 @@ def _compact_advisor_body(
                     f"{len(encoded)} octets UTF-8, ligne maximale={longest_line} octets; "
                     f"sha256_corps={body_sha256}.",
                     "Échantillon de lignes (positions réparties):",
-                    *samples,
+                    *(f"- {sample}" for sample in samples),
                     marker,
                 )
             )
@@ -2753,7 +2736,7 @@ def _compact_advisor_body(
                 "body_truncated": True,
                 "source_body_sha256": body_sha256,
                 "source_body_bytes": len(encoded),
-                "displayed_excerpt_ranges_utf8": sampled_ranges,
+                "displayed_excerpt_ranges_utf8": [],
                 "full_body_ref": source_ref,
                 "sampled_line_count": len(samples),
                 "unique_line_count": distinct,
@@ -2800,6 +2783,11 @@ def _reference_advisor_body(
         "full_body_ref": source_ref,
         **({"body_reused_from_alias": alias} if alias else {}),
     }
+
+
+def _advisor_candidate_piece(item: Mapping[str, Any]) -> str:
+    alias = _as_text(item.get("_alias")) or "E"
+    return f"[{alias}] {_as_text(item.get('label'))}\n{_quote(_as_text(item.get('body')))}"
 
 
 def _carry_advisor_compaction_provenance(
@@ -2900,7 +2888,7 @@ def _advisor_hard_limit_note(
         included += 1
     omitted_from_index = len(ref_lines) - included
     note = (
-        "TRONQUÉ explicitement par le garde-fou technique absolu de 8 MiB: "
+        "TRONQUÉ explicitement par la limite dure de 2 Mo: "
         f"taille initiale={initial_bytes} octets; {len(omitted)} carte(s) résumée(s) "
         f"dans l'index des sources ci-dessous; sha256_liste_sources={digest}."
     )
@@ -2993,7 +2981,7 @@ def _trim_advisor_dossier_to_limit(
         best_indices = set()
         best_omitted = list(selected)
         note = (
-            "TRONQUÉ explicitement par le garde-fou technique absolu de 8 MiB: "
+            "TRONQUÉ explicitement par la limite dure de 2 Mo: "
             f"taille initiale={initial_bytes} octets; toutes les cartes sont représentées "
             "par un index de références borné et une empreinte de la liste complète."
         )
@@ -3029,13 +3017,20 @@ def _advisor_candidate_aliases(selected: Sequence[Mapping[str, Any]]) -> list[st
 def _compact_advisor_candidates(
     selected: Sequence[dict[str, Any]], *, only_large_observation_bodies: bool = False
 ) -> list[dict[str, Any]]:
-    """Deduplicate repeated bodies, then cap automatic displayed content."""
+    """Deduplicate repeated observation content, then cap each displayed body."""
     grouped: list[dict[str, Any]] = []
     observation_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
     for original in selected:
         item = dict(original)
         item["extra"] = dict(item.get("extra", {}))
-        item["_compact_eligible"] = not item.get("_compaction")
+        item["_compact_eligible"] = not item.get("_compaction") and (
+            not only_large_observation_bodies
+            or (
+                item.get("kind") in {"observation", "measurement"}
+                and len(_as_text(item.get("body")).encode("utf-8"))
+                > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES
+            )
+        )
         if not item["_compact_eligible"]:
             grouped.append(item)
             continue
@@ -3046,9 +3041,6 @@ def _compact_advisor_candidates(
                 if item["body"] != existing["body"]:
                     existing["body"] = f"{existing['body']}\n\n{item['body']}"
                 existing["score"] = max(existing["score"], item["score"])
-                existing["_explicit_full_body"] = bool(
-                    existing.get("_explicit_full_body") or item.get("_explicit_full_body")
-                )
                 continue
             observation_by_identity[key] = item
         grouped.append(item)
@@ -3058,7 +3050,6 @@ def _compact_advisor_candidates(
         for _index, item in sorted(
             enumerate(grouped),
             key=lambda pair: (
-                0 if pair[1].get("_explicit_full_body") else 1,
                 -pair[1]["score"],
                 0 if pair[1].get("kind") == "observation" else 1,
                 pair[0],
@@ -3115,13 +3106,7 @@ def _compact_advisor_candidates(
                 max_bytes=_ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES,
             )
             continue
-        should_compact_body = not item.get("_explicit_full_body") and (
-            not only_large_observation_bodies or item.get("kind") in {"observation", "measurement"}
-        )
-        if (
-            should_compact_body
-            and len(original_body.encode("utf-8")) > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES
-        ):
+        if len(original_body.encode("utf-8")) > _ADVISOR_DOSSIER_EXCERPT_LIMIT_BYTES:
             item["body"], item["_compaction"] = _compact_advisor_body(
                 item,
                 original_body,
@@ -3157,7 +3142,6 @@ def _render_advisor_dossier(
             "sha256": item["sha256"],
             "label": item["label"],
             "origin": item["origin"],
-            **({"explicit_full_body_requested": True} if item.get("_explicit_full_body") else {}),
             **({"opinion_version": item["opinion_version"]} if item.get("opinion_version") else {}),
             **item.get("extra", {}),
             "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
