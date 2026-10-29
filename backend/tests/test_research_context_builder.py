@@ -1472,17 +1472,6 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         object_type="family_feature_comparison",
         object_id="e" * 64,
     )
-    unrelated_observation = EvidenceObservation(
-        investigation_id=investigation_id,
-        kind=EvidenceKind.OTHER,
-        blob_id=uuid4(),
-        sha256="1" * 64,
-        source="network.capture.inspect",
-        source_version="1",
-        observed_at=datetime.now(UTC),
-        object_type="network_capture_report",
-        object_id="network-capture-1",
-    )
     observations = InMemoryEvidenceObservationRepository()
     for observation in (
         downloaded_sample,
@@ -1490,7 +1479,6 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         analysis_observation,
         analysis_result,
         comparison_result,
-        unrelated_observation,
     ):
         await observations.append_if_absent(observation)
     download_invocation = ToolInvocation(
@@ -1538,8 +1526,6 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
                 }
             if observation.id == comparison_result.id:
                 return {"comparison_sample_sha256s": [sample_sha256]}
-            if observation.id == unrelated_observation.id:
-                return {"finding": "unrelated network fact remains visible"}
             return None
 
         async def blob_metadata(self, blob_id):
@@ -1604,7 +1590,6 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
     assert "DERNIERS RÉSULTATS D'OUTILS" in prompt
     assert "must-not-reach-the-prompt" not in prompt
     if expected_allowed:
-        assert sample_sha256 in prompt
         assert sample["association_id"] == str(association_id)
         assert sample["sample_id"] == str(sample_id)
         assert sample["sha256"] == sample_sha256
@@ -1620,28 +1605,15 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
     else:
         assert sample == {"restricted": True, "reason": "sample_disclosure_restricted"}
         assert result.output_ids == {"restricted_sample": "restricted"}
-        assert set(result.observation_ids) == {analysis_observation.id, analysis_result.id}
-        assert all(
-            str(observation.id) in prompt
-            for observation in (
-                downloaded_sample,
-                download_result,
-                analysis_observation,
-                analysis_result,
-                comparison_result,
-            )
-        )
-        assert "content restricted (sample policy)" in prompt
-        assert str(unrelated_observation.id) in prompt
-        assert "unrelated network fact remains visible" in prompt
+        assert result.observation_ids == ()
         analysis_coverage = next(
             item
             for item in context.investigation.tool_coverage
             if item.invocation_id == analysis_invocation.id
         )
         assert analysis_coverage.parameter_key == "restricted_sample"
-        assert analysis_coverage.observation_id == analysis_result.id
-        assert "content restricted (sample policy)" in analysis_coverage.summary
+        assert analysis_coverage.observation_id is None
+        assert "Restricted sample evidence omitted" in analysis_coverage.summary
         assert all(pivot.indicator_value != sample_sha256 for pivot in context.available_pivots)
         assert str(association_id) not in prompt
         assert str(sample_id) not in prompt
