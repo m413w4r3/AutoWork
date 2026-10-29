@@ -23,6 +23,7 @@ from cti_app.application.virustotal import (
     VirusTotalRouteStep,
     VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
+    current_virustotal_external_effect_authority,
     virustotal_external_effect_scope,
 )
 from cti_app.config import Settings
@@ -569,18 +570,54 @@ async def test_passive_read_transport_retry_uses_a_fresh_coordinator_claim() -> 
         return httpx.Response(200, content=body, request=request)
 
     value, client = adapter(handler)
+    authority = current_virustotal_external_effect_authority()
+    assert authority is not None
     try:
         result = await value.file_report(SHA256)
     finally:
         await client.aclose()
 
-    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    store = cast(Any, value)._test_external_effect_store
+    claims = tuple(store.claims.values())
     assert result.raw_json == body
     assert calls == 2
     assert len(claims) == 2
     assert [claim.state.value for claim in claims].count("NEEDS_REVIEW") == 1
     assert [claim.state.value for claim in claims].count("COMPLETED") == 1
-    assert cast(Any, value)._test_external_effect_store.invocation_review_marks == [False]
+    # Each physical attempt uses one claim under the same operator operation
+    # key; a fresh effect occurrence gives the retry its own claim.
+    assert store.consumed_operation_keys == [authority.operation_key] * 2
+    assert {claim.invocation_id for claim in claims} == {authority.invocation_id}
+    assert len({claim.effect_key for claim in claims}) == 2
+    assert store.invocation_review_marks == [False]
+
+
+@pytest.mark.asyncio
+async def test_successful_passive_file_report_creates_exactly_one_claim() -> None:
+    body = json.dumps({"data": {"id": SHA256.lower(), "type": "file", "attributes": {}}}).encode()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=body, request=request)
+
+    value, client = adapter(handler)
+    authority = current_virustotal_external_effect_authority()
+    assert authority is not None
+    try:
+        result = await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+
+    store = cast(Any, value)._test_external_effect_store
+    claims = tuple(store.claims.values())
+    assert result.raw_json == body
+    assert calls == 1
+    assert len(claims) == 1
+    assert claims[0].state.value == "COMPLETED"
+    assert claims[0].invocation_id == authority.invocation_id
+    assert store.consumed_operation_keys == [authority.operation_key]
 
 
 @pytest.mark.asyncio

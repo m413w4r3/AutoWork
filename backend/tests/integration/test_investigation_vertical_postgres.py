@@ -1384,6 +1384,10 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 if item.tool_name == "vt.file_report"
                 and item.normalized_parameters.get("file_hash") == candidate_hash
             )
+            arbitrary_report_retry_invocation_id = UUID(arbitrary_report_retry["invocation"]["id"])
+            arbitrary_report_retry_invocation = next(
+                item for item in invocations if item.id == arbitrary_report_retry_invocation_id
+            )
             pivot_invocation = invocations_by_name["vt.intelligence_search"]
             download_invocation = invocations_by_name["vt.download_sample"]
             analysis_invocation = invocations_by_name["sample.analyze"]
@@ -1586,13 +1590,52 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     "advisor.consultation.v1",
                 }
             }
+            # The first candidate report times out on both bounded attempts.
+            # The explicit follow-up invocation succeeds, as does the
+            # separate seed report, so all four real sends retain claims.
             assert family_counts == {
-                "vt.file_report": 2,
+                "vt.file_report": 4,
                 "vt.intelligence_search": 1,
                 "vt.download_sample": 3,
                 "advisor.consultation.v1": 1,
             }
-            assert all(item.state == "COMPLETED" for item in claims)
+            report_claims = tuple(item for item in claims if item.family == "vt.file_report")
+            first_report_claims = tuple(
+                item for item in report_claims if item.invocation_id == first_read_invocation_id
+            )
+            retry_report_claims = tuple(
+                item
+                for item in report_claims
+                if item.invocation_id == arbitrary_report_retry_invocation_id
+            )
+            seed_report_claims = tuple(
+                item for item in report_claims if item.invocation_id == report_invocation.id
+            )
+            assert len(first_report_claims) == 2
+            assert {item.operation_key for item in first_report_claims} == {
+                first_read_invocation.operation_key
+            }
+            assert len(retry_report_claims) == len(seed_report_claims) == 1
+            assert (
+                retry_report_claims[0].operation_key
+                == arbitrary_report_retry_invocation.operation_key
+            )
+            assert seed_report_claims[0].operation_key == report_invocation.operation_key
+            assert (
+                len(
+                    {
+                        first_read_invocation.operation_key,
+                        arbitrary_report_retry_invocation.operation_key,
+                        report_invocation.operation_key,
+                    }
+                )
+                == 3
+            )
+            assert sum(item.state == "NEEDS_REVIEW" for item in report_claims) == 2
+            assert sum(item.state == "COMPLETED" for item in report_claims) == 2
+            assert all(
+                item.state == "COMPLETED" for item in claims if item.family != "vt.file_report"
+            )
             assert len(uses) == len(claims)
             assert all(item.use_kind == "SENT" for item in uses)
             assert {item.claim_id for item in uses} == {item.id for item in claims}
