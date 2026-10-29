@@ -1595,8 +1595,10 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     final_normalized = final_pdf_text.casefold().replace(chr(0x2019), "'")
     assert "avis de l'analyste" in final_normalized
     assert "retouche w18 v3" in final_normalized
-    assert sample_material.seed_hash in final_pdf_text
-    assert sample_material.sample_hash in final_pdf_text
+    # Long hashes in prose may wrap across lines; compare the full value without layout whitespace.
+    final_compact = "".join(final_pdf_text.split())
+    assert sample_material.seed_hash in final_compact
+    assert sample_material.sample_hash in final_compact
     assert sample_material.ip in final_pdf_text
     assert any(
         item["source"] == "synthetic-entry-article-v5"
