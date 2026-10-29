@@ -29,6 +29,7 @@ from cti_app.application.investigation_acquisition import (
     HitAcquisitionError,
     HitAcquisitionResult,
     HitAcquisitionService,
+    HitNotFoundError,
     sample_association_id,
 )
 from cti_app.application.investigation_governance import (
@@ -679,11 +680,22 @@ class ArchiveExtractMemberAdapter:
 
         try:
             parent_association_id = UUID(str(arguments["association_id"]))
+            await self._hits.require_association(context.investigation_id, parent_association_id)
             parent = await self._hits.resolve_quarantined_sample(parent_association_id)
+            if parent.investigation_id != context.investigation_id:
+                raise HitNotFoundError("Sample association does not belong to this investigation")
             member_path = str(arguments["member_path"])
             reason = str(arguments["reason"]).strip()
             if not reason:
                 raise ValueError("reason must not be empty")
+        except HitNotFoundError:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                message="The sample association is not available in the current investigation.",
+                exception_class="HitNotFoundError",
+                error_code="archive_extract_member_association_not_in_investigation",
+                budget_consumed=consumed(),
+            )
         except (ValueError, HitAcquisitionError) as exc:
             return ToolResult(
                 ToolInvocationStatus.FAILED,
@@ -714,7 +726,16 @@ class ArchiveExtractMemberAdapter:
             sample_id=parent.sample_id,
             analysis_parameters=parameters,
         )
-        result = await self._execution.execute(request)
+        try:
+            result = await self._execution.execute(request)
+        except Exception as exc:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                message=f"Confined archive extraction failed ({type(exc).__name__}).",
+                exception_class=type(exc).__name__,
+                error_code=getattr(exc, "code", None) or "tool_execution_failed",
+                budget_consumed=consumed(),
+            )
         if result.status is not ToolInvocationStatus.SUCCEEDED or result.payload is None:
             return ToolResult(
                 result.status,
@@ -810,7 +831,11 @@ class ArchiveExtractMemberAdapter:
                     else None
                 )
                 quarantine_blob = await uow.blobs.get(quarantine_blob_id)
-                current_envelope = await uow.investigation_envelopes.get(parent.investigation_id)
+                current_envelope = (
+                    await uow.investigation_envelopes.get_for_update(parent.investigation_id)
+                    if context.envelope is not None
+                    else await uow.investigation_envelopes.get(parent.investigation_id)
+                )
                 if (
                     investigation is None
                     or parent_association is None
@@ -937,7 +962,7 @@ class ArchiveExtractMemberAdapter:
                             subject_id=sample.subject_id,
                             event_type="sample_derived_from_archive_member",
                             actor_id=actor_id,
-                            tlp=parent_sample.tlp,
+                            tlp=policy.tlp,
                             payload={
                                 "provenance": "archive_extract_member",
                                 "derivation_id": derivation_id,

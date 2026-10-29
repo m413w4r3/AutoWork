@@ -131,6 +131,9 @@ class _Envelopes:
     async def get(self, investigation_id: UUID) -> InvestigationEnvelope | None:
         return self.db.envelopes.get(investigation_id)
 
+    async def get_for_update(self, investigation_id: UUID) -> InvestigationEnvelope | None:
+        return await self.get(investigation_id)
+
     async def save_if_version(
         self, envelope: InvestigationEnvelope, *, expected_version: int | None
     ) -> InvestigationEnvelope:
@@ -164,6 +167,8 @@ class _Associations:
         self, association: SampleAssociation, *, expected_version: int
     ) -> SampleAssociation:
         current = self.db.associations.get(association.id)
+        if current == association:
+            return current
         if current is None:
             if expected_version != 0 or association.version != 1:
                 raise RuntimeError("association version conflict")
