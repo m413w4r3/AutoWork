@@ -1860,8 +1860,118 @@ def _scripted_wire_scalar(value: Any) -> str:
     return rendered
 
 
+def _redact_bridge_context_sample_identities(
+    payload: Any,
+    *,
+    identifiers: Sequence[str],
+    hashes: Sequence[str],
+) -> Any:
+    hash_prefixes = {
+        sample_hash[:length].casefold()
+        for sample_hash in hashes
+        if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sample_hash)
+        for length in range(8, len(sample_hash) + 1)
+    }
+    hash_pattern = (
+        re.compile(
+            r"(?<![A-Za-z0-9_])(?:(?:sha-?256|sha-?1|md5)\s*[:=]\s*)?"
+            r"(?P<digest>[0-9a-fA-F]{8,64})(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        if hash_prefixes
+        else None
+    )
+    normalized_hashes = {sample_hash.casefold() for sample_hash in hashes}
+    identity_values = {
+        value.strip()
+        for value in identifiers
+        if isinstance(value, str)
+        and value.strip()
+        and value.strip().casefold() not in normalized_hashes
+    }
+    identity_pattern = (
+        re.compile(
+            r"(?:"
+            + "|".join(
+                re.escape(value)
+                for value in sorted(identity_values, key=lambda item: (-len(item), item.casefold()))
+            )
+            + r")",
+            re.IGNORECASE,
+        )
+        if identity_values
+        else None
+    )
+
+    def redact_text(value: str) -> str:
+        def redact_hash(match: re.Match[str]) -> str:
+            return (
+                "[restricted sample]"
+                if match.group("digest").casefold() in hash_prefixes
+                else match.group()
+            )
+
+        redacted = hash_pattern.sub(redact_hash, value) if hash_pattern is not None else value
+        return (
+            identity_pattern.sub("[restricted sample]", redacted)
+            if identity_pattern is not None
+            else redacted
+        )
+
+    def contains_restricted_hash(value: Any) -> bool:
+        if isinstance(value, str):
+            return hash_pattern is not None and any(
+                match.group("digest").casefold() in hash_prefixes
+                for match in hash_pattern.finditer(value)
+            )
+        if isinstance(value, Mapping):
+            return any(
+                contains_restricted_hash(str(key)) or contains_restricted_hash(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, (tuple, list)):
+            return any(contains_restricted_hash(item) for item in value)
+        return False
+
+    def pivot_targets_restricted_hash(value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        indicator_type = value.get("indicator_type")
+        indicator_value = value.get("indicator_value")
+        return indicator_type in {"md5", "sha1", "sha256"} and (
+            contains_restricted_hash(indicator_value)
+            or contains_restricted_hash(value.get("arguments"))
+        )
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            redacted: dict[str, Any] = {}
+            for raw_key, child in value.items():
+                key = str(raw_key)
+                if key.casefold() == "available_pivots" and isinstance(child, (tuple, list)):
+                    child = [item for item in child if not pivot_targets_restricted_hash(item)]
+                redacted_key = redact_text(key)
+                if redacted_key in redacted:
+                    redacted_key = f"{redacted_key} [redacted key]"
+                redacted[redacted_key] = redact(child)
+            return redacted
+        if isinstance(value, (tuple, list)):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            return redact_text(value)
+        return value
+
+    return redact(payload)
+
+
 def render_investigation_prompt(context: InvestigationContextV1) -> str:
     context_payload = json.loads(context.canonical_bytes())
+    if context._restricted_sample_values:
+        context_payload = _redact_bridge_context_sample_identities(
+            context_payload,
+            identifiers=context._restricted_sample_values,
+            hashes=context._restricted_sample_hashes,
+        )
     priority_requests = context_payload.pop("operator_requests", [])
     investigation = context_payload["investigation"]
     legacy_requests = investigation.pop("user_requests", [])

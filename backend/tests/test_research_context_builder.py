@@ -15,6 +15,7 @@ from cti_app.application.analyst_handoff import (
 )
 from cti_app.application.bridge_investigator import (
     _minimal_schema_value,
+    _redact_bridge_context_sample_identities,
     render_investigation_prompt,
 )
 from cti_app.application.context_pagination import (
@@ -40,6 +41,7 @@ from cti_app.application.investigation_contracts import (
     AdvisorLastAdviceV1,
     ArticleClaimV1,
     ArticleContextV1,
+    AvailablePivotV1,
     ConfirmedIOCContextV1,
     InvestigationSourceV1,
     PublicationAnchorV1,
@@ -71,6 +73,7 @@ from cti_app.application.research_context_builder import (
     CanonicalEvidenceSummaryPort,
     RepositoryInvestigationGraphReadPort,
     ResearchContextBuilder,
+    SampleDisclosurePolicyResolutionError,
     provider_authorization_blocked_capabilities,
 )
 from cti_app.domain.analyst_opinion import (
@@ -557,8 +560,26 @@ async def test_operator_context_summarizes_pcap_and_keeps_revised_finding() -> N
             )
         )
 
+    async def get_investigation(_investigation_id):
+        return SimpleNamespace(subject_id=uuid4())
+
+    async def list_no_sample_associations(_investigation_id):
+        return ()
+
+    async def list_no_samples(_subject_id):
+        return ()
+
     store._catalog = SimpleNamespace(
-        _uow_factory=lambda: _AsyncContext(SimpleNamespace(blobs=SimpleNamespace(get=get_blob)))
+        _uow_factory=lambda: _AsyncContext(
+            SimpleNamespace(
+                blobs=SimpleNamespace(get=get_blob),
+                analyst_investigations=SimpleNamespace(get=get_investigation),
+                sample_associations=SimpleNamespace(
+                    list_for_investigation=list_no_sample_associations
+                ),
+                samples=SimpleNamespace(list_for_subject=list_no_samples),
+            )
+        )
     )
 
     async def forbidden_read_bytes(_blob_id, *, max_bytes):
@@ -1553,6 +1574,10 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
                     "association_id": str(association_id),
                     "sample_id": str(sample_id),
                     "sample_sha256": sample_sha256,
+                    "md5": "b" * 32,
+                    "sha1": "c" * 40,
+                    "original_name": "sample_payload.exe",
+                    "file_path": "/vault/private/sample_payload.exe",
                     "tlp": sample_tlp,
                     "do_not_submit": True,
                     "external_llm_allowed": external_llm_allowed,
@@ -1569,9 +1594,28 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         article=ArticleContextV1(
             short_summary="Synthetic article.",
             claims=(),
-            documented_samples=(),
-            known_chain=(),
+            documented_samples=(sample_sha256,),
+            known_chain=(
+                {
+                    "sha256": sample_sha256,
+                    "text": (
+                        f"Sha256:{sample_sha256.upper()} "
+                        f"prefixes {sample_sha256[:8]} and {sample_sha256[:16]}"
+                    ),
+                    "filename": "sample_payload.exe",
+                    "path": "/vault/private/sample_payload.exe",
+                },
+            ),
             open_questions=("Analyze the acquired sample.",),
+        ),
+        confirmed_iocs=(
+            ConfirmedIOCContextV1(
+                indicator_type="sha256",
+                value=sample_sha256,
+                extraction_artifact_id=uuid4(),
+                extraction_artifact_version=1,
+                source_document_ids=(uuid4(),),
+            ),
         ),
     )
     builder = ResearchContextBuilder(
@@ -1594,6 +1638,26 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         ),
         budget_remaining={"bridge_turns": 2},
     )
+    context = context.model_copy(
+        update={
+            "available_pivots": (
+                AvailablePivotV1(
+                    tool_name="vt.restricted_pivot",
+                    schema_version="1",
+                    indicator_type="sha256",
+                    indicator_value=sample_sha256,
+                    arguments={"sha256": sample_sha256},
+                ),
+                AvailablePivotV1(
+                    tool_name="vt.allowed_pivot",
+                    schema_version="1",
+                    indicator_type="sha256",
+                    indicator_value="f" * 64,
+                    arguments={"sha256": "f" * 64},
+                ),
+            )
+        }
+    )
     sample = context.investigation.sample_deltas[0]
     result = context.investigation.latest_tool_results[-1]
     prompt = render_investigation_prompt(context)
@@ -1605,6 +1669,10 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
     assert "must-not-reach-the-prompt" not in prompt
     if expected_allowed:
         assert sample_sha256 in prompt
+        assert str(association_id) in prompt
+        assert str(sample_id) in prompt
+        assert "[restricted sample]" not in prompt
+        assert "sample_payload.exe" in prompt
         assert sample["association_id"] == str(association_id)
         assert sample["sample_id"] == str(sample_id)
         assert sample["sha256"] == sample_sha256
@@ -1632,6 +1700,7 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
             )
         )
         assert "content restricted (sample policy)" in prompt
+        assert "[restricted sample]" in prompt
         assert str(unrelated_observation.id) in prompt
         assert "unrelated network fact remains visible" in prompt
         analysis_coverage = next(
@@ -1642,11 +1711,106 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results(
         assert analysis_coverage.parameter_key == "restricted_sample"
         assert analysis_coverage.observation_id == analysis_result.id
         assert "content restricted (sample policy)" in analysis_coverage.summary
-        assert all(pivot.indicator_value != sample_sha256 for pivot in context.available_pivots)
+        assert "vt.restricted_pivot" not in prompt
+        assert "vt.allowed_pivot" in prompt
         assert str(association_id) not in prompt
         assert str(sample_id) not in prompt
         assert sample_sha256 not in prompt
+        assert sample_sha256[:8] not in prompt
+        assert sample_sha256[:16] not in prompt
+        assert ("b" * 32) not in prompt
+        assert ("c" * 40) not in prompt
+        assert "sample_payload.exe" not in prompt
+        assert "/vault/private/sample_payload.exe" not in prompt
         assert context.investigation.truncation_counts["restricted_sample_evidence"] > 0
+
+
+def test_bridge_prompt_redaction_covers_nested_context_and_removes_restricted_pivots() -> None:
+    sample_sha256 = "a" * 64
+    sample_sha1 = "b" * 40
+    sample_md5 = "c" * 32
+    sample_id = str(uuid4())
+    association_id = str(uuid4())
+    observation_id = str(uuid4())
+    permitted_sha256 = "f" * 64
+    payload = {
+        "article": {
+            "documented_samples": [sample_sha256, permitted_sha256],
+            "known_chain": [
+                {
+                    "sha256": sample_sha256,
+                    "free_text": (
+                        f"ShA256:{sample_sha256.upper()} md5={sample_md5} "
+                        f"prefixes {sample_sha256[:8]} and {sample_sha256[:16]}"
+                    ),
+                    "sha1": sample_sha1,
+                    "sample_id": sample_id,
+                    "file_name": "sample_payload.exe",
+                    "file_path": "/vault/private/sample_payload.exe",
+                }
+            ],
+        },
+        "indicator_inventory": {"items": [{"value": sample_sha256}]},
+        "available_pivots": [
+            {
+                "tool_name": "vt.restricted_pivot",
+                "indicator_type": "sha256",
+                "indicator_value": sample_sha256[:16],
+                "arguments": {"sha256": sample_sha256},
+            },
+            {
+                "tool_name": "vt.restricted_argument_pivot",
+                "indicator_type": "sha256",
+                "indicator_value": permitted_sha256,
+                "arguments": {"sha256": sample_sha256},
+            },
+            {
+                "tool_name": "vt.allowed_pivot",
+                "indicator_type": "sha256",
+                "indicator_value": permitted_sha256,
+                "arguments": {"sha256": permitted_sha256},
+            },
+        ],
+        association_id: sample_id,
+        "observation_id": observation_id,
+    }
+
+    redacted = _redact_bridge_context_sample_identities(
+        payload,
+        identifiers=(
+            sample_id,
+            association_id,
+            "sample_payload.exe",
+            "/vault/private/sample_payload.exe",
+            "/vault/private",
+        ),
+        hashes=(sample_sha256, sample_sha1, sample_md5),
+    )
+    encoded = json.dumps(redacted).casefold()
+
+    assert "[restricted sample]" in encoded
+    assert redacted["article"]["documented_samples"] == [
+        "[restricted sample]",
+        permitted_sha256,
+    ]
+    assert redacted["article"]["known_chain"][0]["sha256"] == "[restricted sample]"
+    assert redacted["indicator_inventory"]["items"][0]["value"] == "[restricted sample]"
+    for value in (
+        sample_sha256,
+        sample_sha256[:8],
+        sample_sha256[:16],
+        sample_sha1,
+        sample_md5,
+        sample_id,
+        association_id,
+        "sample_payload.exe",
+        "/vault/private/sample_payload.exe",
+    ):
+        assert value.casefold() not in encoded
+    assert "sha256:" not in encoded
+    assert observation_id in encoded
+    assert permitted_sha256 in encoded
+    assert [item["tool_name"] for item in redacted["available_pivots"]] == ["vt.allowed_pivot"]
 
 
 @pytest.mark.asyncio
@@ -1682,6 +1846,9 @@ async def test_unassociated_file_observation_is_preserved_without_sample_invento
         async def summary(self, _observation):
             return None
 
+        async def sample_disclosure_inventory(self, _investigation_id):
+            return ()
+
     builder = ResearchContextBuilder(
         article_snapshots=_SnapshotPort(snapshot),
         observations=InMemoryEvidenceObservationRepository(),
@@ -1691,7 +1858,7 @@ async def test_unassociated_file_observation_is_preserved_without_sample_invento
     sample_disclosure = await builder._sample_disclosure_index(investigation_id, None)
 
     summaries, restricted_ids = await builder._evidence_context((observation,), sample_disclosure)
-    evidence_index, _ = builder._evidence_index((observation,), sample_disclosure)
+    evidence_index, _ = builder._evidence_index((observation,))
 
     assert not restricted_ids
     assert summaries[0].evidence_id == observation.id
@@ -1701,22 +1868,11 @@ async def test_unassociated_file_observation_is_preserved_without_sample_invento
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_sample_reference_masks_identifier_but_preserves_observation() -> None:
+async def test_partial_sample_policy_resolution_fails_closed() -> None:
     investigation_id = uuid4()
     association_id = uuid4()
     sample_id = uuid4()
     sample_sha256 = "c" * 64
-    observation = EvidenceObservation(
-        investigation_id=investigation_id,
-        kind=EvidenceKind.BINARY_ANALYSIS,
-        blob_id=uuid4(),
-        sha256="b" * 64,
-        source="autowork.analysis_worker.static",
-        source_version="static-v1",
-        observed_at=datetime.now(UTC),
-        object_type="sample",
-        object_id=sample_sha256,
-    )
     snapshot = ArticleSnapshot(
         subject_id=uuid4(),
         production_run_id=uuid4(),
@@ -1732,13 +1888,6 @@ async def test_ambiguous_sample_reference_masks_identifier_but_preserves_observa
     )
 
     class SampleSummaries:
-        async def summary(self, _observation):
-            return {
-                "sample_id": str(sample_id),
-                "sample_sha256": sample_sha256,
-                "finding": "static analysis found a loader",
-            }
-
         async def sample_disclosure_inventory(self, _investigation_id):
             return (
                 {
@@ -1749,41 +1898,51 @@ async def test_ambiguous_sample_reference_masks_identifier_but_preserves_observa
                 },
             )
 
-        async def sample_inventory(self, _investigation_id):
-            return (
-                {
-                    "association_id": str(association_id),
-                    "sample_id": str(sample_id),
-                    "sha256": sample_sha256,
-                    "byte_size": 128,
-                    "provenance": "vt_download",
-                    "qualification": "candidate",
-                },
-            )
-
     builder = ResearchContextBuilder(
         article_snapshots=_SnapshotPort(snapshot),
         observations=InMemoryEvidenceObservationRepository(),
         findings=InMemoryFindingRepository(),
         evidence_summaries=SampleSummaries(),
     )
-    sample_disclosure = await builder._sample_disclosure_index(investigation_id, None)
+    with pytest.raises(
+        SampleDisclosurePolicyResolutionError,
+        match="sample disclosure policy resolution is incomplete",
+    ):
+        await builder._sample_disclosure_index(investigation_id, None)
 
-    summaries, restricted_ids = await builder._evidence_context((observation,), sample_disclosure)
-    evidence_index, _ = builder._evidence_index((observation,), sample_disclosure)
-    sample_rows, _truncated, _total = await builder._sample_index(
-        investigation_id, (), (observation,), sample_disclosure
+
+@pytest.mark.asyncio
+async def test_sample_policy_resolution_exception_fails_closed() -> None:
+    investigation_id = uuid4()
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        article=ArticleContextV1(
+            short_summary="Synthetic article.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
     )
 
-    assert not restricted_ids
-    assert summaries[0].evidence_id == observation.id
-    assert "static analysis found a loader" in summaries[0].summary
-    assert str(sample_id) not in summaries[0].summary
-    assert sample_sha256 not in summaries[0].summary
-    assert evidence_index[0].evidence_id == observation.id
-    assert sample_sha256 not in evidence_index[0].summary
-    assert sample_rows[0]["sample_id"] == "[ambiguous sample identifier]"
-    assert sample_rows[0]["sha256"] == "[ambiguous sample identifier]"
+    class BrokenSampleSummaries:
+        async def sample_disclosure_inventory(self, _investigation_id):
+            raise OSError("policy store unavailable")
+
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        evidence_summaries=BrokenSampleSummaries(),
+    )
+    with pytest.raises(
+        SampleDisclosurePolicyResolutionError,
+        match="sample disclosure policy could not be resolved",
+    ):
+        await builder._sample_disclosure_index(investigation_id, None)
 
 
 @pytest.mark.asyncio
