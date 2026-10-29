@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -251,13 +252,13 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     # L5: the uncertainty list is no longer published inside the article body.
     assert "Attribution remains uncertain" not in text
     assert text.count("RÉFÉRENCES") >= 1
-    assert text.index("SYNTHÈSE") < text.index("RÉFÉRENCES") < text.index("CHRONOLOGIE")
+    assert text.index("RÉFÉRENCES") < text.index("CHRONOLOGIE") < text.index("SYNTHÈSE")
     page_texts = [page.extract_text() or "" for page in reader.pages]
     first_article_page_text = next(page_text for page_text in page_texts if "SYNTHÈSE" in page_text)
     assert "SYNTHÈSE" in first_article_page_text
     if "CHRONOLOGIE" in first_article_page_text:
-        assert first_article_page_text.index("SYNTHÈSE") < first_article_page_text.index(
-            "CHRONOLOGIE"
+        assert first_article_page_text.index("CHRONOLOGIE") < first_article_page_text.index(
+            "SYNTHÈSE"
         )
     assert text.index("Article with titled synthesis") < text.index("Short operational update")
     assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
@@ -386,9 +387,11 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     source = TypstRenderer().render(preview, template_bundle, document_label=document_label)
     render_data = json.loads(source.render_data_bytes)
     section_types = [item["type"] for item in render_data["content_sections"]]
-    assert section_types[:2] == ["synthesis", "references"]
+    assert section_types[0] == "references"
+    assert section_types.index("references") < section_types.index("synthesis")
     if "chronology" in section_types:
         assert section_types.index("references") < section_types.index("chronology")
+        assert section_types.index("chronology") < section_types.index("synthesis")
 
     opinion_section = next(
         item for item in render_data["content_sections"] if item["type"] == "analyst_opinion"
@@ -479,7 +482,7 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     page_texts = [page.extract_text() or "" for page in reader.pages]
 
     assert "SYNTHÈSE" in page_texts[0]
-    assert "Confiance : 90%" not in text
+    assert re.search(r"Confiance\s*:\s*\d+\s*%", text, flags=re.IGNORECASE) is None
     assert "Fait étayé" in text
     assert "[F1]" in text and "[E1]" in text
     assert "Run token" in text

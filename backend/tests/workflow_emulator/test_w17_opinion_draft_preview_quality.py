@@ -472,8 +472,9 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     for table_heading in (
         "type",
         "valeur défanguée",
-        "statut, relation et contexte",
-        "source [n]",
+        "statut indicateur",
+        "statut relation",
+        "contexte et provenance",
     ):
         assert table_heading in annex_text, f"W17 IOC annex table is missing {table_heading!r}"
 

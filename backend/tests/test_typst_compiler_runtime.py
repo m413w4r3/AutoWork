@@ -400,7 +400,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     text; the template does not print those metadata fields separately. The
     reference row prints its publication date, ordinal identifier, reference text,
     and URL. A timeline row prints its date, event text, and source ordinal. Opinion heading,
-    qualification, confidence, text, and visible citations are checked separately.
+    qualification, text, and visible citations are checked separately.
 
     The test sees selectable text through ``pdftotext``. It cannot verify source or
     opinion target IDs, source document UUIDs, or link destination bytes because
@@ -644,7 +644,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         "AVIS DE L'ANALYSTE": 1,
         "Apports de l'enquête": 1,
         "Fait étayé": 1,
-        "Confiance : 90%": 1,
+        "Confiance : 90%": 0,
         opinion_marker: 1,
         # The inline citations repeat as identifiers in the existing traceability annex.
         "[F1]": 2,
@@ -663,6 +663,8 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             f"augmented PDF marker {marker!r}: expected {expected_count}, "
             f"found {augmented_text.count(marker)}"
         )
+    assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", base_text, flags=re.IGNORECASE) is None
+    assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", augmented_text, flags=re.IGNORECASE) is None
     assert_reference_rows(base_text, "base")
     assert_reference_rows(augmented_text, "augmented")
     assert_timeline_citations(base_text, "base")

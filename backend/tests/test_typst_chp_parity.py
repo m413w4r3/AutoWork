@@ -924,7 +924,8 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert re.search(r"#let section-title\s*\(.*?fill:\s*purple", helper_source, re.DOTALL)
     assert re.search(r"#let purple\s*=\s*rgb\(\"#[0-9A-Fa-f]{6}\"\)", color_source)
     assert "#let publication-styled-table" in production_helpers_source
-    assert "set text(size: 8pt)" in production_helpers_source
+    assert "text-size: 8pt" in production_helpers_source
+    assert "set text(size: text-size)" in production_helpers_source
     assert 'rgb("#5D7374")' in production_helpers_source
     assert "fill: white" in production_helpers_source
     assert 'stroke: 0.4pt + rgb("#AEB7C0")' in production_helpers_source
@@ -1246,7 +1247,8 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     assert "APPORTS DE L'ENQUÊTE" in normalized_extracted
     assert "FAIT ÉTAYÉ" in normalized_extracted
     assert "LE CONSTAT SUPPLÉMENTAIRE EST CORROBORÉ" in normalized_extracted
-    assert "CONFIANCE : 90%" in normalized_extracted
+    assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", normalized_extracted) is None
+    assert "[F1]" in normalized_extracted and "[E1]" in normalized_extracted
 
     uris = []
     for page in reader.pages:

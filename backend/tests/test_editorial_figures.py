@@ -566,7 +566,8 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
     assert "Shodan" in normalized
     assert "Article" in normalized
     assert "affirmationfournisseur" in normalized
-    assert "Confiance" in normalized
+    assert "confiancerestenonévaluée" in normalized
+    assert re.search(r"confiance\s*:\s*\d+\s*%", extracted, flags=re.IGNORECASE) is None
     assert "nonévaluée" in normalized
     assert "pivotverscible" in normalized
     assert "dns:A" in extracted
