@@ -58,6 +58,15 @@ def test_running_job_cancellation_is_cooperative() -> None:
     assert_status(job, JobStatus.CANCELLED)
 
 
+def test_cancelling_a_terminal_job_is_idempotent() -> None:
+    job = make_job()
+    job.request_cancellation()
+
+    job.request_cancellation()
+
+    assert_status(job, JobStatus.CANCELLED)
+
+
 def test_waiting_human_is_an_explicit_non_terminal_state() -> None:
     job = make_job()
     job.start()

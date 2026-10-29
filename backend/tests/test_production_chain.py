@@ -16,7 +16,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
-from cti_app.application.jobs import JobHandlerError, JobRegistry
+from cti_app.application.jobs import (
+    DuplicateJobError,
+    JobHandlerError,
+    JobRegistry,
+)
 from cti_app.application.model_conversations import ConversationNeedsReviewError
 from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.application.persistence import UnitOfWorkFactory
@@ -40,6 +44,7 @@ from cti_app.application.production_workflow import (
 )
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
 from cti_app.domain.production import (
     EditionProductionBatch,
@@ -302,6 +307,83 @@ async def test_successful_stage_queues_the_next_one(
 
     assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.REFERENCES)]
     assert uow.production_runs.items[run.id].current_stage is (ProductionStage.REFERENCES)
+
+
+async def test_before_dispatch_does_not_cancel_a_duplicate_terminal_job() -> None:
+    class _CancelledJob:
+        id = uuid4()
+        status = JobStatus.CANCELLED
+
+        @property
+        def is_terminal(self) -> bool:
+            return True
+
+    class _DuplicateJobs:
+        def __init__(self) -> None:
+            self.job = _CancelledJob()
+            self.cancel_calls: list[UUID] = []
+
+        async def submit(self, **options: Any) -> object:
+            del options
+            raise DuplicateJobError(self.job.id)
+
+        async def get(self, job_id: UUID) -> _CancelledJob:
+            assert job_id == self.job.id
+            return self.job
+
+        async def cancel(self, job_id: UUID, *, actor_id: str = "system") -> None:
+            del actor_id
+            self.cancel_calls.append(job_id)
+            raise AssertionError("terminal duplicate job must not be cancelled")
+
+    async def refuse_dispatch() -> bool:
+        return False
+
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    run.start_running()
+    jobs = _DuplicateJobs()
+    dispatcher = _Dispatcher()
+    chain = ProductionStageChain()
+    chain.bind(jobs, dispatcher)  # type: ignore[arg-type]
+
+    with pytest.raises(JobHandlerError, match="production_stage_dispatch_rejected"):
+        await chain.submit(
+            run=run,
+            stage=ProductionStage.SOURCES,
+            correlation_id="test",
+            before_dispatch=refuse_dispatch,
+        )
+
+    assert jobs.cancel_calls == []
+    assert dispatcher.dispatched == []
+
+
+async def test_unexpected_stage_error_fails_the_production_run(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _jobs, orchestrator = _build(
+        uow, monkeypatch, {"stage": "sources", "status": "success"}
+    )
+    run = _run(uow, ProductionStage.SOURCES)
+
+    async def fail_stage(**options: Any) -> dict[str, Any]:
+        del options
+        raise RuntimeError("unexpected stage failure")
+
+    monkeypatch.setattr(orchestrator, "execute_stage", fail_stage)
+
+    with pytest.raises(RuntimeError, match="unexpected stage failure"):
+        await registry.handler(stage_job_kind(ProductionStage.SOURCES))(
+            ProductionStageParameters(
+                run_id=run.id,
+                expected_stage=ProductionStage.SOURCES.value,
+                pipeline_generation=run.pipeline_generation,
+            ),
+            _Context(),  # type: ignore[arg-type]
+        )
+
+    assert uow.production_runs.items[run.id].status is ProductionRunStatus.FAILED
+    assert uow.production_runs.items[run.id].error_code == "internal_error"
 
 
 async def test_reconciliation_resume_consumes_exact_archived_run_and_same_generation(

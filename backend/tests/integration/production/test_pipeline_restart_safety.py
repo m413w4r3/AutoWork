@@ -11,8 +11,13 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
+from cti_app.api.production import router as production_router
+from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.model_gateway import ModelRequest
+from cti_app.application.production_jobs import production_stage_idempotency_key
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -25,6 +30,7 @@ from cti_app.domain.model_runs import (
 )
 from cti_app.domain.production import (
     ProductionArtifactStage,
+    ProductionBatchStatus,
     ProductionRunStatus,
     ProductionStage,
 )
@@ -319,6 +325,70 @@ async def test_restart_after_sources_reconstructs_the_pipeline(
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
     }
+
+
+@pytest.mark.asyncio
+async def test_restart_with_new_sources_reopens_completed_batch_for_each_new_run(
+    production_scenario_factory: ScenarioFactory,
+) -> None:
+    scenario, _urls = _configured(production_scenario_factory, 2)
+    await scenario.start()
+    initial = await scenario.run_until_terminal()
+    assert initial.status is ProductionRunStatus.READY
+    assert scenario.batch_id is not None
+
+    app = FastAPI()
+    app.include_router(production_router)
+    app.state.uow_factory = scenario.uow_factory
+    app.state.job_service = scenario.jobs
+    app.state.job_dispatcher = scenario.runner
+    app.state.identity_provider = LocalIdentityProvider("restart-with-sources-test")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first_response = await client.post(
+            f"/api/production/subjects/{scenario.subject.id}/production/restart-with-new-sources"
+        )
+        assert first_response.status_code == 200, first_response.text
+        first_run_id = UUID(first_response.json()["run_id"])
+        assert first_run_id != initial.id
+        scenario.run_id = first_run_id
+
+        first_restart = await scenario.run_until_terminal()
+        assert first_restart.status is ProductionRunStatus.READY
+
+        second_response = await client.post(
+            f"/api/production/subjects/{scenario.subject.id}/production/restart-with-new-sources"
+        )
+        assert second_response.status_code == 200, second_response.text
+        second_run_id = UUID(second_response.json()["run_id"])
+        assert second_run_id != first_run_id
+        scenario.run_id = second_run_id
+
+        second_restart = await scenario.run_until_terminal()
+        assert second_restart.status is ProductionRunStatus.READY
+
+    async with scenario.uow_factory() as uow:
+        batch = await uow.edition_production_batches.get(scenario.batch_id)
+        item = await uow.edition_production_batch_items.get_by_run(second_run_id)
+    assert batch is not None
+    assert batch.status is ProductionBatchStatus.COMPLETED
+    assert item is not None
+    assert item.production_run_id == second_run_id
+
+    source_jobs = [
+        job
+        for job in await scenario.jobs.list_for_aggregate("subject", scenario.subject.id)
+        if job.kind == "production.subject.sources"
+    ]
+    jobs_by_run = {UUID(job.input_parameters["run_id"]): job for job in source_jobs}
+    assert jobs_by_run[initial.id].id != jobs_by_run[first_run_id].id
+    assert jobs_by_run[first_run_id].id != jobs_by_run[second_run_id].id
+    assert jobs_by_run[first_run_id].idempotency_key == production_stage_idempotency_key(
+        first_restart, ProductionStage.SOURCES
+    )
+    assert jobs_by_run[second_run_id].idempotency_key == production_stage_idempotency_key(
+        second_restart, ProductionStage.SOURCES
+    )
 
 
 @pytest.mark.asyncio

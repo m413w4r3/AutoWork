@@ -29,7 +29,10 @@ from cti_app.domain.discovery_cumulative import (
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
+    EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
@@ -140,6 +143,45 @@ class _BatchItems:
     def __init__(self, item: EditionProductionBatchItem) -> None:
         self.item = item
 
+    async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None:
+        return self.item if self.item.production_run_id == run_id else None
+
+    async def list_for_batch(self, batch_id: UUID) -> list[EditionProductionBatchItem]:
+        return [self.item] if self.item.batch_id == batch_id else []
+
+    async def save(self, item: EditionProductionBatchItem) -> None:
+        self.item = item
+
+
+class _ProductionBatches:
+    def __init__(self, batch: EditionProductionBatch) -> None:
+        self.items = {batch.id: batch}
+
+    async def get(self, batch_id: UUID) -> EditionProductionBatch | None:
+        return self.items.get(batch_id)
+
+    async def get_for_update(self, batch_id: UUID) -> EditionProductionBatch | None:
+        return self.items.get(batch_id)
+
+    async def get_active_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
+        return next(
+            (
+                batch
+                for batch in self.items.values()
+                if batch.edition_id == edition_id
+                and batch.status
+                in {
+                    ProductionBatchStatus.QUEUED,
+                    ProductionBatchStatus.RUNNING,
+                    ProductionBatchStatus.PAUSED,
+                }
+            ),
+            None,
+        )
+
+    async def save(self, batch: EditionProductionBatch) -> None:
+        self.items[batch.id] = batch
+
 
 class _Origins:
     def __init__(self, origin: SubjectDiscoveryOrigin) -> None:
@@ -188,6 +230,7 @@ class _Uow:
         editions: _Editions,
         batches: _Batches,
         items: _BatchItems,
+        production_batch: EditionProductionBatch,
     ) -> None:
         self.production_runs = runs
         self.production_input_snapshots = snapshots
@@ -195,6 +238,7 @@ class _Uow:
         self.editions = editions
         self.discovery_batches = batches
         self.edition_production_batch_items = items
+        self.edition_production_batches = _ProductionBatches(production_batch)
         subject = subjects.subject
         source_batch = batches.batches[-1]
         candidate = DiscoveryCandidate.from_candidate_topic(
@@ -367,8 +411,15 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
         source_coverage_complete=False,
         source_coverage_incomplete_reason="test",
     )
+    production_batch = EditionProductionBatch(
+        edition_id=edition_id,
+        status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+        idempotency_key=f"restart-test-{uuid4()}",
+        request_fingerprint="c" * 64,
+        phase=ProductionBatchPhase.REVIEW,
+    )
     item = EditionProductionBatchItem(
-        batch_id=uuid4(),
+        batch_id=production_batch.id,
         subject_id=subject_id,
         production_run_id=old_run.id,
         position=1,
@@ -391,6 +442,7 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
         editions,
         _Batches([old_batch, replacement_batch]),
         _BatchItems(item),
+        production_batch,
     )
     if archive_before_repoint:
         original_get_for_update = editions.get_for_update
@@ -399,7 +451,7 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
         async def archive_on_repoint(locked_edition_id: UUID) -> Any | None:
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == 1:
                 editions.state = EditionStatus.ARCHIVED
             return await original_get_for_update(locked_edition_id)
 
@@ -433,7 +485,7 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     if archive_before_repoint:
         assert response.status_code == 409
         assert response.json()["detail"]["code"] == "production_edition_archived"
-        assert len(runs.items) == 2
+        assert len(runs.items) == 1
         assert item.production_run_id == old_run.id
         assert jobs.submitted == []
         assert dispatcher.dispatched == []
@@ -451,8 +503,11 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     assert "https://blocked.example/report" not in {
         source.canonical_url for source in snapshot.core_sources
     }
-    assert item.production_run_id == old_run.id
-    assert item.auto_recovery_count == 1
+    assert item.production_run_id == new_run_id
+    assert item.auto_recovery_count == 0
+    assert uow.edition_production_batches.items[production_batch.id].status is (
+        ProductionBatchStatus.RUNNING
+    )
     assert jobs.submitted[0]["kind"] == "production.subject.sources"
     assert dispatcher.dispatched == jobs.ids
     assert editions.state is EditionStatus.OPEN

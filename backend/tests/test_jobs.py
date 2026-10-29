@@ -78,6 +78,27 @@ async def test_submission_is_idempotent() -> None:
     assert len(factory.state) == 1
 
 
+async def test_cancel_is_idempotent_for_a_terminal_job() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    service = JobService(factory, create_job_registry())
+    job = await service.submit(
+        kind="demo.deterministic",
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key="cancel-terminal-job",
+        correlation_id="test",
+        input_parameters={"steps": 2},
+    )
+
+    cancelled = await service.cancel(job.id)
+    event_count = len(factory.events)
+    cancelled_again = await service.cancel(job.id)
+
+    assert cancelled.status is JobStatus.CANCELLED
+    assert cancelled_again.status is JobStatus.CANCELLED
+    assert len(factory.events) == event_count
+
+
 async def test_submit_in_uow_does_not_commit_caller_transaction() -> None:
     factory = InMemoryJobUnitOfWorkFactory()
 

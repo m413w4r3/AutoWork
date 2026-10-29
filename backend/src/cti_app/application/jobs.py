@@ -343,6 +343,8 @@ class JobService:
             job = await uow.jobs.get_for_update(job_id)
             if job is None:
                 raise JobNotFoundError(str(job_id))
+            if job.is_terminal:
+                return job
             previous_status = job.status
             job.request_cancellation()
             await uow.jobs.save(job)
