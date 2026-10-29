@@ -366,6 +366,7 @@ class OperatorContextSectionPageV1(_StrictContract):
         "evidence_index",
         "findings",
         "opinion_notes",
+        "current_opinion",
         "tool_coverage",
         "sample_deltas",
         "publication_anchors",

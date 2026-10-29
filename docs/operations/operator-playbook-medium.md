@@ -48,6 +48,12 @@ Consulte Bridge lorsqu’une réponse peut réellement changer le prochain pivot
 
 Ne demande jamais à Bridge de produire du JSON ou une autre sérialisation machine. Pour une revue, nomme chaque unité et demande un avis distinct en texte clair. Un statut global `partial` n’annule pas automatiquement une unité marquée utilisable; vérifie que l’unité correspond au texte/SHA envoyé et que ses références étayent le conseil. De même, `succeeded` ne rend pas le conseil exact par lui-même.
 
+### Lire et faire relire le brouillon d’avis
+
+Lis `GET /api/investigations/{id}/operator/context/section/current_opinion` avec `limit` (maximum 20), `expected_version` et `expected_sha256` du contexte opérateur. Chaque ligne donne le bloc canonique, son type, son ancre éventuelle, son texte, sa qualification et ses références, avec la version et le SHA de l’avis. Les matériaux d’implantation typés apparaissent en lignes lisibles par élément, avec leur référence d’observation; le JSON interne de projection n’est pas exposé. Vérifie `page_sha256`; pour la page suivante, reprends `next_cursor` avec le même CAS. Si le curseur est périmé, relis le contexte et repars de la première page.
+
+Pour faire relire tout le corps canonique de l’avis, appelle `advisor.consult` avec `consultation_type=review_text`, l’`opinion_id` et la version lus, puis une question en prose; omets `units`, `block_type`, `form` et `anchor`. Les matériaux d’implantation typés sont rendus en texte clair dans cette revue. Pour une revue ciblée, choisis les cibles de la page courante et place-les dans `units`; un bloc utilise `form=body` et `anchor=null`, une note ancrée `form=analyst_note` et son ancre. Un bloc avec ancre seule est invalide; une erreur de cible fournit `valid_targets`, utilise cette liste au lieu d’essayer des ancres supposées. La soumission reste soumise au G2, au TLP et à `external_llm_allowed` courants.
+
 Après la réponse, vérifie les remarques contre les observations et consigne pour chacune : acceptée, adaptée, rejetée ou différée, avec la raison. Une modification de l’avis invalide la revue précédente. Si une réponse complète est persistée mais mal interprétée, repars de cette observation avec le parseur local et son schéma exact (`advisor-reparse.v1` pour `advisor.reparse`). Le reparse ne soumet rien à Bridge. Si aucun texte de réponse n’est enregistré ou si l’effet externe est ambigu, n’essaie pas de récupérer en resoumettant le même dossier.
 
 ## Budgets

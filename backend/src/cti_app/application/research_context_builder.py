@@ -72,7 +72,13 @@ from cti_app.application.operator_advisor_guidance import (
     build_advisor_guidance,
 )
 from cti_app.config import get_settings
-from cti_app.domain.analyst_opinion import AnalystOpinionV1, investigation_opinion_id
+from cti_app.domain.analyst_opinion import (
+    AnalystOpinionV1,
+    OpinionBlockType,
+    OpinionClaimQualification,
+    investigation_opinion_id,
+    render_implant_materials_text,
+)
 from cti_app.domain.investigation import (
     BudgetDimension,
     DetectionCandidateVersion,
@@ -101,6 +107,17 @@ MAX_CONTEXT_TOOL_COVERAGE = 200
 MAX_CONTEXT_ACQUIRED_SAMPLES = 64
 MAX_CONTEXT_LATEST_TOOL_RESULTS = 16
 MAX_CONTEXT_OPINION_NOTES = 24
+_OPERATOR_OPINION_BLOCK_TITLES = {
+    OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
+    OpinionBlockType.ADDITIONAL_SAMPLES: "Échantillons complémentaires",
+    OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES: "Chaîne d'infection et capacités",
+    OpinionBlockType.NETWORK_AND_INFRASTRUCTURE: "Activité réseau et infrastructure",
+    OpinionBlockType.CLAIM_VERIFICATION: "Vérification des affirmations",
+    OpinionBlockType.PROPOSED_DETECTIONS: "Détections proposées",
+    OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS: "Incertitudes et prochaines pistes",
+    OpinionBlockType.IMPLANT_MATERIALS: "Matériel relatif à l'implant",
+    OpinionBlockType.ANALYST_OBSERVATIONS: "Observations de l'analyste",
+}
 PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE = "provider_authorization_refusal"
 PROVIDER_AUTHORIZATION_REFUSAL_THRESHOLD = 2
 PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE = "provider_download_route_refused"
@@ -1931,6 +1948,16 @@ class ResearchContextBuilder:
                 limit=limit,
             )
             return source_page.total, source_page.items
+        if section == "current_opinion":
+            opinion = (
+                await self._opinions.get(investigation_opinion_id(investigation_id))
+                if self._opinions is not None
+                else None
+            )
+            if opinion is None or opinion.investigation_id != investigation_id:
+                return 0, ()
+            opinion_items = self._current_opinion_section_items(opinion)
+            return len(opinion_items), tuple(opinion_items[offset : offset + limit])
         observations = tuple(
             sorted(
                 await self._observations.list_for_investigation(investigation_id),
@@ -2505,6 +2532,112 @@ class ResearchContextBuilder:
             source_bounded=source_page.source_bounded,
             unbounded_reason=source_page.unbounded_reason,
         )
+
+    @staticmethod
+    def _current_opinion_section_items(
+        opinion: AnalystOpinionV1,
+    ) -> tuple[dict[str, Any], ...]:
+        common = {
+            "opinion_id": str(opinion.id),
+            "opinion_version": opinion.version,
+            "opinion_sha256": opinion.content_sha256,
+            "opinion_status": opinion.status.value,
+            "untrusted_data": True,
+        }
+        items: list[dict[str, Any]] = []
+        for source_block in opinion.blocks:
+            if source_block.block_type in {
+                OpinionBlockType.ANALYST_OBSERVATIONS,
+                OpinionBlockType.IMPLANT_MATERIALS,
+            }:
+                continue
+            block = source_block
+            block_type = block.block_type.value
+            items.append(
+                {
+                    **common,
+                    "id": block_type,
+                    "anchor": None,
+                    "title": _OPERATOR_OPINION_BLOCK_TITLES[block.block_type],
+                    "block_type": block_type,
+                    "form": "body",
+                    "text": block.text,
+                    "text_sha256": hashlib.sha256(block.text.encode("utf-8")).hexdigest(),
+                    "qualification": block.qualification.value,
+                    "certainty": block.certainty,
+                    "finding_refs": [str(item) for item in block.finding_refs],
+                    "evidence_refs": [str(item) for item in block.evidence_refs],
+                }
+            )
+        implant_section = opinion.implant_materials_section
+        if implant_section is not None:
+            items.append(
+                {
+                    **common,
+                    "id": OpinionBlockType.IMPLANT_MATERIALS.value,
+                    "anchor": None,
+                    "title": _OPERATOR_OPINION_BLOCK_TITLES[OpinionBlockType.IMPLANT_MATERIALS],
+                    "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
+                    "form": "body",
+                    "text": implant_section.text,
+                    "text_sha256": hashlib.sha256(implant_section.text.encode("utf-8")).hexdigest(),
+                    "qualification": implant_section.qualification.value,
+                    "certainty": implant_section.certainty,
+                    "finding_refs": [str(item) for item in implant_section.finding_refs],
+                    "evidence_refs": [str(item) for item in implant_section.evidence_refs],
+                }
+            )
+        for index, material in enumerate(opinion.implant_materials, start=1):
+            material_text = render_implant_materials_text((material,))
+            items.append(
+                {
+                    **common,
+                    "id": f"{OpinionBlockType.IMPLANT_MATERIALS.value}:{index}",
+                    "anchor": None,
+                    "title": (
+                        f"{_OPERATOR_OPINION_BLOCK_TITLES[OpinionBlockType.IMPLANT_MATERIALS]} "
+                        f"— élément {index}"
+                    ),
+                    "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
+                    "form": "implant_material",
+                    "text": material_text,
+                    "text_sha256": hashlib.sha256(material_text.encode("utf-8")).hexdigest(),
+                    "qualification": OpinionClaimQualification.FACT.value,
+                    "certainty": 1.0,
+                    "finding_refs": [],
+                    "evidence_refs": [str(material.evidence_observation_id)],
+                    "implant_material": material.to_payload(),
+                }
+            )
+        for note in opinion.observations:
+            block_type = (
+                note.bridge_block_type.value
+                if note.bridge_block_type is not None
+                else OpinionBlockType.ANALYST_OBSERVATIONS.value
+            )
+            items.append(
+                {
+                    **common,
+                    "id": str(note.id),
+                    "anchor": note.anchor,
+                    "title": (
+                        _OPERATOR_OPINION_BLOCK_TITLES[note.bridge_block_type]
+                        if note.bridge_block_type is not None
+                        else _OPERATOR_OPINION_BLOCK_TITLES[OpinionBlockType.ANALYST_OBSERVATIONS]
+                    ),
+                    "block_type": block_type,
+                    "form": "analyst_note",
+                    "text": note.text,
+                    "text_sha256": hashlib.sha256(note.text.encode("utf-8")).hexdigest(),
+                    "qualification": None,
+                    "certainty": None,
+                    "state": note.state.value,
+                    "relation": note.relation.value,
+                    "finding_refs": [str(item) for item in note.finding_refs],
+                    "evidence_refs": [str(item) for item in note.evidence_refs],
+                }
+            )
+        return tuple(items)
 
     @staticmethod
     def _current_opinion_context(

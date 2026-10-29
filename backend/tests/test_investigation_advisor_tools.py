@@ -45,7 +45,11 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolResult,
 )
-from cti_app.domain.analyst_opinion import OpinionBlockType
+from cti_app.domain.analyst_opinion import (
+    ImplantMaterialEditorialV1,
+    ImplantMaterialType,
+    OpinionBlockType,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
@@ -6718,7 +6722,7 @@ async def test_draft_text_preserves_bridge_output_above_legacy_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_text_batches_selected_opinion_units_with_individual_hashes() -> None:
+async def test_review_text_without_targets_reviews_all_canonical_opinion_units() -> None:
     investigation_id = uuid4()
     opinion_id = uuid4()
     opinion_sha = "b" * 64
@@ -6774,30 +6778,12 @@ async def test_review_text_batches_selected_opinion_units_with_individual_hashes
         return opinion if version in (None, 27) else None
 
     tool._opinions.get = get_opinion
-    units = [
-        {
-            "id": f"U{index}",
-            "block_type": block_type.value,
-            "form": "body",
-            "anchor": None,
-        }
-        for index, block_type in enumerate(block_types, start=1)
-    ]
-    units.append(
-        {
-            "id": "U8",
-            "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
-            "form": "body",
-            "anchor": None,
-        }
-    )
-
     result = await tool.execute(
         {
             "consultation_type": "review_text",
+            "question": "Review the whole current opinion and identify specific gaps.",
             "opinion_id": str(opinion_id),
             "opinion_version": 27,
-            "units": units,
         },
         make_context(investigation_id, key="operator:advisor:review-text-batch"),
     )
@@ -6814,6 +6800,223 @@ async def test_review_text_batches_selected_opinion_units_with_individual_hashes
     implant_unit = next(item for item in final_payload["units"] if item["unit_id"] == "U8")
     assert implant_unit["block_type"] == "Matériel d\u2019implant"
     assert implant_unit["text"] == implant_text
+    assert '"consultation_type"' not in transport.calls[0]["prompt"]
+
+    targeted = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": 27,
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "form": "body",
+                    "anchor": None,
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:review-text-targeted"),
+    )
+    assert targeted.status is ToolInvocationStatus.SUCCEEDED
+    assert len(transport.calls) == 2
+    targeted_payload = typed_prompt_payload(transport.calls[1]["prompt"])
+    assert len(targeted_payload["units"]) == 1
+    assert targeted_payload["units"][0]["text"] == blocks[0].text
+
+
+@pytest.mark.asyncio
+async def test_review_text_invalid_target_lists_valid_units_before_transport() -> None:
+    investigation_id = uuid4()
+    opinion_id = uuid4()
+    opinion = SimpleNamespace(
+        id=opinion_id,
+        investigation_id=investigation_id,
+        version=3,
+        content_sha256="c" * 64,
+        blocks=(
+            SimpleNamespace(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text="The sole canonical body block.",
+                finding_refs=(),
+                evidence_refs=(),
+            ),
+        ),
+        implant_materials_section=None,
+        observations=(),
+    )
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+
+    async def get_opinion(_opinion_id, *, version=None):
+        return opinion if version in (None, opinion.version) else None
+
+    tool._opinions.get = get_opinion
+    result = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": opinion.version,
+            "block_type": OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS.value,
+        },
+        make_context(investigation_id, key="operator:advisor:invalid-opinion-target"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "editorial_unit_target_invalid"
+    assert result.output["valid_targets"] == (
+        {
+            "block_type": OpinionBlockType.KEY_FINDINGS.value,
+            "form": "body",
+            "anchor": None,
+            "title": OpinionBlockType.KEY_FINDINGS.value,
+            "request_shape": "units",
+        },
+    )
+    assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["provider_usage"] == {"status": "not_submitted"}
+    assert "key_findings" in result.message
+    assert transport.calls == []
+
+    invalid_unit = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": opinion.version,
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "form": "body",
+                    "anchor": "S2P2.1",
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:invalid-unit-anchor"),
+    )
+    assert invalid_unit.status is ToolInvocationStatus.FAILED
+    assert invalid_unit.output["input_error_code"] == "editorial_unit_target_invalid"
+    assert invalid_unit.output["valid_targets"] == result.output["valid_targets"]
+    assert invalid_unit.output["failure_stage"] == "pre_transport_validation"
+    assert transport.calls == []
+
+    anchor_only = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": opinion.version,
+            "anchor": "S2P2.1",
+        },
+        make_context(investigation_id, key="operator:advisor:anchor-without-block-type"),
+    )
+    assert anchor_only.status is ToolInvocationStatus.FAILED
+    assert anchor_only.error_code == "advisor_input_invalid"
+    assert anchor_only.output["input_error_code"] == "editorial_unit_target_invalid"
+    assert anchor_only.output["valid_targets"] == result.output["valid_targets"]
+    assert anchor_only.output["failure_stage"] == "pre_transport_validation"
+    assert anchor_only.output["confirmed_non_execution"] is True
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_review_all_includes_structured_implant_material_as_plain_text() -> None:
+    investigation_id = uuid4()
+    opinion_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticMaterialEvidence", "offset": 8}],
+        },
+    )
+    evidence_observation_id = observation.id
+    material = ImplantMaterialEditorialV1(
+        type=ImplantMaterialType.OTHER,
+        value="synthetic-material-value",
+        role="configuration marker",
+        sample_location=".data/config.bin+0x18",
+        sample_sha256="d" * 64,
+        evidence_observation_id=evidence_observation_id,
+    )
+    internal_projection = json.dumps(
+        {"schema": "implant-materials.v1", "items": [material.to_payload()]}
+    )
+    opinion = SimpleNamespace(
+        id=opinion_id,
+        investigation_id=investigation_id,
+        version=4,
+        content_sha256="e" * 64,
+        blocks=(
+            SimpleNamespace(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text="Canonical key finding text.",
+                finding_refs=(),
+                evidence_refs=(),
+            ),
+            SimpleNamespace(
+                block_type=OpinionBlockType.IMPLANT_MATERIALS,
+                text=internal_projection,
+                finding_refs=(),
+                evidence_refs=(),
+            ),
+        ),
+        implant_materials_section=None,
+        implant_materials=(material,),
+        observations=(),
+    )
+
+    def response_for_call(call):
+        payload = typed_prompt_payload(call["prompt"])
+        lines = ["advisor-wire.v1", "TYPE: review_text", "STATUS: succeeded"]
+        for unit in payload["units"]:
+            lines.extend([f"UNIT: {unit['unit_id']}", "REMARK: Garder les références traçables."])
+        lines.append("LIMITATION: none")
+        return TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="\n".join(lines),
+            bridge_invocation_id=str(uuid4()),
+        )
+
+    transport = Transport(response_for_call)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    async def get_opinion(_opinion_id, *, version=None):
+        return opinion if version in (None, opinion.version) else None
+
+    tool._opinions.get = get_opinion
+    result = await tool.execute(
+        {
+            "consultation_type": "review_text",
+            "opinion_id": str(opinion_id),
+            "opinion_version": opinion.version,
+        },
+        make_context(investigation_id, key="operator:advisor:review-all-implant-material"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    payload = typed_prompt_payload(prompt)
+    assert len(payload["units"]) == 2
+    implant_unit = next(
+        unit for unit in payload["units"] if unit["text"].startswith("Implant material 1:")
+    )
+    assert "Type: other" in implant_unit["text"]
+    assert "Value: synthetic-material-value" in implant_unit["text"]
+    assert implant_unit["evidence_refs"] == ["E2"]
+    assert any(
+        item["ref"] == "E2" and item["kind"] == "observation"
+        for item in payload["wire_ref_catalog"]
+    )
+    assert internal_projection not in prompt
+    assert '"schema":"implant-materials.v1"' not in prompt
 
 
 @pytest.mark.asyncio
