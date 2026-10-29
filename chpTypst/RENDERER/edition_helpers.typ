@@ -1,6 +1,6 @@
 #import "../UTILS/colors.typ": purple
 #import "../UTILS/helpers.typ": article-indexing, better-link, styled-table, tag
-#import "publication_helpers.typ": render-publication-body, render-target
+#import "publication_helpers.typ": render-publication-body, render-publication-provenance, render-target
 
 #let has-text(value) = value != none and value != ""
 #let publication-reference-scope(publication) = "edition-article-" + str(publication.position) + "-"
@@ -80,6 +80,11 @@
     ]
   ]
 
+  render-publication-provenance(
+    document-label,
+    document-label-display: edition.at("document_label_display", default: document-label),
+  )
+
   v(16pt)
   heading(level: 1)[Résumé de l'actualité #tag("Articles")]
   let articles = edition.publications.filter(publication => publication.kind == "article")
@@ -121,8 +126,4 @@
     render-brief(publication)
   }
 
-  pagebreak()
-  heading(level: 1)[Provenance de l'édition]
-  text(size: 8pt, fill: purple)[Identité complète : ]
-  text(size: 8pt)[#document-label]
 }

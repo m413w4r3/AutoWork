@@ -188,6 +188,8 @@
   cell-align: auto,
   title: none,
   breakable: false,
+  text-size: 8pt,
+  footer-note: none,
   inset: (x: 4pt, y: 3pt),
   ..content,
 ) = {
@@ -198,16 +200,21 @@
     #cell
   ])
   let body-cells = cells.slice(column-count).enumerate().map(((index, cell)) => {
-    let row = calc.floor(index / column-count)
-    if calc.rem(row, 2) == 0 {
-      [#block(sticky: true, breakable: false, above: 0pt, below: 0pt)[#cell]]
-    } else {
-      [#block(breakable: false, above: 0pt, below: 0pt)[#cell]]
-    }
+    [#block(breakable: false, above: 0pt, below: 0pt)[#cell]]
   })
+  let footer-cells = if footer-note != none and footer-note != "" {
+    (
+      table.cell(colspan: column-count)[
+        #block(breakable: false)[
+          #set par(justify: false)
+          #text(size: text-size, fill: grey, style: "italic")[#footer-note]
+        ]
+      ],
+    )
+  } else { () }
   let body-row-count = calc.floor((cells.len() - column-count) / column-count)
 
-  set text(size: 8pt)
+  set text(size: text-size)
   let rendered-table = align(center, table(
     columns: columns,
     inset: inset,
@@ -217,7 +224,7 @@
     fill: (_, y) => if y == 0 { rgb("#5D7374") } else { none },
     stroke: 0.4pt + rgb("#AEB7C0"),
     table.header(repeat: true, ..header-cells),
-    ..body-cells,
+    ..(body-cells + footer-cells),
   ))
 
   if body-row-count <= 12 {
@@ -254,7 +261,7 @@
   }
 }
 
-#let render-opinion-pipe-table(pipe-table) = {
+#let render-opinion-pipe-table(pipe-table, footer-note: none) = {
   let columns = pipe-table.column_weights.map(weight => weight * 1fr)
   let cell-align = pipe-table.alignment.map(value => {
     if value == "right" { right } else if value == "center" { center } else { left }
@@ -265,6 +272,8 @@
     columns,
     cell-align: cell-align,
     breakable: true,
+    text-size: 9pt,
+    footer-note: footer-note,
     inset: (x: 4pt, y: 4pt),
     ..(header + rows),
   )
@@ -275,13 +284,15 @@
     let prefix = pipe-table.at("prefix", default: "")
     let suffix = pipe-table.at("suffix", default: "")
     if pipe-table.wide [
-      #if prefix != "" [#text(prefix) #parbreak()]
-      #pagebreak(weak: true)
       #set page(flipped: true)
-      #render-opinion-pipe-table(pipe-table)
-      #pagebreak(weak: true)
+      #if prefix != "" [
+        #block(sticky: true, below: 4pt)[
+          #set par(justify: false)
+          #text(prefix)
+        ]
+      ]
+      #render-opinion-pipe-table(pipe-table, footer-note: suffix)
       #set page(flipped: false)
-      #if suffix != "" [#parbreak() #text(suffix)]
     ] else [
       #if prefix != "" [#text(prefix) #parbreak()]
       #render-opinion-pipe-table(pipe-table)
@@ -401,20 +412,27 @@
   ]
 }
 
-#let render-publication-provenance(document-label) = block(
-  width: 100%,
-  above: 6pt,
-  below: 0pt,
-  fill: rgb("#F8FAFC"),
-  stroke: 0.4pt + rgb("#D0D5DD"),
-  inset: 6pt,
-  radius: 3pt,
-  breakable: false,
-)[
-  #text(size: 8pt, weight: "bold", fill: accent)[PROVENANCE DE PUBLICATION]
-  #linebreak()
-  #text(size: 7.5pt, fill: grey)[Identité complète : #document-label]
-]
+#let render-publication-provenance(document-label, document-label-display: none) = {
+  let display = if document-label-display == none { document-label } else { document-label-display }
+  block(
+    width: 100%,
+    above: 4pt,
+    below: 4pt,
+    fill: rgb("#F8FAFC"),
+    stroke: 0.4pt + rgb("#D0D5DD"),
+    inset: 6pt,
+    radius: 3pt,
+    breakable: true,
+  )[
+    #set par(justify: false)
+    #text(size: 8pt, weight: "bold", fill: accent)[PROVENANCE DE PUBLICATION]
+    #linebreak()
+    #text(size: 7.5pt, fill: grey)[Identité complète : ]
+    #text(font: code-font-families, size: 7.5pt, fill: grey, hyphenate: false)[
+      #publication-display-text(display)
+    ]
+  ]
+}
 
 #let render-ioc-table(groups, reference-scope: "") = {
   for group in groups {
@@ -422,53 +440,50 @@
     let header-cells = if hash-only {
       ([Empreinte de fichier — une valeur par ligne], [Statut, relation et provenance])
     } else {
-      ([Type], [Valeur défanguée], [Statut, relation et contexte], [Source [#text[n]]])
+      ([Type], [Valeur défanguée], [Statut indicateur], [Statut relation], [Contexte et provenance])
     }
     let body-cells = if hash-only {
       group.rows.map(row => (
         [
-          #box[#text(font: code-font-families, size: 8pt, hyphenate: false)[#row.value]]
+          #box[#text(font: code-font-families, size: 9pt, hyphenate: false)[#row.value]]
         ],
         [
-          #text(size: 7.5pt, weight: "bold")[Ind. #row.at("indicator_status_short_label", default: row.at("indicator_status_label", default: "")) · Rel. #row.at("relationship_status_short_label", default: row.at("relationship_status_label", default: row.status_label))]
+          #text(size: 8.5pt, weight: "bold")[Ind. #row.at("indicator_status_short_label", default: row.at("indicator_status_label", default: "")) · Rel. #row.at("relationship_status_short_label", default: row.at("relationship_status_label", default: row.status_label))]
           #let context-summary = row.at("hash_context_summary", default: row.at("context_summary", default: ""))
           #let source-refs = row.at("source_refs", default: ())
           #if context-summary != "" [
             #linebreak()
-            #text(size: 6.5pt, fill: grey)[#context-summary]
+            #text(size: 8.5pt, fill: grey)[#context-summary]
           ]
           #if source-refs.len() > 0 [
-            #if context-summary != "" [#text(size: 6.5pt, fill: grey)[ · ]]
-            #text(size: 6.5pt, fill: grey)[src ]
-            #text(size: 6.5pt, fill: grey)[#render-source-references(source-refs, reference-scope: reference-scope)]
+            #if context-summary != "" [#text(size: 8.5pt, fill: grey)[ · ]]
+            #text(size: 8.5pt, fill: grey)[src ]
+            #text(size: 8.5pt, fill: grey)[#render-source-references(source-refs, reference-scope: reference-scope)]
           ]
           #let draft-refs = row.at("draft_refs", default: ())
           #if draft-refs.len() > 0 [
-            #if context-summary != "" or source-refs.len() > 0 [#text(size: 6.5pt, fill: grey)[ · ]]
+            #if context-summary != "" or source-refs.len() > 0 [#text(size: 8.5pt, fill: grey)[ · ]]
             #render-opinion-references(draft-refs, reference-scope: reference-scope)
           ]
         ],
       )).flatten()
     } else {
       group.rows.map(row => (
-        [#text(size: 7pt, weight: "bold")[#row.type_label]],
-        [#text(font: code-font-families, size: 7.5pt, hyphenate: false)[#semantic-or-plain(row.value, row.value_spans)]],
+        [#text(size: 9pt, weight: "bold")[#row.type_label]],
+        [#text(font: code-font-families, size: 9pt, hyphenate: false)[#semantic-or-plain(row.value, row.value_spans)]],
+        [#text(size: 8.5pt, weight: "bold")[#row.at("indicator_status_label", default: "")]],
+        [#text(size: 8.5pt, weight: "bold")[#row.at("relationship_status_label", default: row.status_label)]],
         [
-          #text(size: 7pt, weight: "bold")[Indicateur : #row.at("indicator_status_label", default: "")]
-          #linebreak()
-          #text(size: 7pt, weight: "bold")[Relation : #row.at("relationship_status_label", default: row.status_label)]
           #let context-summary = row.at("context_summary", default: "")
-          #if context-summary != "" [
-            #linebreak()
-            #text(size: 6.5pt, fill: grey)[#context-summary]
-          ]
-        ],
-        [
+          #if context-summary != "" [#text(size: 8.5pt, fill: grey)[#context-summary]]
           #let source-refs = row.at("source_refs", default: ())
-          #if source-refs.len() > 0 [#render-source-references(source-refs, reference-scope: reference-scope)]
+          #if source-refs.len() > 0 [
+            #if context-summary != "" [#linebreak()]
+            #text(size: 8.5pt, fill: grey)[src #render-source-references(source-refs, reference-scope: reference-scope)]
+          ]
           #let draft-refs = row.at("draft_refs", default: ())
           #if draft-refs.len() > 0 [
-            #linebreak()
+            #if context-summary != "" or source-refs.len() > 0 [#linebreak()]
             #render-opinion-references(draft-refs, reference-scope: reference-scope)
           ]
         ],
@@ -479,12 +494,14 @@
     ]
     publication-styled-table(
       if hash-only {
-        (0.72, 0.28).map(weight => weight * 1fr)
+        (0.55, 0.45).map(weight => weight * 1fr)
       } else {
-        (0.7, 1.4, 3.0, 0.9).map(weight => weight * 1fr)
+        (0.65, 1.45, 1.15, 1.15, 2.35).map(weight => weight * 1fr)
       },
-      cell-align: if hash-only { (left, left) } else { (left, left, left, left) },
-      inset: (x: 3pt, y: 1pt),
+      cell-align: if hash-only { (left, left) } else { (left, left, left, left, left) },
+      breakable: true,
+      text-size: 9pt,
+      inset: (x: 4pt, y: 2.5pt),
       ..(header-cells + body-cells),
     )
   }
@@ -1006,11 +1023,9 @@
       #for item in opinion-blocks [
         #heading(level: 3)[#item.number #text(item.heading)]
         #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
-        #h(1em)
-        #text(size: 8pt)[Confiance : #item.certainty_percent%]
         #parbreak()
         #render-opinion-text(
-          none,
+          item.at("text_spans", default: none),
           item.text,
           pipe-table: item.at("pipe_table", default: none),
         )
@@ -1165,7 +1180,6 @@
         #text(size: 8pt, fill: grey)[#content_section.omitted_invalid_url_count URL non valide(s) omise(s) des listes.]
       ]
     ] else if content_section.type == "technical_annex" [
-      #pagebreak(weak: true)
       #set page(flipped: true)
       #let ioc_rows = content_section.at("ioc_rows", default: ())
       #let ioc_row_groups = content_section.at("ioc_row_groups", default: ())
@@ -1277,9 +1291,6 @@
           ]
         ]
       ]
-      #if publication.at("document_label", default: none) != none [
-        #render-publication-provenance(publication.at("document_label"))
-      ]
       #set page(flipped: false)
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
@@ -1292,9 +1303,6 @@
   if not has-text(document-label) {
     panic("publication render-data requires document_label")
   }
-  let has-technical-annex = publication.content_sections.any(
-    content-section => content-section.type == "technical_annex",
-  )
   [
     #render-target(
       publication.at("article_title_target_id", default: none),
@@ -1328,9 +1336,10 @@
         )
       ]
     ]
+    #render-publication-provenance(
+      document-label,
+      document-label-display: publication.at("document_label_display", default: document-label),
+    )
     #render-publication-body(publication)
-    #if not has-technical-annex [
-      #render-publication-provenance(document-label)
-    ]
   ]
 }

@@ -598,28 +598,47 @@ _OPINION_TECHNICAL_TOKEN = re.compile(
     r"[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
 )
+_OPINION_INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _PIPE_TABLE_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 _PIPE_TABLE_SHA256 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE)
 
 
 def _opinion_text_spans(value: str) -> list[dict[str, Any]]:
-    """Mark hashes and UUIDs for monospaced, non-justified Typst rendering."""
+    """Mark inline code, hashes, and UUIDs for non-justified Typst rendering."""
     spans: list[dict[str, Any]] = []
+
+    def add_plain_text(plain_text: str) -> None:
+        cursor = 0
+        for match in _OPINION_TECHNICAL_TOKEN.finditer(plain_text):
+            if match.start() > cursor:
+                spans.append({"text": plain_text[cursor : match.start()], "technical": False})
+            spans.append(
+                {
+                    **_breakable_typst_display_text(
+                        match.group(0), interval=8, break_at_technical_separators=True
+                    ),
+                    "technical": True,
+                }
+            )
+            cursor = match.end()
+        if cursor < len(plain_text):
+            spans.append({"text": plain_text[cursor:], "technical": False})
+
     cursor = 0
-    for match in _OPINION_TECHNICAL_TOKEN.finditer(value):
-        if match.start() > cursor:
-            spans.append({"text": value[cursor : match.start()], "technical": False})
+    for match in _OPINION_INLINE_CODE.finditer(value):
+        add_plain_text(value[cursor : match.start()])
         spans.append(
             {
                 **_breakable_typst_display_text(
-                    match.group(0), interval=8, break_at_technical_separators=True
+                    match.group(1), interval=8, break_at_technical_separators=True
                 ),
                 "technical": True,
             }
         )
         cursor = match.end()
-    if cursor < len(value) or not spans:
-        spans.append({"text": value[cursor:], "technical": False})
+    add_plain_text(value[cursor:])
+    if not spans:
+        spans.append({"text": "", "technical": False})
     return spans
 
 
@@ -955,9 +974,15 @@ class TypstRenderer:
                 enrichment_identity=target_artifact_identities.get("enrichment"),
             )
 
+        normalized_document_label = document_label.strip()
         render_data: dict[str, Any] = {
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
-            "document_label": document_label.strip(),
+            "document_label": normalized_document_label,
+            "document_label_display": _breakable_typst_display_text(
+                normalized_document_label,
+                interval=8,
+                break_at_technical_separators=True,
+            ),
             "document_header": _publication_document_header(document),
             "language": document.publication_language,
             "title": model.title,
@@ -2199,15 +2224,17 @@ def project_publication_to_typst_model(
         else "Le lien avec le sujet n\u2019est pas démontré."
     )
 
+    reference_section: dict[str, Any] = {
+        "type": "references",
+        "entries": source_references,
+        # Kept as an additive alias for already-published V5/V6 payload readers.
+        "timeline": list(legacy_reference_rows),
+        "blocks": reference_blocks,
+        "sources": sources,
+    }
     content_sections: list[dict[str, Any]] = [
-        {
-            "type": "references",
-            "entries": source_references,
-            # Kept as an additive alias for already-published V5/V6 payload readers.
-            "timeline": list(legacy_reference_rows),
-            "blocks": reference_blocks,
-            "sources": sources,
-        }
+        {"type": "synthesis", "blocks": body_blocks},
+        reference_section,
     ]
     timeline_figure = (
         build_publication_timeline_figure(publication_v5)
@@ -2220,7 +2247,7 @@ def project_publication_to_typst_model(
         else None
     )
     expected_section_types = publication_content_section_types(value)
-    content_sections[0]["show_heading"] = bool(
+    reference_section["show_heading"] = bool(
         reference_entries or "chronology" in expected_section_types
     )
     if timeline_figure is not None:
@@ -2289,8 +2316,6 @@ def project_publication_to_typst_model(
         if timeline_figure is not None:
             chronology_section["derived_timeline_figure"] = timeline_figure
         content_sections.append(chronology_section)
-    content_sections.append({"type": "synthesis", "blocks": body_blocks})
-
     investigation_chain_figure = (
         build_investigation_chain_figure(publication_v6) if publication_v6 is not None else None
     )
@@ -2492,7 +2517,7 @@ def project_publication_to_typst_model(
             heading,
             text,
             qualification,
-            certainty,
+            _certainty,
             finding_refs,
             evidence_refs,
         ) in enumerate(display_blocks):
@@ -2506,7 +2531,6 @@ def project_publication_to_typst_model(
                     "pipe_table": _opinion_pipe_table(text),
                     "qualification": qualification,
                     "qualification_label": qualification_labels[qualification],
-                    "certainty_percent": round(certainty * 100),
                     "finding_refs": collect_opinion_references(
                         context_label, "finding", finding_refs
                     ),
