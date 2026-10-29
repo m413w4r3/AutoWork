@@ -7680,8 +7680,8 @@ def test_exhausted_transport_pre_submission_retry_gets_typed_no_send_proof() -> 
     submission = TurnSubmission(
         TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED,
         error_code="conversation_unavailable",
-        submission_state="pre_submission",
-        failure_stage="bridge_transport_pre_submission",
+        submission_state="not_submitted",
+        failure_stage="pre_submission",
         prior_submission_made=False,
     )
 

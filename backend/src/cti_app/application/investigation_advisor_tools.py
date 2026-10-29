@@ -5468,6 +5468,7 @@ def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
             "secret_preflight",
             "sample_disclosure_restricted",
             "evidence_preflight",
+            "pre_submission",
             "bridge_transport_pre_submission",
         }
     ):
