@@ -379,7 +379,7 @@ class CriticModel(Protocol):
 class ModelOutputStore(Protocol):
     async def store(self, content: bytes, *, mime_type: str) -> str: ...
 
-    async def read(self, reference: str, *, max_bytes: int) -> bytes: ...
+    async def read(self, reference: str, *, max_bytes: int | None) -> bytes: ...
 
 
 class ModelRunRepository(Protocol):
@@ -630,8 +630,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
 
     async def read_output(self, reference: str, *, max_bytes: int | None = None) -> bytes:
         return await self._output_store.read(
-            reference, max_bytes=max_bytes or self._model_output_max_bytes
+            reference,
+            max_bytes=self._model_output_max_bytes if max_bytes is None else max_bytes,
         )
+
+    async def read_output_unbounded(self, reference: str) -> bytes:
+        """Read a stored Bridge response using its verified blob size as the bound."""
+        return await self._output_store.read(reference, max_bytes=None)
 
     async def archive_output(self, content: bytes, *, mime_type: str) -> str:
         return await self._output_store.store(content, mime_type=mime_type)
@@ -1413,7 +1418,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         )
         if reference is None:
             raise ModelGatewayError("Succeeded ModelRun has no persisted output")
-        content = await self._output_store.read(reference, max_bytes=self._model_output_max_bytes)
+        max_bytes = (
+            None
+            if run.backend is ModelBackend.CHATGPT_BRIDGE
+            else self._model_output_max_bytes
+        )
+        content = await self._output_store.read(reference, max_bytes=max_bytes)
         text = content.decode("utf-8")
         structured = validate_structured_output(text, output_schema) if output_schema else None
         return ModelExecution(

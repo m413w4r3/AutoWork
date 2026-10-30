@@ -107,6 +107,7 @@ ADVISOR_REPARSE_TOOL_NAME = "advisor.reparse"
 ADVISOR_REPARSE_SCHEMA_VERSION = "advisor-reparse.v1"
 ADVISOR_OPERATOR_TOOL_NAMES = frozenset({ADVISOR_TOOL_NAME, ADVISOR_REPARSE_TOOL_NAME})
 _UUID = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_ARTICLE_CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
 ADVISOR_RESPONSE_SCHEMA_V2 = "advisor-response.v2"
 ADVISOR_RESPONSE_SCHEMA = ADVISOR_RESPONSE_SCHEMA_V2
 _TYPED_CONSULTATION_TYPES = frozenset(
@@ -1230,6 +1231,14 @@ class InvestigationAdvisorTool:
         parse_started_at = time.perf_counter()
         if output_archive_error is not None:
             consumed_turns = _bridge_turns_consumed(submission)
+            safe_output, secret_count = redact_explicit_operational_secrets(
+                raw_output or "",
+                operational_secret_values=configured_operational_secret_values(self._settings),
+            )
+            advisory_text = str(safe_output)
+            output_warnings = ["response_archival_failed", "structured_parse_unavailable"]
+            if secret_count:
+                output_warnings.append("secret_redacted")
             result = ToolResult(
                 ToolInvocationStatus.NEEDS_REVIEW,
                 observation_refs=advisor_observation_refs,
@@ -1244,7 +1253,17 @@ class InvestigationAdvisorTool:
                 },
                 error_code="advisor_output_persistence_uncertain",
                 output={
-                    "advisor_status": "needs_review",
+                    "advisor_status": "partial",
+                    "consultation_type": consultation_type,
+                    "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
+                    "raw_output": advisory_text,
+                    "raw_output_bytes": len(raw_output_bytes or b""),
+                    "raw_output_sha256": output_sha256,
+                    "raw_output_retained": True,
+                    "raw_output_truncated": False,
+                    "output_sha256": output_sha256,
+                    "usable": False,
+                    "warnings": output_warnings,
                     "failure_stage": "response_archival",
                     "failure_reason": type(output_archive_error).__name__,
                     "confirmed_non_execution": False,
@@ -1254,38 +1273,6 @@ class InvestigationAdvisorTool:
                     "response_bytes": len(raw_output_bytes or b""),
                 },
                 exception_class=type(output_archive_error).__name__,
-            )
-        elif raw_output_bytes is not None and len(raw_output_bytes) > int(
-            getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)
-        ):
-            consumed_turns = _bridge_turns_consumed(submission)
-            result = ToolResult(
-                ToolInvocationStatus.FAILED,
-                observation_refs=advisor_observation_refs,
-                budget_consumed={
-                    BudgetDimension.BRIDGE_TURNS: consumed_turns,
-                    BudgetDimension.CONTEXT_BYTES: len(encoded),
-                    BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
-                    BudgetDimension.TOOL_SECONDS: min(
-                        execution_timeout_seconds,
-                        max(1, math.ceil(time.monotonic() - started_at)),
-                    ),
-                },
-                error_code="advisor_output_object_limit_exceeded",
-                output={
-                    "advisor_status": "output_not_processed",
-                    "failure_stage": "infrastructure_size_guard",
-                    "failure_reason": "model_output_max_bytes_exceeded",
-                    "confirmed_non_execution": False,
-                    "bridge_invocation_id": getattr(submission, "bridge_invocation_id", None),
-                    "bridge_turns_consumed": consumed_turns,
-                    "output_sha256": output_sha256,
-                    "output_blob_id": str(output_blob_id) if output_blob_id else None,
-                    "response_bytes": len(raw_output_bytes),
-                    "maximum_object_bytes": int(
-                        getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)
-                    ),
-                },
             )
         else:
             result = self._submission_result(
@@ -1406,9 +1393,7 @@ class InvestigationAdvisorTool:
             observation = await ProductionEvidenceRecorder(
                 self._artifact_store,
                 self._observations,
-                max_payload_bytes=int(
-                    getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)
-                ),
+                max_payload_bytes=None,
             ).record_json(
                 investigation_id=context.investigation_id,
                 kind=EvidenceKind.OTHER,
@@ -1538,6 +1523,21 @@ class InvestigationAdvisorTool:
                 },
             )
         except Exception as exc:
+            retained_output = dict(result.output)
+            if raw_output is not None:
+                retained_output.setdefault("consultation_type", consultation_type)
+                retained_output.setdefault("advisor_status", "partial")
+                retained_output.setdefault(
+                    "advisory_text", "[UNTRUSTED ADVISORY]\n" + raw_output
+                )
+                retained_output.setdefault("raw_output", raw_output)
+                retained_output.setdefault("raw_output_sha256", output_sha256)
+                retained_output.setdefault("output_sha256", output_sha256)
+                retained_output.setdefault("raw_output_bytes", response_bytes)
+                retained_output.setdefault("raw_output_retained", True)
+                retained_output.setdefault("raw_output_truncated", False)
+                retained_output.setdefault("usable", False)
+                retained_output.setdefault("warnings", ["result_persistence_uncertain"])
             return self._finish(
                 context,
                 ToolResult(
@@ -1545,7 +1545,12 @@ class InvestigationAdvisorTool:
                     observation_refs=tuple(item.id for item in evidence),
                     budget_consumed=result.budget_consumed,
                     error_code="advisor_result_persistence_uncertain",
-                    output={"advisor_status": "needs_review", "retry": False},
+                    output={
+                        **retained_output,
+                        "advisor_status": "partial",
+                        "failure_stage": "result_persistence",
+                        "retry": False,
+                    },
                     exception_class=type(exc).__name__,
                     framework_pre_submission_proof=(
                         FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
@@ -2121,6 +2126,7 @@ class InvestigationAdvisorTool:
             if isinstance(raw_observation_refs, (list, tuple))
             else set()
         )
+        article_passages = _consultation_article_passages(snapshot, question)
         base: dict[str, Any] = {
             "investigation_id": str(investigation_id),
             "consultation_type": consultation_type,
@@ -2128,22 +2134,7 @@ class InvestigationAdvisorTool:
             "article_source_ref": f"article:{snapshot.synthesis_sha256}",
             "article_sha256": snapshot.synthesis_sha256,
             "article_summary": snapshot.article.short_summary.strip(),
-            "article_passages": [
-                {
-                    "claim_id": getattr(item, "claim_id", ""),
-                    "heading": getattr(item, "heading", ""),
-                    "text": getattr(item, "text", ""),
-                    **(
-                        {"section_index": item.section_index}
-                        if type(getattr(item, "section_index", None)) is int
-                        else {}
-                    ),
-                    "source_document_ids": [
-                        str(document_id) for document_id in getattr(item, "source_document_ids", ())
-                    ],
-                }
-                for item in getattr(snapshot, "article_passages", ())
-            ],
+            "article_passages": article_passages,
             "open_questions": list(snapshot.article.open_questions),
             "samples": [],
             "evidence": [],
@@ -4203,38 +4194,83 @@ class InvestigationAdvisorTool:
             prompt_data=prompt_data,
             operational_secret_values=configured_operational_secret_values(self._settings),
         )
+        safe_output, raw_secret_count = redact_explicit_operational_secrets(
+            raw_output,
+            operational_secret_values=configured_operational_secret_values(self._settings),
+        )
+        safe_advisory_text = str(safe_output)
+        draft_assertions = prompt_data.get("assertions")
+        has_linked_draft_assertion = (
+            isinstance(draft_assertions, (list, tuple))
+            and any(
+                isinstance(assertion, Mapping)
+                and any(
+                    isinstance(reference, Mapping)
+                    and reference.get("kind") in {"observation", "finding"}
+                    and isinstance(reference.get("sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", reference["sha256"]) is not None
+                    for reference in assertion.get("refs", ())
+                )
+                for assertion in draft_assertions
+            )
+        )
+        evidence_links_absent = consultation_type == "draft_text" and not has_linked_draft_assertion
+        parse_failed = parsed is None or (
+            isinstance(parsed, Mapping)
+            and (
+                parsed.get("status") in {"invalid", "ambiguous"}
+                or (parsed.get("status") == "partial" and parsed.get("usable") is False)
+            )
+        )
         if parsed is None:
-            return ToolResult(
-                ToolInvocationStatus.FAILED,
-                observation_refs=evidence_refs,
-                budget_consumed=usage,
-                error_code="advisor_output_invalid",
-                output={
-                    "advisor_status": "output_invalid",
-                    "retry": False,
-                    "untrusted": True,
-                    "validation_rejection": validation_rejection,
-                    "response_excerpt": _advisor_response_excerpt(raw_output),
-                    "response_sha256": raw_sha256,
-                    "output_sha256": raw_sha256,
-                    "response_bytes": len(raw_bytes),
-                    "usable": False,
-                    "bridge_turns_consumed": bridge_turns_consumed,
-                    "parse_status": "invalid",
-                },
-            )
-        if isinstance(parsed.get("summary"), str):
-            display_text = parsed["summary"]
-        elif consultation_type == "draft_text":
-            display_text = " ".join(
-                sentence["text"]
-                for block in parsed.get("blocks", ())
-                for sentence in block.get("sentences", ())
-            )
-        else:
-            display_text = f"Bridge a produit un artefact typé {consultation_type}."
+            parsed = {
+                "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+                "consultation_type": consultation_type,
+                "status": "partial",
+                "untrusted": True,
+                "usable": False,
+                "warnings": ["structured_parse_unavailable"],
+                "normalization_status": "partial",
+            }
+        elif parse_failed:
+            parsed = dict(parsed)
+            parsed["status"] = "partial"
+            parsed["usable"] = False
+            warnings = parsed.setdefault("warnings", [])
+            if isinstance(warnings, list) and "structured_parse_unavailable" not in warnings:
+                warnings.append("structured_parse_unavailable")
+            parsed["normalization_status"] = "partial"
+        if evidence_links_absent:
+            parsed["status"] = "partial"
+            parsed["usable"] = False
+            warnings = parsed.setdefault("warnings", [])
+            if isinstance(warnings, list) and "evidence_links_absent" not in warnings:
+                warnings.append("evidence_links_absent")
+            parsed["normalization_status"] = "partial"
+        parsed["raw_output"] = safe_advisory_text
+        parsed["raw_output_bytes"] = len(raw_bytes)
+        parsed["raw_output_sha256"] = raw_sha256
+        parsed["raw_output_retained"] = True
+        parsed["raw_output_truncated"] = False
+        if validation_rejection:
+            parsed["validation_rejection"] = {
+                key: value
+                for key, value in validation_rejection.items()
+                if key in {"code", "path", "normalization_status", "normalizations"}
+            }
+        if raw_secret_count:
+            warnings = parsed.setdefault("warnings", [])
+            if isinstance(warnings, list) and "secret_redacted" not in warnings:
+                warnings.append("secret_redacted")
+        display_text = safe_advisory_text
+        if evidence_links_absent and "liens de preuve absents" not in display_text.casefold():
+            display_text += "\n\n[Avertissement consultatif : liens de preuve absents.]"
         tagged = "[UNTRUSTED ADVISORY]\n" + display_text
-        advisor_status, invocation_status = _advisor_output_result_status(parsed)
+        advisor_status, invocation_status = (
+            ("partial", ToolInvocationStatus.PARTIAL)
+            if parse_failed or evidence_links_absent
+            else _advisor_output_result_status(parsed)
+        )
         advisor_output = {
             "advisor_status": advisor_status,
             "consultation_type": consultation_type,
@@ -4564,11 +4600,24 @@ class ReparsePersistedAdvisorOutputTool:
                 error_code="advisor_reparse_original_not_found",
             )
         try:
+            original_blob = await self._blobs.get(original.blob_id)
+            original_descriptor = getattr(original_blob, "descriptor", None)
+            original_size = getattr(original_descriptor, "size", None)
+            if (
+                original_descriptor is None
+                or getattr(original_descriptor, "sha256", None) != original.sha256
+                or type(original_size) is not int
+                or original_size < 0
+            ):
+                raise ValueError("original observation blob descriptor mismatch")
             original_bytes = await self._artifact_store.read_bytes(
                 original.blob_id,
-                max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+                max_bytes=original_size,
             )
-            if hashlib.sha256(original_bytes).hexdigest() != original.sha256:
+            if (
+                len(original_bytes) != original_size
+                or hashlib.sha256(original_bytes).hexdigest() != original.sha256
+            ):
                 raise ValueError("original observation payload SHA-256 mismatch")
             persisted = json.loads(original_bytes.decode("utf-8", errors="strict"))
         except (
@@ -4626,9 +4675,36 @@ class ReparsePersistedAdvisorOutputTool:
                 error_code="advisor_reparse_provenance_invalid",
             )
         selected_parser = arguments.get("parser_version")
+        if selected_parser not in {
+            ADVISOR_SOURCE_PARSER_VERSION,
+            ADVISOR_SOURCE_PARSER_VERSION_V4,
+        }:
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL,
+                error_code="advisor_reparse_parser_version_required",
+                output={
+                    "status": "parser_version_required",
+                    "reparsed_from_observation_id": str(original.id),
+                    "advisor_response_schema": persisted.get("advisor_response_schema"),
+                    "stored_parser_version": output.get("parser_version"),
+                    "selected_parser_version": selected_parser,
+                    "supported_parser_versions": [
+                        ADVISOR_SOURCE_PARSER_VERSION,
+                        ADVISOR_SOURCE_PARSER_VERSION_V4,
+                    ],
+                    "output_sha256": output_sha256,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                },
+            )
+        expected_schema = (
+            ADVISOR_RESPONSE_SCHEMA_V4
+            if selected_parser == ADVISOR_SOURCE_PARSER_VERSION_V4
+            else ADVISOR_RESPONSE_SCHEMA_V3
+        )
         if (
-            persisted.get("advisor_response_schema") != ADVISOR_RESPONSE_SCHEMA_V4
-            or output.get("parser_version") != ADVISOR_SOURCE_PARSER_VERSION_V4
+            persisted.get("advisor_response_schema") != expected_schema
+            or output.get("parser_version") != selected_parser
         ):
             return ToolResult(
                 ToolInvocationStatus.PARTIAL,
@@ -4643,22 +4719,7 @@ class ReparsePersistedAdvisorOutputTool:
                     "bridge_turns_consumed": 0,
                     "new_observation_written": False,
                 },
-                message=(
-                    "Le format advisor historique est conservé en lecture; "
-                    "aucun nouveau résultat n'a été écrit."
-                ),
-            )
-        if selected_parser != ADVISOR_SOURCE_PARSER_VERSION_V4:
-            return ToolResult(
-                ToolInvocationStatus.PARTIAL,
-                error_code="advisor_reparse_parser_version_required",
-                output={
-                    "status": "parser_version_required",
-                    "required_parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
-                    "output_sha256": output_sha256,
-                    "bridge_turns_consumed": 0,
-                    "new_observation_written": False,
-                },
+                message="La version de parseur choisie ne correspond pas à celle de la sortie.",
             )
         raw_reader = getattr(self._blobs, "get_by_address", None)
         if not callable(raw_reader):
@@ -4676,9 +4737,7 @@ class ReparsePersistedAdvisorOutputTool:
             or raw_blob_id is None
             or getattr(descriptor, "sha256", None) != output_sha256
             or type(raw_size) is not int
-            or not 1
-            <= raw_size
-            <= int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024))
+            or not 1 <= raw_size
         ):
             return ToolResult(
                 ToolInvocationStatus.FAILED,
@@ -4687,7 +4746,7 @@ class ReparsePersistedAdvisorOutputTool:
         try:
             raw_bytes = await self._artifact_store.read_bytes(
                 raw_blob_id,
-                max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+                max_bytes=raw_size,
             )
             raw_text = raw_bytes.decode("utf-8", errors="strict")
         except (AttributeError, KeyError, TypeError, UnicodeDecodeError, ValueError):
@@ -4731,6 +4790,80 @@ class ReparsePersistedAdvisorOutputTool:
                         ToolInvocationStatus.FAILED,
                         error_code="advisor_reparse_measurement_refs_invalid",
                     )
+        if selected_parser == ADVISOR_SOURCE_PARSER_VERSION:
+            raw_reparse_context = persisted.get("reparse_context")
+            refs_match = (
+                isinstance(raw_reparse_context, Mapping)
+                and raw_reparse_context.get("transmitted_refs") == normalized_refs
+            )
+            legacy_parse = None
+            if refs_match:
+                try:
+                    legacy_parse = parse_typed_advisor_response(
+                        raw_text,
+                        consultation_type=consultation_type,
+                        prompt_data=dict(raw_reparse_context),
+                        safe_text=lambda value, _limit: value.strip(),
+                        operational_secret_values=configured_operational_secret_values(
+                            self._settings
+                        ),
+                    )
+                except (TypeError, ValueError, KeyError, AttributeError):
+                    legacy_parse = None
+            redacted_output, redacted_count = redact_explicit_operational_secrets(
+                raw_text,
+                operational_secret_values=configured_operational_secret_values(self._settings),
+            )
+            advisory_text = str(redacted_output)
+            warnings = (
+                list(legacy_parse.get("warnings", ()))
+                if isinstance(legacy_parse, Mapping)
+                and isinstance(legacy_parse.get("warnings"), list)
+                else []
+            )
+            if legacy_parse is None and "structured_parse_unavailable" not in warnings:
+                warnings.append("structured_parse_unavailable")
+            if not refs_match and "legacy_context_unavailable" not in warnings:
+                warnings.append("legacy_context_unavailable")
+            if redacted_count and "secret_redacted" not in warnings:
+                warnings.append("secret_redacted")
+            legacy_output = {
+                "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+                "consultation_type": consultation_type,
+                "status": "partial",
+                "untrusted": True,
+                "usable": False,
+                "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
+                "raw_output": advisory_text,
+                "raw_output_bytes": len(raw_bytes),
+                "raw_output_sha256": output_sha256,
+                "raw_output_retained": True,
+                "raw_output_truncated": False,
+                "warnings": warnings,
+                "structured_parse": (
+                    dict(legacy_parse) if isinstance(legacy_parse, Mapping) else None
+                ),
+                "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+            }
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL,
+                observation_refs=(original.id,),
+                output={
+                    "advisor_status": "partial",
+                    "reparsed_from_observation_id": str(original.id),
+                    "bridge_invocation_id": invocation_id,
+                    "output_sha256": output_sha256,
+                    "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+                    "usable": False,
+                    "warnings": warnings,
+                    "consultation_type": consultation_type,
+                    "output": legacy_output,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                    "canonical_promotion": False,
+                },
+                message="La sortie Bridge historique est restituée comme résultat consultatif non fiable.",
+            )
         raw_reparse_context = persisted.get("reparse_context")
         if not isinstance(raw_reparse_context, Mapping):
             return ToolResult(
@@ -4952,7 +5085,10 @@ def register_advisor_reparse_tool(
                     },
                     "parser_version": {
                         "type": "string",
-                        "enum": [ADVISOR_SOURCE_PARSER_VERSION_V4],
+                        "enum": [
+                            ADVISOR_SOURCE_PARSER_VERSION,
+                            ADVISOR_SOURCE_PARSER_VERSION_V4,
+                        ],
                     },
                 },
                 "required": ["observation_id"],
@@ -5874,6 +6010,78 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
     )
 
 
+def _consultation_article_passages(snapshot: Any, question: str) -> list[dict[str, Any]]:
+    """Resolve cited local claim IDs into the verified article snapshot."""
+    passages = [
+        {
+            "claim_id": getattr(item, "claim_id", ""),
+            "heading": getattr(item, "heading", ""),
+            "text": getattr(item, "text", ""),
+            **(
+                {"section_index": item.section_index}
+                if type(getattr(item, "section_index", None)) is int
+                else {}
+            ),
+            "source_document_ids": [
+                str(document_id) for document_id in getattr(item, "source_document_ids", ())
+            ],
+        }
+        for item in getattr(snapshot, "article_passages", ())
+    ]
+    article = getattr(snapshot, "article", None)
+    local_claims = {
+        str(getattr(item, "id", "")).casefold(): item
+        for item in getattr(article, "claims", ())
+        if isinstance(getattr(item, "id", None), str)
+    }
+    cited_claim_ids = {item.casefold() for item in _ARTICLE_CLAIM_ID.findall(question)}
+    passage_ids = {
+        str(item.get("claim_id", "")).casefold()
+        for item in passages
+        if isinstance(item, Mapping)
+    }
+    publication_anchors = tuple(getattr(article, "publication_anchors", ()))
+
+    def matching_anchor(text: str) -> Any | None:
+        folded = text.casefold()
+        return next(
+            (
+                anchor
+                for anchor in publication_anchors
+                if isinstance(getattr(anchor, "excerpt", None), str)
+                and anchor.excerpt.strip().casefold() in folded
+            ),
+            None,
+        )
+
+    for passage in passages:
+        anchor = matching_anchor(str(passage.get("text", "")))
+        if anchor is not None and isinstance(getattr(anchor, "anchor", None), str):
+            passage["anchor"] = anchor.anchor
+    for claim_id in sorted(cited_claim_ids - passage_ids):
+        claim = local_claims.get(claim_id)
+        if claim is None:
+            continue
+        statement = str(getattr(claim, "statement", "")).strip()
+        if not statement:
+            continue
+        anchor = matching_anchor(statement)
+        passages.append(
+            {
+                "claim_id": str(getattr(claim, "id")),
+                "heading": "Claim canonique",
+                "text": statement,
+                "source_document_ids": [],
+                **(
+                    {"anchor": str(anchor.anchor)}
+                    if anchor is not None and isinstance(getattr(anchor, "anchor", None), str)
+                    else {}
+                ),
+            }
+        )
+    return passages
+
+
 def _typed_transmitted_refs(data: Mapping[str, Any], snapshot: Any) -> list[dict[str, str]]:
     references: dict[tuple[str, str], dict[str, str]] = {}
 
@@ -5944,8 +6152,8 @@ def _transmitted_refs_for_dossier(
         kind = item.get("kind")
         identifier = item.get("id")
         if isinstance(kind, str) and isinstance(identifier, str):
-            if kind == "article" and not identifier.startswith("article:"):
-                identifier = f"article:{identifier}"
+            if kind == "article" and identifier.startswith("article:"):
+                identifier = identifier.partition(":")[2]
             if kind in {"article", "observation", "finding", "measurement"}:
                 selected.add((kind, identifier))
                 if kind == "article":

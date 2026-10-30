@@ -14,6 +14,7 @@ from cti_app.application.advisor_semantic_parser import (
     ADVISOR_RESPONSE_SCHEMA_V4,
     ADVISOR_SOURCE_PARSER_VERSION_V4,
 )
+from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_REPARSE_SCHEMA_VERSION,
     ADVISOR_REPARSE_TOOL_NAME,
@@ -40,6 +41,10 @@ class BlobRepository:
         self.sha256 = sha256
         self.size = size
         self.calls = []
+        self.records = {}
+
+    async def get(self, blob_id):
+        return self.records.get(blob_id)
 
     async def get_by_address(self, logical_bucket: str, sha256: str):
         self.calls.append((logical_bucket, sha256))
@@ -74,7 +79,7 @@ class Recorder:
         return SimpleNamespace(id=self.observation_id)
 
 
-def test_registered_reparse_interface_exposes_only_explicit_v4_selection() -> None:
+def test_registered_reparse_interface_exposes_explicit_versioned_parser_selection() -> None:
     registry = InMemoryToolRegistry()
     adapter = ReparsePersistedAdvisorOutputTool(
         observations=object(),
@@ -88,7 +93,10 @@ def test_registered_reparse_interface_exposes_only_explicit_v4_selection() -> No
     registered = registry.get(ADVISOR_REPARSE_TOOL_NAME, ADVISOR_REPARSE_SCHEMA_VERSION)
     assert registered is not None
     schema = registered[0].input_schema
-    assert schema["properties"]["parser_version"]["enum"] == (ADVISOR_SOURCE_PARSER_VERSION_V4,)
+    assert schema["properties"]["parser_version"]["enum"] == (
+        ADVISOR_SOURCE_PARSER_VERSION,
+        ADVISOR_SOURCE_PARSER_VERSION_V4,
+    )
     assert "parser_version" not in schema["required"]
 
 
@@ -203,9 +211,13 @@ def _harness(
     artifact_store = ArtifactStore(
         {original.blob_id: persisted_bytes, raw_blob_id: raw_text.encode("utf-8")}
     )
+    blobs = BlobRepository(raw_blob_id, output_sha256, len(raw_text.encode("utf-8")))
+    blobs.records[original.blob_id] = SimpleNamespace(
+        descriptor=SimpleNamespace(sha256=original.sha256, size=len(persisted_bytes))
+    )
     tool = ReparsePersistedAdvisorOutputTool(
         observations=ObservationRepository(original),
-        blobs=BlobRepository(raw_blob_id, output_sha256, len(raw_text.encode("utf-8"))),
+        blobs=blobs,
         artifact_store=artifact_store,
         recorder=recorder,
         settings=settings,
@@ -215,20 +227,29 @@ def _harness(
 
 
 @pytest.mark.asyncio
-async def test_legacy_v3_reparse_is_auditable_without_blob_read_or_new_observation() -> None:
+async def test_legacy_v3_reparse_returns_full_advisory_text_without_new_observation() -> None:
     tool, recorder, original, context, output_sha256, store, raw_blob_id = _harness(
         "advisor-wire.v1\nTYPE: draft_text\nSTATUS: succeeded\nOPINION: old output\n"
     )
     original_hash = original.sha256
 
-    result = await tool.execute({"observation_id": str(original.id)}, context)
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+        },
+        context,
+    )
 
     assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.error_code == "unsupported_legacy_format"
-    assert result.output["status"] == "unsupported_legacy_format"
+    assert result.error_code is None
+    assert result.output["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
     assert result.output["output_sha256"] == output_sha256
     assert result.output["new_observation_written"] is False
-    assert store.calls == [original.blob_id]
+    assert result.output["canonical_promotion"] is False
+    assert result.output["output"]["advisory_text"].endswith("OPINION: old output\n")
+    assert result.output["output"]["raw_output_sha256"] == output_sha256
+    assert store.calls == [original.blob_id, raw_blob_id]
     assert recorder.calls == []
     assert original.sha256 == original_hash
     assert (

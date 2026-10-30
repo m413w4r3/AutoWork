@@ -1820,7 +1820,7 @@ class BlobModelOutputStore:
         )
         return f"blob://{blob.id}"
 
-    async def read(self, reference: str, *, max_bytes: int) -> bytes:
+    async def read(self, reference: str, *, max_bytes: int | None) -> bytes:
         if not reference.startswith("blob://"):
             raise ValueError("Unsupported model output reference")
         return await self._catalog.read(
@@ -1841,9 +1841,9 @@ class InMemoryModelOutputStore:
         self.objects.setdefault(digest, content)
         return f"memory://model-outputs/{digest}"
 
-    async def read(self, reference: str, *, max_bytes: int) -> bytes:
+    async def read(self, reference: str, *, max_bytes: int | None) -> bytes:
         content = self.objects[reference.rsplit("/", 1)[-1]]
-        if len(content) > max_bytes:
+        if max_bytes is not None and len(content) > max_bytes:
             raise ValueError("Model output exceeds read limit")
         return content
 

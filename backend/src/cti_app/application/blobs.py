@@ -52,12 +52,13 @@ class BlobCatalogService:
             await uow.commit()
         await self._store.delete(blob.descriptor)
 
-    async def read(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+    async def read(self, blob_id: UUID, *, max_bytes: int | None) -> bytes:
         async with self._uow_factory() as uow:
             blob = await uow.blobs.get(blob_id)
             if blob is None:
                 raise EntityNotFoundError(f"Blob {blob_id} does not exist")
-        return await self._store.read(blob.descriptor, max_bytes=max_bytes)
+        read_limit = blob.descriptor.size if max_bytes is None else max_bytes
+        return await self._store.read(blob.descriptor, max_bytes=read_limit)
 
     @staticmethod
     def _ensure_same_metadata(current: BlobDescriptor, requested: BlobDescriptor) -> None:

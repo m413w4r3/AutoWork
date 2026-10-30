@@ -38,6 +38,7 @@ from cti_app.domain.model_runs import (
     ModelBackend,
     ModelProvider,
     ModelRole,
+    ModelRun,
     ModelRunStatus,
     ModelTransport,
     ModelUsage,
@@ -758,6 +759,44 @@ async def test_succeeded_run_reloads_persisted_output_without_network_call() -> 
     assert len(fake.calls) == 1
     assert second.run.submission_attempt == 1
     assert second.metadata["checkpoint"] == "hit"
+
+
+async def test_bridge_persisted_output_read_does_not_use_the_configured_size_cap() -> None:
+    output = "Bridge consultation text " * 20
+    output_store = InMemoryModelOutputStore()
+    reference = await output_store.store(output.encode("utf-8"), mime_type="text/plain")
+    fake = FakeModelAdapter()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=fake,
+        ),
+        InMemoryModelRunUnitOfWorkFactory(),
+        output_store,
+        model_output_max_bytes=8,
+    )
+    run = ModelRun(
+        provider=ModelProvider.OPENAI,
+        model_role=ModelRole.RESEARCH,
+        requested_model="chatgpt-web",
+        prompt_template_id="bridge-consultation",
+        prompt_template_version="1",
+        authorized_input_hash="a" * 64,
+        evidence_pack_hash="b" * 64,
+        parameters={},
+        backend=ModelBackend.CHATGPT_BRIDGE,
+        status=ModelRunStatus.SUCCEEDED,
+        output_references=(reference,),
+        raw_output_reference=reference,
+    )
+
+    execution = await gateway._persisted_execution(run, output_schema=None)
+
+    assert execution.output_text == output
+    assert len(output.encode("utf-8")) > 8
+    assert fake.calls == []
 
 
 async def test_non_bridge_adapters_still_receive_a_per_attempt_request_id() -> None:

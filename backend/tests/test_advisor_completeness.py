@@ -45,6 +45,25 @@ def _item(preflight: dict, kind: str, identifier: str) -> dict:
     )
 
 
+@pytest.mark.parametrize(
+    "consultation_type", ["plan_investigation", "draft_text", "yara_draft", "suricata_draft", "figure_plan"]
+)
+def test_advisor_prompt_uses_free_prose_and_never_requires_wire_format(
+    consultation_type: str,
+) -> None:
+    prompt = render_advisor_prompt(consultation_type, {"question": "Examiner les faits transmis."})
+
+    assert "JSON" not in prompt
+    assert "advisor-wire.v1" not in prompt
+    assert "prose libre" in prompt
+    if consultation_type == "yara_draft":
+        assert "```yara facultatif" in prompt
+    if consultation_type == "suricata_draft":
+        assert "```suricata facultatif" in prompt
+    if consultation_type == "figure_plan":
+        assert "```figure facultatif" in prompt
+
+
 def test_decisive_proof_moves_from_retrieval_needed_to_sent() -> None:
     observation_id = str(uuid4())
     question = "Vérifier le passage S1P3.1 et les observations associées."
@@ -112,18 +131,6 @@ def test_general_contradiction_search_is_informational_without_a_targeted_claim(
             "text": "Blackwood uses a synthetic behavior marker.",
         }
     ]
-    if consultation_type == "figure_plan":
-        data["findings"] = [
-            {
-                "finding_id": str(uuid4()),
-                "sha256": "c" * 64,
-                "assessment": "inconclusive",
-                "kind": "claim_verification",
-                "line": "Blackwood uses a synthetic behavior marker.",
-                "claim_refs": ["S1P3.1"],
-            }
-        ]
-
     dossier = build_advisor_dossier(data)
     preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
 
@@ -135,6 +142,42 @@ def test_general_contradiction_search_is_informational_without_a_targeted_claim(
         status["reason"] for status in contradiction["statuses"]
     )
     assert "Aucune réfutation connue" in dossier.text
+
+
+def test_figure_plan_accepts_sha_verified_article_passage_without_finding() -> None:
+    data = _planning_data(
+        question="Build a figure from the cited passage S1P3.1.", evidence=[], findings=[]
+    )
+    data["consultation_type"] = "figure_plan"
+    data["article_passages"] = [
+        {
+            "claim_id": "S1P3.1",
+            "heading": "Synthetic article claim",
+            "text": "The article describes a synthetic connection sequence.",
+            "offset": 14,
+        }
+    ]
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "READY"
+    assert not any(item["id"] == "figure-findings" for item in preflight["items"])
+    article = next(item for item in dossier.manifest if item["kind"] == "article")
+    assert article["sha256"] == "a" * 64
+    assert article["claim_id"] == "S1P3.1"
+    assert article["passage_offset"] == 14
+
+
+def test_figure_plan_still_requires_a_sha_verified_canonical_proof() -> None:
+    data = _planning_data(question="Plan a figure for the investigation.", evidence=[], findings=[])
+    data["consultation_type"] = "figure_plan"
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
+    assert any(item["ref"] == "question-proof" for item in preflight["missing_refs"])
 
 
 def test_contradiction_assertion_with_a_cited_finding_is_informational_not_blocking() -> None:

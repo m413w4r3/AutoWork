@@ -34,7 +34,7 @@ class FigureEvidenceRefV1:
             "article",
         }:
             raise ValueError("Figure evidence reference kind is invalid")
-        if not isinstance(self.id, str) or not self.id or len(self.id) > 64:
+        if not isinstance(self.id, str) or not self.id:
             raise ValueError("Figure evidence reference ID is invalid")
 
     def to_payload(self) -> dict[str, str]:
@@ -48,15 +48,15 @@ class FigureNodeV1:
     refs: tuple[FigureEvidenceRefV1, ...]
 
     def __post_init__(self) -> None:
-        if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", self.id) is None:
+        if re.fullmatch(r"[a-z][a-z0-9_-]*", self.id) is None:
             raise ValueError("Figure node ID is invalid")
-        if not isinstance(self.label, str) or not self.label.strip() or len(self.label) > 180:
+        if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("Figure node label is invalid")
         object.__setattr__(self, "refs", tuple(self.refs))
-        if not 1 <= len(self.refs) <= 8 or any(
+        if not self.refs or any(
             not isinstance(ref, FigureEvidenceRefV1) for ref in self.refs
         ):
-            raise ValueError("Figure nodes require one to eight typed evidence references")
+            raise ValueError("Figure nodes require typed evidence references")
 
     def to_payload(self) -> dict[str, Any]:
         return {"id": self.id, "label": self.label, "refs": [ref.to_payload() for ref in self.refs]}
@@ -73,21 +73,21 @@ class FigureEdgeV1:
     direction_refs: tuple[FigureEvidenceRefV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", self.id) is None:
+        if re.fullmatch(r"[a-z][a-z0-9_-]*", self.id) is None:
             raise ValueError("Figure edge ID is invalid")
         if any(
-            re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", item) is None
+            re.fullmatch(r"[a-z][a-z0-9_-]*", item) is None
             for item in (self.source, self.target)
         ):
             raise ValueError("Figure edge endpoint is invalid")
-        if not isinstance(self.label, str) or not self.label.strip() or len(self.label) > 180:
+        if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("Figure edge label is invalid")
         object.__setattr__(self, "refs", tuple(self.refs))
         object.__setattr__(self, "direction_refs", tuple(self.direction_refs))
-        if not 1 <= len(self.refs) <= 8 or any(
+        if not self.refs or any(
             not isinstance(ref, FigureEvidenceRefV1) for ref in self.refs
         ):
-            raise ValueError("Figure edges require one to eight typed evidence references")
+            raise ValueError("Figure edges require typed evidence references")
         if self.direction is not None and not isinstance(self.direction, FigureDirection):
             raise TypeError("Figure edge direction must use FigureDirection")
         if self.direction is None and self.direction_refs:
@@ -117,7 +117,7 @@ class FigureLegendV1:
     def __post_init__(self) -> None:
         if not isinstance(self.evidence_level, FigureEvidenceLevel):
             raise TypeError("Figure legend requires one evidence level")
-        if not isinstance(self.text, str) or not self.text.strip() or len(self.text) > 240:
+        if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("Figure legend text is invalid")
 
     def to_payload(self) -> dict[str, str]:
@@ -135,14 +135,14 @@ class AdvisorFigurePlanV1:
     def __post_init__(self) -> None:
         if self.schema != "advisor-figure-plan.v1":
             raise ValueError("Figure plan schema is invalid")
-        if not isinstance(self.title, str) or not self.title.strip() or len(self.title) > 180:
+        if not isinstance(self.title, str) or not self.title.strip():
             raise ValueError("Figure plan title is invalid")
         if not isinstance(self.legend, FigureLegendV1):
             raise TypeError("Figure plan legend is invalid")
         object.__setattr__(self, "nodes", tuple(self.nodes))
         object.__setattr__(self, "edges", tuple(self.edges))
-        if not 1 <= len(self.nodes) <= 32 or len(self.edges) > 64:
-            raise ValueError("Figure plan node or edge count exceeds bounds")
+        if not self.nodes:
+            raise ValueError("Figure plan requires at least one node")
         if any(not isinstance(item, FigureNodeV1) for item in self.nodes):
             raise TypeError("Figure plan nodes are invalid")
         if any(not isinstance(item, FigureEdgeV1) for item in self.edges):
@@ -239,7 +239,7 @@ _FIGURE_REF_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "kind": {"enum": ["observation", "finding", "experiment", "article"]},
-        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "id": {"type": "string", "minLength": 1},
     },
     "required": ["kind", "id"],
     "additionalProperties": False,
@@ -247,12 +247,11 @@ _FIGURE_REF_SCHEMA: dict[str, Any] = {
 _FIGURE_NODE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "id": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]{0,63}$"},
-        "label": {"type": "string", "minLength": 1, "maxLength": 180},
+        "id": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]*$"},
+        "label": {"type": "string", "minLength": 1},
         "refs": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 8,
             "items": _FIGURE_REF_SCHEMA,
         },
     },
@@ -262,14 +261,13 @@ _FIGURE_NODE_SCHEMA: dict[str, Any] = {
 _FIGURE_EDGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "id": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]{0,63}$"},
-        "source": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]{0,63}$"},
-        "target": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]{0,63}$"},
-        "label": {"type": "string", "minLength": 1, "maxLength": 180},
+        "id": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]*$"},
+        "source": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]*$"},
+        "target": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]*$"},
+        "label": {"type": "string", "minLength": 1},
         "refs": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 8,
             "items": _FIGURE_REF_SCHEMA,
         },
         "direction": {
@@ -277,7 +275,6 @@ _FIGURE_EDGE_SCHEMA: dict[str, Any] = {
         },
         "direction_refs": {
             "type": "array",
-            "maxItems": 8,
             "items": _FIGURE_REF_SCHEMA,
         },
     },
@@ -288,12 +285,12 @@ ADVISOR_FIGURE_PLAN_SCHEMA_V1: dict[str, Any] = {
     "type": "object",
     "properties": {
         "schema": {"const": "advisor-figure-plan.v1"},
-        "title": {"type": "string", "minLength": 1, "maxLength": 180},
+        "title": {"type": "string", "minLength": 1},
         "legend": {
             "type": "object",
             "properties": {
                 "evidence_level": {"enum": [item.value for item in FigureEvidenceLevel]},
-                "text": {"type": "string", "minLength": 1, "maxLength": 240},
+                "text": {"type": "string", "minLength": 1},
             },
             "required": ["evidence_level", "text"],
             "additionalProperties": False,
@@ -301,10 +298,9 @@ ADVISOR_FIGURE_PLAN_SCHEMA_V1: dict[str, Any] = {
         "nodes": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 32,
             "items": _FIGURE_NODE_SCHEMA,
         },
-        "edges": {"type": "array", "maxItems": 64, "items": _FIGURE_EDGE_SCHEMA},
+        "edges": {"type": "array", "items": _FIGURE_EDGE_SCHEMA},
     },
     "required": ["schema", "title", "legend", "nodes", "edges"],
     "additionalProperties": False,
