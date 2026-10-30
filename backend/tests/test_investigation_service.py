@@ -2332,14 +2332,28 @@ async def test_sample_analysis_reuses_same_versioned_result_across_turns() -> No
     result = await fixture.service.run(state.investigation_id)
 
     invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    observations = await fixture.observations.list_for_investigation(state.investigation_id)
     envelope = await fixture.envelopes.get(state.investigation_id)
+    assert envelope is not None
+    consumed_before_replay = dict(envelope.budget.consumed)
+    observation_ids_before_replay = {item.id for item in observations}
     replay, replay_refs, stop = await fixture.service._replay_invocation(invocations[0])
     assert result.stop_reason is StopReason.AGENT_FINISHED
     assert len(fixture.tools["sample.analyze"].calls) == 1
     assert len(invocations) == 1
-    assert envelope is not None
     assert envelope.budget.consumed[BudgetDimension.TOOL_SECONDS] == 1
-    assert replay_refs == (observation.id,)
+    assert len(observations) == 2
+    assert len(invocations[0].response_refs) == 2
+    assert observation.id in invocations[0].response_refs
+    assert set(invocations[0].response_refs) == observation_ids_before_replay
+    assert replay_refs == invocations[0].response_refs
+    assert {
+        item.id
+        for item in await fixture.observations.list_for_investigation(state.investigation_id)
+    } == observation_ids_before_replay
+    envelope_after_replay = await fixture.envelopes.get(state.investigation_id)
+    assert envelope_after_replay is not None
+    assert envelope_after_replay.budget.consumed == consumed_before_replay
     assert stop is None
     assert "Already executed" in replay.message
     assert str(observation.id) in replay.message
