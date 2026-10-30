@@ -696,7 +696,7 @@ class ModelConversationService:
                 and not run.output_references
                 and run.raw_output_reference is None
                 and run.raw_output_sha256 is None
-                and run.raw_output_chars is None
+                and run.raw_output_chars in (None, 0)
                 and turn.error_details == {
                     "pre_submission_proof": {
                         "source": "external_effect_claim",
@@ -714,7 +714,7 @@ class ModelConversationService:
                 or run.output_references
                 or run.raw_output_reference is not None
                 or run.raw_output_sha256 is not None
-                or run.raw_output_chars is not None
+                or run.raw_output_chars not in (None, 0)
             ):
                 raise ModelConversationReconciliationError(
                     "conversation_reconciliation_no_handoff_conflict",

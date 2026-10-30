@@ -1334,7 +1334,7 @@ def test_operator_reconciliation_keeps_unknown_provider_outcome_in_review(
 
 @pytest.mark.parametrize(
     ("raw_output_chars", "expected_outcome"),
-    [(None, "non_execution_sealed"), (0, "needs_review"), (12, "needs_review")],
+    [(None, "non_execution_sealed"), (0, "non_execution_sealed"), (12, "needs_review")],
 )
 def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
     raw_output_chars: int | None, expected_outcome: str

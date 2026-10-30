@@ -39,6 +39,7 @@ from cti_app.application.investigation_advisor_tools import (
     _truncate_context_text,
     register_investigation_advisor_tool,
 )
+from cti_app.application.investigation_contracts import ArticleClaimV1, ArticleContextV1
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
@@ -1069,7 +1070,7 @@ async def test_args_hint_is_normalized_against_recommended_tool_schema(
 
 
 @pytest.mark.asyncio
-async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text() -> None:
+async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> None:
     investigation_id = uuid4()
     sample_sha256 = "b" * 64
     measured = {
@@ -1098,6 +1099,26 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
         observation=observation,
         raw=raw,
     )
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article = ArticleContextV1(
+        short_summary="A realistic canonical article summary.",
+        claims=(
+            ArticleClaimV1(
+                id="S3P2.1",
+                statement="The first canonical passage describes the measured mutex marker.",
+                source_refs=(),
+            ),
+            ArticleClaimV1(
+                id="S4P1.1",
+                statement="The second canonical passage records the associated loader behavior.",
+                source_refs=(),
+            ),
+        ),
+        documented_samples=(),
+        known_chain=(),
+        open_questions=(),
+    )
+    snapshot.article_passages = ()
     unrelated, unrelated_raw = make_observation(
         investigation_id,
         {
@@ -1139,6 +1160,32 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
         )
     )
     tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    valid_measurements = [
+        {
+            "blob_id": str(sample_blob_id),
+            "kind": "string",
+            "offset": 0x80,
+            "value": "CreateMutexW",
+        },
+        {
+            "blob_id": str(sample_blob_id),
+            "kind": "hex",
+            "offset": 0x90,
+            "value": "41424344",
+        },
+        {
+            "blob_id": str(sample_blob_id),
+            "kind": "wide",
+            "offset": 0x98,
+            "value": "WideMarker",
+        },
+        {
+            "blob_id": str(sample_blob_id),
+            "kind": "base64",
+            "offset": 0xA0,
+            "value": "QmFzZTY0TWVhc3VyZQ==",
+        },
+    ]
 
     invalid = await tool.execute(
         {
@@ -1170,39 +1217,19 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
     result = await tool.execute(
         {
             "consultation_type": "yara_draft",
+            "question": (
+                "Draft a candidate using claims s3p2.1 and s4P1.1 with verified measurements."
+            ),
             "evidence_refs": [str(observation.id)],
-            "measurements": [
-                {
-                    "blob_id": str(sample_blob_id),
-                    "kind": "string",
-                    "offset": 0x80,
-                    "value": "CreateMutexW",
-                },
-                {
-                    "blob_id": str(sample_blob_id),
-                    "kind": "hex",
-                    "offset": 0x90,
-                    "value": "41424344",
-                },
-                {
-                    "blob_id": str(sample_blob_id),
-                    "kind": "wide",
-                    "offset": 0x98,
-                    "value": "WideMarker",
-                },
-                {
-                    "blob_id": str(sample_blob_id),
-                    "kind": "base64",
-                    "offset": 0xA0,
-                    "value": "QmFzZTY0TWVhc3VyZQ==",
-                },
-            ],
+            "measurements": valid_measurements,
         },
         make_context(investigation_id),
     )
 
-    prompt = transport.calls[0]["prompt"]
     assert result.status is ToolInvocationStatus.SUCCEEDED, dict(result.output)
+    prompt = transport.calls[0]["prompt"]
+    assert "The first canonical passage describes the measured mutex marker." in prompt
+    assert "The second canonical passage records the associated loader behavior." in prompt
     assert f"blob_id={sample_blob_id}" in prompt
     assert f"sha256={sample_sha256}" in prompt
     prompt_payload = typed_prompt_payload(prompt)
@@ -1251,6 +1278,22 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
     assert persisted["context_bytes"] == persisted["context_estimate"]["context_bytes"]
     assert persisted["context_estimate"]["status"] == "estimated"
     assert result.output["bridge_provenance"]["provider_usage"] == {"status": "usage_unavailable"}
+
+    unknown_claim = await tool.execute(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Draft a candidate using claim s9p9 and the verified measurements.",
+            "evidence_refs": [str(observation.id)],
+            "measurements": valid_measurements,
+        },
+        make_context(investigation_id, key="operator:advisor:unknown-article-claim"),
+    )
+    assert unknown_claim.status is ToolInvocationStatus.FAILED
+    assert unknown_claim.output["input_error_code"] == "article_claim_not_found"
+    assert unknown_claim.output["invalid_article_claim_ids"] == ("s9p9",)
+    assert unknown_claim.output["valid_article_claim_ids"] == ("S3P2.1", "S4P1.1")
+    assert "valid article claim ids: s3p2.1, s4p1.1" in unknown_claim.message.casefold()
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -7778,6 +7821,44 @@ def test_exhausted_transport_pre_submission_retry_gets_typed_no_send_proof() -> 
     assert (
         result.framework_pre_submission_proof
         is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+
+
+def test_bridge_unreachable_preflight_gets_typed_no_send_proof() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+    )
+    submission = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        error_code="bridge_unreachable",
+        submission_state="pre_submission",
+        failure_stage="preflight",
+        prior_submission_made=False,
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic bounded consultation prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=256,
+        consultation_type="yara_draft",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={},
+    )
+    result = tool._finish(make_context(investigation_id, key="advisor:bridge-preflight"), result)
+
+    assert result.output["failure_stage"] == "preflight"
+    assert result.output["failure_reason"] == "bridge_unreachable"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["prior_submission_made"] is False
+    assert result.output["bridge_turns_consumed"] == 0
+    assert result.framework_pre_submission_proof is (
+        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
     )
 
 

@@ -1654,6 +1654,7 @@ async def test_verified_no_handoff_claim_is_consumed_without_resubmission(
         )
     turn = next(iter(state.turns.values()))
     run = state.model_runs[turn.model_run_id]
+    state.model_runs[run.id] = replace(run, raw_output_chars=0)
     claim_id = uuid4()
 
     sealed = await service.seal_verified_pre_submission(

@@ -752,11 +752,11 @@ def test_article_claim_ids_are_resolved_and_anchored_in_the_local_snapshot() -> 
         type("Anchor", (), {"anchor": "second-claim", "excerpt": "second cited claim"})(),
     )
     snapshot.article_passages = ()
-    passages = _consultation_article_passages(snapshot, "Compare S3P2.1 and S4P1.1 with S9P9.")
+    passages = _consultation_article_passages(snapshot, "Compare S3P2.1 and S4P1.1.")
     dossier = build_advisor_dossier(
         {
             "consultation_type": "figure_plan",
-            "question": "Compare S3P2.1 and S4P1.1 with S9P9.",
+            "question": "Compare S3P2.1 and S4P1.1.",
             "article_source_ref": f"article:{article_sha}",
             "article_sha256": article_sha,
             "article_passages": passages,
@@ -771,7 +771,6 @@ def test_article_claim_ids_are_resolved_and_anchored_in_the_local_snapshot() -> 
     assert {row["claim_id"] for row in article_rows} == {"S3P2.1", "S4P1.1"}
     assert {row["sha256"] for row in article_rows} == {article_sha}
     assert {row["anchor"] for row in article_rows} == {"first-claim", "second-claim"}
-    assert "S9P9" not in {row["claim_id"] for row in article_rows}
 
 
 def test_figure_plan_normalizes_article_sha_only_when_transmitted() -> None:
