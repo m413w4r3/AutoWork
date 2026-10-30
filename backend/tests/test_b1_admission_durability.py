@@ -849,7 +849,7 @@ async def test_ambiguous_post_submission_keeps_reservation_and_replay_does_not_r
 
     assert first.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
     assert first.invocation.consumed_budget == {}
-    assert first.output["data"]["result"]["external_state_unknown"] is True
+    assert first.error_code == "provider_result_unknown"
     assert reservation.status is BudgetReservationStatus.RESERVED
     assert replay.idempotent_replay is True
     assert replay.invocation.id == first.invocation.id
@@ -917,7 +917,7 @@ async def test_stale_envelope_cas_cannot_overwrite_a_revocation() -> None:
 
     latest = await base.get(fixture.investigation_id)
     assert result.invocation.status is ToolInvocationStatus.FAILED
-    assert result.output["data"]["result"]["reason"] == "envelope_admission_conflict"
+    assert result.error_code == "envelope_admission_conflict"
     assert latest.allowed_providers == ()
     assert latest.disclosure.do_not_submit is True
     assert latest.disclosure.external_llm_allowed is False
@@ -969,8 +969,7 @@ async def test_revocation_after_admission_is_rechecked_before_dispatch() -> None
     )
     assert revoked is True
     assert result.invocation.status is ToolInvocationStatus.POLICY_DENIED
-    assert result.error_code == "tool_policy_denied"
-    assert result.output["data"]["result"]["reason"] == "envelope_revoked_before_dispatch"
+    assert result.error_code == "envelope_revoked_before_dispatch"
     assert reservation.status is BudgetReservationStatus.RELEASED
     assert latest.allowed_providers == ()
     assert latest.disclosure.external_llm_allowed is False

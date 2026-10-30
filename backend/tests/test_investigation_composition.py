@@ -151,7 +151,10 @@ def _unit_of_work():
 def test_composition_announces_local_tools_and_only_configured_capabilities() -> None:
     investigation_id = uuid4()
     uow = _unit_of_work()
-    settings = Settings.model_construct(investigation_no_progress_limit=7)
+    settings = Settings.model_construct(
+        investigation_no_progress_limit=7,
+        rule_workbench_enabled=False,
+    )
     optional_port = _RuleWorkbench()
 
     composition = build_investigation_composition(

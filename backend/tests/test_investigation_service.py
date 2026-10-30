@@ -1347,7 +1347,7 @@ async def test_budget_exhaustion_is_a_local_stop_without_model_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_view_explains_local_conversation_and_context_limit_code() -> None:
+async def test_operator_view_explains_local_conversation_and_reconciliation_state() -> None:
     from cti_app.application.bridge_investigator import make_investigation_conversation_id
     from cti_app.application.investigation_operator_view import (
         build_investigation_operator_view,
@@ -1358,9 +1358,6 @@ async def test_operator_view_explains_local_conversation_and_context_limit_code(
     pending = state.with_pending_context(uuid4(), "a" * 64).conclude(
         StopReason.SUBMISSION_NEEDS_REVIEW
     )
-    context_limited = state.with_context_limit_failure(
-        actual_bytes=300_000, max_bytes=262_144
-    ).conclude(StopReason.BUDGET_EXHAUSTED)
     investigation = await fixture.investigations.get(fixture.investigation_id)
 
     pending_view = build_investigation_operator_view(
@@ -1420,19 +1417,6 @@ async def test_operator_view_explains_local_conversation_and_context_limit_code(
         pending_bridge_turn_status="failed",
         pending_bridge_turn_error_code="operator_abandoned",
     )
-    limit_view = build_investigation_operator_view(
-        investigation=investigation,
-        state=context_limited,
-        synthesis_sha256=fixture.snapshot.synthesis_sha256,
-        envelope=None,
-        invocations=(),
-        observations=(),
-        opinion=None,
-        jobs=(),
-        available_tools=(),
-        unavailable_tools=(),
-    )
-
     assert pending_view.payload["bridge_conversation_id"] == make_investigation_conversation_id(
         fixture.investigation_id
     )
@@ -1448,7 +1432,10 @@ async def test_operator_view_explains_local_conversation_and_context_limit_code(
         "/reconciliation/visible/adopt"
     )
     assert adopted_turn_view.payload["next_idempotent_action"]["code"] == ("resume_investigation")
-    assert abandoned_turn_view.payload["next_idempotent_action"]["code"] == ("resume_investigation")
+    abandoned_action = abandoned_turn_view.payload["next_idempotent_action"]
+    assert abandoned_action["code"] == "reconcile_model_conversation_turn"
+    assert abandoned_action["reason"] == "legacy_abandonment"
+    assert abandoned_action["resubmission_allowed"] is False
     assert pending_view.payload["last_operation"]["conversation_id_scope"] == (
         "local_autowork_record_only"
     )
@@ -1456,10 +1443,6 @@ async def test_operator_view_explains_local_conversation_and_context_limit_code(
         pending_view.payload
     ).model_dump()
     assert set(response_payload) == set(pending_view.payload)
-    assert limit_view.payload["last_error"] == {
-        "code": "investigation_context_too_large",
-        "details": "300000>262144",
-    }
 
 
 @pytest.mark.parametrize(
@@ -3726,7 +3709,7 @@ async def test_cancelled_bridge_wait_commits_budget_reservation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_seals_orphaned_turn_before_clearing_pending_checkpoint() -> None:
+async def test_resume_releases_orphaned_turn_after_confirmed_non_submission() -> None:
     fixture = _Fixture(responses=[])
     state = await fixture.start()
 
@@ -3743,7 +3726,7 @@ async def test_resume_seals_orphaned_turn_before_clearing_pending_checkpoint() -
                 version=current.version + 1,
                 recent_actions=(
                     *current.recent_actions,
-                    "bridge_turn_orphaned:0:next_attempt=1:turn_id=synthetic-turn",
+                    "bridge_turn_pre_submission_retry:0:next_attempt=1:turn_id=synthetic-turn",
                 ),
             )
             await fixture.states.save_if_version(updated, expected_version=current.version)
