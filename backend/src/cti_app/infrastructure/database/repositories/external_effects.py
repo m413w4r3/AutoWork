@@ -40,6 +40,7 @@ from cti_app.domain.external_effects import (
     ExternalEffectUseKind,
     PreparedExternalRequest,
     canonical_json_bytes,
+    invocation_arguments_digest,
     normalize_credential_parameter_name,
     occurrence_sha256,
     validate_persistable_reference,
@@ -1166,7 +1167,10 @@ class SqlAlchemyExternalEffectClaimStore:
             if authority.invocation_arguments_sha256 is None:
                 raise _ConsumeDenied("invocation_arguments_digest_missing")
             try:
-                actual_digest = _sha256(canonical_json_bytes(invocation.normalized_parameters))
+                actual_digest = invocation_arguments_digest(
+                    invocation.normalized_parameters,
+                    passive_read_retry_trusted=invocation.passive_read_retry_trusted,
+                )
             except (TypeError, ValueError):
                 raise _ConsumeDenied("invocation_arguments_not_canonical") from None
             if actual_digest != authority.invocation_arguments_sha256:

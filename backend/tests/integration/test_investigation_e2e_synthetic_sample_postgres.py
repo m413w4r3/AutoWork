@@ -882,7 +882,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             # proof (pre_transport_validation), so the refusal is a FAILED
             # non-execution and the reservation is released.
             assert incomplete["invocation"]["status"] == "failed"
-            assert incomplete["invocation"]["error_code"] == "tool_failed"
+            assert incomplete["invocation"]["error_code"] == "advisor_input_invalid"
             incomplete_output = incomplete["advisor_output"]
             assert incomplete_output["advisor_status"] == "invalid_input"
             assert incomplete_output["input_error_code"] == "evidence_reference_not_found"

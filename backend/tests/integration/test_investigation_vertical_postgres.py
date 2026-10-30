@@ -1399,6 +1399,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             report_parameters = dict(report_invocation.normalized_parameters)
             report_source_refs = report_parameters.pop("_vt_external_effect_source_refs")
             assert report_parameters == {"file_hash": _SEED_HASH}
+            assert report_invocation.passive_read_retry_trusted is True
             assert [dict(item) for item in report_source_refs] == [
                 {
                     "id": _SEED_HASH,

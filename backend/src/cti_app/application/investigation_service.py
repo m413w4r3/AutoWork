@@ -114,6 +114,7 @@ from cti_app.domain.external_effects import (
     ExternalEffectAuthority,
     ExternalEffectAuthorityKind,
     ExternalEffectValidationError,
+    invocation_arguments_digest,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -1516,22 +1517,23 @@ class InvestigationService:
                 ),
                 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER: True,
             }
-        if tool_name in _VT_PASSIVE_READ_TOOLS and existing is None:
-            invocation_parameters = {
-                **invocation_parameters,
-                VT_PASSIVE_RETRY_TRUSTED_PARAMETER: bool(
-                    definition is not None
-                    and definition.effect is ToolEffect.EXTERNAL_READ
-                    and registered is not None
-                    and is_trusted_vt_passive_read_adapter(tool_name, registered[1])
-                ),
-            }
+        passive_read_retry_trusted = (
+            bool(
+                definition is not None
+                and definition.effect is ToolEffect.EXTERNAL_READ
+                and registered is not None
+                and is_trusted_vt_passive_read_adapter(tool_name, registered[1])
+            )
+            if tool_name in _VT_PASSIVE_READ_TOOLS and existing is None
+            else None
+        )
         invocation = ToolInvocation(
             investigation_id=investigation.id,
             operation_key=operation_key,
             tool_name=tool_name,
             schema_version=schema_version,
             normalized_parameters=invocation_parameters,
+            passive_read_retry_trusted=passive_read_retry_trusted,
             purpose=purpose,
             reserved_budget=requested_cost,
         )
@@ -1706,13 +1708,16 @@ class InvestigationService:
                 reservation_amounts=reservation_amounts,
                 expected_envelope_version=envelope.version,
                 approval_decision_id=envelope.approval_decision_id,
-                invocation_arguments_sha256=hashlib.sha256(
-                    canonical_json_bytes(
-                        arguments
+                invocation_arguments_sha256=invocation_arguments_digest(
+                    arguments
+                    if tool_name == "advisor.consult"
+                    else invocation.normalized_parameters,
+                    passive_read_retry_trusted=(
+                        None
                         if tool_name == "advisor.consult"
-                        else invocation.normalized_parameters
-                    )
-                ).hexdigest(),
+                        else invocation.passive_read_retry_trusted
+                    ),
+                ),
                 authority_kind=authority_kind,
                 policy_event_id=envelope.inherited_policy_event_id,
                 policy_version=(

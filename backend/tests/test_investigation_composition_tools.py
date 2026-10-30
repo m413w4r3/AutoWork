@@ -54,8 +54,11 @@ from cti_app.domain.external_effects import (
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
+    DisclosureBounds,
     InvestigationAgenda,
     InvestigationBudget,
+    InvestigationEnvelope,
+    TLPLevel,
     ToolInvocationStatus,
 )
 from cti_app.domain.virustotal import (
@@ -270,6 +273,9 @@ async def test_vt_registry_operator_status_and_prompt_share_the_same_tool_names(
             known_chain=(),
             open_questions=(),
         ),
+        tlp=TLPLevel.GREEN.value,
+        do_not_submit=False,
+        external_llm_allowed=True,
     )
     artifact_store = SimpleNamespace(read_json=lambda _blob_id: {})
     route = VirusTotalOperationRoute(
@@ -351,9 +357,18 @@ async def test_vt_registry_operator_status_and_prompt_share_the_same_tool_names(
         tool_dependencies=dependencies,
     )
     budget = InvestigationBudget(limits={})
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=("vt",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
     tool_context = ToolExecutionContext(
         investigation_id=investigation_id,
-        envelope=None,
+        envelope=envelope,
         budget=budget,
         idempotency_key="vt-capability-view-test",
         available_capabilities=composition.available_capabilities,
@@ -380,7 +395,7 @@ async def test_vt_registry_operator_status_and_prompt_share_the_same_tool_names(
     operator_inventory = await _operator_status_tool_inventory(
         state=state,
         composition=composition,
-        envelope=None,
+        envelope=envelope,
         invocations=(),
         observations=(),
     )
