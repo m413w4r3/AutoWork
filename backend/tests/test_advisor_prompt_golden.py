@@ -243,44 +243,44 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
     cases = _prompt_cases()
     expected = {
         "plan_investigation": (
-            "4c65163b8c3bcd5aa86d98f6f869c6adfe2e5ef7f8335aa81cf8f05a417a9c7a",
-            1254,
+            "490caeb6027a1f649831be238a70e281d1e077c71a467cf71aeca68216f0297e",
+            1266,
         ),
         "pivot_strategy": (
-            "a12b7d599defba8d6a7a94f769b5e86926b628fe4664ab30b97e8c450ba08219",
-            1355,
+            "55303b63424d1b0e05d87dc5fa63dece4a8c089d95d14b63748c13d27bce11d2",
+            1367,
         ),
         "yara_draft_base64_hex": (
-            "778e3ad3686e596e59b77fa5e84e1988ba2070981810b3a72debb59677fb77b2",
-            1830,
+            "f5700feb97f39264dbfe453cd59191bb8730aa88a53e53d254af36fe51255552",
+            1829,
         ),
         "review_text_multi_unit_versioned": (
-            "fdbca3f9c1589a5bcf1895482c66b1a38e5a7169980cba4448c863f211a04316",
-            1268,
+            "4957c604edb1ee63e9070f128bff06251386222eb884d0a8cd3a7709847d2213",
+            1280,
         ),
         "review_text_legacy_mapping": (
-            "5cd7d87f2b0631c57be0a51f2af47a1874bba18cb59eff220ddd0d764af4b049",
-            1209,
+            "eb71c1b57c1ba2af5edcaddc89711f7942fb560d63126a17492a74a56c7982f4",
+            1221,
         ),
-        "draft_text": ("cb8469d2557b19d8f7f9b3bf1c486360acb633416b837cd7aab752ed987398e6", 1181),
+        "draft_text": ("d75d514e44b376ff7846c355edc5a1b452814023ae6a5ecbb71aebe5ed9946db", 1193),
         "suricata_draft": (
-            "57396b00d996b4bc9383fc97c65ea9cf362c46027ccf782831b215efba1a7402",
-            1140,
+            "3cac1f343949881b69da80759ca3f8904b935911924600d42e0144608297ca84",
+            1139,
         ),
-        "figure_plan": ("27f286736ee854aec3b9ed2b1705477f666a8043bb0aa010e3ae6e70f198eb7b", 1295),
-        "unicode_crlf": ("5ce9018f154eeff13e9407f16e9638ec664b0b73c3891fa2e62610e8047029c8", 1168),
-        "unicode_lf": ("888de35227eb43ac03203a86446a2c440f085956f24afd7c184345d24d217738", 1167),
+        "figure_plan": ("7a640d86aa95ad873f2d3230e9f2c75b76e5e67307dd8d76c948b19a061aa7e1", 1307),
+        "unicode_crlf": ("7f7d8819f47edabf3f637317308a5d9ea537c2a6594d50576dc2efbde7c88b74", 1180),
+        "unicode_lf": ("ab63c973b534e9da87a2f61ebcaa694f1daa99f031ad907507b3341e03f933e8", 1179),
         "json_like_cti_text": (
-            "4a07712fddf740415d89f729bfb60607552b7efbd0b19aa859085c23f57eaeaa",
-            1233,
+            "19decaf04bdbcf71578fbb0d894ea3f9dfe74694fa93e8a1720235a8a8c8b366",
+            1245,
         ),
         "restricted_projection": (
-            "2b8a4c57dd1b73e05917c401f60fa54d5b5646f793902892baa72112074a8d6d",
-            1154,
+            "3546e1e361fb51dc985542b1be3f2c97bb73da70de0b3985d31db8b607d3e58d",
+            1166,
         ),
         "preflight_refusal": (
-            "5672507d08a4a04a3d8c5d3123e6e22e18f5caf105b87e408dd8cb347bdfec2d",
-            1161,
+            "348ee5968bacd90471a716c0d74b071dc4b5c7b015c1454b7acf7d8c8308eed6",
+            1173,
         ),
     }
     assert set(cases) == set(expected)
@@ -328,12 +328,12 @@ def test_prepare_bytes_match_the_legacy_renderer_on_final_prompt_data(monkeypatc
     assert isinstance(rendered, str)
     legacy_bytes = rendered.encode("utf-8")
     assert hashlib.sha256(legacy_bytes).hexdigest() == (
-        "f93ca38ded8d5b7aab6c234d17973e8fd398dbcfd6b4ca56701aaab7e7e23c1e"
+        "bb11403cb0de204823b716b33b999d061ac3141fb11149911cff4d9fe0b30c3b"
     )
-    assert len(legacy_bytes) == 1192
+    assert len(legacy_bytes) == 1204
     assert prepared.prompt_utf8 == legacy_bytes
     assert prepared.prompt_sha256 == hashlib.sha256(legacy_bytes).hexdigest()
-    assert max(1, (len(legacy_bytes) + 3) // 4) == 298
+    assert max(1, (len(legacy_bytes) + 3) // 4) == 301
     final_data = captured["data"]
     assert isinstance(final_data, dict)
     assert _fit_advisor_prompt("review_text", deepcopy(final_data)).encode("utf-8") == legacy_bytes
@@ -367,9 +367,9 @@ def test_prepare_refusal_prompt_has_a_golden_digest(monkeypatch) -> None:
     assert refusal.completeness["status"] == "INSUFFICIENT_EVIDENCE"
     encoded = captured["rendered"].encode("utf-8")
     assert hashlib.sha256(encoded).hexdigest() == (
-        "5672507d08a4a04a3d8c5d3123e6e22e18f5caf105b87e408dd8cb347bdfec2d"
+        "348ee5968bacd90471a716c0d74b071dc4b5c7b015c1454b7acf7d8c8308eed6"
     )
-    assert len(encoded) == 1161
+    assert len(encoded) == 1173
 
 
 def test_preparation_completeness_does_not_have_a_partial_state() -> None:
