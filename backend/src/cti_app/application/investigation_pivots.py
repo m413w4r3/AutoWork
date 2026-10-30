@@ -33,6 +33,9 @@ _COVERED_STATUSES = frozenset(
         ToolInvocationStatus.NEEDS_REVIEW,
     }
 )
+_RETRYABLE_VT_PASSIVE_READS = frozenset(
+    {"vt.file_report", "vt.relationships", "vt.intelligence_search", "vt.behaviour"}
+)
 
 
 def available_investigation_pivots(
@@ -55,18 +58,29 @@ def available_investigation_pivots(
         (item.tool_name, canonical_json_bytes(_tool_arguments(item.normalized_parameters)))
         for item in invocations
         if item.status in _COVERED_STATUSES
+        and not (
+            item.status is ToolInvocationStatus.NEEDS_REVIEW
+            and item.tool_name in _RETRYABLE_VT_PASSIVE_READS
+            and item.tool_name in read_tools
+        )
         and (
             item.id not in visible_coverage or visible_coverage[item.id].status in _COVERED_STATUSES
         )
     }
     observation_ids_by_indicator: dict[tuple[str, str], list[str]] = {}
     for observation in observations:
-        key = (observation.object_type.casefold(), observation.object_id.casefold())
+        object_type = observation.object_type.casefold()
+        object_value = (
+            observation.object_id
+            if object_type in {"url", "urls"}
+            else observation.object_id.casefold()
+        )
+        key = (object_type, object_value)
         observation_ids_by_indicator.setdefault(key, []).append(str(observation.id))
 
     candidates: dict[tuple[str, str], AvailablePivotV1] = {}
     document_backed_indicators = {
-        (item.indicator_type, item.value.casefold())
+        (item.indicator_type, _indicator_value_key(item.indicator_type, item.value))
         for item in inventory
         if item.source_document_ids
     }
@@ -108,15 +122,16 @@ def available_investigation_pivots(
         linked_evidence = _linked_observations(
             kind, value, observations, observation_ids_by_indicator
         )
-        source_available = bool(linked_evidence) or (kind, value.casefold()) in (
-            document_backed_indicators
+        source_available = (
+            bool(linked_evidence)
+            or (
+                kind,
+                _indicator_value_key(kind, value),
+            )
+            in document_backed_indicators
         )
         if kind in {"md5", "sha1", "sha256"}:
-            blocked_reason = (
-                "source_references_required"
-                if kind in {"md5", "sha1"} and not source_available
-                else None
-            )
+            blocked_reason = "source_references_required" if not source_available else None
             add(
                 tool_name="vt.file_report",
                 indicator_type=kind,
@@ -146,6 +161,7 @@ def available_investigation_pivots(
                     "object_id": value,
                     "relation": "resolutions",
                 },
+                blocked_reason=(None if source_available else "source_references_required"),
             )
             add(
                 tool_name="shodan.host",
@@ -163,6 +179,7 @@ def available_investigation_pivots(
                     "object_id": value,
                     "relation": "resolutions",
                 },
+                blocked_reason=(None if source_available else "source_references_required"),
             )
         elif kind == "url":
             add(
@@ -174,6 +191,7 @@ def available_investigation_pivots(
                     "object_id": value,
                     "relation": "communicating_files",
                 },
+                blocked_reason=(None if source_available else "source_references_required"),
             )
 
         if linked_evidence and kind in {"md5", "sha1", "sha256", "ipv4", "domain"}:
@@ -195,6 +213,47 @@ def available_investigation_pivots(
                     indicator_value=value,
                     arguments=exact_search_arguments,
                 )
+
+    # A reviewed passive behaviour read can be offered again as a distinct
+    # invocation. Only rebuild the canonical hash argument; never carry model
+    # supplied reference metadata or a provider cursor into the new occurrence.
+    for invocation in invocations:
+        if (
+            invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
+            or invocation.tool_name != "vt.behaviour"
+            or invocation.tool_name not in read_tools
+        ):
+            continue
+        previous_arguments = _tool_arguments(invocation.normalized_parameters)
+        if not isinstance(previous_arguments, Mapping):
+            continue
+        previous_hash = previous_arguments.get("file_hash")
+        if not isinstance(previous_hash, str):
+            continue
+        for kind, value in indicator_values:
+            if (
+                kind not in {"md5", "sha1", "sha256"}
+                or value.casefold() != previous_hash.casefold()
+            ):
+                continue
+            linked_evidence = _linked_observations(
+                kind, value, observations, observation_ids_by_indicator
+            )
+            source_available = (
+                bool(linked_evidence)
+                or (
+                    kind,
+                    _indicator_value_key(kind, value),
+                )
+                in document_backed_indicators
+            )
+            add(
+                tool_name="vt.behaviour",
+                indicator_type=kind,
+                indicator_value=value,
+                arguments={"file_hash": value},
+                blocked_reason=(None if source_available else "source_references_required"),
+            )
 
     ordered = tuple(
         candidates[key] for key in sorted(candidates, key=lambda item: (item[0], item[1]))
@@ -266,10 +325,11 @@ def _linked_observations(
         "domain": ("domain", "domains"),
         "url": ("url", "urls"),
     }[object_type]
+    value_key = _indicator_value_key(indicator_type, value)
     ids = {
         observation_id
         for alias in aliases
-        for observation_id in observation_ids_by_indicator.get((alias, value.casefold()), ())
+        for observation_id in observation_ids_by_indicator.get((alias, value_key), ())
     }
     ordered = [
         str(item.id)
@@ -277,3 +337,7 @@ def _linked_observations(
         if str(item.id) in ids
     ]
     return tuple(ordered)
+
+
+def _indicator_value_key(indicator_type: str, value: str) -> str:
+    return value if indicator_type == "url" else value.casefold()

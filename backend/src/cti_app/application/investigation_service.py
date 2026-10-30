@@ -180,6 +180,9 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
     }
 )
 _VT_PASSIVE_READ_TOOLS = _VT_COORDINATED_READ_TOOLS - {"vt.download_sample"}
+_VT_HASH_READ_TOOLS = frozenset(
+    {"vt.file_report", "vt.relationships", "vt.behaviour", "vt.behaviour_pcap"}
+)
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER = "_advisor_preflight_refusal_expected"
 
@@ -2077,7 +2080,7 @@ class InvestigationService:
                 return True
             object_type = observation.object_type.casefold()
             if object_type in {"sample", "file", "sample_observation", "md5", "sha1"} or (
-                sample_hashes and object_type == "sha256"
+                family in _VT_HASH_READ_TOOLS and object_type == "sha256"
             ):
                 try:
                     sample_hash = normalize_file_hash(observation.object_id)
@@ -2106,6 +2109,7 @@ class InvestigationService:
                 else ()
             )
             associated_hashes = {association.sample_sha256 for association in associations}
+            allow_unassociated_passive_read_observations = family in _VT_HASH_READ_TOOLS
             allow_unassociated_search_observations = (
                 family == "vt.intelligence_search" and allow_unobserved_hash
             )
@@ -2118,6 +2122,7 @@ class InvestigationService:
                 return True
             if (
                 observation_hashes - (associated_hashes | sample_hashes)
+                and not allow_unassociated_passive_read_observations
                 and not allow_unassociated_search_observations
             ):
                 return True
@@ -2168,7 +2173,7 @@ class InvestigationService:
         arguments: Mapping[str, Any],
         envelope: InvestigationEnvelope | None = None,
     ) -> tuple[EvidenceReference, ...]:
-        """Resolve hash refs from active OSINT authority or local evidence, never caller claims."""
+        """Resolve VT source refs from current-investigation evidence, never caller claims."""
         hash_value: Any = None
         if tool_name in {"vt.file_report", "vt.behaviour", "vt.behaviour_pcap"}:
             hash_value = arguments.get("file_hash")
@@ -2230,33 +2235,62 @@ class InvestigationService:
                 version="sample-hash.v1",
                 sha256=normalized_hash,
             )
+            document_refs: dict[str, EvidenceReference] = {}
+            try:
+                snapshot = await self._context_builder.article_snapshots.resolve(
+                    investigation.synthesis_artifact_id
+                )
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                version = f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}"
+                for indicator in snapshot.confirmed_iocs:
+                    if (
+                        indicator.indicator_type != "sha256"
+                        or indicator.value.casefold() != normalized_hash
+                    ):
+                        continue
+                    for document_id in indicator.source_document_ids:
+                        reference = EvidenceReference(
+                            kind="source_document",
+                            id=str(document_id),
+                            version=version,
+                            sha256=snapshot.synthesis_sha256,
+                        )
+                        document_refs[reference.id] = reference
+
+            observations = await self._observations.list_for_investigation(investigation.id)
+            matching_observations = tuple(
+                item
+                for item in observations
+                if item.investigation_id == investigation.id
+                and item.object_type.casefold()
+                in {"sample", "file", "sample_observation", "sha256"}
+                and item.object_id.casefold() == normalized_hash
+            )
+            observation_refs = tuple(
+                EvidenceReference(
+                    kind="evidence_observation",
+                    id=str(item.id),
+                    version=item.source_version,
+                    sha256=item.sha256,
+                )
+                for item in sorted(matching_observations, key=lambda value: str(value.id))
+            )
             associations = (
                 await self._sample_associations.list_for_investigation(investigation.id)
                 if self._sample_associations is not None
                 else ()
             )
-            if any(item.sample_sha256 == normalized_hash for item in associations):
-                return (hash_reference,)
-            observations = await self._observations.list_for_investigation(investigation.id)
-            matching_observations = tuple(
-                item
-                for item in observations
-                if item.object_type.casefold() in {"sample", "file", "sample_observation", "sha256"}
-                and item.object_id == normalized_hash
-            )
-            if matching_observations:
+            associated = any(item.sample_sha256 == normalized_hash for item in associations)
+            if associated or observation_refs:
                 return (
                     hash_reference,
-                    *(
-                        EvidenceReference(
-                            kind="evidence_observation",
-                            id=str(item.id),
-                            version=item.source_version,
-                            sha256=item.sha256,
-                        )
-                        for item in sorted(matching_observations, key=lambda value: str(value.id))
-                    ),
+                    *observation_refs,
+                    *(document_refs[key] for key in sorted(document_refs)),
                 )
+            if document_refs:
+                return tuple(document_refs[key] for key in sorted(document_refs))
             if await self._osint_open_vt_hash_reads_allowed(investigation, envelope):
                 return (hash_reference,)
             return ()
@@ -2295,7 +2329,7 @@ class InvestigationService:
 
         if tool_name not in {"vt.object_report", "vt.relationships"}:
             return ()
-        raw_kind = str(arguments.get("object_type", ""))
+        raw_kind = str(arguments.get("object_type", "")).casefold()
         raw_object_id = arguments.get("object_id")
         object_type = {
             "ip_addresses": VirusTotalObjectType.IP_ADDRESS,
@@ -2309,36 +2343,71 @@ class InvestigationService:
             return ()
         try:
             normalized_object_id = _normalize_object_id(object_type, raw_object_id)
+        except (TypeError, ValueError, VirusTotalInvalidInputError):
+            return ()
+        try:
             snapshot = await self._context_builder.article_snapshots.resolve(
                 investigation.synthesis_artifact_id
             )
         except Exception:
-            return ()
+            snapshot = None
         expected_indicator = {
             VirusTotalObjectType.IP_ADDRESS: "ipv4",
             VirusTotalObjectType.DOMAIN: "domain",
             VirusTotalObjectType.URL: "url",
         }[object_type]
-        document_refs: dict[str, EvidenceReference] = {}
-        for indicator in snapshot.confirmed_iocs:
-            if indicator.indicator_type != expected_indicator:
+        object_document_refs: dict[str, EvidenceReference] = {}
+        if snapshot is not None:
+            for indicator in snapshot.confirmed_iocs:
+                if indicator.indicator_type != expected_indicator:
+                    continue
+                try:
+                    candidate = _normalize_object_id(object_type, indicator.value)
+                except (TypeError, ValueError, VirusTotalInvalidInputError):
+                    continue
+                if candidate != normalized_object_id:
+                    continue
+                version = f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}"
+                for document_id in indicator.source_document_ids:
+                    reference = EvidenceReference(
+                        kind="source_document",
+                        id=str(document_id),
+                        version=version,
+                        sha256=snapshot.synthesis_sha256,
+                    )
+                    object_document_refs[reference.id] = reference
+
+        observation_types = {
+            VirusTotalObjectType.IP_ADDRESS: {"ip", "ip_address", "ip_addresses", "ipv4"},
+            VirusTotalObjectType.DOMAIN: {"domain", "domains"},
+            VirusTotalObjectType.URL: {"url", "urls"},
+        }[object_type]
+        object_observation_refs: dict[str, EvidenceReference] = {}
+        for observation in await self._observations.list_for_investigation(investigation.id):
+            if (
+                observation.investigation_id != investigation.id
+                or observation.object_type.casefold() not in observation_types
+            ):
                 continue
             try:
-                candidate = _normalize_object_id(object_type, indicator.value)
-            except (TypeError, ValueError):
+                candidate = _normalize_object_id(object_type, observation.object_id)
+            except (TypeError, ValueError, VirusTotalInvalidInputError):
                 continue
             if candidate != normalized_object_id:
                 continue
-            version = f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}"
-            for document_id in indicator.source_document_ids:
-                reference = EvidenceReference(
-                    kind="source_document",
-                    id=str(document_id),
-                    version=version,
-                    sha256=snapshot.synthesis_sha256,
-                )
-                document_refs[reference.id] = reference
-        return tuple(document_refs[key] for key in sorted(document_refs))
+            reference = EvidenceReference(
+                kind="evidence_observation",
+                id=str(observation.id),
+                version=observation.source_version,
+                sha256=observation.sha256,
+            )
+            object_observation_refs[reference.id] = reference
+
+        references = {
+            (reference.kind, reference.id): reference
+            for reference in (*object_document_refs.values(), *object_observation_refs.values())
+        }
+        return tuple(references[key] for key in sorted(references))
 
     async def _osint_open_vt_hash_reads_allowed(
         self,

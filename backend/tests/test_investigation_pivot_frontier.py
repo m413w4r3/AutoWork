@@ -867,6 +867,146 @@ def test_md5_file_pivots_without_provenance_are_blocked_and_relations_stay_disti
     assert relation_arguments == {"contacted_domains"}
 
 
+def test_ip_relationship_pivot_requires_observation_provenance() -> None:
+    ip_address = "198.51.100.42"
+    investigation_id = uuid4()
+    inventory = (
+        ConfirmedIOCContextV1(
+            indicator_type="ipv4",
+            value=ip_address,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        ),
+    )
+    tools = (
+        ToolSummaryV1(
+            name="vt.relationships",
+            schema_version="1",
+            effect=ToolEffect.EXTERNAL_READ,
+            arguments_schema={
+                "type": "object",
+                "properties": {
+                    "object_type": {"type": "string"},
+                    "object_id": {"type": "string"},
+                    "relation": {"type": "string"},
+                },
+                "required": ["object_type", "object_id", "relation"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    without_source, _ = available_investigation_pivots(
+        inventory=inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(),
+        observations=(),
+    )
+    ungrounded = next(item for item in without_source if item.arguments["object_id"] == ip_address)
+    assert ungrounded.execution_state == "blocked"
+    assert ungrounded.blocked_reason == "source_references_required"
+
+    contacted_ip = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="VirusTotal",
+        source_version="vt.relationship.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip_address",
+        object_id=ip_address,
+        limitations=("relation=contacted_ips",),
+    )
+    with_source, _ = available_investigation_pivots(
+        inventory=inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(),
+        observations=(contacted_ip,),
+    )
+    grounded = next(item for item in with_source if item.arguments["object_id"] == ip_address)
+    assert grounded.execution_state == "available"
+    assert grounded.blocked_reason is None
+
+
+def test_needs_review_vt_behaviour_offers_a_fresh_grounded_pivot() -> None:
+    file_hash = "a" * 64
+    inventory = (
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=file_hash,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        ),
+    )
+    tools = (
+        ToolSummaryV1(
+            name="vt.behaviour",
+            schema_version="1",
+            effect=ToolEffect.EXTERNAL_READ,
+            arguments_schema={
+                "type": "object",
+                "properties": {
+                    "file_hash": {"type": "string"},
+                    "cursor": {"type": "string"},
+                },
+                "required": ["file_hash"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    previous = ToolInvocation(
+        investigation_id=uuid4(),
+        operation_key="ambiguous-vt-behaviour",
+        tool_name="vt.behaviour",
+        schema_version="1",
+        normalized_parameters={
+            "file_hash": file_hash,
+            "_vt_external_effect_source_refs": [{"kind": "caller-claimed"}],
+        },
+        purpose="passive behaviour read",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+    )
+
+    blocked, _ = available_investigation_pivots(
+        inventory=inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(previous,),
+        observations=(),
+    )
+    blocked_retry = next(item for item in blocked if item.tool_name == "vt.behaviour")
+    assert blocked_retry.execution_state == "blocked"
+    assert blocked_retry.blocked_reason == "source_references_required"
+    assert blocked_retry.arguments == {"file_hash": file_hash}
+
+    observation = EvidenceObservation(
+        investigation_id=previous.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="f" * 64,
+        source="VirusTotal",
+        source_version="vt.file-report.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=file_hash,
+    )
+    available, _ = available_investigation_pivots(
+        inventory=inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(previous,),
+        observations=(observation,),
+    )
+    grounded_retry = next(item for item in available if item.tool_name == "vt.behaviour")
+    assert grounded_retry.execution_state == "available"
+    assert grounded_retry.blocked_reason is None
+    assert grounded_retry.arguments == {"file_hash": file_hash}
+
+
 def test_invalid_hash_or_missing_cursor_does_not_create_a_confirmed_pivot() -> None:
     article_hash = "a" * 64
     observation = _relation_observation(article_hash, "2" * 64)

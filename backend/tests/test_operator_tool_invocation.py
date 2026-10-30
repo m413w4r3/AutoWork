@@ -1728,8 +1728,12 @@ async def test_replay_after_persisted_running_marks_review_without_redispatch() 
 
 
 @pytest.mark.asyncio
-async def test_fresh_passive_read_settles_orphaned_running_reservation(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "prior_status",
+    [ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW],
+)
+async def test_fresh_passive_read_settles_uncertain_reservation_before_retry(
+    monkeypatch: pytest.MonkeyPatch, prior_status: ToolInvocationStatus
 ) -> None:
     fixture, state, service = await _fixture()
     old_key = "orphaned-passive-read"
@@ -1758,7 +1762,7 @@ async def test_fresh_passive_read_settles_orphaned_running_reservation(
         normalized_parameters=arguments,
         purpose=purpose,
         reserved_budget=reserved,
-    ).transition(ToolInvocationStatus.RUNNING)
+    ).transition(prior_status)
     await fixture.invocations.add_if_absent(old_invocation)
     envelope = await fixture.envelopes.get(fixture.investigation_id)
     assert envelope is not None
