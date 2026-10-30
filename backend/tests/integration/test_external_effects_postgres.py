@@ -6,7 +6,7 @@ import hashlib
 import importlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -52,6 +52,7 @@ from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.config import Settings
 from cti_app.domain.external_effects import (
+    EffectClaimState,
     EvidenceReference,
     ExternalEffectAuthority,
     ExternalEffectAuthorityKind,
@@ -2464,6 +2465,107 @@ def _store(
             )
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_latest_advisor_claim_lookup_is_scoped_and_returns_latest_invocation_claim(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=f"advisor-claim-{uuid4().hex[:12]}", invocations=2
+    )
+    invocation_id = authorities[0][0].invocation_id
+    other_invocation_id = authorities[1][0].invocation_id
+    now = datetime.now(UTC)
+    older_id, latest_id = uuid4(), uuid4()
+
+    def row(
+        identifier: UUID,
+        *,
+        target_invocation_id: UUID,
+        family: str = "advisor.consult",
+        provider: str = "bridge",
+        created_at: datetime,
+    ) -> ExternalEffectClaimRow:
+        return ExternalEffectClaimRow(
+            id=identifier,
+            investigation_id=investigation_id,
+            invocation_id=target_invocation_id,
+            bridge_turn_id=None,
+            model_run_id=None,
+            acquisition_attempt_id=None,
+            retrohunt_reservation_id=None,
+            provider=provider,
+            provider_scope="bridge-profile",
+            family=family,
+            identity_version="external-effect.v1",
+            normalizer_version="advisor-consult.v1",
+            effect_key=hashlib.sha256(identifier.bytes).hexdigest(),
+            canonical_request_sha256="a" * 64,
+            application_request_sha256="b" * 64,
+            occurrence_sha256="c" * 64,
+            occurrence_id=None,
+            request_ref=None,
+            canonical_request={},
+            evidence_refs=[],
+            operation_key=f"advisor-claim:{identifier}",
+            reservation_amounts={},
+            envelope_version=4,
+            approval_decision_id=uuid4(),
+            invocation_arguments_sha256="d" * 64,
+            state=EffectClaimState.NEEDS_REVIEW.value,
+            handoff_permit_nonce=None,
+            version=1,
+            created_at=created_at,
+            consumed_at=created_at,
+            updated_at=created_at,
+            completed_at=None,
+            last_error_code=None,
+        )
+
+    async with session_factory() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    row(
+                        older_id,
+                        target_invocation_id=invocation_id,
+                        created_at=now,
+                    ),
+                    row(
+                        latest_id,
+                        target_invocation_id=invocation_id,
+                        created_at=now + timedelta(microseconds=1),
+                    ),
+                    row(
+                        uuid4(),
+                        target_invocation_id=other_invocation_id,
+                        created_at=now + timedelta(microseconds=2),
+                    ),
+                    row(
+                        uuid4(),
+                        target_invocation_id=invocation_id,
+                        provider="openai",
+                        created_at=now + timedelta(microseconds=3),
+                    ),
+                ]
+            )
+    try:
+        latest = await SqlAlchemyExternalEffectClaimStore(session_factory).latest_advisor_claim_for_invocation(
+            investigation_id, invocation_id
+        )
+        other_investigation = await SqlAlchemyExternalEffectClaimStore(
+            session_factory
+        ).latest_advisor_claim_for_invocation(uuid4(), invocation_id)
+
+        assert latest is not None
+        assert latest.id == latest_id
+        assert latest.invocation_id == invocation_id
+        assert latest.family == "advisor.consult"
+        assert latest.provider == "bridge"
+        assert other_investigation is None
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

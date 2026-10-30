@@ -63,6 +63,7 @@ from cti_app.domain.model_runs import (
     ModelProvider,
     ModelRole,
     ModelRunStatus,
+    ModelSubmissionState,
     ModelTransport,
     ModelUsage,
 )
@@ -623,7 +624,19 @@ async def test_cancelled_bridge_submission_is_persisted_as_needs_review(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_orphaned_running_turn_is_reviewed_before_distinct_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("submission_state", "expected_disposition", "expected_attempt"),
+    [
+        (ModelSubmissionState.EXTERNAL_STATE_UNKNOWN, "needs_review", 0),
+        (ModelSubmissionState.NOT_SUBMITTED, "orphaned_running_turn", 1),
+    ],
+)
+async def test_orphaned_turn_retries_only_with_durable_pre_submission_proof(
+    tmp_path: Path,
+    submission_state: ModelSubmissionState,
+    expected_disposition: str,
+    expected_attempt: int,
+) -> None:
     entered = asyncio.Event()
 
     class _FirstCallInterruptedAdapter(_ScriptedBridgeAdapter):
@@ -720,6 +733,10 @@ async def test_orphaned_running_turn_is_reviewed_before_distinct_retry(tmp_path:
     orphaned_run.error_message = None
     orphaned_run.error_details = None
     orphaned_run.finished_at = None
+    orphaned_run.submission_state = submission_state
+    orphaned_run.submission_attempt = (
+        0 if submission_state is ModelSubmissionState.NOT_SUBMITTED else 1
+    )
     state.conversations[conversation.id].status = ConversationStatus.BUSY
     stale_replay = await ModelConversationTurnTransport(service).submit(
         investigation_id=investigation_id,
@@ -757,25 +774,30 @@ async def test_orphaned_running_turn_is_reviewed_before_distinct_retry(tmp_path:
     )
     turns = await service.turns(conversation.id, context_subject_id=subject_id)
 
-    assert recovered == "orphaned_running_turn"
-    assert retry_attempt == 1
-    assert turns[0].turn.status is ConversationTurnStatus.NEEDS_REVIEW
-    assert turns[0].turn.error_code == "orphaned_running_turn"
-    assert turns[1].turn.idempotency_key != key
-    assert retried.status.value == "succeeded"
-    assert len(adapter.calls) - calls_before_retry == 1
-    assert len(adapter.calls) == 2
-    explicitly_abandoned = await service.abandon_investigation_turn(
-        conversation.id,
-        turns[0].turn.id,
-        reason="Operator reviewed the orphaned synthetic attempt",
-        actor_id="operator:synthetic",
-        context_subject_id=subject_id,
-    )
-    assert explicitly_abandoned.error_code == "operator_abandoned"
+    assert recovered == expected_disposition
+    assert retry_attempt == expected_attempt
+    if expected_attempt == 0:
+        assert turns[0].turn.status is ConversationTurnStatus.NEEDS_REVIEW
+        assert turns[0].turn.error_code == "orphaned_running_turn"
+        assert retried.status.value == "needs_review"
+        assert len(turns) == 1
+        assert len(adapter.calls) == calls_before_retry == 1
+    else:
+        assert turns[0].turn.status is ConversationTurnStatus.FAILED
+        assert turns[0].turn.error_code == "bridge_pre_submission_failure"
+        assert turns[0].turn.error_details == {
+            "pre_submission_proof": {
+                "model_run_id": str(turns[0].turn.model_run_id),
+                "submission_attempt": 0,
+                "submission_state": "not_submitted",
+            }
+        }
+        assert turns[1].turn.idempotency_key != key
+        assert retried.status.value == "succeeded"
+        assert len(adapter.calls) == calls_before_retry + 1
     assert (
         investigation_bridge_attempt(state.investigation_states[investigation_id].recent_actions, 0)
-        == 2
+        == expected_attempt
     )
 
 
@@ -1583,6 +1605,94 @@ class _StalledVisibleAnswerAdapter(_ScriptedBridgeAdapter):
         )
 
 
+class _NoResponseReviewAdapter(_ScriptedBridgeAdapter):
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        return AdapterResult(
+            status=AdapterResultStatus.NEEDS_REVIEW,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            response_id=None,
+            usage=ModelUsage(input_tokens=3, output_tokens=0, total_tokens=3),
+            metadata={
+                "reason": "submission_state_uncertain",
+                "submission_state": "external_state_unknown",
+            },
+        )
+
+
+async def test_verified_no_handoff_claim_is_consumed_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    adapter = _NoResponseReviewAdapter("unused")
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    conversation = await service.get_or_create(
+        make_investigation_conversation_id(investigation_id),
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.PIVOT_RESEARCH,
+        title="Synthetic investigation no-handoff recovery",
+        edition_id=None,
+        subject_id=subject_id,
+        expected_profile=None,
+        requested_model=None,
+    )
+    with pytest.raises(ConversationNeedsReviewError):
+        await service.add_turn(
+            conversation.id,
+            message="Question de recherche",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="verified-no-handoff-turn",
+            correlation_id="corr-no-handoff",
+        )
+    turn = next(iter(state.turns.values()))
+    run = state.model_runs[turn.model_run_id]
+    claim_id = uuid4()
+
+    sealed = await service.seal_verified_pre_submission(
+        conversation.id,
+        turn.id,
+        claim_id=claim_id,
+        actor_id="operator:operator-client",
+        context_subject_id=subject_id,
+    )
+    repeated = await service.seal_verified_pre_submission(
+        conversation.id,
+        turn.id,
+        claim_id=claim_id,
+        actor_id="operator:operator-client",
+        context_subject_id=subject_id,
+    )
+    run = state.model_runs[turn.model_run_id]
+
+    assert sealed.status is ConversationTurnStatus.FAILED
+    assert sealed.error_code == "bridge_pre_submission_failure"
+    assert sealed.error_details == {
+        "pre_submission_proof": {
+            "source": "external_effect_claim",
+            "claim_id": str(claim_id),
+            "model_run_id": str(run.id),
+        }
+    }
+    assert repeated.id == sealed.id
+    assert run.status is ModelRunStatus.FAILED
+    assert run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+    assert run.error_details == {
+        "pre_submission_proof": {
+            "source": "external_effect_claim",
+            "claim_id": str(claim_id),
+        }
+    }
+    assert len(adapter.calls) == 1
+
+
 async def test_native_needs_review_is_not_collapsed_into_a_generic_error(
     tmp_path: Path,
 ) -> None:
@@ -1781,6 +1891,26 @@ async def test_visible_turn_preview_and_adoption_preserve_missing_external_ident
     assert len(adapter.calls) == 1
 
 
+async def test_visible_recovery_preserves_response_larger_than_legacy_limit(
+    tmp_path: Path,
+) -> None:
+    text = "é" * 1_100_000
+    recovery = _VisibleTurnRecovery({"text": text})
+    adapter = _StalledVisibleAnswerAdapter("Short interrupted answer")
+    service, _state = _build_service(adapter, tmp_path, visible_recovery_transport=recovery)
+    conversation = await _fresh_conversation(service)
+    turn = await _create_needs_review_turn(service, conversation, key="large-visible-recovery")
+
+    preview = await service.preview_visible_recovery(
+        conversation.id, turn.id, context_subject_id=None
+    )
+
+    assert len(text.encode("utf-8")) > 2_000_000
+    assert preview["text"] == text
+    assert preview["characters"] == len(text)
+    assert preview["sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 async def test_visible_turn_adoption_rejects_wrong_hash_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -1892,7 +2022,7 @@ async def test_placeholder_turn_id_is_rejected_as_a_durable_identity() -> None:
     assert _verified_external_turn_id("assistant-42") == "assistant-42"
 
 
-async def test_abandoning_investigation_turn_records_next_attempt_without_reusing_key(
+async def test_abandoning_investigation_turn_does_not_authorize_next_attempt(
     tmp_path: Path,
 ) -> None:
     class _StatelessAmbiguousAdapter(_ScriptedBridgeAdapter):
@@ -1981,8 +2111,11 @@ async def test_abandoning_investigation_turn_records_next_attempt_without_reusin
             f"/reconciliation/abandon?subject_id={subject_id}",
             json={"reason": "Operator confirmed no execution occurred"},
         )
-    assert response.status_code == 200, response.text
-    abandoned = state.turns[turn.id]
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == (
+        "conversation_reconciliation_requires_provider_resolution"
+    )
+    retained = state.turns[turn.id]
     persisted_state = state.investigation_states[investigation_id]
     next_attempt = investigation_bridge_attempt(persisted_state.recent_actions, 0)
     retry_key = make_investigation_turn_idempotency_key(
@@ -1991,38 +2124,33 @@ async def test_abandoning_investigation_turn_records_next_attempt_without_reusin
         context_sha256=context_sha256,
         attempt=next_attempt,
     )
-    retry = await ModelConversationTurnTransport(service).submit(
-        investigation_id=investigation_id,
-        subject_id=subject_id,
-        turn_index=0,
-        context_sha256=context_sha256,
-        prompt="Canonical investigation prompt",
-        external_llm_allowed=True,
-        attempt=next_attempt,
-    )
-    replay = await service.abandon_investigation_turn(
-        conversation.id,
-        turn.id,
-        reason="Operator confirmed no execution occurred",
-        actor_id="operator:synthetic",
-        context_subject_id=subject_id,
-    )
+    with pytest.raises(ModelConversationReconciliationError) as rejected:
+        await service.abandon_investigation_turn(
+            conversation.id,
+            turn.id,
+            reason="Operator confirmed no execution occurred",
+            actor_id="operator:synthetic",
+            context_subject_id=subject_id,
+        )
 
-    assert abandoned.status is ConversationTurnStatus.FAILED
-    assert abandoned.error_code == "operator_abandoned"
-    assert state.model_runs[turn.model_run_id].status is ModelRunStatus.FAILED
+    assert rejected.value.code == "conversation_reconciliation_requires_provider_resolution"
+    assert retained.status is ConversationTurnStatus.NEEDS_REVIEW
+    assert state.model_runs[turn.model_run_id].status is ModelRunStatus.NEEDS_REVIEW
     assert state.model_runs[turn.model_run_id].submission_state.value == "external_state_unknown"
-    assert next_attempt == 1
-    assert retry_key != abandoned_key
-    assert retry_key.endswith(":attempt=1")
-    assert retry.status.value == "needs_review", retry
-    assert retry.idempotency_key == retry_key
-    persisted_turns = await service.turns(conversation.id, context_subject_id=subject_id)
-    assert len(persisted_turns) == 2
-    assert persisted_turns[1].turn.sequence == 2
-    assert persisted_turns[1].turn.parent_turn_id == abandoned.id
-    assert len(adapter.calls) == 2
-    assert replay.id == abandoned.id
+    assert next_attempt == 0
+    assert retry_key == abandoned_key
+    assert not any(
+        action.startswith("bridge_turn_abandoned:0:")
+        for action in persisted_state.recent_actions
+    )
+    assert investigation_bridge_attempt(
+        ("bridge_turn_abandoned:0:next_attempt=1:turn_id=" + str(turn.id),), 0
+    ) == 0
+    assert investigation_bridge_attempt(
+        ("bridge_turn_orphaned:0:next_attempt=1:turn_id=" + str(turn.id),), 0
+    ) == 0
+    assert len(adapter.calls) == 1
+    assert len(state.turns) == 1
 
 
 async def test_visible_turn_reconciliation_routes_use_local_preview_and_actor(

@@ -928,7 +928,9 @@ async def test_args_hint_contract_is_bounded_and_normalization_is_recorded(
     assert result.output["advisor_status"] == "partial"
     assert len(transport.calls) == 1, result
     prompt = transport.calls[0]["prompt"]
-    assert "advisor-wire.v1" in prompt
+    assert "advisor-wire.v1" not in prompt
+    assert "JSON" not in prompt
+    assert "prose libre" in prompt
     assert "FAITS TRANSMIS" in prompt
     assert "required_arguments" not in prompt
     advisor_observation = next(
@@ -1609,6 +1611,69 @@ async def test_pivot_strategy_rejects_a_basis_reference_absent_from_observations
     assert len(transport.calls) == 1
 
 
+def test_unparsed_bridge_prose_is_returned_complete_with_its_sha256() -> None:
+    investigation_id = uuid4()
+    tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    raw_output = "Bridge prose without a recognized block.\n" + ("retained text " * 7_000)
+    submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=raw_output,
+        bridge_invocation_id=str(uuid4()),
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic prose consultation prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=128,
+        consultation_type="figure_plan",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={"transmitted_refs": []},
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["advisory_text"] == "[UNTRUSTED ADVISORY]\n" + raw_output
+    assert result.output["raw_output"] == raw_output
+    assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert result.output["raw_output_sha256"] == result.output["output_sha256"]
+    assert "structured_parse_unavailable" in result.output["warnings"]
+    assert result.output["usable"] is False
+
+
+def test_unlinked_draft_prose_includes_explicit_consultative_warning() -> None:
+    investigation_id = uuid4()
+    tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    raw_output = "Première proposition de texte, à vérifier par l’analyste."
+    submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=raw_output,
+        bridge_invocation_id=str(uuid4()),
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic opinion draft prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=128,
+        consultation_type="draft_text",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={"assertions": []},
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert raw_output in result.output["advisory_text"]
+    assert "liens de preuve absents" in result.output["advisory_text"].casefold()
+    assert "evidence_links_absent" in result.output["warnings"]
+    assert result.output["raw_output"] == raw_output
+    assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+
+
 @pytest.mark.asyncio
 async def test_unknown_basis_refs_are_removed_and_traced_when_valid_refs_remain() -> None:
     investigation_id = uuid4()
@@ -1943,7 +2008,12 @@ async def test_malformed_basis_ref_lists_remain_rejected(basis_refs, expected_co
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["advisory_text"].endswith(json.dumps(payload, ensure_ascii=False))
+    assert result.output["output_sha256"] == hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False).encode()
+    ).hexdigest()
+    assert "structured_parse_unavailable" in result.output["warnings"]
     assert result.output["validation_rejection"]["code"] == expected_code
     assert result.output["validation_rejection"]["path"] == "$.alternative_hypotheses[0].basis_refs"
     assert "normalization_status" not in result.output["validation_rejection"]
@@ -4381,8 +4451,9 @@ async def test_invalid_json_schema_excerpt_omits_response_values() -> None:
         "code": "schema_mismatch",
         "path": "$.schema",
     }
-    assert "PRIVATE-RESPONSE-MARKER" not in result.output["response_excerpt"]
-    assert result.output["response_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert "response_excerpt" not in result.output
+    assert "PRIVATE-RESPONSE-MARKER" in result.output["advisory_text"]
+    assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -5280,6 +5351,7 @@ async def test_transmitted_article_passage_resolves_canonical_source_document(
         assert len(transport.calls) == 1
         external_effect_context = transport.binding_context
         assert external_effect_context["transmitted_refs"] == (
+            {"kind": "article", "id": "a" * 64, "sha256": "a" * 64},
             {"kind": "source_document", "id": str(document_id), "sha256": "a" * 64},
         )
         assert external_effect_context["evidence_refs"] == (

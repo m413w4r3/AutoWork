@@ -530,6 +530,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.network_capture_import_service = network_capture_import_service
     app.state.rule_corpus_import_service = rule_corpus_import_service
     app.state.model_gateway = model_gateway
+    app.state.external_effect_coordinator = external_effect_coordinator
     app.state.bridge_capabilities_provider = bridge_provider
     app.state.model_conversation_service = model_conversation_service
     app.state.investigation_composition_factory = investigation_composition_factory
@@ -824,6 +825,17 @@ def _operator_client_route_allowed(method: str, path: str) -> bool:
     except ValueError:
         return False
     if method == "GET" and len(parts) == 4 and parts[3] == "operator-status":
+        return True
+    if (
+        method == "POST"
+        and len(parts) == 7
+        and parts[3:5] == ["operator", "invocations"]
+        and parts[6] == "reconcile"
+    ):
+        try:
+            UUID(parts[5])
+        except ValueError:
+            return False
         return True
     if method == "GET" and len(parts) == 3:
         return True

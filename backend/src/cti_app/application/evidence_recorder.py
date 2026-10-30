@@ -116,7 +116,7 @@ class ProductionEvidenceRecorder:
         artifact_store: ProductionArtifactStore,
         observations: EvidenceObservationRepository,
         *,
-        max_payload_bytes: int = MAX_EVIDENCE_JSON_BYTES,
+        max_payload_bytes: int | None = MAX_EVIDENCE_JSON_BYTES,
     ) -> None:
         self._artifact_store = artifact_store
         self._observations = observations
@@ -146,7 +146,7 @@ class ProductionEvidenceRecorder:
             raise ValueError("Evidence JSON payload must be an object")
         encoded = ProductionArtifactStore.canonical_json_bytes(safe_payload)
         maximum = self._max_payload_bytes
-        if len(encoded) > maximum:
+        if maximum is not None and len(encoded) > maximum:
             raise ValueError(
                 f"Evidence JSON payload exceeds configured {maximum} byte object guard"
             )

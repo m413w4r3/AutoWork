@@ -20,21 +20,27 @@ from cti_app.api.investigation import (
     _operator_bridge_invocation_costs,
     router,
 )
+from cti_app.application.bridge_investigator import make_investigation_conversation_id
 from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
+from cti_app.application.model_conversations import ModelConversationReconciliationError
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
+    DisclosureBounds,
     EvidenceKind,
     EvidenceObservation,
     InvestigationAgenda,
+    InvestigationBudget,
     InvestigationEnvelope,
     InvestigationExecutionMode,
     SampleAssociation,
+    TLPLevel,
+    ToolInvocation,
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_state import InvestigationWorkingState, StopReason
@@ -185,6 +191,9 @@ class _Envelopes:
     async def get(self, investigation_id: UUID):
         return self.rows.get(investigation_id)
 
+    async def get_for_update(self, investigation_id: UUID):
+        return self.rows.get(investigation_id)
+
     async def save_if_version(
         self, envelope: InvestigationEnvelope, *, expected_version: int | None
     ):
@@ -245,6 +254,7 @@ class _Uow:
         self.analyst_decisions = _Decisions(store.decisions)
         self.analyst_opinions = _Opinions(store.opinions)
         self.tool_invocations = _Items(store.invocations)
+        self.model_runs = _Rows(store.model_runs)
         self.production_input_snapshots = _InputSnapshots(store)
 
     async def __aenter__(self):
@@ -268,6 +278,13 @@ class _Items:
         return next((item for item in self.rows if getattr(item, "id", None) == identity), None)
 
     async def append_version(self, item, *, expected_version: int):
+        current = await self.get(item.id)
+        if current is None or current.version != expected_version:
+            raise VersionConflictError("stale test item")
+        self.rows[self.rows.index(current)] = item
+        return item
+
+    async def update_if_version(self, item, *, expected_version: int):
         current = await self.get(item.id)
         if current is None or current.version != expected_version:
             raise VersionConflictError("stale test item")
@@ -331,6 +348,7 @@ class _Store:
         self.jobs = _Jobs()
         self.observations: list[object] = []
         self.invocations: list[object] = []
+        self.model_runs: dict[UUID, Any] = {}
         self.findings: list[object] = []
         self.associations: list[object] = []
         self.opinions: dict[UUID, object] = {}
@@ -741,6 +759,70 @@ def test_operator_observation_route_paginates_sanitized_canonical_json() -> None
     assert len(first_page["payload"]) <= 32_000
 
 
+def test_advisor_observation_payload_is_not_truncated_by_configured_size_cap() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:claude-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    blob_id = uuid4()
+    observation_id = uuid4()
+    canonical = json.dumps(
+        {"schema": "operator-advisor-call.v1", "advisory_text": "complete result " * 20},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=INVESTIGATION_ID,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        source="advisor.consult",
+        object_type="advisor_call",
+    )
+    store = _Store()
+    store.observations.append(observation)
+
+    def uow_factory():
+        uow = _Uow(store)
+        uow.blobs = _Rows(
+            {
+                blob_id: SimpleNamespace(
+                    descriptor=SimpleNamespace(
+                        mime_type="application/json",
+                        logical_bucket="investigation-evidence",
+                        size=len(canonical),
+                    )
+                )
+            }
+        )
+        return uow
+
+    class ArtifactStore:
+        async def read_bytes(self, requested_blob_id, *, max_bytes):
+            assert requested_blob_id == blob_id
+            assert max_bytes == len(canonical)
+            return canonical
+
+    factory = _CompositionFactory(_SnapshotPort())
+    factory.settings = SimpleNamespace(model_output_max_bytes=16)
+    client, _store = _client(store=store, factory=factory)
+    client.app.state.uow_factory = uow_factory
+    client.app.state.production_artifact_store = ArtifactStore()
+    client.app.state.identity_provider = OperatorIdentityProvider()
+
+    response = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/observations/{observation_id}",
+        params={"offset": 0, "length": 32_000},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["total_chars"] > 16
+    assert "complete result " * 20 in payload["payload"]
+
+
 def _read_operator_observation(payload: dict[str, Any]):
     canonical = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     blob_id = uuid4()
@@ -934,7 +1016,464 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
         "reconcile interrupted Bridge turn before resume"
     )
     assert body["next_idempotent_action"]["reason"] == "operator_interrupted"
-    assert body["next_idempotent_action"]["path"].endswith("/reconciliation/abandon")
+    assert body["next_idempotent_action"]["path"].endswith("/reconciliation/visible/preview")
+    assert body["next_idempotent_action"]["resubmission_allowed"] is False
+    assert "abandon_path" not in body["next_idempotent_action"]
+
+
+def test_operator_status_reconciles_needs_review_even_with_refs_and_links_reservation() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].version = 1
+    store.states.rows[INVESTIGATION_ID] = _working_state()
+    invocation_id = uuid4()
+    model_run_id = uuid4()
+    operation_key = "advisor-operation-with-reservation"
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key=operation_key,
+            tool_name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            normalized_parameters={"consultation_type": "review_text"},
+            purpose="Review article passages",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            response_refs=(uuid4(),),
+            id=invocation_id,
+            version=7,
+        )
+    )
+    budget = InvestigationBudget(limits={BudgetDimension.BRIDGE_TURNS: 4})
+    budget.reserve(operation_key, {BudgetDimension.BRIDGE_TURNS: 1})
+    store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
+        investigation_id=INVESTIGATION_ID,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.AMBER, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
+    store.model_runs[model_run_id] = SimpleNamespace(response_id="resp_provider_17")
+
+    class _ClaimLookup:
+        async def latest_advisor_claim_for_invocation(self, investigation_id, requested_id):
+            assert investigation_id == INVESTIGATION_ID
+            assert requested_id == invocation_id
+            return SimpleNamespace(
+                investigation_id=INVESTIGATION_ID,
+                invocation_id=invocation_id,
+                model_run_id=model_run_id,
+            )
+
+    client.app.state.external_effect_coordinator = _ClaimLookup()
+
+    response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    listed = body["invocations_requiring_reconciliation"]
+    assert len(listed) == 1
+    assert listed[0]["id"] == str(invocation_id)
+    assert listed[0]["provider_response_id"] == "resp_provider_17"
+    assert listed[0]["decision_expected"] == "reconcile before resume"
+    assert listed[0]["reconciliation_action"] == {
+        "method": "POST",
+        "path": (
+            f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
+            f"{invocation_id}/reconcile"
+        ),
+        "expected_version": 7,
+        "resubmission_allowed": False,
+    }
+    assert body["ambiguous_invocations"] == listed
+    reservation = body["budget_reservations"][0]
+    assert reservation["operation_key"] == operation_key
+    assert reservation["invocation_id"] == str(invocation_id)
+    assert body["next_idempotent_action"]["path"].endswith(
+        f"/operator/invocations/{invocation_id}/reconcile"
+    )
+
+
+def test_operator_client_recovers_exact_advisor_response_without_resubmitting() -> None:
+    invocation_id = uuid4()
+    turn_id = uuid4()
+    model_run_id = uuid4()
+    response_text = "Consultative prose recovered from the provider."
+    response_sha256 = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+
+    class _OperatorClientIdentity:
+        async def current(self):
+            return Identity(
+                actor_id="operator:operator-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class _RecoverySnapshots(_SnapshotPort):
+        async def resolve(self, synthesis_artifact_id: UUID):
+            assert synthesis_artifact_id == SYNTHESIS_ID
+            return SimpleNamespace(
+                subject_id=SUBJECT_ID,
+                production_run_id=RUN_ID,
+                synthesis_sha256=SHA256,
+                tlp="amber",
+                do_not_submit=True,
+                external_llm_allowed=True,
+            )
+
+    class _RecoveryService:
+        def __init__(self):
+            self.preview_calls = []
+            self.adopt_calls = []
+
+        async def preview_visible_recovery(self, conversation_id, requested_turn, **kwargs):
+            self.preview_calls.append((conversation_id, requested_turn, kwargs))
+            return {"turn_id": turn_id, "sha256": response_sha256, "text": response_text}
+
+        async def adopt_visible_recovery(self, conversation_id, requested_turn, **kwargs):
+            self.adopt_calls.append((conversation_id, requested_turn, kwargs))
+            return SimpleNamespace(id=requested_turn)
+
+    class _RecoveryFactory(_CompositionFactory):
+        def __init__(self):
+            super().__init__(_RecoverySnapshots())
+            self.model_conversations = _RecoveryService()
+
+    client, store = _client(factory=_RecoveryFactory())
+    client.app.state.identity_provider = _OperatorClientIdentity()
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key="advisor-ambiguous-operation",
+            tool_name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            normalized_parameters={"consultation_type": "review_text"},
+            purpose="Consult the advisor",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            response_refs=(uuid4(),),
+            id=invocation_id,
+            version=5,
+        )
+    )
+    state = SimpleNamespace(value="needs_review")
+    store.model_runs[model_run_id] = SimpleNamespace(
+        id=model_run_id,
+        status=state,
+        response_id="resp_exact_123",
+        output_references=(),
+        raw_output_reference=None,
+        raw_output_sha256=None,
+    )
+    store.conversation_turns.row = SimpleNamespace(
+        id=turn_id,
+        model_run_id=model_run_id,
+        conversation_id=make_investigation_conversation_id(INVESTIGATION_ID),
+        status=state,
+        output_blob_reference=None,
+    )
+    budget = InvestigationBudget(limits={BudgetDimension.BRIDGE_TURNS: 4})
+    store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
+        investigation_id=INVESTIGATION_ID,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.AMBER, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
+
+    class _ClaimLookup:
+        async def latest_advisor_claim_for_invocation(self, investigation_id, requested_id):
+            assert investigation_id == INVESTIGATION_ID
+            assert requested_id == invocation_id
+            return SimpleNamespace(
+                investigation_id=INVESTIGATION_ID,
+                invocation_id=invocation_id,
+                family="advisor.consult",
+                provider="bridge",
+                bridge_turn_id=turn_id,
+                model_run_id=model_run_id,
+                state=SimpleNamespace(value="NEEDS_REVIEW"),
+            )
+
+    client.app.state.external_effect_coordinator = _ClaimLookup()
+    path = (
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
+        f"{invocation_id}/reconcile"
+    )
+
+    response = client.post(path, json={"expected_version": 5})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["outcome"] == "response_adopted"
+    assert body["status"] == "needs_review"
+    assert body["version"] == 5
+    assert body["provider_response_id"] == "resp_exact_123"
+    assert body["response_sha256"] == response_sha256
+    assert body["response_text"] == response_text
+    assert body["result_is_untrusted"] is True
+    assert body["canonical_promotion"] is False
+    assert body["non_execution_sealed"] is False
+    service = client.app.state.investigation_composition_factory.model_conversations
+    assert len(service.preview_calls) == 1
+    assert len(service.adopt_calls) == 1
+    assert service.adopt_calls[0][2]["expected_sha256"] == response_sha256
+    assert not hasattr(service, "submit")
+
+    stale = client.post(path, json={"expected_version": 4})
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "stale_invocation_version"
+    assert len(service.preview_calls) == 1
+
+
+@pytest.mark.parametrize("provider_response_id", ["resp_unknown_456", None])
+def test_operator_reconciliation_keeps_unknown_provider_outcome_in_review(
+    provider_response_id: str | None,
+) -> None:
+    invocation_id = uuid4()
+    turn_id = uuid4()
+    model_run_id = uuid4()
+
+    class _OperatorClientIdentity:
+        async def current(self):
+            return Identity(
+                actor_id="operator:operator-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class _RecoverySnapshots(_SnapshotPort):
+        async def resolve(self, _synthesis_artifact_id: UUID):
+            return SimpleNamespace(tlp="amber", external_llm_allowed=True)
+
+    class _UnknownRecoveryService:
+        def __init__(self):
+            self.preview_calls = 0
+            self.adopt_calls = 0
+
+        async def preview_visible_recovery(self, *_args, **_kwargs):
+            self.preview_calls += 1
+            raise ModelConversationReconciliationError(
+                "conversation_reconciliation_visible_unavailable", "no exact response"
+            )
+
+        async def adopt_visible_recovery(self, *_args, **_kwargs):
+            self.adopt_calls += 1
+
+    class _RecoveryFactory(_CompositionFactory):
+        def __init__(self):
+            super().__init__(_RecoverySnapshots())
+            self.model_conversations = _UnknownRecoveryService()
+
+    client, store = _client(factory=_RecoveryFactory())
+    client.app.state.identity_provider = _OperatorClientIdentity()
+    invocation = ToolInvocation(
+        investigation_id=INVESTIGATION_ID,
+        operation_key="advisor-unknown-operation",
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        normalized_parameters={"consultation_type": "review_text"},
+        purpose="Consult the advisor",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        response_refs=(),
+        id=invocation_id,
+        version=2,
+    )
+    store.invocations.append(invocation)
+    store.model_runs[model_run_id] = SimpleNamespace(
+        id=model_run_id,
+        status=SimpleNamespace(value="needs_review"),
+        response_id=provider_response_id,
+    )
+    store.conversation_turns.row = SimpleNamespace(
+        id=turn_id,
+        model_run_id=model_run_id,
+        conversation_id=make_investigation_conversation_id(INVESTIGATION_ID),
+        status=SimpleNamespace(value="needs_review"),
+    )
+    store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
+        investigation_id=INVESTIGATION_ID,
+        allowed_providers=("bridge",),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.AMBER, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
+
+    class _ClaimLookup:
+        async def latest_advisor_claim_for_invocation(self, _investigation_id, _invocation_id):
+            return SimpleNamespace(
+                investigation_id=INVESTIGATION_ID,
+                invocation_id=invocation_id,
+                family="advisor.consult",
+                provider="bridge",
+                bridge_turn_id=turn_id,
+                model_run_id=model_run_id,
+                state=SimpleNamespace(value="NEEDS_REVIEW"),
+            )
+
+    client.app.state.external_effect_coordinator = _ClaimLookup()
+    path = (
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
+        f"{invocation_id}/reconcile"
+    )
+
+    response = client.post(path, json={"expected_version": 2})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["outcome"] == "needs_review"
+    assert body["status"] == "needs_review"
+    assert body["provider_response_id"] == provider_response_id
+    assert body["response_text"] is None
+    assert body["non_execution_sealed"] is False
+    service = client.app.state.investigation_composition_factory.model_conversations
+    assert service.preview_calls == (1 if provider_response_id else 0)
+    assert service.adopt_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("raw_output_chars", "expected_outcome"),
+    [(None, "non_execution_sealed"), (0, "needs_review"), (12, "needs_review")],
+)
+def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
+    raw_output_chars: int | None, expected_outcome: str
+) -> None:
+    invocation_id = uuid4()
+    turn_id = uuid4()
+    model_run_id = uuid4()
+    claim_id = uuid4()
+
+    class _OperatorClientIdentity:
+        async def current(self):
+            return Identity(
+                actor_id="operator:operator-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class _NoHandoffService:
+        def __init__(self):
+            self.seal_calls = []
+
+        async def seal_verified_pre_submission(
+            self, conversation_id, requested_turn, **kwargs
+        ):
+            self.seal_calls.append((conversation_id, requested_turn, kwargs))
+
+    class _RecoveryFactory(_CompositionFactory):
+        def __init__(self):
+            super().__init__(_SnapshotPort())
+            self.model_conversations = _NoHandoffService()
+
+    client, store = _client(factory=_RecoveryFactory())
+    client.app.state.identity_provider = _OperatorClientIdentity()
+    operation_key = "advisor-no-handoff-operation"
+    reserved = {BudgetDimension.BRIDGE_TURNS: 1}
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key=operation_key,
+            tool_name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            normalized_parameters={"consultation_type": "review_text"},
+            purpose="Consult the advisor",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            reserved_budget=reserved,
+            id=invocation_id,
+            version=3,
+        )
+    )
+    needs_review = SimpleNamespace(value="needs_review")
+    store.model_runs[model_run_id] = SimpleNamespace(
+        id=model_run_id,
+        status=needs_review,
+        response_id=None,
+        output_references=(),
+        raw_output_reference=None,
+        raw_output_sha256=None,
+        raw_output_chars=raw_output_chars,
+    )
+    store.conversation_turns.row = SimpleNamespace(
+        id=turn_id,
+        model_run_id=model_run_id,
+        conversation_id=make_investigation_conversation_id(INVESTIGATION_ID),
+        status=needs_review,
+        output_blob_reference=None,
+    )
+    budget = InvestigationBudget(limits={BudgetDimension.BRIDGE_TURNS: 4})
+    budget.reserve(operation_key, reserved)
+    store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
+        investigation_id=INVESTIGATION_ID,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.AMBER, external_llm_allowed=False),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
+
+    class _ClaimLookup:
+        async def latest_advisor_claim_for_invocation(self, _investigation_id, _invocation_id):
+            return SimpleNamespace(
+                id=claim_id,
+                investigation_id=INVESTIGATION_ID,
+                invocation_id=invocation_id,
+                family="advisor.consult",
+                provider="bridge",
+                bridge_turn_id=turn_id,
+                model_run_id=model_run_id,
+                state=SimpleNamespace(value="DEFINITIVELY_NOT_SUBMITTED"),
+            )
+
+    client.app.state.external_effect_coordinator = _ClaimLookup()
+    path = (
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
+        f"{invocation_id}/reconcile"
+    )
+
+    response = client.post(path, json={"expected_version": 3})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["outcome"] == expected_outcome
+    expected_status = "failed" if expected_outcome == "non_execution_sealed" else "needs_review"
+    assert body["status"] == expected_status
+    assert body["version"] == (4 if expected_outcome == "non_execution_sealed" else 3)
+    assert body["provider_response_id"] is None
+    assert body["response_text"] is None
+    assert body["non_execution_sealed"] is (expected_outcome == "non_execution_sealed")
+    assert body["resubmission_allowed"] is (expected_outcome == "non_execution_sealed")
+    service = client.app.state.investigation_composition_factory.model_conversations
+    expected_seal_calls = (
+        [
+            (
+                make_investigation_conversation_id(INVESTIGATION_ID),
+                turn_id,
+                {
+                    "claim_id": claim_id,
+                    "actor_id": "operator:operator-client",
+                    "context_subject_id": SUBJECT_ID,
+                },
+            )
+        ]
+        if expected_outcome == "non_execution_sealed"
+        else []
+    )
+    assert service.seal_calls == expected_seal_calls
+    reservation = store.envelopes.rows[INVESTIGATION_ID].budget.reservations[0]
+    assert reservation.status.value == (
+        "released" if expected_outcome == "non_execution_sealed" else "reserved"
+    )
+
+    repeated = client.post(path, json={"expected_version": 3})
+    if expected_outcome == "non_execution_sealed":
+        assert repeated.status_code == 409
+        assert repeated.json()["detail"]["code"] == "stale_invocation_version"
+        assert len(service.seal_calls) == 1
+    else:
+        assert repeated.status_code == 200
+        assert repeated.json()["outcome"] == "needs_review"
+        assert service.seal_calls == []
 
 
 def test_operator_status_unavailable_dependencies_include_recorded_reason_codes() -> None:

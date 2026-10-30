@@ -151,7 +151,7 @@ class _CatalogModelOutputStore:
         )
         return f"blob://{record.id}"
 
-    async def read(self, reference: str, *, max_bytes: int) -> bytes:
+    async def read(self, reference: str, *, max_bytes: int | None) -> bytes:
         try:
             blob_id = UUID(reference.removeprefix("blob://"))
         except ValueError as exc:

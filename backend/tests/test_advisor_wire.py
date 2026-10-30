@@ -21,9 +21,11 @@ from cti_app.application.advisor_wire import (
 )
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
+    _consultation_article_passages,
     _parse_advisor_output,
     _safe_text,
 )
+from cti_app.domain.advisor_figure_plan import AdvisorFigurePlanV1
 
 _ARCHIVED_RUN12_CORPUS = (
     Path(__file__).parents[2]
@@ -737,6 +739,128 @@ LIMITATION: none
     assert parsed["node_roles"] == {"sample": "sample", "host": "infrastructure"}
 
 
+def test_article_claim_ids_are_resolved_and_anchored_in_the_local_snapshot() -> None:
+    article_sha = "a" * 64
+    snapshot = type("Snapshot", (), {})()
+    snapshot.article = type("Article", (), {})()
+    snapshot.article.claims = (
+        type("Claim", (), {"id": "S3P2.1", "statement": "The first cited claim is canonical."})(),
+        type("Claim", (), {"id": "S4P1.1", "statement": "The second cited claim is canonical."})(),
+    )
+    snapshot.article.publication_anchors = (
+        type("Anchor", (), {"anchor": "first-claim", "excerpt": "first cited claim"})(),
+        type("Anchor", (), {"anchor": "second-claim", "excerpt": "second cited claim"})(),
+    )
+    snapshot.article_passages = ()
+    passages = _consultation_article_passages(snapshot, "Compare S3P2.1 and S4P1.1 with S9P9.")
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "figure_plan",
+            "question": "Compare S3P2.1 and S4P1.1 with S9P9.",
+            "article_source_ref": f"article:{article_sha}",
+            "article_sha256": article_sha,
+            "article_passages": passages,
+        }
+    )
+
+    article_rows = [
+        row
+        for row in dossier.manifest
+        if row["kind"] == "article" and row.get("origin") == "article_passage"
+    ]
+    assert {row["claim_id"] for row in article_rows} == {"S3P2.1", "S4P1.1"}
+    assert {row["sha256"] for row in article_rows} == {article_sha}
+    assert {row["anchor"] for row in article_rows} == {"first-claim", "second-claim"}
+    assert "S9P9" not in {row["claim_id"] for row in article_rows}
+
+
+def test_figure_plan_normalizes_article_sha_only_when_transmitted() -> None:
+    article_sha = "c" * 64
+
+    def response(sha: str) -> str:
+        return json.dumps(
+            {
+                "schema": "advisor-response.v3",
+                "consultation_type": "figure_plan",
+                "status": "succeeded",
+                "untrusted": True,
+                "limitations": [],
+                "figure_plan": {
+                    "schema": "advisor-figure-plan.v1",
+                    "title": "A verified article figure",
+                    "legend": {"evidence_level": "documented", "text": "Claim-level evidence."},
+                    "nodes": [
+                        {
+                            "id": "claim",
+                            "label": "Claim S3P2.1",
+                            "refs": [{"kind": "article", "id": f"article:{sha}"}],
+                        }
+                    ],
+                    "edges": [],
+                },
+            }
+        )
+
+    prompt_data = {"transmitted_refs": [{"kind": "article", "id": article_sha, "sha256": article_sha}]}
+    parsed = parse_typed_advisor_response(
+        response(article_sha),
+        consultation_type="figure_plan",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+    absent = parse_typed_advisor_response(
+        response("d" * 64),
+        consultation_type="figure_plan",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["figure_plan"]["nodes"][0]["refs"] == [
+        {"kind": "article", "id": article_sha}
+    ]
+    assert absent is not None
+    assert "figure_plan" not in absent
+    assert absent["usable"] is False
+    assert "reference_alias_unknown" in absent["warnings"]
+
+
+def test_figure_plan_has_no_application_node_edge_or_text_length_caps() -> None:
+    source = {"kind": "article", "id": "e" * 64}
+    nodes = [
+        {
+            "id": f"node_{index}_" + ("x" * 70),
+            "label": f"Node {index} " + ("long description " * 15),
+            "refs": [source],
+        }
+        for index in range(33)
+    ]
+    edges = [
+        {
+            "id": f"edge_{index}_" + ("y" * 70),
+            "source": nodes[0]["id"],
+            "target": nodes[(index % 32) + 1]["id"],
+            "label": "documented relation " * 12,
+            "refs": [source],
+            "direction": None,
+            "direction_refs": [],
+        }
+        for index in range(65)
+    ]
+    plan = AdvisorFigurePlanV1.from_payload(
+        {
+            "schema": "advisor-figure-plan.v1",
+            "title": "Full figure plan " * 20,
+            "legend": {"evidence_level": "documented", "text": "Evidence " * 40},
+            "nodes": nodes,
+            "edges": edges,
+        }
+    )
+
+    assert len(plan.nodes) == 33
+    assert len(plan.edges) == 65
+
+
 def test_yara_source_above_legacy_limit_is_preserved() -> None:
     source = "rule Candidate { condition: true }\n" + ("// x\n" * 14_000)
     parsed = parse_typed_advisor_response(
@@ -1344,6 +1468,23 @@ def test_review_text_attaches_unstructured_overall_to_each_requested_unit() -> N
     assert all(item["remarks"] == [raw] for item in parsed["reviews"])
     assert all(item["assignment"] == "unstructured_overall" for item in parsed["reviews"])
     assert parsed["raw_output"] == raw
+
+
+def test_review_text_preserves_complete_prose_above_legacy_64k_cap() -> None:
+    raw = "Conseil lisible.\n" + ("suite complète " * 8_000)
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert len(raw.encode("utf-8")) > 64 * 1024
+    assert parsed["raw_output"] == raw
+    assert parsed["raw_output_bytes"] == len(raw.encode("utf-8"))
+    assert parsed["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert parsed["raw_output_truncated"] is False
 
 
 def test_review_text_keeps_advice_while_redacting_operational_secret_fields() -> None:

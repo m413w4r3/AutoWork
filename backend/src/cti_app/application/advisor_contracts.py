@@ -212,7 +212,6 @@ def parse_typed_advisor_response(
     return _classify_advisor_warnings(result)
 
 
-_MAX_ADVISOR_RAW_OUTPUT_CHARS = 64 * 1024
 _MAX_HEURISTIC_REVIEW_TEXT_CHARS = 4000
 _REVIEW_TEXT_KEYS = frozenset(
     {
@@ -727,24 +726,13 @@ def _finish_review_normalization(
         _append_warning(result, warning)
     if raw_secret_count:
         _append_warning(result, "secret_redacted")
-    raw_output = raw_safe
-    if len(raw_output) > _MAX_ADVISOR_RAW_OUTPUT_CHARS:
-        raw_output = raw_output[:_MAX_ADVISOR_RAW_OUTPUT_CHARS].rstrip() + "…"
-        _append_warning(result, "response_bounded")
     encoded = raw_text.encode("utf-8")
-    result["raw_output"] = raw_output
+    result["raw_output"] = raw_safe
     result["raw_output_bytes"] = len(encoded)
     result["raw_output_sha256"] = hashlib.sha256(encoded).hexdigest()
     result["raw_output_retained"] = True
-    result["raw_output_truncated"] = len(raw_safe) > _MAX_ADVISOR_RAW_OUTPUT_CHARS
+    result["raw_output_truncated"] = False
     return result
-
-
-def _bounded_advisor_raw_output(raw: str, result: dict[str, Any]) -> str:
-    if len(raw) <= _MAX_ADVISOR_RAW_OUTPUT_CHARS:
-        return raw
-    _append_warning(result, "response_bounded")
-    return raw[:_MAX_ADVISOR_RAW_OUTPUT_CHARS].rstrip() + "…"
 
 
 def _warning_is_blocking(code: object) -> bool:
@@ -858,6 +846,9 @@ def _resolve_typed_json_aliases(
         item = collection.get(key)
         if item is None and prefix == "R" and re.fullmatch(r"E[1-9][0-9]*", key):
             item = aliases["evidence"].get(key)
+        if item is None and prefix == "R" and alias.startswith("article:"):
+            article_sha = alias.partition(":")[2]
+            item = actual_refs.get(("article", article_sha))
         if item is None and prefix == "R":
             item = next(
                 (row for (kind, identifier), row in actual_refs.items() if identifier == alias),
@@ -2421,12 +2412,58 @@ def _parse_figure_plan(
     if parsed.get("status") not in {"succeeded", "partial"}:
         return None
     try:
-        plan = AdvisorFigurePlanV1.from_payload(parsed.get("figure_plan"))
         allowed = {
             (str(item.get("kind")), str(item.get("id")))
             for item in prompt_data.get("transmitted_refs", ())
             if isinstance(item, Mapping)
         }
+        figure_payload = parsed.get("figure_plan")
+        if isinstance(figure_payload, Mapping):
+            figure_payload = dict(figure_payload)
+            for collection_name in ("nodes", "edges"):
+                collection = figure_payload.get(collection_name)
+                if not isinstance(collection, list):
+                    continue
+                normalized_collection = []
+                for item in collection:
+                    if not isinstance(item, Mapping):
+                        normalized_collection.append(item)
+                        continue
+                    normalized_item = dict(item)
+                    refs = normalized_item.get("refs")
+                    if isinstance(refs, list):
+                        normalized_refs = []
+                        for reference in refs:
+                            if (
+                                isinstance(reference, Mapping)
+                                and reference.get("kind") == "article"
+                                and isinstance(reference.get("id"), str)
+                                and reference["id"].startswith("article:")
+                            ):
+                                article_sha = reference["id"].partition(":")[2]
+                                if ("article", article_sha) in allowed:
+                                    reference = {**dict(reference), "id": article_sha}
+                            normalized_refs.append(reference)
+                        normalized_item["refs"] = normalized_refs
+                    if collection_name == "edges":
+                        direction_refs = normalized_item.get("direction_refs")
+                        if isinstance(direction_refs, list):
+                            normalized_direction_refs = []
+                            for reference in direction_refs:
+                                if (
+                                    isinstance(reference, Mapping)
+                                    and reference.get("kind") == "article"
+                                    and isinstance(reference.get("id"), str)
+                                    and reference["id"].startswith("article:")
+                                ):
+                                    article_sha = reference["id"].partition(":")[2]
+                                    if ("article", article_sha) in allowed:
+                                        reference = {**dict(reference), "id": article_sha}
+                                normalized_direction_refs.append(reference)
+                            normalized_item["direction_refs"] = normalized_direction_refs
+                    normalized_collection.append(normalized_item)
+                figure_payload[collection_name] = normalized_collection
+        plan = AdvisorFigurePlanV1.from_payload(figure_payload)
         plan.require_transmitted_refs(allowed)
     except (TypeError, ValueError):
         return None

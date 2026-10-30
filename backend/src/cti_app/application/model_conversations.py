@@ -498,7 +498,23 @@ class ModelConversationService:
                 "La récupération visible est réservée aux tours ChatGPT Bridge.",
                 status_code=422,
             )
-        if run.status is not ModelRunStatus.NEEDS_REVIEW:
+        legacy_abandoned_unknown = (
+            run.status is ModelRunStatus.FAILED
+            and run.error_code == "operator_abandoned"
+            and isinstance(run.error_details, dict)
+            and isinstance(run.error_details.get("operator_abandonment"), dict)
+            and run.error_details["operator_abandonment"].get("external_outcome")
+            in {
+                ModelSubmissionState.EXTERNAL_STATE_UNKNOWN.value,
+                ModelSubmissionState.SUBMISSION_IN_PROGRESS.value,
+            }
+            and run.submission_state.value
+            in {
+                ModelSubmissionState.EXTERNAL_STATE_UNKNOWN.value,
+                ModelSubmissionState.SUBMISSION_IN_PROGRESS.value,
+            }
+        )
+        if run.status is not ModelRunStatus.NEEDS_REVIEW and not legacy_abandoned_unknown:
             raise ModelConversationReconciliationError(
                 "conversation_reconciliation_not_required",
                 "Le ModelRun ne nécessite plus de réconciliation.",
@@ -527,7 +543,10 @@ class ModelConversationService:
         conversation, turn, run = await self._recovery_target(
             conversation_id, turn_id, context_subject_id=context_subject_id
         )
-        if turn.status is not ConversationTurnStatus.NEEDS_REVIEW:
+        legacy_abandoned_unknown = (
+            turn.status is ConversationTurnStatus.FAILED and turn.error_code == "operator_abandoned"
+        )
+        if turn.status is not ConversationTurnStatus.NEEDS_REVIEW and not legacy_abandoned_unknown:
             raise ModelConversationReconciliationError(
                 "conversation_reconciliation_not_required",
                 "Ce tour ne nécessite plus de réconciliation.",
@@ -551,12 +570,6 @@ class ModelConversationService:
                 "Aucune réponse finale visible n'est disponible pour ce tour.",
             )
         content = text.encode("utf-8")
-        if len(content) > 2_000_000:
-            raise ModelConversationReconciliationError(
-                "conversation_reconciliation_response_too_large",
-                "La réponse visible dépasse la taille maximale autorisée.",
-                status_code=413,
-            )
         return {
             "turn_id": turn.id,
             "sha256": hashlib.sha256(content).hexdigest(),
@@ -594,7 +607,10 @@ class ModelConversationService:
                 "conversation_reconciliation_adoption_conflict",
                 "Le tour a déjà été réconcilié avec un autre résultat.",
             )
-        if turn.status is not ConversationTurnStatus.NEEDS_REVIEW:
+        legacy_abandoned_unknown = (
+            turn.status is ConversationTurnStatus.FAILED and turn.error_code == "operator_abandoned"
+        )
+        if turn.status is not ConversationTurnStatus.NEEDS_REVIEW and not legacy_abandoned_unknown:
             raise ModelConversationReconciliationError(
                 "conversation_reconciliation_not_required",
                 "Ce tour ne peut pas être adopté dans son état actuel.",
@@ -632,6 +648,93 @@ class ModelConversationService:
             )
         return adopted
 
+    async def seal_verified_pre_submission(
+        self,
+        conversation_id: UUID,
+        turn_id: UUID,
+        *,
+        claim_id: UUID,
+        actor_id: str,
+        context_subject_id: UUID | None = None,
+    ) -> ModelConversationTurn:
+        """Consume a server-verified no-handoff claim for this exact Bridge turn."""
+        if not actor_id.strip():
+            raise ModelConversationReconciliationError(
+                "conversation_reconciliation_actor_required",
+                "Une identité opérateur est requise.",
+                status_code=403,
+            )
+        async with self._uow_factory() as uow:
+            conversation = await uow.model_conversations.get_for_update(conversation_id)
+            self._ensure_visible(conversation, context_subject_id)
+            turn = await uow.model_conversation_turns.get(turn_id)
+            if turn is None or turn.conversation_id != conversation_id:
+                raise ConversationNotFoundError("Tour introuvable dans cette conversation")
+            run = await uow.model_runs.get_for_update(turn.model_run_id)
+            if (
+                conversation.transport is not ConversationTransport.CHATGPT_BRIDGE
+                or conversation.purpose is not ConversationPurpose.PIVOT_RESEARCH
+                or run is None
+                or run.backend is not ModelBackend.CHATGPT_BRIDGE
+            ):
+                raise ModelConversationReconciliationError(
+                    "conversation_reconciliation_no_handoff_conflict",
+                    "La preuve ne correspond pas à un tour Bridge d'investigation.",
+                )
+            proof = (run.error_details or {}).get("pre_submission_proof") if run is not None else None
+            if (
+                run is not None
+                and turn.status is ConversationTurnStatus.FAILED
+                and turn.error_code == "bridge_pre_submission_failure"
+                and run.status is ModelRunStatus.FAILED
+                and run.error_code == "bridge_pre_submission_failure"
+                and isinstance(proof, dict)
+                and proof.get("source") == "external_effect_claim"
+                and proof.get("claim_id") == str(claim_id)
+                and turn.output_blob_reference is None
+                and run.response_id is None
+                and not run.output_references
+                and run.raw_output_reference is None
+                and run.raw_output_sha256 is None
+                and run.raw_output_chars is None
+                and turn.error_details == {
+                    "pre_submission_proof": {
+                        "source": "external_effect_claim",
+                        "claim_id": str(claim_id),
+                        "model_run_id": str(run.id),
+                    }
+                }
+            ):
+                return turn
+            if (
+                run is None
+                or turn.status is not ConversationTurnStatus.NEEDS_REVIEW
+                or turn.output_blob_reference is not None
+                or run.response_id is not None
+                or run.output_references
+                or run.raw_output_reference is not None
+                or run.raw_output_sha256 is not None
+                or run.raw_output_chars is not None
+            ):
+                raise ModelConversationReconciliationError(
+                    "conversation_reconciliation_no_handoff_conflict",
+                    "Le tour contient une réponse ou ne correspond pas à une preuve de non-handoff.",
+                )
+            try:
+                run.seal_verified_no_handoff(claim_id=claim_id)
+                turn.seal_verified_no_handoff(model_run_id=run.id, claim_id=claim_id)
+            except (TypeError, ValueError) as exc:
+                raise ModelConversationReconciliationError(
+                    "conversation_reconciliation_no_handoff_conflict",
+                    "Le ModelRun ne peut pas être scellé comme non soumis.",
+                ) from exc
+            conversation.mark_problem(uncertain=False)
+            await uow.model_conversation_turns.save(turn)
+            await uow.model_runs.save(run)
+            await uow.model_conversations.save(conversation)
+            await uow.commit()
+            return turn
+
     async def abandon_investigation_turn(
         self,
         conversation_id: UUID,
@@ -660,227 +763,12 @@ class ModelConversationService:
             turn = await uow.model_conversation_turns.get(turn_id)
             if turn is None or turn.conversation_id != conversation_id:
                 raise ConversationNotFoundError("Tour introuvable dans cette conversation")
-            assert conversation is not None
-            if (
-                turn.status is ConversationTurnStatus.FAILED
-                and turn.error_code == "operator_abandoned"
-            ):
-                audit = (turn.error_details or {}).get("operator_abandonment")
-                if (
-                    isinstance(audit, dict)
-                    and audit.get("actor_id") == actor_id
-                    and audit.get("reason") == reason
-                ):
-                    return turn
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_abandon_conflict",
-                    "Ce tour a déjà été abandonné avec une autre décision.",
-                )
-            if (
-                conversation.purpose.value != "pivot_research"
-                or conversation.transport.value != "chatgpt_bridge"
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_abandon_unsupported",
-                    "L'abandon avec nouvelle tentative est réservé aux tours "
-                    "d'investigation Bridge.",
-                    status_code=422,
-                )
-            try:
-                parts = turn.correlation_id.split(":")
-                if len(parts) != 5 or parts[0] != "investigation" or parts[2] != "turn":
-                    raise ValueError
-                investigation_id = UUID(parts[1])
-                turn_index = int(parts[3])
-            except (ValueError, TypeError) as exc:
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_investigation_identity_invalid",
-                    "Le tour n'est pas relié à une identité d'investigation vérifiable.",
-                ) from exc
-            # Lazy import avoids a module cycle: BridgeInvestigator itself depends
-            # on this conversation service.
-            from cti_app.application.bridge_investigator import (
-                make_investigation_conversation_id,
-                make_investigation_turn_idempotency_key,
+            raise ModelConversationReconciliationError(
+                "conversation_reconciliation_requires_provider_resolution",
+                "Une raison libre ne prouve pas la non-exécution. Récupérez et adoptez la réponse "
+                "Bridge exacte, ou attendez une preuve serveur de non-handoff ; aucun nouvel "
+                "envoi n'est autorisé par cette action.",
             )
-
-            state = await uow.investigation_states.get(investigation_id)
-            if (
-                state is None
-                or conversation.id != make_investigation_conversation_id(investigation_id)
-                or state.turn_index != turn_index
-                or state.pending_context_sha256 is None
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_investigation_checkpoint_mismatch",
-                    "Le tour ne correspond pas au checkpoint d'investigation en attente.",
-                )
-            current_attempt = investigation_bridge_attempt(state.recent_actions, turn_index)
-            prior_abandoned = investigation_abandoned_turn_id(
-                state.recent_actions, turn_index, current_attempt
-            )
-            orphaned_source = (
-                investigation_orphaned_turn_id(state.recent_actions, turn_index, current_attempt)
-                == turn.id
-                and turn.error_code == "orphaned_running_turn"
-            )
-            if (
-                state.stop_reason
-                not in {
-                    StopReason.SUBMISSION_NEEDS_REVIEW,
-                    StopReason.USER_INTERRUPT,
-                    # An earlier retry can exhaust the investigation as
-                    # MODEL_UNAVAILABLE while the original persisted Bridge
-                    # attempt is still the exact pending checkpoint. The
-                    # identity checks below still require that exact turn.
-                    StopReason.MODEL_UNAVAILABLE,
-                }
-                and not orphaned_source
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_investigation_checkpoint_mismatch",
-                    "Le tour ne correspond pas au checkpoint d'investigation en attente.",
-                )
-            if prior_abandoned == turn.id:
-                audit = (turn.error_details or {}).get("operator_abandonment")
-                if (
-                    turn.status is ConversationTurnStatus.FAILED
-                    and turn.error_code == "operator_abandoned"
-                    and isinstance(audit, dict)
-                    and audit.get("actor_id") == actor_id
-                    and audit.get("reason") == reason
-                ):
-                    return turn
-            expected_key = make_investigation_turn_idempotency_key(
-                investigation_id=investigation_id,
-                turn_index=turn_index,
-                context_sha256=state.pending_context_sha256,
-                attempt=current_attempt,
-            )
-            expected_correlation = (
-                f"investigation:{investigation_id}:turn:{turn_index}:{expected_key[:16]}"
-            )
-            if turn.status is not ConversationTurnStatus.NEEDS_REVIEW or (
-                not orphaned_source
-                and (
-                    turn.idempotency_key != expected_key
-                    or turn.correlation_id != expected_correlation
-                )
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_turn_identity_mismatch",
-                    "Le tour ne correspond pas à la tentative Bridge en attente.",
-                )
-            run = await uow.model_runs.get_for_update(turn.model_run_id)
-            if run is None:
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_run_not_recoverable",
-                    "Le ModelRun associé ne nécessite plus de réconciliation.",
-                )
-            if run.status is not ModelRunStatus.NEEDS_REVIEW:
-                if run.status is ModelRunStatus.FAILED:
-                    await uow.model_conversations.get_for_update(conversation_id)
-                    repeated = await uow.model_conversation_turns.get(turn_id)
-                    audit = (
-                        (repeated.error_details or {}).get("operator_abandonment")
-                        if repeated is not None
-                        else None
-                    )
-                    if (
-                        repeated is not None
-                        and repeated.status is ConversationTurnStatus.FAILED
-                        and repeated.error_code == "operator_abandoned"
-                        and isinstance(audit, dict)
-                        and audit.get("actor_id") == actor_id
-                        and audit.get("reason") == reason
-                    ):
-                        return repeated
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_run_not_recoverable",
-                    "Le ModelRun associé ne nécessite plus de réconciliation.",
-                )
-            # Use the same lock order as ModelGateway.adopt_recovery_output:
-            # ModelRun first, conversation second. Re-read all fenced records
-            # after acquiring locks so concurrent adopt/abandon cannot cross.
-            conversation = await uow.model_conversations.get_for_update(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
-            locked_turn = await uow.model_conversation_turns.get(turn_id)
-            state = await uow.investigation_states.get(investigation_id)
-            if (
-                conversation is None
-                or locked_turn is None
-                or locked_turn.conversation_id != conversation_id
-                or state is None
-                or state.turn_index != turn_index
-                or state.pending_context_sha256 is None
-                or run.status is not ModelRunStatus.NEEDS_REVIEW
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_checkpoint_changed",
-                    "Le checkpoint a changé pendant la réconciliation ; relisez operator-status.",
-                )
-            current_attempt = investigation_bridge_attempt(state.recent_actions, turn_index)
-            orphaned_source = (
-                investigation_orphaned_turn_id(state.recent_actions, turn_index, current_attempt)
-                == locked_turn.id
-                and locked_turn.error_code == "orphaned_running_turn"
-            )
-            if (
-                state.stop_reason
-                not in {
-                    StopReason.SUBMISSION_NEEDS_REVIEW,
-                    StopReason.USER_INTERRUPT,
-                    StopReason.MODEL_UNAVAILABLE,
-                }
-                and not orphaned_source
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_checkpoint_changed",
-                    "Le checkpoint a changé pendant la réconciliation ; relisez operator-status.",
-                )
-            expected_key = make_investigation_turn_idempotency_key(
-                investigation_id=investigation_id,
-                turn_index=turn_index,
-                context_sha256=state.pending_context_sha256,
-                attempt=current_attempt,
-            )
-            expected_correlation = (
-                f"investigation:{investigation_id}:turn:{turn_index}:{expected_key[:16]}"
-            )
-            if (
-                locked_turn.status is not ConversationTurnStatus.NEEDS_REVIEW
-                or (
-                    not orphaned_source
-                    and (
-                        locked_turn.idempotency_key != expected_key
-                        or locked_turn.correlation_id != expected_correlation
-                    )
-                )
-                or locked_turn.model_run_id != run.id
-            ):
-                raise ModelConversationReconciliationError(
-                    "conversation_reconciliation_checkpoint_changed",
-                    "Le tour n'est plus la tentative en attente ; relisez operator-status.",
-                )
-            turn = locked_turn
-            run.abandon_uncertain_submission(actor_id=actor_id, reason=reason)
-            turn.abandon_uncertain_submission(actor_id=actor_id, reason=reason)
-            updated_state = replace(
-                state,
-                version=state.version + 1,
-                recent_actions=(
-                    *state.recent_actions,
-                    "bridge_turn_abandoned:"
-                    f"{turn_index}:next_attempt={current_attempt + 1}:turn_id={turn.id}",
-                )[-32:],
-            )
-            await uow.investigation_states.save_if_version(
-                updated_state, expected_version=state.version
-            )
-            await uow.model_runs.save(run)
-            await uow.model_conversation_turns.save(turn)
-            await uow.commit()
-            return turn
 
     async def reconcile_orphaned_investigation_turn(
         self,
@@ -935,7 +823,7 @@ class ModelConversationService:
             if turn.status is ConversationTurnStatus.SUCCEEDED:
                 return "captured_output"
             if run.status is ModelRunStatus.SUCCEEDED and output_reference is not None:
-                content = await self._gateway.read_output(output_reference)
+                content = await self._gateway.read_output_unbounded(output_reference)
                 turn.adopt_recovery_output(
                     output_blob_reference=output_reference,
                     output_sha256=hashlib.sha256(content).hexdigest(),
@@ -973,26 +861,38 @@ class ModelConversationService:
                 ModelRunStatus.FAILED,
             }:
                 return "needs_review"
+            if run.submission_state is ModelSubmissionState.NOT_SUBMITTED:
+                turn.mark_pre_submission_retryable(
+                    model_run_id=run.id,
+                    submission_attempt=run.submission_attempt,
+                )
+                run.mark_pre_submission_retryable()
+                conversation.mark_problem(uncertain=False)
+                updated_state = replace(
+                    state,
+                    version=state.version + 1,
+                    recent_actions=(
+                        *state.recent_actions,
+                        "bridge_turn_pre_submission_retry:"
+                        f"{turn_index}:next_attempt={attempt + 1}:turn_id={turn.id}",
+                    )[-32:],
+                )
+                await uow.investigation_states.save_if_version(
+                    updated_state, expected_version=state.version
+                )
+                await uow.model_conversation_turns.save(turn)
+                await uow.model_runs.save(run)
+                await uow.model_conversations.save(conversation)
+                await uow.commit()
+                return "orphaned_running_turn"
             turn.mark_orphaned()
             run.mark_orphaned_running_turn()
             conversation.mark_problem(uncertain=True)
-            updated_state = replace(
-                state,
-                version=state.version + 1,
-                recent_actions=(
-                    *state.recent_actions,
-                    "bridge_turn_orphaned:"
-                    f"{turn_index}:next_attempt={attempt + 1}:turn_id={turn.id}",
-                )[-32:],
-            )
-            await uow.investigation_states.save_if_version(
-                updated_state, expected_version=state.version
-            )
             await uow.model_conversation_turns.save(turn)
             await uow.model_runs.save(run)
             await uow.model_conversations.save(conversation)
             await uow.commit()
-            return "orphaned_running_turn"
+            return "needs_review"
 
     async def seal_orphaned_investigation_turn(
         self,
@@ -1027,7 +927,7 @@ class ModelConversationService:
                 run.output_references[0] if run.output_references else None
             )
             if run.status is ModelRunStatus.SUCCEEDED and output_reference is not None:
-                content = await self._gateway.read_output(output_reference)
+                content = await self._gateway.read_output_unbounded(output_reference)
                 locked_turn.adopt_recovery_output(
                     output_blob_reference=output_reference,
                     output_sha256=hashlib.sha256(content).hexdigest(),
@@ -1674,7 +1574,7 @@ class ModelConversationService:
         blob = blobs.get(blob_id)
         if blob is None:
             raise ModelConversationError("Blob conversationnel introuvable")
-        return (await self._blob_store.read(blob.descriptor, max_bytes=2_000_000)).decode()
+        return (await self._blob_store.read(blob.descriptor, max_bytes=blob.descriptor.size)).decode()
 
 
 def _needs_review_error(execution: ModelExecution) -> ConversationNeedsReviewError:

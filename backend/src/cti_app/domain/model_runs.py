@@ -288,6 +288,72 @@ class ModelRun:
         self.finished_at = timestamp
         self.updated_at = timestamp
 
+    def mark_pre_submission_retryable(self, *, now: datetime | None = None) -> None:
+        """Seal only a run whose durable state proves no provider handoff began."""
+        if self.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
+            raise ValueError("ModelRun submission is not proven absent")
+        if self.status not in {
+            ModelRunStatus.RUNNING,
+            ModelRunStatus.WAITING_BACKGROUND,
+            ModelRunStatus.NEEDS_REVIEW,
+            ModelRunStatus.FAILED,
+        }:
+            raise ValueError("ModelRun is not eligible for pre-submission recovery")
+        timestamp = now or datetime.now(UTC)
+        self.status = ModelRunStatus.FAILED
+        self.error_code = "bridge_pre_submission_failure"
+        self.error_message = "Le ModelRun confirme que le fournisseur n'a pas reçu ce tour."
+        self.error_details = {
+            "pre_submission_proof": {
+                "submission_state": self.submission_state.value,
+                "submission_attempt": self.submission_attempt,
+            }
+        }
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
+    def seal_verified_no_handoff(
+        self, *, claim_id: UUID, now: datetime | None = None
+    ) -> None:
+        """Seal this run after its exact external-effect claim proves zero handoff."""
+        if self.status not in {
+            ModelRunStatus.RUNNING,
+            ModelRunStatus.WAITING_BACKGROUND,
+            ModelRunStatus.NEEDS_REVIEW,
+            ModelRunStatus.FAILED,
+        }:
+            raise ValueError("ModelRun is not eligible for no-handoff reconciliation")
+        if (
+            self.response_id is not None
+            or self.output_references
+            or self.raw_output_reference
+            or self.raw_output_sha256 is not None
+            or self.raw_output_chars is not None
+        ):
+            raise ValueError("ModelRun has provider output and cannot be sealed as unsubmitted")
+        if not isinstance(claim_id, UUID):
+            raise TypeError("claim_id must be UUID")
+        proof = {
+            "source": "external_effect_claim",
+            "claim_id": str(claim_id),
+        }
+        previous = (self.error_details or {}).get("pre_submission_proof")
+        if (
+            self.status is ModelRunStatus.FAILED
+            and self.error_code == "bridge_pre_submission_failure"
+            and previous == proof
+            and self.submission_state is ModelSubmissionState.NOT_SUBMITTED
+        ):
+            return
+        timestamp = now or datetime.now(UTC)
+        self.status = ModelRunStatus.FAILED
+        self.submission_state = ModelSubmissionState.NOT_SUBMITTED
+        self.error_code = "bridge_pre_submission_failure"
+        self.error_message = "Une preuve serveur confirme que Bridge n'a pas reçu ce tour."
+        self.error_details = {"pre_submission_proof": proof}
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
     def adopt_recovery(
         self,
         *,

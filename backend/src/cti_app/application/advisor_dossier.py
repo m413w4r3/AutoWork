@@ -683,6 +683,11 @@ def build_advisor_dossier(
                             if type(item.get("offset")) is int
                             else {}
                         ),
+                        **(
+                            {"anchor": _as_text(item.get("anchor"))}
+                            if _as_text(item.get("anchor"))
+                            else {}
+                        ),
                     },
                 )
             )
@@ -2012,20 +2017,6 @@ def evaluate_advisor_evidence_preflight(
                     ),
                 }
             )
-
-    if consultation_type == "figure_plan" and not any(
-        isinstance(item, Mapping) and _as_text(item.get("finding_id"))
-        for item in prompt_data.get("findings", ())
-    ):
-        add(
-            "finding",
-            "figure-findings",
-            "",
-            None,
-            False,
-            True,
-            "Figure planning requires at least one selected canonical finding.",
-        )
 
     proof_kinds = {"observation", "finding", "article", "measurement", "fact"}
     if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"} and not any(

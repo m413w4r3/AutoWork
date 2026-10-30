@@ -13,6 +13,10 @@ OBSERVATION_ID = "56a906d5-943b-4dae-a3c8-867d730e2229"
     (
         ("GET", f"/api/investigations/{INVESTIGATION_ID}"),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/operator-status"),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{OBSERVATION_ID}/reconcile",
+        ),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/operator/context"),
         (
             "GET",
@@ -63,6 +67,14 @@ def test_operator_client_route_allowlist_normalizes_outer_slashes_only() -> None
     (
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/envelope/approve"),
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/envelope/revoke"),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/not-a-uuid/reconcile",
+        ),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION_ID}/invocations/{OBSERVATION_ID}/reconcile",
+        ),
         (
             "POST",
             f"/api/investigations/{INVESTIGATION_ID}/operator/tools/sample.set_qualification",
