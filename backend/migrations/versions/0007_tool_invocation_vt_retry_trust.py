@@ -19,8 +19,11 @@ _COLUMN = "passive_read_retry_trusted"
 
 
 def upgrade() -> None:
-    op.add_column("tool_invocations", sa.Column(_COLUMN, sa.Boolean(), nullable=True))
     bind = op.get_bind()
+    # The frozen baseline creates tables from the current ORM metadata, so a database
+    # built from scratch already has the column; only pre-0007 databases need it added.
+    if _COLUMN not in {item["name"] for item in sa.inspect(bind).get_columns("tool_invocations")}:
+        op.add_column("tool_invocations", sa.Column(_COLUMN, sa.Boolean(), nullable=True))
     bind.execute(
         sa.text(
             f"""
