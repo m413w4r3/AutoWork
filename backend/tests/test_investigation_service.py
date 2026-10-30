@@ -18,6 +18,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
+from cti_app.application.investigation_acquisition_tools import VT_DOWNLOAD_SAMPLE_SCHEMA
 from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_composition import (
     build_investigation_composition,
@@ -81,6 +82,8 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
 )
+from cti_app.domain.classification import TLP
+from cti_app.domain.entities import SourceDocument
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -734,6 +737,122 @@ class _Fixture:
         )
 
 
+class _DownloadSampleRepository:
+    def __init__(self) -> None:
+        self.samples: dict[str, tuple[Any, ...]] = {}
+
+    async def list_by_subject_and_sha256(self, _subject_id: UUID, sample_sha256: str):
+        return self.samples.get(sample_sha256, ())
+
+
+class _SourceDocumentRepository:
+    def __init__(self) -> None:
+        self.documents: dict[UUID, Any] = {}
+
+    async def get(self, document_id: UUID):
+        return self.documents.get(document_id)
+
+
+def _vt_download_fixture(*, documented_hash: str | None = None) -> _Fixture:
+    cost = {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1}
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "vt.download_sample",
+                "vt",
+                ToolEffect.ACQUIRE,
+                "vt.file_download",
+                cost,
+            ),
+        ),
+    )
+    fixture.registry.unregister("vt.download_sample", "1")
+    fixture.registry.register(
+        ToolDefinition(
+            name="vt.download_sample",
+            schema_version="1",
+            input_schema=VT_DOWNLOAD_SAMPLE_SCHEMA,
+            effect=ToolEffect.ACQUIRE,
+            cost_model=cost,
+            confidentiality=ToolConfidentiality.RESTRICTED,
+            limitations=("Synthetic offline acquisition adapter.",),
+            capability_key="vt.file_download",
+        ),
+        fixture.tools["vt.download_sample"],
+    )
+    fixture.envelope = replace(
+        fixture.envelope,
+        acquire_hits_allowed=True,
+        budget=InvestigationBudget(
+            limits={
+                BudgetDimension.BRIDGE_TURNS: 8,
+                BudgetDimension.VT_UNITS: 20,
+                BudgetDimension.DOWNLOADS: 4,
+            }
+        ),
+    )
+    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    fixture.service._samples = _DownloadSampleRepository()
+    fixture.service._source_documents = _SourceDocumentRepository()
+    if documented_hash is not None:
+        document_id = uuid4()
+        fixture.snapshot = replace(
+            fixture.snapshot,
+            confirmed_iocs=(
+                ConfirmedIOCContextV1(
+                    indicator_type="sha256",
+                    value=documented_hash.upper(),
+                    extraction_artifact_id=uuid4(),
+                    extraction_artifact_version=1,
+                    source_document_ids=(document_id,),
+                ),
+            ),
+        )
+        fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+        fixture.service._source_documents.documents[document_id] = SourceDocument(
+            id=document_id,
+            subject_id=fixture.subject_id,
+            blob_id=uuid4(),
+            original_name="synthetic-article.html",
+            origin="synthetic-test",
+            acquired_at=datetime.now(UTC),
+            license_restriction=None,
+            tlp=TLP.GREEN,
+            do_not_submit=True,
+            external_llm_allowed=True,
+        )
+    return fixture
+
+
+async def _execute_vt_download(fixture: _Fixture, file_hash: str):
+    state = await fixture.start()
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert investigation is not None
+    assert envelope is not None
+    purpose = "Acquire a synthetic documented sample."
+    arguments = {"sha256": file_hash, "purpose": purpose, "evidence_refs": []}
+    operation_key = tool_operation_key(
+        investigation_id=investigation.id,
+        tool_name="vt.download_sample",
+        schema_version="1",
+        normalized_parameters=arguments,
+        purpose=purpose,
+    )
+    return await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="vt.download_sample",
+        schema_version="1",
+        arguments=arguments,
+        purpose=purpose,
+        operation_key=operation_key,
+    )
+
+
 def _enable_osint_vt_hash_reads(fixture: _Fixture, *, authorized: bool = True):
     policy_id = uuid4()
     policy_event_id = uuid4()
@@ -1075,12 +1194,126 @@ async def test_trusted_vt_source_refs_resolve_sha256_observation_and_confirmed_i
     )
     assert document_only_references == (
         EvidenceReference(
+            "sample_hash",
+            document_only_hash,
+            "sample-hash.v1",
+            document_only_hash,
+        ),
+        EvidenceReference(
             "source_document",
             str(document_only_id),
             document_only_version,
             document_only_snapshot.synthesis_sha256,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_vt_download_allows_unassociated_confirmed_documented_ioc() -> None:
+    sample_hash = "a" * 64
+    fixture = _vt_download_fixture(documented_hash=sample_hash)
+
+    invocation, result, _response_refs, _external_effect = await _execute_vt_download(
+        fixture, sample_hash
+    )
+
+    assert invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert result.framework_pre_submission_proof is None
+    assert fixture.tools["vt.download_sample"].calls == [
+        {
+            "sha256": sample_hash,
+            "purpose": "Acquire a synthetic documented sample.",
+            "evidence_refs": [],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vt_download_rejects_ungrounded_hash_with_actionable_reason() -> None:
+    sample_hash = "b" * 64
+    fixture = _vt_download_fixture()
+
+    invocation, result, _response_refs, _external_effect = await _execute_vt_download(
+        fixture, sample_hash
+    )
+
+    assert invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
+    assert result.error_code == "vt_hash_not_grounded"
+    assert result.output["reason"] == "vt_hash_not_grounded"
+    assert "vt.file_report" in result.output["correction"]
+    assert fixture.tools["vt.download_sample"].calls == []
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    reservation = envelope.budget.reservations[0]
+    assert reservation.status is BudgetReservationStatus.RELEASED
+
+
+@pytest.mark.asyncio
+async def test_vt_download_still_requires_acquisition_authorization() -> None:
+    sample_hash = "c" * 64
+    fixture = _vt_download_fixture(documented_hash=sample_hash)
+    fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=False)
+
+    invocation, result, _response_refs, _external_effect = await _execute_vt_download(
+        fixture, sample_hash
+    )
+
+    assert invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.POLICY_REJECTED
+    assert fixture.tools["vt.download_sample"].calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("document_tlp", "document_license"),
+    ((TLP.RED, None), (TLP.GREEN, "restricted synthetic license")),
+)
+async def test_vt_download_still_rejects_restricted_source_document(
+    document_tlp: TLP, document_license: str | None
+) -> None:
+    sample_hash = "d" * 64
+    fixture = _vt_download_fixture(documented_hash=sample_hash)
+    document_id = fixture.snapshot.confirmed_iocs[0].source_document_ids[0]
+    fixture.service._source_documents.documents[document_id] = replace(
+        fixture.service._source_documents.documents[document_id],
+        tlp=document_tlp,
+        license_restriction=document_license,
+    )
+
+    invocation, result, _response_refs, _external_effect = await _execute_vt_download(
+        fixture, sample_hash
+    )
+
+    assert invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.error_code == "external_disclosure_revoked_before_dispatch"
+    assert fixture.tools["vt.download_sample"].calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sample_tlp", "sample_license"),
+    ((TLP.RED, None), (TLP.GREEN, "restricted synthetic license")),
+)
+async def test_vt_download_still_rejects_restricted_existing_sample(
+    sample_tlp: TLP, sample_license: str | None
+) -> None:
+    sample_hash = "e" * 64
+    fixture = _vt_download_fixture(documented_hash=sample_hash)
+    fixture.service._samples.samples[sample_hash] = (
+        SimpleNamespace(
+            tlp=sample_tlp,
+            do_not_submit=False,
+            license_restriction=sample_license,
+        ),
+    )
+
+    invocation, _result, _response_refs, _external_effect = await _execute_vt_download(
+        fixture, sample_hash
+    )
+
+    assert invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert fixture.tools["vt.download_sample"].calls == []
 
 
 @pytest.mark.asyncio

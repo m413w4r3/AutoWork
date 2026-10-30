@@ -188,6 +188,11 @@ _VT_HASH_READ_TOOLS = frozenset(
 )
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER = "_advisor_preflight_refusal_expected"
+_VT_HASH_NOT_GROUNDED_REASON = "vt_hash_not_grounded"
+_VT_HASH_NOT_GROUNDED_CORRECTION = (
+    "Cite an observation or a source-documented SHA-256 IOC, or associate the hash through "
+    "vt.file_report before retrying."
+)
 
 
 class InvocationReconciliationOutcome(StrEnum):
@@ -1747,9 +1752,12 @@ class InvestigationService:
             purpose=purpose,
         )
 
+        pre_submission_correction: str | None = None
+
         async def check_current_admission(
             _context: ToolExecutionContext,
         ) -> FrameworkPreSubmissionProof | None:
+            nonlocal pre_submission_correction
             if not external_effect or envelope is None:
                 return None
             current_envelope = await self._envelopes.get(investigation.id)
@@ -1794,18 +1802,23 @@ class InvestigationService:
                         )
                         != 1
                     ):
+                        pre_submission_correction = _VT_HASH_NOT_GROUNDED_CORRECTION
                         return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.vt_external_disclosure_allowed(
-                    snapshot, current_envelope, tool_name
-                ) or await self._vt_source_disclosure_restricted(
+                if not self.vt_external_disclosure_allowed(snapshot, current_envelope, tool_name):
+                    return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
+                rejection_reason: list[str] = []
+                if await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
                     tool_name,
                     envelope=current_envelope,
+                    rejection_reason=rejection_reason,
                 ):
+                    if rejection_reason == [_VT_HASH_NOT_GROUNDED_REASON]:
+                        pre_submission_correction = _VT_HASH_NOT_GROUNDED_CORRECTION
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
                 current_investigation = await self._investigations.get(investigation.id)
@@ -1830,6 +1843,26 @@ class InvestigationService:
             # The coordinator repeats the authoritative checks under its consume lock.
             pre_dispatch_check=check_current_admission,
         )
+        if (
+            pre_submission_correction is not None
+            and result.framework_pre_submission_proof
+            is FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
+        ):
+            reason = _VT_HASH_NOT_GROUNDED_REASON
+            output = dict(result.output)
+            output.update(
+                {
+                    "reason": reason,
+                    "error_code": reason,
+                    "correction": pre_submission_correction,
+                }
+            )
+            result = replace(
+                result,
+                error_code=reason,
+                message=pre_submission_correction,
+                output=output,
+            )
         advisor_admission_recheck = (
             tool_name == "advisor.consult"
             and result.output.get("failure_stage") == "post_preparation_admission"
@@ -2074,9 +2107,10 @@ class InvestigationService:
         family: str,
         *,
         envelope: InvestigationEnvelope | None = None,
+        rejection_reason: list[str] | None = None,
     ) -> bool:
         sample_hashes = {
-            reference.id for reference in references if reference.kind == "sample_hash"
+            reference.id.casefold() for reference in references if reference.kind == "sample_hash"
         }
         observation_hashes: set[str] = set()
         hashes = set(sample_hashes)
@@ -2113,6 +2147,28 @@ class InvestigationService:
                     hashes.add(sample_hash)
             elif object_type in {"source_document", "document"}:
                 document_ids.add(observation.object_id)
+
+        documented_hashes: set[str] = set()
+        if sample_hashes:
+            try:
+                snapshot = await self._context_builder.article_snapshots.resolve(
+                    investigation.synthesis_artifact_id
+                )
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                for indicator in snapshot.confirmed_iocs:
+                    if indicator.indicator_type != "sha256" or not indicator.source_document_ids:
+                        continue
+                    try:
+                        documented_hash = normalize_file_hash(indicator.value).casefold()
+                    except (TypeError, ValueError, VirusTotalInvalidInputError):
+                        continue
+                    if len(documented_hash) != 64 or documented_hash not in sample_hashes:
+                        continue
+                    documented_hashes.add(documented_hash)
+                    document_ids.update(str(item) for item in indicator.source_document_ids)
+
         sample_associations = self._sample_associations
         sample_repository = self._samples
         if hashes:
@@ -2128,7 +2184,9 @@ class InvestigationService:
                 if sample_associations is not None
                 else ()
             )
-            associated_hashes = {association.sample_sha256 for association in associations}
+            associated_hashes = {
+                association.sample_sha256.casefold() for association in associations
+            }
             allow_unassociated_passive_read_observations = family in _VT_HASH_READ_TOOLS
             allow_unassociated_search_observations = (
                 family == "vt.intelligence_search" and allow_unobserved_hash
@@ -2137,8 +2195,12 @@ class InvestigationService:
                 reference.kind == "sample_hash" for reference in references
             ) and not observation_hashes.issubset(sample_hashes):
                 return True
-            ungrounded_hashes = sample_hashes - (associated_hashes | observation_hashes)
+            ungrounded_hashes = sample_hashes - (
+                associated_hashes | observation_hashes | documented_hashes
+            )
             if ungrounded_hashes and not allow_unobserved_hash:
+                if rejection_reason is not None:
+                    rejection_reason[:] = [_VT_HASH_NOT_GROUNDED_REASON]
                 return True
             if (
                 observation_hashes - (associated_hashes | sample_hashes)
@@ -2303,14 +2365,12 @@ class InvestigationService:
                 else ()
             )
             associated = any(item.sample_sha256 == normalized_hash for item in associations)
-            if associated or observation_refs:
+            if associated or observation_refs or document_refs:
                 return (
                     hash_reference,
                     *observation_refs,
                     *(document_refs[key] for key in sorted(document_refs)),
                 )
-            if document_refs:
-                return tuple(document_refs[key] for key in sorted(document_refs))
             if await self._osint_open_vt_hash_reads_allowed(investigation, envelope):
                 return (hash_reference,)
             return ()

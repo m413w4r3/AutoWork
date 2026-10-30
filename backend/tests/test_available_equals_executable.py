@@ -14,6 +14,8 @@ import pytest
 from cti_app.application.investigation_acquisition_tools import (
     ARCHIVE_EXTRACT_MEMBER_SCHEMA,
     SAMPLE_ANALYZE_SCHEMA,
+    VT_DOWNLOAD_SAMPLE_SCHEMA,
+    VT_FILE_DOWNLOAD_CAPABILITY,
 )
 from cti_app.application.investigation_contracts import ConfirmedIOCContextV1
 from cti_app.application.investigation_operator_view import build_investigation_operator_view
@@ -41,6 +43,8 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationService,
 )
 from cti_app.application.research_context_builder import blocked_capabilities_from_history
+from cti_app.domain.classification import TLP
+from cti_app.domain.entities import SourceDocument
 from cti_app.domain.external_effects import invocation_arguments_digest
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -722,6 +726,119 @@ async def test_available_pivots_and_exposed_families_execute_with_seeded_state()
 
     assert invoked_tools >= {"sample.analyze", "archive.extract_member", "rule.propose"}
     assert all(tool.calls for tool in tools.values() if tool.name in invoked_tools)
+
+
+@pytest.mark.asyncio
+async def test_documented_download_is_available_executable_and_reports_ungrounded_hash() -> None:
+    (
+        fixture,
+        state,
+        registry,
+        _summaries,
+        operator_service,
+        tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+    definition, adapter = _schema_tool(
+        "vt.download_sample",
+        VT_DOWNLOAD_SAMPLE_SCHEMA,
+        ToolEffect.ACQUIRE,
+        VT_FILE_DOWNLOAD_CAPABILITY,
+    )
+    definition = replace(
+        definition,
+        cost_model={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+    )
+    registry.register(definition, adapter)
+    tools["vt.download_sample"] = adapter
+    capabilities = frozenset((*fixture.available_capabilities, VT_FILE_DOWNLOAD_CAPABILITY))
+    fixture.available_capabilities = capabilities
+    fixture.service._available_capabilities = capabilities
+    operator_service._available_capabilities = capabilities
+
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    envelope = replace(envelope, acquire_hits_allowed=True)
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+
+    sample_hash = "f" * 64
+    document_id = uuid4()
+    fixture.snapshot = replace(
+        fixture.snapshot,
+        confirmed_iocs=(
+            *fixture.snapshot.confirmed_iocs,
+            ConfirmedIOCContextV1(
+                indicator_type="sha256",
+                value=sample_hash.upper(),
+                extraction_artifact_id=uuid4(),
+                extraction_artifact_version=1,
+                source_document_ids=(document_id,),
+            ),
+        ),
+    )
+    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+
+    class _SourceDocuments:
+        async def get(self, requested_id: UUID):
+            return source_document if requested_id == document_id else None
+
+    source_document = SourceDocument(
+        id=document_id,
+        subject_id=fixture.subject_id,
+        blob_id=uuid4(),
+        original_name="synthetic-article.html",
+        origin="synthetic-test",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.GREEN,
+        do_not_submit=False,
+        external_llm_allowed=True,
+    )
+    fixture.service._source_documents = _SourceDocuments()
+
+    context = await _build_context(fixture, state, registry)
+    assert "vt.download_sample" in {tool.name for tool in context.available_tools}
+    downloaded = await operator_service.invoke(
+        tool_name="vt.download_sample",
+        schema_version="1",
+        arguments={
+            "sha256": sample_hash,
+            "purpose": "Acquire a documented synthetic sample.",
+            "evidence_refs": [],
+        },
+        purpose="Acquire a documented synthetic sample.",
+        expected_version=state.version,
+        idempotency_key="documented-vt-download",
+    )
+    assert downloaded.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert tools["vt.download_sample"].calls == [
+        {
+            "sha256": sample_hash,
+            "purpose": "Acquire a documented synthetic sample.",
+            "evidence_refs": [],
+        }
+    ]
+
+    refused = await operator_service.invoke(
+        tool_name="vt.download_sample",
+        schema_version="1",
+        arguments={
+            "sha256": "9" * 64,
+            "purpose": "Acquire an ungrounded synthetic sample.",
+            "evidence_refs": [],
+        },
+        purpose="Acquire an ungrounded synthetic sample.",
+        expected_version=downloaded.working_state_version,
+        idempotency_key="ungrounded-vt-download",
+    )
+    assert refused.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert refused.error_code == "vt_hash_not_grounded"
+    result_data = refused.output["data"]["result"]
+    assert result_data["reason"] == "vt_hash_not_grounded"
+    assert "vt.file_report" in result_data["correction"]
+    assert refused.output["error"]["reason"] == result_data["correction"]
+    assert len(tools["vt.download_sample"].calls) == 1
 
 
 @pytest.mark.asyncio

@@ -162,6 +162,10 @@ _OPERATOR_ERROR_MESSAGES = {
         "No external request was authorized. Update the investigation disclosure approval "
         "before retrying this action."
     ),
+    "vt_hash_not_grounded": (
+        "Cite an observation or a source-documented SHA-256 IOC, or associate the hash through "
+        "vt.file_report before retrying."
+    ),
     "source_references_required": (
         "Add a canonical observation reference from this investigation that is associated with "
         "the exact requested target, then retry."
@@ -1784,6 +1788,9 @@ class OperatorToolInvocationService:
         }:
             if safe_nested_error_code is not None:
                 result_data = {"error_code": safe_nested_error_code}
+                if safe_nested_error_code == "vt_hash_not_grounded":
+                    result_data["reason"] = safe_nested_error_code
+                    result_data["correction"] = _OPERATOR_ERROR_MESSAGES[safe_nested_error_code]
                 if safe_nested_error_code == "invalid_tool_arguments" and tool_result is not None:
                     result_data["validation_errors"] = _operator_validation_errors(
                         tool_result.output.get("validation_errors")
