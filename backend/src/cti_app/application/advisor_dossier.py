@@ -918,6 +918,11 @@ def build_advisor_dossier(
         explicitly_referenced_observation = ("observation", identifier) in explicitly_referenced
         label = _human_evidence_label(item, excerpts)
         row_score = _relevance_score(task_terms, label)
+        if _as_text(item.get("source")).casefold().startswith(("virustotal.", "vt.")):
+            # Include current VT reports in the consultation dossier even when the
+            # question says only "VT" and the provider name does not tokenize as
+            # a lexical match.
+            row_score = max(row_score, 1)
         for excerpt in excerpts:
             body = _as_text(excerpt.get("text"))
             title = _as_text(excerpt.get("title")) or "Extrait"
@@ -1004,7 +1009,7 @@ def build_advisor_dossier(
                 pieces.append(f"Mesure observée: {fact_text}")
                 piece_contents.append((len(pieces) - 1, value, value, identifier))
                 row_score = max(row_score, score, 1)
-        if explicitly_referenced_observation and not pieces and excerpts:
+        if (explicitly_referenced_observation or row_score > 0) and not pieces and excerpts:
             best = max(
                 excerpts, key=lambda row: _relevance_score(task_terms, _as_text(row.get("text")))
             )
@@ -1045,13 +1050,20 @@ def build_advisor_dossier(
         if not statement:
             continue
         finding_id = _as_text(item.get("finding_id"))
-        score = _relevance_score(task_terms, statement)
         assessment = _as_text(item.get("assessment"))
         claim_refs = item.get("claim_refs", ())
         claim_text = (
             ", ".join(str(value) for value in claim_refs)
             if isinstance(claim_refs, (list, tuple))
             else ""
+        )
+        score = _relevance_score(
+            task_terms,
+            " ".join(
+                part
+                for part in (statement, claim_text, assessment, _as_text(item.get("kind")))
+                if part
+            ),
         )
         if (
             assessment == "refuted"
@@ -1186,7 +1198,7 @@ def build_advisor_dossier(
             score > 0
             or ("observation", evidence_id) in explicitly_referenced
             or (
-                consultation_type == "yara_draft"
+                consultation_type in {"yara_draft", "pivot_strategy"}
                 and not _numeric_targets_conflict(relevance_text, body)
             )
         ):
@@ -1676,16 +1688,6 @@ def evaluate_advisor_evidence_preflight(
     hypotheses = [item for item in prompt_data.get("hypotheses", ()) if isinstance(item, Mapping)]
     if consultation_type in {"plan_investigation", "pivot_strategy"}:
         active = [item for item in hypotheses if _as_text(item.get("status")) != "abandoned"]
-        if not active:
-            add(
-                "hypothesis",
-                "working-state",
-                _as_text(prompt_data.get("working_state_sha256")),
-                prompt_data.get("working_state_ref"),
-                False,
-                True,
-                "No current hypothesis was loaded from canonical working state.",
-            )
         for item in active:
             identifier = _as_text(item.get("id"))
             state_sha = _as_text(prompt_data.get("working_state_sha256"))
@@ -1696,8 +1698,8 @@ def evaluate_advisor_evidence_preflight(
                 state_sha,
                 {"kind": "hypothesis", "id": identifier, "version": version, "sha256": state_sha},
                 bool(_as_text(item.get("statement"))),
-                True,
-                "A current non-abandoned hypothesis is required for planning or pivot comparison.",
+                False,
+                "Current hypotheses are optional planning context.",
                 state_version=version,
                 verified=bool(re.fullmatch(r"[0-9a-f]{64}", state_sha)) and type(version) is int,
             )
@@ -1812,16 +1814,6 @@ def evaluate_advisor_evidence_preflight(
     legacy_target = prompt_data.get("review_text")
     if isinstance(legacy_target, Mapping):
         opinion_targets.append(legacy_target)
-    if consultation_type == "review_text" and not opinion_targets:
-        add(
-            "opinion",
-            "review-target",
-            "",
-            None,
-            False,
-            True,
-            "No versioned opinion target was loaded for review.",
-        )
     for item in opinion_targets:
         identifier = _as_text(item.get("opinion_id"))
         if not identifier:
@@ -1986,7 +1978,7 @@ def evaluate_advisor_evidence_preflight(
             assertion_checks.append(
                 {
                     "id": _as_text(item.get("id")),
-                    "required": True,
+                    "required": False,
                     "present": complete,
                     "sent": sent,
                     "reference_count": len(refs),
@@ -1994,26 +1986,6 @@ def evaluate_advisor_evidence_preflight(
                         "Validated assertion, text, and canonical references are present."
                         if complete
                         else "Assertion text or a SHA-verified canonical reference is missing."
-                    ),
-                }
-            )
-            if not complete or not alias_visible or (submitted and not sent):
-                missing_refs.append(
-                    {
-                        "ref": f"assertion:{_as_text(item.get('id')) or index}",
-                        "reason": (
-                            "Validated assertion and its canonical references must be rendered "
-                            "in the draft prompt."
-                        ),
-                    }
-                )
-        if not assertions:
-            missing_refs.append(
-                {
-                    "ref": "assertions:draft_text",
-                    "reason": (
-                        "Draft text requires at least one validated assertion with canonical "
-                        "references."
                     ),
                 }
             )
@@ -2037,6 +2009,23 @@ def evaluate_advisor_evidence_preflight(
                 "this question."
             ),
         )
+    useful_text_kinds = {"observation", "finding", "article"}
+    if consultation_type == "review_text":
+        useful_text_kinds.add("opinion")
+    if consultation_type in {"draft_text", "review_text"} and not any(
+        item["kind"] in useful_text_kinds and item["body_present"] for item in records
+    ):
+        add(
+            "observation",
+            "question-proof",
+            "",
+            None,
+            False,
+            True,
+            "No canonical observation, finding, or claim passage body is available "
+            "for this text consultation.",
+        )
+
     if contradiction_requested:
         if contradiction_required and claim_ids:
             covered_claims = {
@@ -2375,7 +2364,7 @@ def evaluate_advisor_evidence_preflight(
             for item in records
         ),
         "missing": len(missing_refs),
-        "assertions_required": len(assertion_checks),
+        "assertions_required": sum(bool(item.get("required")) for item in assertion_checks),
         "assertions_present": sum(item["present"] for item in assertion_checks),
         "assertions_sent": sum(item["sent"] for item in assertion_checks),
     }
@@ -2383,13 +2372,63 @@ def evaluate_advisor_evidence_preflight(
         {key: value for key, value in item.items() if key not in {"body_present", "reason"}}
         for item in records
     ]
+    missing_kinds = {item.get("ref") for item in missing_refs}
+    has_no_useful_context = bool(
+        missing_kinds.intersection(
+            {"measurement:verified-measurement", "fact:network-fact", "observation:question-proof"}
+        )
+    )
+    next_action = (
+        _advisor_preflight_next_action(consultation_type, prompt_data)
+        if has_no_useful_context
+        else ""
+    )
     return {
         "status": status.value,
         "missing_refs": missing_refs,
         "counts": counts,
         "assertions": assertion_checks,
         "items": items,
+        **({"next_action": next_action} if next_action else {}),
     }
+
+
+def _advisor_preflight_next_action(consultation_type: str, prompt_data: Mapping[str, Any]) -> str:
+    sample_sha = next(
+        (
+            _as_text(item.get("sha256"))
+            for item in prompt_data.get("samples", ())
+            if isinstance(item, Mapping)
+            and item.get("verified") is True
+            and re.fullmatch(r"[0-9a-f]{64}", _as_text(item.get("sha256")))
+        ),
+        "",
+    )
+    if consultation_type == "yara_draft":
+        if sample_sha:
+            return (
+                f"Aucune mesure vérifiée n'est disponible. Lance sample.analyze sur {sample_sha}, "
+                "puis relance yara_draft."
+            )
+        return (
+            "Aucune mesure vérifiée n'est disponible. Associe un échantillon à l'enquête, "
+            "lance sample.analyze sur son hash, puis relance yara_draft."
+        )
+    if consultation_type == "suricata_draft":
+        return (
+            "Aucun fait réseau mesuré n'est disponible. Lance network.capture.inspect sur la "
+            "capture PCAP associée, puis relance suricata_draft."
+        )
+    if sample_sha:
+        return (
+            f"Aucune matière canonique pertinente n'est disponible. Lance sample.analyze sur "
+            f"{sample_sha}, puis relance cette consultation."
+        )
+    return (
+        "Aucune matière canonique utile n'est disponible. Associe un échantillon ou une capture "
+        "réseau à l'enquête, lance l'analyse locale correspondante, puis relance "
+        "cette consultation."
+    )
 
 
 def _candidate(
@@ -2630,7 +2669,11 @@ def _human_evidence_label(item: Mapping[str, Any], excerpts: Sequence[Mapping[st
         product = "Analyse locale"
     elif source_folded == "vt.download_sample":
         product = "Échantillon téléchargé"
-    elif source_folded == "virustotal" or source_folded.startswith("vt."):
+    elif (
+        source_folded == "virustotal"
+        or source_folded.startswith("virustotal.")
+        or source_folded.startswith("vt.")
+    ):
         product = "VirusTotal"
     else:
         # Unknown provider/tool identifiers are provenance details, not task

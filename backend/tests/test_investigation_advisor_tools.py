@@ -1689,7 +1689,7 @@ def test_unparsed_bridge_prose_is_returned_complete_with_its_sha256() -> None:
 def test_unlinked_draft_prose_includes_explicit_consultative_warning() -> None:
     investigation_id = uuid4()
     tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
-    raw_output = "Première proposition de texte, à vérifier par l’analyste."
+    raw_output = "Première proposition de texte, à vérifier par l\u2019analyste."
     submission = TurnSubmission(
         TurnSubmissionStatus.SUCCEEDED,
         output_text=raw_output,
@@ -2053,9 +2053,10 @@ async def test_malformed_basis_ref_lists_remain_rejected(basis_refs, expected_co
 
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["advisory_text"].endswith(json.dumps(payload, ensure_ascii=False))
-    assert result.output["output_sha256"] == hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False).encode()
-    ).hexdigest()
+    assert (
+        result.output["output_sha256"]
+        == hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+    )
     assert "structured_parse_unavailable" in result.output["warnings"]
     assert result.output["validation_rejection"]["code"] == expected_code
     assert result.output["validation_rejection"]["path"] == "$.alternative_hypotheses[0].basis_refs"
@@ -3084,12 +3085,10 @@ async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest
     assert "mime_type=application/x-synthetic-sample" in prompt
     assert "encoding=base64" in prompt
     assert "offset=0" in prompt
-    assert "length=4096" in prompt
+    assert "length=10240" in prompt
     assert "byte_length=10240" in prompt
-    assert "omitted_range=[4096,10240)" in prompt
-    fragment = base64.b64encode(sample_content[:4096]).decode("ascii")
-    assert fragment in prompt
-    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert "omitted_range" not in prompt
+    assert base64.b64encode(sample_content).decode("ascii") in prompt
     advisor_observation = next(
         item
         for item in tool._observations.observations.values()
@@ -3154,8 +3153,8 @@ async def test_osint_policy_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "do_not_submit" not in prompt
-    assert "length=4096" in prompt
-    assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
+    assert "length=10240" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") in prompt
     advisor_observation = next(
         item
         for item in tool._observations.observations.values()
@@ -3252,9 +3251,9 @@ async def test_human_g2_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "do_not_submit" not in prompt
-    assert "length=4096" in prompt
-    assert base64.b64encode(sample_content[:4096]).decode("ascii") in prompt
-    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert "length=10240" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert base64.b64encode(sample_content).decode("ascii") in prompt
 
 
 @pytest.mark.asyncio
@@ -6137,7 +6136,7 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_figure_plan_only_transmits_operator_selected_findings() -> None:
+async def test_figure_plan_auto_loads_current_findings_and_accepts_priority_selection() -> None:
     investigation_id = uuid4()
     tool, _sample_blob = make_tool(
         investigation_id=investigation_id,
@@ -6183,7 +6182,7 @@ async def test_figure_plan_only_transmits_operator_selected_findings() -> None:
         question="",
     )
 
-    assert implicit["findings"] == []
+    assert [item["finding_id"] for item in implicit["findings"]] == [str(finding.id)]
     assert [item["finding_id"] for item in selected["findings"]] == [str(finding.id)]
 
 
@@ -6644,18 +6643,17 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert uncertain is False
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
-    assert len(prompt.encode("utf-8")) < 20_000
-    assert base64.b64encode(sample_bytes[:4096]).decode("ascii") in prompt
-    assert "omitted_range=[4096,3200000)" in prompt
-    assert "length=4096" in prompt
+    assert len(prompt.encode("utf-8")) > 4_000_000
+    assert base64.b64encode(sample_bytes).decode("ascii") in prompt
+    assert "omitted_range" not in prompt
+    assert "length=3200000" in prompt
     assert "byte_length=3200000" in prompt
-    assert base64.b64encode(sample_bytes).decode("ascii") not in prompt
     assert sample_sha256 in prompt
     assert str(sample_id) in prompt
     assert str(association_id) in prompt
     assert str(blob_id) in prompt
     assert "mime_type=application/x-synthetic-sample; fixture=large" in prompt
-    assert "length=4096" in prompt
+    assert "length=3200000" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -7712,8 +7710,8 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_input_invalid"
     assert result.output["advisor_status"] == "invalid_input"
-    assert result.output["input_error_code"] == "advisor_input_rejected"
-    assert str(missing_observation_id) in result.output["input_error_detail"]["message"]
+    assert result.output["input_error_code"] == "evidence_reference_not_found"
+    assert "canonical observation from this investigation" in result.message
     assert result.output["failure_stage"] == "pre_transport_validation"
     assert result.output["confirmed_non_execution"] is True
     assert result.output["provider_usage"] == {"status": "not_submitted"}
@@ -7862,7 +7860,7 @@ def test_bridge_unreachable_preflight_gets_typed_no_send_proof() -> None:
     )
 
 
-def test_cited_unknown_evidence_ref_is_ignored_and_reported_instead_of_rejecting() -> None:
+def test_cited_unknown_evidence_ref_has_a_specific_provenance_error() -> None:
     import asyncio
     from types import SimpleNamespace
     from uuid import uuid4
@@ -7889,7 +7887,7 @@ def test_cited_unknown_evidence_ref_is_ignored_and_reported_instead_of_rejecting
 
     assert [item.id for item in found] == [known]
     assert tool._ignored_evidence_refs["key-1"] == (str(foreign), str(missing))
-    with pytest.raises(ValueError, match="None of the cited evidence references"):
+    with pytest.raises(ValueError, match="evidence_reference_not_found"):
         asyncio.run(tool._load_cited_evidence(context, (foreign, missing)))
 
 

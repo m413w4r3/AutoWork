@@ -872,7 +872,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 {
                     "consultation_type": "plan_investigation",
                     "question": "Check evidence completeness before local Advisor dispatch.",
-                    # Unknown references are ignored; refusal happens when none resolves.
+                    # An explicitly cited reference must resolve to this investigation.
                     "evidence_refs": [str(missing_ref)],
                 },
                 key=f"m05c-advisor-veto:missing-ref:{investigation_id}",
@@ -885,7 +885,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert incomplete["invocation"]["error_code"] == "tool_failed"
             incomplete_output = incomplete["advisor_output"]
             assert incomplete_output["advisor_status"] == "invalid_input"
-            assert incomplete_output["input_error_code"] == "advisor_input_rejected"
+            assert incomplete_output["input_error_code"] == "evidence_reference_not_found"
             assert incomplete_output["confirmed_non_execution"] is True
             assert incomplete_output["provider_usage"] == {"status": "not_submitted"}
 

@@ -53,6 +53,7 @@ separate approval and state/backup preflight.
 |---|---|---|
 | Production and publication | [`workflow.md`](workflow.md), [`production.md`](production.md), [`model_conversations.md`](model_conversations.md) | ACTIVE_REFERENCE |
 | CTI contracts, governance and API | [`investigation_contracts.md`](investigation_contracts.md), [`investigation_governance.md`](investigation_governance.md), [`investigation_api.md`](investigation_api.md) | ACTIVE_REFERENCE |
+| Bridge advisor consultation preflight | [`advisor_preflight_catalog.md`](advisor_preflight_catalog.md) | ACTIVE_REFERENCE; reconcile with advisor code and G2/TLP guards |
 | CTI tools and loop | [`investigation_agent_loop.md`](investigation_agent_loop.md), [`investigation_operations.md`](investigation_operations.md), [`investigation_local_tools.md`](investigation_local_tools.md), [`investigation_rule_tools.md`](investigation_rule_tools.md), [`investigation_vt_tools.md`](investigation_vt_tools.md) | ACTIVE_REFERENCE; verify versions |
 | Operator-led workflows | [`operations/operator-playbook-medium.md`](operations/operator-playbook-medium.md) | ACTIVE_REFERENCE; verify deployment |
 | Coding orchestration | [`operations/paseo-agent-orchestration.md`](operations/paseo-agent-orchestration.md) | ACTIVE_REFERENCE (recommended setup, not verified host config) |

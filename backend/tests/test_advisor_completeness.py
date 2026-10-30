@@ -45,8 +45,30 @@ def _item(preflight: dict, kind: str, identifier: str) -> dict:
     )
 
 
+def test_existing_canonical_claims_allow_planning_without_a_working_hypothesis() -> None:
+    question = "Plan the next step for Blackwood using the verified article claim."
+    data = _planning_data(question=question, evidence=[], findings=[])
+    data["hypotheses"] = []
+    data["article_passages"] = [
+        {
+            "claim_id": "S1P1",
+            "heading": "Synthetic finding",
+            "text": "S1P1 describes the observed Blackwood loader behavior.",
+        }
+    ]
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(
+        data, dossier, f"TASK: {question}\n{dossier.text}", submitted=True
+    )
+
+    assert preflight["status"] == "READY"
+    assert preflight["missing_refs"] == []
+
+
 @pytest.mark.parametrize(
-    "consultation_type", ["plan_investigation", "draft_text", "yara_draft", "suricata_draft", "figure_plan"]
+    "consultation_type",
+    ["plan_investigation", "draft_text", "yara_draft", "suricata_draft", "figure_plan"],
 )
 def test_advisor_prompt_uses_free_prose_and_never_requires_wire_format(
     consultation_type: str,
