@@ -240,8 +240,7 @@ function InvestigationDetail({
     ? latest.stop_reason
     : investigation.stop_reason;
   const currentVersion = latest?.version ?? investigation.version;
-  const isRunning =
-    currentStatus === "queued" || currentStatus === "running";
+  const isRunning = currentStatus === "queued" || currentStatus === "running";
   const canInterrupt = isRunning || currentStatus === "awaiting_review";
   const canResume = Boolean(
     currentStopReason &&
@@ -257,9 +256,12 @@ function InvestigationDetail({
         <div>
           <h2 id="investigation-detail-heading">Enquête {investigation.id}</h2>
           <p>
-            {statusLabel({ status: currentStatus, stop_reason: currentStopReason })} ·
-            version CAS {currentVersion} ·
-            run {investigation.production_run_id} · synthèse{" "}
+            {statusLabel({
+              status: currentStatus,
+              stop_reason: currentStopReason,
+            })}{" "}
+            · version CAS {currentVersion} · run{" "}
+            {investigation.production_run_id} · synthèse{" "}
             {investigation.synthesis_artifact_id} · SHA-256{" "}
             <code>{investigation.synthesis_sha256}</code>
           </p>

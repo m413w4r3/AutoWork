@@ -498,6 +498,9 @@ describe("InvestigationTab", () => {
     });
     const { container } = renderInvestigation(view);
 
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Claims / Hypothèses" }),
+    );
     expect(
       await screen.findByText(/Nouveau dans cet article/),
     ).toBeInTheDocument();

@@ -55,10 +55,7 @@ function renderCockpit(page: InvestigationActivityPage) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   });
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue(Response.json(page)),
-  );
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(page)));
   return render(
     <QueryClientProvider client={queryClient}>
       <InvestigationActivityCockpit
@@ -74,68 +71,62 @@ afterEach(() => {
 });
 
 describe("InvestigationActivityCockpit", () => {
-  it(
-    "shows unknown activity without inferring that the agent stopped",
-    async () => {
-      renderCockpit(makePage());
+  it("shows unknown activity without inferring that the agent stopped", async () => {
+    renderCockpit(makePage());
 
-      expect(
-        await screen.findByRole("heading", { name: "Investigation en cours" }),
-      ).toBeTruthy();
-      expect(screen.getByText("Inconnu — non mesurable")).toBeTruthy();
-      expect(
-        screen.getByText(/Cela ne permet pas de conclure que l’agent est arrêté/),
-      ).toBeTruthy();
-      expect(screen.getAllByText("Non déterminée").length).toBeGreaterThan(0);
-      expect(screen.getByText("9. Note de l’analyste")).toBeTruthy();
-    },
-  );
+    expect(
+      await screen.findByRole("heading", { name: "Investigation en cours" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Inconnu — non mesurable")).toBeTruthy();
+    expect(
+      screen.getByText(/Cela ne permet pas de conclure que l’agent est arrêté/),
+    ).toBeTruthy();
+    expect(screen.getAllByText("Non déterminée").length).toBeGreaterThan(0);
+    expect(screen.getByText("9. Note de l’analyste")).toBeTruthy();
+  });
 
-  it(
-    "reports persisted activity as partial, not as a completed stage",
-    async () => {
-      const page = makePage({
-        timeline: [
-          {
-            id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
-            version: 2,
-            tool_name: "sample.analyze",
-            schema_version: "sample-analysis.v1",
-            purpose_excerpt: "Analyser un échantillon",
-            status: "succeeded",
-            created_at: "2026-10-30T11:00:00Z",
-            updated_at: "2026-10-30T11:01:00Z",
-            duration_seconds: null,
-            duration_quality: "unknown",
-            reserved_budget: { tool_seconds: 10 },
-            consumed_budget: { tool_seconds: 4 },
-            repeated_input_count_in_page: 1,
-            observation_refs: ["11111111-1111-4111-8111-111111111111"],
-            observations: [
-              {
-                id: "11111111-1111-4111-8111-111111111111",
-                kind: "binary_analysis",
-                sha256: "b".repeat(64),
-                source: "local-analysis",
-                source_version: "2",
-                observed_at: "2026-10-30T11:01:00Z",
-              },
-            ],
-          },
-        ],
-      });
-      renderCockpit(page);
+  it("reports persisted activity as partial, not as a completed stage", async () => {
+    const page = makePage({
+      timeline: [
+        {
+          id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          version: 2,
+          tool_name: "sample.analyze",
+          schema_version: "sample-analysis.v1",
+          purpose_excerpt: "Analyser un échantillon",
+          status: "succeeded",
+          created_at: "2026-10-30T11:00:00Z",
+          updated_at: "2026-10-30T11:01:00Z",
+          duration_seconds: null,
+          duration_quality: "unknown",
+          reserved_budget: { tool_seconds: 10 },
+          consumed_budget: { tool_seconds: 4 },
+          repeated_input_count_in_page: 1,
+          observation_refs: ["11111111-1111-4111-8111-111111111111"],
+          observations: [
+            {
+              id: "11111111-1111-4111-8111-111111111111",
+              kind: "binary_analysis",
+              sha256: "b".repeat(64),
+              source: "local-analysis",
+              source_version: "2",
+              observed_at: "2026-10-30T11:01:00Z",
+            },
+          ],
+        },
+      ],
+    });
+    renderCockpit(page);
 
-      expect(await screen.findByText("2. Analyse statique")).toBeTruthy();
-      expect(
-        screen.getAllByText("Partielle · clôture inconnue").length,
-      ).toBeGreaterThan(0);
-      expect(screen.queryByText("Terminée")).toBeNull();
-      expect(
-        screen.getByText(/Aucune mesure fiable n’est persistée/),
-      ).toBeTruthy();
-    },
-  );
+    expect(await screen.findByText("2. Analyse statique")).toBeTruthy();
+    expect(
+      screen.getAllByText("Partielle · clôture inconnue").length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("Terminée")).toBeNull();
+    expect(
+      screen.getByText(/Aucune mesure fiable n’est persistée/),
+    ).toBeTruthy();
+  });
 
   it("presents an inconclusive finding as insufficient evidence, not a bug", async () => {
     const page = makePage({
@@ -145,8 +136,10 @@ describe("InvestigationActivityCockpit", () => {
           code: "inconclusive_findings",
           invocation_id: null,
           external_effect_state: null,
-          message: "1 constat reste sans preuve suffisante; ce n’est pas un bug.",
-          next_action: "Clarifier l’hypothèse ou rechercher une preuve admissible supplémentaire.",
+          message:
+            "1 constat reste sans preuve suffisante; ce n’est pas un bug.",
+          next_action:
+            "Clarifier l’hypothèse ou rechercher une preuve admissible supplémentaire.",
         },
       ],
     });

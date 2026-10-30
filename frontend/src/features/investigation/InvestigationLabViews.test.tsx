@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { InvestigationView } from "../../api/investigation";
+import type { InvestigationActivityPage } from "../../api/investigationOperator";
 import { InvestigationLabViews } from "./InvestigationLabViews";
 
 const INVESTIGATION_ID = "11111111-1111-4111-8111-111111111111";
@@ -10,6 +11,39 @@ const CLAIM_ID = "claim-c2-tunnel";
 const OBSERVATION_ID = "22222222-2222-4222-8222-222222222222";
 const CANDIDATE_ID = "a".repeat(64);
 const SAMPLE_SHA256 = "b".repeat(64);
+
+const activityPage: InvestigationActivityPage = {
+  schema_version: "investigation-activity.v1",
+  investigation: {
+    id: INVESTIGATION_ID,
+    subject_id: "33333333-3333-4333-8333-333333333333",
+    production_run_id: "44444444-4444-4444-8444-444444444444",
+    synthesis_artifact_id: "55555555-5555-4555-8555-555555555555",
+    synthesis_sha256: "c".repeat(64),
+    status: "completed",
+    version: 7,
+    stop_reason: null,
+    execution_mode: "operator_led",
+  },
+  operator: {
+    principal: null,
+    model: null,
+    effort: null,
+    active_subagent_count: null,
+    metadata_source: "unavailable_in_autowork",
+  },
+  working_state: null,
+  last_activity_at: null,
+  last_activity_source: null,
+  active_backend_job_count: 0,
+  budget: null,
+  timeline: [],
+  next_cursor: null,
+  has_more: false,
+  blockers: [],
+  counts: { inconclusive_findings: 0 },
+  generated_at: "2026-10-30T12:00:00Z",
+};
 
 const investigation: InvestigationView = {
   id: INVESTIGATION_ID,
@@ -85,6 +119,9 @@ const investigation: InvestigationView = {
 };
 
 function mockResponse(url: string): Response {
+  if (url.includes("/activity?")) {
+    return Response.json(activityPage);
+  }
   if (url.includes("/operator/context/section/article_claims")) {
     return Response.json({
       schema: "investigation-operator-context-section.v1",
@@ -435,6 +472,10 @@ describe("InvestigationLabViews", () => {
       </QueryClientProvider>,
     );
 
+    fireEvent.click(
+      screen.getByRole("button", { name: "Claims / Hypothèses" }),
+    );
+
     expect(
       await screen.findByRole("heading", {
         name: "Le client contacte le serveur C2 par tunnel.",
@@ -512,6 +553,10 @@ describe("InvestigationLabViews", () => {
           editionId="edition-1"
         />
       </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Claims / Hypothèses" }),
     );
 
     expect(await screen.findByText(/Remplacée par/)).toBeInTheDocument();

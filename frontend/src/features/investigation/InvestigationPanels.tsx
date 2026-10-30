@@ -22,6 +22,7 @@ import {
   useInvestigationActivityHistory,
   type InvestigationActivityBlockerKind,
   type InvestigationActivityInvocation,
+  type InvestigationActivityPage,
 } from "../../api/investigationOperator";
 import {
   useInvestigationSamples,
@@ -1159,13 +1160,15 @@ export function InvestigationActivityCockpit({
     ? Boolean(historyQuery.hasNextPage)
     : Boolean(firstPage?.has_more);
   const invocations = deduplicateInvocations(
-    [
-      ...(firstPage ? [firstPage] : []),
-      ...historyPages,
-    ].flatMap((page) => page.timeline),
+    [...(firstPage ? [firstPage] : []), ...historyPages].flatMap(
+      (page) => page.timeline,
+    ),
   );
   const latestActivityAt = firstPage?.last_activity_at ?? null;
-  const stageGroups = new Map<ActivityStageId, InvestigationActivityInvocation[]>();
+  const stageGroups = new Map<
+    ActivityStageId,
+    InvestigationActivityInvocation[]
+  >();
   const unclassified: InvestigationActivityInvocation[] = [];
   for (const invocation of invocations) {
     const stageId = activityStageFor(invocation);
@@ -1179,7 +1182,8 @@ export function InvestigationActivityCockpit({
     [...stageGroups.entries()]
       .filter(([, stageInvocations]) =>
         stageInvocations.some(
-          (invocation) => invocation.status === "pending" || invocation.status === "running",
+          (invocation) =>
+            invocation.status === "pending" || invocation.status === "running",
         ),
       )
       .map(([stageId]) => stageId),
@@ -1210,18 +1214,22 @@ export function InvestigationActivityCockpit({
         <h2 id="activity-summary-heading">Investigation en cours</h2>
         {activityQuery.isError ? (
           <p className="verification-warning" role="note">
-            L’actualisation a échoué; les dernières données persistées reçues sont affichées.
+            L’actualisation a échoué; les dernières données persistées reçues
+            sont affichées.
           </p>
         ) : null}
         <p>
-          {activityStatusLabel(investigation.status, investigation.stop_reason)} ·
-          version d’état canonique{" "}
-          {firstPage.working_state?.version ?? "inconnue"} · version CAS {investigation.version}
+          {activityStatusLabel(investigation.status, investigation.stop_reason)}{" "}
+          · version d’état canonique{" "}
+          {firstPage.working_state?.version ?? "inconnue"} · version CAS{" "}
+          {investigation.version}
         </p>
         <dl>
           <div>
             <dt>Enquête</dt>
-            <dd><code>{investigation.id}</code></dd>
+            <dd>
+              <code>{investigation.id}</code>
+            </dd>
           </div>
           <div>
             <dt>Synthèse</dt>
@@ -1232,12 +1240,16 @@ export function InvestigationActivityCockpit({
           </div>
           <div>
             <dt>Responsable principal</dt>
-            <dd>{firstPage.operator.principal ?? "Non renseigné par AutoWork"}</dd>
+            <dd>
+              {firstPage.operator.principal ?? "Non renseigné par AutoWork"}
+            </dd>
           </div>
           <div>
             <dt>Dernière activité persistée</dt>
             <dd>
-              {latestActivityAt ? formatActivityTime(latestActivityAt) : "Inconnue"}
+              {latestActivityAt
+                ? formatActivityTime(latestActivityAt)
+                : "Inconnue"}
               {latestActivityAt
                 ? ` · ${activitySourceLabel(firstPage.last_activity_source)}`
                 : null}
@@ -1257,7 +1269,10 @@ export function InvestigationActivityCockpit({
           </div>
           <div>
             <dt>Sous-agents actifs</dt>
-            <dd>{firstPage.operator.active_subagent_count ?? "Inconnu — non mesurable"}</dd>
+            <dd>
+              {firstPage.operator.active_subagent_count ??
+                "Inconnu — non mesurable"}
+            </dd>
           </div>
           <div>
             <dt>Hypothèses ouvertes</dt>
@@ -1266,26 +1281,33 @@ export function InvestigationActivityCockpit({
         </dl>
         {!latestActivityAt ? (
           <p className="verification-warning" role="note">
-            Aucune activité récente n’est disponible dans cette projection. Cela ne permet pas
-            de conclure que l’agent est arrêté.
+            Aucune activité récente n’est disponible dans cette projection. Cela
+            ne permet pas de conclure que l’agent est arrêté.
           </p>
         ) : null}
       </section>
 
       <section className="job-card" aria-labelledby="activity-steps-heading">
-        <h2 id="activity-steps-heading">Progression analytique · étapes 0 à 9</h2>
+        <h2 id="activity-steps-heading">
+          Progression analytique · étapes 0 à 9
+        </h2>
         <p role="note">
-          Les rattachements d’activité reposent sur les noms d’outils et l’objectif déclaré.
-          Une invocation réussie ne clôt pas une étape; aucun état de clôture analytique fiable
-          n’est persisté pour ces dix étapes. Les compteurs et coûts par étape couvrent les
-          opérations chargées; l’historique peut être étendu.
+          Les rattachements d’activité reposent sur les noms d’outils et
+          l’objectif déclaré. Une invocation réussie ne clôt pas une étape;
+          aucun état de clôture analytique fiable n’est persisté pour ces dix
+          étapes. Les compteurs et coûts par étape couvrent les opérations
+          chargées; l’historique peut être étendu.
         </p>
         <ol className="activity-stage-list">
           {ANALYTIC_STAGES.map((stage) => {
             const stageInvocations = stageGroups.get(stage.id) ?? [];
             const stageStatus = activityStageStatus(stageInvocations);
             const evidenceRefs = [
-              ...new Set(stageInvocations.flatMap((invocation) => invocation.observation_refs)),
+              ...new Set(
+                stageInvocations.flatMap(
+                  (invocation) => invocation.observation_refs,
+                ),
+              ),
             ];
             return (
               <li key={stage.id}>
@@ -1298,21 +1320,24 @@ export function InvestigationActivityCockpit({
                     <span>{stageInvocations.length} activité(s)</span>
                   </summary>
                   <dl>
-                    <div><dt>Responsable</dt><dd>Inconnu</dd></div>
+                    <div>
+                      <dt>Responsable</dt>
+                      <dd>Inconnu</dd>
+                    </div>
                     <div>
                       <dt>Activités chargées</dt>
-                      <dd>{stageInvocations.length || "Aucun signal rattaché"}</dd>
+                      <dd>
+                        {stageInvocations.length || "Aucun signal rattaché"}
+                      </dd>
                     </div>
                     <div>
                       <dt>Preuves liées</dt>
                       <dd>
-                        {evidenceRefs.length > 0 ? (
-                          evidenceRefs.map((reference) => (
-                            <code key={reference}>{reference} </code>
-                          ))
-                        ) : (
-                          "Aucune référence liée dans les opérations chargées"
-                        )}
+                        {evidenceRefs.length > 0
+                          ? evidenceRefs.map((reference) => (
+                              <code key={reference}>{reference} </code>
+                            ))
+                          : "Aucune référence liée dans les opérations chargées"}
                       </dd>
                     </div>
                     <div>
@@ -1322,8 +1347,8 @@ export function InvestigationActivityCockpit({
                           "Non déterminées"
                         ) : (
                           <>
-                            {openHypotheses} hypothèse(s) ouverte(s); rattachement à cette
-                            étape inconnu
+                            {openHypotheses} hypothèse(s) ouverte(s);
+                            rattachement à cette étape inconnu
                           </>
                         )}
                       </dd>
@@ -1356,7 +1381,8 @@ export function InvestigationActivityCockpit({
         </ol>
         {unclassified.length > 0 ? (
           <p>
-            {unclassified.length} activité(s) sans rattachement fiable à une étape.
+            {unclassified.length} activité(s) sans rattachement fiable à une
+            étape.
           </p>
         ) : null}
       </section>
@@ -1371,27 +1397,34 @@ export function InvestigationActivityCockpit({
               <li key={invocation.id}>
                 <details>
                   <summary>
-                    <strong>{invocation.tool_name}</strong> · {invocation.status} ·{" "}
+                    <strong>{invocation.tool_name}</strong> ·{" "}
+                    {invocation.status} ·{" "}
                     {formatActivityTime(invocation.created_at)}
                   </summary>
                   <p>
                     Agent : non identifié · objectif déclaré :{" "}
                     {invocation.purpose_excerpt || "inconnu"}
                   </p>
-                  <p>Durée d’exécution : inconnue. Aucune mesure fiable n’est persistée.</p>
                   <p>
-                    Coût/budget consommé : {formatInvocationBudget(invocation.consumed_budget)} ·
-                    réservé : {formatInvocationBudget(invocation.reserved_budget)}
+                    Durée d’exécution : inconnue. Aucune mesure fiable n’est
+                    persistée.
+                  </p>
+                  <p>
+                    Coût/budget consommé :{" "}
+                    {formatInvocationBudget(invocation.consumed_budget)} ·
+                    réservé :{" "}
+                    {formatInvocationBudget(invocation.reserved_budget)}
                   </p>
                   {invocation.repeated_input_count_in_page > 1 ? (
                     <p role="note">
-                      Entrée identique observée {invocation.repeated_input_count_in_page} fois
-                      dans cette page; les paramètres restent masqués.
+                      Entrée identique observée{" "}
+                      {invocation.repeated_input_count_in_page} fois dans cette
+                      page; les paramètres restent masqués.
                     </p>
                   ) : null}
                   <p>
-                    Invocation canonique <code>{invocation.id}</code> v{invocation.version} ·
-                    schéma {invocation.schema_version}
+                    Invocation canonique <code>{invocation.id}</code> v
+                    {invocation.version} · schéma {invocation.schema_version}
                   </p>
                   {invocation.observations.length > 0 ? (
                     <section aria-label="Observations liées">
@@ -1399,9 +1432,9 @@ export function InvestigationActivityCockpit({
                       <ul>
                         {invocation.observations.map((observation) => (
                           <li key={observation.id}>
-                            <code>{observation.id}</code> · {observation.kind} · SHA-256{" "}
-                            <code>{observation.sha256}</code> · {observation.source} v
-                            {observation.source_version}
+                            <code>{observation.id}</code> · {observation.kind} ·
+                            SHA-256 <code>{observation.sha256}</code> ·{" "}
+                            {observation.source} v{observation.source_version}
                           </li>
                         ))}
                       </ul>
@@ -1412,7 +1445,8 @@ export function InvestigationActivityCockpit({
                       {invocation.observation_refs.map((id) => (
                         <code key={id}>{id} </code>
                       ))}
-                      Les métadonnées de cette page ne contiennent pas leur résumé.
+                      Les métadonnées de cette page ne contiennent pas leur
+                      résumé.
                     </p>
                   ) : (
                     <p>Aucune observation liée à cette invocation.</p>
@@ -1426,13 +1460,17 @@ export function InvestigationActivityCockpit({
           <button
             type="button"
             className="button button--secondary"
-            disabled={historyQuery.isFetchingNextPage || (historyEnabled && historyQuery.isPending)}
+            disabled={
+              historyQuery.isFetchingNextPage ||
+              (historyEnabled && historyQuery.isPending)
+            }
             onClick={() => {
               if (!historyEnabled) setHistoryEnabled(true);
               else void historyQuery.fetchNextPage();
             }}
           >
-            {historyQuery.isFetchingNextPage || (historyEnabled && historyQuery.isPending)
+            {historyQuery.isFetchingNextPage ||
+            (historyEnabled && historyQuery.isPending)
               ? "Chargement…"
               : "Charger les opérations précédentes"}
           </button>
@@ -1454,14 +1492,19 @@ export function InvestigationActivityCockpit({
       <section className="job-card" aria-labelledby="activity-agents-heading">
         <h2 id="activity-agents-heading">Agents et délégations</h2>
         <p>
-          AutoWork ne reçoit pas les événements de sessions Paseo. L’identité de session, le
-          modèle, l’effort, la mission et les résultats de délégation sont donc inconnus; les
-          métadonnées d’orchestration ne constituent pas des preuves CTI.
+          AutoWork ne reçoit pas les événements de sessions Paseo. L’identité de
+          session, le modèle, l’effort, la mission et les résultats de
+          délégation sont donc inconnus; les métadonnées d’orchestration ne
+          constituent pas des preuves CTI.
         </p>
-        <p>Sous-agents actifs : inconnu — non mesurable dans les sources AutoWork disponibles.</p>
         <p>
-          Jobs de traitement AutoWork actifs : {firstPage.active_backend_job_count}; ce compteur
-          ne mesure pas les sous-agents.
+          Sous-agents actifs : inconnu — non mesurable dans les sources AutoWork
+          disponibles.
+        </p>
+        <p>
+          Jobs de traitement AutoWork actifs :{" "}
+          {firstPage.active_backend_job_count}; ce compteur ne mesure pas les
+          sous-agents.
         </p>
       </section>
 
@@ -1473,12 +1516,19 @@ export function InvestigationActivityCockpit({
           <ul>
             {firstPage.blockers.map((blocker, index) => (
               <li key={`${blocker.code}-${blocker.invocation_id ?? index}`}>
-                <strong>{BLOCKER_LABELS[blocker.kind]}</strong> · {blocker.message}
+                <strong>{BLOCKER_LABELS[blocker.kind]}</strong> ·{" "}
+                {blocker.message}
                 {blocker.invocation_id ? (
-                  <> · invocation <code>{blocker.invocation_id}</code></>
+                  <>
+                    {" "}
+                    · invocation <code>{blocker.invocation_id}</code>
+                  </>
                 ) : null}
                 {blocker.kind === "external_effect_ambiguous" ? (
-                  <p>État externe réel : {blocker.external_effect_state ?? "Inconnu"}.</p>
+                  <p>
+                    État externe réel :{" "}
+                    {blocker.external_effect_state ?? "Inconnu"}.
+                  </p>
                 ) : null}
                 <p>Prochaine action : {blocker.next_action}</p>
                 {blocker.kind === "permission_missing" ? (
@@ -1528,16 +1578,17 @@ export function InvestigationActivityCockpit({
           </div>
         ) : (
           <p role="note">
-            Budget : consommé, réservé et restant inconnus (aucune enveloppe lisible).
+            Budget : consommé, réservé et restant inconnus (aucune enveloppe
+            lisible).
           </p>
         )}
         <p>
-          Les estimations monétaires ou de coût fournisseur ne sont pas disponibles dans cette
-          projection.
+          Les estimations monétaires ou de coût fournisseur ne sont pas
+          disponibles dans cette projection.
         </p>
         <p>
-          Les répétitions sont comptées par empreinte interne des paramètres sur la page chargée;
-          aucune entrée brute n’est exposée.
+          Les répétitions sont comptées par empreinte interne des paramètres sur
+          la page chargée; aucune entrée brute n’est exposée.
         </p>
         <h3>Invocations avec consommation enregistrée</h3>
         {invocations.some((invocation) => hasMeasuredSpend(invocation)) ? (
@@ -1546,7 +1597,8 @@ export function InvestigationActivityCockpit({
               .filter((invocation) => hasMeasuredSpend(invocation))
               .map((invocation) => (
                 <li key={invocation.id}>
-                  {formatActivityTime(invocation.created_at)} · {invocation.tool_name} ·{" "}
+                  {formatActivityTime(invocation.created_at)} ·{" "}
+                  {invocation.tool_name} ·{" "}
                   {formatInvocationBudget(invocation.consumed_budget)}
                   {invocation.repeated_input_count_in_page > 1
                     ? ` · répété ${invocation.repeated_input_count_in_page} fois sur cette page`
@@ -1567,7 +1619,9 @@ function deduplicateInvocations(
 ): InvestigationActivityInvocation[] {
   const byId = new Map<string, InvestigationActivityInvocation>();
   for (const invocation of invocations) byId.set(invocation.id, invocation);
-  return [...byId.values()].sort((left, right) => right.created_at.localeCompare(left.created_at));
+  return [...byId.values()].sort((left, right) =>
+    right.created_at.localeCompare(left.created_at),
+  );
 }
 
 function activityStageFor(
@@ -1583,7 +1637,11 @@ function activityStageFor(
     return null;
   }
   if (tool === "vt.file_report") return 0;
-  if (tool === "opinion.compose" || tool === "opinion.note" || tool === "opinion.revise") {
+  if (
+    tool === "opinion.compose" ||
+    tool === "opinion.note" ||
+    tool === "opinion.revise"
+  ) {
     return 9;
   }
   if (
@@ -1609,9 +1667,14 @@ function activityStageFor(
   if (tool === "rule.propose_bridge") return 4;
   if (tool.startsWith("rule.")) return 5;
   if (tool.includes("yara") || tool.includes("ruleworkbench")) return 5;
-  if (tool === "vt.download_sample" || tool === "sample.set_qualification") return 7;
+  if (tool === "vt.download_sample" || tool === "sample.set_qualification")
+    return 7;
   if (purpose.includes("revalid")) return 8;
-  if (purpose.includes("analyst note") || purpose.includes("note de l’analyste")) return 9;
+  if (
+    purpose.includes("analyst note") ||
+    purpose.includes("note de l’analyste")
+  )
+    return 9;
   return null;
 }
 
@@ -1619,7 +1682,11 @@ function activityStageStatus(
   invocations: InvestigationActivityInvocation[],
 ): ActivityStageStatus {
   if (invocations.length === 0) return "unknown";
-  if (invocations.some((item) => item.status === "pending" || item.status === "running")) {
+  if (
+    invocations.some(
+      (item) => item.status === "pending" || item.status === "running",
+    )
+  ) {
     return "in_progress";
   }
   const latest = [...invocations].sort((left, right) =>
@@ -1627,25 +1694,33 @@ function activityStageStatus(
   )[0];
   if (
     latest &&
-    ["needs_review", "policy_denied", "unavailable", "failed"].includes(latest.status)
+    ["needs_review", "policy_denied", "unavailable", "failed"].includes(
+      latest.status,
+    )
   ) {
     return "blocked";
   }
   return "partial";
 }
 
-function summarizeStageBudget(invocations: InvestigationActivityInvocation[]): string {
+function summarizeStageBudget(
+  invocations: InvestigationActivityInvocation[],
+): string {
   if (invocations.length === 0) return "Inconnu";
   const consumed = new Map<BudgetDimension, number>();
   const reserved = new Map<BudgetDimension, number>();
   for (const invocation of invocations) {
-    for (const [dimension, amount] of Object.entries(invocation.consumed_budget)) {
+    for (const [dimension, amount] of Object.entries(
+      invocation.consumed_budget,
+    )) {
       if (amount) {
         const key = dimension as BudgetDimension;
         consumed.set(key, (consumed.get(key) ?? 0) + amount);
       }
     }
-    for (const [dimension, amount] of Object.entries(invocation.reserved_budget)) {
+    for (const [dimension, amount] of Object.entries(
+      invocation.reserved_budget,
+    )) {
       if (amount) {
         const key = dimension as BudgetDimension;
         reserved.set(key, (reserved.get(key) ?? 0) + amount);
@@ -1655,10 +1730,16 @@ function summarizeStageBudget(invocations: InvestigationActivityInvocation[]): s
   return `consommé : ${formatBudgetMap(consumed)} · réservé : ${formatBudgetMap(reserved)}`;
 }
 
-function summarizeStageBlockers(invocations: InvestigationActivityInvocation[]): string {
-  const ambiguous = invocations.filter((item) => item.status === "needs_review");
+function summarizeStageBlockers(
+  invocations: InvestigationActivityInvocation[],
+): string {
+  const ambiguous = invocations.filter(
+    (item) => item.status === "needs_review",
+  );
   if (ambiguous.length > 0) {
-    return ambiguous.map((item) => `${item.tool_name} · needs_review`).join("; ");
+    return ambiguous
+      .map((item) => `${item.tool_name} · needs_review`)
+      .join("; ");
   }
   const latest = [...invocations].sort((left, right) =>
     right.updated_at.localeCompare(left.updated_at),
@@ -1672,7 +1753,9 @@ function summarizeStageBlockers(invocations: InvestigationActivityInvocation[]):
   return "Aucun blocage opérationnel explicite";
 }
 
-function formatInvocationBudget(values: Partial<Record<BudgetDimension, number>>): string {
+function formatInvocationBudget(
+  values: Partial<Record<BudgetDimension, number>>,
+): string {
   const valuesByDimension = new Map<BudgetDimension, number>();
   for (const dimension of ACTIVITY_BUDGET_ORDER) {
     const value = values[dimension];
@@ -1681,7 +1764,9 @@ function formatInvocationBudget(values: Partial<Record<BudgetDimension, number>>
   return formatBudgetMap(valuesByDimension);
 }
 
-function hasMeasuredSpend(invocation: InvestigationActivityInvocation): boolean {
+function hasMeasuredSpend(
+  invocation: InvestigationActivityInvocation,
+): boolean {
   return Object.values(invocation.consumed_budget).some(
     (amount) => typeof amount === "number" && amount > 0,
   );
@@ -1703,7 +1788,8 @@ function formatActivityTime(value: string): string {
 }
 
 function activitySourceLabel(source: string | null): string {
-  if (source === "investigation_record") return "mise à jour du dossier AutoWork";
+  if (source === "investigation_record")
+    return "mise à jour du dossier AutoWork";
   if (source === "invocation") return "invocation persistée";
   if (source === "observation") return "observation persistée";
   if (source === "backend_job_heartbeat") return "heartbeat du job AutoWork";

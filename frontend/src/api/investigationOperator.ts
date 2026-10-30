@@ -154,7 +154,8 @@ export function useInvestigationActivityHistory(
 ) {
   return useInfiniteQuery({
     queryKey: investigationOperatorQueryKeys.activityHistory(investigationId),
-    queryFn: ({ pageParam }) => getInvestigationActivity(investigationId, pageParam),
+    queryFn: ({ pageParam }) =>
+      getInvestigationActivity(investigationId, pageParam),
     initialPageParam: cursor,
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     enabled: Boolean(investigationId && cursor && enabled),

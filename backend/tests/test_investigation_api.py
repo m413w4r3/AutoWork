@@ -367,6 +367,7 @@ class _Store:
                     max_vt_read_units=50,
                 ),
                 status=AnalystInvestigationStatus.QUEUED,
+                version=1,
                 updated_at=datetime.now(UTC),
             )
         }
@@ -1896,6 +1897,7 @@ def test_http_start_creates_a_missing_handoff_from_exact_verified_synthesis(monk
                 synthesis_artifact_id=SYNTHESIS_ID,
                 budget=SimpleNamespace(max_cycles=4),
                 status=AnalystInvestigationStatus.QUEUED,
+                version=1,
                 updated_at=datetime.now(UTC),
             )
             return SimpleNamespace(investigation_id=INVESTIGATION_ID)
