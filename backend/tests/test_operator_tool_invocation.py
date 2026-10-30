@@ -1684,7 +1684,7 @@ async def test_secret_fields_and_signed_urls_are_rejected_before_persistence() -
 
 
 @pytest.mark.asyncio
-async def test_replay_after_persisted_running_marks_review_without_redispatch() -> None:
+async def test_replay_after_persisted_running_preserves_live_state_without_redispatch() -> None:
     fixture, state, service = await _fixture()
     key = "crash-key"
     args = {"query": "hash"}
@@ -1721,16 +1721,18 @@ async def test_replay_after_persisted_running_marks_review_without_redispatch() 
         idempotency_key=key,
     )
 
-    assert result.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.error_code == "invocation_needs_review"
+    assert result.invocation.status is ToolInvocationStatus.RUNNING
+    assert result.error_code is None
     assert result.idempotent_replay is True
     assert fixture.tools["vt.file_report"].calls == []
+    latest = await fixture.invocations.get(running.id)
+    assert latest is not None and latest.status is ToolInvocationStatus.RUNNING
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "prior_status",
-    [ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW],
+    [ToolInvocationStatus.NEEDS_REVIEW],
 )
 async def test_fresh_passive_read_settles_uncertain_reservation_before_retry(
     monkeypatch: pytest.MonkeyPatch, prior_status: ToolInvocationStatus

@@ -26,7 +26,6 @@ from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.investigation_acquisition_tools import (
     SAMPLE_ANALYSIS_CAPABILITY,
     SAMPLE_ANALYZE_SCHEMA,
-    VT_DOWNLOAD_SAMPLE_SCHEMA,
     VT_FILE_DOWNLOAD_CAPABILITY,
     register_acquisition_tools,
 )
@@ -1038,6 +1037,8 @@ async def test_repeated_vt_download_route_refusals_block_only_downloads_in_conte
             known_chain=(),
             open_questions=("Review the sample acquisition path.",),
         ),
+        tlp="GREEN",
+        external_llm_allowed=True,
     )
     observations = InMemoryEvidenceObservationRepository()
     invocations = InMemoryToolInvocationRepository()
@@ -1105,7 +1106,7 @@ async def test_repeated_vt_download_route_refusals_block_only_downloads_in_conte
         allowed_providers=("vt",),
         budget=InvestigationBudget(),
         acquire_hits_allowed=True,
-        disclosure=DisclosureBounds(),
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN, external_llm_allowed=True),
         approval_decision_id=uuid4(),
         approval_actor_id="analyst-test",
     )
@@ -1440,6 +1441,9 @@ async def test_context_exposes_exact_registered_tool_argument_schema() -> None:
         ),
         confirmed_iocs=(),
         confirmed_iocs_truncated=False,
+        tlp="GREEN",
+        external_llm_allowed=True,
+        do_not_submit=False,
     )
     schema = {
         "type": "object",
@@ -1472,14 +1476,23 @@ async def test_context_exposes_exact_registered_tool_argument_schema() -> None:
         findings=InMemoryFindingRepository(),
         registry=registry,
     )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=("vt",),
+        budget=InvestigationBudget(limits={BudgetDimension.VT_UNITS: 4}),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-test",
+    )
     context = await builder.build(
         investigation_id=investigation_id,
         synthesis_artifact_id=synthesis_artifact_id,
         state=_state(investigation_id),
         tool_context=ToolExecutionContext(
             investigation_id=investigation_id,
-            envelope=None,
-            budget=InvestigationBudget(),
+            envelope=envelope,
+            budget=envelope.budget,
             idempotency_key="tool-schema-context",
             available_capabilities=frozenset({"vt.read"}),
         ),
@@ -1791,7 +1804,11 @@ async def test_prompt_lists_schema_derived_required_arguments_as_plain_text() ->
         or tool.name.startswith("sample.")
         or tool.name.startswith("rule.")
     }
-    assert "vt.download_sample" in schemas
+    assert "vt.download_sample" not in schemas
+    assert any(
+        item.startswith("vt.download_sample:external_disclosure_denied")
+        for item in context.unavailable_tools
+    )
     assert "sample.analyze" in schemas
     assert "rule.test" in schemas
     for name, schema in schemas.items():
@@ -1799,8 +1816,6 @@ async def test_prompt_lists_schema_derived_required_arguments_as_plain_text() ->
         required_line = f"{name} required ARG keys: {', '.join(required)}"
         assert required_line in prompt
         assert f"{name} minimal ARG JSON" not in prompt
-        if name == "vt.download_sample":
-            assert schema == VT_DOWNLOAD_SAMPLE_SCHEMA
         if name == "sample.analyze":
             assert schema == SAMPLE_ANALYZE_SCHEMA
     assert "ARG values are plain scalars" in prompt
