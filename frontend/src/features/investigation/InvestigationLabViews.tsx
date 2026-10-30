@@ -29,14 +29,22 @@ import {
   InvestigationFindings,
   InvestigationObservations,
   InvestigationSamples,
+  InvestigationActivityCockpit,
 } from "./InvestigationPanels";
 import { InvestigationReadPanels } from "./InvestigationReadPanels";
 import { PublicationLineagePanel } from "./PublicationLineagePanel";
 
 type LabView =
-  "claims" | "pivots" | "samples" | "network" | "journal" | "publication";
+  | "activity"
+  | "claims"
+  | "pivots"
+  | "samples"
+  | "network"
+  | "journal"
+  | "publication";
 
 const VIEWS: Array<{ id: LabView; label: string }> = [
+  { id: "activity", label: "Investigation en cours" },
   { id: "claims", label: "Claims / Hypothèses" },
   { id: "pivots", label: "Pivots" },
   { id: "samples", label: "Échantillons" },
@@ -117,7 +125,7 @@ export function InvestigationLabViews({
   editionId: string;
   showG2Prompt?: boolean;
 }) {
-  const [activeView, setActiveView] = useState<LabView>("claims");
+  const [activeView, setActiveView] = useState<LabView>("activity");
   const [selectedClaimId, setSelectedClaimId] = useState("");
   const panelId = "investigation-lab-view";
 
@@ -156,6 +164,12 @@ export function InvestigationLabViews({
         role="region"
         aria-label={VIEWS.find((view) => view.id === activeView)?.label}
       >
+        {activeView === "activity" ? (
+          <InvestigationActivityCockpit
+            investigationId={investigation.id}
+            onOpenJournal={() => setActiveView("journal")}
+          />
+        ) : null}
         {activeView === "claims" ? (
           <ClaimsView
             investigation={investigation}

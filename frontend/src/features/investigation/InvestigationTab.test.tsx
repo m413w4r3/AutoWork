@@ -128,6 +128,43 @@ function createFetch(view: InvestigationView | null) {
     if (url === `/api/investigations/${INVESTIGATION_ID}` && currentView) {
       return Promise.resolve(Response.json(currentView));
     }
+    if (url.startsWith(`/api/investigations/${INVESTIGATION_ID}/activity?`)) {
+      const view = currentView ?? makeInvestigation();
+      return Promise.resolve(
+        Response.json({
+          schema_version: "investigation-activity.v1",
+          investigation: {
+            id: view.id,
+            subject_id: view.subject_id,
+            production_run_id: view.production_run_id,
+            synthesis_artifact_id: view.synthesis_artifact_id,
+            synthesis_sha256: view.synthesis_sha256,
+            status: view.status,
+            version: view.version,
+            stop_reason: view.stop_reason,
+            execution_mode: "bridge_led",
+          },
+          operator: {
+            principal: null,
+            model: null,
+            effort: null,
+            active_subagent_count: null,
+            metadata_source: "unavailable_in_autowork",
+          },
+          working_state: null,
+          last_activity_at: null,
+          last_activity_source: null,
+          active_backend_job_count: 0,
+          budget: null,
+          timeline: [],
+          next_cursor: null,
+          has_more: false,
+          blockers: [],
+          counts: { inconclusive_findings: 0 },
+          generated_at: "2026-10-30T12:00:00Z",
+        }),
+      );
+    }
     if (url === `/api/investigations/${INVESTIGATION_ID}/envelope`) {
       return Promise.resolve(
         Response.json({
@@ -302,6 +339,9 @@ describe("InvestigationTab", () => {
   it("montre l’enquête en cours et permet de l’interrompre", async () => {
     renderInvestigation(makeInvestigation({ status: "running" }));
 
+    expect(
+      await screen.findByRole("heading", { name: "Investigation en cours" }),
+    ).toBeInTheDocument();
     expect(
       await screen.findByRole("heading", {
         name: `Enquête ${INVESTIGATION_ID}`,

@@ -42,6 +42,9 @@ from cti_app.application.identity import (
     is_human_actor_id,
     is_loopback_bind_host,
 )
+from cti_app.application.investigation_activity_projection import (
+    build_investigation_activity_projection,
+)
 from cti_app.application.investigation_composition import (
     InvestigationComposition,
     InvestigationCompositionFactory,
@@ -829,6 +832,87 @@ class InvestigationOperatorStatusResponse(BaseModel):
     next_idempotent_action: dict[str, Any]
 
 
+class InvestigationActivityObservationView(BaseModel):
+    id: UUID
+    kind: str
+    sha256: str
+    source: str
+    source_version: str
+    observed_at: datetime
+
+
+class InvestigationActivityInvocationView(BaseModel):
+    id: UUID
+    version: int
+    tool_name: str
+    schema_version: str
+    purpose_excerpt: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    duration_seconds: int | None
+    duration_quality: Literal["unknown"]
+    reserved_budget: dict[str, int]
+    consumed_budget: dict[str, int]
+    repeated_input_count_in_page: int
+    observation_refs: list[UUID]
+    observations: list[InvestigationActivityObservationView]
+
+
+class InvestigationActivityInvestigationView(BaseModel):
+    id: UUID
+    subject_id: UUID
+    production_run_id: UUID
+    synthesis_artifact_id: UUID
+    synthesis_sha256: str | None
+    status: AnalystInvestigationStatus
+    version: int
+    stop_reason: StopReason | None
+    execution_mode: InvestigationExecutionMode | None
+
+
+class InvestigationActivityOperatorView(BaseModel):
+    principal: str | None
+    model: str | None
+    effort: str | None
+    active_subagent_count: int | None
+    metadata_source: Literal["unavailable_in_autowork"]
+
+
+class InvestigationActivityStateView(BaseModel):
+    version: int
+    turn_index: int
+    stop_reason: StopReason | None
+    hypothesis_count: int
+    open_hypothesis_count: int
+
+
+class InvestigationActivityBlockerView(BaseModel):
+    kind: str
+    code: str
+    invocation_id: UUID | None
+    external_effect_state: str | None = None
+    message: str
+    next_action: str
+
+
+class InvestigationActivityResponse(BaseModel):
+    schema_version: Literal["investigation-activity.v1"]
+    investigation: InvestigationActivityInvestigationView
+    operator: InvestigationActivityOperatorView
+    working_state: InvestigationActivityStateView | None
+    last_activity_at: datetime | None
+    last_activity_source: str | None
+    active_backend_job_count: int
+    budget: dict[str, BudgetDimensionView] | None
+    timeline: list[InvestigationActivityInvocationView]
+    next_cursor: str | None
+    has_more: bool
+    blockers: list[InvestigationActivityBlockerView]
+    counts: dict[str, int]
+    generated_at: datetime
+
+
 @router.post(
     "/subjects/{subject_id}/investigations",
     response_model=InvestigationActionResponse,
@@ -1030,6 +1114,97 @@ async def get_investigation(investigation_id: UUID, request: Request) -> Investi
             composition=composition,
             state=state,
         )
+
+
+@router.get(
+    "/investigations/{investigation_id}/activity",
+    response_model=InvestigationActivityResponse,
+)
+async def get_investigation_activity(
+    investigation_id: UUID,
+    request: Request,
+    cursor: str | None = Query(default=None, max_length=1_024),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> InvestigationActivityResponse:
+    """Return a bounded, read-only activity projection for cockpit polling."""
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+
+        invocation_repository = getattr(uow, "tool_invocations", None)
+        page_for_investigation = getattr(
+            invocation_repository, "page_for_investigation", None
+        )
+        if not callable(page_for_investigation):
+            raise _http_error(503, "investigation_activity_unavailable")
+        try:
+            page = await page_for_investigation(
+                investigation_id,
+                cursor=cursor,
+                limit=limit,
+                descending=True,
+                section="investigation_activity",
+            )
+        except ValueError as exc:
+            raise _http_error(422, "investigation_activity_cursor_invalid") from exc
+
+        state = await uow.investigation_states.get(investigation_id)
+        envelope = await uow.investigation_envelopes.get(investigation_id)
+        synthesis_sha256 = None
+        artifact = await uow.production_artifacts.get(investigation.synthesis_artifact_id)
+        if (
+            artifact is not None
+            and artifact.id == investigation.synthesis_artifact_id
+            and artifact.subject_id == investigation.subject_id
+            and artifact.production_run_id == investigation.production_run_id
+            and artifact.stage is ProductionArtifactStage.SYNTHESIS
+            and artifact.status is ProductionArtifactStatus.VERIFIED
+            and artifact.canonical_blob_id is not None
+        ):
+            blob_repository = getattr(uow, "blobs", None)
+            get_blob = getattr(blob_repository, "get", None)
+            if callable(get_blob):
+                blob = await get_blob(artifact.canonical_blob_id)
+                if blob is not None and blob.id == artifact.canonical_blob_id:
+                    synthesis_sha256 = blob.descriptor.sha256
+        observation_repository = getattr(uow, "evidence_observations", None)
+        observation_page_method = getattr(
+            observation_repository, "page_for_investigation", None
+        )
+        if not callable(observation_page_method):
+            raise _http_error(503, "investigation_activity_unavailable")
+        observation_page = await observation_page_method(
+            investigation_id,
+            cursor=None,
+            limit=min(limit * 8, 400),
+            descending=True,
+            section="investigation_activity_observations",
+        )
+        observations = tuple(observation_page.items)
+        jobs = tuple(
+            await uow.jobs.list_for_aggregate(
+                INVESTIGATION_RUN_AGGREGATE_TYPE,
+                investigation_id,
+                kind=INVESTIGATION_RUN_JOB_KIND,
+            )
+        )
+        findings = tuple(
+            await uow.investigation_findings.list_for_investigation(investigation_id)
+        )
+        payload = build_investigation_activity_projection(
+            investigation=investigation,
+            state=state,
+            envelope=envelope,
+            invocations=tuple(page.items),
+            observations=observations,
+            jobs=jobs,
+            findings=findings,
+            synthesis_sha256=synthesis_sha256,
+            next_cursor=page.next_cursor,
+            has_more=page.has_more,
+        )
+    return InvestigationActivityResponse.model_validate(payload, strict=False)
 
 
 @router.get(
@@ -4295,7 +4470,10 @@ async def reconcile_operator_advisor_invocation(
                 make_investigation_conversation_id(investigation_id),
                 context_subject_id=context_subject_id,
             )
-            content = next((item for item in contents if item.turn.id == claim.bridge_turn_id), None)
+            content = next(
+                (item for item in contents if item.turn.id == claim.bridge_turn_id),
+                None,
+            )
             if (
                 content is None
                 or not isinstance(content.output_text, str)

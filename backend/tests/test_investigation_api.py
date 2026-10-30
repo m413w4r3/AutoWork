@@ -274,6 +274,34 @@ class _Items:
     async def list_for_investigation(self, _investigation_id: UUID):
         return tuple(self.rows)
 
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "tool_invocations",
+    ):
+        del cursor, section
+        rows = [
+            item
+            for item in self.rows
+            if getattr(item, "investigation_id", None) == investigation_id
+        ]
+        rows.sort(
+            key=lambda item: (
+                getattr(item, "created_at", getattr(item, "observed_at", None)),
+                item.id,
+            ),
+            reverse=descending,
+        )
+        return SimpleNamespace(
+            items=tuple(rows[:limit]),
+            next_cursor=None,
+            has_more=len(rows) > limit,
+        )
+
     async def get(self, identity: UUID):
         return next((item for item in self.rows if getattr(item, "id", None) == identity), None)
 
@@ -2004,6 +2032,50 @@ def test_read_projection_exposes_metadata_without_blobs_or_raw_outputs() -> None
     assert str(blob_id) not in encoded
     assert "raw-provider-secret" not in encoded
     assert "api_key" not in encoded
+
+
+def test_compact_activity_projection_paginates_and_omits_raw_invocation_parameters() -> None:
+    client, store = _client()
+    client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=_start_body())
+    blob_id = uuid4()
+    observation = EvidenceObservation(
+        investigation_id=INVESTIGATION_ID,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=SHA256,
+        source="simulated-tool",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="report",
+        object_id="safe-object",
+    )
+    invocation = ToolInvocation(
+        investigation_id=INVESTIGATION_ID,
+        operation_key="activity-test-operation",
+        tool_name="vt.file_report",
+        schema_version="vt-file-report.v1",
+        normalized_parameters={"sample_sha256": SHA256},
+        purpose="Check the known sample report",
+        status=ToolInvocationStatus.SUCCEEDED,
+        response_refs=(observation.id,),
+    )
+    store.observations.append(observation)
+    store.invocations.append(invocation)
+
+    response = client.get(f"/api/investigations/{INVESTIGATION_ID}/activity?limit=5")
+
+    assert response.status_code == 200
+    body = response.json()
+    encoded = response.text
+    assert body["schema_version"] == "investigation-activity.v1"
+    assert body["investigation"]["version"] == 1
+    assert body["timeline"][0]["id"] == str(invocation.id)
+    assert body["timeline"][0]["version"] == invocation.version
+    assert body["timeline"][0]["observations"][0]["id"] == str(observation.id)
+    assert body["timeline"][0]["duration_quality"] == "unknown"
+    assert body["operator"]["active_subagent_count"] is None
+    assert str(blob_id) not in encoded
+    assert "normalized_parameters" not in encoded
 
 
 def test_g2_can_authorize_the_bridge_advisor_provider_only_when_the_tool_exists() -> None:

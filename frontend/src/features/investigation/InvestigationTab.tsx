@@ -11,6 +11,7 @@ import {
   useSubjectInvestigations,
   type InvestigationView,
 } from "../../api/investigation";
+import { useInvestigationActivity } from "../../api/investigationOperator";
 import { InvestigationLabViews } from "./InvestigationLabViews";
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
@@ -191,16 +192,16 @@ export function InvestigationTab({
           <InvestigationDetail
             investigation={investigationQuery.data}
             editionId={editionId}
-            onResume={() =>
+            onResume={(expectedVersion) =>
               resume.mutate({
                 investigationId,
-                expected_version: investigationQuery.data.version,
+                expected_version: expectedVersion,
               })
             }
-            onInterrupt={() =>
+            onInterrupt={(expectedVersion) =>
               interrupt.mutate({
                 investigationId,
-                expected_version: investigationQuery.data.version,
+                expected_version: expectedVersion,
               })
             }
             actionPending={resume.isPending || interrupt.isPending}
@@ -227,21 +228,28 @@ function InvestigationDetail({
 }: {
   investigation: InvestigationView;
   editionId: string;
-  onResume: () => void;
-  onInterrupt: () => void;
+  onResume: (expectedVersion: number) => void;
+  onInterrupt: (expectedVersion: number) => void;
   actionPending: boolean;
   actionError: Error | null;
 }) {
+  const activityQuery = useInvestigationActivity(investigation.id);
+  const latest = activityQuery.data?.investigation;
+  const currentStatus = latest?.status ?? investigation.status;
+  const currentStopReason = latest
+    ? latest.stop_reason
+    : investigation.stop_reason;
+  const currentVersion = latest?.version ?? investigation.version;
   const isRunning =
-    investigation.status === "queued" || investigation.status === "running";
-  const canInterrupt = isRunning || investigation.status === "awaiting_review";
+    currentStatus === "queued" || currentStatus === "running";
+  const canInterrupt = isRunning || currentStatus === "awaiting_review";
   const canResume = Boolean(
-    investigation.stop_reason &&
+    currentStopReason &&
     !isRunning &&
-    investigation.status !== "completed" &&
-    investigation.status !== "cancelled" &&
-    investigation.stop_reason !== "permission_required" &&
-    investigation.stop_reason !== "budget_exhausted",
+    currentStatus !== "completed" &&
+    currentStatus !== "cancelled" &&
+    currentStopReason !== "permission_required" &&
+    currentStopReason !== "budget_exhausted",
   );
   return (
     <section aria-labelledby="investigation-detail-heading">
@@ -249,7 +257,8 @@ function InvestigationDetail({
         <div>
           <h2 id="investigation-detail-heading">Enquête {investigation.id}</h2>
           <p>
-            {statusLabel(investigation)} · version CAS {investigation.version} ·
+            {statusLabel({ status: currentStatus, stop_reason: currentStopReason })} ·
+            version CAS {currentVersion} ·
             run {investigation.production_run_id} · synthèse{" "}
             {investigation.synthesis_artifact_id} · SHA-256{" "}
             <code>{investigation.synthesis_sha256}</code>
@@ -257,7 +266,7 @@ function InvestigationDetail({
           <p>Décisions attribuées à l’identité authentifiée côté serveur.</p>
         </div>
       </header>
-      {investigation.stop_reason === "model_unavailable" ? (
+      {currentStopReason === "model_unavailable" ? (
         <p className="verification-warning" role="note">
           Le modèle est indisponible. C’est une limite locale de cette piste ;
           les constats déjà enregistrés restent consultables et l’enquête n’est
@@ -275,7 +284,7 @@ function InvestigationDetail({
             type="button"
             className="button button--secondary"
             disabled={actionPending}
-            onClick={onResume}
+            onClick={() => onResume(currentVersion)}
           >
             Reprendre l’enquête
           </button>
@@ -285,7 +294,7 @@ function InvestigationDetail({
             type="button"
             className="button button--secondary"
             disabled={actionPending}
-            onClick={onInterrupt}
+            onClick={() => onInterrupt(currentVersion)}
           >
             Interrompre l’enquête
           </button>
@@ -294,7 +303,7 @@ function InvestigationDetail({
       <InvestigationLabViews
         investigation={investigation}
         editionId={editionId}
-        showG2Prompt={investigation.stop_reason === "permission_required"}
+        showG2Prompt={currentStopReason === "permission_required"}
       />
     </section>
   );
