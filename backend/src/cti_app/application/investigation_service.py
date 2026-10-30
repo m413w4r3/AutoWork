@@ -2666,16 +2666,16 @@ class InvestigationService:
                 normalized_parameters=proposed.arguments,
                 purpose=proposed.purpose,
             )
-            deduplicate_read = definition is not None and definition.effect in {
-                ToolEffect.LOCAL_READ,
-                ToolEffect.EXTERNAL_READ,
-            }
+            deduplicate_operation = definition is not None and (
+                definition.effect in {ToolEffect.LOCAL_READ, ToolEffect.EXTERNAL_READ}
+                or proposed.tool_name in {"sample.analyze", "archive.extract_member"}
+            )
             call_scope = hashlib.sha256(
                 f"{state.turn_index}:{context_sha256}".encode()
             ).hexdigest()[:20]
             operation_key = (
                 base_operation_key
-                if deduplicate_read
+                if deduplicate_operation
                 else f"{base_operation_key}:turn:{call_scope}"
             )
             all_matching_invocations = tuple(
@@ -2745,7 +2745,7 @@ class InvestigationService:
                 failed_attempts = sum(
                     item.status is ToolInvocationStatus.FAILED for item in matching_invocations
                 )
-                retry_parent_key = base_operation_key if deduplicate_read else operation_key
+                retry_parent_key = base_operation_key if deduplicate_operation else operation_key
                 operation_key = f"{retry_parent_key}:retry:{failed_attempts}"
                 invocation = await self._invocations.get_by_operation_key(operation_key)
             if invocation is not None and invocation.status not in {
@@ -3218,7 +3218,11 @@ class InvestigationService:
         self, invocation: ToolInvocation
     ) -> tuple[ToolResult, tuple[UUID, ...], StopReason | None]:
         status = invocation.status
-        if status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.EMPTY}:
+        if status in {
+            ToolInvocationStatus.SUCCEEDED,
+            ToolInvocationStatus.EMPTY,
+            ToolInvocationStatus.PARTIAL,
+        }:
             reference = (
                 f" See observation {invocation.response_refs[0]}."
                 if invocation.response_refs

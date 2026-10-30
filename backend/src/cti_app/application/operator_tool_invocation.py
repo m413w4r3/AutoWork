@@ -1648,6 +1648,8 @@ class OperatorToolInvocationService:
                 output_data["observations"] = persisted
         elif persisted:
             output_data = {"observations": persisted}
+            if result_data is not None:
+                output_data["result"] = result_data
         elif result_data is not None:
             output_data = {"result": result_data}
         else:
