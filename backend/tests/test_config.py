@@ -392,7 +392,10 @@ def test_dotnet_address_space_limit_is_bounded_and_passed_to_worker(
     assert "DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES" in example_names
 
 
-def test_investigation_runtime_settings_are_documented_with_safe_defaults() -> None:
+def test_investigation_runtime_settings_are_documented_with_safe_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RULE_WORKBENCH_ENABLED", raising=False)
     prefixes = (
         "local_analysis_",
         "rule_workbench_",
@@ -404,14 +407,17 @@ def test_investigation_runtime_settings_are_documented_with_safe_defaults() -> N
     repo_root = Path(__file__).resolve().parents[2]
     compose = yaml.safe_load((repo_root / "compose.yaml").read_text(encoding="utf-8"))
     backend_env = compose["services"]["backend"]["environment"]
-    example_names = set(_parse_fake_dotenv(repo_root / ".env.example"))
+    example_values = _parse_fake_dotenv(repo_root / ".env.example")
+    example_names = set(example_values)
 
     assert expected <= set(backend_env)
     assert expected <= example_names
+    assert backend_env["RULE_WORKBENCH_ENABLED"] == "${RULE_WORKBENCH_ENABLED:-true}"
+    assert example_values["RULE_WORKBENCH_ENABLED"] == "true"
     defaults = Settings(_env_file=None)
     assert defaults.local_analysis_enabled is False
     assert defaults.local_analysis_require_filesystem_confinement is True
-    assert defaults.rule_workbench_enabled is False
+    assert defaults.rule_workbench_enabled is True
     assert defaults.mwcp_parser_versions == {}
     assert defaults.ghidra_enabled is False
     assert defaults.native_analysis_enabled is False

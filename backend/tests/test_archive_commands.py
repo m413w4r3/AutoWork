@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import io
 import json
@@ -14,9 +15,11 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisTool,
     validate_archive_tool_request,
 )
+from cti_app.infrastructure import analysis_subprocess
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessResult,
     AnalysisSubprocessStatus,
+    run_analysis_subprocess,
 )
 from cti_app.workers import archive_commands
 from cti_app.workers.archive_commands import run_7z_archive_command, run_zip_members
@@ -89,6 +92,76 @@ def _set_declared_compressed_size(payload: bytes, size: int) -> bytes:
     struct.pack_into("<I", patched, local_offset + 18, size)
     struct.pack_into("<I", patched, central_offset + 20, size)
     return bytes(patched)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_error", "expected_errno"),
+    [
+        (FileNotFoundError(errno.ENOENT, "not found"), errno.ENOENT),
+        (PermissionError(errno.EACCES, "permission denied"), errno.EACCES),
+    ],
+)
+async def test_analysis_subprocess_keeps_only_start_errno_for_safe_classification(
+    monkeypatch: pytest.MonkeyPatch, start_error: OSError, expected_errno: int
+) -> None:
+    async def fail_to_start(*_args, **_kwargs):
+        raise start_error
+
+    monkeypatch.setattr(analysis_subprocess.asyncio, "create_subprocess_exec", fail_to_start)
+
+    result = await run_analysis_subprocess(["/usr/bin/7z"])
+
+    assert result.status is AnalysisSubprocessStatus.FAILED_TO_START
+    assert result.start_errno == expected_errno
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_errno", "expected_status", "expected_error_code"),
+    [
+        (errno.ENOENT, "7z_start_failed", "not_found"),
+        (errno.EACCES, "7z_start_failed", "permission_denied"),
+        (errno.EIO, "7z_start_failed", "other_os_error"),
+    ],
+)
+async def test_7z_list_start_failure_reports_only_safe_errno_category(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    start_errno: int,
+    expected_status: str,
+    expected_error_code: str,
+) -> None:
+    async def failed_start(_argv, **_kwargs):
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.FAILED_TO_START,
+            None,
+            b"",
+            b"sensitive stderr must never be forwarded",
+            start_errno=start_errno,
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", failed_start)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_LIST,
+        b"archive bytes",
+        member_prefix=None,
+        max_members=1,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+    )
+    report = _read_result(result)
+
+    assert report["archive_status"] == expected_status
+    assert report["archive_error_code"] == expected_error_code
+    assert "sensitive stderr" not in str(result)
 
 
 def _corrupt_stored_member(payload: bytes) -> bytes:

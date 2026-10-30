@@ -110,6 +110,7 @@ class OperatorFindingToolAdapter:
     ) -> ToolResult:
         action = arguments["action"]
         kind = FindingKind(arguments["kind"]) if action == "propose" else None
+        requested_assessment = FindingAssessment(arguments["assessment"])
         previous = None
         if action == "revise":
             finding_id = UUID(arguments["finding_id"])
@@ -129,7 +130,7 @@ class OperatorFindingToolAdapter:
             kind = previous.kind
 
         assert kind is not None
-        assessment = FindingAssessment(arguments["assessment"])
+        assessment = requested_assessment
         refs = tuple(UUID(item) for item in arguments["observation_refs"])
         claim_refs = tuple(arguments["claim_refs"])
         supplied_subject = arguments.get("subject_ref")
@@ -164,6 +165,15 @@ class OperatorFindingToolAdapter:
             novelty = classification.novelty
             limitations = tuple(dict.fromkeys((*limitations, *classification.limitations)))
 
+        downgrade_code, prewrite_message = _finding_downgrade_guidance(
+            requested_assessment=requested_assessment,
+            resulting_assessment=assessment,
+            kind=kind,
+            subject_ref=subject_ref,
+            claim_refs=claim_refs,
+            observations=evidence,
+            observation_refs=refs,
+        )
         scope = _scope_with_subject_ref(subject_ref, arguments["scope"])
         service = FindingService(
             findings=self._findings,
@@ -194,6 +204,22 @@ class OperatorFindingToolAdapter:
                 scope=scope,
                 limitations=limitations,
             )
+        if finding.assessment is not requested_assessment and downgrade_code is None:
+            downgrade_code, prewrite_message = _finding_downgrade_guidance(
+                requested_assessment=requested_assessment,
+                resulting_assessment=finding.assessment,
+                kind=kind,
+                subject_ref=subject_ref,
+                claim_refs=claim_refs,
+                observations=evidence,
+                observation_refs=refs,
+            )
+            if downgrade_code is None:
+                downgrade_code = "downgraded_by_provenance_guard"
+                prewrite_message = (
+                    "The requested assessment was constrained by the finding provenance "
+                    "rules before the version was saved. Review its cited observations."
+                )
         return ToolResult(
             ToolInvocationStatus.SUCCEEDED,
             observation_refs=tuple(item.id for item in evidence),
@@ -201,10 +227,91 @@ class OperatorFindingToolAdapter:
                 "finding_id": str(finding.id),
                 "finding_version": finding.version,
                 "assessment": finding.assessment.value,
+                "assessment_requested": requested_assessment.value,
+                "assessment_recorded": finding.assessment.value,
+                "assessment_downgrade_code": downgrade_code,
+                "assessment_prewrite_message": prewrite_message,
                 "kind": finding.kind.value,
             },
-            message="Operator finding saved as a versioned draft.",
+            message=prewrite_message or "Operator finding saved as a versioned draft.",
         )
+
+    async def result_for_replay(
+        self, arguments: Mapping[str, Any], investigation_id: UUID
+    ) -> Mapping[str, Any] | None:
+        """Rebuild the bounded finding result from its canonical saved version."""
+        try:
+            action = arguments["action"]
+            if action == "revise":
+                previous_id = UUID(str(arguments["finding_id"]))
+                previous = await self._findings.get(previous_id)
+                if previous is None or previous.investigation_id != investigation_id:
+                    return None
+                kind = previous.kind
+                subject_ref = arguments.get("subject_ref")
+                if subject_ref is None:
+                    subject_ref = _subject_from_scope(previous.scope)
+                expected_version = int(arguments["expected_finding_version"])
+            elif action == "propose":
+                previous_id = None
+                kind = FindingKind(arguments["kind"])
+                subject_ref = arguments.get("subject_ref")
+                expected_version = 0
+            else:
+                return None
+
+            normalized_subject = _normalize_subject_ref(subject_ref)
+            expected_scope = _scope_with_subject_ref(
+                normalized_subject, str(arguments.get("scope", ""))
+            )
+            expected_refs = tuple(
+                dict.fromkeys(UUID(str(item)) for item in arguments["observation_refs"])
+            )
+            expected_claims = tuple(dict.fromkeys(str(item) for item in arguments["claim_refs"]))
+            statement = str(arguments["statement"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        candidates = tuple(
+            item
+            for item in await self._findings.list_for_investigation(investigation_id)
+            if item.kind is kind
+            and item.statement == statement
+            and item.scope == expected_scope
+            and item.observation_refs == expected_refs
+            and item.claim_refs == expected_claims
+            and (
+                (previous_id is None and item.version == 1 and item.supersedes is None)
+                or (
+                    previous_id is not None
+                    and item.version == expected_version + 1
+                    and item.supersedes == previous_id
+                )
+            )
+        )
+        if len(candidates) != 1:
+            return None
+        finding = candidates[0]
+        requested_assessment = FindingAssessment(arguments["assessment"])
+        evidence = await self._load_observations(investigation_id, expected_refs)
+        downgrade_code, _message = _finding_downgrade_guidance(
+            requested_assessment=requested_assessment,
+            resulting_assessment=finding.assessment,
+            kind=kind,
+            subject_ref=normalized_subject,
+            claim_refs=expected_claims,
+            observations=evidence,
+            observation_refs=expected_refs,
+        )
+        return {
+            "finding_id": str(finding.id),
+            "finding_version": finding.version,
+            "assessment": finding.assessment.value,
+            "assessment_requested": requested_assessment.value,
+            "assessment_recorded": finding.assessment.value,
+            "assessment_downgrade_code": downgrade_code,
+            "kind": finding.kind.value,
+        }
 
     async def _load_observations(
         self, investigation_id: UUID, refs: tuple[UUID, ...]
@@ -766,6 +873,73 @@ class FindingService:
             and finding.version == previous.version + 1
             and finding.supersedes == previous.id
         )
+
+
+def _finding_downgrade_guidance(
+    *,
+    requested_assessment: FindingAssessment,
+    resulting_assessment: FindingAssessment,
+    kind: FindingKind,
+    subject_ref: str | None,
+    claim_refs: tuple[str, ...],
+    observations: tuple[EvidenceObservation, ...],
+    observation_refs: tuple[UUID, ...],
+) -> tuple[str | None, str | None]:
+    """Explain a predictable provenance downgrade without echoing evidence values."""
+    if (
+        requested_assessment is not FindingAssessment.SUPPORTED
+        or resulting_assessment is FindingAssessment.SUPPORTED
+    ):
+        return None, None
+
+    if kind in _OBJECT_IDENTIFIED_KINDS:
+        if subject_ref is None or not subject_ref.strip():
+            return (
+                "downgraded_no_matching_subject",
+                "Before saving a supported finding, provide subject_ref for the object and "
+                "cite an observation whose object_id matches it. Without subject_ref, the "
+                "assessment is recorded as inconclusive.",
+            )
+        if not observation_refs:
+            return (
+                "downgraded_without_observation",
+                "Before saving a supported finding, cite an observation from this investigation "
+                "whose object_id matches subject_ref; without a cited observation, the "
+                "assessment is recorded as inconclusive.",
+            )
+        if not any(item.object_id == subject_ref for item in observations):
+            return (
+                "downgraded_no_matching_observation",
+                "Before saving a supported finding, cite an observation from this investigation "
+                "whose object_id matches subject_ref; the recorded assessment is qualified "
+                "when cited observations do not match.",
+            )
+    if kind is FindingKind.CLAIM_VERIFICATION and (
+        not claim_refs
+        or not any(item.kind is not EvidenceKind.CLAIM_SOURCE for item in observations)
+    ):
+        return (
+            "downgraded_claim_without_supporting_observation",
+            "Before saving a supported claim verification, provide a claim reference and cite "
+            "a non-source observation from this investigation.",
+        )
+    if kind is FindingKind.NEW_SAMPLE and not _is_sample_hash(subject_ref):
+        return (
+            "downgraded_invalid_sample_subject",
+            "Before saving a supported new-sample finding, provide a valid sample hash in "
+            "subject_ref and cite matching evidence.",
+        )
+    if not observation_refs:
+        return (
+            "downgraded_without_observation",
+            "Before saving a supported finding, cite an observation from this investigation; "
+            "supported requires persisted evidence.",
+        )
+    return (
+        "downgraded_by_provenance_guard",
+        "The requested assessment was constrained by the finding provenance rules before the "
+        "version was saved. Review its cited observations.",
+    )
 
 
 __all__ = [
