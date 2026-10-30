@@ -267,6 +267,8 @@ async def _run_inherited_case(
     source_license_restriction: str | None = None,
     associate_hashes: bool = True,
     sample_observation_hashes: tuple[str, ...] = (),
+    file_hash_observations: tuple[str, ...] = (),
+    foreign_file_hash_observations: tuple[str, ...] = (),
     enable_file_download: bool = False,
     file_download_legacy_fallback_enabled: bool = False,
     download_allowed_hosts: frozenset[str] = frozenset(),
@@ -378,6 +380,60 @@ async def _run_inherited_case(
                         object_type="sha256",
                         object_id=file_hash,
                         limitations=("Synthetic source observation only.",),
+                    )
+                )
+            await uow.commit()
+    if file_hash_observations:
+        async with uow_factory() as uow:
+            for file_hash in sorted(set(file_hash_observations)):
+                observation_bytes = f"synthetic observed VT file hash {uuid4()}".encode()
+                observation_blob_id = await artifact_store.put_bytes(
+                    observation_bytes,
+                    bucket="vt-read-file-hash-observations",
+                    mime_type="application/octet-stream",
+                )
+                await uow.evidence_observations.append_if_absent(
+                    EvidenceObservation(
+                        investigation_id=seeded.investigation.id,
+                        kind=EvidenceKind.VT_FILE_REPORT,
+                        blob_id=observation_blob_id,
+                        sha256=hashlib.sha256(observation_bytes).hexdigest(),
+                        source="vt.file_report",
+                        source_version="synthetic-v1",
+                        observed_at=datetime.now(UTC),
+                        object_type="file",
+                        object_id=file_hash,
+                        limitations=("Synthetic same-investigation VT source observation.",),
+                    )
+                )
+            await uow.commit()
+    if foreign_file_hash_observations:
+        foreign = await seed_verified_article(
+            uow_factory,
+            artifact_store,
+            suffix=f"{seeded.investigation.id.hex[:12]}-foreign",
+            include_seed=False,
+        )
+        async with uow_factory() as uow:
+            for file_hash in sorted(set(foreign_file_hash_observations)):
+                observation_bytes = f"synthetic foreign VT file hash {uuid4()}".encode()
+                observation_blob_id = await artifact_store.put_bytes(
+                    observation_bytes,
+                    bucket="vt-read-foreign-file-hash-observations",
+                    mime_type="application/octet-stream",
+                )
+                await uow.evidence_observations.append_if_absent(
+                    EvidenceObservation(
+                        investigation_id=foreign.investigation.id,
+                        kind=EvidenceKind.VT_FILE_REPORT,
+                        blob_id=observation_blob_id,
+                        sha256=hashlib.sha256(observation_bytes).hexdigest(),
+                        source="vt.file_report",
+                        source_version="synthetic-v1",
+                        observed_at=datetime.now(UTC),
+                        object_type="file",
+                        object_id=file_hash,
+                        limitations=("Synthetic foreign-investigation source observation.",),
                     )
                 )
             await uow.commit()
@@ -713,6 +769,140 @@ async def test_osint_open_inherited_investigation_uses_vt_coordinator_and_hides_
         )
         assert _VT_KEY not in durable_rows
         assert _VT_KEY not in caplog.text
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.parametrize("hash_length", [32, 40], ids=["md5", "sha1"])
+@pytest.mark.asyncio
+async def test_vt_file_report_accepts_exact_same_investigation_md5_sha1_observation(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    hash_length: int,
+) -> None:
+    file_hash = "a" * hash_length
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": file_hash,
+                    "type": "file",
+                    "attributes": {"reputation": 0, "last_analysis_stats": {}},
+                }
+            },
+            request=request,
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(),
+        proxy_handler=proxy_handler,
+        tool_name="vt.file_report",
+        tool_arguments={"file_hash": file_hash},
+        file_hash_observations=(file_hash,),
+        associate_hashes=False,
+    )
+    try:
+        assert len(physical_requests) == 1
+        assert result["invocations"]
+        assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
+        assert len(result["claims"]) == 1
+        assert any(
+            reference["kind"] == "evidence_observation"
+            for reference in result["claims"][0].evidence_refs
+        )
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.parametrize("hash_length", [32, 40], ids=["md5", "sha1"])
+@pytest.mark.asyncio
+async def test_vt_file_report_without_md5_sha1_provenance_is_refused_before_transport(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    hash_length: int,
+) -> None:
+    file_hash = "b" * hash_length
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200, json={"data": {"id": file_hash, "type": "file"}}, request=request
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(),
+        proxy_handler=proxy_handler,
+        tool_name="vt.file_report",
+        tool_arguments={"file_hash": file_hash},
+        associate_hashes=False,
+    )
+    try:
+        assert physical_requests == []
+        assert result["claims"] == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.FAILED,
+            ToolInvocationStatus.POLICY_DENIED,
+        }
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.parametrize("hash_length", [32, 40], ids=["md5", "sha1"])
+@pytest.mark.asyncio
+async def test_vt_file_report_rejects_md5_sha1_observation_from_another_investigation(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    hash_length: int,
+) -> None:
+    file_hash = "c" * hash_length
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200, json={"data": {"id": file_hash, "type": "file"}}, request=request
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(),
+        proxy_handler=proxy_handler,
+        tool_name="vt.file_report",
+        tool_arguments={"file_hash": file_hash},
+        foreign_file_hash_observations=(file_hash,),
+        associate_hashes=False,
+    )
+    try:
+        assert physical_requests == []
+        assert result["claims"] == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.FAILED,
+            ToolInvocationStatus.POLICY_DENIED,
+        }
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()

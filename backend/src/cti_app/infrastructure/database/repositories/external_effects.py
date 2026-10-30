@@ -105,7 +105,11 @@ def _vt_file_hash_from_request(prepared: PreparedExternalRequest) -> str | None:
         files_index = -1
     if files_index >= 0 and files_index + 1 < len(path_parts):
         candidate = path_parts[files_index + 1]
-        return candidate if re.fullmatch(r"[0-9a-f]{64}", candidate) else None
+        return (
+            candidate
+            if re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", candidate)
+            else None
+        )
     if not path.rstrip("/").endswith("/file/report"):
         return None
     query = prepared.canonical_request.get("query")
@@ -119,7 +123,9 @@ def _vt_file_hash_from_request(prepared: PreparedExternalRequest) -> str | None:
         and item[0] == "resource"
         and isinstance(item[1], str)
     ]
-    if len(resources) != 1 or not re.fullmatch(r"[0-9a-f]{64}", resources[0]):
+    if len(resources) != 1 or not re.fullmatch(
+        r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", resources[0]
+    ):
         return None
     return resources[0]
 
@@ -1071,8 +1077,9 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("approval_changed")
         if prepared.provider not in envelope.allowed_providers:
             raise _ConsumeDenied("provider_not_allowed")
-        if envelope.disclosure_tlp == "red":
-            raise _ConsumeDenied("tlp_red")
+        disclosure_tlp = (envelope.disclosure_tlp or "").casefold()
+        if disclosure_tlp in {"amber", "red"}:
+            raise _ConsumeDenied(f"tlp_{disclosure_tlp}")
         if external_effect_source_do_not_submit_blocks(
             prepared.family, envelope.disclosure_do_not_submit
         ):
@@ -1427,6 +1434,7 @@ class SqlAlchemyExternalEffectClaimStore:
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
+        observation_file_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
         is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
@@ -1516,12 +1524,29 @@ class SqlAlchemyExternalEffectClaimStore:
                     raise _ConsumeDenied("evidence_observation_version_mismatch")
                 object_type = observation.object_type.casefold()
                 file_object_types = {"sample", "file", "sample_observation"}
-                if vt_file_hash_read or is_bridge_submission:
+                supports_short_file_hash = prepared.family in {
+                    "vt.file_report",
+                    "vt.relationships",
+                }
+                if supports_short_file_hash:
+                    file_object_types.update({"sha256", "md5", "sha1"})
+                elif vt_file_hash_read:
+                    file_object_types.add("sha256")
+                elif is_bridge_submission:
                     file_object_types.add("sha256")
                 if object_type in file_object_types:
-                    if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
+                    normalized_observation_hash = observation.object_id.casefold()
+                    hash_pattern = (
+                        r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})"
+                        if supports_short_file_hash
+                        else r"[0-9a-f]{64}"
+                    )
+                    if not re.fullmatch(hash_pattern, normalized_observation_hash):
                         raise _ConsumeDenied("unresolvable_evidence_observation_source")
-                    observation_hashes.add(observation.object_id)
+                    if vt_file_hash_read:
+                        observation_file_hashes.add(normalized_observation_hash)
+                    if len(normalized_observation_hash) == 64:
+                        observation_hashes.add(normalized_observation_hash)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
@@ -1531,6 +1556,14 @@ class SqlAlchemyExternalEffectClaimStore:
                     raise _ConsumeDenied("unresolvable_evidence_observation_source")
 
         if vt_file_hash_read and sample_hashes and not observation_hashes.issubset(sample_hashes):
+            raise _ConsumeDenied("vt_source_observation_hash_mismatch")
+
+        requested_file_hash = _vt_file_hash_from_request(prepared) if vt_file_hash_read else None
+        if (
+            requested_file_hash is not None
+            and observation_file_hashes
+            and observation_file_hashes != {requested_file_hash}
+        ):
             raise _ConsumeDenied("vt_source_observation_hash_mismatch")
 
         association_terms: list[ColumnElement[bool]] = []

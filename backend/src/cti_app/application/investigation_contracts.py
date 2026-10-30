@@ -101,6 +101,8 @@ class AvailablePivotV1(_StrictContract):
     indicator_type: Literal["md5", "sha1", "sha256", "ipv4", "domain", "url"]
     indicator_value: str = Field(min_length=1, max_length=2_048)
     arguments: dict[str, Any]
+    execution_state: Literal["available", "blocked"] = "available"
+    blocked_reason: str | None = Field(default=None, min_length=1, max_length=96)
 
 
 class EvidenceSummaryV1(_StrictContract):
@@ -167,8 +169,11 @@ class ToolCoverageEntryV1(_StrictContract):
     invocation_id: UUID
     tool_name: str = Field(min_length=1, max_length=128)
     parameter_key: str = Field(min_length=1, max_length=320)
+    argument_key_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    normalized_parameters: dict[str, Any] = Field(default_factory=dict)
     status: ToolInvocationStatus
     observation_id: UUID | None = None
+    error_code: str | None = Field(default=None, min_length=1, max_length=96)
     summary: str = Field(min_length=1, max_length=512)
 
 

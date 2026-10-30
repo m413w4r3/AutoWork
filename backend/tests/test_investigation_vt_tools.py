@@ -78,11 +78,13 @@ from cti_app.domain.analyst_opinion import (
     OpinionClaimQualification,
 )
 from cti_app.domain.entities import Sample
+from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     DisclosureBounds,
     EvidenceKind,
+    EvidenceObservation,
     FindingAssessment,
     FindingKind,
     FrameworkPreSubmissionProof,
@@ -815,11 +817,104 @@ async def test_disclosure_bounds_allow_do_not_submit_but_deny_tlp(
 
 
 @pytest.mark.asyncio
+async def test_trusted_vt_md5_provenance_uses_exact_same_investigation_sources() -> None:
+    investigation_id = uuid4()
+    artifact_id = uuid4()
+    document_id = uuid4()
+    hash_value = "a" * 32
+    other_hash = "b" * 32
+    snapshot = SimpleNamespace(
+        synthesis_artifact_id=artifact_id,
+        synthesis_version=3,
+        synthesis_sha256="d" * 64,
+        confirmed_iocs=(
+            SimpleNamespace(
+                indicator_type="md5",
+                value=hash_value,
+                source_document_ids=(document_id,),
+            ),
+        ),
+    )
+
+    class _Snapshots:
+        async def resolve(self, requested_artifact_id):
+            assert requested_artifact_id == artifact_id
+            return snapshot
+
+    observations = InMemoryEvidenceObservationRepository()
+    matching_observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt.file_report",
+        source_version="vt-raw.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=hash_value,
+    )
+    await observations.append_if_absent(matching_observation)
+    await observations.append_if_absent(
+        EvidenceObservation(
+            investigation_id=uuid4(),
+            kind=EvidenceKind.VT_FILE_REPORT,
+            blob_id=uuid4(),
+            sha256="f" * 64,
+            source="vt.file_report",
+            source_version="vt-raw.v1",
+            observed_at=datetime.now(UTC),
+            object_type="file",
+            object_id=hash_value,
+        )
+    )
+    service = object.__new__(InvestigationService)
+    service._observations = observations
+    service._context_builder = SimpleNamespace(article_snapshots=_Snapshots())
+    investigation = SimpleNamespace(id=investigation_id, synthesis_artifact_id=artifact_id)
+
+    references = await service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": hash_value, "evidence_refs": [str(uuid4())]},
+    )
+    assert set(references) == {
+        EvidenceReference(
+            kind="source_document",
+            id=str(document_id),
+            version=f"{artifact_id}@3",
+            sha256="d" * 64,
+        ),
+        EvidenceReference(
+            kind="evidence_observation",
+            id=str(matching_observation.id),
+            version=matching_observation.source_version,
+            sha256=matching_observation.sha256,
+        ),
+    }
+    missing = await service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": other_hash},
+    )
+    assert missing == ()
+    assert (
+        await service._trusted_vt_source_references(
+            investigation=investigation,
+            tool_name="vt.behaviour",
+            arguments={"file_hash": hash_value},
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stage", "reason_code", "expected_status"),
     (
         ("PRE_CONSUME", "source_references_mismatch", ToolInvocationStatus.POLICY_DENIED),
         ("PREPARATION", "invalid_prepared_effect", ToolInvocationStatus.FAILED),
+        ("EXISTING_CLAIM", "effect_occurrence_required", ToolInvocationStatus.FAILED),
+        ("REUSE_POLICY", "effect_occurrence_required", ToolInvocationStatus.FAILED),
     ),
 )
 async def test_framework_presend_refusal_is_terminal_and_carries_no_send_proof(
@@ -842,6 +937,9 @@ async def test_framework_presend_refusal_is_terminal_and_carries_no_send_proof(
     )
     assert result.error_code == f"virustotal_external_effect_refused_{reason_code}"
     assert result.output["reason"] == "external_effect_refused"
+    assert result.budget_consumed[BudgetDimension.VT_UNITS] == 0
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 0
+    assert tools.context.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert tools.vt.calls["file_report"] == 1
 
 

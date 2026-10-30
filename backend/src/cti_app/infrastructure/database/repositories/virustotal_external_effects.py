@@ -49,6 +49,7 @@ from cti_app.infrastructure.database.models.osint_open_policy import (
 )
 from cti_app.infrastructure.database.repositories.external_effects import (
     ExternalEffectFamilyBinding,
+    _vt_file_hash_from_request,
 )
 
 VT_EXTERNAL_EFFECT_FAMILIES = {
@@ -120,6 +121,15 @@ def _source_refs_for_family(
             normalized_hash = normalize_file_hash(hash_value)
         except VirusTotalInvalidInputError:
             return ()
+        if len(normalized_hash) in {32, 40}:
+            if family not in {"vt.file_report", "vt.relationships"}:
+                return ()
+            if not metadata or any(
+                reference.kind not in {"source_document", "document", "evidence_observation"}
+                for reference in metadata
+            ):
+                return ()
+            return metadata
         if len(normalized_hash) != 64:
             return ()
         expected = (
@@ -435,16 +445,33 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 ):
                     return False
                 object_type = observation.object_type.casefold()
-                if object_type in _VT_FILE_OBJECT_TYPES or (
-                    object_type == "sha256"
-                    and (
-                        context.prepared.family in _VT_HASH_READ_FAMILIES
-                        or context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+                if (
+                    object_type in _VT_FILE_OBJECT_TYPES
+                    or (
+                        object_type == "sha256"
+                        and (
+                            context.prepared.family in _VT_HASH_READ_FAMILIES
+                            or context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
+                        )
+                    )
+                    or (
+                        object_type in {"md5", "sha1"}
+                        and context.prepared.family in _VT_HASH_READ_FAMILIES
                     )
                 ):
-                    if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
+                    normalized_observation_hash = observation.object_id.casefold()
+                    requested_hash = _vt_file_hash_from_request(context.prepared)
+                    if not re.fullmatch(
+                        r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})",
+                        normalized_observation_hash,
+                    ) or (
+                        context.prepared.family in _VT_HASH_READ_FAMILIES
+                        and requested_hash is not None
+                        and normalized_observation_hash != requested_hash
+                    ):
                         return False
-                    observation_hashes.add(observation.object_id)
+                    if len(normalized_observation_hash) == 64:
+                        observation_hashes.add(normalized_observation_hash)
                 elif observation.object_type.casefold() in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))

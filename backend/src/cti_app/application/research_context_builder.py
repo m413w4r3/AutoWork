@@ -89,6 +89,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     ToolInvocation,
     ToolInvocationStatus,
+    canonical_json_bytes,
     thaw_json,
 )
 from cti_app.domain.investigation_state import (
@@ -2195,10 +2196,13 @@ class ResearchContextBuilder:
                         invocation_id=tool_invocation.id,
                         tool_name=_truncate(_safe_untrusted(tool_invocation.tool_name), 128),
                         parameter_key=_coverage_parameter_key(tool_invocation),
+                        argument_key_sha256=_coverage_argument_key_sha256(tool_invocation),
+                        normalized_parameters=_coverage_normalized_parameters(tool_invocation),
                         status=tool_invocation.status,
                         observation_id=(
                             linked_observation.id if linked_observation is not None else None
                         ),
+                        error_code=_coverage_error_code(tool_invocation, summary_facts),
                         summary=_tool_coverage_summary(
                             tool_invocation, linked_observation, summary_facts
                         ),
@@ -3371,8 +3375,11 @@ class ResearchContextBuilder:
                 invocation_id=invocation.id,
                 tool_name=_truncate(_safe_untrusted(invocation.tool_name), 128),
                 parameter_key=_coverage_parameter_key(invocation),
+                argument_key_sha256=_coverage_argument_key_sha256(invocation),
+                normalized_parameters=_coverage_normalized_parameters(invocation),
                 status=invocation.status,
                 observation_id=observation.id if observation is not None else None,
+                error_code=_coverage_error_code(invocation, facts),
                 summary=summary,
             )
             entries.append(entry)
@@ -3942,7 +3949,7 @@ def _coverage_parameter_key(invocation: ToolInvocation) -> str:
         and invocation.status is ToolInvocationStatus.FAILED
     ):
         return "advisor arguments withheld after local refusal"
-    parameters = thaw_json(invocation.normalized_parameters)
+    parameters = _coverage_raw_parameters(invocation)
     if not isinstance(parameters, Mapping):
         return "parameters: unavailable"
     preferred_names = (
@@ -3965,6 +3972,67 @@ def _coverage_parameter_key(invocation: ToolInvocation) -> str:
             return f"{name}: {safe_value}"
     encoded = json.dumps(_sanitize(parameters), ensure_ascii=False, sort_keys=True)
     return f"parameters: {_truncate(_safe_untrusted(encoded), 240)}"
+
+
+def _coverage_normalized_parameters(invocation: ToolInvocation) -> dict[str, Any]:
+    parameters = _coverage_raw_parameters(invocation)
+    sanitized = _sanitize(parameters)
+    if not isinstance(sanitized, Mapping):
+        return {}
+    return {str(key): _coverage_untrusted_value(value) for key, value in sanitized.items()}
+
+
+def _coverage_raw_parameters(invocation: ToolInvocation) -> dict[str, Any]:
+    if (
+        invocation.tool_name == "advisor.consult"
+        and invocation.status is ToolInvocationStatus.FAILED
+    ):
+        return {"withheld": True}
+    parameters = thaw_json(invocation.normalized_parameters)
+    if not isinstance(parameters, Mapping):
+        return {}
+    return {str(key): value for key, value in parameters.items() if not str(key).startswith("_")}
+
+
+def _coverage_untrusted_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _safe_untrusted(value)
+    if isinstance(value, Mapping):
+        return {str(key): _coverage_untrusted_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_coverage_untrusted_value(item) for item in value]
+    return value
+
+
+def _coverage_argument_key_sha256(invocation: ToolInvocation) -> str:
+    payload = {
+        "tool_name": invocation.tool_name,
+        "normalized_parameters": _coverage_raw_parameters(invocation),
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _coverage_error_code(
+    invocation: ToolInvocation,
+    facts: Mapping[str, Any] | str | None,
+) -> str | None:
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(facts, Mapping):
+        candidates.append(facts)
+        for key in ("result", "output"):
+            nested = facts.get(key)
+            if isinstance(nested, Mapping):
+                candidates.append(nested)
+    for candidate in candidates:
+        code = _safe_error_code(candidate.get("error_code") or candidate.get("available_reason"))
+        if code is not None:
+            return code
+    return {
+        ToolInvocationStatus.FAILED: "tool_failed",
+        ToolInvocationStatus.POLICY_DENIED: "policy_denied",
+        ToolInvocationStatus.UNAVAILABLE: "tool_unavailable",
+        ToolInvocationStatus.NEEDS_REVIEW: "needs_review",
+    }.get(invocation.status)
 
 
 def _advisor_sample_refusal_context_summary(
