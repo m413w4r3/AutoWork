@@ -96,17 +96,14 @@ def build_investigation_activity_projection(
     latest = max(activity_times, key=lambda item: item[0], default=None)
 
     active_job_count = sum(
-        _value(item.status)
-        in {JobStatus.QUEUED.value, JobStatus.RUNNING.value}
-        for item in jobs
+        _value(item.status) in {JobStatus.QUEUED.value, JobStatus.RUNNING.value} for item in jobs
     )
     superseded_ids = {
         item.supersedes for item in findings if getattr(item, "supersedes", None) is not None
     }
     current_findings = tuple(item for item in findings if item.id not in superseded_ids)
     inconclusive_count = sum(
-        _value(getattr(item, "assessment", None)) == "inconclusive"
-        for item in current_findings
+        _value(getattr(item, "assessment", None)) == "inconclusive" for item in current_findings
     )
     stop_reason = _value(
         getattr(state, "stop_reason", None)
@@ -206,8 +203,7 @@ def _project_blockers(
             }
         )
     elif stop_reason == "submission_needs_review" and not any(
-        _value(item.status) == ToolInvocationStatus.NEEDS_REVIEW.value
-        for item in invocations
+        _value(item.status) == ToolInvocationStatus.NEEDS_REVIEW.value for item in invocations
     ):
         blockers.append(
             {
@@ -266,8 +262,7 @@ def _project_blockers(
                         "n’est pas confirmé."
                     ),
                     "next_action": (
-                        "Vérifier l’état réel de cet identifiant puis réconcilier "
-                        "l’invocation."
+                        "Vérifier l’état réel de cet identifiant puis réconcilier l’invocation."
                     ),
                 }
             )

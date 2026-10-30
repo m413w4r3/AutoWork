@@ -2141,15 +2141,20 @@ async def test_abandoning_investigation_turn_does_not_authorize_next_attempt(
     assert next_attempt == 0
     assert retry_key == abandoned_key
     assert not any(
-        action.startswith("bridge_turn_abandoned:0:")
-        for action in persisted_state.recent_actions
+        action.startswith("bridge_turn_abandoned:0:") for action in persisted_state.recent_actions
     )
-    assert investigation_bridge_attempt(
-        ("bridge_turn_abandoned:0:next_attempt=1:turn_id=" + str(turn.id),), 0
-    ) == 0
-    assert investigation_bridge_attempt(
-        ("bridge_turn_orphaned:0:next_attempt=1:turn_id=" + str(turn.id),), 0
-    ) == 0
+    assert (
+        investigation_bridge_attempt(
+            ("bridge_turn_abandoned:0:next_attempt=1:turn_id=" + str(turn.id),), 0
+        )
+        == 0
+    )
+    assert (
+        investigation_bridge_attempt(
+            ("bridge_turn_orphaned:0:next_attempt=1:turn_id=" + str(turn.id),), 0
+        )
+        == 0
+    )
     assert len(adapter.calls) == 1
     assert len(state.turns) == 1
 

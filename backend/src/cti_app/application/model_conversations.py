@@ -661,6 +661,8 @@ class ModelConversationService:
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get_for_update(conversation_id)
             self._ensure_visible(conversation, context_subject_id)
+            if conversation is None:
+                raise ConversationNotFoundError("Conversation introuvable dans ce sujet")
             turn = await uow.model_conversation_turns.get(turn_id)
             if turn is None or turn.conversation_id != conversation_id:
                 raise ConversationNotFoundError("Tour introuvable dans cette conversation")

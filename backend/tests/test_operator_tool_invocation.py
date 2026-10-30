@@ -566,9 +566,7 @@ async def test_result_omits_unverified_observation_refs_without_changing_the_404
         "not_verified_in_investigation"
     }
     assert len(result.output["data"]["observations"]) == 1
-    assert result.output["data"]["result"]["summary"] == (
-        "The analysis remains a candidate."
-    )
+    assert result.output["data"]["result"]["summary"] == ("The analysis remains a candidate.")
 
 
 @pytest.mark.asyncio

@@ -1167,9 +1167,7 @@ async def get_investigation_activity(
             raise _http_error(404, "investigation_not_found")
 
         invocation_repository = getattr(uow, "tool_invocations", None)
-        page_for_investigation = getattr(
-            invocation_repository, "page_for_investigation", None
-        )
+        page_for_investigation = getattr(invocation_repository, "page_for_investigation", None)
         if not callable(page_for_investigation):
             raise _http_error(503, "investigation_activity_unavailable")
         try:
@@ -1203,9 +1201,7 @@ async def get_investigation_activity(
                 if blob is not None and blob.id == artifact.canonical_blob_id:
                     synthesis_sha256 = blob.descriptor.sha256
         observation_repository = getattr(uow, "evidence_observations", None)
-        observation_page_method = getattr(
-            observation_repository, "page_for_investigation", None
-        )
+        observation_page_method = getattr(observation_repository, "page_for_investigation", None)
         if not callable(observation_page_method):
             raise _http_error(503, "investigation_activity_unavailable")
         observation_page = await observation_page_method(
@@ -1223,9 +1219,7 @@ async def get_investigation_activity(
                 kind=INVESTIGATION_RUN_JOB_KIND,
             )
         )
-        findings = tuple(
-            await uow.investigation_findings.list_for_investigation(investigation_id)
-        )
+        findings = tuple(await uow.investigation_findings.list_for_investigation(investigation_id))
         payload = build_investigation_activity_projection(
             investigation=investigation,
             state=state,
@@ -1970,7 +1964,7 @@ async def get_investigation_operator_observation(
             raw = await _artifact_store(request).read_bytes(
                 observation.blob_id,
                 max_bytes=(
-                    descriptor_size
+                    cast(int, descriptor_size)
                     if is_advisor_call
                     else max_object_bytes
                     if preserve_complete_content

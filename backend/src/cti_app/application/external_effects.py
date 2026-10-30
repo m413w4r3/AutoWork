@@ -863,7 +863,7 @@ class ExternalEffectCoordinator:
         lookup = getattr(self._claim_store, "latest_advisor_claim_for_invocation", None)
         if not callable(lookup):
             return None
-        return await lookup(investigation_id, invocation_id)
+        return cast(ExternalEffectClaim | None, await lookup(investigation_id, invocation_id))
 
     async def latest_claim_for_invocation(
         self, investigation_id: UUID, invocation_id: UUID
@@ -872,7 +872,7 @@ class ExternalEffectCoordinator:
         lookup = getattr(self._claim_store, "latest_claim_for_invocation", None)
         if not callable(lookup):
             return None
-        return await lookup(investigation_id, invocation_id)
+        return cast(ExternalEffectClaim | None, await lookup(investigation_id, invocation_id))
 
     async def _handle_existing(
         self,

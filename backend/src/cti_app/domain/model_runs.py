@@ -312,9 +312,7 @@ class ModelRun:
         self.finished_at = timestamp
         self.updated_at = timestamp
 
-    def seal_verified_no_handoff(
-        self, *, claim_id: UUID, now: datetime | None = None
-    ) -> None:
+    def seal_verified_no_handoff(self, *, claim_id: UUID, now: datetime | None = None) -> None:
         """Seal this run after its exact external-effect claim proves zero handoff."""
         if self.status not in {
             ModelRunStatus.RUNNING,

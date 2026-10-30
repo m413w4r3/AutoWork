@@ -179,9 +179,7 @@ def test_activity_projection_types_ambiguity_and_inconclusive_as_non_bug_limitat
         invocations=(ambiguous,),
         observations=(),
         jobs=(),
-        findings=(
-            SimpleNamespace(id=uuid4(), supersedes=None, assessment="inconclusive"),
-        ),
+        findings=(SimpleNamespace(id=uuid4(), supersedes=None, assessment="inconclusive"),),
         synthesis_sha256=SHA256,
         next_cursor=None,
         has_more=False,
@@ -192,9 +190,7 @@ def test_activity_projection_types_ambiguity_and_inconclusive_as_non_bug_limitat
     assert "permission_missing" in blocker_kinds
     assert "external_effect_ambiguous" in blocker_kinds
     ambiguity = next(
-        item
-        for item in projection["blockers"]
-        if item["kind"] == "external_effect_ambiguous"
+        item for item in projection["blockers"] if item["kind"] == "external_effect_ambiguous"
     )
     assert ambiguity["invocation_id"] == ambiguous.id
     assert ambiguity["external_effect_state"] == "unknown"

@@ -1984,14 +1984,16 @@ def evaluate_advisor_evidence_preflight(
     proof_kinds = {"observation", "finding", "article", "measurement", "fact"}
     if consultation_type == "yara_draft":
         proof_kinds = {"observation", "measurement"}
-    if (
-        consultation_type in {"plan_investigation", "pivot_strategy", "yara_draft", "figure_plan"}
-        and not any(
-            item["required"]
-            and item["kind"] in proof_kinds
-            and (item["body_present"] or item.get("retrieval_available"))
-            for item in records
-        )
+    if consultation_type in {
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "figure_plan",
+    } and not any(
+        item["required"]
+        and item["kind"] in proof_kinds
+        and (item["body_present"] or item.get("retrieval_available"))
+        for item in records
     ):
         proof_reason = (
             "No canonical static-analysis observation or verified measurement body was loaded "

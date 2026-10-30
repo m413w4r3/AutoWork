@@ -576,23 +576,23 @@ def _project_operator_tool_inventory(
 
     visible: list[str] = []
     for name in available_tools:
-        reason = vt_reason if name.startswith("vt.") else None
-        if reason is None and name in _VT_RETRY_MAX_RESERVATIONS and envelope is not None:
+        tool_reason: str | None = vt_reason if name.startswith("vt.") else None
+        if tool_reason is None and name in _VT_RETRY_MAX_RESERVATIONS and envelope is not None:
             for dimension, amount in _VT_RETRY_MAX_RESERVATIONS[name].items():
                 remaining = envelope.budget.remaining.get(dimension)
                 if remaining is not None and remaining < amount:
-                    reason = "budget_exhausted"
+                    tool_reason = "budget_exhausted"
                     break
         if (
             name == "vt.download_sample"
             and envelope is not None
             and not envelope.acquire_hits_allowed
         ):
-            reason = "acquisition_not_authorized"
-        if reason is None:
+            tool_reason = "acquisition_not_authorized"
+        if tool_reason is None:
             visible.append(name)
         else:
-            diagnostics.add(f"{name}:{reason}")
+            diagnostics.add(f"{name}:{tool_reason}")
     visible_names = set(visible)
     retryable_vt_tool_versions = {
         key for key in retryable_vt_tool_versions if key[0] in visible_names

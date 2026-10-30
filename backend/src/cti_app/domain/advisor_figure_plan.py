@@ -53,9 +53,7 @@ class FigureNodeV1:
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("Figure node label is invalid")
         object.__setattr__(self, "refs", tuple(self.refs))
-        if not self.refs or any(
-            not isinstance(ref, FigureEvidenceRefV1) for ref in self.refs
-        ):
+        if not self.refs or any(not isinstance(ref, FigureEvidenceRefV1) for ref in self.refs):
             raise ValueError("Figure nodes require typed evidence references")
 
     def to_payload(self) -> dict[str, Any]:
@@ -76,17 +74,14 @@ class FigureEdgeV1:
         if re.fullmatch(r"[a-z][a-z0-9_-]*", self.id) is None:
             raise ValueError("Figure edge ID is invalid")
         if any(
-            re.fullmatch(r"[a-z][a-z0-9_-]*", item) is None
-            for item in (self.source, self.target)
+            re.fullmatch(r"[a-z][a-z0-9_-]*", item) is None for item in (self.source, self.target)
         ):
             raise ValueError("Figure edge endpoint is invalid")
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("Figure edge label is invalid")
         object.__setattr__(self, "refs", tuple(self.refs))
         object.__setattr__(self, "direction_refs", tuple(self.direction_refs))
-        if not self.refs or any(
-            not isinstance(ref, FigureEvidenceRefV1) for ref in self.refs
-        ):
+        if not self.refs or any(not isinstance(ref, FigureEvidenceRefV1) for ref in self.refs):
             raise ValueError("Figure edges require typed evidence references")
         if self.direction is not None and not isinstance(self.direction, FigureDirection):
             raise TypeError("Figure edge direction must use FigureDirection")
