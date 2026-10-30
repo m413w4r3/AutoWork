@@ -1110,8 +1110,7 @@ def test_operator_status_reconciles_needs_review_even_with_refs_and_links_reserv
     assert listed[0]["reconciliation_action"] == {
         "method": "POST",
         "path": (
-            f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
-            f"{invocation_id}/reconcile"
+            f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
         ),
         "expected_version": 7,
         "resubmission_allowed": False,
@@ -1227,10 +1226,7 @@ def test_operator_client_recovers_exact_advisor_response_without_resubmitting() 
             )
 
     client.app.state.external_effect_coordinator = _ClaimLookup()
-    path = (
-        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
-        f"{invocation_id}/reconcile"
-    )
+    path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
 
     response = client.post(path, json={"expected_version": 5})
 
@@ -1344,10 +1340,7 @@ def test_operator_reconciliation_keeps_unknown_provider_outcome_in_review(
             )
 
     client.app.state.external_effect_coordinator = _ClaimLookup()
-    path = (
-        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
-        f"{invocation_id}/reconcile"
-    )
+    path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
 
     response = client.post(path, json={"expected_version": 2})
 
@@ -1386,9 +1379,7 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
         def __init__(self):
             self.seal_calls = []
 
-        async def seal_verified_pre_submission(
-            self, conversation_id, requested_turn, **kwargs
-        ):
+        async def seal_verified_pre_submission(self, conversation_id, requested_turn, **kwargs):
             self.seal_calls.append((conversation_id, requested_turn, kwargs))
 
     class _RecoveryFactory(_CompositionFactory):
@@ -1457,10 +1448,7 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
             )
 
     client.app.state.external_effect_coordinator = _ClaimLookup()
-    path = (
-        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/"
-        f"{invocation_id}/reconcile"
-    )
+    path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
 
     response = client.post(path, json={"expected_version": 3})
 
@@ -1481,9 +1469,7 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
         assert body["next_action"]["path"].endswith("/operator/context")
         assert body["next_action"]["follow_up"]["method"] == "POST"
         assert body["next_action"]["follow_up"]["fresh_idempotency_key_required"] is True
-        assert body["next_action"]["follow_up"]["expected_sha256_from"] == (
-            "working_state_sha256"
-        )
+        assert body["next_action"]["follow_up"]["expected_sha256_from"] == ("working_state_sha256")
     service = client.app.state.investigation_composition_factory.model_conversations
     expected_seal_calls = (
         [

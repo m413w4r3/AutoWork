@@ -362,9 +362,9 @@ def project_tool_availability(
             if item.name == tool_name and item.effect is ToolEffect.EXTERNAL_READ
         )
         for definition in candidate_definitions:
-            registered = registry.get(tool_name, definition.schema_version)
-            if registered is not None and is_trusted_vt_passive_read_adapter(
-                tool_name, registered[1]
+            registered_tool = registry.get(tool_name, definition.schema_version)
+            if registered_tool is not None and is_trusted_vt_passive_read_adapter(
+                tool_name, registered_tool[1]
             ):
                 # A later trusted passive adapter version can safely carry a fresh
                 # read occurrence when the original schema is no longer registered.

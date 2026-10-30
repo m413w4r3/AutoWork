@@ -1419,9 +1419,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         if reference is None:
             raise ModelGatewayError("Succeeded ModelRun has no persisted output")
         max_bytes = (
-            None
-            if run.backend is ModelBackend.CHATGPT_BRIDGE
-            else self._model_output_max_bytes
+            None if run.backend is ModelBackend.CHATGPT_BRIDGE else self._model_output_max_bytes
         )
         content = await self._output_store.read(reference, max_bytes=max_bytes)
         text = content.decode("utf-8")

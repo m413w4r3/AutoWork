@@ -1022,11 +1022,7 @@ class InvestigationAdvisorTool:
                 ).hexdigest()
                 refusal_fingerprint = hashlib.sha256(
                     (
-                        consultation_type
-                        + ":"
-                        + refusal_context_sha256
-                        + ":"
-                        + preflight_status
+                        consultation_type + ":" + refusal_context_sha256 + ":" + preflight_status
                     ).encode("utf-8")
                 ).hexdigest()
                 cached_refusal = self._preflight_refusals.get(refusal_fingerprint)
@@ -5117,9 +5113,7 @@ class ReparsePersistedAdvisorOutputTool:
                 error_code="advisor_reparse_raw_output_sha256_mismatch",
             )
 
-        def unparsed_advisory_result(
-            reason: str, selected_parser: object
-        ) -> ToolResult:
+        def unparsed_advisory_result(reason: str, selected_parser: object) -> ToolResult:
             safe_output, secret_count = redact_explicit_operational_secrets(
                 raw_text,
                 operational_secret_values=configured_operational_secret_values(self._settings),
@@ -5209,7 +5203,7 @@ class ReparsePersistedAdvisorOutputTool:
                     legacy_parse = parse_typed_advisor_response(
                         raw_text,
                         consultation_type=consultation_type,
-                        prompt_data=dict(raw_reparse_context),
+                        prompt_data=dict(cast(Mapping[str, Any], raw_reparse_context)),
                         safe_text=lambda value, _limit: value.strip(),
                         operational_secret_values=configured_operational_secret_values(
                             self._settings

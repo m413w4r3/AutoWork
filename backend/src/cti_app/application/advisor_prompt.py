@@ -175,18 +175,13 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
         return guidance
     if consultation_type == "yara_draft":
         return [
-            (
-                "Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara."
-            ),
+            ("Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara."),
             ("Expliquer en prose les marqueurs qui la justifient et les limites des mesures."),
             "Ne pas exécuter, téléverser, analyser, ou appeler d\u2019outil.",
         ]
     if consultation_type == "suricata_draft":
         return [
-            (
-                "Placer toute règle Suricata proposée, complète, dans un bloc clôturé "
-                "```suricata."
-            ),
+            ("Placer toute règle Suricata proposée, complète, dans un bloc clôturé ```suricata."),
             ("Expliquer en prose les faits réseau qui la justifient et les limites des mesures."),
             (
                 "Ne pas inférer le contenu des paquets, le sens du flux, ni une activité C2 "

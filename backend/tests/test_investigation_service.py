@@ -2294,9 +2294,7 @@ async def test_sample_analysis_reuses_same_versioned_result_across_turns() -> No
             _decision(
                 goal="analyze the quarantined sample", next_action="continue", tools=(first,)
             ),
-            _decision(
-                goal="repeat the same analysis", next_action="continue", tools=(second,)
-            ),
+            _decision(goal="repeat the same analysis", next_action="continue", tools=(second,)),
             _decision(goal="finish", next_action="finish"),
         ],
         tools=(
