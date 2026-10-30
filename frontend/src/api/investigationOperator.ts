@@ -40,7 +40,7 @@ export interface InvestigationActivityInvocation {
   version: number;
   tool_name: string;
   schema_version: string;
-  purpose_excerpt: string;
+  activity_label: string;
   status: ToolInvocationStatus;
   created_at: string;
   updated_at: string;

@@ -18,6 +18,7 @@ from httpx import ASGITransport
 from cti_app.api.investigation import (
     _attach_operator_invocation_costs,
     _operator_bridge_invocation_costs,
+    _operator_invocation_reconciliation_summary,
     router,
 )
 from cti_app.application.bridge_investigator import make_investigation_conversation_id
@@ -176,12 +177,13 @@ class _States:
 class _ConversationTurns:
     def __init__(self) -> None:
         self.row: Any = None
+        self.rows: dict[UUID, Any] = {}
 
     async def get_by_idempotency_key(self, _key: str):
         return self.row
 
-    async def get(self, _turn_id: UUID):
-        return self.row
+    async def get(self, turn_id: UUID):
+        return self.rows.get(turn_id, self.row)
 
 
 class _Envelopes:
@@ -1124,6 +1126,58 @@ def test_operator_status_reconciles_needs_review_even_with_refs_and_links_reserv
     )
 
 
+def test_reconciliation_summary_keeps_older_completed_claim_authoritative() -> None:
+    invocation_id = uuid4()
+    completed_claim = SimpleNamespace(
+        investigation_id=INVESTIGATION_ID,
+        invocation_id=invocation_id,
+        state=SimpleNamespace(value="COMPLETED"),
+        result_ref=None,
+        evidence_refs=(),
+        provider="bridge",
+        model_run_id=None,
+    )
+    not_submitted_claim = SimpleNamespace(
+        investigation_id=INVESTIGATION_ID,
+        invocation_id=invocation_id,
+        state=SimpleNamespace(value="DEFINITIVELY_NOT_SUBMITTED"),
+        result_ref=None,
+        evidence_refs=(),
+        provider="bridge",
+        model_run_id=None,
+    )
+
+    class _ClaimLookup:
+        async def latest_claim_for_invocation(self, _investigation_id, _invocation_id):
+            return not_submitted_claim
+
+        async def claims_for_invocation(self, _investigation_id, _invocation_id):
+            return completed_claim, not_submitted_claim
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(external_effect_coordinator=_ClaimLookup()))
+    )
+    invocation = SimpleNamespace(
+        id=invocation_id,
+        tool_name="advisor.consult",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        version=5,
+        response_refs=(),
+    )
+
+    summary = asyncio.run(
+        _operator_invocation_reconciliation_summary(
+            request=request,
+            uow=SimpleNamespace(),
+            investigation_id=INVESTIGATION_ID,
+            invocation=invocation,
+        )
+    )
+
+    assert summary.external_transport_occurred is True
+    assert summary.next_action["resubmission_allowed"] is False
+
+
 def test_operator_client_recovers_exact_advisor_response_without_resubmitting() -> None:
     invocation_id = uuid4()
     turn_id = uuid4()
@@ -1224,6 +1278,9 @@ def test_operator_client_recovers_exact_advisor_response_without_resubmitting() 
                 model_run_id=model_run_id,
                 state=SimpleNamespace(value="NEEDS_REVIEW"),
             )
+
+        async def advisor_claims_for_invocation(self, investigation_id, requested_id):
+            return (await self.latest_advisor_claim_for_invocation(investigation_id, requested_id),)
 
     client.app.state.external_effect_coordinator = _ClaimLookup()
     path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
@@ -1339,6 +1396,9 @@ def test_operator_reconciliation_keeps_unknown_provider_outcome_in_review(
                 state=SimpleNamespace(value="NEEDS_REVIEW"),
             )
 
+        async def advisor_claims_for_invocation(self, investigation_id, requested_id):
+            return (await self.latest_advisor_claim_for_invocation(investigation_id, requested_id),)
+
     client.app.state.external_effect_coordinator = _ClaimLookup()
     path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
 
@@ -1357,16 +1417,39 @@ def test_operator_reconciliation_keeps_unknown_provider_outcome_in_review(
 
 
 @pytest.mark.parametrize(
-    ("raw_output_chars", "expected_outcome"),
-    [(None, "non_execution_sealed"), (0, "non_execution_sealed"), (12, "needs_review")],
+    ("raw_output_chars", "claim_states", "shared_bridge_attempt", "expected_outcome"),
+    [
+        (None, ("DEFINITIVELY_NOT_SUBMITTED",), False, "non_execution_sealed"),
+        (0, ("DEFINITIVELY_NOT_SUBMITTED",), False, "non_execution_sealed"),
+        (12, ("DEFINITIVELY_NOT_SUBMITTED",), False, "needs_review"),
+        (None, ("COMPLETED", "DEFINITIVELY_NOT_SUBMITTED"), False, "needs_review"),
+        (
+            None,
+            ("DEFINITIVELY_NOT_SUBMITTED", "DEFINITIVELY_NOT_SUBMITTED"),
+            False,
+            "non_execution_sealed",
+        ),
+        (
+            None,
+            ("DEFINITIVELY_NOT_SUBMITTED", "DEFINITIVELY_NOT_SUBMITTED"),
+            True,
+            "non_execution_sealed",
+        ),
+    ],
 )
 def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
-    raw_output_chars: int | None, expected_outcome: str
+    raw_output_chars: int | None,
+    claim_states: tuple[str, ...],
+    shared_bridge_attempt: bool,
+    expected_outcome: str,
 ) -> None:
     invocation_id = uuid4()
-    turn_id = uuid4()
-    model_run_id = uuid4()
-    claim_id = uuid4()
+    turn_ids = tuple(uuid4() for _ in claim_states)
+    model_run_ids = tuple(uuid4() for _ in claim_states)
+    if shared_bridge_attempt:
+        turn_ids = (turn_ids[0],) * len(claim_states)
+        model_run_ids = (model_run_ids[0],) * len(claim_states)
+    claim_ids = tuple(uuid4() for _ in claim_states)
 
     class _OperatorClientIdentity:
         async def current(self):
@@ -1406,22 +1489,23 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
         )
     )
     needs_review = SimpleNamespace(value="needs_review")
-    store.model_runs[model_run_id] = SimpleNamespace(
-        id=model_run_id,
-        status=needs_review,
-        response_id=None,
-        output_references=(),
-        raw_output_reference=None,
-        raw_output_sha256=None,
-        raw_output_chars=raw_output_chars,
-    )
-    store.conversation_turns.row = SimpleNamespace(
-        id=turn_id,
-        model_run_id=model_run_id,
-        conversation_id=make_investigation_conversation_id(INVESTIGATION_ID),
-        status=needs_review,
-        output_blob_reference=None,
-    )
+    for turn_id, model_run_id in zip(turn_ids, model_run_ids, strict=True):
+        store.model_runs[model_run_id] = SimpleNamespace(
+            id=model_run_id,
+            status=needs_review,
+            response_id=None,
+            output_references=(),
+            raw_output_reference=None,
+            raw_output_sha256=None,
+            raw_output_chars=raw_output_chars,
+        )
+        store.conversation_turns.rows[turn_id] = SimpleNamespace(
+            id=turn_id,
+            model_run_id=model_run_id,
+            conversation_id=make_investigation_conversation_id(INVESTIGATION_ID),
+            status=needs_review,
+            output_blob_reference=None,
+        )
     budget = InvestigationBudget(limits={BudgetDimension.BRIDGE_TURNS: 4})
     budget.reserve(operation_key, reserved)
     store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
@@ -1434,18 +1518,28 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
         approval_actor_id="analyst:test",
     )
 
+    claims = [
+        SimpleNamespace(
+            id=claim_id,
+            investigation_id=INVESTIGATION_ID,
+            invocation_id=invocation_id,
+            family="advisor.consult",
+            provider="bridge",
+            bridge_turn_id=turn_id,
+            model_run_id=model_run_id,
+            state=SimpleNamespace(value=claim_state),
+        )
+        for claim_id, turn_id, model_run_id, claim_state in zip(
+            claim_ids, turn_ids, model_run_ids, claim_states, strict=True
+        )
+    ]
+
     class _ClaimLookup:
         async def latest_advisor_claim_for_invocation(self, _investigation_id, _invocation_id):
-            return SimpleNamespace(
-                id=claim_id,
-                investigation_id=INVESTIGATION_ID,
-                invocation_id=invocation_id,
-                family="advisor.consult",
-                provider="bridge",
-                bridge_turn_id=turn_id,
-                model_run_id=model_run_id,
-                state=SimpleNamespace(value="DEFINITIVELY_NOT_SUBMITTED"),
-            )
+            return claims[-1]
+
+        async def advisor_claims_for_invocation(self, _investigation_id, _invocation_id):
+            return tuple(claims)
 
     client.app.state.external_effect_coordinator = _ClaimLookup()
     path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
@@ -1471,6 +1565,9 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
         assert body["next_action"]["follow_up"]["fresh_idempotency_key_required"] is True
         assert body["next_action"]["follow_up"]["expected_sha256_from"] == ("working_state_sha256")
     service = client.app.state.investigation_composition_factory.model_conversations
+    unique_turn_claims = {}
+    for turn_id, claim_id in zip(turn_ids, claim_ids, strict=True):
+        unique_turn_claims.setdefault(turn_id, claim_id)
     expected_seal_calls = (
         [
             (
@@ -1482,6 +1579,7 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
                     "context_subject_id": SUBJECT_ID,
                 },
             )
+            for turn_id, claim_id in unique_turn_claims.items()
         ]
         if expected_outcome == "non_execution_sealed"
         else []
@@ -1496,7 +1594,7 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
     if expected_outcome == "non_execution_sealed":
         assert repeated.status_code == 409
         assert repeated.json()["detail"]["code"] == "stale_invocation_version"
-        assert len(service.seal_calls) == 1
+        assert len(service.seal_calls) == len(unique_turn_claims)
     else:
         assert repeated.status_code == 200
         assert repeated.json()["outcome"] == "needs_review"

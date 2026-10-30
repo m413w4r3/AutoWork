@@ -865,6 +865,15 @@ class ExternalEffectCoordinator:
             return None
         return cast(ExternalEffectClaim | None, await lookup(investigation_id, invocation_id))
 
+    async def advisor_claims_for_invocation(
+        self, investigation_id: UUID, invocation_id: UUID
+    ) -> tuple[ExternalEffectClaim, ...]:
+        """Read every durable Bridge advisor claim for one invocation."""
+        lookup = getattr(self._claim_store, "advisor_claims_for_invocation", None)
+        if not callable(lookup):
+            return ()
+        return cast(tuple[ExternalEffectClaim, ...], await lookup(investigation_id, invocation_id))
+
     async def latest_claim_for_invocation(
         self, investigation_id: UUID, invocation_id: UUID
     ) -> ExternalEffectClaim | None:
@@ -873,6 +882,15 @@ class ExternalEffectCoordinator:
         if not callable(lookup):
             return None
         return cast(ExternalEffectClaim | None, await lookup(investigation_id, invocation_id))
+
+    async def claims_for_invocation(
+        self, investigation_id: UUID, invocation_id: UUID
+    ) -> tuple[ExternalEffectClaim, ...]:
+        """Read every durable effect claim for one invocation."""
+        lookup = getattr(self._claim_store, "claims_for_invocation", None)
+        if not callable(lookup):
+            return ()
+        return cast(tuple[ExternalEffectClaim, ...], await lookup(investigation_id, invocation_id))
 
     async def _handle_existing(
         self,

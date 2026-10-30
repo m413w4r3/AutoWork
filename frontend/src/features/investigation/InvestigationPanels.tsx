@@ -1403,7 +1403,7 @@ export function InvestigationActivityCockpit({
                   </summary>
                   <p>
                     Agent : non identifié · objectif déclaré :{" "}
-                    {invocation.purpose_excerpt || "inconnu"}
+                    {invocation.activity_label || "Opération d’investigation"}
                   </p>
                   <p>
                     Durée d’exécution : inconnue. Aucune mesure fiable n’est
@@ -1628,12 +1628,18 @@ function activityStageFor(
   invocation: InvestigationActivityInvocation,
 ): ActivityStageId | null {
   const tool = invocation.tool_name.toLocaleLowerCase("fr-FR");
-  const purpose = invocation.purpose_excerpt.toLocaleLowerCase("fr-FR");
+  const label = invocation.activity_label.toLocaleLowerCase("fr-FR");
   if (tool === "advisor.consult") {
-    if (purpose.includes("yara") || purpose.includes("règle")) return 4;
-    if (purpose.includes("plan")) return 1;
-    if (purpose.includes("revalid")) return 8;
-    if (purpose.includes("note") || purpose.includes("avis")) return 9;
+    if (label.includes("yara") || label.includes("règle")) return 4;
+    if (label.includes("plan")) return 1;
+    if (label.includes("revalid")) return 8;
+    if (
+      label.includes("note") ||
+      label.includes("avis") ||
+      label.includes("rédaction") ||
+      label.includes("revue de texte")
+    )
+      return 9;
     return null;
   }
   if (tool === "vt.file_report") return 0;
@@ -1669,11 +1675,8 @@ function activityStageFor(
   if (tool.includes("yara") || tool.includes("ruleworkbench")) return 5;
   if (tool === "vt.download_sample" || tool === "sample.set_qualification")
     return 7;
-  if (purpose.includes("revalid")) return 8;
-  if (
-    purpose.includes("analyst note") ||
-    purpose.includes("note de l’analyste")
-  )
+  if (label.includes("revalid")) return 8;
+  if (label.includes("note analyste") || label.includes("avis analyste"))
     return 9;
   return null;
 }

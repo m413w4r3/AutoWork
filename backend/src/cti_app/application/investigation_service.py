@@ -2737,13 +2737,23 @@ class InvestigationService:
                     )
                 )
                 continue
-            if (
-                invocation is not None
-                and invocation.status is ToolInvocationStatus.FAILED
-                and (not external_effect or invocation.response_refs)
-            ):
+            local_partial_retry = proposed.tool_name in {
+                "sample.analyze",
+                "archive.extract_member",
+            }
+            retry_terminal_invocation = invocation is not None and (
+                (
+                    invocation.status is ToolInvocationStatus.FAILED
+                    and (not external_effect or invocation.response_refs)
+                )
+                or (invocation.status is ToolInvocationStatus.PARTIAL and local_partial_retry)
+            )
+            if retry_terminal_invocation:
+                retry_statuses = {ToolInvocationStatus.FAILED}
+                if local_partial_retry:
+                    retry_statuses.add(ToolInvocationStatus.PARTIAL)
                 failed_attempts = sum(
-                    item.status is ToolInvocationStatus.FAILED for item in matching_invocations
+                    item.status in retry_statuses for item in matching_invocations
                 )
                 retry_parent_key = base_operation_key if deduplicate_operation else operation_key
                 operation_key = f"{retry_parent_key}:retry:{failed_attempts}"

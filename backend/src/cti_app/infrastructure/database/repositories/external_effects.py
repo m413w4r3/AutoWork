@@ -309,6 +309,26 @@ class SqlAlchemyExternalEffectClaimStore:
             )
         return _claim_to_domain(row) if row is not None else None
 
+    async def advisor_claims_for_invocation(
+        self, investigation_id: UUID, invocation_id: UUID
+    ) -> tuple[ExternalEffectClaim, ...]:
+        async with self._session_factory() as session:
+            rows = await session.scalars(
+                select(ExternalEffectClaimRow)
+                .where(
+                    ExternalEffectClaimRow.investigation_id == investigation_id,
+                    ExternalEffectClaimRow.invocation_id == invocation_id,
+                    ExternalEffectClaimRow.family == "advisor.consult",
+                    ExternalEffectClaimRow.provider == "bridge",
+                )
+                .order_by(
+                    ExternalEffectClaimRow.created_at.desc(),
+                    ExternalEffectClaimRow.id.desc(),
+                )
+                .execution_options(populate_existing=True)
+            )
+        return tuple(_claim_to_domain(row) for row in rows)
+
     async def latest_claim_for_invocation(
         self, investigation_id: UUID, invocation_id: UUID
     ) -> ExternalEffectClaim | None:
@@ -327,6 +347,24 @@ class SqlAlchemyExternalEffectClaimStore:
                 .execution_options(populate_existing=True)
             )
         return _claim_to_domain(row) if row is not None else None
+
+    async def claims_for_invocation(
+        self, investigation_id: UUID, invocation_id: UUID
+    ) -> tuple[ExternalEffectClaim, ...]:
+        async with self._session_factory() as session:
+            rows = await session.scalars(
+                select(ExternalEffectClaimRow)
+                .where(
+                    ExternalEffectClaimRow.investigation_id == investigation_id,
+                    ExternalEffectClaimRow.invocation_id == invocation_id,
+                )
+                .order_by(
+                    ExternalEffectClaimRow.created_at.desc(),
+                    ExternalEffectClaimRow.id.desc(),
+                )
+                .execution_options(populate_existing=True)
+            )
+        return tuple(_claim_to_domain(row) for row in rows)
 
     async def consume(
         self,

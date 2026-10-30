@@ -880,7 +880,7 @@ class InvestigationActivityInvocationView(BaseModel):
     version: int
     tool_name: str
     schema_version: str
-    purpose_excerpt: str
+    activity_label: str
     status: str
     created_at: datetime
     updated_at: datetime
@@ -1816,25 +1816,25 @@ async def _operator_invocation_reconciliation_summary(
     persisted_response_sha256 = None
     provider_response_id = None
     coordinator = getattr(request.app.state, "external_effect_coordinator", None)
-    claim_lookup = getattr(coordinator, "latest_claim_for_invocation", None)
+    claim_lookup = getattr(coordinator, "claims_for_invocation", None)
     try:
-        claim = (
-            await claim_lookup(investigation_id, invocation.id) if callable(claim_lookup) else None
+        claims = tuple(
+            await claim_lookup(investigation_id, invocation.id) if callable(claim_lookup) else ()
         )
     except Exception:
-        claim = None
-    if (
-        claim is not None
-        and claim.investigation_id == investigation_id
-        and claim.invocation_id == invocation.id
-    ):
+        claims = ()
+    matching_claims = tuple(
+        claim
+        for claim in claims
+        if claim.investigation_id == investigation_id and claim.invocation_id == invocation.id
+    )
+    all_claims_match = bool(claims) and len(matching_claims) == len(claims)
+    claim_states: list[str] = []
+    for claim in matching_claims:
         claim_state = getattr(claim.state, "value", claim.state)
-        persisted_response_available = persisted_response_available or bool(
-            claim.result_ref or claim.evidence_refs
-        )
-        if claim_state == "DEFINITIVELY_NOT_SUBMITTED" and not persisted_response_available:
-            external_transport_occurred = False
-        elif claim_state == "COMPLETED":
+        claim_states.append(claim_state)
+        persisted_response_available = persisted_response_available or bool(claim.result_ref)
+        if claim_state == "COMPLETED":
             external_transport_occurred = True
 
         if claim.provider == "bridge" and claim.model_run_id is not None:
@@ -1845,20 +1845,33 @@ async def _operator_invocation_reconciliation_summary(
             except Exception:
                 run = None
             if run is not None:
-                provider_response_id = getattr(run, "response_id", None)
+                response_id = getattr(run, "response_id", None)
+                if provider_response_id is None and isinstance(response_id, str):
+                    provider_response_id = response_id
                 raw_output_sha256 = getattr(run, "raw_output_sha256", None)
                 has_stored_output = bool(
                     getattr(run, "output_references", ())
                     or getattr(run, "raw_output_reference", None)
                     or raw_output_sha256
-                ) or bool(getattr(run, "raw_output_chars", None))
+                ) or getattr(run, "raw_output_chars", None) not in (None, 0)
                 persisted_response_available = persisted_response_available or has_stored_output
-                if isinstance(raw_output_sha256, str) and re.fullmatch(
-                    r"[0-9a-f]{64}", raw_output_sha256
+                if (
+                    persisted_response_sha256 is None
+                    and isinstance(raw_output_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", raw_output_sha256)
                 ):
                     persisted_response_sha256 = raw_output_sha256
-                if provider_response_id or has_stored_output:
+                if response_id or has_stored_output:
                     external_transport_occurred = True
+    if external_transport_occurred is not True:
+        if (
+            all_claims_match
+            and all(state == "DEFINITIVELY_NOT_SUBMITTED" for state in claim_states)
+            and not persisted_response_available
+        ):
+            external_transport_occurred = False
+        else:
+            external_transport_occurred = None
 
     prefix = f"/api/investigations/{investigation_id}"
     advisor_action = invocation.tool_name == "advisor.consult"
@@ -4475,90 +4488,138 @@ async def reconcile_operator_advisor_invocation(
             raise _http_error(422, "provider_reconciliation_unsupported")
 
         coordinator = getattr(request.app.state, "external_effect_coordinator", None)
-        claim_lookup = getattr(coordinator, "latest_advisor_claim_for_invocation", None)
+        claim_lookup = getattr(coordinator, "advisor_claims_for_invocation", None)
         if not callable(claim_lookup):
             return _operator_advisor_reconciliation_pending(invocation, None)
-        claim = await claim_lookup(investigation_id, invocation_id)
-        if (
-            claim is None
-            or claim.investigation_id != investigation_id
+        try:
+            claims = tuple(await claim_lookup(investigation_id, invocation_id))
+        except Exception:
+            return _operator_advisor_reconciliation_pending(invocation, None)
+        if not claims or any(
+            claim.investigation_id != investigation_id
             or claim.invocation_id != invocation_id
             or claim.family != "advisor.consult"
             or claim.provider != "bridge"
             or claim.bridge_turn_id is None
             or claim.model_run_id is None
+            for claim in claims
         ):
             return _operator_advisor_reconciliation_pending(invocation, None)
-        run = await uow.model_runs.get(claim.model_run_id)
-        turn = await uow.model_conversation_turns.get(claim.bridge_turn_id)
-        if (
-            run is None
-            or turn is None
-            or turn.model_run_id != run.id
-            or turn.conversation_id != make_investigation_conversation_id(investigation_id)
-        ):
-            return _operator_advisor_reconciliation_pending(invocation, None)
-        claim_status = getattr(claim.state, "value", claim.state)
-        provider_response_id = run.response_id
-        raw_output_sha256 = getattr(run, "raw_output_sha256", None)
-        stored_response_sha256 = (
-            raw_output_sha256
-            if isinstance(raw_output_sha256, str)
-            and re.fullmatch(r"[0-9a-f]{64}", raw_output_sha256)
-            else None
+
+        claim_contexts: list[tuple[Any, Any, Any, str]] = []
+        provider_response_id = None
+        stored_response_sha256 = None
+        has_stored_output = False
+        for claim in claims:
+            run = await uow.model_runs.get(claim.model_run_id)
+            turn = await uow.model_conversation_turns.get(claim.bridge_turn_id)
+            if (
+                run is None
+                or turn is None
+                or turn.model_run_id != run.id
+                or turn.conversation_id != make_investigation_conversation_id(investigation_id)
+            ):
+                return _operator_advisor_reconciliation_pending(invocation, None)
+            claim_status = getattr(claim.state, "value", claim.state)
+            response_id = getattr(run, "response_id", None)
+            if provider_response_id is None and isinstance(response_id, str):
+                provider_response_id = response_id
+            raw_output_sha256 = getattr(run, "raw_output_sha256", None)
+            if (
+                stored_response_sha256 is None
+                and isinstance(raw_output_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", raw_output_sha256)
+            ):
+                stored_response_sha256 = raw_output_sha256
+            raw_output_chars = getattr(run, "raw_output_chars", None)
+            claim_has_output = bool(
+                getattr(turn, "output_blob_reference", None)
+                or getattr(run, "output_references", ())
+                or getattr(run, "raw_output_reference", None)
+                or getattr(run, "raw_output_sha256", None)
+            ) or (raw_output_chars is not None and raw_output_chars != 0)
+            has_stored_output = has_stored_output or claim_has_output
+            claim_contexts.append((claim, run, turn, claim_status))
+
+        has_claim_result = any(getattr(claim, "result_ref", None) for claim in claims)
+        persisted_response_available = (
+            bool(invocation.response_refs)
+            or has_stored_output
+            or bool(provider_response_id)
+            or has_claim_result
         )
-        raw_output_chars = getattr(run, "raw_output_chars", None)
-        has_stored_output = bool(
-            getattr(turn, "output_blob_reference", None)
-            or getattr(run, "output_references", ())
-            or getattr(run, "raw_output_reference", None)
-            or getattr(run, "raw_output_sha256", None)
-        ) or (raw_output_chars is not None and raw_output_chars != 0)
-        proof_claim_id = (
-            claim.id
-            if claim_status == "DEFINITIVELY_NOT_SUBMITTED"
-            and not provider_response_id
+        all_claims_prove_non_execution = (
+            all(
+                claim_status == "DEFINITIVELY_NOT_SUBMITTED"
+                for _, _, _, claim_status in claim_contexts
+            )
             and not has_stored_output
-            else None
+            and not provider_response_id
+            and not invocation.response_refs
+            and not has_claim_result
         )
         conversation_service = getattr(_composition_factory(request), "model_conversations", None)
         if conversation_service is None:
             raise _http_error(503, "operator_reconciliation_unavailable")
-
-        run_status = getattr(run.status, "value", run.status)
-        turn_status = getattr(turn.status, "value", turn.status)
-        already_adopted = run_status == "succeeded" and turn_status == "succeeded"
-        if (
-            proof_claim_id is None
-            and not already_adopted
-            and (
+        context_subject_id = investigation.subject_id
+        proof_claims: tuple[Any, ...] = ()
+        if all_claims_prove_non_execution:
+            claims_by_bridge_attempt: dict[tuple[UUID, UUID], Any] = {}
+            for claim in claims:
+                claims_by_bridge_attempt.setdefault(
+                    (claim.bridge_turn_id, claim.model_run_id), claim
+                )
+            proof_claims = tuple(claims_by_bridge_attempt.values())
+        if not proof_claims:
+            response_context = next(
+                (item for item in claim_contexts if getattr(item[1], "response_id", None)),
+                None,
+            )
+            if response_context is None:
+                completed_claim_exists = any(
+                    claim_status == "COMPLETED" for _, _, _, claim_status in claim_contexts
+                )
+                return _operator_advisor_reconciliation_pending(
+                    invocation,
+                    provider_response_id,
+                    response_sha256=stored_response_sha256,
+                    persisted_response_available=persisted_response_available,
+                    external_transport_occurred=(
+                        True if completed_claim_exists or has_stored_output else None
+                    ),
+                )
+            claim, run, turn, claim_status = response_context
+            run_status = getattr(run.status, "value", run.status)
+            turn_status = getattr(turn.status, "value", turn.status)
+            already_adopted = run_status == "succeeded" and turn_status == "succeeded"
+            if not already_adopted and (
                 run_status != "needs_review"
                 or turn_status != "needs_review"
                 or claim_status != "NEEDS_REVIEW"
-            )
-        ):
-            return _operator_advisor_reconciliation_pending(
-                invocation,
-                provider_response_id,
-                response_sha256=stored_response_sha256,
-                persisted_response_available=has_stored_output or bool(provider_response_id),
-            )
-        context_subject_id = investigation.subject_id
+            ):
+                return _operator_advisor_reconciliation_pending(
+                    invocation,
+                    provider_response_id,
+                    response_sha256=stored_response_sha256,
+                    persisted_response_available=persisted_response_available,
+                    external_transport_occurred=True,
+                )
 
-    if proof_claim_id is not None:
+    if proof_claims:
         seal = getattr(conversation_service, "seal_verified_pre_submission", None)
         if not callable(seal):
             return _operator_advisor_reconciliation_pending(
                 invocation, None, external_transport_occurred=False
             )
         try:
-            await seal(
-                make_investigation_conversation_id(investigation_id),
-                claim.bridge_turn_id,
-                claim_id=proof_claim_id,
-                actor_id=identity.actor_id,
-                context_subject_id=context_subject_id,
-            )
+            for claim in proof_claims:
+                await seal(
+                    make_investigation_conversation_id(investigation_id),
+                    claim.bridge_turn_id,
+                    claim_id=claim.id,
+                    actor_id=identity.actor_id,
+                    context_subject_id=context_subject_id,
+                )
         except ModelConversationReconciliationError:
             return _operator_advisor_reconciliation_pending(
                 invocation, None, external_transport_occurred=False
@@ -4643,7 +4704,7 @@ async def reconcile_operator_advisor_invocation(
                 invocation,
                 provider_response_id,
                 response_sha256=stored_response_sha256,
-                persisted_response_available=has_stored_output or bool(provider_response_id),
+                persisted_response_available=persisted_response_available,
             )
         try:
             snapshot = await _composition_factory(request).article_snapshots.resolve(
@@ -4654,14 +4715,14 @@ async def reconcile_operator_advisor_invocation(
                 invocation,
                 provider_response_id,
                 response_sha256=stored_response_sha256,
-                persisted_response_available=has_stored_output or bool(provider_response_id),
+                persisted_response_available=persisted_response_available,
             )
         if not InvestigationService.bridge_disclosure_allowed(snapshot, envelope):
             return _operator_advisor_reconciliation_pending(
                 invocation,
                 provider_response_id,
                 response_sha256=stored_response_sha256,
-                persisted_response_available=has_stored_output or bool(provider_response_id),
+                persisted_response_available=persisted_response_available,
             )
 
     if not isinstance(provider_response_id, str) or not provider_response_id:
@@ -4669,7 +4730,7 @@ async def reconcile_operator_advisor_invocation(
             invocation,
             None,
             response_sha256=stored_response_sha256,
-            persisted_response_available=has_stored_output,
+            persisted_response_available=persisted_response_available,
         )
 
     try:
@@ -4693,7 +4754,7 @@ async def reconcile_operator_advisor_invocation(
                     invocation,
                     provider_response_id,
                     response_sha256=stored_response_sha256,
-                    persisted_response_available=has_stored_output or bool(provider_response_id),
+                    persisted_response_available=persisted_response_available,
                 )
             response_text = content.output_text
             response_sha256 = run.raw_output_sha256
@@ -4766,7 +4827,7 @@ async def reconcile_operator_advisor_invocation(
             invocation,
             provider_response_id,
             response_sha256=stored_response_sha256,
-            persisted_response_available=has_stored_output or bool(provider_response_id),
+            persisted_response_available=persisted_response_available,
         )
 
     return OperatorAdvisorReconciliationResponse(

@@ -93,7 +93,7 @@ describe("InvestigationActivityCockpit", () => {
           version: 2,
           tool_name: "sample.analyze",
           schema_version: "sample-analysis.v1",
-          purpose_excerpt: "Analyser un échantillon",
+          activity_label: "Analyse locale · sample.analyze",
           status: "succeeded",
           created_at: "2026-10-30T11:00:00Z",
           updated_at: "2026-10-30T11:01:00Z",

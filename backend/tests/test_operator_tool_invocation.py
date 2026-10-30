@@ -1853,6 +1853,77 @@ async def test_fresh_passive_read_settles_uncertain_reservation_before_retry(
 
 
 @pytest.mark.asyncio
+async def test_stale_passive_read_retry_leaves_prior_reservation_and_invocation_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture, state, service = await _fixture()
+    old_key = "stale-orphaned-passive-read"
+    arguments = {"query": "hash"}
+    purpose = "recover an interrupted passive read"
+    payload = canonical_json_bytes(
+        {
+            "tool_name": "vt.file_report",
+            "schema_version": "1",
+            "arguments": arguments,
+            "purpose": purpose,
+            "expected_version": state.version,
+        }
+    )
+    key_digest = hashlib.sha256(f"{fixture.investigation_id}\0{old_key}".encode()).hexdigest()
+    operation_key = f"operator:{key_digest}:{hashlib.sha256(payload).hexdigest()}"
+    reserved = {
+        BudgetDimension.VT_UNITS: 2,
+        BudgetDimension.TOOL_SECONDS: 30,
+    }
+    old_invocation = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key=operation_key,
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters=arguments,
+        purpose=purpose,
+        reserved_budget=reserved,
+    ).transition(ToolInvocationStatus.NEEDS_REVIEW)
+    await fixture.invocations.add_if_absent(old_invocation)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+    monkeypatch.setattr(
+        operator_tool_invocation,
+        "is_trusted_vt_passive_read_adapter",
+        lambda _name, _adapter: True,
+    )
+
+    with pytest.raises(OperatorToolInvocationError) as stale:
+        await service.invoke(
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments=arguments,
+            purpose=purpose,
+            expected_version=state.version + 1,
+            expected_sha256=state.sha256,
+            idempotency_key="fresh-after-stale-passive-read",
+        )
+
+    latest = await fixture.invocations.get(old_invocation.id)
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert stale.value.code == "stale_working_state"
+    assert latest is not None and latest_envelope is not None
+    assert latest.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert latest.consumed_budget == {}
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status.value == "reserved"
+    assert reservation.committed_amounts == {}
+    assert fixture.tools["vt.file_report"].calls == []
+    assert len(await fixture.invocations.list_for_investigation(fixture.investigation_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() -> None:
     fixture, state, _ = await _fixture()
     idempotency_key = "legacy-invalid-advisor-input"
@@ -2556,6 +2627,9 @@ async def test_reconciliation_summary_reports_proven_non_submission() -> None:
                 provider="vt",
                 model_run_id=None,
             )
+
+        async def claims_for_invocation(self, investigation_id, invocation_id):
+            return (await self.latest_claim_for_invocation(investigation_id, invocation_id),)
 
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(external_effect_coordinator=_Coordinator()))
