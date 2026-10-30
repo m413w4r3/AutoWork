@@ -259,6 +259,30 @@ async def test_legacy_v3_reparse_returns_full_advisory_text_without_new_observat
 
 
 @pytest.mark.asyncio
+async def test_parser_version_mismatch_still_returns_archived_advisory_text() -> None:
+    raw = "Ancien conseil Bridge en prose, à vérifier par l'analyste.\n"
+    tool, recorder, original, context, output_sha256, _store, _raw_blob_id = _harness(raw)
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.error_code is None
+    assert result.output["status"] == "raw_advisory_text_available"
+    assert result.output["advisory_text"].endswith(raw)
+    assert result.output["raw_output_sha256"] == output_sha256
+    assert result.output["usable"] is True
+    assert result.output["canonical_promotion"] is False
+    assert result.output["new_observation_written"] is False
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
 async def test_explicit_v4_reparse_appends_verified_parse_without_bridge_or_egress(
     monkeypatch,
 ) -> None:

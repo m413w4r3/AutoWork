@@ -212,7 +212,6 @@ def parse_typed_advisor_response(
     return _classify_advisor_warnings(result)
 
 
-_MAX_HEURISTIC_REVIEW_TEXT_CHARS = 4000
 _REVIEW_TEXT_KEYS = frozenset(
     {
         "analysis",
@@ -420,7 +419,7 @@ def _normalize_heuristic_draft(
         for value in text_values:
             if not _review_text_is_useful(value):
                 continue
-            cleaned = safe_text(value, _MAX_HEURISTIC_REVIEW_TEXT_CHARS + 1)
+            cleaned = safe_text(value, len(value) + 1)
             if _review_text_is_useful(cleaned):
                 sentences.append({"text": _bound_review_remark(cleaned), "assertion_ids": []})
         if not sentences:
@@ -455,7 +454,7 @@ def _normalize_heuristic_draft(
         }
     if overall_text is None or not _review_text_is_useful(overall_text):
         return None
-    overall_text = safe_text(overall_text, _MAX_HEURISTIC_REVIEW_TEXT_CHARS + 1)
+    overall_text = safe_text(overall_text, len(overall_text) + 1)
     if not _review_text_is_useful(overall_text):
         return None
     return {
@@ -671,10 +670,7 @@ def _review_text_is_useful(value: str) -> bool:
 
 
 def _bound_review_remark(value: str) -> str:
-    text = value.strip()
-    if len(text) <= _MAX_HEURISTIC_REVIEW_TEXT_CHARS:
-        return text
-    return text[: _MAX_HEURISTIC_REVIEW_TEXT_CHARS - 1].rstrip() + "…"
+    return value.strip()
 
 
 def _unusable_review_result(_raw: str) -> dict[str, Any]:

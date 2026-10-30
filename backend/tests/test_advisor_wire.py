@@ -81,6 +81,36 @@ def test_wire_dossier_renders_relevant_measurement_with_byte_provenance() -> Non
     assert "1" * 64 not in rendered
 
 
+def test_advisor_dossier_preserves_large_authorized_evidence_without_a_size_cap() -> None:
+    excerpt = ("Canonical static analysis marker with complete source text.\n" * 40_000) + (
+        "FINAL-SOURCE-MARKER"
+    )
+    prompt_data = {
+        "consultation_type": "plan_investigation",
+        "question": "Review the canonical static analysis marker.",
+        "transmitted_refs": [
+            {"kind": "observation", "id": "observation-large", "sha256": "a" * 64}
+        ],
+        "evidence": [
+            {
+                "evidence_id": "observation-large",
+                "sha256": "a" * 64,
+                "source": "static-analysis",
+                "content_excerpts": [
+                    {"kind": "text", "title": "Complete tool output", "text": excerpt}
+                ],
+            }
+        ],
+    }
+
+    dossier = build_advisor_dossier(prompt_data)
+
+    assert len(excerpt.encode("utf-8")) > 1_000_000
+    assert dossier.byte_size > 1_000_000
+    assert dossier.text.count("Canonical static analysis marker") == 40_000
+    assert dossier.text.rsplit("\n", 1)[-1].endswith("FINAL-SOURCE-MARKER")
+
+
 def test_content_excerpt_extraction_keeps_whole_methods_decoded_values_and_offset_hex() -> None:
     method = "private void MapImage(byte[] image) {\n    MapSections(image);\n}"
     excerpts = extract_content_excerpts(
@@ -1484,6 +1514,35 @@ def test_review_text_preserves_complete_prose_above_legacy_64k_cap() -> None:
     assert parsed["raw_output_bytes"] == len(raw.encode("utf-8"))
     assert parsed["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
     assert parsed["raw_output_truncated"] is False
+
+
+def test_heuristic_review_keeps_complete_unit_advice_above_legacy_remark_cap() -> None:
+    advice = "Clarifier la portée du constat et conserver sa réserve probatoire. " * 100
+    raw = f"U1: {advice}"
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["reviews"][0]["remarks"] == [advice.strip()]
+
+
+def test_heuristic_draft_keeps_complete_unit_text_above_legacy_remark_cap() -> None:
+    draft = "Les observations indiquent une séquence cohérente à confirmer. " * 100
+    parsed = parse_typed_advisor_response(
+        f"U1: {draft}",
+        consultation_type="draft_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["blocks"][0]["sentences"][0]["text"] == draft.strip()
 
 
 def test_review_text_keeps_advice_while_redacting_operational_secret_fields() -> None:

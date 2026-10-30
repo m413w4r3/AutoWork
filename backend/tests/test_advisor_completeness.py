@@ -75,13 +75,15 @@ def test_advisor_prompt_uses_free_prose_and_never_requires_wire_format(
 ) -> None:
     prompt = render_advisor_prompt(consultation_type, {"question": "Examiner les faits transmis."})
 
-    assert "JSON" not in prompt
+    assert "json" not in prompt.casefold()
     assert "advisor-wire.v1" not in prompt
     assert "prose libre" in prompt
     if consultation_type == "yara_draft":
-        assert "```yara facultatif" in prompt
+        assert "```yara" in prompt
+        assert "toute règle YARA proposée, complète" in prompt
     if consultation_type == "suricata_draft":
-        assert "```suricata facultatif" in prompt
+        assert "```suricata" in prompt
+        assert "toute règle Suricata proposée, complète" in prompt
     if consultation_type == "figure_plan":
         assert "```figure facultatif" in prompt
 
@@ -200,6 +202,65 @@ def test_figure_plan_still_requires_a_sha_verified_canonical_proof() -> None:
 
     assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
     assert any(item["ref"] == "question-proof" for item in preflight["missing_refs"])
+
+
+def test_yara_draft_accepts_a_canonical_static_observation_without_measurement() -> None:
+    observation_id = "static-observation-1"
+    question = "Draft a YARA rule using the observed CreateMutexW static string."
+    data = _planning_data(
+        question=question,
+        evidence=[
+            {
+                "evidence_id": observation_id,
+                "sha256": "c" * 64,
+                "source": "static-analysis",
+                "object_type": "sample_obfuscated_strings",
+                "blob_read_verified": True,
+                "content_excerpts": [
+                    {
+                        "kind": "text",
+                        "title": "Static strings",
+                        "text": "CreateMutexW appears at offset 128 in the verified string table.",
+                    }
+                ],
+            }
+        ],
+        findings=[],
+    )
+    data["consultation_type"] = "yara_draft"
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "READY"
+    assert not any(
+        item["kind"] == "measurement" and item["id"] == "verified-measurement"
+        for item in preflight["items"]
+    )
+    assert any(
+        item["kind"] == "observation"
+        and item["id"] == observation_id
+        and item["sha256"] == "c" * 64
+        for item in dossier.manifest
+    )
+
+
+def test_yara_draft_without_canonical_evidence_has_an_actionable_preflight_cause() -> None:
+    data = _planning_data(
+        question="Draft a YARA rule for the investigation.", evidence=[], findings=[]
+    )
+    data["consultation_type"] = "yara_draft"
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
+    missing = next(item for item in preflight["missing_refs"] if item["ref"] == "question-proof")
+    assert "static-analysis observation" in missing["reason"]
+    assert "SHA-256" in missing["reason"]
+    assert not any(item["ref"] == "verified-measurement" for item in preflight["missing_refs"])
+    assert "identifiant" in preflight["next_action"]
+    assert "offsets d'échantillon vérifiés" in preflight["next_action"]
 
 
 def test_contradiction_assertion_with_a_cited_finding_is_informational_not_blocking() -> None:

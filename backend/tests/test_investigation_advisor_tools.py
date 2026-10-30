@@ -931,6 +931,7 @@ async def test_args_hint_contract_is_bounded_and_normalization_is_recorded(
     prompt = transport.calls[0]["prompt"]
     assert "advisor-wire.v1" not in prompt
     assert "JSON" not in prompt
+    assert "json" not in prompt.casefold()
     assert "prose libre" in prompt
     assert "FAITS TRANSMIS" in prompt
     assert "required_arguments" not in prompt
@@ -1230,6 +1231,7 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     prompt = transport.calls[0]["prompt"]
     assert "The first canonical passage describes the measured mutex marker." in prompt
     assert "The second canonical passage records the associated loader behavior." in prompt
+    assert "bloc clôturé ```yara" in prompt
     assert f"blob_id={sample_blob_id}" in prompt
     assert f"sha256={sample_sha256}" in prompt
     prompt_payload = typed_prompt_payload(prompt)
@@ -3906,6 +3908,50 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
     )
     assert "REQUIRED" not in {row["status"] for row in omitted["statuses"]}
     assert "INTENTIONALLY_OMITTED" in {row["status"] for row in omitted["statuses"]}
+
+
+@pytest.mark.asyncio
+async def test_yara_draft_uses_canonical_static_observation_without_sample_association() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "e" * 64,
+            "strings": [{"value": "StaticOnlyMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Rule idea: match StaticOnlyMarker, then validate the candidate locally.",
+            bridge_invocation_id=str(uuid4()),
+        )
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Draft a rule from the StaticOnlyMarker static observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:yara-static-only"),
+    )
+
+    assert result.output["preflight_status"] == "READY"
+    assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert len(transport.calls) == 1
+    assert "StaticOnlyMarker" in transport.calls[0]["prompt"]
+    assert not any(
+        item["kind"] == "measurement" and item["id"] == "verified-measurement"
+        for item in result.output["bridge_provenance"]["completeness_manifest"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -7443,11 +7489,77 @@ LIMITATION: none
 
     assert result.status is ToolInvocationStatus.NEEDS_REVIEW
     assert result.output["advisor_status"] == "needs_review"
+    assert result.output["response_state"] == "submission_ambiguous"
+    assert result.output["response_received"] is True
     assert result.framework_pre_submission_proof is None
     assert "blocks" not in result.output
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
     assert len(transport.calls) == 1
+    assert result.output["response_bytes"] == len(raw.encode("utf-8"))
+    assert result.output["output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    archived_output_id = UUID(result.output["output_blob_id"])
+    assert tool._artifact_store.values[archived_output_id] == raw.encode("utf-8")
+    archived_call = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult" and item.object_type == "advisor_call"
+    )
+    archived_call_payload = json.loads(
+        await tool._artifact_store.read_bytes(archived_call.blob_id, max_bytes=1_000_000)
+    )
+    assert archived_call_payload["output_blob_id"] == str(archived_output_id)
+    assert archived_call_payload["output_sha256"] == result.output["output_sha256"]
+
+
+def test_partial_bridge_response_returns_and_consumes_each_usable_unit() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+    )
+    raw = """advisor-wire.v1
+TYPE: review_text
+STATUS: partial
+UNIT: U13
+REMARK: Séparer le constat observé de son interprétation.
+UNIT: U15
+REMARK: Préciser la limite de portée de cette preuve.
+"""
+    submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=raw,
+        bridge_invocation_id=str(uuid4()),
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic partial review prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=256,
+        consultation_type="review_text",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={
+            "units": [
+                {"unit_id": "U13", "block_type": "key_findings"},
+                {"unit_id": "U15", "block_type": "claim_verification"},
+                {"unit_id": "U17", "block_type": "uncertainties_and_next_leads"},
+            ]
+        },
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["response_received"] is True
+    assert result.output["advisor_status"] == "partial"
+    assert result.output["usable"] is True
+    assert [item["unit_id"] for item in result.output["reviews"]] == ["U13", "U15"]
+    assert all(item["usable"] for item in result.output["reviews"])
+    assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert result.output["bridge_turns_consumed"] == 1
 
 
 def test_yara_v3_preserves_complete_rule_over_summary_limit_and_checks_measurement_refs() -> None:
@@ -7648,10 +7760,52 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
     )
     assert result.output["bridge_turns_consumed"] == 0
     assert result.output["usable"] is False
+    assert result.output["response_state"] == "pre_send_failure"
+    assert result.output["response_received"] is False
     assert (
         result.framework_pre_submission_proof
         is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
     )
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_identical_preflight_refusal_short_circuits_but_new_question_runs_again() -> None:
+    investigation_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article_passages = ()
+    snapshot.article = SimpleNamespace(short_summary="", open_questions=())
+    tool._article_snapshots.resolve = async_get(snapshot)
+    artifact_store = tool._artifact_store
+    original_put = artifact_store.put_canonical_json
+    persisted_refusals = 0
+
+    async def count_put(*args, **kwargs):
+        nonlocal persisted_refusals
+        persisted_refusals += 1
+        return await original_put(*args, **kwargs)
+
+    artifact_store.put_canonical_json = count_put
+    arguments = {
+        "consultation_type": "yara_draft",
+        "question": "Draft a YARA rule from the available canonical evidence.",
+    }
+
+    first = await tool.execute(arguments, make_context(investigation_id, key="advisor:first"))
+    repeated = await tool.execute(arguments, make_context(investigation_id, key="advisor:repeat"))
+    changed = await tool.execute(
+        {**arguments, "question": "Test a new YARA hypothesis against canonical evidence."},
+        make_context(investigation_id, key="advisor:new-hypothesis"),
+    )
+
+    assert first.output["preflight_status"] == "INSUFFICIENT_EVIDENCE"
+    assert repeated.output["repeat_refusal_short_circuited"] is True
+    assert repeated.output["preflight_cause"] == first.output["preflight_cause"]
+    assert repeated.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    assert "repeat_refusal_short_circuited" not in changed.output
+    assert persisted_refusals == 2
     assert transport.calls == []
 
 
