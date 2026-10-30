@@ -108,7 +108,10 @@ def _advisor_task_description(consultation_type: str) -> str:
         "plan_investigation": "Proposer les vérifications qui départagent les hypothèses citées.",
         "pivot_strategy": "Comparer des pivots observables et préciser le signal attendu.",
         "yara_draft": "Produire une règle YARA fondée sur les mesures transmises.",
-        "review_text": "Relire uniquement le texte cible et formuler des remarques vérifiables.",
+        "review_text": (
+            "Relire les claims ou le texte cible présent dans le dossier et formuler des "
+            "remarques vérifiables."
+        ),
         "draft_text": "Rédiger le texte cible à partir des assertions et faits transmis.",
         "suricata_draft": "Produire une règle Suricata fondée sur les faits réseau transmis.",
         "figure_plan": "Décrire un plan de figure dont chaque relation est étayée.",
@@ -133,16 +136,25 @@ def _humanize_advisor_label(value: object) -> str:
     return localized.get(label, value.strip())
 
 
-def _advisor_free_prose_guidance(
-    consultation_type: str, data: Mapping[str, Any]
-) -> list[str]:
+def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]) -> list[str]:
     if consultation_type == "review_text":
-        return [
-            (
+        if data.get("units") or isinstance(data.get("review_text"), Mapping):
+            target_guidance = (
                 "Relire le texte fourni et donner des remarques précises, en indiquant les "
                 "passages concernés quand ils sont identifiables."
+            )
+        else:
+            target_guidance = (
+                "Examiner les claims d\u2019article et les observations présentes dans le dossier; "
+                "indiquer ce qui peut être vérifié et ce qui reste à examiner."
+            )
+        return [
+            target_guidance,
+            (
+                "Ne pas réécrire ni approuver le texte canonique."
+                if data.get("units") or isinstance(data.get("review_text"), Mapping)
+                else "Ne pas réécrire ni approuver un objet canonique."
             ),
-            "Ne pas réécrire ni approuver le texte canonique.",
             (
                 "Séparer les faits vérifiables des interprétations et signaler les limites "
                 "qui changent la conclusion."
@@ -153,25 +165,30 @@ def _advisor_free_prose_guidance(
         guidance = [
             "Rédiger un brouillon lisible à partir des éléments présents.",
             "Conserver les références de preuve disponibles à côté des affirmations concernées.",
-            "Ce brouillon est consultatif et ne modifie aucune version d’avis canonique.",
+            "Ce brouillon est consultatif et ne modifie aucune version d\u2019avis canonique.",
         ]
         if not isinstance(assertions, (list, tuple)) or not assertions:
-            guidance.append("Signaler explicitement : liens de preuve absents.")
+            guidance.append(
+                "Aucune assertion cible n\u2019a été fournie; rédiger à partir du dossier et citer "
+                "les références disponibles quand elles étayent le texte."
+            )
         return guidance
     if consultation_type == "yara_draft":
         return [
-            "Si une règle YARA est proposée, placer son texte complet dans un bloc ```yara facultatif.",
             (
-                "Expliquer en prose les marqueurs qui la justifient et les limites des mesures."
+                "Si une règle YARA est proposée, placer son texte complet dans un bloc "
+                "```yara facultatif."
             ),
+            ("Expliquer en prose les marqueurs qui la justifient et les limites des mesures."),
             "Ne pas exécuter, téléverser, analyser, ou appeler d\u2019outil.",
         ]
     if consultation_type == "suricata_draft":
         return [
-            "Si une règle Suricata est proposée, placer son texte complet dans un bloc ```suricata facultatif.",
             (
-                "Expliquer en prose les faits réseau qui la justifient et les limites des mesures."
+                "Si une règle Suricata est proposée, placer son texte complet dans un bloc "
+                "```suricata facultatif."
             ),
+            ("Expliquer en prose les faits réseau qui la justifient et les limites des mesures."),
             (
                 "Ne pas inférer le contenu des paquets, le sens du flux, ni une activité C2 "
                 "non observée."
@@ -181,7 +198,7 @@ def _advisor_free_prose_guidance(
         return [
             (
                 "Décrire en prose la figure souhaitée et les éléments que chaque preuve "
-                "permet d’étayer. Un schéma de figure structuré peut être fourni dans un "
+                "permet d\u2019étayer. Un schéma de figure structuré peut être fourni dans un "
                 "bloc ```figure facultatif."
             ),
             (
@@ -190,12 +207,13 @@ def _advisor_free_prose_guidance(
             ),
         ]
     return [
-        "Présenter les constats et recommandations en prose claire, avec leurs références si disponibles.",
         (
-            "Ne recommander un outil que s’il est explicitement nommé dans la tâche; "
+            "Présenter les constats et recommandations en prose claire, avec leurs références "
+            "si disponibles."
+        ),
+        (
+            "Ne recommander un outil que s\u2019il est explicitement nommé dans la tâche; "
             "ne pas inventer de nom ni de version."
         ),
-        (
-            "Distinguer observation, interprétation et hypothèse; signaler les lacunes utiles."
-        ),
+        ("Distinguer observation, interprétation et hypothèse; signaler les lacunes utiles."),
     ]

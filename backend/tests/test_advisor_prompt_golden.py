@@ -1,5 +1,3 @@
-# ruff: noqa: E501, RUF001
-
 from __future__ import annotations
 
 import ast
@@ -277,8 +275,8 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
             1233,
         ),
         "restricted_projection": (
-            "a8ded1d21a1dac8c2f4a427f3a55744792f25e636f1de4db642d28373d85f9ed",
-            1133,
+            "2b8a4c57dd1b73e05917c401f60fa54d5b5646f793902892baa72112074a8d6d",
+            1154,
         ),
         "preflight_refusal": (
             "5672507d08a4a04a3d8c5d3123e6e22e18f5caf105b87e408dd8cb347bdfec2d",

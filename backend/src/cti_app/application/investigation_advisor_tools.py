@@ -114,9 +114,7 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_TOOL_SECONDS = 3_600
-# Verify each complete quarantine blob, then include at most this many prefix bytes.
-# The dossier records any omitted range explicitly.
-MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES = 4_096
+# Verify each complete quarantine blob; there is no sample-fragment byte cap.
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
 # the archive timeout and the 35s advisor preparation/scheduling margin. This
@@ -264,14 +262,20 @@ class InvestigationAdvisorTool:
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
             if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return no_context_cost
-            evidence = await self._load_cited_evidence(context, evidence_refs)
-            if not evidence_refs and consultation_type not in {
-                "review_text",
-                "draft_text",
-                "figure_plan",
-                "suricata_draft",
-            }:
-                evidence = await self._auto_evidence(context.investigation_id)
+            explicit_evidence = await self._load_cited_evidence(context, evidence_refs)
+            auto_evidence = await self._auto_evidence(context.investigation_id)
+            evidence_by_id = {item.id: item for item in (*explicit_evidence, *auto_evidence)}
+            evidence = tuple(evidence_by_id.values())
+            sample_sha256 = arguments.get("sample_sha256")
+            if isinstance(sample_sha256, str) and sample_sha256:
+                prioritized = []
+                remaining = []
+                for item in evidence:
+                    if await self._observation_references_sample(item, sample_sha256):
+                        prioritized.append(item)
+                    else:
+                        remaining.append(item)
+                evidence = tuple((*prioritized, *remaining))
             if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
                 raw_finding_refs = arguments.get("finding_refs", ())
                 if consultation_type == "figure_plan" and not isinstance(
@@ -306,10 +310,23 @@ class InvestigationAdvisorTool:
             restricted_sample_hashes = await self._restricted_sample_hashes(
                 context.investigation_id, investigation.subject_id, context.envelope
             )
+            protected_refs = set(evidence_refs)
+            if consultation_type == "figure_plan" and requested_ids:
+                protected_refs.update(
+                    ref
+                    for finding in findings
+                    if finding.id in requested_ids
+                    for ref in finding.observation_refs
+                )
+            restricted_ids = set()
             for item in evidence:
                 for sample_hash in restricted_sample_hashes:
                     if await self._observation_references_sample(item, sample_hash):
-                        return no_context_cost
+                        restricted_ids.add(item.id)
+                        break
+            if restricted_ids.intersection(protected_refs):
+                return no_context_cost
+            evidence = tuple(item for item in evidence if item.id not in restricted_ids)
             prompt_data = await self._consultation_data(
                 consultation_type=consultation_type,
                 investigation_id=context.investigation_id,
@@ -391,6 +408,12 @@ class InvestigationAdvisorTool:
             raw_refs = arguments.get("evidence_refs", ())
             if not isinstance(raw_refs, (tuple, list)):
                 raise _AdvisorInputValidationError("evidence_refs_invalid")
+            sample_sha256 = arguments.get("sample_sha256")
+            if sample_sha256 is not None and (
+                not isinstance(sample_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", sample_sha256) is None
+            ):
+                raise _AdvisorInputValidationError("sample_hash_invalid")
             parsed_refs: list[UUID] = []
             malformed_refs: list[str] = []
             for item in raw_refs:
@@ -483,20 +506,34 @@ class InvestigationAdvisorTool:
             )
             if pacing_result is not None:
                 return self._finish(context, _attest_advisor_pre_submission(pacing_result))
-            evidence = await self._load_cited_evidence(context, evidence_refs)
-            if not evidence_refs and consultation_type not in {
-                "review_text",
-                "draft_text",
-                "figure_plan",
-                "suricata_draft",
-            }:
-                evidence = await self._auto_evidence(context.investigation_id)
+            explicit_evidence = await self._load_cited_evidence(context, evidence_refs)
+            auto_evidence = await self._auto_evidence(context.investigation_id)
+            evidence_by_id = {item.id: item for item in (*explicit_evidence, *auto_evidence)}
+            evidence = tuple(evidence_by_id.values())
+            sample_sha256 = arguments.get("sample_sha256")
+            if isinstance(sample_sha256, str) and sample_sha256:
+                prioritized = []
+                remaining = []
+                for item in evidence:
+                    if await self._observation_references_sample(item, sample_sha256):
+                        prioritized.append(item)
+                    else:
+                        remaining.append(item)
+                evidence = tuple((*prioritized, *remaining))
+            requested_finding_ids: tuple[UUID, ...] = ()
+            finding_rows: tuple[Any, ...] = ()
             if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
                 if consultation_type == "figure_plan":
                     raw_finding_refs = arguments.get("finding_refs", ())
                     if not isinstance(raw_finding_refs, (tuple, list)):
                         raise _AdvisorInputValidationError("figure_finding_refs_invalid")
-                    requested_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+                    try:
+                        requested_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+                    except (TypeError, ValueError):
+                        raise _AdvisorInputValidationError("figure_finding_refs_invalid") from None
+                    if len(set(requested_ids)) != len(requested_ids):
+                        raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+                    requested_finding_ids = requested_ids
                 else:
                     requested_ids = ()
                 finding_rows = self._latest_findings(
@@ -536,6 +573,82 @@ class InvestigationAdvisorTool:
                     ),
                 )
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
+            if sample_sha256 is not None:
+                association_list = getattr(
+                    self._sample_associations, "list_for_investigation", None
+                )
+                associations = (
+                    tuple(await association_list(context.investigation_id))
+                    if callable(association_list)
+                    else ()
+                )
+                if not any(
+                    getattr(item, "sample_sha256", None) == sample_sha256 for item in associations
+                ):
+                    return await self._input_failure(
+                        context,
+                        "sample_hash_not_associated",
+                        observation_refs=tuple(item.id for item in evidence),
+                    )
+                sample_list = getattr(self._samples, "list_for_subject", None)
+                sample_rows = (
+                    tuple(await sample_list(investigation.subject_id))
+                    if callable(sample_list)
+                    else ()
+                )
+                matching_samples = tuple(
+                    item
+                    for item in sample_rows
+                    if getattr(item, "expected_hash", None) == sample_sha256
+                    or getattr(item, "source_object_id", None) == sample_sha256
+                )
+                if not matching_samples:
+                    return await self._input_failure(
+                        context,
+                        "sample_hash_unavailable",
+                        observation_refs=tuple(item.id for item in evidence),
+                    )
+                restrictions = tuple(
+                    sorted(
+                        {
+                            reason
+                            for item in matching_samples
+                            for reason in _sample_disclosure_restriction_sources(
+                                item, context.envelope
+                            )
+                        }
+                    )
+                )
+                if restrictions:
+                    reason_text = ", ".join(
+                        reason.replace("tlp_red", "TLP RED")
+                        .replace("tlp_above_envelope_bound", "TLP above the approved envelope")
+                        .replace("external_llm_disallowed", "external LLM disallowed")
+                        .replace("license_restriction", "sample licence restriction")
+                        for reason in restrictions
+                    )
+                    return self._finish(
+                        context,
+                        _attest_advisor_pre_submission(
+                            ToolResult(
+                                ToolInvocationStatus.POLICY_DENIED,
+                                observation_refs=tuple(item.id for item in evidence),
+                                error_code="advisor_disclosure_restricted",
+                                message=(
+                                    "Selected sample is blocked from Bridge disclosure: "
+                                    f"{reason_text}."
+                                ),
+                                output={
+                                    "advisor_status": "disclosure_restricted",
+                                    "failure_stage": "sample_disclosure_restricted",
+                                    "failure_reason": "sample_disclosure_policy",
+                                    "confirmed_non_execution": True,
+                                    "bridge_turns_consumed": 0,
+                                    "usable": False,
+                                },
+                            )
+                        ),
+                    )
             restricted_sample_hashes = await self._restricted_sample_hashes(
                 context.investigation_id, investigation.subject_id, context.envelope
             )
@@ -552,10 +665,17 @@ class InvestigationAdvisorTool:
                             break
                 restricted_evidence_refs = tuple(dict.fromkeys(restricted_ids))
                 restricted_evidence = tuple({item.id: item for item in restricted_items}.values())
-                if restricted_evidence_refs:
-                    restricted_id_set = set(restricted_evidence_refs)
-                    evidence = tuple(item for item in evidence if item.id not in restricted_id_set)
-            if restricted_evidence_refs:
+                restricted_id_set = set(restricted_evidence_refs)
+                evidence = tuple(item for item in evidence if item.id not in restricted_id_set)
+            protected_refs = set(evidence_refs)
+            if requested_finding_ids:
+                protected_refs.update(
+                    ref
+                    for finding in finding_rows
+                    if finding.id in requested_finding_ids
+                    for ref in getattr(finding, "observation_refs", ())
+                )
+            if set(restricted_evidence_refs).intersection(protected_refs):
                 sample_trace = await self._restricted_sample_association_trace(
                     context.investigation_id,
                     restricted_sample_hashes,
@@ -899,6 +1019,11 @@ class InvestigationAdvisorTool:
                         "failure_stage": "evidence_preflight",
                         "failure_reason": "required_canonical_evidence_not_in_payload",
                         "missing_refs": evidence_preflight["missing_refs"],
+                        **(
+                            {"next_action": evidence_preflight["next_action"]}
+                            if evidence_preflight.get("next_action")
+                            else {}
+                        ),
                         "completeness_counts": evidence_preflight["counts"],
                         "completeness_manifest": evidence_preflight["items"],
                         "dossier_sha256": dossier.sha256,
@@ -917,25 +1042,6 @@ class InvestigationAdvisorTool:
                         "usable": False,
                     },
                     error_code=f"advisor_preflight_{preflight_status.casefold()}",
-                )
-            if consultation_type == "suricata_draft" and not prompt_data.get("network_facts"):
-                return self._finish(
-                    context,
-                    _attest_advisor_pre_submission(
-                        ToolResult(
-                            ToolInvocationStatus.FAILED,
-                            observation_refs=tuple(item.id for item in evidence),
-                            error_code="suricata_network_evidence_required",
-                            output={
-                                "advisor_status": "refused",
-                                "usable": False,
-                                "refusal_code": "SURICATA_NOT_JUSTIFIED",
-                                "refusal_reason": (
-                                    "Aucune mesure réseau observée n'a été transmise."
-                                ),
-                            },
-                        )
-                    ),
                 )
             transmitted_refs = _prompt_transmitted_refs(prompt_data)
             external_effect_evidence_refs = await _advisor_external_effect_evidence_refs(
@@ -1105,11 +1211,25 @@ class InvestigationAdvisorTool:
                 type(exc).__name__,
                 exc_info=True,
             )
-            return await self._input_failure(
+            return await self._persist_preflight_failure(
                 context,
-                "advisor_input_rejected",
-                observation_refs=tuple(item.id for item in evidence),
-                internal_detail=_internal_failure_detail(exc),
+                consultation_type=consultation_type,
+                evidence_refs=tuple(item.id for item in evidence),
+                output={
+                    "advisor_status": "context_invalid",
+                    "failure_stage": "advisor_context_preparation",
+                    "failure_reason": "canonical_context_validation_failed",
+                    "next_action": (
+                        "The stored advisor context failed canonical source validation. "
+                        "Refresh the affected observation, finding, sample association, or "
+                        "opinion target, then retry."
+                    ),
+                    "confirmed_non_execution": True,
+                    "bridge_invocation_id": None,
+                    "bridge_turns_consumed": 0,
+                },
+                error_code="advisor_context_invalid",
+                exception_class=type(exc).__name__,
             )
         except Exception as exc:
             return await self._persist_preflight_failure(
@@ -1120,7 +1240,11 @@ class InvestigationAdvisorTool:
                     "advisor_status": "context_unavailable",
                     "exception_class": type(exc).__name__,
                     "failure_stage": "advisor_context_preparation",
-                    "failure_reason": type(exc).__name__,
+                    "failure_reason": "canonical_context_unavailable",
+                    "next_action": (
+                        "The server could not read all canonical advisor sources. Verify the "
+                        "investigation records and associated evidence blobs, then retry."
+                    ),
                     "confirmed_non_execution": True,
                     "bridge_invocation_id": None,
                     "bridge_turns_consumed": 0,
@@ -1283,7 +1407,6 @@ class InvestigationAdvisorTool:
                     "confirmed_non_execution": False,
                     "bridge_invocation_id": getattr(submission, "bridge_invocation_id", None),
                     "bridge_turns_consumed": consumed_turns,
-                    "output_sha256": output_sha256,
                     "response_bytes": len(raw_output_bytes or b""),
                 },
                 exception_class=type(output_archive_error).__name__,
@@ -1541,9 +1664,7 @@ class InvestigationAdvisorTool:
             if raw_output is not None:
                 retained_output.setdefault("consultation_type", consultation_type)
                 retained_output.setdefault("advisor_status", "partial")
-                retained_output.setdefault(
-                    "advisory_text", "[UNTRUSTED ADVISORY]\n" + raw_output
-                )
+                retained_output.setdefault("advisory_text", "[UNTRUSTED ADVISORY]\n" + raw_output)
                 retained_output.setdefault("raw_output", raw_output)
                 retained_output.setdefault("raw_output_sha256", output_sha256)
                 retained_output.setdefault("output_sha256", output_sha256)
@@ -1867,13 +1988,50 @@ class InvestigationAdvisorTool:
         invalid_article_claim_ids: tuple[str, ...] = (),
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
+        actionable = {
+            "sample_hash_not_associated": (
+                "The selected hash is not associated with this investigation. Add it through "
+                "the investigation sample intake, then run sample.analyze on that hash."
+            ),
+            "sample_hash_unavailable": (
+                "The selected sample record or verified blob is unavailable; restore its "
+                "canonical association and blob before running sample.analyze."
+            ),
+            "evidence_reference_not_found": (
+                "The cited evidence reference is missing or belongs to another investigation. "
+                "Choose a canonical observation from this investigation or remove the optional "
+                "reference."
+            ),
+            "advisor_evidence_reference_mismatch": (
+                "A stored evidence link no longer matches a canonical observation in this "
+                "investigation. Repair the source link or remove the affected finding before "
+                "retrying."
+            ),
+            "figure_finding_refs_invalid": (
+                "Figure finding references must be a list of unique finding IDs. Remove "
+                "malformed or duplicate IDs and retry."
+            ),
+            "figure_finding_not_found": (
+                "A selected figure finding is not current in this investigation. Choose a "
+                "current finding or omit finding_refs to use the latest available findings."
+            ),
+            "opinion_reference_invalid": (
+                "The selected opinion ID is malformed. Use the canonical opinion ID or omit "
+                "the target for a general review."
+            ),
+            "opinion_version_invalid": (
+                "The selected opinion version is invalid. Use a current positive version or "
+                "omit the target for a general review."
+            ),
+        }.get(reason_code)
         message = (
             "Advisor input rejected before Bridge submission: "
             + "; ".join(
                 f"measurement[{item['index']}]: {item['reason']}" for item in measurement_errors
             )
             if measurement_errors
-            else f"Advisor input rejected before Bridge submission: {reason_code}."
+            else actionable
+            or f"Advisor input rejected before Bridge submission: {reason_code}."
             + (
                 f" ({internal_detail.get('exception_class')} at "
                 f"{internal_detail.get('location')}: {internal_detail.get('message')})"
@@ -2014,10 +2172,7 @@ class InvestigationAdvisorTool:
                 continue
             found.append(item)
         if unique_refs and not found:
-            raise ValueError(
-                "None of the cited evidence references exists in this investigation: "
-                + ", ".join(ignored[:8])
-            )
+            raise _AdvisorInputValidationError("evidence_reference_not_found")
         if ignored:
             self._ignored_evidence_refs[context.idempotency_key] = (
                 *self._ignored_evidence_refs.get(context.idempotency_key, ()),
@@ -2031,12 +2186,12 @@ class InvestigationAdvisorTool:
         refs: tuple[UUID, ...],
     ) -> tuple[EvidenceObservation, ...]:
         if len(set(refs)) != len(refs):
-            raise ValueError("Evidence references must be unique")
+            raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
         result = []
         for ref in refs:
             item = await self._observations.get(ref)
             if item is None or item.investigation_id != investigation_id:
-                raise ValueError("Evidence reference is absent or belongs to another case")
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
             result.append(item)
         return tuple(result)
 
@@ -2180,12 +2335,20 @@ class InvestigationAdvisorTool:
         if editorial:
             # Local availability state is not an investigation fact Bridge can verify.
             base.pop("gaps")
-        if consultation_type == "review_text":
-            opinion_id = UUID(
-                str(arguments.get("opinion_id", investigation_opinion_id(investigation_id)))
-            )
+        if consultation_type == "review_text" and any(
+            key in arguments
+            for key in ("opinion_id", "opinion_version", "units", "block_type", "anchor", "form")
+        ):
+            try:
+                opinion_id = UUID(
+                    str(arguments.get("opinion_id", investigation_opinion_id(investigation_id)))
+                )
+            except (TypeError, ValueError):
+                raise _AdvisorInputValidationError("opinion_reference_invalid") from None
             raw_version = arguments.get("opinion_version")
-            opinion_version = int(raw_version) if raw_version is not None else None
+            if raw_version is not None and (type(raw_version) is not int or raw_version < 1):
+                raise _AdvisorInputValidationError("opinion_version_invalid")
+            opinion_version = raw_version
             opinion = await self._opinions.get(opinion_id, version=opinion_version)
             if opinion is None or opinion.investigation_id != investigation_id:
                 raise _AdvisorInputValidationError("opinion_not_found")
@@ -2448,9 +2611,17 @@ class InvestigationAdvisorTool:
                         "form": str(raw_unit["form"]),
                         "anchor": raw_unit.get("anchor"),
                     }
-                    validated = await self._validated_assertions(
-                        investigation_id, raw_unit.get("assertions")
-                    )
+                    raw_unit_assertions = raw_unit.get("assertions")
+                    try:
+                        validated = (
+                            await self._validated_assertions(investigation_id, raw_unit_assertions)
+                            if isinstance(raw_unit_assertions, (list, tuple))
+                            and raw_unit_assertions
+                            else []
+                        )
+                    except ValueError:
+                        # Optional draft annotations do not gate consultive text generation.
+                        validated = []
                     for assertion in validated:
                         if assertion["id"] in seen_assertion_ids:
                             raise ValueError("Assertion ids must be unique across editorial units")
@@ -2473,11 +2644,19 @@ class InvestigationAdvisorTool:
                     unit_targets.append(target)
                 base["units"] = unit_targets
                 base["assertions"] = draft_assertions
-            else:
-                draft_assertions = await self._validated_assertions(
-                    investigation_id, arguments.get("assertions")
-                )
+            elif isinstance(arguments.get("assertions"), (list, tuple)) and arguments.get(
+                "assertions"
+            ):
+                try:
+                    draft_assertions = await self._validated_assertions(
+                        investigation_id, arguments.get("assertions")
+                    )
+                except ValueError:
+                    # These annotations are optional for consultation and are not promotion data.
+                    draft_assertions = []
                 base["assertions"] = draft_assertions
+            else:
+                base["assertions"] = []
 
         tool_inventory = (
             []
@@ -2511,6 +2690,11 @@ class InvestigationAdvisorTool:
             base["evidence"] = evidence_payload
             base["measured_facts"] = measured_facts
             base["findings"] = finding_payload
+            base["candidate_rules"] = [
+                await self._candidate_rule_summary(item)
+                for item in evidence
+                if "rule" in item.source.casefold() or "rule" in item.object_type.casefold()
+            ]
 
         async def verified_measurements() -> tuple[
             list[dict[str, Any]], dict[str, list[dict[str, Any]]]
@@ -2740,8 +2924,14 @@ class InvestigationAdvisorTool:
             ]
             base["candidate_rules"] = candidate_rules
         if consultation_type in {"plan_investigation", "pivot_strategy"}:
+            available_observation_ids = {item.id for item in evidence}
             findings = self._latest_findings(
                 tuple(await self._findings.list_for_investigation(investigation_id))
+            )
+            findings = tuple(
+                item
+                for item in findings
+                if set(getattr(item, "observation_refs", ())).issubset(available_observation_ids)
             )
             base["findings"] = [
                 {
@@ -2777,11 +2967,7 @@ class InvestigationAdvisorTool:
                     measurements, candidates, content_patterns=content_patterns
                 )
             else:
-                if not measurements:
-                    raise _AdvisorInputValidationError("no_verified_measurements")
                 measurements = self._select_discriminating_measurements(measurements)
-            if not measurements:
-                raise _AdvisorInputValidationError("no_verified_measurements")
             measurements = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -2832,18 +3018,27 @@ class InvestigationAdvisorTool:
         elif consultation_type == "figure_plan":
             raw_finding_refs = arguments.get("finding_refs", ())
             if not isinstance(raw_finding_refs, (list, tuple)):
-                raise ValueError("Figure finding references exceed bounds")
-            requested_finding_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+                raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+            try:
+                requested_finding_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+            except (TypeError, ValueError):
+                raise _AdvisorInputValidationError("figure_finding_refs_invalid") from None
             if len(set(requested_finding_ids)) != len(requested_finding_ids):
-                raise ValueError("Figure finding references must be unique")
+                raise _AdvisorInputValidationError("figure_finding_refs_invalid")
             all_findings = {
                 item.id: item
                 for item in await self._findings.list_for_investigation(investigation_id)
                 if item.investigation_id == investigation_id
             }
             if any(item not in all_findings for item in requested_finding_ids):
-                raise ValueError("Selected figure finding is absent from this investigation")
-            findings = tuple(all_findings[item] for item in requested_finding_ids)
+                raise _AdvisorInputValidationError("figure_finding_not_found")
+            available_observation_ids = {item.id for item in evidence}
+            selected_finding_ids = requested_finding_ids or tuple(
+                item.id
+                for item in self._latest_findings(tuple(all_findings.values()))
+                if set(getattr(item, "observation_refs", ())).issubset(available_observation_ids)
+            )
+            findings = tuple(all_findings[item] for item in selected_finding_ids)
             base["findings"] = [
                 {
                     "finding_id": str(item.id),
@@ -2857,7 +3052,33 @@ class InvestigationAdvisorTool:
                 }
                 for item in findings
             ]
-            base["finding_refs"] = [str(item) for item in requested_finding_ids]
+            base["finding_refs"] = [str(item) for item in selected_finding_ids]
+        if consultation_type not in {
+            "plan_investigation",
+            "pivot_strategy",
+            "figure_plan",
+            "draft_text",
+            "review_text",
+        }:
+            available_observation_ids = {item.id for item in evidence}
+            current_findings = self._latest_findings(
+                tuple(await self._findings.list_for_investigation(investigation_id))
+            )
+            base["findings"] = [
+                {
+                    "finding_id": str(item.id),
+                    "sha256": _advisor_source_sha256("finding", item),
+                    "kind": item.kind.value,
+                    "assessment": item.assessment.value,
+                    "line": item.statement,
+                    "observation_refs": [str(value) for value in item.observation_refs],
+                    "claim_refs": [str(value) for value in item.claim_refs],
+                    "limitations": list(item.limitations),
+                }
+                for item in current_findings
+                if set(getattr(item, "observation_refs", ())).issubset(available_observation_ids)
+            ]
+
         if consultation_type == "pivot_strategy" or (
             consultation_type in _TYPED_CONSULTATION_TYPES
             and consultation_type not in {"yara_draft", "draft_text", "review_text"}
@@ -3045,6 +3266,15 @@ class InvestigationAdvisorTool:
         }
         for observation in evidence:
             add("observation", observation.id)
+        available_observation_ids = {item.id for item in evidence}
+        listing = getattr(self._findings, "list_for_investigation", None)
+        if callable(listing):
+            current_findings = self._latest_findings(tuple(await listing(investigation_id)))
+            for finding in current_findings:
+                if set(getattr(finding, "observation_refs", ())).issubset(
+                    available_observation_ids
+                ):
+                    add("finding", finding.id)
 
         observations_by_id = {item.id: item for item in evidence}
         finding_items: list[Any] = []
@@ -3213,6 +3443,9 @@ class InvestigationAdvisorTool:
                 "kind": item.kind.value,
                 "assessment": item.assessment.value,
                 "line": item.statement,
+                "observation_refs": [str(ref) for ref in item.observation_refs],
+                "claim_refs": list(item.claim_refs),
+                "limitations": list(item.limitations),
             }
             for item in finding_items
         ]
@@ -3345,19 +3578,9 @@ class InvestigationAdvisorTool:
                 if isinstance(raw_mime_type, str) and raw_mime_type.strip()
                 else "application/octet-stream"
             )
-            fragment = (
-                blob_content[:MAX_ADVISOR_SAMPLE_FRAGMENT_BYTES]
-                if blob_content is not None
-                else b""
-            )
-            omitted_range = (
-                f"[{len(fragment)},{descriptor.size})"
-                if blob_content is not None and len(fragment) < descriptor.size
-                else ""
-            )
-            content_omission_reason = (
-                f"sample_fragment_truncated:{omitted_range}" if omitted_range else ""
-            )
+            fragment = blob_content if blob_content is not None else b""
+            omitted_range = ""
+            content_omission_reason = ""
             rows.append(
                 {
                     "verified": True,
@@ -4233,19 +4456,16 @@ class InvestigationAdvisorTool:
         )
         safe_advisory_text = str(safe_output)
         draft_assertions = prompt_data.get("assertions")
-        has_linked_draft_assertion = (
-            isinstance(draft_assertions, (list, tuple))
+        has_linked_draft_assertion = isinstance(draft_assertions, (list, tuple)) and any(
+            isinstance(assertion, Mapping)
             and any(
-                isinstance(assertion, Mapping)
-                and any(
-                    isinstance(reference, Mapping)
-                    and reference.get("kind") in {"observation", "finding"}
-                    and isinstance(reference.get("sha256"), str)
-                    and re.fullmatch(r"[0-9a-f]{64}", reference["sha256"]) is not None
-                    for reference in assertion.get("refs", ())
-                )
-                for assertion in draft_assertions
+                isinstance(reference, Mapping)
+                and reference.get("kind") in {"observation", "finding"}
+                and isinstance(reference.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", reference["sha256"]) is not None
+                for reference in assertion.get("refs", ())
             )
+            for assertion in draft_assertions
         )
         evidence_links_absent = consultation_type == "draft_text" and not has_linked_draft_assertion
         parse_failed = parsed is None or (
@@ -4343,10 +4563,26 @@ class InvestigationAdvisorTool:
         reason = str(safe_output.get("failure_reason", error_code))[:128]
         message = ""
         if stage == "evidence_preflight":
+            next_action = safe_output.get("next_action")
             message = (
-                "Required canonical evidence could not be verified for the advisor dossier. "
-                "If a missing reference is raw sample bytes, cite the VT report or an analysis "
-                "observation instead of raw sample bytes."
+                str(next_action)
+                if isinstance(next_action, str) and next_action.strip()
+                else "Required canonical evidence could not be verified for the advisor dossier. "
+                "Check the source identity, SHA-256, and canonical blob availability. If the "
+                "missing item is raw sample bytes, verify its associated sample blob; a related "
+                "VT report or analysis observation may be selected if that is the source you "
+                "intend to review."
+            )
+            safe_output.setdefault("refusal_guidance", message)
+        elif stage == "advisor_context_preparation":
+            next_action = safe_output.get("next_action")
+            message = (
+                str(next_action)
+                if isinstance(next_action, str) and next_action.strip()
+                else (
+                    "The canonical advisor context could not be validated. Refresh the "
+                    "affected investigation source record before retrying."
+                )
             )
             safe_output.setdefault("refusal_guidance", message)
         result = ToolResult(
@@ -4524,6 +4760,7 @@ def register_investigation_advisor_tool(
                         ],
                     },
                     "question": {"type": "string"},
+                    "sample_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
                     "evidence_refs": {
                         "type": "array",
                         "uniqueItems": True,
@@ -4895,7 +5132,10 @@ class ReparsePersistedAdvisorOutputTool:
                     "new_observation_written": False,
                     "canonical_promotion": False,
                 },
-                message="La sortie Bridge historique est restituée comme résultat consultatif non fiable.",
+                message=(
+                    "La sortie Bridge historique est restituée comme résultat consultatif "
+                    "non fiable."
+                ),
             )
         raw_reparse_context = persisted.get("reparse_context")
         if not isinstance(raw_reparse_context, Mapping):
@@ -6071,9 +6311,7 @@ def _consultation_article_passages(snapshot: Any, question: str) -> list[dict[st
     cited_claims = {item.casefold(): item for item in _ARTICLE_CLAIM_ID.findall(question)}
     cited_claim_ids = set(cited_claims)
     passage_ids = {
-        str(item.get("claim_id", "")).casefold()
-        for item in passages
-        if isinstance(item, Mapping)
+        str(item.get("claim_id", "")).casefold() for item in passages if isinstance(item, Mapping)
     }
     valid_claims: dict[str, str] = {}
     for claim in getattr(article, "claims", ()):
