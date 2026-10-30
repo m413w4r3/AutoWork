@@ -123,12 +123,14 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
     EnvelopeAuthorityKind,
+    EvidenceKind,
     FindingAssessment,
     InvestigationBudget,
     InvestigationExecutionMode,
     QualificationActorKind,
     SampleQualification,
     TLPLevel,
+    ToolInvocation,
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_experiment import (
@@ -525,8 +527,40 @@ class OperatorObservationPayloadResponse(BaseModel):
     untrusted_data: bool = True
 
 
+class OperatorObservationMetadataResponse(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_version: Literal["investigation-operator-observation-metadata.v1"] = Field(
+        default="investigation-operator-observation-metadata.v1", alias="schema"
+    )
+    observation_id: UUID
+    kind: EvidenceKind
+    source: str
+    object_type: str
+    object_id: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+    invocation_status: ToolInvocationStatus | None
+    body_read: Literal[False] = False
+
+
+class OperatorInvocationReconciliationSummary(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    invocation_id: UUID
+    tool_name: str = Field(min_length=1, max_length=128)
+    status: ToolInvocationStatus
+    version: int = Field(ge=1)
+    external_transport_occurred: bool | None
+    persisted_response_available: bool
+    persisted_response_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_response_id: str | None = Field(default=None, max_length=512)
+    next_action: dict[str, Any]
+
+
 class OperatorToolInvocationApiResponseV1(OperatorToolInvocationResponseV1):
     output: dict[str, Any]
+    reconciliation: OperatorInvocationReconciliationSummary | None = None
 
 
 _OBSERVATION_SECRET_FIELD = re.compile(
@@ -1554,6 +1588,7 @@ async def invoke_investigation_operator_tool(
                 arguments=payload.arguments,
                 purpose=payload.purpose,
                 expected_version=payload.expected_version,
+                expected_sha256=payload.expected_sha256,
                 idempotency_key=idempotency_key,
                 actor_id=identity.actor_id,
             )
@@ -1572,9 +1607,20 @@ async def invoke_investigation_operator_tool(
                 and result.invocation.status is ToolInvocationStatus.SUCCEEDED
             ):
                 advisor_output_not_replayed = True
+        reconciliation = (
+            await _operator_invocation_reconciliation_summary(
+                request=request,
+                uow=uow,
+                investigation_id=investigation_id,
+                invocation=result.invocation,
+            )
+            if result.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+            else None
+        )
     return OperatorToolInvocationApiResponseV1(
         investigation_id=result.investigation_id,
         working_state_version=result.working_state_version,
+        working_state_sha256=result.working_state_sha256,
         idempotent_replay=result.idempotent_replay,
         invocation=OperatorToolInvocationViewV1(
             id=result.invocation.id,
@@ -1589,20 +1635,102 @@ async def invoke_investigation_operator_tool(
         advisor_output=advisor_output,
         advisor_output_not_replayed=advisor_output_not_replayed,
         output=dict(result.output),
+        reconciliation=reconciliation,
+    )
+
+
+async def _operator_invocation_reconciliation_summary(
+    *, request: Request, uow: Any, investigation_id: UUID, invocation: ToolInvocation
+) -> OperatorInvocationReconciliationSummary:
+    external_transport_occurred: bool | None = None
+    persisted_response_available = bool(invocation.response_refs)
+    persisted_response_sha256 = None
+    provider_response_id = None
+    coordinator = getattr(request.app.state, "external_effect_coordinator", None)
+    claim_lookup = getattr(coordinator, "latest_claim_for_invocation", None)
+    try:
+        claim = (
+            await claim_lookup(investigation_id, invocation.id) if callable(claim_lookup) else None
+        )
+    except Exception:
+        claim = None
+    if (
+        claim is not None
+        and claim.investigation_id == investigation_id
+        and claim.invocation_id == invocation.id
+    ):
+        claim_state = getattr(claim.state, "value", claim.state)
+        persisted_response_available = persisted_response_available or bool(
+            claim.result_ref or claim.evidence_refs
+        )
+        if claim_state == "DEFINITIVELY_NOT_SUBMITTED" and not persisted_response_available:
+            external_transport_occurred = False
+        elif claim_state == "COMPLETED":
+            external_transport_occurred = True
+
+        if claim.provider == "bridge" and claim.model_run_id is not None:
+            model_runs = getattr(uow, "model_runs", None)
+            get_run = getattr(model_runs, "get", None)
+            try:
+                run = await get_run(claim.model_run_id) if callable(get_run) else None
+            except Exception:
+                run = None
+            if run is not None:
+                provider_response_id = getattr(run, "response_id", None)
+                raw_output_sha256 = getattr(run, "raw_output_sha256", None)
+                has_stored_output = bool(
+                    getattr(run, "output_references", ())
+                    or getattr(run, "raw_output_reference", None)
+                    or raw_output_sha256
+                ) or bool(getattr(run, "raw_output_chars", None))
+                persisted_response_available = persisted_response_available or has_stored_output
+                if isinstance(raw_output_sha256, str) and re.fullmatch(
+                    r"[0-9a-f]{64}", raw_output_sha256
+                ):
+                    persisted_response_sha256 = raw_output_sha256
+                if provider_response_id or has_stored_output:
+                    external_transport_occurred = True
+
+    prefix = f"/api/investigations/{investigation_id}"
+    advisor_action = invocation.tool_name == "advisor.consult"
+    path = (
+        f"{prefix}/operator/invocations/{invocation.id}/reconcile"
+        if advisor_action
+        else f"{prefix}/invocations/{invocation.id}/reconcile"
+    )
+    return OperatorInvocationReconciliationSummary(
+        invocation_id=invocation.id,
+        tool_name=invocation.tool_name,
+        status=invocation.status,
+        version=invocation.version,
+        external_transport_occurred=external_transport_occurred,
+        persisted_response_available=persisted_response_available,
+        persisted_response_sha256=persisted_response_sha256,
+        provider_response_id=provider_response_id,
+        next_action={
+            "code": "reconcile_before_retry",
+            "method": "POST",
+            "path": path,
+            "expected_version": invocation.version,
+            "resubmission_allowed": False,
+            "other_pivots_allowed": True,
+            "requires_verified_human_operator": not advisor_action,
+        },
     )
 
 
 @router.get(
     "/investigations/{investigation_id}/operator/observations/{observation_id}",
-    response_model=OperatorObservationPayloadResponse,
+    response_model=OperatorObservationPayloadResponse | OperatorObservationMetadataResponse,
 )
 async def get_investigation_operator_observation(
     investigation_id: UUID,
     observation_id: UUID,
     request: Request,
+    view: Literal["payload", "metadata"] = Query(default="payload"),
     offset: int = Query(default=0, ge=0),
     length: int = Query(default=16 * 1024, ge=1, le=32 * 1024),
-) -> OperatorObservationPayloadResponse:
+) -> OperatorObservationPayloadResponse | OperatorObservationMetadataResponse:
     await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
@@ -1613,6 +1741,30 @@ async def get_investigation_operator_observation(
             raise _http_error(404, "operator_observation_not_found")
         blob = await uow.blobs.get(observation.blob_id)
         descriptor = getattr(blob, "descriptor", None)
+        if view == "metadata":
+            if (
+                descriptor is None
+                or getattr(descriptor, "sha256", None) != observation.sha256
+                or type(getattr(descriptor, "size", None)) is not int
+                or descriptor.size < 0
+            ):
+                raise _http_error(409, "operator_observation_integrity_failed")
+            invocation_status = None
+            if observation.invocation_ref is not None:
+                invocation = await uow.tool_invocations.get(observation.invocation_ref)
+                if invocation is None or invocation.investigation_id != investigation_id:
+                    raise _http_error(409, "operator_observation_integrity_failed")
+                invocation_status = invocation.status
+            return OperatorObservationMetadataResponse(
+                observation_id=observation.id,
+                kind=observation.kind,
+                source=observation.source,
+                object_type=observation.object_type,
+                object_id=observation.object_id,
+                sha256=observation.sha256,
+                size_bytes=descriptor.size,
+                invocation_status=invocation_status,
+            )
         if (
             descriptor is None
             or descriptor.mime_type.split(";", 1)[0].strip().lower() != "application/json"
@@ -1632,9 +1784,7 @@ async def get_investigation_operator_observation(
         is_advisor_call = (
             observation_source == "advisor.consult" and observation_object_type == "advisor_call"
         )
-        preserve_complete_content = (
-            is_advisor_call
-        ) or (
+        preserve_complete_content = (is_advisor_call) or (
             str(observation_source).casefold() == "autowork ruleworkbench"
             and observation_object_type == "detection_candidate_version"
         )
@@ -4106,12 +4256,16 @@ class OperatorAdvisorReconciliationRequest(BaseModel):
 
 class OperatorAdvisorReconciliationResponse(BaseModel):
     invocation_id: UUID
+    tool_name: Literal["advisor.consult"] = "advisor.consult"
     status: ToolInvocationStatus
     version: int
     outcome: Literal["response_adopted", "non_execution_sealed", "needs_review"]
+    external_transport_occurred: bool | None
+    persisted_response_available: bool
     provider_response_id: str | None
     response_sha256: str | None
     response_text: str | None
+    next_action: dict[str, Any]
     result_is_untrusted: Literal[True] = True
     canonical_promotion: Literal[False] = False
     non_execution_sealed: bool = False
@@ -4177,6 +4331,13 @@ async def reconcile_operator_advisor_invocation(
             return _operator_advisor_reconciliation_pending(invocation, None)
         claim_status = getattr(claim.state, "value", claim.state)
         provider_response_id = run.response_id
+        raw_output_sha256 = getattr(run, "raw_output_sha256", None)
+        stored_response_sha256 = (
+            raw_output_sha256
+            if isinstance(raw_output_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", raw_output_sha256)
+            else None
+        )
         raw_output_chars = getattr(run, "raw_output_chars", None)
         has_stored_output = bool(
             getattr(turn, "output_blob_reference", None)
@@ -4198,18 +4359,29 @@ async def reconcile_operator_advisor_invocation(
         run_status = getattr(run.status, "value", run.status)
         turn_status = getattr(turn.status, "value", turn.status)
         already_adopted = run_status == "succeeded" and turn_status == "succeeded"
-        if proof_claim_id is None and not already_adopted and (
-            run_status != "needs_review"
-            or turn_status != "needs_review"
-            or claim_status != "NEEDS_REVIEW"
+        if (
+            proof_claim_id is None
+            and not already_adopted
+            and (
+                run_status != "needs_review"
+                or turn_status != "needs_review"
+                or claim_status != "NEEDS_REVIEW"
+            )
         ):
-            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+            return _operator_advisor_reconciliation_pending(
+                invocation,
+                provider_response_id,
+                response_sha256=stored_response_sha256,
+                persisted_response_available=has_stored_output or bool(provider_response_id),
+            )
         context_subject_id = investigation.subject_id
 
     if proof_claim_id is not None:
         seal = getattr(conversation_service, "seal_verified_pre_submission", None)
         if not callable(seal):
-            return _operator_advisor_reconciliation_pending(invocation, None)
+            return _operator_advisor_reconciliation_pending(
+                invocation, None, external_transport_occurred=False
+            )
         try:
             await seal(
                 make_investigation_conversation_id(investigation_id),
@@ -4219,7 +4391,9 @@ async def reconcile_operator_advisor_invocation(
                 context_subject_id=context_subject_id,
             )
         except ModelConversationReconciliationError:
-            return _operator_advisor_reconciliation_pending(invocation, None)
+            return _operator_advisor_reconciliation_pending(
+                invocation, None, external_transport_occurred=False
+            )
 
         async with _uow_factory(request)() as recheck_uow:
             current = await recheck_uow.tool_invocations.get(invocation_id)
@@ -4230,11 +4404,11 @@ async def reconcile_operator_advisor_invocation(
                 or current.status is not ToolInvocationStatus.NEEDS_REVIEW
             ):
                 raise _http_error(409, "stale_invocation_version")
-            envelope = await recheck_uow.investigation_envelopes.get_for_update(
-                investigation_id
-            )
+            envelope = await recheck_uow.investigation_envelopes.get_for_update(investigation_id)
             if envelope is None and current.reserved_budget:
-                return _operator_advisor_reconciliation_pending(current, None)
+                return _operator_advisor_reconciliation_pending(
+                    current, None, external_transport_occurred=False
+                )
             if envelope is not None:
                 reservation = next(
                     (
@@ -4245,7 +4419,9 @@ async def reconcile_operator_advisor_invocation(
                     None,
                 )
                 if reservation is None and current.reserved_budget:
-                    return _operator_advisor_reconciliation_pending(current, None)
+                    return _operator_advisor_reconciliation_pending(
+                        current, None, external_transport_occurred=False
+                    )
                 if reservation is not None and reservation.status.value != "released":
                     envelope.budget.release_confirmed_non_submission(current.operation_key)
                     updated_envelope = replace(envelope, version=envelope.version + 1)
@@ -4262,9 +4438,27 @@ async def reconcile_operator_advisor_invocation(
             status=resolved.status,
             version=resolved.version,
             outcome="non_execution_sealed",
+            external_transport_occurred=False,
+            persisted_response_available=False,
             provider_response_id=None,
             response_sha256=None,
             response_text=None,
+            next_action={
+                "code": "new_invocation_after_proven_non_execution",
+                "method": "GET",
+                "path": f"/api/investigations/{investigation_id}/operator/context",
+                "follow_up": {
+                    "method": "POST",
+                    "path": (
+                        f"/api/investigations/{investigation_id}/operator/tools/advisor.consult"
+                    ),
+                    "fresh_idempotency_key_required": True,
+                    "expected_version_from": "working_state_version",
+                    "expected_sha256_from": "working_state_sha256",
+                },
+                "resubmission_allowed": True,
+                "other_pivots_allowed": True,
+            },
             non_execution_sealed=True,
             resubmission_allowed=True,
         )
@@ -4276,18 +4470,38 @@ async def reconcile_operator_advisor_invocation(
         )
         authorization = g2_envelope_authorization_state(envelope, decisions)
         if envelope is None or authorization.revoked:
-            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+            return _operator_advisor_reconciliation_pending(
+                invocation,
+                provider_response_id,
+                response_sha256=stored_response_sha256,
+                persisted_response_available=has_stored_output or bool(provider_response_id),
+            )
         try:
             snapshot = await _composition_factory(request).article_snapshots.resolve(
                 investigation.synthesis_artifact_id
             )
         except (KeyError, ValueError):
-            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+            return _operator_advisor_reconciliation_pending(
+                invocation,
+                provider_response_id,
+                response_sha256=stored_response_sha256,
+                persisted_response_available=has_stored_output or bool(provider_response_id),
+            )
         if not InvestigationService.bridge_disclosure_allowed(snapshot, envelope):
-            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+            return _operator_advisor_reconciliation_pending(
+                invocation,
+                provider_response_id,
+                response_sha256=stored_response_sha256,
+                persisted_response_available=has_stored_output or bool(provider_response_id),
+            )
 
     if not isinstance(provider_response_id, str) or not provider_response_id:
-        return _operator_advisor_reconciliation_pending(invocation, None)
+        return _operator_advisor_reconciliation_pending(
+            invocation,
+            None,
+            response_sha256=stored_response_sha256,
+            persisted_response_available=has_stored_output,
+        )
 
     try:
         if already_adopted:
@@ -4295,7 +4509,10 @@ async def reconcile_operator_advisor_invocation(
                 make_investigation_conversation_id(investigation_id),
                 context_subject_id=context_subject_id,
             )
-            content = next((item for item in contents if item.turn.id == claim.bridge_turn_id), None)
+            content = next(
+                (item for item in contents if item.turn.id == claim.bridge_turn_id),
+                None,
+            )
             if (
                 content is None
                 or not isinstance(content.output_text, str)
@@ -4303,7 +4520,12 @@ async def reconcile_operator_advisor_invocation(
                 or hashlib.sha256(content.output_text.encode("utf-8")).hexdigest()
                 != run.raw_output_sha256
             ):
-                return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+                return _operator_advisor_reconciliation_pending(
+                    invocation,
+                    provider_response_id,
+                    response_sha256=stored_response_sha256,
+                    persisted_response_available=has_stored_output or bool(provider_response_id),
+                )
             response_text = content.output_text
             response_sha256 = run.raw_output_sha256
         else:
@@ -4321,9 +4543,7 @@ async def reconcile_operator_advisor_invocation(
                     or current.status is not ToolInvocationStatus.NEEDS_REVIEW
                 ):
                     raise _http_error(409, "stale_invocation_version")
-                current_envelope = await recheck_uow.investigation_envelopes.get(
-                    investigation_id
-                )
+                current_envelope = await recheck_uow.investigation_envelopes.get(investigation_id)
                 current_decisions = tuple(
                     await recheck_uow.analyst_decisions.list_for_investigation(investigation_id)
                 )
@@ -4332,7 +4552,12 @@ async def reconcile_operator_advisor_invocation(
                 )
                 if current_envelope is None or current_authorization.revoked:
                     return _operator_advisor_reconciliation_pending(
-                        invocation, provider_response_id
+                        invocation,
+                        provider_response_id,
+                        response_sha256=stored_response_sha256,
+                        persisted_response_available=(
+                            has_stored_output or bool(provider_response_id)
+                        ),
                     )
                 try:
                     current_snapshot = await _composition_factory(
@@ -4340,13 +4565,23 @@ async def reconcile_operator_advisor_invocation(
                     ).article_snapshots.resolve(investigation.synthesis_artifact_id)
                 except (KeyError, ValueError):
                     return _operator_advisor_reconciliation_pending(
-                        invocation, provider_response_id
+                        invocation,
+                        provider_response_id,
+                        response_sha256=stored_response_sha256,
+                        persisted_response_available=(
+                            has_stored_output or bool(provider_response_id)
+                        ),
                     )
                 if not InvestigationService.bridge_disclosure_allowed(
                     current_snapshot, current_envelope
                 ):
                     return _operator_advisor_reconciliation_pending(
-                        invocation, provider_response_id
+                        invocation,
+                        provider_response_id,
+                        response_sha256=stored_response_sha256,
+                        persisted_response_available=(
+                            has_stored_output or bool(provider_response_id)
+                        ),
                     )
             await conversation_service.adopt_visible_recovery(
                 make_investigation_conversation_id(investigation_id),
@@ -4358,32 +4593,74 @@ async def reconcile_operator_advisor_invocation(
             response_text = preview["text"]
             response_sha256 = preview["sha256"]
     except ModelConversationReconciliationError:
-        return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+        return _operator_advisor_reconciliation_pending(
+            invocation,
+            provider_response_id,
+            response_sha256=stored_response_sha256,
+            persisted_response_available=has_stored_output or bool(provider_response_id),
+        )
 
     return OperatorAdvisorReconciliationResponse(
         invocation_id=invocation.id,
         status=invocation.status,
         version=invocation.version,
         outcome="response_adopted",
+        external_transport_occurred=True,
+        persisted_response_available=True,
         provider_response_id=provider_response_id,
         response_sha256=response_sha256,
         response_text=response_text,
+        next_action={
+            "code": "review_saved_response",
+            "method": "GET",
+            "path": f"/api/investigations/{investigation_id}/operator-status",
+            "resubmission_allowed": False,
+            "other_pivots_allowed": True,
+        },
         non_execution_sealed=False,
         resubmission_allowed=False,
     )
 
 
 def _operator_advisor_reconciliation_pending(
-    invocation: Any, provider_response_id: str | None
+    invocation: Any,
+    provider_response_id: str | None,
+    *,
+    response_sha256: str | None = None,
+    persisted_response_available: bool | None = None,
+    external_transport_occurred: bool | None = None,
 ) -> OperatorAdvisorReconciliationResponse:
     return OperatorAdvisorReconciliationResponse(
         invocation_id=invocation.id,
         status=invocation.status,
         version=invocation.version,
         outcome="needs_review",
+        external_transport_occurred=(
+            external_transport_occurred
+            if external_transport_occurred is not None
+            else True
+            if provider_response_id or response_sha256
+            else None
+        ),
+        persisted_response_available=(
+            bool(invocation.response_refs) or bool(provider_response_id) or bool(response_sha256)
+            if persisted_response_available is None
+            else persisted_response_available
+        ),
         provider_response_id=provider_response_id,
-        response_sha256=None,
+        response_sha256=response_sha256,
         response_text=None,
+        next_action={
+            "code": "reconcile_before_retry",
+            "method": "POST",
+            "path": (
+                f"/api/investigations/{invocation.investigation_id}/operator/invocations/"
+                f"{invocation.id}/reconcile"
+            ),
+            "expected_version": invocation.version,
+            "resubmission_allowed": False,
+            "other_pivots_allowed": True,
+        },
         non_execution_sealed=False,
         resubmission_allowed=False,
     )

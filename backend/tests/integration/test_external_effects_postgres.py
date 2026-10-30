@@ -2551,9 +2551,9 @@ async def test_latest_advisor_claim_lookup_is_scoped_and_returns_latest_invocati
                 ]
             )
     try:
-        latest = await SqlAlchemyExternalEffectClaimStore(session_factory).latest_advisor_claim_for_invocation(
-            investigation_id, invocation_id
-        )
+        latest = await SqlAlchemyExternalEffectClaimStore(
+            session_factory
+        ).latest_advisor_claim_for_invocation(investigation_id, invocation_id)
         other_investigation = await SqlAlchemyExternalEffectClaimStore(
             session_factory
         ).latest_advisor_claim_for_invocation(uuid4(), invocation_id)

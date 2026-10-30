@@ -617,6 +617,7 @@ def test_operator_advisor_consult_returns_bounded_untrusted_text() -> None:
             return SimpleNamespace(
                 investigation_id=INVESTIGATION_ID,
                 working_state_version=2,
+                working_state_sha256="b" * 64,
                 error_code=None,
                 job_id=None,
                 idempotent_replay=False,
@@ -668,6 +669,7 @@ def test_operator_advisor_consult_returns_bounded_untrusted_text() -> None:
         "arguments": {"consultation_type": "plan_investigation", "evidence_refs": []},
         "purpose": "Request bounded planning guidance.",
         "expected_version": 1,
+        "expected_sha256": "a" * 64,
     }
 
     response = client.post(
@@ -1443,6 +1445,16 @@ def test_operator_reconciliation_seals_only_durable_no_handoff_proof(
     assert body["response_text"] is None
     assert body["non_execution_sealed"] is (expected_outcome == "non_execution_sealed")
     assert body["resubmission_allowed"] is (expected_outcome == "non_execution_sealed")
+    if expected_outcome == "non_execution_sealed":
+        assert body["external_transport_occurred"] is False
+        assert body["persisted_response_available"] is False
+        assert body["next_action"]["method"] == "GET"
+        assert body["next_action"]["path"].endswith("/operator/context")
+        assert body["next_action"]["follow_up"]["method"] == "POST"
+        assert body["next_action"]["follow_up"]["fresh_idempotency_key_required"] is True
+        assert body["next_action"]["follow_up"]["expected_sha256_from"] == (
+            "working_state_sha256"
+        )
     service = client.app.state.investigation_composition_factory.model_conversations
     expected_seal_calls = (
         [

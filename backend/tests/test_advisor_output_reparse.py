@@ -10,11 +10,11 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
 from cti_app.application.advisor_semantic_parser import (
     ADVISOR_RESPONSE_SCHEMA_V4,
     ADVISOR_SOURCE_PARSER_VERSION_V4,
 )
-from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_REPARSE_SCHEMA_VERSION,
     ADVISOR_REPARSE_TOOL_NAME,

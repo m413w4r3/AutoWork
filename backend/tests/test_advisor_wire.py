@@ -830,7 +830,9 @@ def test_figure_plan_normalizes_article_sha_only_when_transmitted() -> None:
             }
         )
 
-    prompt_data = {"transmitted_refs": [{"kind": "article", "id": article_sha, "sha256": article_sha}]}
+    prompt_data = {
+        "transmitted_refs": [{"kind": "article", "id": article_sha, "sha256": article_sha}]
+    }
     parsed = parse_typed_advisor_response(
         response(article_sha),
         consultation_type="figure_plan",
@@ -845,9 +847,7 @@ def test_figure_plan_normalizes_article_sha_only_when_transmitted() -> None:
     )
 
     assert parsed is not None
-    assert parsed["figure_plan"]["nodes"][0]["refs"] == [
-        {"kind": "article", "id": article_sha}
-    ]
+    assert parsed["figure_plan"]["nodes"][0]["refs"] == [{"kind": "article", "id": article_sha}]
     assert absent is not None
     assert "figure_plan" not in absent
     assert absent["usable"] is False

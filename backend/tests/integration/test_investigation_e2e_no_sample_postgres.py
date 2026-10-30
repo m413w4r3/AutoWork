@@ -674,6 +674,7 @@ async def test_investigation_no_sample_postgres_continuous_journey(
                 },
                 "purpose": "Record the bounded hypothesis supported by synthetic evidence.",
                 "expected_version": state.version,
+                "expected_sha256": state.sha256,
             },
             headers={"Idempotency-Key": f"m05b-hypothesis-{investigation_id}"},
         )
@@ -738,6 +739,7 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             client,
             investigation_id,
             state.version,
+            state.sha256,
             idempotency_key=f"m05b-advisor-partial-{investigation_id}",
             evidence_ref=observation.id,
         )
@@ -747,10 +749,12 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             ToolInvocationStatus.SUCCEEDED.value,
         }, partial.text
         partial_state = partial.json()["working_state_version"]
+        partial_sha256 = partial.json()["working_state_sha256"]
         succeeded = await _invoke_advisor(
             client,
             investigation_id,
             partial_state,
+            partial_sha256,
             idempotency_key=f"m05b-advisor-success-{investigation_id}",
             evidence_ref=observation.id,
         )
@@ -818,6 +822,7 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             client,
             investigation_id,
             reparse_state.version,
+            reparse_state.sha256,
             observation_id=v4_original.id,
             idempotency_key=f"m05b-advisor-v4-reparse-{investigation_id}",
         )
@@ -1054,6 +1059,7 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             client,
             investigation_id,
             uncertain_state.version,
+            uncertain_state.sha256,
             idempotency_key=uncertain_key,
             evidence_ref=observation.id,
         )
@@ -1103,6 +1109,7 @@ async def test_investigation_no_sample_postgres_continuous_journey(
                 replay_client,
                 investigation_id,
                 uncertain_state.version,
+                uncertain_state.sha256,
                 idempotency_key=uncertain_key,
                 evidence_ref=observation.id,
             )
@@ -1313,6 +1320,7 @@ async def _invoke_advisor(
     client: httpx.AsyncClient,
     investigation_id: UUID,
     expected_version: int,
+    expected_sha256: str,
     *,
     idempotency_key: str,
     evidence_ref: UUID | None,
@@ -1330,6 +1338,7 @@ async def _invoke_advisor(
             "arguments": arguments,
             "purpose": "Review one synthetic, no-sample article claim.",
             "expected_version": expected_version,
+            "expected_sha256": expected_sha256,
         },
         headers={"Idempotency-Key": idempotency_key},
     )
@@ -1339,6 +1348,7 @@ async def _invoke_advisor_reparse(
     client: httpx.AsyncClient,
     investigation_id: UUID,
     expected_version: int,
+    expected_sha256: str,
     *,
     observation_id: UUID,
     idempotency_key: str,
@@ -1353,6 +1363,7 @@ async def _invoke_advisor_reparse(
             },
             "purpose": "Locally reparse a separately persisted synthetic V4 fixture.",
             "expected_version": expected_version,
+            "expected_sha256": expected_sha256,
         },
         headers={"Idempotency-Key": idempotency_key},
     )

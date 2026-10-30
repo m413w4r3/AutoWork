@@ -485,10 +485,70 @@ class OperatorToolInvocationError(RuntimeError):
         self.details = dict(details or {})
 
 
+def _stale_working_state_error(
+    expected_version: int | None,
+    expected_sha256: str | None,
+    current_state: Any | None,
+) -> OperatorToolInvocationError:
+    current_version = getattr(current_state, "version", None)
+    current_sha256 = getattr(current_state, "sha256", None)
+    return OperatorToolInvocationError(
+        "stale_working_state",
+        409,
+        details={
+            "received": {
+                "working_state_version": expected_version,
+                "working_state_sha256": expected_sha256,
+            },
+            "current": {
+                "working_state_version": current_version,
+                "working_state_sha256": current_sha256,
+            },
+            "current_version": current_version,
+            "current_sha256": current_sha256,
+            "correction": (
+                "GET /api/investigations/{investigation_id}/operator/context and retry with "
+                "expected_version=<working_state_version> and "
+                "expected_sha256=<working_state_sha256> from that same response."
+            ),
+        },
+    )
+
+
+def _operator_reconciliation_path(investigation_id: UUID, invocation: ToolInvocation) -> str:
+    prefix = f"/api/investigations/{investigation_id}"
+    if invocation.tool_name == "advisor.consult":
+        return f"{prefix}/operator/invocations/{invocation.id}/reconcile"
+    return f"{prefix}/invocations/{invocation.id}/reconcile"
+
+
+def _ambiguous_invocation_details(
+    invocation: ToolInvocation, *, persisted_response_available: bool
+) -> dict[str, Any]:
+    advisor_action = invocation.tool_name == "advisor.consult"
+    return {
+        "existing_invocation_id": str(invocation.id),
+        "invocation_status": invocation.status.value,
+        "external_transport_occurred": None,
+        "persisted_response_available": persisted_response_available,
+        "persisted_response_refs": [str(item) for item in invocation.response_refs],
+        "next_action": {
+            "code": "reconcile_before_retry",
+            "method": "POST",
+            "path": _operator_reconciliation_path(invocation.investigation_id, invocation),
+            "expected_version": invocation.version,
+            "resubmission_allowed": False,
+            "other_pivots_allowed": True,
+            "requires_verified_human_operator": not advisor_action,
+        },
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorToolInvocationResult:
     investigation_id: UUID
     working_state_version: int
+    working_state_sha256: str
     invocation: ToolInvocation
     error_code: str | None
     job_id: UUID | None
@@ -539,9 +599,9 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError("investigation_not_started", 409)
         self._require_operator_mode(state.execution_mode)
         if expected_version is not None and state.version != expected_version:
-            raise OperatorToolInvocationError("stale_working_state", 409)
+            raise _stale_working_state_error(expected_version, expected_sha256, state)
         if expected_sha256 is not None and state.sha256 != expected_sha256:
-            raise OperatorToolInvocationError("stale_working_state", 409)
+            raise _stale_working_state_error(expected_version, expected_sha256, state)
         if state.pending_context_sha256 is not None:
             raise OperatorToolInvocationError("bridge_checkpoint_pending", 409)
         investigation = await self._investigations.get(self._investigation_id)
@@ -612,9 +672,9 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError("investigation_not_started", 409)
         self._require_operator_mode(state.execution_mode)
         if expected_version is not None and state.version != expected_version:
-            raise OperatorToolInvocationError("stale_working_state", 409)
+            raise _stale_working_state_error(expected_version, expected_sha256, state)
         if expected_sha256 is not None and state.sha256 != expected_sha256:
-            raise OperatorToolInvocationError("stale_working_state", 409)
+            raise _stale_working_state_error(expected_version, expected_sha256, state)
         if cursor is not None:
             if isinstance(cursor, bool):
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
@@ -889,6 +949,7 @@ class OperatorToolInvocationService:
         arguments: Mapping[str, Any],
         purpose: str,
         expected_version: int,
+        expected_sha256: str | None = None,
         idempotency_key: str,
         actor_id: str | None = None,
     ) -> OperatorToolInvocationResult:
@@ -940,6 +1001,7 @@ class OperatorToolInvocationService:
                 arguments=arguments,
                 purpose=purpose,
                 expected_version=expected_version,
+                expected_sha256=expected_sha256,
                 operation_prefix=operation_prefix,
                 operation_key=operation_key,
                 trace=trace,
@@ -985,6 +1047,27 @@ class OperatorToolInvocationService:
         # Rows written before the provenance marker existed used the built-in v1
         # passive adapters. Later schema versions must carry explicit provenance.
         return invocation.schema_version == "1"
+
+    async def _has_persisted_adapter_response(self, invocation: ToolInvocation) -> bool:
+        if self._observations is None or self._evidence_summaries is None:
+            return False
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if observation is None or observation.investigation_id != invocation.investigation_id:
+                continue
+            try:
+                summary = await self._evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if (
+                not isinstance(summary, Mapping)
+                or not summary
+                or summary.get("adapter_output_archived") is False
+                or "framework_pre_submission_proof" in summary
+            ):
+                continue
+            return True
+        return False
 
     async def _settle_passive_read_reservation(self, invocation: ToolInvocation) -> ToolInvocation:
         """Close an uncertain passive GET reservation before a fresh retry."""
@@ -1044,6 +1127,7 @@ class OperatorToolInvocationService:
         arguments: Mapping[str, Any],
         purpose: str,
         expected_version: int,
+        expected_sha256: str | None,
         operation_prefix: str,
         operation_key: str,
         trace: Mapping[str, Any] | None,
@@ -1053,6 +1137,12 @@ class OperatorToolInvocationService:
         if state is None:
             raise OperatorToolInvocationError("investigation_not_started", 409)
         self._require_operator_mode(state.execution_mode)
+        if (
+            state.version == expected_version
+            and expected_sha256 is not None
+            and state.sha256 != expected_sha256
+        ):
+            raise _stale_working_state_error(expected_version, expected_sha256, state)
         investigation = await self._investigations.get(self._investigation_id)
         if investigation is None:
             raise OperatorToolInvocationError("investigation_not_found", 404)
@@ -1107,14 +1197,14 @@ class OperatorToolInvocationService:
                 # A persisted RUNNING row may still belong to a live adapter call
                 # in another process. Never settle it or turn it into a retryable
                 # NEEDS_REVIEW occurrence from the request replay path.
-                return await self._result(existing, state.version, replay=True)
+                return await self._result(existing, state.version, state.sha256, replay=True)
             if (
                 existing.status is ToolInvocationStatus.NEEDS_REVIEW
                 and self._is_trusted_passive_read(tool_name, definition, registered)
                 and self._persisted_passive_read_trust(existing)
             ):
                 existing = await self._settle_passive_read_reservation(existing)
-            return await self._result(existing, state.version, replay=True)
+            return await self._result(existing, state.version, state.sha256, replay=True)
 
         semantic_parameters = _semantic_parameters_fingerprint(
             tool_name, arguments, self._investigation_id
@@ -1133,7 +1223,12 @@ class OperatorToolInvocationService:
             ):
                 continue
             if existing.status is ToolInvocationStatus.RUNNING:
-                details: dict[str, Any] = {"existing_invocation_id": str(existing.id)}
+                details = _ambiguous_invocation_details(
+                    existing,
+                    persisted_response_available=await self._has_persisted_adapter_response(
+                        existing
+                    ),
+                )
                 raise OperatorToolInvocationError(
                     "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
                 )
@@ -1172,7 +1267,10 @@ class OperatorToolInvocationService:
                 # budget before each physical request.
                 await self._settle_passive_read_reservation(existing)
                 continue
-            details: dict[str, Any] = {"existing_invocation_id": str(existing.id)}
+            details = _ambiguous_invocation_details(
+                existing,
+                persisted_response_available=await self._has_persisted_adapter_response(existing),
+            )
             if proof_rejection is not None:
                 details["framework_proof_rejection"] = proof_rejection
             raise OperatorToolInvocationError(
@@ -1205,8 +1303,10 @@ class OperatorToolInvocationService:
         ):
             raise OperatorToolInvocationError("external_disclosure_denied", 403)
 
-        if state.version != expected_version:
-            raise OperatorToolInvocationError("stale_working_state", 409)
+        if state.version != expected_version or (
+            expected_sha256 is not None and state.sha256 != expected_sha256
+        ):
+            raise _stale_working_state_error(expected_version, expected_sha256, state)
 
         record_purpose = purpose
         checkpoint = trace.get("checkpoint") if isinstance(trace, Mapping) else None
@@ -1354,7 +1454,10 @@ class OperatorToolInvocationService:
                 updated_state, expected_version=state.version
             )
         except (VersionConflictError, InvestigationStateVersionConflict):
-            raise OperatorToolInvocationError("stale_working_state", 409) from None
+            current_state = await self._states.get(self._investigation_id)
+            raise _stale_working_state_error(
+                expected_version, expected_sha256, current_state
+            ) from None
 
         budget = (
             envelope.budget
@@ -1402,6 +1505,7 @@ class OperatorToolInvocationService:
         return await self._result(
             invocation,
             updated_state.version,
+            updated_state.sha256,
             replay=False,
             tool_result=result,
             unavailable_reason=(
@@ -1535,6 +1639,7 @@ class OperatorToolInvocationService:
         self,
         invocation: ToolInvocation,
         state_version: int,
+        state_sha256: str,
         *,
         replay: bool,
         tool_result: Any | None = None,
@@ -1636,6 +1741,12 @@ class OperatorToolInvocationService:
         }:
             if safe_nested_error_code is not None:
                 result_data = {"error_code": safe_nested_error_code}
+                if safe_nested_error_code == "invalid_tool_arguments" and tool_result is not None:
+                    result_data["validation_errors"] = _operator_validation_errors(
+                        tool_result.output.get("validation_errors")
+                        if isinstance(tool_result.output, Mapping)
+                        else None
+                    )
         elif tool_result is not None:
             result_data = (
                 _finding_tool_result_data(invocation, tool_result)
@@ -1660,6 +1771,31 @@ class OperatorToolInvocationService:
             "status": invocation.status.value,
             "untrusted_data": True,
             "data": safe_data,
+            "next_action": {
+                "code": (
+                    "reconcile_before_retry"
+                    if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                    else "continue_with_current_context"
+                ),
+                "method": "POST"
+                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else "GET",
+                "path": _operator_reconciliation_path(self._investigation_id, invocation)
+                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else f"/api/investigations/{self._investigation_id}/operator/context",
+                "expected_version": invocation.version
+                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else state_version,
+                "expected_sha256": None
+                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else state_sha256,
+                "resubmission_allowed": False
+                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else None,
+                "other_pivots_allowed": True
+                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else None,
+            },
         }
         if invocation.status in {
             ToolInvocationStatus.UNAVAILABLE,
@@ -1682,9 +1818,15 @@ class OperatorToolInvocationService:
                     required_capability=required_capability,
                 ),
             }
+            if error_code == "invalid_tool_arguments":
+                output["error"]["correction"] = (
+                    "Use the published arguments_schema in available_tools and correct the "
+                    "listed fields before retrying."
+                )
         return OperatorToolInvocationResult(
             investigation_id=invocation.investigation_id,
             working_state_version=state_version,
+            working_state_sha256=state_sha256,
             invocation=replace(invocation, response_refs=tuple(response_refs)),
             error_code=error_code,
             job_id=job_id,
@@ -1707,6 +1849,29 @@ def _safe_operator_error_code(value: object, parameters: Mapping[str, Any]) -> s
     if value.casefold() in _parameter_string_values(parameters):
         return None
     return value
+
+
+def _operator_validation_errors(value: Any) -> list[dict[str, str]]:
+    """Preserve only bounded, sanitized field diagnostics from schema validation."""
+    if not isinstance(value, list | tuple):
+        return []
+    fields = ("argument", "expected", "received", "value")
+    result: list[dict[str, str]] = []
+    for item in value[:4]:
+        if not isinstance(item, Mapping):
+            continue
+        issue: dict[str, str] = {}
+        for field in fields:
+            raw = item.get(field)
+            if not isinstance(raw, str):
+                continue
+            sanitized = _sanitize_json({field: raw})
+            safe = sanitized.get(field) if isinstance(sanitized, Mapping) else None
+            if isinstance(safe, str):
+                issue[field] = safe[:256]
+        if issue:
+            result.append(issue)
+    return result
 
 
 def _parameter_string_values(value: Any) -> set[str]:
