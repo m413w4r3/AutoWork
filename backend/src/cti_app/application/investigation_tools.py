@@ -342,9 +342,40 @@ def project_tool_availability(
     for name in (*catalog_names, *known_tool_names):
         if name not in unavailable and name not in {item.name for item in available}:
             unavailable[name] = context.unavailable_tool_reasons.get(name, "dependency_unavailable")
+    retry_hints: set[tuple[str, str]] = set()
+    from cti_app.application.investigation_vt_tools import (
+        VT_PASSIVE_RETRY_HINT_PREFIX,
+        VT_PASSIVE_RETRY_TOOL_NAMES,
+        is_trusted_vt_passive_read_adapter,
+    )
+
+    for blocked in context.blocked_capabilities:
+        if not blocked.startswith(VT_PASSIVE_RETRY_HINT_PREFIX):
+            continue
+        tool_version = blocked.removeprefix(VT_PASSIVE_RETRY_HINT_PREFIX)
+        tool_name, separator, _old_schema_version = tool_version.rpartition("@")
+        if not separator or tool_name not in VT_PASSIVE_RETRY_TOOL_NAMES:
+            continue
+        candidate_definitions = (
+            item
+            for item in available
+            if item.name == tool_name and item.effect is ToolEffect.EXTERNAL_READ
+        )
+        for definition in candidate_definitions:
+            registered = registry.get(tool_name, definition.schema_version)
+            if registered is not None and is_trusted_vt_passive_read_adapter(
+                tool_name, registered[1]
+            ):
+                # A later trusted passive adapter version can safely carry a fresh
+                # read occurrence when the original schema is no longer registered.
+                retry_hints.add((tool_name, definition.schema_version))
+    retry_readiness = tuple(
+        (f"{tool_name}@{schema_version}", "passive_retry_ready")
+        for tool_name, schema_version in sorted(retry_hints)
+    )
     return ToolAvailability(
         available=tuple(sorted(available, key=lambda item: (item.name, item.schema_version))),
-        unavailable=tuple(sorted(unavailable.items())),
+        unavailable=tuple(sorted((*unavailable.items(), *retry_readiness))),
     )
 
 

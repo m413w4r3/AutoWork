@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any
 from uuid import UUID
 
 from cti_app.application.bridge_investigator import (
     make_investigation_conversation_id,
     make_investigation_turn_idempotency_key,
+)
+from cti_app.application.investigation_vt_tools import (
+    VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
@@ -21,6 +25,7 @@ from cti_app.domain.investigation import (
     ToolInvocation,
     ToolInvocationStatus,
     canonical_json_bytes,
+    thaw_json,
 )
 from cti_app.domain.investigation_state import (
     InvestigationWorkingState,
@@ -44,6 +49,7 @@ class OperatorNextAction(StrEnum):
     INSPECT_BRIDGE_TURN = "inspect_bridge_turn"
     RECONCILE_MODEL_CONVERSATION_TURN = "reconcile_model_conversation_turn"
     RECONCILE_TOOL_INVOCATION = "reconcile_tool_invocation"
+    RETRY_PASSIVE_READ = "retry_passive_read"
     REQUEST_G2_DECISION = "request_g2_decision"
     CREATE_NEW_INVESTIGATION = "create_new_investigation"
     RESUME_INVESTIGATION = "resume_investigation"
@@ -168,6 +174,13 @@ def build_investigation_operator_view(
     pending_bridge_turn_key: str | None = None,
     provider_response_ids: Mapping[UUID, str] | None = None,
 ) -> InvestigationOperatorView:
+    (
+        projected_available_tools,
+        projected_unavailable_tools,
+        retryable_vt_tool_versions,
+    ) = _project_operator_tool_inventory(
+        available_tools, unavailable_tools, envelope=envelope, g2_revoked=g2_revoked
+    )
     guidance = advisor_guidance or {
         "checkpoint_due": False,
         "reason": None,
@@ -206,9 +219,7 @@ def build_investigation_operator_view(
         for item in unresolved
         if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
     )
-    invocation_ids_by_operation_key = {
-        item.operation_key: item.id for item in ordered_invocations
-    }
+    invocation_ids_by_operation_key = {item.operation_key: item.id for item in ordered_invocations}
     latest_invocation = ordered_invocations[-1] if ordered_invocations else None
     pending_bridge_key = None
     bridge_conversation_id = make_investigation_conversation_id(investigation.id)
@@ -271,7 +282,13 @@ def build_investigation_operator_view(
             ),
         }
     elif latest_invocation is not None:
-        last_operation = _invocation_view(latest_invocation)
+        last_operation = _invocation_view(
+            latest_invocation,
+            investigation_id=investigation.id,
+            working_state_version=state.version,
+            available_tools=projected_available_tools,
+            retryable_vt_tool_versions=retryable_vt_tool_versions,
+        )
     else:
         last_operation = None
 
@@ -368,6 +385,8 @@ def build_investigation_operator_view(
         g2_revoked=g2_revoked,
         g2_reapproval_supported=g2_reapproval_supported,
         advisor_guidance=guidance,
+        available_tools=projected_available_tools,
+        retryable_vt_tool_versions=retryable_vt_tool_versions,
     )
     return InvestigationOperatorView(
         payload={
@@ -414,6 +433,9 @@ def build_investigation_operator_view(
                     item,
                     investigation_id=investigation.id,
                     provider_response_id=(provider_response_ids or {}).get(item.id),
+                    working_state_version=state.version,
+                    available_tools=projected_available_tools,
+                    retryable_vt_tool_versions=retryable_vt_tool_versions,
                 )
                 for item in ordered_invocations
             ],
@@ -422,6 +444,9 @@ def build_investigation_operator_view(
                     item,
                     investigation_id=investigation.id,
                     provider_response_id=(provider_response_ids or {}).get(item.id),
+                    working_state_version=state.version,
+                    available_tools=projected_available_tools,
+                    retryable_vt_tool_versions=retryable_vt_tool_versions,
                 )
                 for item in ambiguous
             ],
@@ -430,6 +455,9 @@ def build_investigation_operator_view(
                     item,
                     investigation_id=investigation.id,
                     provider_response_id=(provider_response_ids or {}).get(item.id),
+                    working_state_version=state.version,
+                    available_tools=projected_available_tools,
+                    retryable_vt_tool_versions=retryable_vt_tool_versions,
                 )
                 for item in unresolved
             ],
@@ -476,12 +504,12 @@ def build_investigation_operator_view(
             "budget": budget,
             "budget_reservations": reservations,
             "dependencies": {
-                "available": list(available_tools),
-                "unavailable": list(unavailable_tools),
+                "available": list(projected_available_tools),
+                "unavailable": list(projected_unavailable_tools),
             },
             "tool_inventory": {
-                "available": list(available_tools),
-                "unavailable": list(unavailable_tools),
+                "available": list(projected_available_tools),
+                "unavailable": list(projected_unavailable_tools),
             },
             "advisor_guidance": guidance,
             "next_idempotent_action": next_action,
@@ -489,16 +517,183 @@ def build_investigation_operator_view(
     )
 
 
+_PASSIVE_VT_RETRY_ARGUMENTS = {
+    "vt.file_report": frozenset({"file_hash"}),
+    "vt.object_report": frozenset({"object_type", "object_id"}),
+    "vt.relationships": frozenset({"object_type", "object_id", "relation"}),
+    "vt.intelligence_search": frozenset({"query", "justification", "evidence_refs"}),
+    "vt.behaviour": frozenset({"file_hash"}),
+    "vt.behaviour_pcap": frozenset({"file_hash", "sandbox_id"}),
+}
+_VT_RETRY_MAX_RESERVATIONS = {
+    "vt.file_report": {BudgetDimension.VT_UNITS: 1},
+    "vt.object_report": {BudgetDimension.VT_UNITS: 2},
+    # The operator projection receives names, not registered cost models;
+    # relationship/search/behaviour adapters can reserve up to 10 pages.
+    "vt.relationships": {BudgetDimension.VT_UNITS: 10},
+    "vt.intelligence_search": {BudgetDimension.VT_UNITS: 10},
+    "vt.behaviour": {BudgetDimension.VT_UNITS: 10},
+    "vt.behaviour_pcap": {BudgetDimension.VT_UNITS: 1},
+    "vt.download_sample": {
+        BudgetDimension.VT_UNITS: 1,
+        BudgetDimension.DOWNLOADS: 1,
+    },
+}
+
+
+def _project_operator_tool_inventory(
+    available_tools: tuple[str, ...],
+    unavailable_tools: tuple[str, ...],
+    *,
+    envelope: InvestigationEnvelope | None,
+    g2_revoked: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...], frozenset[tuple[str, str]]]:
+    """Hide externally gated tools whose current blocker is visible in status."""
+    diagnostics: set[str] = set()
+    retryable_vt_tool_versions: set[tuple[str, str]] = set()
+    for item in unavailable_tools:
+        name, separator, reason = item.partition(":")
+        if separator and reason == "passive_retry_ready":
+            tool_name, version_separator, schema_version = name.rpartition("@")
+            if version_separator:
+                retryable_vt_tool_versions.add((tool_name, schema_version))
+                continue
+        diagnostics.add(item)
+    bridge_disclosure_denied = any(
+        item == "bridge.advisor:external_llm_disclosure_denied" for item in unavailable_tools
+    )
+    vt_reason: str | None = None
+    if g2_revoked:
+        vt_reason = "envelope_revoked"
+    elif (
+        envelope is None or bridge_disclosure_denied or not envelope.disclosure.external_llm_allowed
+    ):
+        vt_reason = "external_disclosure_denied"
+    elif "vt" not in envelope.allowed_providers:
+        vt_reason = "provider_not_authorized"
+    elif envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red":
+        vt_reason = "external_disclosure_denied"
+
+    visible: list[str] = []
+    for name in available_tools:
+        reason = vt_reason if name.startswith("vt.") else None
+        if reason is None and name in _VT_RETRY_MAX_RESERVATIONS and envelope is not None:
+            for dimension, amount in _VT_RETRY_MAX_RESERVATIONS[name].items():
+                remaining = envelope.budget.remaining.get(dimension)
+                if remaining is not None and remaining < amount:
+                    reason = "budget_exhausted"
+                    break
+        if (
+            name == "vt.download_sample"
+            and envelope is not None
+            and not envelope.acquire_hits_allowed
+        ):
+            reason = "acquisition_not_authorized"
+        if reason is None:
+            visible.append(name)
+        else:
+            diagnostics.add(f"{name}:{reason}")
+    visible_names = set(visible)
+    retryable_vt_tool_versions = {
+        key for key in retryable_vt_tool_versions if key[0] in visible_names
+    }
+    return (
+        tuple(visible),
+        tuple(sorted(diagnostics)),
+        frozenset(retryable_vt_tool_versions),
+    )
+
+
+def _passive_retry_action(
+    invocation: ToolInvocation,
+    *,
+    investigation_id: UUID,
+    working_state_version: int,
+    available_tools: tuple[str, ...],
+    retryable_vt_tool_versions: frozenset[tuple[str, str]],
+) -> dict[str, Any] | None:
+    fields = _PASSIVE_VT_RETRY_ARGUMENTS.get(invocation.tool_name)
+    if (
+        invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
+        or fields is None
+        or invocation.tool_name not in available_tools
+    ):
+        return None
+    retryable_schema_versions = sorted(
+        schema_version
+        for tool_name, schema_version in retryable_vt_tool_versions
+        if tool_name == invocation.tool_name
+    )
+    if not retryable_schema_versions:
+        return None
+    raw_arguments = thaw_json(invocation.normalized_parameters)
+    if (
+        not isinstance(raw_arguments, Mapping)
+        or raw_arguments.get(VT_PASSIVE_RETRY_TRUSTED_PARAMETER) is not True
+    ):
+        return None
+    arguments = {key: value for key, value in raw_arguments.items() if key in fields}
+    required = {
+        "vt.file_report": {"file_hash"},
+        "vt.object_report": {"object_type", "object_id"},
+        "vt.relationships": {"object_type", "object_id", "relation"},
+        "vt.intelligence_search": {"query", "justification", "evidence_refs"},
+        "vt.behaviour": {"file_hash"},
+        "vt.behaviour_pcap": {"file_hash", "sandbox_id"},
+    }[invocation.tool_name]
+    if not required.issubset(arguments):
+        return None
+    if invocation.tool_name == "vt.intelligence_search":
+        refs = arguments["evidence_refs"]
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs):
+            return None
+        try:
+            tuple(UUID(ref) for ref in refs)
+        except ValueError:
+            return None
+    retry_schema_version = (
+        invocation.schema_version
+        if invocation.schema_version in retryable_schema_versions
+        else retryable_schema_versions[0]
+    )
+    return {
+        "method": "POST",
+        "path": f"/api/investigations/{investigation_id}/operator/tools/{invocation.tool_name}",
+        "tool_name": invocation.tool_name,
+        "schema_version": retry_schema_version,
+        "arguments": arguments,
+        "purpose": "Retry an idempotent passive VT read as a new occurrence.",
+        "expected_version": working_state_version,
+        "idempotency_key": f"operator-passive-retry:{invocation.id}:{invocation.version}",
+        "requires_new_occurrence": True,
+        "resubmission_allowed": True,
+    }
+
+
 def _invocation_view(
     invocation: ToolInvocation,
     *,
     investigation_id: UUID | None = None,
     provider_response_id: str | None = None,
+    working_state_version: int | None = None,
+    available_tools: tuple[str, ...] = (),
+    retryable_vt_tool_versions: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     needs_reconciliation = invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-    reconcile_path = (
-        f"/api/investigations/{investigation_id}/operator/invocations/{invocation.id}/reconcile"
+    reconciliation_action = (
+        _reconciliation_action(invocation, investigation_id=investigation_id)
         if investigation_id is not None and needs_reconciliation
+        else None
+    )
+    retry_action = (
+        _passive_retry_action(
+            invocation,
+            investigation_id=investigation_id,
+            working_state_version=working_state_version,
+            available_tools=available_tools,
+            retryable_vt_tool_versions=retryable_vt_tool_versions,
+        )
+        if investigation_id is not None and working_state_version is not None
         else None
     )
     return {
@@ -509,6 +704,7 @@ def _invocation_view(
         "version": invocation.version,
         "response_refs": list(invocation.response_refs),
         "provider_response_id": provider_response_id,
+        "resubmission_allowed": retry_action is not None,
         "evidence_missing": (
             ["provider outcome reconciliation"]
             if needs_reconciliation
@@ -517,22 +713,42 @@ def _invocation_view(
             else ["provider response or reconciliation evidence"]
         ),
         "decision_expected": (
-            "reconcile before resume"
+            "retry passive read as a new occurrence"
+            if retry_action is not None
+            else "reconcile before resume"
             if invocation.status in {ToolInvocationStatus.PENDING, ToolInvocationStatus.RUNNING}
             or needs_reconciliation
             else None
         ),
-        "reconciliation_action": (
-            {
-                "method": "POST",
-                "path": reconcile_path,
-                "expected_version": invocation.version,
-                "resubmission_allowed": False,
-            }
-            if reconcile_path is not None
-            else None
-        ),
+        "reconciliation_action": reconciliation_action,
+        "retry_action": retry_action,
         "updated_at": invocation.updated_at,
+    }
+
+
+def _reconciliation_action(
+    invocation: ToolInvocation,
+    *,
+    investigation_id: UUID,
+) -> dict[str, Any]:
+    prefix = f"/api/investigations/{investigation_id}"
+    if invocation.tool_name == "advisor.consult":
+        return {
+            "method": "POST",
+            "path": f"{prefix}/operator/invocations/{invocation.id}/reconcile",
+            "expected_version": invocation.version,
+            "resubmission_allowed": False,
+        }
+    return {
+        "method": "POST",
+        "path": f"{prefix}/invocations/{invocation.id}/reconcile",
+        "expected_version": invocation.version,
+        "accepted_outcomes": ["executed_with_result", "not_executed", "abandon"],
+        "reason_required": True,
+        "response_refs_allowed_for": "executed_with_result",
+        "idempotency_key_header": "Idempotency-Key",
+        "requires_verified_human_operator": True,
+        "resubmission_allowed": False,
     }
 
 
@@ -553,6 +769,8 @@ def _next_action(
     g2_revoked: bool,
     g2_reapproval_supported: bool,
     advisor_guidance: dict[str, Any],
+    available_tools: tuple[str, ...],
+    retryable_vt_tool_versions: frozenset[tuple[str, str]],
 ) -> dict[str, Any]:
     prefix = f"/api/investigations/{investigation.id}"
     if active_jobs:
@@ -566,13 +784,23 @@ def _next_action(
     if unresolved:
         invocation = unresolved[0]
         if invocation.status is ToolInvocationStatus.NEEDS_REVIEW:
+            retry_action = _passive_retry_action(
+                invocation,
+                investigation_id=investigation.id,
+                working_state_version=state.version,
+                available_tools=available_tools,
+                retryable_vt_tool_versions=retryable_vt_tool_versions,
+            )
+            if retry_action is not None:
+                return {
+                    "code": OperatorNextAction.RETRY_PASSIVE_READ.value,
+                    "invocation_id": invocation.id,
+                    **retry_action,
+                }
             return {
                 "code": OperatorNextAction.RECONCILE_TOOL_INVOCATION.value,
-                "method": "POST",
-                "path": f"{prefix}/operator/invocations/{invocation.id}/reconcile",
                 "invocation_id": invocation.id,
-                "expected_version": invocation.version,
-                "resubmission_allowed": False,
+                **_reconciliation_action(invocation, investigation_id=investigation.id),
             }
         return {
             "code": OperatorNextAction.RECONCILE_TOOL_INVOCATION.value,
@@ -626,10 +854,15 @@ def _next_action(
         pending_bridge_key is not None
         and pending_bridge_turn_id is not None
         and (
-            pending_bridge_turn_status == "needs_review"
-            and pending_bridge_turn_error_code in {"operator_interrupted", "orphaned_running_turn"}
-            or pending_bridge_turn_status == "failed"
-            and pending_bridge_turn_error_code == "operator_abandoned"
+            (
+                pending_bridge_turn_status == "needs_review"
+                and pending_bridge_turn_error_code
+                in {"operator_interrupted", "orphaned_running_turn"}
+            )
+            or (
+                pending_bridge_turn_status == "failed"
+                and pending_bridge_turn_error_code == "operator_abandoned"
+            )
         )
     ):
         turn_prefix = (

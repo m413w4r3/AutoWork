@@ -34,8 +34,16 @@ _COVERED_STATUSES = frozenset(
     }
 )
 _RETRYABLE_VT_PASSIVE_READS = frozenset(
-    {"vt.file_report", "vt.relationships", "vt.intelligence_search", "vt.behaviour"}
+    {
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    }
 )
+_VT_PASSIVE_RETRY_TRUSTED_PARAMETER = "_vt_passive_retry_adapter_trusted"
 
 
 def available_investigation_pivots(
@@ -46,22 +54,59 @@ def available_investigation_pivots(
     tool_coverage: Sequence[ToolCoverageEntryV1],
     invocations: Sequence[ToolInvocation],
     observations: Sequence[EvidenceObservation],
+    blocked_tool_reasons: Mapping[tuple[str, str], str] | None = None,
+    retryable_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> tuple[tuple[AvailablePivotV1, ...], bool]:
     """Return only valid read-tool calls whose exact normalized arguments are not covered."""
     read_tools = {
-        item.name: item
+        (item.name, item.schema_version): item
         for item in tools
         if item.effect in {ToolEffect.LOCAL_READ, ToolEffect.EXTERNAL_READ}
     }
+    blocked_tool_reasons = blocked_tool_reasons or {}
+    from cti_app.application.investigation_vt_tools import VT_PASSIVE_RETRY_TOOL_NAMES
+
+    blocked_retry_arguments: set[tuple[str, bytes]] = set()
+    for invocation in invocations:
+        if (
+            invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
+            or invocation.tool_name not in VT_PASSIVE_RETRY_TOOL_NAMES
+        ):
+            continue
+        parameters = thaw_json(invocation.normalized_parameters)
+        if not isinstance(parameters, Mapping):
+            continue
+        persisted_trust = parameters.get(_VT_PASSIVE_RETRY_TRUSTED_PARAMETER)
+        legacy_builtin = (
+            _VT_PASSIVE_RETRY_TRUSTED_PARAMETER not in parameters
+            and invocation.schema_version == "1"
+        )
+        if persisted_trust is True or legacy_builtin:
+            continue
+        blocked_retry_arguments.add(
+            (
+                invocation.tool_name,
+                canonical_json_bytes(_tool_arguments(parameters)),
+            )
+        )
     visible_coverage = {item.invocation_id: item for item in tool_coverage}
+    retryable_tools = retryable_vt_tool_versions
+    if retryable_tools is None:
+        retryable_tools = frozenset(
+            key for key in read_tools if key[0] in _RETRYABLE_VT_PASSIVE_READS
+        )
     covered_arguments = {
-        (item.tool_name, canonical_json_bytes(_tool_arguments(item.normalized_parameters)))
+        (
+            item.tool_name,
+            item.schema_version,
+            canonical_json_bytes(_tool_arguments(item.normalized_parameters)),
+        )
         for item in invocations
         if item.status in _COVERED_STATUSES
         and not (
             item.status is ToolInvocationStatus.NEEDS_REVIEW
             and item.tool_name in _RETRYABLE_VT_PASSIVE_READS
-            and item.tool_name in read_tools
+            and (item.tool_name, item.schema_version) in read_tools
         )
         and (
             item.id not in visible_coverage or visible_coverage[item.id].status in _COVERED_STATUSES
@@ -78,7 +123,7 @@ def available_investigation_pivots(
         key = (object_type, object_value)
         observation_ids_by_indicator.setdefault(key, []).append(str(observation.id))
 
-    candidates: dict[tuple[str, str], AvailablePivotV1] = {}
+    candidates: dict[tuple[str, str, str], AvailablePivotV1] = {}
     document_backed_indicators = {
         (item.indicator_type, _indicator_value_key(item.indicator_type, item.value))
         for item in inventory
@@ -91,28 +136,47 @@ def available_investigation_pivots(
         indicator_type: PivotableIndicatorType,
         indicator_value: str,
         arguments: Mapping[str, Any],
+        schema_version: str | None = None,
         blocked_reason: str | None = None,
     ) -> None:
-        tool = read_tools.get(tool_name)
-        if tool is None or not _arguments_fit_schema(arguments, tool.arguments_schema):
-            return
         normalized = canonical_json_bytes(dict(arguments))
-        identity = (tool_name, normalized)
-        if identity in covered_arguments:
-            return
-        # The visible coverage index supplies statuses for displayed invocations;
-        # the full persisted invocation record supplies the complete parameter map,
-        # since parameter_key intentionally shows only one compact discriminator.
-        pivot = AvailablePivotV1(
-            tool_name=tool_name,
-            schema_version=tool.schema_version,
-            indicator_type=indicator_type,
-            indicator_value=indicator_value,
-            arguments=dict(arguments),
-            execution_state="blocked" if blocked_reason else "available",
-            blocked_reason=blocked_reason,
+        matching_tools = (
+            (read_tools[(tool_name, schema_version)],)
+            if schema_version is not None and (tool_name, schema_version) in read_tools
+            else ()
+            if schema_version is not None
+            else tuple(tool for (name, _version), tool in read_tools.items() if name == tool_name)
         )
-        candidates[(tool_name, normalized.decode("utf-8"))] = pivot
+        for tool in matching_tools:
+            identity = (tool_name, tool.schema_version, normalized)
+            if (
+                not _arguments_fit_schema(arguments, tool.arguments_schema)
+                or identity in covered_arguments
+            ):
+                continue
+            # The visible coverage index supplies statuses for displayed invocations;
+            # the full persisted invocation record supplies the complete parameter map,
+            # since parameter_key intentionally shows only one compact discriminator.
+            tool_key = (tool_name, tool.schema_version)
+            effective_block = (
+                blocked_tool_reasons.get(tool_key)
+                or blocked_reason
+                or (
+                    "ambiguous_tool_invocation_requires_reconciliation"
+                    if (tool_name, normalized) in blocked_retry_arguments
+                    else None
+                )
+            )
+            pivot = AvailablePivotV1(
+                tool_name=tool_name,
+                schema_version=tool.schema_version,
+                indicator_type=indicator_type,
+                indicator_value=indicator_value,
+                arguments=dict(arguments),
+                execution_state="blocked" if effective_block else "available",
+                blocked_reason=effective_block,
+            )
+            candidates[(tool_name, tool.schema_version, normalized.decode("utf-8"))] = pivot
 
     indicator_values = tuple((item.indicator_type, item.value) for item in inventory) + tuple(
         discovered_inventory
@@ -221,7 +285,7 @@ def available_investigation_pivots(
         if (
             invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
             or invocation.tool_name != "vt.behaviour"
-            or invocation.tool_name not in read_tools
+            or (invocation.tool_name, invocation.schema_version) not in read_tools
         ):
             continue
         previous_arguments = _tool_arguments(invocation.normalized_parameters)
@@ -247,16 +311,25 @@ def available_investigation_pivots(
                 )
                 in document_backed_indicators
             )
+            retry_blocker = None
+            if not source_available:
+                retry_blocker = "source_references_required"
+            elif (invocation.tool_name, invocation.schema_version) not in retryable_tools:
+                retry_blocker = blocked_tool_reasons.get(
+                    (invocation.tool_name, invocation.schema_version),
+                    "ambiguous_tool_invocation_requires_reconciliation",
+                )
             add(
                 tool_name="vt.behaviour",
                 indicator_type=kind,
                 indicator_value=value,
                 arguments={"file_hash": value},
-                blocked_reason=(None if source_available else "source_references_required"),
+                schema_version=invocation.schema_version,
+                blocked_reason=retry_blocker,
             )
 
     ordered = tuple(
-        candidates[key] for key in sorted(candidates, key=lambda item: (item[0], item[1]))
+        candidates[key] for key in sorted(candidates, key=lambda item: (item[0], item[1], item[2]))
     )
     result: list[AvailablePivotV1] = []
     used_bytes = 2

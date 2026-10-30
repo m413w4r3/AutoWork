@@ -834,6 +834,20 @@ def is_trusted_vt_passive_read_adapter(tool_name: str, adapter: object) -> bool:
     )
 
 
+VT_PASSIVE_RETRY_TRUSTED_PARAMETER = "_vt_passive_retry_adapter_trusted"
+VT_PASSIVE_RETRY_HINT_PREFIX = "operator_passive_retry:"
+VT_PASSIVE_RETRY_TOOL_NAMES = frozenset(
+    {
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    }
+)
+
+
 class _FileReportAdapter(_VirusTotalAdapter):
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext

@@ -54,7 +54,10 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
 )
-from cti_app.application.investigation_vt_tools import is_trusted_vt_passive_read_adapter
+from cti_app.application.investigation_vt_tools import (
+    VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
+    is_trusted_vt_passive_read_adapter,
+)
 from cti_app.application.operator_context_summary import (
     OperatorContextItemPageV1,
 )
@@ -972,6 +975,15 @@ class OperatorToolInvocationService:
             and is_trusted_vt_passive_read_adapter(tool_name, registered[1])
         )
 
+    @staticmethod
+    def _persisted_passive_read_trust(invocation: ToolInvocation) -> bool:
+        parameters = invocation.normalized_parameters
+        if VT_PASSIVE_RETRY_TRUSTED_PARAMETER in parameters:
+            return parameters.get(VT_PASSIVE_RETRY_TRUSTED_PARAMETER) is True
+        # Rows written before the provenance marker existed used the built-in v1
+        # passive adapters. Later schema versions must carry explicit provenance.
+        return invocation.schema_version == "1"
+
     async def _settle_passive_read_reservation(self, invocation: ToolInvocation) -> ToolInvocation:
         """Close an uncertain passive GET reservation before a fresh retry."""
         envelope = await self._envelopes.get(self._investigation_id)
@@ -1090,16 +1102,15 @@ class OperatorToolInvocationService:
             if existing.operation_key != operation_key:
                 raise OperatorToolInvocationError("idempotency_conflict", 409)
             if existing.status in {ToolInvocationStatus.PENDING, ToolInvocationStatus.RUNNING}:
-                reviewed = existing.transition(ToolInvocationStatus.NEEDS_REVIEW)
-                existing = await self._invocations.update_if_version(
-                    reviewed, expected_version=existing.version
-                )
-                await self._execution.commit_current_uow()
-            if existing.status in {
-                ToolInvocationStatus.PENDING,
-                ToolInvocationStatus.RUNNING,
-                ToolInvocationStatus.NEEDS_REVIEW,
-            } and self._is_trusted_passive_read(tool_name, definition, registered):
+                # A persisted RUNNING row may still belong to a live adapter call
+                # in another process. Never settle it or turn it into a retryable
+                # NEEDS_REVIEW occurrence from the request replay path.
+                return await self._result(existing, state.version, replay=True)
+            if (
+                existing.status is ToolInvocationStatus.NEEDS_REVIEW
+                and self._is_trusted_passive_read(tool_name, definition, registered)
+                and self._persisted_passive_read_trust(existing)
+            ):
                 existing = await self._settle_passive_read_reservation(existing)
             return await self._result(existing, state.version, replay=True)
 
@@ -1119,39 +1130,12 @@ class OperatorToolInvocationService:
                 not in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
             ):
                 continue
-            proof, proof_rejection = await self._framework_pre_submission_proof(existing)
-            if existing.status is ToolInvocationStatus.RUNNING and self._is_trusted_passive_read(
-                tool_name, definition, registered
-            ):
-                reviewed = existing.transition(ToolInvocationStatus.NEEDS_REVIEW)
-                existing = await self._invocations.update_if_version(
-                    reviewed, expected_version=existing.version
+            if existing.status is ToolInvocationStatus.RUNNING:
+                details: dict[str, Any] = {"existing_invocation_id": str(existing.id)}
+                raise OperatorToolInvocationError(
+                    "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
                 )
-                if proof is not None:
-                    resolved = existing.resolve_pre_submission_failure()
-                    existing = await self._invocations.update_if_version(
-                        resolved, expected_version=existing.version
-                    )
-                    failure = ToolResult(
-                        ToolInvocationStatus.FAILED,
-                        error_code=proof.value,
-                        message=(
-                            "Persisted evidence proves the prior invocation did not reach "
-                            "external submission."
-                        ),
-                        framework_pre_submission_proof=proof,
-                    )
-                    await self._execution._complete_tool_reservation(
-                        investigation_id=self._investigation_id,
-                        operation_key=existing.operation_key,
-                        result=failure,
-                        reserved_amounts=existing.reserved_budget,
-                        uncertain=False,
-                    )
-                    await self._execution.commit_current_uow()
-                else:
-                    existing = await self._settle_passive_read_reservation(existing)
-                continue
+            proof, proof_rejection = await self._framework_pre_submission_proof(existing)
             if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
                 existing = await self._invocations.update_if_version(
@@ -1178,6 +1162,7 @@ class OperatorToolInvocationService:
             if (
                 existing.status is ToolInvocationStatus.NEEDS_REVIEW
                 and self._is_trusted_passive_read(tool_name, definition, registered)
+                and self._persisted_passive_read_trust(existing)
             ):
                 # A passive VT GET can safely be attempted under a fresh
                 # invocation even if canonical result archival failed; the
@@ -1830,6 +1815,7 @@ def _semantic_parameters_fingerprint(
     # them out of semantic replay matching so retries still find the original
     # unresolved operation.
     normalized.pop(_VT_SOURCE_REFS_PARAMETER, None)
+    normalized.pop(VT_PASSIVE_RETRY_TRUSTED_PARAMETER, None)
     if tool_name == "advisor.consult":
         question = normalized.get("question", "")
         if isinstance(question, str):

@@ -28,6 +28,7 @@ from cti_app.application.context_pagination import (
     order_keyset_items,
     source_reference,
 )
+from cti_app.application.external_effects import external_effect_source_do_not_submit_blocks
 from cti_app.application.investigation_contracts import (
     MAX_CONTEXT_CONFIRMED_IOCS,
     AdvisorGuidanceV1,
@@ -82,11 +83,13 @@ from cti_app.domain.analyst_opinion import (
 from cti_app.domain.investigation import (
     BudgetDimension,
     DetectionCandidateVersion,
+    EnvelopeAuthorityKind,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     InvestigationExecutionMode,
     InvestigationFinding,
+    TLPLevel,
     ToolInvocation,
     ToolInvocationStatus,
     canonical_json_bytes,
@@ -134,6 +137,87 @@ MAX_CONTEXT_RULE_CANDIDATES = 16
 USER_REQUEST_ACTION_PREFIX = "user-request:"
 MAX_OPERATOR_REQUESTS = 8
 MAX_OPERATOR_REQUEST_BYTES = 32_768
+
+
+def _current_tool_readiness_block(
+    definition: ToolDefinition,
+    *,
+    snapshot: ArticleSnapshot,
+    tool_context: ToolExecutionContext,
+    budget_remaining: Mapping[str, int | None],
+) -> str | None:
+    """Project the invocation-time G2, provider, disclosure and budget gates."""
+    envelope = tool_context.envelope
+    if definition.effect in {
+        ToolEffect.EXTERNAL_READ,
+        ToolEffect.ACQUIRE,
+        ToolEffect.EXTERNAL_ACTIVE,
+        ToolEffect.EXTERNAL_SUBMIT,
+    }:
+        if envelope is None:
+            return "external_disclosure_denied"
+        if not snapshot.external_llm_allowed or not envelope.disclosure.external_llm_allowed:
+            return "external_disclosure_denied"
+        raw_tlp = (snapshot.tlp or "").strip().casefold()
+        if raw_tlp.startswith("tlp:"):
+            raw_tlp = raw_tlp[4:].strip()
+        try:
+            source_tlp = TLPLevel(raw_tlp)
+        except ValueError:
+            return "external_disclosure_denied"
+        approved_tlp = envelope.disclosure.tlp
+        ranks = {
+            TLPLevel.WHITE: 0,
+            TLPLevel.CLEAR: 1,
+            TLPLevel.GREEN: 2,
+            TLPLevel.AMBER: 3,
+            TLPLevel.RED: 4,
+        }
+        if (
+            source_tlp is TLPLevel.RED
+            or approved_tlp is TLPLevel.RED
+            or (approved_tlp is not None and ranks[approved_tlp] < ranks[source_tlp])
+        ):
+            return "external_disclosure_denied"
+        provider = definition.name.split(".", 1)[0]
+        if provider not in envelope.allowed_providers:
+            return "provider_not_authorized"
+        if external_effect_source_do_not_submit_blocks(
+            definition.name,
+            snapshot.do_not_submit or envelope.disclosure.do_not_submit,
+        ):
+            return "external_disclosure_denied"
+        if definition.effect is ToolEffect.ACQUIRE and not envelope.acquire_hits_allowed:
+            return "acquisition_not_authorized"
+        if (
+            envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+            and tool_context.external_effect_authority is None
+        ):
+            # A materialized policy envelope is not proof that its policy remains active.
+            return "policy_authorization_unverified"
+
+    for raw_dimension, amount in definition.cost_model.items():
+        dimension = (
+            raw_dimension
+            if isinstance(raw_dimension, BudgetDimension)
+            else next(
+                (item for item in BudgetDimension if item.value == str(raw_dimension)),
+                None,
+            )
+        )
+        if dimension is None or dimension in {
+            BudgetDimension.CONTEXT_BYTES,
+            BudgetDimension.TOOL_SECONDS,
+        }:
+            continue
+        remaining = budget_remaining.get(dimension.value)
+        if remaining is None:
+            remaining = tool_context.budget.remaining.get(dimension)
+        if remaining is not None and remaining < amount:
+            return "budget_exhausted"
+    return None
+
+
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|"
     r"bearer|token|secret|password|authorization|credential|cookie|signature)",
@@ -1180,6 +1264,54 @@ class ResearchContextBuilder:
             if selected_registry is not None
             else None
         )
+        registry_definitions = tool_availability.available if tool_availability is not None else ()
+        retryable_vt_tool_versions: frozenset[tuple[str, str]] = frozenset()
+        if selected_registry is not None:
+            # A same-named adapter is not enough to make a fresh occurrence safe.
+            # Only the built-in adapters retain retryability after NEEDS_REVIEW.
+            from cti_app.application.investigation_service import _VT_PASSIVE_READ_TOOLS
+            from cti_app.application.investigation_vt_tools import (
+                is_trusted_vt_passive_read_adapter,
+            )
+
+            trusted_retryable_versions: set[tuple[str, str]] = set()
+            for definition in registry_definitions:
+                if (
+                    definition.name not in _VT_PASSIVE_READ_TOOLS
+                    or definition.effect is not ToolEffect.EXTERNAL_READ
+                ):
+                    continue
+                registered = selected_registry.get(definition.name, definition.schema_version)
+                if registered is not None and is_trusted_vt_passive_read_adapter(
+                    definition.name, registered[1]
+                ):
+                    trusted_retryable_versions.add((definition.name, definition.schema_version))
+            retryable_vt_tool_versions = frozenset(trusted_retryable_versions)
+        untrusted_needs_review_tools = {
+            (item.tool_name, item.schema_version)
+            for item in tool_invocations
+            if item.status is ToolInvocationStatus.NEEDS_REVIEW
+            and item.tool_name.startswith("vt.")
+            and (item.tool_name, item.schema_version) not in retryable_vt_tool_versions
+        }
+        blocked_tool_reasons: dict[tuple[str, str], str] = {}
+        executable_definitions: list[ToolDefinition] = []
+        for definition in registry_definitions:
+            reason = (
+                "ambiguous_tool_invocation_requires_reconciliation"
+                if (definition.name, definition.schema_version) in untrusted_needs_review_tools
+                else _current_tool_readiness_block(
+                    definition,
+                    snapshot=snapshot,
+                    tool_context=availability_context,
+                    budget_remaining=budget_remaining,
+                )
+            )
+            if reason is None:
+                executable_definitions.append(definition)
+            else:
+                blocked_tool_reasons[(definition.name, definition.schema_version)] = reason
+
         tools = tuple(
             ToolSummaryV1(
                 name=item.name,
@@ -1187,16 +1319,43 @@ class ResearchContextBuilder:
                 effect=item.effect,
                 arguments_schema=thaw_json(item.input_schema),
             )
-            for item in (
-                tool_availability.available[:MAX_CONTEXT_TOOLS]
-                if tool_availability is not None
-                else ()
+            for item in (executable_definitions[:MAX_CONTEXT_TOOLS])
+        )
+        pivot_tools = tuple(
+            ToolSummaryV1(
+                name=item.name,
+                schema_version=item.schema_version,
+                effect=item.effect,
+                arguments_schema=thaw_json(item.input_schema),
+            )
+            for item in registry_definitions[:MAX_CONTEXT_TOOLS]
+        )
+        unavailable_tool_diagnostics = tuple(
+            sorted(
+                {
+                    item
+                    for item in (
+                        tool_availability.unavailable_diagnostics
+                        if tool_availability is not None
+                        else ()
+                    )
+                    if not item.endswith(":passive_retry_ready")
+                }
             )
         )
-        unavailable_tool_diagnostics = (
-            tool_availability.unavailable_diagnostics if tool_availability is not None else ()
-        )
-        unavailable_tools = unavailable_tool_diagnostics[:MAX_CONTEXT_TOOLS]
+        unavailable_tools = tuple(
+            sorted(
+                {
+                    *unavailable_tool_diagnostics,
+                    *(
+                        f"{name}:{reason}"
+                        if sum(item.name == name for item in registry_definitions) == 1
+                        else f"{name}@{schema_version}:{reason}"
+                        for (name, schema_version), reason in blocked_tool_reasons.items()
+                    ),
+                }
+            )
+        )[:MAX_CONTEXT_TOOLS]
         hypothesis_payload = tuple(
             self._hypothesis_payload(
                 item,
@@ -1226,10 +1385,12 @@ class ResearchContextBuilder:
         available_pivots, pivots_truncated = available_investigation_pivots(
             inventory=indicator_inventory.items,
             discovered_inventory=discovered_inventory,
-            tools=tools,
+            tools=pivot_tools,
             tool_coverage=tool_coverage,
             invocations=tool_invocations,
             observations=observations,
+            blocked_tool_reasons=blocked_tool_reasons,
+            retryable_vt_tool_versions=retryable_vt_tool_versions,
         )
         available_pivots_truncated = pivots_truncated or pivot_observations_truncated
         user_requests = self._user_requests_from_actions(state.recent_actions)
@@ -1378,7 +1539,9 @@ class ResearchContextBuilder:
             tool_coverage_truncated=tool_coverage_truncated,
             latest_tool_results=latest_tool_results,
             sample_deltas_truncated=sample_deltas_truncated,
-            blocked_capabilities=tuple(item[:128] for item in all_blocked[:64]),
+            blocked_capabilities=tuple(
+                item[:128] for item in all_blocked if not item.startswith("operator_passive_retry:")
+            )[:64],
             budget_remaining=_safe_budget_names(budget_remaining),
         )
         context = InvestigationContextV1.model_construct(
@@ -3888,6 +4051,32 @@ async def blocked_capabilities_from_history(
 ) -> tuple[str, ...]:
     """Resolve the shared persisted provider blocks for prompt and status views."""
     blocked = set(additional)
+    from cti_app.application.investigation_vt_tools import (
+        VT_PASSIVE_RETRY_HINT_PREFIX,
+        VT_PASSIVE_RETRY_TOOL_NAMES,
+        VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
+    )
+
+    for invocation in invocations:
+        if (
+            invocation.status is not ToolInvocationStatus.NEEDS_REVIEW
+            or invocation.tool_name not in VT_PASSIVE_RETRY_TOOL_NAMES
+        ):
+            continue
+        parameters = thaw_json(invocation.normalized_parameters)
+        trusted = (
+            isinstance(parameters, Mapping)
+            and parameters.get(VT_PASSIVE_RETRY_TRUSTED_PARAMETER) is True
+        )
+        legacy_builtin = (
+            isinstance(parameters, Mapping)
+            and VT_PASSIVE_RETRY_TRUSTED_PARAMETER not in parameters
+            and invocation.schema_version == "1"
+        )
+        if trusted or legacy_builtin:
+            blocked.add(
+                f"{VT_PASSIVE_RETRY_HINT_PREFIX}{invocation.tool_name}@{invocation.schema_version}"
+            )
     blocked.update(
         await provider_authorization_blocked_capabilities(
             investigation_id=investigation_id,

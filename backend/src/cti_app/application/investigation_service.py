@@ -67,6 +67,7 @@ from cti_app.application.investigation_tools import (
     tool_operation_cache_identity,
 )
 from cti_app.application.investigation_vt_tools import (
+    VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
     _normalize_object_id,
     is_trusted_vt_passive_read_adapter,
 )
@@ -1514,6 +1515,16 @@ class InvestigationService:
                     else {}
                 ),
                 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER: True,
+            }
+        if tool_name in _VT_PASSIVE_READ_TOOLS and existing is None:
+            invocation_parameters = {
+                **invocation_parameters,
+                VT_PASSIVE_RETRY_TRUSTED_PARAMETER: bool(
+                    definition is not None
+                    and definition.effect is ToolEffect.EXTERNAL_READ
+                    and registered is not None
+                    and is_trusted_vt_passive_read_adapter(tool_name, registered[1])
+                ),
             }
         invocation = ToolInvocation(
             investigation_id=investigation.id,
@@ -4734,6 +4745,7 @@ def _tool_call_arguments_match(
     if not isinstance(call_arguments, dict):
         return False
     stored_arguments.pop(_VT_SOURCE_REFS_PARAMETER, None)
+    stored_arguments.pop(VT_PASSIVE_RETRY_TRUSTED_PARAMETER, None)
     return stored_arguments == call_arguments
 
 
