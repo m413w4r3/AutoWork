@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import importlib
 import pickle
 import time
@@ -150,6 +151,187 @@ def test_vt_consume_source_refs_keep_md5_and_sha1_outside_sample_hash_policy(
     hash_length: int,
 ) -> None:
     assert _source_refs_for_family("vt.file_report", {"file_hash": "a" * hash_length}) == ()
+
+
+@pytest.mark.parametrize("family", ["vt.file_report", "vt.relationships"])
+@pytest.mark.parametrize("hash_length", [32, 40], ids=["md5", "sha1"])
+def test_vt_consume_resolves_md5_sha1_only_from_server_metadata(
+    family: str, hash_length: int
+) -> None:
+    file_hash = "a" * hash_length
+    reference = EvidenceReference("source_document", str(uuid4()), "article@1", "b" * 64)
+    parameters: dict[str, object] = {
+        "_vt_external_effect_source_refs": [reference.to_json()],
+    }
+    if family == "vt.file_report":
+        parameters["file_hash"] = file_hash
+    else:
+        parameters.update({"object_type": "file", "object_id": file_hash})
+
+    assert _source_refs_for_family(family, parameters) == (reference,)
+    assert (
+        _source_refs_for_family(family, {**parameters, "_vt_external_effect_source_refs": []}) == ()
+    )
+    assert _source_refs_for_family("vt.behaviour", {**parameters, "file_hash": file_hash}) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observed_hash", "return_observation", "expected_reason"),
+    [
+        ("a" * 32, True, None),
+        ("b" * 32, True, "vt_source_observation_hash_mismatch"),
+        ("a" * 32, False, "evidence_observation_missing"),
+    ],
+    ids=["exact-current-observation", "wrong-target", "missing-current-investigation-row"],
+)
+async def test_vt_source_gate_binds_md5_observation_to_exact_request(
+    observed_hash: str,
+    return_observation: bool,
+    expected_reason: str | None,
+) -> None:
+    file_hash = "a" * 32
+    observation_id = uuid4()
+    reference = EvidenceReference("evidence_observation", str(observation_id), "obs.v1", "c" * 64)
+    prepared = PreparedExternalRequest.build(
+        family="vt.file_report",
+        provider="vt",
+        provider_scope="default",
+        normalizer_version="vt-read.v1",
+        canonical_request={"path": f"/api/v3/files/{file_hash}"},
+        application_request=_wire(target=f"/api/v3/files/{file_hash}".encode()),
+        evidence_refs=(reference,),
+        credential_parameter_names=("apikey",),
+    )
+    authority = _authority()
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=authority.investigation_id,
+        source_version=reference.version,
+        sha256=reference.sha256,
+        object_type="file",
+        object_id=observed_hash,
+    )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def scalars(self, *args: object, **kwargs: object):
+            self.calls += 1
+            if self.calls == 1 and return_observation:
+                return [observation]
+            return []
+
+    store = SqlAlchemyExternalEffectClaimStore(
+        lambda: None,  # type: ignore[arg-type]
+        family_bindings=virustotal_external_effect_family_bindings(),
+    )
+    session = _Session()
+    binding = virustotal_external_effect_family_bindings()["vt.file_report"]
+
+    if expected_reason is None:
+        await store._check_source_restrictions(
+            session,
+            authority,
+            prepared,
+            uuid4(),
+            binding,  # type: ignore[arg-type]
+        )
+    else:
+        with pytest.raises(_ConsumeDenied, match=expected_reason):
+            await store._check_source_restrictions(
+                session,
+                authority,
+                prepared,
+                uuid4(),
+                binding,  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.asyncio
+async def test_durable_consume_refuses_amber_before_claim_insert_offline() -> None:
+    prepared = _prepared()
+    authority = _authority()
+    invocation_parameters = {"hash": "abc", "include": ["relations", "history"]}
+    authority = replace(
+        authority,
+        invocation_arguments_sha256=hashlib.sha256(
+            canonical_json_bytes(invocation_parameters)
+        ).hexdigest(),
+    )
+    invocation = SimpleNamespace(
+        investigation_id=authority.investigation_id,
+        operation_key=authority.operation_key,
+        normalized_parameters=invocation_parameters,
+        status="running",
+        tool_name="vt.file_report",
+        schema_version="1",
+    )
+    investigation = SimpleNamespace(subject_id=uuid4())
+    envelope = SimpleNamespace(
+        version=authority.expected_envelope_version,
+        approval_decision_id=authority.approval_decision_id,
+        allowed_providers=(prepared.provider,),
+        disclosure_tlp="amber",
+        disclosure_do_not_submit=False,
+        disclosure_external_llm_allowed=True,
+        acquire_hits_allowed=True,
+    )
+    reservation = SimpleNamespace(status="reserved")
+
+    class _NoopContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+    class _Session:
+        def __init__(self) -> None:
+            self.execute_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+        def begin(self):
+            return _NoopContext()
+
+        async def scalar(self, *args: object, **kwargs: object):
+            return None
+
+        async def execute(self, *args: object, **kwargs: object):
+            self.execute_calls += 1
+            raise AssertionError("AMBER must be denied before inserting an effect claim")
+
+    session = _Session()
+
+    class _ConsumeStore(SqlAlchemyExternalEffectClaimStore):
+        async def _lock_authority(self, *_args, **_kwargs):
+            return investigation, envelope, invocation, reservation, []
+
+    binding = ExternalEffectFamilyBinding(
+        provider=prepared.provider,
+        provider_scopes=frozenset({prepared.provider_scope}),
+        normalizer_versions=frozenset({prepared.normalizer_version}),
+        invocation_tool_binding=("vt.file_report", "1"),
+    )
+    store = _ConsumeStore(
+        lambda: session,  # type: ignore[arg-type]
+        family_bindings={prepared.family: binding},
+    )
+    result = await store.consume(
+        authority,
+        prepared,
+        effect_key=effect_key(authority.investigation_id, prepared),
+        occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+    )
+
+    assert result == ConsumeRefused("tlp_amber")
+    assert session.execute_calls == 0
 
 
 @pytest.mark.parametrize(

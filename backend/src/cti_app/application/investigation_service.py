@@ -2076,17 +2076,18 @@ class InvestigationService:
             ):
                 return True
             object_type = observation.object_type.casefold()
-            if object_type in {"sample", "file", "sample_observation"} or (
+            if object_type in {"sample", "file", "sample_observation", "md5", "sha1"} or (
                 sample_hashes and object_type == "sha256"
             ):
                 try:
                     sample_hash = normalize_file_hash(observation.object_id)
                 except (TypeError, ValueError):
                     return True
-                if len(sample_hash) != 64:
+                if len(sample_hash) not in {32, 40, 64}:
                     return True
-                observation_hashes.add(sample_hash)
-                hashes.add(sample_hash)
+                if len(sample_hash) == 64:
+                    observation_hashes.add(sample_hash)
+                    hashes.add(sample_hash)
             elif object_type in {"source_document", "document"}:
                 document_ids.add(observation.object_id)
         sample_associations = self._sample_associations
@@ -2178,6 +2179,49 @@ class InvestigationService:
                 normalized_hash = normalize_file_hash(str(hash_value))
             except (TypeError, ValueError, VirusTotalInvalidInputError):
                 return ()
+            if len(normalized_hash) in {32, 40}:
+                if tool_name not in {"vt.file_report", "vt.relationships"}:
+                    return ()
+                indicator_type = "md5" if len(normalized_hash) == 32 else "sha1"
+                resolved: dict[tuple[str, str], EvidenceReference] = {}
+                try:
+                    snapshot = await self._context_builder.article_snapshots.resolve(
+                        investigation.synthesis_artifact_id
+                    )
+                except Exception:
+                    snapshot = None
+                if snapshot is not None:
+                    version = f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}"
+                    for indicator in snapshot.confirmed_iocs:
+                        if (
+                            indicator.indicator_type != indicator_type
+                            or indicator.value.casefold() != normalized_hash
+                        ):
+                            continue
+                        for document_id in indicator.source_document_ids:
+                            reference = EvidenceReference(
+                                kind="source_document",
+                                id=str(document_id),
+                                version=version,
+                                sha256=snapshot.synthesis_sha256,
+                            )
+                            resolved[(reference.kind, reference.id)] = reference
+                observations = await self._observations.list_for_investigation(investigation.id)
+                for item in observations:
+                    if (
+                        item.object_type.casefold()
+                        not in {"sample", "file", "sample_observation", "md5", "sha1"}
+                        or item.object_id.casefold() != normalized_hash
+                    ):
+                        continue
+                    reference = EvidenceReference(
+                        kind="evidence_observation",
+                        id=str(item.id),
+                        version=item.source_version,
+                        sha256=item.sha256,
+                    )
+                    resolved[(reference.kind, reference.id)] = reference
+                return tuple(resolved[key] for key in sorted(resolved))
             if len(normalized_hash) != 64:
                 return ()
             hash_reference = EvidenceReference(

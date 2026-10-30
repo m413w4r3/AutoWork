@@ -52,7 +52,7 @@ def available_investigation_pivots(
     }
     visible_coverage = {item.invocation_id: item for item in tool_coverage}
     covered_arguments = {
-        (item.tool_name, canonical_json_bytes(thaw_json(item.normalized_parameters)))
+        (item.tool_name, canonical_json_bytes(_tool_arguments(item.normalized_parameters)))
         for item in invocations
         if item.status in _COVERED_STATUSES
         and (
@@ -65,6 +65,11 @@ def available_investigation_pivots(
         observation_ids_by_indicator.setdefault(key, []).append(str(observation.id))
 
     candidates: dict[tuple[str, str], AvailablePivotV1] = {}
+    document_backed_indicators = {
+        (item.indicator_type, item.value.casefold())
+        for item in inventory
+        if item.source_document_ids
+    }
 
     def add(
         *,
@@ -72,6 +77,7 @@ def available_investigation_pivots(
         indicator_type: PivotableIndicatorType,
         indicator_value: str,
         arguments: Mapping[str, Any],
+        blocked_reason: str | None = None,
     ) -> None:
         tool = read_tools.get(tool_name)
         if tool is None or not _arguments_fit_schema(arguments, tool.arguments_schema):
@@ -89,6 +95,8 @@ def available_investigation_pivots(
             indicator_type=indicator_type,
             indicator_value=indicator_value,
             arguments=dict(arguments),
+            execution_state="blocked" if blocked_reason else "available",
+            blocked_reason=blocked_reason,
         )
         candidates[(tool_name, normalized.decode("utf-8"))] = pivot
 
@@ -100,12 +108,21 @@ def available_investigation_pivots(
         linked_evidence = _linked_observations(
             kind, value, observations, observation_ids_by_indicator
         )
+        source_available = bool(linked_evidence) or (kind, value.casefold()) in (
+            document_backed_indicators
+        )
         if kind in {"md5", "sha1", "sha256"}:
+            blocked_reason = (
+                "source_references_required"
+                if kind in {"md5", "sha1"} and not source_available
+                else None
+            )
             add(
                 tool_name="vt.file_report",
                 indicator_type=kind,
                 indicator_value=value,
                 arguments={"file_hash": value},
+                blocked_reason=blocked_reason,
             )
             for relation in ("contacted_ips", "contacted_domains"):
                 add(
@@ -117,6 +134,7 @@ def available_investigation_pivots(
                         "object_id": value,
                         "relation": relation,
                     },
+                    blocked_reason=blocked_reason,
                 )
         elif kind == "ipv4":
             add(
@@ -218,6 +236,13 @@ def _arguments_fit_schema(arguments: Mapping[str, Any], schema: Mapping[str, Any
         if isinstance(enum, list) and value not in enum:
             return False
     return True
+
+
+def _tool_arguments(value: Any) -> Any:
+    parameters = thaw_json(value)
+    if isinstance(parameters, Mapping):
+        return {key: item for key, item in parameters.items() if not str(key).startswith("_")}
+    return parameters
 
 
 def _linked_observations(

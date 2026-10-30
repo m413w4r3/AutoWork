@@ -538,7 +538,14 @@ class _VirusTotalAdapter:
                     framework_no_send_proof.reason_code
                     if (
                         isinstance(framework_no_send_proof, FrameworkNoSendProof)
-                        and framework_no_send_proof.kind in {"PREPARATION", "PRE_CONSUME"}
+                        and (
+                            framework_no_send_proof.kind in {"PREPARATION", "PRE_CONSUME"}
+                            or (
+                                framework_no_send_proof.kind in {"EXISTING_CLAIM", "REUSE_POLICY"}
+                                and framework_no_send_proof.reason_code
+                                == "effect_occurrence_required"
+                            )
+                        )
                     )
                     else None
                 )
@@ -562,6 +569,7 @@ class _VirusTotalAdapter:
                         if proven_pre_send_refusal
                         else None
                     ),
+                    zero_cost=proven_pre_send_refusal,
                 )
             except VirusTotalInvalidInputError:
                 return self._result(

@@ -786,6 +786,87 @@ def test_discovered_hash_becomes_report_pivot_without_reprocessing_covered_artic
     ]
 
 
+def test_md5_file_pivots_without_provenance_are_blocked_and_relations_stay_distinct() -> None:
+    file_hash = "a" * 32
+    inventory = (
+        ConfirmedIOCContextV1(
+            indicator_type="md5",
+            value=file_hash,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        ),
+    )
+    tools = (
+        ToolSummaryV1(
+            name="vt.file_report",
+            schema_version="1",
+            effect=ToolEffect.EXTERNAL_READ,
+            arguments_schema={
+                "type": "object",
+                "properties": {"file_hash": {"type": "string"}},
+                "required": ["file_hash"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolSummaryV1(
+            name="vt.relationships",
+            schema_version="1",
+            effect=ToolEffect.EXTERNAL_READ,
+            arguments_schema={
+                "type": "object",
+                "properties": {
+                    "object_type": {"type": "string"},
+                    "object_id": {"type": "string"},
+                    "relation": {"type": "string"},
+                },
+                "required": ["object_type", "object_id", "relation"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    blocked, _ = available_investigation_pivots(
+        inventory=inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(),
+        observations=(),
+    )
+    assert len(blocked) == 3
+    assert {item.execution_state for item in blocked} == {"blocked"}
+    assert {item.blocked_reason for item in blocked} == {"source_references_required"}
+    assert {
+        item.arguments.get("relation") for item in blocked if item.tool_name == "vt.relationships"
+    } == {"contacted_ips", "contacted_domains"}
+
+    documented_inventory = (inventory[0].model_copy(update={"source_document_ids": (uuid4(),)}),)
+    already_contacted_ips = ToolInvocation(
+        investigation_id=uuid4(),
+        operation_key="contacted-ips",
+        tool_name="vt.relationships",
+        schema_version="1",
+        normalized_parameters={
+            "object_type": "file",
+            "object_id": file_hash,
+            "relation": "contacted_ips",
+            "_vt_external_effect_source_refs": [{"internal": True}],
+        },
+        purpose="synthetic completed pivot",
+        status=ToolInvocationStatus.SUCCEEDED,
+    )
+    available, _ = available_investigation_pivots(
+        inventory=documented_inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(already_contacted_ips,),
+        observations=(),
+    )
+    relation_arguments = {
+        item.arguments["relation"] for item in available if item.tool_name == "vt.relationships"
+    }
+    assert relation_arguments == {"contacted_domains"}
+
+
 def test_invalid_hash_or_missing_cursor_does_not_create_a_confirmed_pivot() -> None:
     article_hash = "a" * 64
     observation = _relation_observation(article_hash, "2" * 64)

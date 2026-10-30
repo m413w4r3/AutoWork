@@ -753,6 +753,101 @@ async def test_tool_coverage_includes_more_than_recent_evidence_with_bounded_saf
 
 
 @pytest.mark.asyncio
+async def test_tool_coverage_preserves_full_relation_arguments_status_observation_and_code() -> (
+    None
+):
+    investigation_id = uuid4()
+    file_hash = "a" * 32
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="b" * 64,
+        source="investigation-framework",
+        source_version="refusal.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=file_hash,
+    )
+    invocations = (
+        ToolInvocation(
+            investigation_id=investigation_id,
+            operation_key="contacted-ips",
+            tool_name="vt.relationships",
+            schema_version="1",
+            normalized_parameters={
+                "object_type": "file",
+                "object_id": file_hash,
+                "relation": "contacted_ips",
+                "_vt_external_effect_source_refs": [{"sha256": "hidden"}],
+            },
+            purpose="synthetic refusal",
+            status=ToolInvocationStatus.FAILED,
+            response_refs=(observation.id,),
+        ),
+        ToolInvocation(
+            investigation_id=investigation_id,
+            operation_key="contacted-domains",
+            tool_name="vt.relationships",
+            schema_version="1",
+            normalized_parameters={
+                "object_type": "file",
+                "object_id": file_hash,
+                "relation": "contacted_domains",
+            },
+            purpose="synthetic refusal without observation",
+            status=ToolInvocationStatus.FAILED,
+        ),
+    )
+
+    class _RefusalFacts:
+        async def summary(self, _observation):
+            return {"error_code": "source_references_required"}
+
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="c" * 64,
+        article=ArticleContextV1(
+            short_summary="Synthetic article.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        invocations=InMemoryToolInvocationRepository(),
+        evidence_summaries=_RefusalFacts(),
+    )
+
+    entries, truncated = await builder._tool_coverage(invocations, (observation,))
+
+    assert truncated is False
+    assert len(entries) == 2
+    assert len({entry.argument_key_sha256 for entry in entries}) == 2
+    by_relation = {
+        relation: next(
+            entry for entry in entries if relation in entry.normalized_parameters["relation"]
+        )
+        for relation in ("contacted_ips", "contacted_domains")
+    }
+    assert by_relation["contacted_ips"].status is ToolInvocationStatus.FAILED
+    assert by_relation["contacted_ips"].observation_id == observation.id
+    assert by_relation["contacted_ips"].error_code == "source_references_required"
+    assert by_relation["contacted_domains"].status is ToolInvocationStatus.FAILED
+    assert by_relation["contacted_domains"].observation_id is None
+    assert by_relation["contacted_domains"].error_code == "tool_failed"
+    assert all(
+        "_vt_external_effect_source_refs" not in entry.normalized_parameters for entry in entries
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_coverage_caps_history_by_item_count_without_a_byte_ceiling() -> None:
     investigation_id = uuid4()
     snapshot = ArticleSnapshot(

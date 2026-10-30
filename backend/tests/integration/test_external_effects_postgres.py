@@ -25,6 +25,7 @@ from cti_app.application.external_effects import (
     Completed,
     ConsumeCommitted,
     ConsumePolicyContext,
+    ConsumeRefused,
     DefinitelyNotSubmitted,
     ExternalEffectCoordinator,
     HandoffGateRefused,
@@ -335,6 +336,7 @@ async def _prepare_case(
     *,
     suffix: str,
     invocations: int = 1,
+    disclosure_tlp: str = "clear",
 ) -> tuple[
     async_sessionmaker[AsyncSession],
     AsyncEngine,
@@ -385,7 +387,7 @@ async def _prepare_case(
                     allowed_providers=[_PROVIDER],
                     budget_snapshot=budget_snapshot,
                     acquire_hits_allowed=True,
-                    disclosure_tlp="clear",
+                    disclosure_tlp=disclosure_tlp,
                     disclosure_do_not_submit=False,
                     disclosure_external_llm_allowed=True,
                     approval_decision_id=approval_id,
@@ -400,7 +402,7 @@ async def _prepare_case(
                         "allowed_providers": [_PROVIDER],
                         "budget_snapshot": budget_snapshot,
                         "acquire_hits_allowed": True,
-                        "disclosure_tlp": "clear",
+                        "disclosure_tlp": disclosure_tlp,
                         "disclosure_do_not_submit": False,
                         "disclosure_external_llm_allowed": True,
                         "approval_decision_id": approval_id,
@@ -491,6 +493,38 @@ async def _prepare_case(
         )
         await uow.commit()
     return session_factory, engine, seeded.investigation.id, subject_id, authorities
+
+
+@pytest.mark.asyncio
+async def test_durable_coordinator_refuses_amber_before_persisting_claim(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url,
+        tmp_path,
+        suffix=uuid4().hex[:12],
+        disclosure_tlp="amber",
+    )
+    authority, prepared = authorities[0]
+    try:
+        result = await _store(session_factory).consume(
+            authority,
+            prepared,
+            effect_key=effect_key(investigation_id, prepared),
+            occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+        )
+        assert result == ConsumeRefused("tlp_amber")
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id
+                    )
+                )
+            )
+        assert claims == []
+    finally:
+        await engine.dispose()
 
 
 async def _prepare_model_submission_case(
