@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import lzma
@@ -24,6 +25,7 @@ from cti_app.domain.local_analysis import (
     LOCAL_ARCHIVE_MAX_TOTAL_BYTES,
 )
 from cti_app.infrastructure.analysis_subprocess import (
+    AnalysisSubprocessResult,
     AnalysisSubprocessStatus,
     run_analysis_subprocess,
 )
@@ -315,6 +317,8 @@ async def run_7z_archive_command(
                 "archive_members_total": len(entries),
                 "uncompressed_bytes_read": 0,
             }
+            if listing.status is AnalysisSubprocessStatus.FAILED_TO_START:
+                report["archive_error_code"] = _7z_start_error_code(listing)
             text, truncated = _encode_report(report, (), max_output_bytes, (), 0)
             return _worker_result(text, truncated, tool.value, tool_version)
         if listing_truncated and tool in {
@@ -424,7 +428,8 @@ async def run_7z_archive_command(
                 elif extract.status is AnalysisSubprocessStatus.TIMED_OUT:
                     record["status"] = "timeout"
                 elif extract.status is AnalysisSubprocessStatus.FAILED_TO_START:
-                    record["status"] = "7z_unavailable"
+                    record["status"] = "7z_start_failed"
+                    record["archive_error_code"] = _7z_start_error_code(extract)
                 else:
                     record["status"] = _member_failure_status(extract.stderr, entry)
             records.append(record)
@@ -520,17 +525,19 @@ async def _extract_7z_archive_member(
     memory_limit_bytes: int,
     tool_version: str | None,
 ) -> dict[str, Any]:
-    def refusal(status: str) -> dict[str, Any]:
+    def refusal(status: str, *, error_code: str | None = None) -> dict[str, Any]:
+        report = {"schema_version": _ARCHIVE_OUTPUT_SCHEMA, "status": status}
+        if error_code is not None:
+            report["archive_error_code"] = error_code
         result = _worker_result(
-            json.dumps(
-                {"schema_version": _ARCHIVE_OUTPUT_SCHEMA, "status": status},
-                separators=(",", ":"),
-            ),
+            json.dumps(report, separators=(",", ":")),
             False,
             ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER.value,
             tool_version,
         )
         result["member_status"] = status
+        if error_code is not None:
+            result["archive_error_code"] = error_code
         return result
 
     if not _safe_archive_member_path(member_path):
@@ -583,7 +590,7 @@ async def _extract_7z_archive_member(
     if extracted.status is AnalysisSubprocessStatus.TIMED_OUT:
         return refusal("timeout")
     if extracted.status is AnalysisSubprocessStatus.FAILED_TO_START:
-        return refusal("7z_unavailable")
+        return refusal("7z_start_failed", error_code=_7z_start_error_code(extracted))
     if extracted.status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
         return refusal("actual_size_or_member_limit")
     if extracted.status is not AnalysisSubprocessStatus.SUCCEEDED:
@@ -662,13 +669,21 @@ def _7z_status(result: Any, stderr: bytes) -> str:
     if result.status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
         return "listing_output_limit"
     if result.status is AnalysisSubprocessStatus.FAILED_TO_START:
-        return "7z_unavailable"
+        return "7z_start_failed"
     if result.status is AnalysisSubprocessStatus.NON_ZERO_EXIT:
         text = stderr.decode("utf-8", "replace")[:4096]
         if _PASSWORD_ERROR.search(text):
             return "encrypted_password_required"
         return "corrupt_or_unsupported_archive"
     return "ok"
+
+
+def _7z_start_error_code(result: AnalysisSubprocessResult) -> str:
+    if result.start_errno == errno.ENOENT:
+        return "not_found"
+    if result.start_errno in {errno.EACCES, errno.EPERM}:
+        return "permission_denied"
+    return "other_os_error"
 
 
 def _encode_report(

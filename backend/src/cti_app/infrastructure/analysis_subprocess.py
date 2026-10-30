@@ -24,6 +24,7 @@ class AnalysisSubprocessResult:
     exit_code: int | None
     stdout: bytes
     stderr: bytes
+    start_errno: int | None = None
 
 
 async def run_analysis_subprocess(
@@ -67,9 +68,13 @@ async def run_analysis_subprocess(
                 env=env,
                 preexec_fn=limit if os.name == "posix" else None,
             )
-        except OSError:
+        except OSError as exc:
             return AnalysisSubprocessResult(
-                AnalysisSubprocessStatus.FAILED_TO_START, None, b"", b""
+                AnalysisSubprocessStatus.FAILED_TO_START,
+                None,
+                b"",
+                b"",
+                start_errno=exc.errno,
             )
 
         async def read_stream(stream: asyncio.StreamReader) -> tuple[bytes, bool]:
