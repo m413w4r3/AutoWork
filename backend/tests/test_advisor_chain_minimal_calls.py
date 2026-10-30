@@ -304,7 +304,7 @@ async def test_minimal_call_auto_assembles_canonical_dossier_and_returns_advisor
     )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=output))
     tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
-    await _seed_chain(investigation_id, tool)
+    sample_hashes = await _seed_chain(investigation_id, tool)
     context = make_dispatch_context(investigation_id)
 
     result = await _dispatch(tool, context, consultation_type)
@@ -323,11 +323,13 @@ async def test_minimal_call_auto_assembles_canonical_dossier_and_returns_advisor
     prompt = transport.calls[0]["prompt"]
     assert "json" not in prompt.casefold()
     assert "S3P2.1" in prompt and "S4P1.1" in prompt
+    assert all(sample_hash in prompt for sample_hash in sample_hashes)
+    assert prompt.count("VirusTotal") >= 15
     assert "SyntheticBeaconMarker" in prompt
     assert "InitializeLoader" in prompt or "DecryptConfiguration" in prompt
-    assert "VirusTotal" in prompt or "detection_ratio" in prompt
     assert "The loader capability remains inconclusive" in prompt
     assert "The persistence claim is qualified" in prompt
+    assert "The observed destination is limited to one capture" in prompt
     assert result.output["untrusted"] is True
     assert output in result.output["advisory_text"]
     assert result.budget_consumed
@@ -337,6 +339,23 @@ async def test_minimal_call_auto_assembles_canonical_dossier_and_returns_advisor
         assert "updates.example.test" in prompt
     if consultation_type == "yara_draft":
         assert "SyntheticBeaconMarker0" in prompt
+
+
+@pytest.mark.asyncio
+async def test_yara_prose_without_a_fenced_rule_is_still_consultative() -> None:
+    investigation_id = uuid4()
+    output = "The measured strings provide a tentative YARA lead; verify it locally."
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=output))
+    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    await _seed_chain(investigation_id, tool)
+    context = make_dispatch_context(investigation_id)
+
+    result = await _dispatch(tool, context, "yara_draft")
+
+    assert len(transport.calls) == 1, result
+    assert "```yara" not in output
+    assert output in result.output["advisory_text"]
+    assert result.output["untrusted"] is True
 
 
 @pytest.mark.asyncio
