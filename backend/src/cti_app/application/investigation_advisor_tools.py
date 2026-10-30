@@ -5163,7 +5163,9 @@ class ReparsePersistedAdvisorOutputTool:
             persisted.get("advisor_response_schema") != expected_schema
             or output.get("parser_version") != selected_parser
         ):
-            return unparsed_advisory_result("parser_version_mismatch_raw_text_returned", selected_parser)
+            return unparsed_advisory_result(
+                "parser_version_mismatch_raw_text_returned", selected_parser
+            )
 
         normalized_refs: list[dict[str, str]] = []
         seen_refs: set[tuple[str, str]] = set()
