@@ -219,6 +219,7 @@ class InvestigationAdvisorTool:
         self._artifact_store = artifact_store
         self._registry = registry
         self._results: dict[str, ToolResult] = {}
+        self._preflight_refusals: dict[str, dict[str, Any]] = {}
         self._ignored_evidence_refs: dict[str, tuple[str, ...]] = {}
         self._reference_answers: dict[tuple[UUID, str, str], bool] = {}
         self._reference_payloads: dict[tuple[UUID, str], Any | None] = {}
@@ -1009,40 +1010,122 @@ class InvestigationAdvisorTool:
             prompt_data["evidence_preflight"] = evidence_preflight
             if evidence_preflight["status"] != "READY":
                 preflight_status = str(evidence_preflight["status"])
-                return await self._persist_preflight_failure(
-                    context,
-                    consultation_type=consultation_type,
-                    evidence_refs=tuple(item.id for item in evidence),
-                    output={
-                        "advisor_status": preflight_status.casefold(),
-                        "preflight_status": preflight_status,
-                        "failure_stage": "evidence_preflight",
-                        "failure_reason": "required_canonical_evidence_not_in_payload",
-                        "missing_refs": evidence_preflight["missing_refs"],
-                        **(
-                            {"next_action": evidence_preflight["next_action"]}
-                            if evidence_preflight.get("next_action")
-                            else {}
-                        ),
-                        "completeness_counts": evidence_preflight["counts"],
-                        "completeness_manifest": evidence_preflight["items"],
-                        "dossier_sha256": dossier.sha256,
-                        "dossier_bytes": dossier.byte_size,
-                        **(
-                            {
-                                "disclosure_restricted_refs": [
-                                    str(item) for item in restricted_evidence_refs
-                                ]
-                            }
-                            if restricted_evidence_refs
-                            else {}
-                        ),
+                refusal_context_sha256 = hashlib.sha256(
+                    encoded
+                    + b"\0"
+                    + json.dumps(
+                        [dict(item) for item in dossier.manifest],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                refusal_fingerprint = hashlib.sha256(
+                    (
+                        consultation_type
+                        + ":"
+                        + refusal_context_sha256
+                        + ":"
+                        + preflight_status
+                    ).encode("utf-8")
+                ).hexdigest()
+                cached_refusal = self._preflight_refusals.get(refusal_fingerprint)
+                if cached_refusal is not None:
+                    refusal_output = {
+                        **cached_refusal,
+                        "repeat_refusal_short_circuited": True,
+                        "refusal_fingerprint": refusal_fingerprint,
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
                         "usable": False,
-                    },
+                    }
+                    return self._finish(
+                        context,
+                        ToolResult(
+                            ToolInvocationStatus.UNAVAILABLE,
+                            observation_refs=tuple(item.id for item in evidence),
+                            budget_consumed={BudgetDimension.BRIDGE_TURNS: 0},
+                            error_code=f"advisor_preflight_{preflight_status.casefold()}",
+                            message=(
+                                str(cached_refusal.get("next_action", ""))
+                                or "The same advisor evidence preflight refusal was already "
+                                "returned for this prompt and dossier."
+                            ),
+                            output=refusal_output,
+                        ),
+                    )
+                missing_rows = evidence_preflight["missing_refs"]
+                first_cause = (
+                    dict(missing_rows[0])
+                    if isinstance(missing_rows, list) and missing_rows
+                    else {
+                        "ref": "evidence_preflight",
+                        "reason": f"Advisor evidence preflight returned {preflight_status}.",
+                    }
+                )
+                refusal_output = {
+                    "advisor_status": preflight_status.casefold(),
+                    "preflight_status": preflight_status,
+                    "failure_stage": "evidence_preflight",
+                    "failure_reason": "required_canonical_evidence_not_in_payload",
+                    "preflight_cause": first_cause,
+                    "missing_refs": [first_cause],
+                    "additional_missing_ref_count": max(0, len(missing_rows) - 1),
+                    **(
+                        {"next_action": evidence_preflight["next_action"]}
+                        if evidence_preflight.get("next_action")
+                        else {}
+                    ),
+                    "completeness_counts": evidence_preflight["counts"],
+                    "completeness_manifest": evidence_preflight["items"],
+                    "dossier_sha256": dossier.sha256,
+                    "dossier_bytes": dossier.byte_size,
+                    **(
+                        {
+                            "disclosure_restricted_refs": [
+                                str(item) for item in restricted_evidence_refs
+                            ]
+                        }
+                        if restricted_evidence_refs
+                        else {}
+                    ),
+                    "confirmed_non_execution": True,
+                    "bridge_turns_consumed": 0,
+                    "usable": False,
+                }
+                refusal = await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    output=refusal_output,
                     error_code=f"advisor_preflight_{preflight_status.casefold()}",
                 )
+                if (
+                    refusal.status is ToolInvocationStatus.UNAVAILABLE
+                    and refusal.output.get("failure_stage") == "evidence_preflight"
+                ):
+                    self._preflight_refusals[refusal_fingerprint] = {
+                        key: value
+                        for key, value in refusal.output.items()
+                        if key
+                        in {
+                            "advisor_status",
+                            "preflight_status",
+                            "failure_stage",
+                            "failure_reason",
+                            "preflight_cause",
+                            "missing_refs",
+                            "additional_missing_ref_count",
+                            "next_action",
+                            "refusal_guidance",
+                            "completeness_counts",
+                            "dossier_sha256",
+                            "dossier_bytes",
+                        }
+                    }
+                    if len(self._preflight_refusals) > 128:
+                        self._preflight_refusals.pop(next(iter(self._preflight_refusals)))
+                return refusal
             transmitted_refs = _prompt_transmitted_refs(prompt_data)
             external_effect_evidence_refs = await _advisor_external_effect_evidence_refs(
                 transmitted_refs,
@@ -1341,11 +1424,9 @@ class InvestigationAdvisorTool:
         )
         prompt_data["evidence_preflight"] = evidence_preflight
         submission_elapsed_ms = round((time.perf_counter() - submission_started_at) * 1000)
-        # A recovered response attached to NEEDS_REVIEW is still ambiguous. It
-        # must not be archived or parsed as a successful advisor answer.
-        raw_output = (
-            submission.output_text if submission.status is TurnSubmissionStatus.SUCCEEDED else None
-        )
+        # Archive every response text actually received. An ambiguous
+        # submission remains unparsed and unusable until reconciled.
+        raw_output = submission.output_text
         raw_output_bytes = raw_output.encode("utf-8") if raw_output is not None else None
         output_sha256 = (
             hashlib.sha256(raw_output_bytes).hexdigest() if raw_output_bytes is not None else None
@@ -1429,6 +1510,16 @@ class InvestigationAdvisorTool:
                 prompt_data=prompt_data,
                 execution_timeout_seconds=execution_timeout_seconds,
             )
+        response_received = submission.output_text is not None
+        response_state = _advisor_response_state(result, submission)
+        result = replace(
+            result,
+            output={
+                **dict(result.output),
+                "response_state": response_state,
+                "response_received": response_received,
+            },
+        )
         if submission_proves_no_execution:
             result = _attest_advisor_pre_submission(result)
         parse_elapsed_ms = round((time.perf_counter() - parse_started_at) * 1000)
@@ -4533,6 +4624,14 @@ class InvestigationAdvisorTool:
             "output_sha256": raw_sha256,
             "usable": parsed.get("usable", True),
             "bridge_turns_consumed": bridge_turns_consumed,
+            "response_state": (
+                "partial_response_usable"
+                if parsed.get("usable") is True and advisor_status == "partial"
+                else "response_received"
+                if parsed.get("usable") is True
+                else "response_unusable"
+            ),
+            "response_received": True,
         }
         return ToolResult(
             invocation_status,
@@ -4655,6 +4754,18 @@ class InvestigationAdvisorTool:
         return self._finish(context, result)
 
     def _finish(self, context: ToolExecutionContext, result: ToolResult) -> ToolResult:
+        if (
+            "response_state" not in result.output
+            and result.output.get("confirmed_non_execution") is True
+        ):
+            result = replace(
+                result,
+                output={
+                    **dict(result.output),
+                    "response_state": "pre_send_failure",
+                    "response_received": False,
+                },
+            )
         ignored = self._ignored_evidence_refs.pop(context.idempotency_key, ())
         if ignored:
             result = replace(
@@ -4967,30 +5078,6 @@ class ReparsePersistedAdvisorOutputTool:
                     "new_observation_written": False,
                 },
             )
-        expected_schema = (
-            ADVISOR_RESPONSE_SCHEMA_V4
-            if selected_parser == ADVISOR_SOURCE_PARSER_VERSION_V4
-            else ADVISOR_RESPONSE_SCHEMA_V3
-        )
-        if (
-            persisted.get("advisor_response_schema") != expected_schema
-            or output.get("parser_version") != selected_parser
-        ):
-            return ToolResult(
-                ToolInvocationStatus.PARTIAL,
-                error_code="unsupported_legacy_format",
-                output={
-                    "status": "unsupported_legacy_format",
-                    "reparsed_from_observation_id": str(original.id),
-                    "advisor_response_schema": persisted.get("advisor_response_schema"),
-                    "stored_parser_version": output.get("parser_version"),
-                    "selected_parser_version": selected_parser,
-                    "output_sha256": output_sha256,
-                    "bridge_turns_consumed": 0,
-                    "new_observation_written": False,
-                },
-                message="La version de parseur choisie ne correspond pas à celle de la sortie.",
-            )
         raw_reader = getattr(self._blobs, "get_by_address", None)
         if not callable(raw_reader):
             return ToolResult(
@@ -5029,6 +5116,54 @@ class ReparsePersistedAdvisorOutputTool:
                 ToolInvocationStatus.FAILED,
                 error_code="advisor_reparse_raw_output_sha256_mismatch",
             )
+
+        def unparsed_advisory_result(
+            reason: str, selected_parser: object
+        ) -> ToolResult:
+            safe_output, secret_count = redact_explicit_operational_secrets(
+                raw_text,
+                operational_secret_values=configured_operational_secret_values(self._settings),
+            )
+            advisory_text = str(safe_output)
+            warnings = [reason]
+            if secret_count:
+                warnings.append("secret_redacted")
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL,
+                error_code=None,
+                message=(
+                    "The complete archived advisory text is returned as untrusted prose; "
+                    "no parser projection or canonical promotion was created."
+                ),
+                output={
+                    "status": "raw_advisory_text_available",
+                    "reparsed_from_observation_id": str(original.id),
+                    "advisor_response_schema": persisted.get("advisor_response_schema"),
+                    "stored_parser_version": output.get("parser_version"),
+                    "selected_parser_version": selected_parser,
+                    "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
+                    "raw_output": advisory_text,
+                    "raw_output_sha256": output_sha256,
+                    "output_sha256": output_sha256,
+                    "warnings": warnings,
+                    "usable": bool(advisory_text.strip()),
+                    "untrusted": True,
+                    "canonical_promotion": False,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                },
+            )
+
+        expected_schema = (
+            ADVISOR_RESPONSE_SCHEMA_V4
+            if selected_parser == ADVISOR_SOURCE_PARSER_VERSION_V4
+            else ADVISOR_RESPONSE_SCHEMA_V3
+        )
+        if (
+            persisted.get("advisor_response_schema") != expected_schema
+            or output.get("parser_version") != selected_parser
+        ):
+            return unparsed_advisory_result("parser_version_mismatch_raw_text_returned", selected_parser)
 
         normalized_refs: list[dict[str, str]] = []
         seen_refs: set[tuple[str, str]] = set()
@@ -5807,6 +5942,30 @@ def _advisor_invocation_stage(submission: TurnSubmission) -> str:
     if state in {"submission_attempted", "post_submission"}:
         return "submitted"
     return "submission_failed"
+
+
+def _advisor_response_state(result: ToolResult, submission: TurnSubmission) -> str:
+    if (
+        submission.status is TurnSubmissionStatus.NEEDS_REVIEW
+        or submission.submission_state == "external_state_unknown"
+        or (submission.output_text is None and submission.prior_submission_made)
+    ):
+        return "submission_ambiguous"
+    if submission.output_text is not None:
+        if result.output.get("usable") is True:
+            if (
+                result.output.get("advisor_status") == "partial"
+                or result.output.get("status") == "partial"
+            ):
+                return "partial_response_usable"
+            return "response_received"
+        return "response_unusable"
+    if (
+        result.output.get("confirmed_non_execution") is True
+        or submission.submission_state == "pre_submission"
+    ):
+        return "pre_send_failure"
+    return "response_not_received"
 
 
 def _advisor_context_reservation(

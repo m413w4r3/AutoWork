@@ -20,7 +20,7 @@ def render_advisor_prompt(consultation_type: str, data: Mapping[str, Any]) -> st
         f"TYPE: {consultation_type}",
         f"TASK: {task}",
         "Répondre en français courant. La prose libre est le résultat principal.",
-        "Des blocs de code balisés sont facultatifs; ne pas forcer un format de sortie.",
+        "Réserver les blocs de code clôturés au code proposé; ne pas forcer un format de sortie.",
     ]
     targets = data.get("units")
     if not isinstance(targets, (list, tuple)):
@@ -176,8 +176,7 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
     if consultation_type == "yara_draft":
         return [
             (
-                "Si une règle YARA est proposée, placer son texte complet dans un bloc "
-                "```yara facultatif."
+                "Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara."
             ),
             ("Expliquer en prose les marqueurs qui la justifient et les limites des mesures."),
             "Ne pas exécuter, téléverser, analyser, ou appeler d\u2019outil.",
@@ -185,8 +184,8 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
     if consultation_type == "suricata_draft":
         return [
             (
-                "Si une règle Suricata est proposée, placer son texte complet dans un bloc "
-                "```suricata facultatif."
+                "Placer toute règle Suricata proposée, complète, dans un bloc clôturé "
+                "```suricata."
             ),
             ("Expliquer en prose les faits réseau qui la justifient et les limites des mesures."),
             (

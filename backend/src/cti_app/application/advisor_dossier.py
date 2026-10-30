@@ -1744,6 +1744,7 @@ def evaluate_advisor_evidence_preflight(
                 in {
                     "plan_investigation",
                     "pivot_strategy",
+                    "yara_draft",
                     "figure_plan",
                 }
                 and has_body
@@ -1842,16 +1843,6 @@ def evaluate_advisor_evidence_preflight(
     measurements = [
         item for item in prompt_data.get("measurements", ()) if isinstance(item, Mapping)
     ]
-    if consultation_type == "yara_draft" and not measurements:
-        add(
-            "measurement",
-            "verified-measurement",
-            "",
-            None,
-            False,
-            True,
-            "No verified measurement with sample SHA and offset was loaded for YARA drafting.",
-        )
     for item in measurements:
         identifier = _as_text(item.get("measurement_id"))
         digest = hashlib.sha256(
@@ -1991,12 +1982,25 @@ def evaluate_advisor_evidence_preflight(
             )
 
     proof_kinds = {"observation", "finding", "article", "measurement", "fact"}
-    if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"} and not any(
-        item["required"]
-        and item["kind"] in proof_kinds
-        and (item["body_present"] or item.get("retrieval_available"))
-        for item in records
+    if consultation_type == "yara_draft":
+        proof_kinds = {"observation", "measurement"}
+    if (
+        consultation_type in {"plan_investigation", "pivot_strategy", "yara_draft", "figure_plan"}
+        and not any(
+            item["required"]
+            and item["kind"] in proof_kinds
+            and (item["body_present"] or item.get("retrieval_available"))
+            for item in records
+        )
     ):
+        proof_reason = (
+            "No canonical static-analysis observation or verified measurement body was loaded "
+            "for this YARA draft; add an observation reference with its SHA-256 or provide a "
+            "verified sample offset."
+            if consultation_type == "yara_draft"
+            else "No canonical observation, finding, or claim passage body is available for "
+            "this question."
+        )
         add(
             "observation",
             "question-proof",
@@ -2004,10 +2008,7 @@ def evaluate_advisor_evidence_preflight(
             None,
             False,
             True,
-            (
-                "No canonical observation, finding, or claim passage body is available for "
-                "this question."
-            ),
+            proof_reason,
         )
     useful_text_kinds = {"observation", "finding", "article"}
     if consultation_type == "review_text":
@@ -2375,7 +2376,12 @@ def evaluate_advisor_evidence_preflight(
     missing_kinds = {item.get("ref") for item in missing_refs}
     has_no_useful_context = bool(
         missing_kinds.intersection(
-            {"measurement:verified-measurement", "fact:network-fact", "observation:question-proof"}
+            {
+                "measurement:verified-measurement",
+                "fact:network-fact",
+                "observation:question-proof",
+                "question-proof",
+            }
         )
     )
     next_action = (
@@ -2405,14 +2411,10 @@ def _advisor_preflight_next_action(consultation_type: str, prompt_data: Mapping[
         "",
     )
     if consultation_type == "yara_draft":
-        if sample_sha:
-            return (
-                f"Aucune mesure vérifiée n'est disponible. Lance sample.analyze sur {sample_sha}, "
-                "puis relance yara_draft."
-            )
         return (
-            "Aucune mesure vérifiée n'est disponible. Associe un échantillon à l'enquête, "
-            "lance sample.analyze sur son hash, puis relance yara_draft."
+            "Aucune preuve canonique exploitable n'est présente pour ce dossier YARA. Ajoute "
+            "une observation d'analyse statique avec son identifiant et son SHA-256, ou fournis "
+            "des offsets d'échantillon vérifiés, puis relance yara_draft."
         )
     if consultation_type == "suricata_draft":
         return (
