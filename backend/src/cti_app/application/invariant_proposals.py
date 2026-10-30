@@ -1001,7 +1001,7 @@ def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, 
     prompt = (
         "You are preparing a bounded P10 proposal from the supplied measured facts.\n"
         "Start with advisor-wire.v1, then TYPE: p10_proposal and STATUS: succeeded, partial, "
-        "or refused. Reply as compact text lines; do not return JSON. Repeat "
+        "or refused. Reply in plain text lines. Repeat "
         "CANDIDATE: type | category | "
         "operator | pattern | semantic justification | refs=E1,E2 for candidate "
         "invariants. Use YARA: name | description, YARA_CONDITION: operator | "

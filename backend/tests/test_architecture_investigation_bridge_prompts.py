@@ -29,11 +29,11 @@ def _string_literals(function: object) -> str:
     )
 
 
-def test_investigation_bridge_prompts_request_only_text_wire_formats() -> None:
+def test_investigation_bridge_prompts_request_plain_text_without_forbidden_formats() -> None:
     for consultation_type in _CONSULTATION_TYPES:
         prompt = render_advisor_prompt(consultation_type, {})
         format_instructions = prompt.split("<UNTRUSTED_ADVISORY_INPUT>", 1)[0]
-        assert "advisor-wire.v1" in format_instructions
+        assert "advisor-wire.v1" not in format_instructions
         assert _FORBIDDEN_FORMAT_REQUEST.search(format_instructions) is None
 
     for prompt_builder in (render_investigation_prompt, render_p10_prompt):
