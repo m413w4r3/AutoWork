@@ -67,6 +67,7 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
     project_tool_availability,
+    tool_provider,
 )
 from cti_app.application.operator_advisor_guidance import (
     ADVISOR_CONSULTATION_TYPES,
@@ -139,7 +140,7 @@ MAX_OPERATOR_REQUESTS = 8
 MAX_OPERATOR_REQUEST_BYTES = 32_768
 
 
-def _current_tool_readiness_block(
+def current_tool_readiness_block(
     definition: ToolDefinition,
     *,
     snapshot: ArticleSnapshot,
@@ -179,7 +180,7 @@ def _current_tool_readiness_block(
             or (approved_tlp is not None and ranks[approved_tlp] < ranks[source_tlp])
         ):
             return "external_disclosure_denied"
-        provider = definition.name.split(".", 1)[0]
+        provider = tool_provider(definition)
         if provider not in envelope.allowed_providers:
             return "provider_not_authorized"
         if external_effect_source_do_not_submit_blocks(
@@ -191,9 +192,9 @@ def _current_tool_readiness_block(
             return "acquisition_not_authorized"
         if (
             envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
-            and tool_context.external_effect_authority is None
+            and tool_context.osint_policy_authorized is not True
         ):
-            # A materialized policy envelope is not proof that its policy remains active.
+            # Projection uses current policy state; dispatch still checks at invocation time.
             return "policy_authorization_unverified"
 
     for raw_dimension, amount in definition.cost_model.items():
@@ -1300,7 +1301,7 @@ class ResearchContextBuilder:
             reason = (
                 "ambiguous_tool_invocation_requires_reconciliation"
                 if (definition.name, definition.schema_version) in untrusted_needs_review_tools
-                else _current_tool_readiness_block(
+                else current_tool_readiness_block(
                     definition,
                     snapshot=snapshot,
                     tool_context=availability_context,

@@ -398,6 +398,7 @@ async def test_vt_registry_operator_status_and_prompt_share_the_same_tool_names(
         envelope=envelope,
         invocations=(),
         observations=(),
+        snapshot=snapshot,
     )
     registry_names = {item.name for item in composition.registry.list_available(tool_context)}
     operator_status_names = set(tool_availability.available_names)
@@ -532,6 +533,7 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
         envelope=None,
         invocations=(),
         observations=(),
+        snapshot=snapshot,
     )
     registry_names = {item.name for item in composition.registry.list_available(tool_context)}
     prompt_names = {item.name for item in prompt.available_tools}
@@ -619,6 +621,7 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
         envelope=None,
         invocations=(),
         observations=(),
+        snapshot=snapshot,
     )
     unavailable_registry_names = {
         item.name for item in unavailable_composition.registry.list_available(unavailable_context)

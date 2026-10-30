@@ -81,6 +81,7 @@ from cti_app.domain.investigation_experiment import (
     HYPOTHESIS_ID_PATTERN,
 )
 from cti_app.domain.investigation_state import Hypothesis
+from cti_app.domain.osint_open import osint_effective_policy_authorizes_binding
 
 _LEGACY_SCHEMA_V1_TOOLS = frozenset(
     {
@@ -616,6 +617,17 @@ class OperatorToolInvocationService:
             if envelope is not None
             else self._execution.unapproved_budget_for(investigation)
         )
+        osint_policy_authorized: bool | None = None
+        if envelope is not None:
+            from cti_app.domain.investigation import EnvelopeAuthorityKind
+
+            if envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY:
+                try:
+                    osint_policy_authorized = await self._policy_envelope_authorized_for_projection(
+                        envelope, investigation
+                    )
+                except Exception:
+                    osint_policy_authorized = False
         tool_context = ToolExecutionContext(
             investigation_id=self._investigation_id,
             envelope=envelope,
@@ -623,6 +635,7 @@ class OperatorToolInvocationService:
             idempotency_key="operator-context-read",
             available_capabilities=self._available_capabilities,
             unavailable_tool_reasons=self._unavailable_tool_reasons,
+            osint_policy_authorized=osint_policy_authorized,
             blocked_capabilities=(
                 ("bridge.advisor:external_llm_disclosure_denied",)
                 if not InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
@@ -1634,6 +1647,26 @@ class OperatorToolInvocationService:
             return False
         effective = await resolver(self._investigation_id)
         return bool(effective is not None and effective.authorized)
+
+    async def _policy_envelope_authorized_for_projection(
+        self, envelope: Any, investigation: Any
+    ) -> bool:
+        from cti_app.domain.investigation import EnvelopeAuthorityKind
+
+        if envelope is None or envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY:
+            return True
+        resolver = self._effective_policy_for
+        if resolver is None:
+            return False
+        effective = await resolver(self._investigation_id)
+        return osint_effective_policy_authorizes_binding(
+            effective,
+            investigation_id=investigation.id,
+            subject_id=investigation.subject_id,
+            policy_id=envelope.inherited_policy_id,
+            policy_version=envelope.inherited_policy_version,
+            policy_event_id=envelope.inherited_policy_event_id,
+        )
 
     async def _result(
         self,

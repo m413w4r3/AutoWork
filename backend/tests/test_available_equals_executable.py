@@ -5,6 +5,7 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -43,6 +44,7 @@ from cti_app.application.research_context_builder import blocked_capabilities_fr
 from cti_app.domain.external_effects import invocation_arguments_digest
 from cti_app.domain.investigation import (
     BudgetDimension,
+    EnvelopeAuthorityKind,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
@@ -391,6 +393,7 @@ async def _build_context(
     registry: InMemoryToolRegistry,
     *,
     envelope: Any = ...,
+    osint_policy_authorized: bool | None = None,
 ):
     active_envelope = (
         await fixture.envelopes.get(fixture.investigation_id) if envelope is ... else envelope
@@ -407,6 +410,7 @@ async def _build_context(
         budget=budget,
         idempotency_key="available-equals-executable-context",
         available_capabilities=capabilities,
+        osint_policy_authorized=osint_policy_authorized,
     )
     return await fixture.context_builder.build(
         investigation_id=fixture.investigation_id,
@@ -419,6 +423,213 @@ async def _build_context(
             if amount is not None
         },
         registry=registry,
+    )
+
+
+def _osint_policy_envelope(envelope: Any, *, providers: tuple[str, ...]) -> Any:
+    event_id = uuid4()
+    return replace(
+        envelope,
+        allowed_providers=providers,
+        authority_kind=EnvelopeAuthorityKind.OSINT_POLICY,
+        inherited_policy_id=uuid4(),
+        inherited_policy_version=1,
+        inherited_policy_event_id=event_id,
+        approval_decision_id=event_id,
+    )
+
+
+def _register_advisor(registry: InMemoryToolRegistry, fixture: _Fixture) -> None:
+    definition, adapter = _schema_tool(
+        "advisor.consult",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        ToolEffect.EXTERNAL_READ,
+        "bridge.advisor",
+    )
+    registry.register(definition, adapter)
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "bridge.advisor"))
+
+
+@pytest.mark.asyncio
+async def test_active_osint_policy_projection_matches_dispatch_gates() -> None:
+    (
+        fixture,
+        state,
+        registry,
+        _summaries,
+        operator_service,
+        _tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+    _register_advisor(registry, fixture)
+    envelope = _osint_policy_envelope(fixture.envelope, providers=("bridge", "vt"))
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+
+    context = await _build_context(
+        fixture,
+        state,
+        registry,
+        osint_policy_authorized=True,
+    )
+
+    available_names = {item.name for item in context.available_tools}
+    assert "advisor.consult" in available_names
+    assert {name for name in available_names if name.startswith("vt.")}
+    vt_pivots = [item for item in context.available_pivots if item.tool_name.startswith("vt.")]
+    assert vt_pivots
+    assert all(
+        item.execution_state == "available" or item.blocked_reason == "source_references_required"
+        for item in vt_pivots
+    ), [
+        (item.tool_name, item.execution_state, item.blocked_reason)
+        for item in vt_pivots
+        if item.execution_state != "available"
+        and item.blocked_reason != "source_references_required"
+    ]
+
+    async def active_policy(_investigation_id):
+        investigation = await fixture.investigations.get(fixture.investigation_id)
+        inheritance = SimpleNamespace(
+            investigation_id=fixture.investigation_id,
+            subject_id=investigation.subject_id,
+            policy_id=envelope.inherited_policy_id,
+            policy_version=envelope.inherited_policy_version,
+            policy_event_id=envelope.inherited_policy_event_id,
+        )
+        policy = SimpleNamespace(
+            policy_id=envelope.inherited_policy_id,
+            version=envelope.inherited_policy_version,
+            event_id=envelope.inherited_policy_event_id,
+            contains_subject=lambda subject_id: subject_id == investigation.subject_id,
+        )
+        return SimpleNamespace(authorized=True, inheritance=inheritance, policy=policy)
+
+    operator_service._available_capabilities = fixture.available_capabilities
+    operator_service._effective_policy_for = active_policy
+    operator_context = await operator_service.get_context()
+    operator_tool_names = {item.name for item in operator_context.context.available_tools}
+    assert {"advisor.consult", "vt.file_report"} <= operator_tool_names
+
+
+@pytest.mark.asyncio
+async def test_operator_context_blocks_active_policy_with_mismatched_envelope_lineage() -> None:
+    (
+        fixture,
+        _state,
+        registry,
+        _summaries,
+        operator_service,
+        _tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+    _register_advisor(registry, fixture)
+    envelope = _osint_policy_envelope(fixture.envelope, providers=("bridge", "vt"))
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+
+    async def mismatched_active_policy(_investigation_id):
+        return SimpleNamespace(
+            authorized=True,
+            inheritance=SimpleNamespace(
+                investigation_id=fixture.investigation_id,
+                subject_id=investigation.subject_id,
+                policy_id=uuid4(),
+                policy_version=envelope.inherited_policy_version,
+                policy_event_id=envelope.inherited_policy_event_id,
+            ),
+            policy=SimpleNamespace(
+                policy_id=envelope.inherited_policy_id,
+                version=envelope.inherited_policy_version,
+                event_id=envelope.inherited_policy_event_id,
+                contains_subject=lambda subject_id: subject_id == investigation.subject_id,
+            ),
+        )
+
+    operator_service._effective_policy_for = mismatched_active_policy
+    operator_service._available_capabilities = fixture.available_capabilities
+
+    operator_context = await operator_service.get_context()
+    tool_names = {item.name for item in operator_context.context.available_tools}
+    assert "advisor.consult" not in tool_names
+    assert "vt.file_report" not in tool_names
+    unavailable = set(operator_context.context.unavailable_tools)
+    assert "advisor.consult:policy_authorization_unverified" in unavailable
+    assert "vt.file_report:policy_authorization_unverified" in unavailable
+
+
+@pytest.mark.asyncio
+async def test_inactive_osint_policy_blocks_external_tools_and_vt_pivots() -> None:
+    fixture, state, registry, _summaries, _service, _tools, _identifiers = await _seeded_fixture()
+    _register_advisor(registry, fixture)
+    envelope = _osint_policy_envelope(fixture.envelope, providers=("bridge", "vt"))
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+
+    context = await _build_context(
+        fixture,
+        state,
+        registry,
+        osint_policy_authorized=False,
+    )
+
+    assert "advisor.consult" not in {item.name for item in context.available_tools}
+    assert "advisor.consult:policy_authorization_unverified" in context.unavailable_tools
+    vt_pivots = [item for item in context.available_pivots if item.tool_name.startswith("vt.")]
+    assert vt_pivots
+    assert {item.blocked_reason for item in vt_pivots} == {"policy_authorization_unverified"}
+
+
+@pytest.mark.asyncio
+async def test_osint_policy_does_not_authorize_advisor_when_bridge_is_not_allowed() -> None:
+    fixture, state, registry, _summaries, _service, _tools, _identifiers = await _seeded_fixture()
+    _register_advisor(registry, fixture)
+    envelope = _osint_policy_envelope(fixture.envelope, providers=("vt",))
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+
+    context = await _build_context(
+        fixture,
+        state,
+        registry,
+        osint_policy_authorized=True,
+    )
+
+    assert "advisor.consult" not in {item.name for item in context.available_tools}
+    assert "advisor.consult:provider_not_authorized" in context.unavailable_tools
+    assert any(item.name.startswith("vt.") for item in context.available_tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ("tlp_red", "external_llm_disallowed"))
+async def test_osint_policy_keeps_external_disclosure_denials(denial: str) -> None:
+    fixture, state, registry, _summaries, _service, _tools, _identifiers = await _seeded_fixture()
+    _register_advisor(registry, fixture)
+    envelope = _osint_policy_envelope(fixture.envelope, providers=("bridge", "vt"))
+    if denial == "external_llm_disallowed":
+        fixture.snapshot = replace(fixture.snapshot, external_llm_allowed=False)
+        fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+    else:
+        fixture.snapshot = replace(fixture.snapshot, tlp="RED")
+        fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+
+    context = await _build_context(
+        fixture,
+        state,
+        registry,
+        osint_policy_authorized=True,
+    )
+
+    assert "advisor.consult" not in {item.name for item in context.available_tools}
+    assert "advisor.consult:external_disclosure_denied" in context.unavailable_tools
+    assert any(
+        item.tool_name.startswith("vt.")
+        and item.execution_state == "blocked"
+        and item.blocked_reason == "external_disclosure_denied"
+        for item in context.available_pivots
     )
 
 
