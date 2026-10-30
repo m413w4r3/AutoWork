@@ -419,7 +419,7 @@ class Settings(BaseSettings):
     osint_open_default_tlp: Literal["white", "clear", "green", "amber", "red"] = "clear"
     osint_open_acquire_hits_allowed: bool = True
     osint_open_max_effect_claims_per_investigation: int | None = Field(default=500, ge=1)
-    rule_workbench_enabled: bool = False
+    rule_workbench_enabled: bool = True
     analysis_string_min_length: int = Field(default=4, ge=1, le=1024)
     analysis_max_strings: int = Field(default=10_000, ge=1, le=1_000_000)
     analysis_max_sample_bytes: int = Field(default=200 * 1024 * 1024, gt=0)

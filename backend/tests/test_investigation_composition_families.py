@@ -280,6 +280,23 @@ def test_rule_get_is_registered_without_the_rule_workbench_when_read_ports_exist
     assert composition.registry.get("rule.propose", "1") is None
 
 
+def test_default_rule_workbench_fails_closed_without_engine_and_candidate_ports() -> None:
+    class _ReadableArtifacts:
+        async def read_json(self, _blob_id):
+            return {}
+
+    ports = replace(_all_family_ports(), rule_workbench=None, rule_corpus_bytes=None)
+    settings = _settings()
+    assert settings.rule_workbench_enabled is True
+
+    composition = _build(ports, settings=settings, artifact_store=_ReadableArtifacts())
+
+    assert "rule.get" in composition.available_tools
+    assert "rule.propose" not in composition.available_tools
+    assert "rule.test" not in composition.available_tools
+    assert composition.registry.get("rule.propose", "1") is None
+
+
 @pytest.mark.asyncio
 async def test_missing_rea_runner_does_not_disable_other_tool_families() -> None:
     composition = _build(replace(_all_family_ports(), confined_rea_runner=None))
