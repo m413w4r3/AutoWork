@@ -903,7 +903,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         missing_payload = missing_ref.json()
         # Typed pre-transport proof (confirmed non-execution) => FAILED, not NEEDS_REVIEW.
         assert missing_payload["invocation"]["status"] == ToolInvocationStatus.FAILED.value
-        assert missing_payload["invocation"]["error_code"] == "tool_failed"
+        assert missing_payload["invocation"]["error_code"] == "advisor_input_invalid"
         assert missing_payload["advisor_output"]["advisor_status"] == "invalid_input"
         assert missing_payload["advisor_output"]["confirmed_non_execution"] is True
         assert missing_payload["advisor_output"]["provider_usage"] == {"status": "not_submitted"}
@@ -916,6 +916,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             client,
             investigation_id,
             latest_state.version,
+            latest_state.sha256,
             idempotency_key=f"m05d-allowed-fake-send-{investigation_id}",
             evidence_ref=first.id,
         )
@@ -1036,6 +1037,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             client,
             investigation_id,
             latest_state.version,
+            latest_state.sha256,
             idempotency_key=f"m05d-revoked-advisor-{investigation_id}",
             evidence_ref=first.id,
         )
@@ -1150,7 +1152,7 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
             assert refused.status_code == 200, refused.text
             body = refused.json()
             assert body["invocation"]["status"] == ToolInvocationStatus.FAILED.value
-            assert body["invocation"]["error_code"] == "tool_failed"
+            assert body["invocation"]["error_code"] == "advisor_disclosure_restricted"
             advisor_output = body["advisor_output"]
             assert advisor_output["advisor_status"] == "disclosure_restricted"
             assert advisor_output["preflight_status"] == "POLICY_BLOCKED"
