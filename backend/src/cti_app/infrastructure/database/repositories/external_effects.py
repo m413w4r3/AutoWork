@@ -281,6 +281,24 @@ class SqlAlchemyExternalEffectClaimStore:
         verifier = self._no_handoff_proof_verifier
         return verifier.consume(self, proof, claim_id) if verifier is not None else None
 
+    async def latest_advisor_claim_for_invocation(
+        self, investigation_id: UUID, invocation_id: UUID
+    ) -> ExternalEffectClaim | None:
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(ExternalEffectClaimRow)
+                .where(
+                    ExternalEffectClaimRow.investigation_id == investigation_id,
+                    ExternalEffectClaimRow.invocation_id == invocation_id,
+                    ExternalEffectClaimRow.family == "advisor.consult",
+                    ExternalEffectClaimRow.provider == "bridge",
+                )
+                .order_by(ExternalEffectClaimRow.created_at.desc(), ExternalEffectClaimRow.id.desc())
+                .limit(1)
+                .execution_options(populate_existing=True)
+            )
+        return _claim_to_domain(row) if row is not None else None
+
     async def consume(
         self,
         authority: ExternalEffectAuthority,

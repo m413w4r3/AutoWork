@@ -206,7 +206,9 @@ class ModelConversationTurn:
         now: datetime | None = None,
     ) -> None:
         """Close a turn from an already-adopted exact ModelRun output."""
-        if self.status not in {ConversationTurnStatus.RUNNING, ConversationTurnStatus.NEEDS_REVIEW}:
+        if self.status not in {ConversationTurnStatus.RUNNING, ConversationTurnStatus.NEEDS_REVIEW} and not (
+            self.status is ConversationTurnStatus.FAILED and self.error_code == "operator_abandoned"
+        ):
             raise ValueError("Conversation turn is not recoverable")
         self.output_blob_reference = output_blob_reference
         self.output_sha256 = output_sha256
@@ -273,4 +275,47 @@ class ModelConversationTurn:
         self.error_code = "orphaned_running_turn"
         self.error_message = "Le job propriétaire est terminé sans sortie Bridge persistée."
         self.error_details = previous
+        self.finished_at = now or datetime.now(UTC)
+
+    def mark_pre_submission_retryable(
+        self, *, model_run_id: UUID, submission_attempt: int, now: datetime | None = None
+    ) -> None:
+        """Seal this exact turn after its ModelRun proves no provider handoff began."""
+        if self.status not in {
+            ConversationTurnStatus.RUNNING,
+            ConversationTurnStatus.NEEDS_REVIEW,
+        }:
+            raise ValueError("Only an unresolved conversation turn can be sealed pre-submission")
+        if submission_attempt < 0:
+            raise ValueError("Submission attempt cannot be negative")
+        self.status = ConversationTurnStatus.FAILED
+        self.error_code = "bridge_pre_submission_failure"
+        self.error_message = "Le ModelRun confirme que le fournisseur n'a pas reçu ce tour."
+        self.error_details = {
+            "pre_submission_proof": {
+                "model_run_id": str(model_run_id),
+                "submission_attempt": submission_attempt,
+                "submission_state": "not_submitted",
+            }
+        }
+        self.finished_at = now or datetime.now(UTC)
+
+    def seal_verified_no_handoff(
+        self, *, model_run_id: UUID, claim_id: UUID, now: datetime | None = None
+    ) -> None:
+        """Seal this turn using a server-verified, invocation-bound no-handoff claim."""
+        if self.status is not ConversationTurnStatus.NEEDS_REVIEW:
+            raise ValueError("Only an unresolved conversation turn can be sealed")
+        if not isinstance(claim_id, UUID):
+            raise TypeError("claim_id must be UUID")
+        self.status = ConversationTurnStatus.FAILED
+        self.error_code = "bridge_pre_submission_failure"
+        self.error_message = "Une preuve serveur confirme que Bridge n'a pas reçu ce tour."
+        self.error_details = {
+            "pre_submission_proof": {
+                "source": "external_effect_claim",
+                "claim_id": str(claim_id),
+                "model_run_id": str(model_run_id),
+            }
+        }
         self.finished_at = now or datetime.now(UTC)

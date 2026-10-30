@@ -259,10 +259,9 @@ class InvestigationWorkingState:
 
 
 def investigation_bridge_attempt(recent_actions: tuple[str, ...], turn_index: int) -> int:
-    """Return the next Bridge attempt after an explicit or automatic disposition."""
+    """Return the next attempt only after a recorded non-handoff proof."""
     prefixes = (
-        f"bridge_turn_abandoned:{turn_index}:next_attempt=",
-        f"bridge_turn_orphaned:{turn_index}:next_attempt=",
+        f"bridge_turn_pre_submission_retry:{turn_index}:next_attempt=",
         f"bridge_turn_pre_submission_retry_exhausted:{turn_index}:next_attempt=",
     )
     attempts = []

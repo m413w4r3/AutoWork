@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID
 
 from cti_app.application.bridge_investigator import (
@@ -166,6 +166,7 @@ def build_investigation_operator_view(
     pending_bridge_turn_status: str | None = None,
     pending_bridge_turn_error_code: str | None = None,
     pending_bridge_turn_key: str | None = None,
+    provider_response_ids: Mapping[UUID, str] | None = None,
 ) -> InvestigationOperatorView:
     guidance = advisor_guidance or {
         "checkpoint_due": False,
@@ -198,13 +199,16 @@ def build_investigation_operator_view(
             ToolInvocationStatus.RUNNING,
             ToolInvocationStatus.NEEDS_REVIEW,
         }
-        and not item.response_refs
+        and (item.status is ToolInvocationStatus.NEEDS_REVIEW or not item.response_refs)
     )
     ambiguous = tuple(
         item
         for item in unresolved
         if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
     )
+    invocation_ids_by_operation_key = {
+        item.operation_key: item.id for item in ordered_invocations
+    }
     latest_invocation = ordered_invocations[-1] if ordered_invocations else None
     pending_bridge_key = None
     bridge_conversation_id = make_investigation_conversation_id(investigation.id)
@@ -261,7 +265,7 @@ def build_investigation_operator_view(
                 if pending_bridge_turn_error_code == "orphaned_running_turn"
                 else "reconcile interrupted Bridge turn before resume"
                 if pending_bridge_turn_error_code == "operator_interrupted"
-                else "submit a new attempt after explicit operator abandonment"
+                else "reconcile the exact provider result after legacy abandonment"
                 if pending_bridge_turn_error_code == "operator_abandoned"
                 else "reconcile the exact persisted turn before resume"
             ),
@@ -310,6 +314,7 @@ def build_investigation_operator_view(
         [
             {
                 "operation_key": item.operation_key,
+                "invocation_id": invocation_ids_by_operation_key.get(item.operation_key),
                 "status": item.status.value,
                 "amounts": {key.value: value for key, value in item.amounts.items()},
                 "committed_amounts": {
@@ -404,9 +409,30 @@ def build_investigation_operator_view(
             },
             "last_error": last_error,
             "last_operation": last_operation,
-            "invocations": [_invocation_view(item) for item in ordered_invocations],
-            "ambiguous_invocations": [_invocation_view(item) for item in ambiguous],
-            "invocations_requiring_reconciliation": [_invocation_view(item) for item in unresolved],
+            "invocations": [
+                _invocation_view(
+                    item,
+                    investigation_id=investigation.id,
+                    provider_response_id=(provider_response_ids or {}).get(item.id),
+                )
+                for item in ordered_invocations
+            ],
+            "ambiguous_invocations": [
+                _invocation_view(
+                    item,
+                    investigation_id=investigation.id,
+                    provider_response_id=(provider_response_ids or {}).get(item.id),
+                )
+                for item in ambiguous
+            ],
+            "invocations_requiring_reconciliation": [
+                _invocation_view(
+                    item,
+                    investigation_id=investigation.id,
+                    provider_response_id=(provider_response_ids or {}).get(item.id),
+                )
+                for item in unresolved
+            ],
             "evidence_checkpoint": {
                 "observation_count": len(evidence),
                 "sha256": evidence_checkpoint_sha256,
@@ -463,7 +489,18 @@ def build_investigation_operator_view(
     )
 
 
-def _invocation_view(invocation: ToolInvocation) -> dict[str, Any]:
+def _invocation_view(
+    invocation: ToolInvocation,
+    *,
+    investigation_id: UUID | None = None,
+    provider_response_id: str | None = None,
+) -> dict[str, Any]:
+    needs_reconciliation = invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    reconcile_path = (
+        f"/api/investigations/{investigation_id}/operator/invocations/{invocation.id}/reconcile"
+        if investigation_id is not None and needs_reconciliation
+        else None
+    )
     return {
         "id": invocation.id,
         "operation_key": invocation.operation_key,
@@ -471,16 +508,28 @@ def _invocation_view(invocation: ToolInvocation) -> dict[str, Any]:
         "status": invocation.status.value,
         "version": invocation.version,
         "response_refs": list(invocation.response_refs),
+        "provider_response_id": provider_response_id,
         "evidence_missing": (
-            [] if invocation.response_refs else ["provider response or reconciliation evidence"]
+            ["provider outcome reconciliation"]
+            if needs_reconciliation
+            else []
+            if invocation.response_refs
+            else ["provider response or reconciliation evidence"]
         ),
         "decision_expected": (
             "reconcile before resume"
             if invocation.status in {ToolInvocationStatus.PENDING, ToolInvocationStatus.RUNNING}
-            or (
-                invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-                and not invocation.response_refs
-            )
+            or needs_reconciliation
+            else None
+        ),
+        "reconciliation_action": (
+            {
+                "method": "POST",
+                "path": reconcile_path,
+                "expected_version": invocation.version,
+                "resubmission_allowed": False,
+            }
+            if reconcile_path is not None
             else None
         ),
         "updated_at": invocation.updated_at,
@@ -516,6 +565,15 @@ def _next_action(
         }
     if unresolved:
         invocation = unresolved[0]
+        if invocation.status is ToolInvocationStatus.NEEDS_REVIEW:
+            return {
+                "code": OperatorNextAction.RECONCILE_TOOL_INVOCATION.value,
+                "method": "POST",
+                "path": f"{prefix}/operator/invocations/{invocation.id}/reconcile",
+                "invocation_id": invocation.id,
+                "expected_version": invocation.version,
+                "resubmission_allowed": False,
+            }
         return {
             "code": OperatorNextAction.RECONCILE_TOOL_INVOCATION.value,
             "method": "POST",
@@ -567,8 +625,12 @@ def _next_action(
     if (
         pending_bridge_key is not None
         and pending_bridge_turn_id is not None
-        and pending_bridge_turn_status == "needs_review"
-        and pending_bridge_turn_error_code in {"operator_interrupted", "orphaned_running_turn"}
+        and (
+            pending_bridge_turn_status == "needs_review"
+            and pending_bridge_turn_error_code in {"operator_interrupted", "orphaned_running_turn"}
+            or pending_bridge_turn_status == "failed"
+            and pending_bridge_turn_error_code == "operator_abandoned"
+        )
     ):
         turn_prefix = (
             f"/api/model-conversations/{bridge_conversation_id}/turns/"
@@ -576,22 +638,25 @@ def _next_action(
         )
         return {
             "code": OperatorNextAction.RECONCILE_MODEL_CONVERSATION_TURN.value,
-            "reason": "orphaned_running_turn"
+            "reason": "legacy_abandonment"
+            if pending_bridge_turn_error_code == "operator_abandoned"
+            else "orphaned_running_turn"
             if pending_bridge_turn_error_code == "orphaned_running_turn"
             else "operator_interrupted",
             "method": "POST",
-            "path": f"{turn_prefix}/abandon",
+            "path": f"{turn_prefix}/visible/preview",
             "preview_path": f"{turn_prefix}/visible/preview",
-            "abandon_path": f"{turn_prefix}/abandon",
+            "adopt_path": f"{turn_prefix}/visible/adopt",
             "query": {"subject_id": str(investigation.subject_id)},
             "submission_key": pending_bridge_turn_key or pending_bridge_key,
             "requires_human_reconciliation": True,
-            "abandon_body_fields": ["reason"],
+            "adoption_requires_expected_sha256": True,
+            "resubmission_allowed": False,
         }
     if pending_bridge_key is not None and state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW:
         if pending_bridge_turn_status == "succeeded" or (
             pending_bridge_turn_status == "failed"
-            and pending_bridge_turn_error_code == "operator_abandoned"
+            and pending_bridge_turn_error_code == "bridge_pre_submission_failure"
         ):
             return {
                 "code": OperatorNextAction.RESUME_INVESTIGATION.value,
@@ -615,13 +680,12 @@ def _next_action(
                 "path": f"{turn_prefix}/visible/preview",
                 "preview_path": f"{turn_prefix}/visible/preview",
                 "adopt_path": f"{turn_prefix}/visible/adopt",
-                "abandon_path": f"{turn_prefix}/abandon",
                 "query": {"subject_id": str(investigation.subject_id)},
                 "submission_key": pending_bridge_turn_key or pending_bridge_key,
                 "requires_human_reconciliation": True,
                 "adoption_requires_expected_sha256": True,
                 "adoption_is_not_g2_g3_approval": True,
-                "abandon_body_fields": ["reason"],
+                "resubmission_allowed": False,
             }
         return {
             "code": OperatorNextAction.INSPECT_BRIDGE_TURN.value,

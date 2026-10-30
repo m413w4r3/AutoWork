@@ -26,7 +26,10 @@ from cti_app.application.analyst_handoff import (
     loop_budget_from_settings,
 )
 from cti_app.application.blob_storage import BlobReadLimitExceededError
-from cti_app.application.bridge_investigator import make_investigation_turn_idempotency_key
+from cti_app.application.bridge_investigator import (
+    make_investigation_conversation_id,
+    make_investigation_turn_idempotency_key,
+)
 from cti_app.application.content_pivot_candidates import (
     validated_unlinked_content_pivot_payload,
 )
@@ -87,6 +90,7 @@ from cti_app.application.investigation_pivot_frontier import (
 )
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
+from cti_app.application.model_conversations import ModelConversationReconciliationError
 from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     project_tool_availability,
@@ -1625,16 +1629,28 @@ async def get_investigation_operator_observation(
         )
         observation_source = getattr(observation, "source", "")
         observation_object_type = getattr(observation, "object_type", "")
-        preserve_complete_content = (
+        is_advisor_call = (
             observation_source == "advisor.consult" and observation_object_type == "advisor_call"
+        )
+        preserve_complete_content = (
+            is_advisor_call
         ) or (
             str(observation_source).casefold() == "autowork ruleworkbench"
             and observation_object_type == "detection_candidate_version"
         )
+        descriptor_size = getattr(descriptor, "size", None)
+        if is_advisor_call and (type(descriptor_size) is not int or descriptor_size < 0):
+            raise _http_error(409, "operator_observation_integrity_failed")
         try:
             raw = await _artifact_store(request).read_bytes(
                 observation.blob_id,
-                max_bytes=max_object_bytes if preserve_complete_content else 8 * 1024 * 1024,
+                max_bytes=(
+                    descriptor_size
+                    if is_advisor_call
+                    else max_object_bytes
+                    if preserve_complete_content
+                    else 8 * 1024 * 1024
+                ),
             )
         except (ValueError, KeyError) as exc:
             raise _http_error(413, "operator_observation_too_large") from exc
@@ -1663,7 +1679,7 @@ async def get_investigation_operator_observation(
             sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         payload_maximum = max_object_bytes if preserve_complete_content else 8 * 1024 * 1024
-        if len(payload_json.encode("utf-8")) > payload_maximum:
+        if not is_advisor_call and len(payload_json.encode("utf-8")) > payload_maximum:
             raise _http_error(413, "operator_observation_too_large")
         page = payload_json[offset : offset + length]
         next_offset = offset + len(page) if offset + len(page) < len(payload_json) else None
@@ -1734,6 +1750,32 @@ async def get_investigation_operator_status(
                 "activated_by": await _policy_activation_actor(uow, effective_policy),
             }
         invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
+        provider_response_ids: dict[UUID, str] = {}
+        coordinator = getattr(request.app.state, "external_effect_coordinator", None)
+        claim_lookup = getattr(coordinator, "latest_advisor_claim_for_invocation", None)
+        if callable(claim_lookup):
+            for invocation in invocations:
+                if (
+                    invocation.status
+                    not in {
+                        ToolInvocationStatus.PENDING,
+                        ToolInvocationStatus.RUNNING,
+                        ToolInvocationStatus.NEEDS_REVIEW,
+                    }
+                    or invocation.tool_name != "advisor.consult"
+                ):
+                    continue
+                claim = await claim_lookup(investigation_id, invocation.id)
+                if (
+                    claim is None
+                    or claim.investigation_id != investigation_id
+                    or claim.invocation_id != invocation.id
+                    or claim.model_run_id is None
+                ):
+                    continue
+                model_run = await uow.model_runs.get(claim.model_run_id)
+                if model_run is not None and isinstance(model_run.response_id, str):
+                    provider_response_ids[invocation.id] = model_run.response_id
         observations = tuple(
             await uow.evidence_observations.list_for_investigation(investigation_id)
         )
@@ -1831,6 +1873,7 @@ async def get_investigation_operator_status(
             pending_bridge_turn_key=(
                 pending_bridge_turn.idempotency_key if pending_bridge_turn else None
             ),
+            provider_response_ids=provider_response_ids,
         )
         invocation_costs = await _operator_bridge_invocation_costs(
             invocations=invocations,
@@ -4053,6 +4096,296 @@ class InvocationReconciliationResponse(BaseModel):
     status: ToolInvocationStatus
     version: int
     response_refs: tuple[UUID, ...]
+
+
+class OperatorAdvisorReconciliationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+
+
+class OperatorAdvisorReconciliationResponse(BaseModel):
+    invocation_id: UUID
+    status: ToolInvocationStatus
+    version: int
+    outcome: Literal["response_adopted", "non_execution_sealed", "needs_review"]
+    provider_response_id: str | None
+    response_sha256: str | None
+    response_text: str | None
+    result_is_untrusted: Literal[True] = True
+    canonical_promotion: Literal[False] = False
+    non_execution_sealed: bool = False
+    resubmission_allowed: bool = False
+
+
+@router.post(
+    "/investigations/{investigation_id}/operator/invocations/{invocation_id}/reconcile",
+    response_model=OperatorAdvisorReconciliationResponse,
+)
+async def reconcile_operator_advisor_invocation(
+    investigation_id: UUID,
+    invocation_id: UUID,
+    payload: OperatorAdvisorReconciliationRequest,
+    request: Request,
+) -> OperatorAdvisorReconciliationResponse:
+    """Recover an exact advisor response through the configured server transport.
+
+    This action never resubmits a request or treats observation references as
+    provider results. A missing or unavailable response leaves the invocation
+    in NEEDS_REVIEW.
+    """
+    identity = await _require_operator_client(request)
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        invocation = await uow.tool_invocations.get(invocation_id)
+        if (
+            investigation is None
+            or invocation is None
+            or invocation.investigation_id != investigation_id
+        ):
+            raise _http_error(404, "invocation_not_found")
+        if invocation.version != payload.expected_version:
+            raise _http_error(409, "stale_invocation_version")
+        if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
+            raise _http_error(409, "invocation_reconciliation_not_required")
+        if invocation.tool_name != "advisor.consult":
+            raise _http_error(422, "provider_reconciliation_unsupported")
+
+        coordinator = getattr(request.app.state, "external_effect_coordinator", None)
+        claim_lookup = getattr(coordinator, "latest_advisor_claim_for_invocation", None)
+        if not callable(claim_lookup):
+            return _operator_advisor_reconciliation_pending(invocation, None)
+        claim = await claim_lookup(investigation_id, invocation_id)
+        if (
+            claim is None
+            or claim.investigation_id != investigation_id
+            or claim.invocation_id != invocation_id
+            or claim.family != "advisor.consult"
+            or claim.provider != "bridge"
+            or claim.bridge_turn_id is None
+            or claim.model_run_id is None
+        ):
+            return _operator_advisor_reconciliation_pending(invocation, None)
+        run = await uow.model_runs.get(claim.model_run_id)
+        turn = await uow.model_conversation_turns.get(claim.bridge_turn_id)
+        if (
+            run is None
+            or turn is None
+            or turn.model_run_id != run.id
+            or turn.conversation_id != make_investigation_conversation_id(investigation_id)
+        ):
+            return _operator_advisor_reconciliation_pending(invocation, None)
+        claim_status = getattr(claim.state, "value", claim.state)
+        provider_response_id = run.response_id
+        has_stored_output = bool(
+            getattr(turn, "output_blob_reference", None)
+            or getattr(run, "output_references", ())
+            or getattr(run, "raw_output_reference", None)
+            or getattr(run, "raw_output_sha256", None)
+        ) or getattr(run, "raw_output_chars", None) is not None
+        proof_claim_id = (
+            claim.id
+            if claim_status == "DEFINITIVELY_NOT_SUBMITTED"
+            and not provider_response_id
+            and not has_stored_output
+            else None
+        )
+        conversation_service = getattr(_composition_factory(request), "model_conversations", None)
+        if conversation_service is None:
+            raise _http_error(503, "operator_reconciliation_unavailable")
+
+        run_status = getattr(run.status, "value", run.status)
+        turn_status = getattr(turn.status, "value", turn.status)
+        already_adopted = run_status == "succeeded" and turn_status == "succeeded"
+        if proof_claim_id is None and not already_adopted and (
+            run_status != "needs_review"
+            or turn_status != "needs_review"
+            or claim_status != "NEEDS_REVIEW"
+        ):
+            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+        context_subject_id = investigation.subject_id
+
+    if proof_claim_id is not None:
+        seal = getattr(conversation_service, "seal_verified_pre_submission", None)
+        if not callable(seal):
+            return _operator_advisor_reconciliation_pending(invocation, None)
+        try:
+            await seal(
+                make_investigation_conversation_id(investigation_id),
+                claim.bridge_turn_id,
+                claim_id=proof_claim_id,
+                actor_id=identity.actor_id,
+                context_subject_id=context_subject_id,
+            )
+        except ModelConversationReconciliationError:
+            return _operator_advisor_reconciliation_pending(invocation, None)
+
+        async with _uow_factory(request)() as recheck_uow:
+            current = await recheck_uow.tool_invocations.get(invocation_id)
+            if (
+                current is None
+                or current.investigation_id != investigation_id
+                or current.version != payload.expected_version
+                or current.status is not ToolInvocationStatus.NEEDS_REVIEW
+            ):
+                raise _http_error(409, "stale_invocation_version")
+            envelope = await recheck_uow.investigation_envelopes.get_for_update(
+                investigation_id
+            )
+            if envelope is None and current.reserved_budget:
+                return _operator_advisor_reconciliation_pending(current, None)
+            if envelope is not None:
+                reservation = next(
+                    (
+                        item
+                        for item in envelope.budget.reservations
+                        if item.operation_key == current.operation_key
+                    ),
+                    None,
+                )
+                if reservation is None and current.reserved_budget:
+                    return _operator_advisor_reconciliation_pending(current, None)
+                if reservation is not None and reservation.status.value != "released":
+                    envelope.budget.release_confirmed_non_submission(current.operation_key)
+                    updated_envelope = replace(envelope, version=envelope.version + 1)
+                    await recheck_uow.investigation_envelopes.save_if_version(
+                        updated_envelope, expected_version=envelope.version
+                    )
+            resolved = current.resolve_pre_submission_failure()
+            await recheck_uow.tool_invocations.update_if_version(
+                resolved, expected_version=current.version
+            )
+            await recheck_uow.commit()
+        return OperatorAdvisorReconciliationResponse(
+            invocation_id=resolved.id,
+            status=resolved.status,
+            version=resolved.version,
+            outcome="non_execution_sealed",
+            provider_response_id=None,
+            response_sha256=None,
+            response_text=None,
+            non_execution_sealed=True,
+            resubmission_allowed=True,
+        )
+
+    async with _uow_factory(request)() as policy_uow:
+        envelope = await policy_uow.investigation_envelopes.get(investigation_id)
+        decisions = tuple(
+            await policy_uow.analyst_decisions.list_for_investigation(investigation_id)
+        )
+        authorization = g2_envelope_authorization_state(envelope, decisions)
+        if envelope is None or authorization.revoked:
+            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+        try:
+            snapshot = await _composition_factory(request).article_snapshots.resolve(
+                investigation.synthesis_artifact_id
+            )
+        except (KeyError, ValueError):
+            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+        if not InvestigationService.bridge_disclosure_allowed(snapshot, envelope):
+            return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+
+    if not isinstance(provider_response_id, str) or not provider_response_id:
+        return _operator_advisor_reconciliation_pending(invocation, None)
+
+    try:
+        if already_adopted:
+            contents = await conversation_service.turns(
+                make_investigation_conversation_id(investigation_id),
+                context_subject_id=context_subject_id,
+            )
+            content = next((item for item in contents if item.turn.id == claim.bridge_turn_id), None)
+            if (
+                content is None
+                or not isinstance(content.output_text, str)
+                or not content.output_text
+                or hashlib.sha256(content.output_text.encode("utf-8")).hexdigest()
+                != run.raw_output_sha256
+            ):
+                return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+            response_text = content.output_text
+            response_sha256 = run.raw_output_sha256
+        else:
+            preview = await conversation_service.preview_visible_recovery(
+                make_investigation_conversation_id(investigation_id),
+                claim.bridge_turn_id,
+                context_subject_id=context_subject_id,
+            )
+            async with _uow_factory(request)() as recheck_uow:
+                current = await recheck_uow.tool_invocations.get(invocation_id)
+                if (
+                    current is None
+                    or current.investigation_id != investigation_id
+                    or current.version != payload.expected_version
+                    or current.status is not ToolInvocationStatus.NEEDS_REVIEW
+                ):
+                    raise _http_error(409, "stale_invocation_version")
+                current_envelope = await recheck_uow.investigation_envelopes.get(
+                    investigation_id
+                )
+                current_decisions = tuple(
+                    await recheck_uow.analyst_decisions.list_for_investigation(investigation_id)
+                )
+                current_authorization = g2_envelope_authorization_state(
+                    current_envelope, current_decisions
+                )
+                if current_envelope is None or current_authorization.revoked:
+                    return _operator_advisor_reconciliation_pending(
+                        invocation, provider_response_id
+                    )
+                try:
+                    current_snapshot = await _composition_factory(
+                        request
+                    ).article_snapshots.resolve(investigation.synthesis_artifact_id)
+                except (KeyError, ValueError):
+                    return _operator_advisor_reconciliation_pending(
+                        invocation, provider_response_id
+                    )
+                if not InvestigationService.bridge_disclosure_allowed(
+                    current_snapshot, current_envelope
+                ):
+                    return _operator_advisor_reconciliation_pending(
+                        invocation, provider_response_id
+                    )
+            await conversation_service.adopt_visible_recovery(
+                make_investigation_conversation_id(investigation_id),
+                claim.bridge_turn_id,
+                expected_sha256=preview["sha256"],
+                actor_id=identity.actor_id,
+                context_subject_id=context_subject_id,
+            )
+            response_text = preview["text"]
+            response_sha256 = preview["sha256"]
+    except ModelConversationReconciliationError:
+        return _operator_advisor_reconciliation_pending(invocation, provider_response_id)
+
+    return OperatorAdvisorReconciliationResponse(
+        invocation_id=invocation.id,
+        status=invocation.status,
+        version=invocation.version,
+        outcome="response_adopted",
+        provider_response_id=provider_response_id,
+        response_sha256=response_sha256,
+        response_text=response_text,
+        non_execution_sealed=False,
+        resubmission_allowed=False,
+    )
+
+
+def _operator_advisor_reconciliation_pending(
+    invocation: Any, provider_response_id: str | None
+) -> OperatorAdvisorReconciliationResponse:
+    return OperatorAdvisorReconciliationResponse(
+        invocation_id=invocation.id,
+        status=invocation.status,
+        version=invocation.version,
+        outcome="needs_review",
+        provider_response_id=provider_response_id,
+        response_sha256=None,
+        response_text=None,
+        non_execution_sealed=False,
+        resubmission_allowed=False,
+    )
 
 
 @router.post(
