@@ -27,7 +27,7 @@ from cti_app.application.context_pagination import (
     decode_offset_cursor,
     encode_offset_cursor,
 )
-from cti_app.application.evidence_recorder import _sanitize_json, sanitize_evidence_text
+from cti_app.application.evidence_recorder import _sanitize_json
 from cti_app.application.investigation_contracts import (
     InvestigationContextV1,
     InvestigationOperatorContextV1,
@@ -66,6 +66,7 @@ from cti_app.application.research_context_builder import (
 from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.investigation import (
     BudgetReservationStatus,
+    FindingAssessment,
     FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -100,6 +101,88 @@ _CREDENTIAL_TEXT = re.compile(
     r"password|authorization)\s*[:=]\s*\S+)",
     re.I,
 )
+_OPERATOR_ERROR_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
+_FINDING_RESULT_FIELDS = (
+    "finding_id",
+    "finding_version",
+    "kind",
+    "assessment",
+    "assessment_requested",
+    "assessment_recorded",
+    "assessment_downgrade_code",
+    "assessment_prewrite_message",
+)
+_FINDING_OBJECT_KINDS = frozenset(
+    {"new_sample", "network_behaviour", "infection_chain", "capability", "detection"}
+)
+_FINDING_DOWNGRADE_MESSAGES = {
+    "downgraded_no_matching_subject": (
+        "The requested supported assessment was saved as inconclusive because subject_ref "
+        "was missing. Provide subject_ref and cite an observation whose object_id matches it."
+    ),
+    "downgraded_without_observation": (
+        "The requested supported assessment was saved without cited evidence. Cite an "
+        "observation from this investigation before requesting supported."
+    ),
+    "downgraded_no_matching_observation": (
+        "The requested supported assessment was constrained because no cited observation "
+        "matched subject_ref. Cite an observation with the same object_id."
+    ),
+    "downgraded_claim_without_supporting_observation": (
+        "The requested supported claim assessment needs a current claim reference and a "
+        "supporting non-source observation from this investigation."
+    ),
+    "downgraded_invalid_sample_subject": (
+        "The requested supported new-sample assessment needs a valid sample hash in "
+        "subject_ref and matching evidence."
+    ),
+}
+_OPERATOR_ERROR_MESSAGES = {
+    "tool_unavailable": (
+        "This tool is not registered or unavailable in the current runtime. Select a registered "
+        "tool or enable its required capability."
+    ),
+    "tool_policy_denied": (
+        "The current policy refused this action. Refresh the approved investigation scope and "
+        "retry only if the action is authorized."
+    ),
+    "invocation_needs_review": (
+        "The prior operation has an unconfirmed outcome. Complete the human reconciliation "
+        "step before retrying it."
+    ),
+    "tool_failed": (
+        "The tool could not complete the request. Review this error code and the current "
+        "investigation context, correct the inputs, then retry."
+    ),
+    "external_disclosure_denied": (
+        "No external request was authorized. Update the investigation disclosure approval "
+        "before retrying this action."
+    ),
+    "source_references_required": (
+        "Add a canonical observation reference from this investigation that is associated with "
+        "the exact requested target, then retry."
+    ),
+    "finding_observation_not_found": (
+        "Refresh the observation list and cite an observation that exists in this investigation."
+    ),
+    "finding_observation_investigation_mismatch": (
+        "Choose an observation from this investigation; cross-investigation references cannot "
+        "support a finding."
+    ),
+    "finding_claim_not_found": (
+        "Refresh the article context and cite a claim from its current article snapshot."
+    ),
+    "finding_not_found": (
+        "Refresh the finding list and use a finding version that belongs to this investigation."
+    ),
+    "stale_finding_version": (
+        "Reload the current finding and submit its latest expected_finding_version."
+    ),
+    "finding_invalid": (
+        "Check the finding fields and provenance requirements, including subject_ref and "
+        "matching observations for object-specific findings."
+    ),
+}
 _SIGNED_QUERY = frozenset(
     {
         "signature",
@@ -1470,12 +1553,37 @@ class OperatorToolInvocationService:
         tool_result: Any | None = None,
         unavailable_reason: str | None = None,
     ) -> OperatorToolInvocationResult:
-        error_code = {
+        if tool_result is None and invocation.tool_name in {"finding.propose", "finding.revise"}:
+            registered = self._registry.get(invocation.tool_name, invocation.schema_version)
+            replay_lookup = (
+                getattr(registered[1], "result_for_replay", None) if registered else None
+            )
+            if callable(replay_lookup):
+                replay_output = await replay_lookup(
+                    invocation.normalized_parameters, self._investigation_id
+                )
+                if isinstance(replay_output, Mapping):
+                    tool_result = ToolResult(
+                        status=invocation.status,
+                        observation_refs=invocation.response_refs,
+                        output=replay_output,
+                    )
+
+        status_error_code = {
             ToolInvocationStatus.UNAVAILABLE: "tool_unavailable",
             ToolInvocationStatus.POLICY_DENIED: "tool_policy_denied",
             ToolInvocationStatus.NEEDS_REVIEW: "invocation_needs_review",
             ToolInvocationStatus.FAILED: "tool_failed",
         }.get(invocation.status)
+        nested_error_code = getattr(tool_result, "error_code", None) or (
+            tool_result.output.get("error_code") if tool_result is not None else None
+        )
+        safe_nested_error_code = _safe_operator_error_code(
+            nested_error_code, invocation.normalized_parameters
+        )
+        error_code = (
+            safe_nested_error_code or status_error_code if status_error_code is not None else None
+        )
         job_id = None
         if tool_result is not None:
             raw_job_id = tool_result.output.get("job_id")
@@ -1484,10 +1592,36 @@ class OperatorToolInvocationService:
                     job_id = UUID(raw_job_id)
                 except ValueError:
                     job_id = None
-        output_data: Any = None
+        response_refs: list[UUID] = []
+        for observation_id in invocation.response_refs:
+            if not isinstance(observation_id, UUID) or observation_id in response_refs:
+                continue
+            if self._observations is None:
+                # execute_tool_call validates refs before persisting the invocation.
+                response_refs.append(observation_id)
+                continue
+            observation = await self._observations.get(observation_id)
+            if observation is not None and observation.investigation_id == self._investigation_id:
+                response_refs.append(observation_id)
+        published_refs = set(response_refs)
+        referenced_ids: list[UUID] = [
+            item for item in invocation.response_refs if isinstance(item, UUID)
+        ]
+        if tool_result is not None:
+            referenced_ids.extend(
+                item
+                for item in getattr(tool_result, "observation_refs", ())
+                if isinstance(item, UUID)
+            )
+        omitted_observation_refs = [
+            {"observation_ref": str(item), "reason": "not_verified_in_investigation"}
+            for item in dict.fromkeys(referenced_ids)
+            if isinstance(item, UUID) and item not in published_refs
+        ]
+
+        persisted: list[dict[str, Any]] = []
         if self._observations is not None and self._evidence_summaries is not None:
-            persisted: list[dict[str, Any]] = []
-            for observation_id in invocation.response_refs[:8]:
+            for observation_id in response_refs[:8]:
                 observation = await self._observations.get(observation_id)
                 if observation is None or observation.investigation_id != self._investigation_id:
                     continue
@@ -1505,10 +1639,33 @@ class OperatorToolInvocationService:
                         "summary": summary,
                     }
                 )
+
+        result_data: Mapping[str, Any] | None = None
+        if tool_result is not None and invocation.status in {
+            ToolInvocationStatus.UNAVAILABLE,
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.FAILED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }:
+            if safe_nested_error_code is not None:
+                result_data = {"error_code": safe_nested_error_code}
+        elif tool_result is not None:
+            result_data = (
+                _finding_tool_result_data(invocation, tool_result)
+                if invocation.tool_name in {"finding.propose", "finding.revise"}
+                else tool_result.output
+            )
+        if invocation.tool_name in {"finding.propose", "finding.revise"}:
+            output_data: dict[str, Any] = {"result": dict(result_data or {})}
             if persisted:
-                output_data = {"observations": persisted}
-        if output_data is None and tool_result is not None:
-            output_data = {"result": tool_result.output}
+                output_data["observations"] = persisted
+        elif persisted:
+            output_data = {"observations": persisted}
+        elif result_data is not None:
+            output_data = {"result": result_data}
+        else:
+            output_data = {}
+        output_data["omitted_observation_refs"] = omitted_observation_refs
         safe_data = _sanitize_json(output_data or {})
         safe_data = _bounded_json_value(safe_data)
         output: dict[str, Any] = {
@@ -1523,25 +1680,130 @@ class OperatorToolInvocationService:
             ToolInvocationStatus.FAILED,
             ToolInvocationStatus.NEEDS_REVIEW,
         }:
-            raw_reason = (
-                unavailable_reason
-                or getattr(tool_result, "message", None)
-                or (tool_result.output.get("reason") if tool_result is not None else None)
-                or invocation.status.value
+            safe_reason_key = _safe_operator_error_code(
+                unavailable_reason, invocation.normalized_parameters
+            )
+            registered = self._registry.get(invocation.tool_name, invocation.schema_version)
+            required_capability = (
+                getattr(registered[0], "capability_key", None) if registered is not None else None
             )
             output["error"] = {
                 "code": error_code or invocation.status.value,
-                "reason": sanitize_evidence_text(raw_reason, max_chars=512),
+                "reason": _operator_tool_error_message(
+                    error_code or invocation.status.value,
+                    safe_reason_key=safe_reason_key,
+                    required_capability=required_capability,
+                ),
             }
         return OperatorToolInvocationResult(
             investigation_id=invocation.investigation_id,
             working_state_version=state_version,
-            invocation=invocation,
+            invocation=replace(invocation, response_refs=tuple(response_refs)),
             error_code=error_code,
             job_id=job_id,
             idempotent_replay=replay,
             output=output,
         )
+
+
+def _safe_operator_error_code(value: object, parameters: Mapping[str, Any]) -> str | None:
+    if (
+        not isinstance(value, str)
+        or len(value) > 64
+        or _OPERATOR_ERROR_CODE.fullmatch(value) is None
+    ):
+        return None
+    if _SECRET_FIELD.search(value):
+        return None
+    if len(value) in {32, 40, 64} and all(character in "0123456789abcdef" for character in value):
+        return None
+    if value.casefold() in _parameter_string_values(parameters):
+        return None
+    return value
+
+
+def _parameter_string_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value.casefold()}
+    if isinstance(value, Mapping):
+        result: set[str] = set()
+        for item in value.values():
+            result.update(_parameter_string_values(item))
+        return result
+    if isinstance(value, (list, tuple)):
+        result = set()
+        for item in value:
+            result.update(_parameter_string_values(item))
+        return result
+    return set()
+
+
+def _operator_tool_error_message(
+    code: str,
+    *,
+    safe_reason_key: str | None = None,
+    required_capability: str | None = None,
+) -> str:
+    if safe_reason_key == "external_llm_disclosure_denied":
+        return _OPERATOR_ERROR_MESSAGES["external_disclosure_denied"]
+    if (
+        code == "tool_unavailable"
+        and isinstance(required_capability, str)
+        and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", required_capability) is not None
+    ):
+        return (
+            f"This tool requires the {required_capability} capability, which is unavailable "
+            "in the current runtime. Select an available tool or enable that capability."
+        )
+    return _OPERATOR_ERROR_MESSAGES.get(
+        code,
+        "The tool could not complete the request. Review this error code and current "
+        "investigation context, correct the inputs, then retry.",
+    )
+
+
+def _finding_tool_result_data(invocation: ToolInvocation, tool_result: Any) -> dict[str, Any]:
+    raw_output = tool_result.output if isinstance(tool_result.output, Mapping) else {}
+    result = {key: raw_output[key] for key in _FINDING_RESULT_FIELDS if key in raw_output}
+    valid_assessments = {item.value for item in FindingAssessment}
+    requested = result.get(
+        "assessment_requested", invocation.normalized_parameters.get("assessment")
+    )
+    if requested not in valid_assessments:
+        requested = None
+    recorded = result.get("assessment_recorded", result.get("assessment"))
+    if recorded not in valid_assessments:
+        recorded = None
+    if requested is not None:
+        result["assessment_requested"] = requested
+    if recorded is not None:
+        result["assessment"] = recorded
+        result["assessment_recorded"] = recorded
+
+    if requested is not None and recorded is not None and requested != recorded:
+        code = result.get("assessment_downgrade_code")
+        if not isinstance(code, str) or _OPERATOR_ERROR_CODE.fullmatch(code) is None:
+            kind = result.get("kind", invocation.normalized_parameters.get("kind"))
+            subject_ref = invocation.normalized_parameters.get("subject_ref")
+            code = (
+                "downgraded_no_matching_subject"
+                if kind in _FINDING_OBJECT_KINDS and not subject_ref
+                else "downgraded_by_provenance_guard"
+            )
+        result["assessment_downgrade_code"] = code
+        prewrite_message = result.get("assessment_prewrite_message")
+        if isinstance(prewrite_message, str) and len(prewrite_message) <= 512:
+            result["assessment_prewrite_message"] = prewrite_message
+        else:
+            result["assessment_prewrite_message"] = _FINDING_DOWNGRADE_MESSAGES.get(
+                code,
+                "The requested assessment was constrained by the finding provenance rules. "
+                "Review the recorded assessment and cited observations.",
+            )
+    else:
+        result["assessment_downgrade_code"] = None
+        result.pop("assessment_prewrite_message", None)
+    return result
 
 
 def _canonical_uuid_reference(value: object) -> str | None:

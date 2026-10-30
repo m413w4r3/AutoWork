@@ -43,6 +43,10 @@ from cti_app.application.investigation_experiments import (
     InMemoryInvestigationExperimentRepository,
     register_operator_experiment_tools,
 )
+from cti_app.application.investigation_findings import (
+    OPERATOR_FINDING_SCHEMA_VERSION,
+    register_operator_finding_tools,
+)
 from cti_app.application.investigation_persistence import (
     InMemoryInvestigationBudgetRepository,
     VersionConflictError,
@@ -449,6 +453,164 @@ async def test_same_key_replays_durable_result_and_changed_payload_conflicts() -
     with pytest.raises(OperatorToolInvocationError) as error:
         await service.invoke(**{**request, "purpose": "different payload"})
     assert error.value.code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_result_preserves_safe_tool_error_code_and_uses_actionable_message() -> None:
+    fixture, state, service = await _fixture()
+    invocation = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key="operator-write:error-code-test",
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters={"query": "synthetic target"},
+        purpose="Verify safe error reporting.",
+        status=ToolInvocationStatus.FAILED,
+    )
+    tool_result = ToolResult(
+        ToolInvocationStatus.FAILED,
+        error_code="source_references_required",
+        message="exception details containing a raw value must not be echoed",
+    )
+
+    result = await service._result(invocation, state.version, replay=False, tool_result=tool_result)
+
+    assert result.error_code == "source_references_required"
+    assert result.output["error"]["code"] == "source_references_required"
+    assert "canonical observation reference" in result.output["error"]["reason"]
+    assert "exception details" not in result.output["error"]["reason"]
+
+    unsafe_code = "a" * 64
+    unsafe_result = await service._result(
+        invocation,
+        state.version,
+        replay=False,
+        tool_result=ToolResult(
+            ToolInvocationStatus.FAILED,
+            error_code=unsafe_code,
+            message="untrusted diagnostic text",
+        ),
+    )
+    assert unsafe_result.error_code == "tool_failed"
+    assert unsafe_code not in str(unsafe_result.output)
+    assert "untrusted diagnostic text" not in str(unsafe_result.output)
+
+
+@pytest.mark.asyncio
+async def test_result_omits_unverified_observation_refs_without_changing_the_404_route() -> None:
+    fixture, state, _service_without_observations = await _fixture()
+    valid = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="a" * 64,
+        source="sample.analyze",
+        source_version="analysis-v1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id="synthetic-sample",
+    )
+    foreign = replace(valid, id=uuid4(), investigation_id=uuid4())
+    missing_ref = uuid4()
+    await fixture.observations.append_if_absent(valid)
+    await fixture.observations.append_if_absent(foreign)
+
+    class _Summary:
+        async def summary(self, _observation):
+            return {"status": "stored"}
+
+    service = _service(fixture, observations=fixture.observations, evidence_summaries=_Summary())
+    invocation = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key="operator-write:response-ref-validation",
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters={"query": "synthetic target"},
+        purpose="Verify response reference filtering.",
+        status=ToolInvocationStatus.SUCCEEDED,
+        response_refs=(valid.id, foreign.id, missing_ref),
+    )
+
+    result = await service._result(invocation, state.version, replay=True)
+
+    assert result.invocation.response_refs == (valid.id,)
+    omitted_refs = result.output["data"]["omitted_observation_refs"]
+    assert [item["observation_ref"] for item in omitted_refs] == [
+        str(foreign.id),
+        str(missing_ref),
+    ]
+    assert {item["reason"] for item in result.output["data"]["omitted_observation_refs"]} == {
+        "not_verified_in_investigation"
+    }
+    assert len(result.output["data"]["observations"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_finding_result_keeps_recorded_and_requested_assessments_with_observations() -> None:
+    fixture, state, _ = await _fixture()
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="b" * 64,
+        source="sample.analyze",
+        source_version="analysis-v1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id="sample-under-test",
+    )
+    await fixture.observations.append_if_absent(observation)
+    register_operator_finding_tools(
+        fixture.registry,
+        findings=fixture.findings,
+        observations=fixture.observations,
+        investigations=fixture.investigations,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "operator.write"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+
+    class _Summary:
+        async def summary(self, _observation):
+            return {"status": "stored"}
+
+    service = _service(fixture, observations=fixture.observations, evidence_summaries=_Summary())
+    arguments = {
+        "action": "propose",
+        "kind": "infection_chain",
+        "assessment": "supported",
+        "statement": "Synthetic infection chain observation.",
+        "subject_ref": None,
+        "observation_refs": [str(observation.id)],
+        "claim_refs": [],
+        "novelty": None,
+        "scope": "offline analysis",
+        "limitations": [],
+    }
+    request = {
+        "tool_name": "finding.propose",
+        "schema_version": OPERATOR_FINDING_SCHEMA_VERSION,
+        "arguments": arguments,
+        "purpose": "Record an operator finding.",
+        "expected_version": state.version,
+        "idempotency_key": "operator-finding-result-test",
+    }
+
+    first = await service.invoke(**request)
+    replay = await service.invoke(**request)
+    data = first.output["data"]
+    replay_data = replay.output["data"]
+
+    assert first.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert data["result"]["assessment_requested"] == "supported"
+    assert data["result"]["assessment_recorded"] == "inconclusive"
+    assert data["result"]["assessment_downgrade_code"] == "downgraded_no_matching_subject"
+    assert data["result"]["assessment"] == "inconclusive"
+    assert data["observations"][0]["observation_id"] == str(observation.id)
+    assert replay.idempotent_replay is True
+    assert replay_data["result"]["assessment_requested"] == "supported"
+    assert replay_data["result"]["assessment_recorded"] == "inconclusive"
+    assert replay_data["result"]["assessment_downgrade_code"] == "downgraded_no_matching_subject"
 
 
 @pytest.mark.asyncio

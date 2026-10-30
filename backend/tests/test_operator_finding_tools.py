@@ -110,6 +110,10 @@ async def test_supported_operator_finding_without_real_observation_is_downgraded
     assert len(persisted) == 1
     assert persisted[0].assessment is FindingAssessment.INCONCLUSIVE
     assert "Subject reference: sample-a" in persisted[0].scope
+    assert result.output["assessment_requested"] == "supported"
+    assert result.output["assessment_recorded"] == "inconclusive"
+    assert result.output["assessment_downgrade_code"] == "downgraded_without_observation"
+    assert "object_id matches subject_ref" in result.output["assessment_prewrite_message"]
 
 
 @pytest.mark.asyncio
@@ -148,12 +152,60 @@ async def test_supported_finding_requires_matching_observation_and_deduplicates(
         proposal(subject_ref="different-object", observation_refs=[str(observation.id)]),
         context(investigation_id),
     )
+    nonmatching = make_observation(investigation_id, object_id="another-object")
+    await observations.append_if_absent(nonmatching)
+    revised = await adapter.execute(
+        proposal(
+            action="revise",
+            finding_id=result.output["finding_id"],
+            expected_finding_version=1,
+            subject_ref=None,
+            observation_refs=[str(nonmatching.id)],
+            statement="The measured sample exposes an infection chain.",
+        ),
+        context(investigation_id),
+    )
 
     persisted = await findings.list_for_investigation(investigation_id)
     assert result.status.value == "succeeded"
     assert duplicate.output["finding_id"] == result.output["finding_id"]
-    assert len(persisted) == 2
+    assert len(persisted) == 3
     current = next(item for item in persisted if "different-object" in item.scope)
     assert downgraded.status.value == "succeeded"
     assert downgraded.output["assessment"] == "qualified"
+    assert downgraded.output["assessment_requested"] == "supported"
+    assert downgraded.output["assessment_recorded"] == "qualified"
+    assert downgraded.output["assessment_downgrade_code"] == ("downgraded_no_matching_observation")
+    assert revised.status.value == "succeeded"
+    assert revised.output["assessment_requested"] == "supported"
+    assert revised.output["assessment_recorded"] == "qualified"
+    assert revised.output["assessment_downgrade_code"] == "downgraded_no_matching_observation"
     assert current.assessment is FindingAssessment.QUALIFIED
+
+
+@pytest.mark.asyncio
+async def test_supported_finding_without_subject_warns_before_append_and_records_reason() -> None:
+    investigation_id = uuid4()
+    findings, observations, adapter = make_adapter(investigation_id)
+    observation = make_observation(investigation_id)
+    await observations.append_if_absent(observation)
+
+    result = await adapter.execute(
+        proposal(
+            kind="infection_chain",
+            subject_ref=None,
+            observation_refs=[str(observation.id)],
+        ),
+        context(investigation_id),
+    )
+
+    persisted = await findings.list_for_investigation(investigation_id)
+    assert len(persisted) == 1
+    assert persisted[0].assessment is FindingAssessment.INCONCLUSIVE
+    assert result.output["assessment_requested"] == "supported"
+    assert result.output["assessment_recorded"] == "inconclusive"
+    assert result.output["assessment_downgrade_code"] == "downgraded_no_matching_subject"
+    message = result.output["assessment_prewrite_message"]
+    assert "Before saving" in message
+    assert "subject_ref" in message
+    assert "sample-a" not in message
