@@ -140,13 +140,29 @@ def _source_refs_for_family(
                 sha256=normalized_hash,
             ),
         )
+        if (
+            family in _VT_HASH_READ_FAMILIES
+            and metadata
+            and not any(reference.kind == "sample_hash" for reference in metadata)
+            and all(
+                reference.kind in {"evidence_observation", "source_document", "document"}
+                for reference in metadata
+            )
+        ):
+            return metadata
         if not metadata or metadata == expected:
             return expected
         if (
             sum(reference.kind == "sample_hash" for reference in metadata) == 1
             and expected[0] in metadata
             and all(
-                reference.kind in {"sample_hash", "evidence_observation"} for reference in metadata
+                reference.kind
+                in (
+                    {"sample_hash", "evidence_observation", "source_document", "document"}
+                    if family in _VT_HASH_READ_FAMILIES
+                    else {"sample_hash", "evidence_observation"}
+                )
+                for reference in metadata
             )
         ):
             return metadata
@@ -503,12 +519,14 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 or not await self._invocation_hash_source_allowed(context, ungrounded_hashes)
             ):
                 return False
-            if observation_hashes - (
-                associated_hashes | sample_hashes
-            ) and not osint_vt_search_may_cite_unassociated_observation_hash(
-                authority_kind=context.authority.authority_kind,
-                provider=context.prepared.provider,
-                family=context.prepared.family,
+            if (
+                observation_hashes - (associated_hashes | sample_hashes)
+                and context.prepared.family not in _VT_HASH_READ_FAMILIES
+                and not osint_vt_search_may_cite_unassociated_observation_hash(
+                    authority_kind=context.authority.authority_kind,
+                    provider=context.prepared.provider,
+                    family=context.prepared.family,
+                )
             ):
                 return False
             sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)

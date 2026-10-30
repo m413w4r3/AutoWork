@@ -26,6 +26,7 @@ from cti_app.application.investigation_composition import (
 from cti_app.application.investigation_contracts import (
     ArticleClaimV1,
     ArticleContextV1,
+    ConfirmedIOCContextV1,
     FindingProposalV1,
     PublicationAnchorV1,
 )
@@ -928,6 +929,157 @@ async def test_trusted_vt_source_refs_accept_any_file_pivot_hash_under_osint(
     hash_value = arguments.get("file_hash", arguments.get("object_id"))
     assert references == (
         EvidenceReference("sample_hash", hash_value, "sample-hash.v1", hash_value),
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_vt_source_refs_resolve_ip_from_contacted_ips_observation() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    ip_address = "198.51.100.42"
+    observation = EvidenceObservation(
+        investigation_id=investigation.id,
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="VirusTotal",
+        source_version="vt.relationship.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip_address",
+        object_id=ip_address,
+        limitations=("relation=contacted_ips",),
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.relationships",
+        arguments={
+            "object_type": "ip_address",
+            "object_id": ip_address,
+            "relation": "resolutions",
+            "_vt_external_effect_source_refs": [
+                EvidenceReference("evidence_observation", str(uuid4()), "fake", "f" * 64).to_json()
+            ],
+        },
+        envelope=fixture.envelope,
+    )
+
+    assert references == (
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_vt_source_refs_resolve_sha256_observation_and_confirmed_ioc() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    file_hash = "a" * 64
+    observation = EvidenceObservation(
+        investigation_id=investigation.id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="VirusTotal",
+        source_version="vt.file-report.v1",
+        observed_at=datetime.now(UTC),
+        object_type="sha256",
+        object_id=file_hash,
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    observation_references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.behaviour",
+        arguments={"file_hash": file_hash},
+        envelope=fixture.envelope,
+    )
+    assert observation_references == (
+        EvidenceReference("sample_hash", file_hash, "sample-hash.v1", file_hash),
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+    )
+
+    document_id = uuid4()
+    snapshot = replace(
+        fixture.snapshot,
+        confirmed_iocs=(
+            ConfirmedIOCContextV1(
+                indicator_type="sha256",
+                value=file_hash,
+                extraction_artifact_id=uuid4(),
+                extraction_artifact_version=1,
+                source_document_ids=(document_id,),
+            ),
+        ),
+    )
+    fixture.snapshot = snapshot
+    fixture.service._context_builder.article_snapshots.snapshot = snapshot
+    document_references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.behaviour",
+        arguments={"file_hash": file_hash},
+        envelope=fixture.envelope,
+    )
+    assert document_references == (
+        EvidenceReference("sample_hash", file_hash, "sample-hash.v1", file_hash),
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+        EvidenceReference(
+            "source_document",
+            str(document_id),
+            f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}",
+            snapshot.synthesis_sha256,
+        ),
+    )
+
+    document_only_hash = "b" * 64
+    document_only_id = uuid4()
+    document_only_snapshot = replace(
+        snapshot,
+        confirmed_iocs=(
+            ConfirmedIOCContextV1(
+                indicator_type="sha256",
+                value=document_only_hash,
+                extraction_artifact_id=uuid4(),
+                extraction_artifact_version=1,
+                source_document_ids=(document_only_id,),
+            ),
+        ),
+    )
+    fixture.service._context_builder.article_snapshots.snapshot = document_only_snapshot
+    document_only_references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.behaviour",
+        arguments={"file_hash": document_only_hash},
+        envelope=fixture.envelope,
+    )
+    document_only_version = (
+        f"{document_only_snapshot.synthesis_artifact_id}@"
+        f"{document_only_snapshot.synthesis_version or 1}"
+    )
+    assert document_only_references == (
+        EvidenceReference(
+            "source_document",
+            str(document_only_id),
+            document_only_version,
+            document_only_snapshot.synthesis_sha256,
+        ),
     )
 
 

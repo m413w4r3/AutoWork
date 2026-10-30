@@ -175,6 +175,36 @@ def test_vt_consume_resolves_md5_sha1_only_from_server_metadata(
     assert _source_refs_for_family("vt.behaviour", {**parameters, "file_hash": file_hash}) == ()
 
 
+@pytest.mark.parametrize("family", ["vt.file_report", "vt.relationships", "vt.behaviour"])
+@pytest.mark.parametrize("reference_kind", ["source_document", "evidence_observation"])
+def test_vt_passive_sha256_reads_accept_only_server_resolved_metadata(
+    family: str, reference_kind: str
+) -> None:
+    file_hash = "a" * 64
+    reference = EvidenceReference(
+        reference_kind,
+        str(uuid4()),
+        "article@1" if reference_kind == "source_document" else "observation.v1",
+        "b" * 64,
+    )
+    parameters: dict[str, object] = {
+        "_vt_external_effect_source_refs": [reference.to_json()],
+    }
+    if family == "vt.relationships":
+        parameters.update({"object_type": "file", "object_id": file_hash})
+    else:
+        parameters["file_hash"] = file_hash
+
+    assert _source_refs_for_family(family, parameters) == (reference,)
+    assert (
+        _source_refs_for_family(
+            "vt.download_sample",
+            {"sha256": file_hash, "_vt_external_effect_source_refs": [reference.to_json()]},
+        )
+        == ()
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("observed_hash", "return_observation", "expected_reason"),
@@ -2483,26 +2513,48 @@ async def test_consume_allows_unassociated_vt_search_observation_only_under_osin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("policy", "source_restriction"),
-    [(True, None), (False, None), (True, "red"), (True, "license")],
+    ("family", "policy", "source_restriction"),
+    [
+        ("vt.intelligence_search", True, None),
+        ("vt.intelligence_search", False, None),
+        ("vt.intelligence_search", True, "red"),
+        ("vt.intelligence_search", True, "license"),
+        ("vt.file_report", True, None),
+        ("vt.file_report", False, None),
+        ("vt.file_report", False, "red"),
+        ("vt.file_report", False, "license"),
+    ],
 )
-async def test_vt_policy_guard_checks_unassociated_search_observation_under_osint(
-    policy: bool, source_restriction: str | None
+async def test_vt_policy_guard_checks_unassociated_observation_for_passive_read(
+    family: str, policy: bool, source_restriction: str | None
 ) -> None:
+    sample_hash = "e" * 64
     observation_id = uuid4()
     reference = EvidenceReference(
         "evidence_observation", str(observation_id), "vt-file-report.v1", "f" * 64
     )
-    prepared = PreparedExternalRequest.build(
-        family="vt.intelligence_search",
-        provider="vt",
-        provider_scope="default",
-        normalizer_version="vt-read.v1",
-        canonical_request={"query": "type:peexe"},
-        application_request=_wire(target=b"/api/v3/intelligence/search?query=type%3Apeexe"),
-        evidence_refs=(reference,),
-        credential_parameter_names=("apikey",),
-    )
+    if family == "vt.intelligence_search":
+        prepared = PreparedExternalRequest.build(
+            family=family,
+            provider="vt",
+            provider_scope="default",
+            normalizer_version="vt-read.v1",
+            canonical_request={"query": "type:peexe"},
+            application_request=_wire(target=b"/api/v3/intelligence/search?query=type%3Apeexe"),
+            evidence_refs=(reference,),
+            credential_parameter_names=("apikey",),
+        )
+    else:
+        prepared = PreparedExternalRequest.build(
+            family=family,
+            provider="vt",
+            provider_scope="default",
+            normalizer_version="vt-read.v1",
+            canonical_request={"path": f"/api/v3/files/{sample_hash}"},
+            application_request=_wire(target=f"/api/v3/files/{sample_hash}".encode()),
+            evidence_refs=(reference,),
+            credential_parameter_names=("apikey",),
+        )
     authority = _authority(policy=policy)
     restricted_sample = SimpleNamespace(
         tlp="RED" if source_restriction == "red" else "GREEN",
@@ -2515,7 +2567,7 @@ async def test_vt_policy_guard_checks_unassociated_search_observation_under_osin
         source_version=reference.version,
         sha256=reference.sha256,
         object_type="file",
-        object_id="e" * 64,
+        object_id=sample_hash,
     )
 
     class _Session(AsyncSession):
@@ -2541,7 +2593,10 @@ async def test_vt_policy_guard_checks_unassociated_search_observation_under_osin
 
     allowed = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(context)
 
-    assert allowed is (policy and source_restriction is None)
+    expected = (policy if family == "vt.intelligence_search" else True) and (
+        source_restriction is None
+    )
+    assert allowed is expected
 
 
 @pytest.mark.parametrize(
