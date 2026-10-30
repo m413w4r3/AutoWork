@@ -33,7 +33,9 @@ DEFAULT_EXECUTOR = [
     "-c",
 ]
 GET_OK = re.compile(r"^/[A-Za-z0-9_\-/.?=&%:,+]*$")
-TOOL_OK = re.compile(r"^/operator/tools/[a-z_.]+$")
+TOOL_OK = re.compile(
+    r"^/operator/(tools/[a-z_.]+|invocations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/reconcile)$"
+)
 INVESTIGATION_ID_OK = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 SCRIPT = r'''
