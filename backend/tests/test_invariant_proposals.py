@@ -545,7 +545,7 @@ async def test_all_six_immutable_references_are_in_canonical_input() -> None:
     }
     assert all(value for value in references.values())
     assert all("BEGIN_P10_FACTS" in prompt for prompt in conversation.prompts)
-    assert all("do not return JSON" in prompt for prompt in conversation.prompts)
+    assert all("Reply in plain text lines" in prompt and "JSON" not in prompt for prompt in conversation.prompts)
     assert all("BEGIN_P10_SNAPSHOT_DATA" not in prompt for prompt in conversation.prompts)
     assert '"snapshot_references":' not in conversation.prompts[0]
     assert str(INVESTIGATION_ID) not in conversation.prompts[0]
