@@ -1203,6 +1203,10 @@ class OperatorToolInvocationService:
                 and self._is_trusted_passive_read(tool_name, definition, registered)
                 and self._persisted_passive_read_trust(existing)
             ):
+                if state.version != expected_version or (
+                    expected_sha256 is not None and state.sha256 != expected_sha256
+                ):
+                    raise _stale_working_state_error(expected_version, expected_sha256, state)
                 existing = await self._settle_passive_read_reservation(existing)
             return await self._result(existing, state.version, state.sha256, replay=True)
 
@@ -1232,6 +1236,14 @@ class OperatorToolInvocationService:
                 raise OperatorToolInvocationError(
                     "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
                 )
+            trusted_passive_read = self._is_trusted_passive_read(
+                tool_name, definition, registered
+            ) and self._persisted_passive_read_trust(existing)
+            if trusted_passive_read and (
+                state.version != expected_version
+                or (expected_sha256 is not None and state.sha256 != expected_sha256)
+            ):
+                raise _stale_working_state_error(expected_version, expected_sha256, state)
             proof, proof_rejection = await self._framework_pre_submission_proof(existing)
             if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
@@ -1256,11 +1268,7 @@ class OperatorToolInvocationService:
                 )
                 await self._execution.commit_current_uow()
                 continue
-            if (
-                existing.status is ToolInvocationStatus.NEEDS_REVIEW
-                and self._is_trusted_passive_read(tool_name, definition, registered)
-                and self._persisted_passive_read_trust(existing)
-            ):
+            if existing.status is ToolInvocationStatus.NEEDS_REVIEW and trusted_passive_read:
                 # A passive VT GET can safely be attempted under a fresh
                 # invocation even if canonical result archival failed; the
                 # coordinator still checks current authority, disclosure and

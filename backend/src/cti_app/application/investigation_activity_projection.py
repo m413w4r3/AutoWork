@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from collections import Counter
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,12 +17,30 @@ from cti_app.domain.investigation import (
 )
 from cti_app.domain.jobs import JobStatus
 
-_SENSITIVE_PURPOSE_MARKERS = re.compile(
-    r"(?i)(api[_ -]?key|access[_ -]?token|(?<![\w])token(?![\w])|password|secret|"
-    r"authorization|bearer|signed[_ -]?url|private[_ -]?key|data:|https?://|ftp://)"
-)
-_PURPOSE_LIMIT = 240
 _OBSERVATIONS_PER_INVOCATION = 8
+_ADVISOR_ACTIVITY_LABELS = {
+    "plan_investigation": "Conseil Bridge · Plan d’enquête",
+    "pivot_strategy": "Conseil Bridge · Stratégie de pivot",
+    "yara_draft": "Conseil Bridge · Règle YARA",
+    "review_text": "Conseil Bridge · Revue de texte",
+    "draft_text": "Conseil Bridge · Rédaction",
+    "suricata_draft": "Conseil Bridge · Règle Suricata",
+    "figure_plan": "Conseil Bridge · Plan de figure",
+}
+_TOOL_ACTIVITY_LABELS = {
+    "vt.file_report": "Rapport VT · vt.file_report",
+    "vt.relationships": "Relations VT · vt.relationships",
+    "vt.intelligence_search": "Recherche VT · vt.intelligence_search",
+    "vt.object_report": "Rapport VT · vt.object_report",
+    "vt.download_sample": "Acquisition VT · vt.download_sample",
+    "sample.analyze": "Analyse locale · sample.analyze",
+    "sample.set_qualification": "Qualification · sample.set_qualification",
+    "archive.extract_member": "Extraction locale · archive.extract_member",
+    "opinion.compose": "Avis analyste · opinion.compose",
+    "opinion.note": "Note analyste · opinion.note",
+    "opinion.revise": "Révision analyste · opinion.revise",
+    "rule.propose_bridge": "Proposition de règle · rule.propose_bridge",
+}
 
 
 def build_investigation_activity_projection(
@@ -58,7 +76,7 @@ def build_investigation_activity_projection(
                 "version": item.version,
                 "tool_name": item.tool_name[:128],
                 "schema_version": item.schema_version[:128],
-                "purpose_excerpt": _purpose_excerpt(item.purpose),
+                "activity_label": _activity_label(item.tool_name, item.normalized_parameters),
                 "status": _value(item.status),
                 "created_at": item.created_at,
                 "updated_at": item.updated_at,
@@ -336,13 +354,17 @@ def _parameter_fingerprint(invocation: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(fingerprint_payload)).hexdigest()
 
 
-def _purpose_excerpt(purpose: str) -> str:
-    normalized = " ".join(purpose.split())
-    if _SENSITIVE_PURPOSE_MARKERS.search(normalized):
-        return "Objectif masqué car son libellé peut contenir une donnée sensible."
-    if len(normalized) > _PURPOSE_LIMIT:
-        return normalized[:_PURPOSE_LIMIT].rstrip() + "…"
-    return normalized
+def _activity_label(tool_name: str, parameters: Any) -> str:
+    if tool_name == "advisor.consult":
+        consultation_type = (
+            parameters.get("consultation_type") if isinstance(parameters, Mapping) else None
+        )
+        if isinstance(consultation_type, str):
+            return _ADVISOR_ACTIVITY_LABELS.get(
+                consultation_type, "Conseil Bridge · advisor.consult"
+            )
+        return "Conseil Bridge · advisor.consult"
+    return _TOOL_ACTIVITY_LABELS.get(tool_name, "Autre opération d’investigation")
 
 
 def _budget_amounts(values: Any) -> dict[str, int]:
