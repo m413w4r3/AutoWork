@@ -4135,6 +4135,67 @@ async def test_untyped_advisor_failure_does_not_release_reserved_units() -> None
 
 
 @pytest.mark.asyncio
+async def test_typed_bridge_unreachable_preflight_marks_failed_and_releases_reservation() -> None:
+    call = _advisor_tool_call("Draft one synthetic YARA candidate.")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="consult Bridge once", next_action="continue", tools=(call,)),
+            _decision(goal="finish after the confirmed no-send result", next_action="finish"),
+        ],
+        tools=(
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                {BudgetDimension.BRIDGE_TURNS: 1},
+            ),
+        ),
+    )
+    tool = fixture.tools["advisor.consult"]
+    _authorize_framework_refusal_proof_adapter(tool)
+    tool.reservation_cost = _zero_prompt_advisor_cost
+    tool.result = ToolResult(
+        ToolInvocationStatus.UNAVAILABLE,
+        error_code="advisor_unavailable",
+        budget_consumed={
+            BudgetDimension.BRIDGE_TURNS: 0,
+        },
+        output={
+            "advisor_status": "unavailable",
+            "failure_stage": "preflight",
+            "failure_reason": "bridge_unreachable",
+            "invocation_stage": "pretransport_failure",
+            "confirmed_non_execution": True,
+            "prior_submission_made": False,
+            "bridge_turns_consumed": 0,
+            "bridge_invocation_id": None,
+            "provider_usage": {"status": "not_submitted"},
+        },
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    state = await fixture.start()
+
+    await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.FAILED
+    assert tool.calls == [call["arguments"]]
+    latest_envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item
+        for item in latest_envelope.budget.reservations
+        if item.operation_key == invocations[0].operation_key
+    )
+    assert reservation.status is BudgetReservationStatus.RELEASED
+    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert reservation.committed_amounts.get(BudgetDimension.BRIDGE_TURNS, 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_g2_revocation_between_external_tools_blocks_the_second_call() -> None:
     first = _tool_call("vt.search", "content:one", "check the first payload")
     second = _tool_call("network.lookup", "203.0.113.9", "check the endpoint")

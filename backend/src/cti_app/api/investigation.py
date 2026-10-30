@@ -90,12 +90,12 @@ from cti_app.application.investigation_pivot_frontier import (
 )
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
-from cti_app.application.model_conversations import ModelConversationReconciliationError
 from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     project_tool_availability,
 )
 from cti_app.application.jobs import DuplicateJobError
+from cti_app.application.model_conversations import ModelConversationReconciliationError
 from cti_app.application.network_protocol_model import render_protocol_model
 from cti_app.application.operator_advisor_guidance import build_advisor_guidance
 from cti_app.application.operator_context_summary import (
@@ -4177,12 +4177,13 @@ async def reconcile_operator_advisor_invocation(
             return _operator_advisor_reconciliation_pending(invocation, None)
         claim_status = getattr(claim.state, "value", claim.state)
         provider_response_id = run.response_id
+        raw_output_chars = getattr(run, "raw_output_chars", None)
         has_stored_output = bool(
             getattr(turn, "output_blob_reference", None)
             or getattr(run, "output_references", ())
             or getattr(run, "raw_output_reference", None)
             or getattr(run, "raw_output_sha256", None)
-        ) or getattr(run, "raw_output_chars", None) is not None
+        ) or (raw_output_chars is not None and raw_output_chars != 0)
         proof_claim_id = (
             claim.id
             if claim_status == "DEFINITIVELY_NOT_SUBMITTED"

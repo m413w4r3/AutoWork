@@ -159,11 +159,23 @@ class _AdvisorInputValidationError(ValueError):
         *,
         measurement_errors: tuple[dict[str, int | str], ...] = (),
         valid_targets: tuple[dict[str, Any], ...] = (),
+        valid_article_claim_ids: tuple[str, ...] = (),
+        invalid_article_claim_ids: tuple[str, ...] = (),
     ) -> None:
         self.reason_code = reason_code
         self.measurement_errors = measurement_errors
         self.valid_targets = valid_targets
-        super().__init__(reason_code)
+        self.valid_article_claim_ids = valid_article_claim_ids
+        self.invalid_article_claim_ids = invalid_article_claim_ids
+        detail = (
+            "Unknown article claim ID(s): "
+            + ", ".join(invalid_article_claim_ids)
+            + ". Valid article claim IDs: "
+            + (", ".join(valid_article_claim_ids) if valid_article_claim_ids else "(none)")
+            if invalid_article_claim_ids
+            else reason_code
+        )
+        super().__init__(detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1084,6 +1096,8 @@ class InvestigationAdvisorTool:
                 observation_refs=tuple(item.id for item in evidence),
                 measurement_errors=exc.measurement_errors,
                 valid_targets=exc.valid_targets,
+                valid_article_claim_ids=exc.valid_article_claim_ids,
+                invalid_article_claim_ids=exc.invalid_article_claim_ids,
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(
@@ -1849,6 +1863,8 @@ class InvestigationAdvisorTool:
         measurement_errors: tuple[dict[str, int | str], ...] = (),
         internal_detail: Mapping[str, str | int] | None = None,
         valid_targets: tuple[dict[str, Any], ...] = (),
+        valid_article_claim_ids: tuple[str, ...] = (),
+        invalid_article_claim_ids: tuple[str, ...] = (),
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
         message = (
@@ -1869,6 +1885,14 @@ class InvestigationAdvisorTool:
             message += " Valid opinion targets: " + "; ".join(
                 _format_opinion_review_target(item) for item in valid_targets
             )
+        if invalid_article_claim_ids:
+            message += (
+                " Unknown article claim ID(s): "
+                + ", ".join(invalid_article_claim_ids)
+                + ". Valid article claim IDs: "
+                + (", ".join(valid_article_claim_ids) if valid_article_claim_ids else "(none)")
+                + "."
+            )
         result = await self._persist_preflight_failure(
             context,
             consultation_type="unknown",
@@ -1883,6 +1907,14 @@ class InvestigationAdvisorTool:
                 "bridge_turns_consumed": 0,
                 **({"measurement_errors": list(measurement_errors)} if measurement_errors else {}),
                 **({"valid_targets": list(valid_targets)} if valid_targets else {}),
+                **(
+                    {
+                        "invalid_article_claim_ids": list(invalid_article_claim_ids),
+                        "valid_article_claim_ids": list(valid_article_claim_ids),
+                    }
+                    if invalid_article_claim_ids
+                    else {}
+                ),
                 **({"input_error_detail": dict(internal_detail)} if internal_detail else {}),
                 "bridge_invocation_id": None,
                 "provider_usage": {"status": "not_submitted"},
@@ -2760,6 +2792,7 @@ class InvestigationAdvisorTool:
                 "question": question,
                 "article_source_ref": f"article:{snapshot.synthesis_sha256}",
                 "article_sha256": snapshot.synthesis_sha256,
+                "article_passages": article_passages,
                 "evidence": base["evidence"],
                 "measured_facts": base["measured_facts"],
                 "measurements": measurements,
@@ -5604,6 +5637,7 @@ def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
             "secret_preflight",
             "sample_disclosure_restricted",
             "evidence_preflight",
+            "preflight",
             "bridge_transport_pre_submission",
             "pre_submission",
         }
@@ -6034,12 +6068,31 @@ def _consultation_article_passages(snapshot: Any, question: str) -> list[dict[st
         for item in getattr(article, "claims", ())
         if isinstance(getattr(item, "id", None), str)
     }
-    cited_claim_ids = {item.casefold() for item in _ARTICLE_CLAIM_ID.findall(question)}
+    cited_claims = {item.casefold(): item for item in _ARTICLE_CLAIM_ID.findall(question)}
+    cited_claim_ids = set(cited_claims)
     passage_ids = {
         str(item.get("claim_id", "")).casefold()
         for item in passages
         if isinstance(item, Mapping)
     }
+    valid_claims: dict[str, str] = {}
+    for claim in getattr(article, "claims", ()):
+        claim_id = claim.id
+        if isinstance(claim_id, str) and claim_id.strip():
+            valid_claims.setdefault(claim_id.casefold(), claim_id)
+    for passage in passages:
+        claim_id = passage.get("claim_id") if isinstance(passage, Mapping) else None
+        if isinstance(claim_id, str) and claim_id.strip():
+            valid_claims.setdefault(claim_id.casefold(), claim_id)
+    unknown_claim_ids = cited_claim_ids - set(valid_claims)
+    if unknown_claim_ids:
+        raise _AdvisorInputValidationError(
+            "article_claim_not_found",
+            valid_article_claim_ids=tuple(sorted(valid_claims.values(), key=str.casefold)),
+            invalid_article_claim_ids=tuple(
+                sorted(cited_claims[claim_id] for claim_id in unknown_claim_ids)
+            ),
+        )
     publication_anchors = tuple(getattr(article, "publication_anchors", ()))
 
     def matching_anchor(text: str) -> Any | None:
@@ -6068,7 +6121,7 @@ def _consultation_article_passages(snapshot: Any, question: str) -> list[dict[st
         anchor = matching_anchor(statement)
         passages.append(
             {
-                "claim_id": str(getattr(claim, "id")),
+                "claim_id": str(claim.id),
                 "heading": "Claim canonique",
                 "text": statement,
                 "source_document_ids": [],

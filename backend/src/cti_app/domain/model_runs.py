@@ -328,7 +328,7 @@ class ModelRun:
             or self.output_references
             or self.raw_output_reference
             or self.raw_output_sha256 is not None
-            or self.raw_output_chars is not None
+            or (self.raw_output_chars is not None and self.raw_output_chars != 0)
         ):
             raise ValueError("ModelRun has provider output and cannot be sealed as unsubmitted")
         if not isinstance(claim_id, UUID):
