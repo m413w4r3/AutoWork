@@ -390,7 +390,7 @@ async def test_vt_unit_refusal_requires_approval_and_low_tool_time_does_not_bloc
 
 
 @pytest.mark.asyncio
-async def test_persisted_running_reservation_replays_to_review_without_transport() -> None:
+async def test_same_key_replay_preserves_persisted_running_without_transport() -> None:
     fixture, state, service = await _external_fixture()
     key = "crash-after-admission"
     arguments = {"query": "ambiguous operation"}
@@ -431,7 +431,7 @@ async def test_persisted_running_reservation_replays_to_review_without_transport
     )
     assert replay.idempotent_replay is True
     assert replay.invocation.id == invocation.id
-    assert replay.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert replay.invocation.status is ToolInvocationStatus.RUNNING
     assert reservation.status is BudgetReservationStatus.RESERVED
     assert latest.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert fixture.tools["vt.file_report"].calls == []

@@ -350,6 +350,29 @@ def canonical_json_bytes(value: Any) -> bytes:
     return _write_jcs(normalized).encode("utf-8")
 
 
+def invocation_arguments_digest(
+    arguments: Mapping[str, Any], *, passive_read_retry_trusted: bool | None = None
+) -> str:
+    """Bind invocation arguments and trusted retry provenance at consume time.
+
+    Retry provenance is deliberately outside the caller argument map and its
+    idempotency identity. When present, it is included in this integrity digest
+    so a persisted trust decision cannot be changed between admission and send.
+    ``None`` retains the historical arguments-only digest for non-VT and legacy
+    invocations.
+    """
+    if passive_read_retry_trusted is None:
+        payload: Mapping[str, Any] = arguments
+    else:
+        if not isinstance(passive_read_retry_trusted, bool):
+            raise TypeError("passive_read_retry_trusted must be a boolean or None")
+        payload = {
+            "arguments": arguments,
+            "passive_read_retry_trusted": passive_read_retry_trusted,
+        }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
 def canonical_request_sha256(canonical_request: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(canonical_request)).hexdigest()
 

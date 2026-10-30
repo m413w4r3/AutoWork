@@ -40,6 +40,7 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationService,
 )
 from cti_app.application.research_context_builder import blocked_capabilities_from_history
+from cti_app.domain.external_effects import invocation_arguments_digest
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
@@ -53,6 +54,7 @@ from cti_app.domain.investigation import (
     SampleOrigin,
     ToolInvocation,
     ToolInvocationStatus,
+    tool_operation_key,
 )
 from tests.test_investigation_service import _Fixture
 
@@ -77,6 +79,34 @@ class _RecordingTool:
             status=self.status,
             output={"summary": f"{self.name} accepted the synthetic request."},
         )
+
+
+def test_passive_retry_trust_is_outside_arguments_but_bound_at_consume() -> None:
+    investigation_id = uuid4()
+    arguments = {"file_hash": "d" * 64}
+    key = tool_operation_key(
+        investigation_id=investigation_id,
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters=arguments,
+        purpose="same caller request",
+    )
+    invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key=key,
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters=arguments,
+        passive_read_retry_trusted=True,
+        purpose="same caller request",
+    )
+
+    assert dict(invocation.normalized_parameters) == arguments
+    assert VT_PASSIVE_RETRY_TRUSTED_PARAMETER not in invocation.normalized_parameters
+    assert invocation.operation_key == key
+    assert invocation_arguments_digest(
+        arguments, passive_read_retry_trusted=True
+    ) != invocation_arguments_digest(arguments, passive_read_retry_trusted=False)
 
 
 class _SeededEvidenceSummaries:
@@ -562,7 +592,8 @@ async def test_untrusted_v1_review_has_no_retry_when_only_v2_is_trusted(monkeypa
         idempotency_key="untrusted-v1-needs-review",
     )
     assert result.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.invocation.normalized_parameters[VT_PASSIVE_RETRY_TRUSTED_PARAMETER] is False
+    assert result.invocation.passive_read_retry_trusted is False
+    assert VT_PASSIVE_RETRY_TRUSTED_PARAMETER not in result.invocation.normalized_parameters
 
     current_state = await fixture.states.get(fixture.investigation_id)
     assert current_state is not None

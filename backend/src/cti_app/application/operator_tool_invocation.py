@@ -977,6 +977,8 @@ class OperatorToolInvocationService:
 
     @staticmethod
     def _persisted_passive_read_trust(invocation: ToolInvocation) -> bool:
+        if invocation.passive_read_retry_trusted is not None:
+            return invocation.passive_read_retry_trusted
         parameters = invocation.normalized_parameters
         if VT_PASSIVE_RETRY_TRUSTED_PARAMETER in parameters:
             return parameters.get(VT_PASSIVE_RETRY_TRUSTED_PARAMETER) is True

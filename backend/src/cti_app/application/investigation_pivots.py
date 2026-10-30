@@ -76,9 +76,12 @@ def available_investigation_pivots(
         parameters = thaw_json(invocation.normalized_parameters)
         if not isinstance(parameters, Mapping):
             continue
-        persisted_trust = parameters.get(_VT_PASSIVE_RETRY_TRUSTED_PARAMETER)
+        persisted_trust = invocation.passive_read_retry_trusted
+        if persisted_trust is None:
+            persisted_trust = parameters.get(_VT_PASSIVE_RETRY_TRUSTED_PARAMETER)
         legacy_builtin = (
-            _VT_PASSIVE_RETRY_TRUSTED_PARAMETER not in parameters
+            invocation.passive_read_retry_trusted is None
+            and _VT_PASSIVE_RETRY_TRUSTED_PARAMETER not in parameters
             and invocation.schema_version == "1"
         )
         if persisted_trust is True or legacy_builtin:

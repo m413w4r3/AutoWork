@@ -447,6 +447,7 @@ class ToolInvocation:
     status: ToolInvocationStatus = ToolInvocationStatus.PENDING
     reserved_budget: Mapping[BudgetDimension, int] = field(default_factory=dict)
     consumed_budget: Mapping[BudgetDimension, int] = field(default_factory=dict)
+    passive_read_retry_trusted: bool | None = None
     response_refs: tuple[UUID, ...] = ()
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -455,6 +456,10 @@ class ToolInvocation:
 
     def __post_init__(self) -> None:
         _require_enum(self.status, ToolInvocationStatus, "status")
+        if self.passive_read_retry_trusted is not None and not isinstance(
+            self.passive_read_retry_trusted, bool
+        ):
+            raise TypeError("passive_read_retry_trusted must be a boolean or None")
         if (
             not self.operation_key.strip()
             or not self.tool_name.strip()

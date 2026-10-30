@@ -92,6 +92,7 @@ class ToolInvocationRow(Base):
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
     normalized_parameters: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    passive_read_retry_trusted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     purpose: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     reserved_budget: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False)
