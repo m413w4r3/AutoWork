@@ -283,6 +283,36 @@ class OsintEffectivePolicy:
         )
 
 
+def osint_effective_policy_authorizes_binding(
+    effective_policy: OsintEffectivePolicy | None,
+    *,
+    investigation_id: UUID,
+    subject_id: UUID,
+    policy_id: UUID | None,
+    policy_version: int | None,
+    policy_event_id: UUID | None,
+) -> bool:
+    """Check that an active policy matches the exact envelope inheritance lineage."""
+    try:
+        if effective_policy is None or not effective_policy.authorized:
+            return False
+        inheritance = effective_policy.inheritance
+        policy = effective_policy.policy
+        return bool(
+            inheritance.investigation_id == investigation_id
+            and inheritance.subject_id == subject_id
+            and inheritance.policy_id == policy_id
+            and inheritance.policy_version == policy_version
+            and inheritance.policy_event_id == policy_event_id
+            and policy.policy_id == policy_id
+            and policy.version == policy_version
+            and policy.event_id == policy_event_id
+            and policy.contains_subject(subject_id)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def intersect_disclosure(
     source_tlp: TLPLevel | str | None,
     source_do_not_submit: bool,

@@ -149,6 +149,7 @@ from cti_app.domain.investigation_state import (
     StopReason,
     investigation_bridge_attempt,
 )
+from cti_app.domain.osint_open import osint_effective_policy_authorizes_binding
 from cti_app.domain.production import (
     AnalystInvestigation,
     AnalystInvestigationStatus,
@@ -882,6 +883,9 @@ class InvestigationService:
                 budget=budget,
                 idempotency_key=f"context:{state.turn_index}",
                 available_capabilities=self._available_capabilities,
+                osint_policy_authorized=await self._osint_policy_authorized_for_projection(
+                    investigation, envelope
+                ),
             )
             if state.pending_context_snapshot_id is not None:
                 pending_json = await self._context_snapshots.load(state.pending_context_snapshot_id)
@@ -4068,6 +4072,29 @@ class InvestigationService:
                     denied, expected_version=invocation.version
                 )
         await self._commit_current_uow()
+
+    async def _osint_policy_authorized_for_projection(
+        self,
+        investigation: AnalystInvestigation,
+        envelope: InvestigationEnvelope | None,
+    ) -> bool | None:
+        if envelope is None or envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY:
+            return None
+        resolver = self._effective_policy_for
+        if resolver is None:
+            return False
+        try:
+            effective = await resolver(investigation.id)
+            return osint_effective_policy_authorizes_binding(
+                effective,
+                investigation_id=investigation.id,
+                subject_id=investigation.subject_id,
+                policy_id=envelope.inherited_policy_id,
+                policy_version=envelope.inherited_policy_version,
+                policy_event_id=envelope.inherited_policy_event_id,
+            )
+        except Exception:
+            return False
 
     async def _bridge_submission_allowed(
         self,

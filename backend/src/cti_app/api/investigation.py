@@ -118,8 +118,10 @@ from cti_app.application.research_context_builder import (
     MAX_OPERATOR_REQUEST_BYTES,
     MAX_OPERATOR_REQUESTS,
     USER_REQUEST_ACTION_PREFIX,
+    ArticleSnapshot,
     CanonicalEvidenceSummaryPort,
     blocked_capabilities_from_history,
+    current_tool_readiness_block,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
@@ -160,6 +162,7 @@ from cti_app.domain.investigation_state import (
     investigation_orphaned_turn_id,
 )
 from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, Job, JobStatus
+from cti_app.domain.osint_open import osint_effective_policy_authorizes_binding
 from cti_app.domain.production import (
     AnalystInvestigation,
     AnalystInvestigationStatus,
@@ -1307,7 +1310,8 @@ async def get_investigation_experiments(
             envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
         )
         g2_blocked = authorization.revoked or bool(
-            policy_authority and (effective_policy is None or not effective_policy.authorized)
+            policy_authority
+            and not _policy_envelope_currently_authorized(effective_policy, investigation, envelope)
         )
         strategy = build_investigation_strategy_projection(
             investigation_id=investigation_id,
@@ -1378,6 +1382,10 @@ async def get_investigation_pivot_frontier(
         ceiling = authorization.authorization_ceiling
         g2_vt_authorized = bool(
             not g2_revoked
+            and (
+                not policy_authority
+                or _policy_envelope_currently_authorized(effective_policy, investigation, envelope)
+            )
             and ceiling is not None
             and ceiling.acquire_hits_allowed
             and any(
@@ -1588,7 +1596,7 @@ async def _operator_context_invalidation_facts(
         or bool(policy_authority and effective_policy and effective_policy.revoked),
         "currently_authorized": (
             not authorization.revoked
-            and (not policy_authority or bool(effective_policy and effective_policy.authorized))
+            and _policy_envelope_currently_authorized(effective_policy, investigation, envelope)
         ),
         "allowed_providers": list(getattr(envelope, "allowed_providers", ())),
         "acquire_hits_allowed": getattr(envelope, "acquire_hits_allowed", False),
@@ -2069,6 +2077,9 @@ async def get_investigation_operator_status(
         policy_authority = (
             envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
         )
+        currently_authorized = not authorization.revoked and (
+            _policy_envelope_currently_authorized(effective_policy, investigation, envelope)
+        )
         g2_revoked = authorization.revoked or bool(
             policy_authority and effective_policy and effective_policy.revoked
         )
@@ -2117,7 +2128,12 @@ async def get_investigation_operator_status(
             envelope=envelope,
             invocations=invocations,
             observations=observations,
-            external_llm_allowed=InvestigationService.bridge_disclosure_allowed(snapshot, envelope),
+            snapshot=snapshot,
+            external_llm_allowed=(
+                not authorization.revoked
+                and InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
+            ),
+            osint_policy_authorized=currently_authorized,
         )
         if tool_inventory is not None:
             available_tool_names, unavailable_tool_diagnostics = tool_inventory
@@ -3231,11 +3247,8 @@ async def _investigation_view(
         if policy_service is not None and getattr(uow, "osint_open_policies", None) is not None
         else None
     )
-    policy_authority = (
-        envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
-    )
     currently_authorized = not authorization.revoked and (
-        not policy_authority or bool(effective_policy and effective_policy.authorized)
+        _policy_envelope_currently_authorized(effective_policy, investigation, envelope)
     )
     opinion = await uow.analyst_opinions.get(uuid5(_OPINION_NAMESPACE, str(investigation_id)))
     effective_budget = (
@@ -3264,10 +3277,12 @@ async def _investigation_view(
         envelope=envelope,
         invocations=invocations,
         observations=observations,
+        snapshot=snapshot,
         external_llm_allowed=(
-            currently_authorized
+            not authorization.revoked
             and InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
         ),
+        osint_policy_authorized=currently_authorized,
     )
     if tool_inventory is None:
         available_tools = tuple(composition.available_tools)
@@ -3499,7 +3514,7 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
             ),
             currently_authorized=(
                 not authorization.revoked
-                and (not policy_authority or bool(effective_policy and effective_policy.authorized))
+                and _policy_envelope_currently_authorized(effective_policy, investigation, current)
             ),
         )
 
@@ -4075,7 +4090,9 @@ async def _operator_status_tool_inventory(
     envelope: Any | None,
     invocations: tuple[Any, ...],
     observations: tuple[Any, ...],
+    snapshot: ArticleSnapshot,
     external_llm_allowed: bool | None = None,
+    osint_policy_authorized: bool | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     """Use the registry projection shared with prompt construction and dispatch."""
     registry = getattr(composition, "registry", None)
@@ -4088,6 +4105,7 @@ async def _operator_status_tool_inventory(
         budget=envelope.budget if envelope is not None else InvestigationBudget(limits={}),
         idempotency_key="operator-status-tool-availability",
         available_capabilities=available_capabilities,
+        osint_policy_authorized=osint_policy_authorized,
     )
     blocked_capabilities = await blocked_capabilities_from_history(
         investigation_id=state.investigation_id,
@@ -4104,6 +4122,28 @@ async def _operator_status_tool_inventory(
         blocked_capabilities=blocked_capabilities,
     )
     availability = project_tool_availability(registry, context)
+    budget_remaining = (
+        {
+            dimension.value: amount
+            for dimension, amount in envelope.budget.remaining.items()
+            if amount is not None
+        }
+        if envelope is not None
+        else {}
+    )
+    unavailable = {name: reason for name, reason in availability.unavailable}
+    ready_names: list[str] = []
+    for definition in availability.available:
+        reason = current_tool_readiness_block(
+            definition,
+            snapshot=snapshot,
+            tool_context=context,
+            budget_remaining=budget_remaining,
+        )
+        if reason is None:
+            ready_names.append(definition.name)
+        else:
+            unavailable[definition.name] = reason
     dependencies = getattr(composition, "tool_dependencies", None)
     pending = await _pending_prompt_tool_inventory(
         state,
@@ -4111,7 +4151,8 @@ async def _operator_status_tool_inventory(
     )
     if pending is not None:
         return pending
-    return availability.available_names, availability.unavailable_diagnostics[:64]
+    diagnostics = tuple(f"{name}:{reason}" for name, reason in sorted(unavailable.items()))
+    return tuple(sorted(set(ready_names))), diagnostics[:64]
 
 
 async def _operator_bridge_invocation_costs(
@@ -4277,6 +4318,23 @@ async def _effective_osint_policy(request: Request, uow: Any, investigation_id: 
     if service is None or getattr(uow, "osint_open_policies", None) is None:
         return None
     return await service.effective_for(uow, investigation_id)
+
+
+def _policy_envelope_currently_authorized(
+    effective_policy: Any,
+    investigation: Any,
+    envelope: Any,
+) -> bool:
+    if envelope is None or envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY:
+        return True
+    return osint_effective_policy_authorizes_binding(
+        effective_policy,
+        investigation_id=investigation.id,
+        subject_id=investigation.subject_id,
+        policy_id=envelope.inherited_policy_id,
+        policy_version=envelope.inherited_policy_version,
+        policy_event_id=envelope.inherited_policy_event_id,
+    )
 
 
 async def _policy_activation_actor(uow: Any, effective_policy: Any) -> str | None:

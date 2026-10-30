@@ -189,6 +189,11 @@ class ToolDefinition:
         object.__setattr__(self, "limitations", tuple(self.limitations))
 
 
+def tool_provider(definition: ToolDefinition) -> str:
+    """Return the canonical provider prefix used by execution and availability gates."""
+    return definition.capability_key.partition(".")[0]
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     status: ToolInvocationStatus
@@ -233,6 +238,8 @@ class ToolExecutionContext:
     blocked_capabilities: tuple[str, ...] = ()
     unavailable_tool_reasons: Mapping[str, str] = field(default_factory=dict)
     external_effect_authority: ExternalEffectAuthority | None = None
+    # Projection hint only; dispatch still performs its own current-policy gate.
+    osint_policy_authorized: bool | None = None
     external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
     actor_id: str | None = None
     purpose: str | None = None
@@ -985,7 +992,7 @@ class RegistryToolDispatcher:
         ):
             if envelope is None:
                 return ToolInvocationStatus.POLICY_DENIED
-            provider = definition.capability_key.partition(".")[0]
+            provider = tool_provider(definition)
             if provider not in envelope.allowed_providers:
                 return ToolInvocationStatus.POLICY_DENIED
             if envelope.disclosure.tlp is TLPLevel.RED or (

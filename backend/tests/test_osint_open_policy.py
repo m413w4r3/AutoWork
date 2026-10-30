@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
+import cti_app.api.investigation as investigation_api
 from cti_app.api.investigation import router as investigation_router
 from cti_app.api.osint_policy import router as policy_router
 from cti_app.application.analyst_handoff import analyst_handoff_policy_from_sources
@@ -20,7 +21,11 @@ from cti_app.application.investigation_governance import (
     _copy_budget,
 )
 from cti_app.application.investigation_service import InvestigationService
-from cti_app.application.investigation_tools import ToolEffect
+from cti_app.application.investigation_tools import (
+    ToolConfidentiality,
+    ToolDefinition,
+    ToolEffect,
+)
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationService,
@@ -666,9 +671,30 @@ async def test_envelope_view_reconstructs_inherited_policy_event_lineage() -> No
 
 
 @pytest.mark.asyncio
-async def test_operator_status_projects_policy_authority_without_individual_g2_approval() -> None:
+@pytest.mark.parametrize(
+    ("policy_authorized", "inheritance_status", "lineage_matches"),
+    ((True, "active", True), (False, "superseded", True), (True, "active", False)),
+)
+async def test_operator_status_projects_policy_authority_and_tool_inventory(
+    policy_authorized: bool, inheritance_status: str, lineage_matches: bool
+) -> None:
     fixture, _state, service = await operator_fixture()
-    envelope = _policy_authorized_envelope(fixture.envelope)
+    envelope = replace(
+        _policy_authorized_envelope(fixture.envelope),
+        allowed_providers=("bridge", "vt"),
+    )
+    advisor_definition = ToolDefinition(
+        name="advisor.consult",
+        schema_version="1",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        effect=ToolEffect.EXTERNAL_READ,
+        cost_model={},
+        confidentiality=ToolConfidentiality.INTERNAL,
+        limitations=("Synthetic offline status projection.",),
+        capability_key="bridge.advisor",
+    )
+    fixture.registry.register(advisor_definition, fixture.tools["vt.file_report"])
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "bridge.advisor"))
     activation_correlation_id = "status-policy-activation-correlation"
     activation_event_id = uuid4()
     policy_event_id = envelope.inherited_policy_event_id
@@ -684,16 +710,23 @@ async def test_operator_status_projects_policy_authority_without_individual_g2_a
         async def effective_for(self, _uow, _investigation_id):
             return SimpleNamespace(
                 inheritance=SimpleNamespace(
+                    investigation_id=fixture.investigation_id,
                     policy_id=policy_id,
                     policy_version=2,
-                    policy_event_id=policy_event_id,
+                    policy_event_id=policy_event_id if lineage_matches else uuid4(),
                     activation_correlation_id=activation_correlation_id,
                     subject_id=fixture.subject_id,
-                    status=SimpleNamespace(value="active"),
+                    status=SimpleNamespace(value=inheritance_status),
                 ),
-                policy=SimpleNamespace(actor_id="human:policy-extender"),
+                policy=SimpleNamespace(
+                    actor_id="human:policy-extender",
+                    policy_id=policy_id,
+                    version=2,
+                    event_id=policy_event_id,
+                    contains_subject=lambda subject_id: subject_id == fixture.subject_id,
+                ),
                 revoked=False,
-                authorized=True,
+                authorized=policy_authorized,
             )
 
     class _PolicyRepository:
@@ -744,9 +777,112 @@ async def test_operator_status_projects_policy_authority_without_individual_g2_a
         "policy_id": str(policy_id),
         "policy_version": 2,
         "policy_event_id": str(policy_event_id),
-        "status": "active",
+        "status": inheritance_status,
         "activated_by": "human:policy-activator",
     }
+    available_tools = set(payload["tool_inventory"]["available"])
+    if policy_authorized and lineage_matches:
+        assert {"advisor.consult", "vt.file_report"} <= available_tools, payload["tool_inventory"]
+    else:
+        assert "advisor.consult" not in available_tools
+        assert "vt.file_report" not in available_tools
+        unavailable = set(payload["tool_inventory"]["unavailable"])
+        assert "advisor.consult:policy_authorization_unverified" in unavailable
+        assert "vt.file_report:policy_authorization_unverified" in unavailable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy_authorized", "inheritance_status", "lineage_matches"),
+    ((False, "superseded", True), (True, "active", False)),
+)
+async def test_pivot_frontier_blocks_inactive_or_mismatched_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    policy_authorized: bool,
+    inheritance_status: str,
+    lineage_matches: bool,
+) -> None:
+    fixture, _state, service = await operator_fixture()
+    envelope = replace(
+        _policy_authorized_envelope(fixture.envelope),
+        allowed_providers=("vt",),
+        acquire_hits_allowed=True,
+    )
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+    policy_event_id = envelope.inherited_policy_event_id
+
+    class _PolicyService:
+        async def effective_for(self, _uow, _investigation_id):
+            return SimpleNamespace(
+                inheritance=SimpleNamespace(
+                    investigation_id=fixture.investigation_id,
+                    subject_id=fixture.subject_id,
+                    policy_id=envelope.inherited_policy_id,
+                    policy_version=envelope.inherited_policy_version,
+                    policy_event_id=policy_event_id if lineage_matches else uuid4(),
+                    status=SimpleNamespace(value=inheritance_status),
+                ),
+                policy=SimpleNamespace(
+                    policy_id=envelope.inherited_policy_id,
+                    version=envelope.inherited_policy_version,
+                    event_id=policy_event_id,
+                    contains_subject=lambda subject_id: subject_id == fixture.subject_id,
+                ),
+                revoked=False,
+                authorized=policy_authorized,
+            )
+
+    class _PolicyRepository:
+        pass
+
+    def uow_factory():
+        uow = _Uow(fixture)
+        uow.osint_open_policies = _PolicyRepository()
+        return uow
+
+    app = FastAPI()
+    app.include_router(investigation_router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = uow_factory
+    composition_factory = _CompositionFactory(service, fixture=fixture)
+    composition_factory.osint_open_policy_service = _PolicyService()
+    composition_factory.article_snapshots = SimpleNamespace(
+        resolve=lambda _artifact_id: _snapshot()
+    )
+
+    async def _snapshot():
+        return fixture.snapshot
+
+    app.state.investigation_composition_factory = composition_factory
+    projected: dict[str, bool] = {}
+
+    def fake_build_frontier(**kwargs):
+        projected["g2_vt_authorized"] = kwargs["g2_vt_authorized"]
+        return object()
+
+    monkeypatch.setattr(investigation_api, "build_pivot_frontier", fake_build_frontier)
+    monkeypatch.setattr(
+        investigation_api,
+        "frontier_to_dict",
+        lambda _frontier: {
+            "schema_version": "investigation-pivot-frontier.v1",
+            "source_sha256": fixture.snapshot.synthesis_sha256,
+            "frontier_sha256": "4" * 64,
+            "records": [],
+            "edges": [],
+            "paths": [],
+            "truncated": False,
+            "next_cursor": None,
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/api/investigations/{fixture.investigation_id}/pivots")
+
+    assert response.status_code == 200, response.text
+    assert projected["g2_vt_authorized"] is False
 
 
 _MUTATION_REQUESTS = (
