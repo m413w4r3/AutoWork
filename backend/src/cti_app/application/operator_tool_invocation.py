@@ -1216,11 +1216,13 @@ class OperatorToolInvocationService:
                 and self._is_trusted_passive_read(tool_name, definition, registered)
                 and self._persisted_passive_read_trust(existing)
             ):
-                if state.version != expected_version or (
-                    expected_sha256 is not None and state.sha256 != expected_sha256
+                # An idempotent replay returns the stored result for any CAS, but
+                # only a request against the current state may settle the
+                # reservation: a stale request must not mutate anything.
+                if state.version == expected_version and (
+                    expected_sha256 is None or state.sha256 == expected_sha256
                 ):
-                    raise _stale_working_state_error(expected_version, expected_sha256, state)
-                existing = await self._settle_passive_read_reservation(existing)
+                    existing = await self._settle_passive_read_reservation(existing)
             return await self._result(existing, state.version, state.sha256, replay=True)
 
         semantic_parameters = _semantic_parameters_fingerprint(
