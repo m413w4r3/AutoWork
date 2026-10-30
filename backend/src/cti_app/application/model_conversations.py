@@ -24,12 +24,6 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
-from cti_app.domain.investigation_state import (
-    StopReason,
-    investigation_abandoned_turn_id,
-    investigation_bridge_attempt,
-    investigation_orphaned_turn_id,
-)
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -681,7 +675,9 @@ class ModelConversationService:
                     "conversation_reconciliation_no_handoff_conflict",
                     "La preuve ne correspond pas à un tour Bridge d'investigation.",
                 )
-            proof = (run.error_details or {}).get("pre_submission_proof") if run is not None else None
+            proof = (
+                (run.error_details or {}).get("pre_submission_proof") if run is not None else None
+            )
             if (
                 run is not None
                 and turn.status is ConversationTurnStatus.FAILED
@@ -697,7 +693,8 @@ class ModelConversationService:
                 and run.raw_output_reference is None
                 and run.raw_output_sha256 is None
                 and run.raw_output_chars in (None, 0)
-                and turn.error_details == {
+                and turn.error_details
+                == {
                     "pre_submission_proof": {
                         "source": "external_effect_claim",
                         "claim_id": str(claim_id),
@@ -718,7 +715,8 @@ class ModelConversationService:
             ):
                 raise ModelConversationReconciliationError(
                     "conversation_reconciliation_no_handoff_conflict",
-                    "Le tour contient une réponse ou ne correspond pas à une preuve de non-handoff.",
+                    "Le tour contient une réponse ou ne correspond pas à une preuve "
+                    "de non-handoff.",
                 )
             try:
                 run.seal_verified_no_handoff(claim_id=claim_id)
@@ -1574,7 +1572,9 @@ class ModelConversationService:
         blob = blobs.get(blob_id)
         if blob is None:
             raise ModelConversationError("Blob conversationnel introuvable")
-        return (await self._blob_store.read(blob.descriptor, max_bytes=blob.descriptor.size)).decode()
+        return (
+            await self._blob_store.read(blob.descriptor, max_bytes=blob.descriptor.size)
+        ).decode()
 
 
 def _needs_review_error(execution: ModelExecution) -> ConversationNeedsReviewError:

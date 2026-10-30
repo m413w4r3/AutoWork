@@ -300,7 +300,10 @@ class SqlAlchemyExternalEffectClaimStore:
                     ExternalEffectClaimRow.family == "advisor.consult",
                     ExternalEffectClaimRow.provider == "bridge",
                 )
-                .order_by(ExternalEffectClaimRow.created_at.desc(), ExternalEffectClaimRow.id.desc())
+                .order_by(
+                    ExternalEffectClaimRow.created_at.desc(),
+                    ExternalEffectClaimRow.id.desc(),
+                )
                 .limit(1)
                 .execution_options(populate_existing=True)
             )
@@ -316,7 +319,10 @@ class SqlAlchemyExternalEffectClaimStore:
                     ExternalEffectClaimRow.investigation_id == investigation_id,
                     ExternalEffectClaimRow.invocation_id == invocation_id,
                 )
-                .order_by(ExternalEffectClaimRow.created_at.desc(), ExternalEffectClaimRow.id.desc())
+                .order_by(
+                    ExternalEffectClaimRow.created_at.desc(),
+                    ExternalEffectClaimRow.id.desc(),
+                )
                 .limit(1)
                 .execution_options(populate_existing=True)
             )

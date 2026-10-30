@@ -409,7 +409,7 @@ class OperatorToolInvocationRequestV1(_StrictContract):
     arguments: dict[str, Any]
     purpose: str = Field(min_length=1, max_length=2_000)
     expected_version: int = Field(ge=1)
-    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class OperatorToolInvocationViewV1(_StrictContract):

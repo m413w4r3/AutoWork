@@ -1509,9 +1509,7 @@ async def test_stale_version_unknown_tool_and_invalid_schema_are_stable() -> Non
     assert stale.value.code == "stale_working_state"
     assert stale.value.details["current_version"] == state.version
     assert stale.value.details["current_sha256"] == state.sha256
-    assert "expected_version=<working_state_version>" in (
-        stale.value.details["correction"]
-    )
+    assert "expected_version=<working_state_version>" in (stale.value.details["correction"])
     assert "expected_sha256=<working_state_sha256>" in stale.value.details["correction"]
 
     wrong_sha256 = ("0" if state.sha256[0] != "0" else "1") + state.sha256[1:]
@@ -2397,9 +2395,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert tool_section.json()["items"] == context.json()["context"]["available_tools"]
     tool_section_payload = tool_section.json()
     file_report_schema = next(
-        item
-        for item in tool_section_payload["items"]
-        if item["name"] == "vt.file_report"
+        item for item in tool_section_payload["items"] if item["name"] == "vt.file_report"
     )
     assert file_report_schema["schema_version"] == "1"
     assert file_report_schema["arguments_schema"]["properties"]["query"]["type"] == "string"
@@ -2450,7 +2446,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
 
 @pytest.mark.asyncio
 async def test_operator_observation_metadata_does_not_read_blob_body() -> None:
-    fixture, state, service = await _fixture()
+    fixture, _state, service = await _fixture()
     digest = "a" * 64
     blob_id = uuid4()
     invocation = ToolInvocation(
@@ -2479,9 +2475,7 @@ async def test_operator_observation_metadata_does_not_read_blob_body() -> None:
     class _BlobRepository:
         async def get(self, requested_id):
             assert requested_id == blob_id
-            return SimpleNamespace(
-                descriptor=SimpleNamespace(sha256=digest, size=1234)
-            )
+            return SimpleNamespace(descriptor=SimpleNamespace(sha256=digest, size=1234))
 
     class _NoReadArtifactStore:
         async def read_bytes(self, *_args, **_kwargs):
@@ -2553,9 +2547,7 @@ async def test_reconciliation_summary_reports_proven_non_submission() -> None:
             )
 
     request = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(external_effect_coordinator=_Coordinator())
-        )
+        app=SimpleNamespace(state=SimpleNamespace(external_effect_coordinator=_Coordinator()))
     )
     summary = await investigation_api._operator_invocation_reconciliation_summary(
         request=request,
@@ -2777,9 +2769,25 @@ async def test_operator_http_reports_invalid_framework_proof_and_keeps_retry_blo
     detail = response.json()["detail"]
     assert response.status_code == 409
     assert detail["code"] == "ambiguous_tool_invocation_requires_reconciliation"
-    assert detail["details"] == {
-        "existing_invocation_id": str(refused.invocation.id),
-        "framework_proof_rejection": "framework_proof_blob_hash_mismatch",
+    assert detail["details"]["existing_invocation_id"] == str(refused.invocation.id)
+    assert detail["details"]["invocation_status"] == "needs_review"
+    assert detail["details"]["external_transport_occurred"] is None
+    assert detail["details"]["persisted_response_available"] is False
+    assert detail["details"]["persisted_response_refs"] == [
+        str(refused.invocation.response_refs[0])
+    ]
+    assert detail["details"]["framework_proof_rejection"] == ("framework_proof_blob_hash_mismatch")
+    assert detail["details"]["next_action"] == {
+        "code": "reconcile_before_retry",
+        "method": "POST",
+        "path": (
+            f"/api/investigations/{fixture.investigation_id}/invocations/"
+            f"{refused.invocation.id}/reconcile"
+        ),
+        "expected_version": refused.invocation.version,
+        "resubmission_allowed": False,
+        "other_pivots_allowed": True,
+        "requires_verified_human_operator": True,
     }
     still_blocked = await fixture.invocations.get_by_operation_key(refused.invocation.operation_key)
     assert still_blocked is not None
@@ -3299,7 +3307,7 @@ async def test_operator_context_validation_error_is_logged_without_input_values(
 
 @pytest.mark.asyncio
 async def test_operator_http_route_rejects_invalid_body_before_dispatch() -> None:
-    fixture, _state, service = await _fixture()
+    fixture, state, service = await _fixture()
     app = FastAPI()
     app.include_router(router)
     app.state.identity_provider = _IdentityProvider()
@@ -3326,19 +3334,38 @@ async def test_operator_http_route_rejects_invalid_body_before_dispatch() -> Non
             json={
                 "schema_version": "1",
                 "arguments": {"query": "synthetic hash"},
-                "purpose": "Require the state digest with its version.",
+                "purpose": "The version may be supplied without its digest.",
                 "expected_version": state.version,
             },
             headers={"Idempotency-Key": "missing-cas-digest"},
         )
 
     assert response.status_code == 422
-    assert missing_cas.status_code == 422
-    assert any(
-        item["loc"][-1] == "expected_sha256"
-        for item in missing_cas.json()["detail"]
-    )
-    assert fixture.tools["vt.file_report"].calls == []
+    assert missing_cas.status_code == 200, missing_cas.text
+    assert missing_cas.json()["invocation"]["status"] == "succeeded"
+    assert fixture.tools["vt.file_report"].calls == [{"query": "synthetic hash"}]
+
+    latest_state = await fixture.states.get(fixture.investigation_id)
+    assert latest_state is not None
+    wrong_sha256 = ("0" if latest_state.sha256[0] != "0" else "1") + latest_state.sha256[1:]
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        stale_sha = await client.post(
+            f"/api/investigations/{fixture.investigation_id}/operator/tools/vt.file_report",
+            json={
+                "schema_version": "1",
+                "arguments": {"query": "a different synthetic hash"},
+                "purpose": "Reject a supplied digest that does not match the current state.",
+                "expected_version": latest_state.version,
+                "expected_sha256": wrong_sha256,
+            },
+            headers={"Idempotency-Key": "wrong-cas-digest"},
+        )
+
+    assert stale_sha.status_code == 409
+    assert stale_sha.json()["detail"]["code"] == "stale_working_state"
+    assert fixture.tools["vt.file_report"].calls == [{"query": "synthetic hash"}]
 
 
 @pytest.mark.asyncio
@@ -3546,7 +3573,8 @@ async def test_advisor_ambiguous_external_result_keeps_reservation_and_needs_rev
                 ToolEffect.EXTERNAL_READ,
                 "bridge.advisor",
                 reserved,
-            )
+            ),
+            ("vt.file_report", "vt"),
         ],
     )
     state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)

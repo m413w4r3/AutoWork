@@ -1650,9 +1650,7 @@ async def _operator_invocation_reconciliation_summary(
     claim_lookup = getattr(coordinator, "latest_claim_for_invocation", None)
     try:
         claim = (
-            await claim_lookup(investigation_id, invocation.id)
-            if callable(claim_lookup)
-            else None
+            await claim_lookup(investigation_id, invocation.id) if callable(claim_lookup) else None
         )
     except Exception:
         claim = None
@@ -1684,12 +1682,8 @@ async def _operator_invocation_reconciliation_summary(
                     getattr(run, "output_references", ())
                     or getattr(run, "raw_output_reference", None)
                     or raw_output_sha256
-                ) or bool(
-                    getattr(run, "raw_output_chars", None)
-                )
-                persisted_response_available = (
-                    persisted_response_available or has_stored_output
-                )
+                ) or bool(getattr(run, "raw_output_chars", None))
+                persisted_response_available = persisted_response_available or has_stored_output
                 if isinstance(raw_output_sha256, str) and re.fullmatch(
                     r"[0-9a-f]{64}", raw_output_sha256
                 ):
@@ -1790,9 +1784,7 @@ async def get_investigation_operator_observation(
         is_advisor_call = (
             observation_source == "advisor.consult" and observation_object_type == "advisor_call"
         )
-        preserve_complete_content = (
-            is_advisor_call
-        ) or (
+        preserve_complete_content = (is_advisor_call) or (
             str(observation_source).casefold() == "autowork ruleworkbench"
             and observation_object_type == "detection_candidate_version"
         )
@@ -4367,10 +4359,14 @@ async def reconcile_operator_advisor_invocation(
         run_status = getattr(run.status, "value", run.status)
         turn_status = getattr(turn.status, "value", turn.status)
         already_adopted = run_status == "succeeded" and turn_status == "succeeded"
-        if proof_claim_id is None and not already_adopted and (
-            run_status != "needs_review"
-            or turn_status != "needs_review"
-            or claim_status != "NEEDS_REVIEW"
+        if (
+            proof_claim_id is None
+            and not already_adopted
+            and (
+                run_status != "needs_review"
+                or turn_status != "needs_review"
+                or claim_status != "NEEDS_REVIEW"
+            )
         ):
             return _operator_advisor_reconciliation_pending(
                 invocation,
@@ -4408,9 +4404,7 @@ async def reconcile_operator_advisor_invocation(
                 or current.status is not ToolInvocationStatus.NEEDS_REVIEW
             ):
                 raise _http_error(409, "stale_invocation_version")
-            envelope = await recheck_uow.investigation_envelopes.get_for_update(
-                investigation_id
-            )
+            envelope = await recheck_uow.investigation_envelopes.get_for_update(investigation_id)
             if envelope is None and current.reserved_budget:
                 return _operator_advisor_reconciliation_pending(
                     current, None, external_transport_occurred=False
@@ -4515,7 +4509,10 @@ async def reconcile_operator_advisor_invocation(
                 make_investigation_conversation_id(investigation_id),
                 context_subject_id=context_subject_id,
             )
-            content = next((item for item in contents if item.turn.id == claim.bridge_turn_id), None)
+            content = next(
+                (item for item in contents if item.turn.id == claim.bridge_turn_id),
+                None,
+            )
             if (
                 content is None
                 or not isinstance(content.output_text, str)
@@ -4546,9 +4543,7 @@ async def reconcile_operator_advisor_invocation(
                     or current.status is not ToolInvocationStatus.NEEDS_REVIEW
                 ):
                     raise _http_error(409, "stale_invocation_version")
-                current_envelope = await recheck_uow.investigation_envelopes.get(
-                    investigation_id
-                )
+                current_envelope = await recheck_uow.investigation_envelopes.get(investigation_id)
                 current_decisions = tuple(
                     await recheck_uow.analyst_decisions.list_for_investigation(investigation_id)
                 )
@@ -4560,7 +4555,9 @@ async def reconcile_operator_advisor_invocation(
                         invocation,
                         provider_response_id,
                         response_sha256=stored_response_sha256,
-                        persisted_response_available=has_stored_output or bool(provider_response_id),
+                        persisted_response_available=(
+                            has_stored_output or bool(provider_response_id)
+                        ),
                     )
                 try:
                     current_snapshot = await _composition_factory(
@@ -4571,7 +4568,9 @@ async def reconcile_operator_advisor_invocation(
                         invocation,
                         provider_response_id,
                         response_sha256=stored_response_sha256,
-                        persisted_response_available=has_stored_output or bool(provider_response_id),
+                        persisted_response_available=(
+                            has_stored_output or bool(provider_response_id)
+                        ),
                     )
                 if not InvestigationService.bridge_disclosure_allowed(
                     current_snapshot, current_envelope
@@ -4580,7 +4579,9 @@ async def reconcile_operator_advisor_invocation(
                         invocation,
                         provider_response_id,
                         response_sha256=stored_response_sha256,
-                        persisted_response_available=has_stored_output or bool(provider_response_id),
+                        persisted_response_available=(
+                            has_stored_output or bool(provider_response_id)
+                        ),
                     )
             await conversation_service.adopt_visible_recovery(
                 make_investigation_conversation_id(investigation_id),

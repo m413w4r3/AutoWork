@@ -206,7 +206,10 @@ class ModelConversationTurn:
         now: datetime | None = None,
     ) -> None:
         """Close a turn from an already-adopted exact ModelRun output."""
-        if self.status not in {ConversationTurnStatus.RUNNING, ConversationTurnStatus.NEEDS_REVIEW} and not (
+        if self.status not in {
+            ConversationTurnStatus.RUNNING,
+            ConversationTurnStatus.NEEDS_REVIEW,
+        } and not (
             self.status is ConversationTurnStatus.FAILED and self.error_code == "operator_abandoned"
         ):
             raise ValueError("Conversation turn is not recoverable")

@@ -522,13 +522,15 @@ def _operator_reconciliation_path(investigation_id: UUID, invocation: ToolInvoca
     return f"{prefix}/invocations/{invocation.id}/reconcile"
 
 
-def _ambiguous_invocation_details(invocation: ToolInvocation) -> dict[str, Any]:
+def _ambiguous_invocation_details(
+    invocation: ToolInvocation, *, persisted_response_available: bool
+) -> dict[str, Any]:
     advisor_action = invocation.tool_name == "advisor.consult"
     return {
         "existing_invocation_id": str(invocation.id),
         "invocation_status": invocation.status.value,
         "external_transport_occurred": None,
-        "persisted_response_available": bool(invocation.response_refs),
+        "persisted_response_available": persisted_response_available,
         "persisted_response_refs": [str(item) for item in invocation.response_refs],
         "next_action": {
             "code": "reconcile_before_retry",
@@ -1046,6 +1048,27 @@ class OperatorToolInvocationService:
         # passive adapters. Later schema versions must carry explicit provenance.
         return invocation.schema_version == "1"
 
+    async def _has_persisted_adapter_response(self, invocation: ToolInvocation) -> bool:
+        if self._observations is None or self._evidence_summaries is None:
+            return False
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if observation is None or observation.investigation_id != invocation.investigation_id:
+                continue
+            try:
+                summary = await self._evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if (
+                not isinstance(summary, Mapping)
+                or not summary
+                or summary.get("adapter_output_archived") is False
+                or "framework_pre_submission_proof" in summary
+            ):
+                continue
+            return True
+        return False
+
     async def _settle_passive_read_reservation(self, invocation: ToolInvocation) -> ToolInvocation:
         """Close an uncertain passive GET reservation before a fresh retry."""
         envelope = await self._envelopes.get(self._investigation_id)
@@ -1174,9 +1197,7 @@ class OperatorToolInvocationService:
                 # A persisted RUNNING row may still belong to a live adapter call
                 # in another process. Never settle it or turn it into a retryable
                 # NEEDS_REVIEW occurrence from the request replay path.
-                return await self._result(
-                    existing, state.version, state.sha256, replay=True
-                )
+                return await self._result(existing, state.version, state.sha256, replay=True)
             if (
                 existing.status is ToolInvocationStatus.NEEDS_REVIEW
                 and self._is_trusted_passive_read(tool_name, definition, registered)
@@ -1202,7 +1223,12 @@ class OperatorToolInvocationService:
             ):
                 continue
             if existing.status is ToolInvocationStatus.RUNNING:
-                details = _ambiguous_invocation_details(existing)
+                details = _ambiguous_invocation_details(
+                    existing,
+                    persisted_response_available=await self._has_persisted_adapter_response(
+                        existing
+                    ),
+                )
                 raise OperatorToolInvocationError(
                     "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
                 )
@@ -1241,7 +1267,10 @@ class OperatorToolInvocationService:
                 # budget before each physical request.
                 await self._settle_passive_read_reservation(existing)
                 continue
-            details = _ambiguous_invocation_details(existing)
+            details = _ambiguous_invocation_details(
+                existing,
+                persisted_response_available=await self._has_persisted_adapter_response(existing),
+            )
             if proof_rejection is not None:
                 details["framework_proof_rejection"] = proof_rejection
             raise OperatorToolInvocationError(
