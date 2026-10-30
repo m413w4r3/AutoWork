@@ -123,6 +123,7 @@ def test_operator_client_can_read_analysis_and_create_supported_draft() -> None:
             return SimpleNamespace(
                 investigation_id=INVESTIGATION_ID,
                 working_state_version=self.version,
+                working_state_sha256="a" * 64,
                 error_code=None,
                 job_id=None,
                 idempotent_replay=False,
@@ -166,6 +167,7 @@ def test_operator_client_can_read_analysis_and_create_supported_draft() -> None:
                 "arguments": arguments,
                 "purpose": f"Operator workflow: {tool_name}",
                 "expected_version": version,
+                "expected_sha256": "a" * 64,
             },
             headers={"Idempotency-Key": f"workflow-{tool_name}"},
         )

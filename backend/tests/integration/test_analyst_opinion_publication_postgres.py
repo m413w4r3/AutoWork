@@ -248,6 +248,7 @@ class _OperatorInvocationService:
         arguments: dict[str, object],
         purpose: str,
         expected_version: int,
+        expected_sha256: str,
         idempotency_key: str,
         actor_id: str | None = None,
     ):
@@ -272,6 +273,7 @@ class _OperatorInvocationService:
         return SimpleNamespace(
             investigation_id=self._investigation_id,
             working_state_version=expected_version + 1,
+            working_state_sha256=expected_sha256,
             idempotent_replay=False,
             invocation=invocation,
             job_id=None,
@@ -622,6 +624,7 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
                     },
                     "purpose": "Compose the cited draft with its rendered protocol model.",
                     "expected_version": 1,
+                    "expected_sha256": "a" * 64,
                 },
                 headers={"Idempotency-Key": f"operator-opinion-compose-{suffix}"},
             )
@@ -668,6 +671,7 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
                     },
                     "purpose": "Retain all three protocol views on the revised draft.",
                     "expected_version": 2,
+                    "expected_sha256": operator_result["working_state_sha256"],
                 },
                 headers={"Idempotency-Key": f"operator-opinion-revise-{suffix}"},
             )

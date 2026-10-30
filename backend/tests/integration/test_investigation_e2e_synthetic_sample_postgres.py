@@ -627,6 +627,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                     state = await uow.investigation_states.get(investigation_id)
                     assert state is not None
                     expected_version = state.version
+                    expected_sha256 = state.sha256
                 response = await client.post(
                     f"/api/investigations/{investigation_id}/operator/tools/advisor.consult",
                     headers={"Idempotency-Key": key},
@@ -635,6 +636,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                         "arguments": arguments,
                         "purpose": "Exercise the local D7 Advisor boundary with inert fixtures.",
                         "expected_version": expected_version,
+                        "expected_sha256": expected_sha256,
                     },
                 )
                 assert response.status_code == 200, response.text

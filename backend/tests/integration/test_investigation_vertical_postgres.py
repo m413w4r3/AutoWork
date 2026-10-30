@@ -1056,6 +1056,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                     "arguments": arguments,
                     "purpose": purpose,
                     "expected_version": working_state.version,
+                    "expected_sha256": working_state.sha256,
                 }
                 response = await client.post(
                     f"/api/investigations/{investigation_id}/operator/tools/{tool_name}",

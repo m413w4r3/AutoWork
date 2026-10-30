@@ -746,6 +746,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                 },
                 "purpose": "Record a bounded hypothesis from the synthetic source record.",
                 "expected_version": state.version,
+                "expected_sha256": state.sha256,
             },
             headers={"Idempotency-Key": f"m05d-hypothesis-{investigation_id}"},
         )
@@ -894,6 +895,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                 },
                 "purpose": "Check that a request citing only an absent reference is refused.",
                 "expected_version": latest_state.version,
+                "expected_sha256": latest_state.sha256,
             },
             headers={"Idempotency-Key": f"m05d-missing-ref-{investigation_id}"},
         )
@@ -1142,6 +1144,7 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
                     },
                     "purpose": "Verify Advisor refuses this inert restricted sample association.",
                     "expected_version": state.version,
+                    "expected_sha256": state.sha256,
                 },
             )
             assert refused.status_code == 200, refused.text
