@@ -155,12 +155,14 @@ class _AdvisorInputValidationError(ValueError):
         self,
         reason_code: str,
         *,
+        reference: str | None = None,
         measurement_errors: tuple[dict[str, int | str], ...] = (),
         valid_targets: tuple[dict[str, Any], ...] = (),
         valid_article_claim_ids: tuple[str, ...] = (),
         invalid_article_claim_ids: tuple[str, ...] = (),
     ) -> None:
         self.reason_code = reason_code
+        self.reference = reference
         self.measurement_errors = measurement_errors
         self.valid_targets = valid_targets
         self.valid_article_claim_ids = valid_article_claim_ids
@@ -1283,6 +1285,7 @@ class InvestigationAdvisorTool:
                 valid_targets=exc.valid_targets,
                 valid_article_claim_ids=exc.valid_article_claim_ids,
                 invalid_article_claim_ids=exc.invalid_article_claim_ids,
+                reference=exc.reference,
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(
@@ -2067,6 +2070,7 @@ class InvestigationAdvisorTool:
         context: ToolExecutionContext,
         reason_code: str,
         *,
+        reference: str | None = None,
         observation_refs: tuple[UUID, ...] = (),
         measurement_errors: tuple[dict[str, int | str], ...] = (),
         internal_detail: Mapping[str, str | int] | None = None,
@@ -2086,7 +2090,7 @@ class InvestigationAdvisorTool:
             ),
             "evidence_reference_not_found": (
                 "The cited evidence reference is missing or belongs to another investigation. "
-                "Choose a canonical observation from this investigation or remove the optional "
+                "Choose a canonical observation from this investigation or correct/remove the "
                 "reference."
             ),
             "advisor_evidence_reference_mismatch": (
@@ -2138,6 +2142,20 @@ class InvestigationAdvisorTool:
                 + (", ".join(valid_article_claim_ids) if valid_article_claim_ids else "(none)")
                 + "."
             )
+        if reference:
+            message += f" Reference: {reference}."
+        reference_cause = (
+            {
+                "ref": reference,
+                "reason": (
+                    "The explicit observation reference is missing or belongs to another "
+                    "investigation; choose a canonical observation from this investigation "
+                    "or remove the reference."
+                ),
+            }
+            if reason_code == "evidence_reference_not_found" and reference
+            else None
+        )
         result = await self._persist_preflight_failure(
             context,
             consultation_type="unknown",
@@ -2147,6 +2165,11 @@ class InvestigationAdvisorTool:
                 "input_error_code": reason_code,
                 "failure_stage": "pre_transport_validation",
                 "failure_reason": reason_code,
+                **(
+                    {"preflight_cause": reference_cause, "missing_refs": [reference_cause]}
+                    if reference_cause is not None
+                    else {}
+                ),
                 "confirmed_non_execution": True,
                 "invocation_stage": "prevalidation",
                 "bridge_turns_consumed": 0,
@@ -2244,27 +2267,17 @@ class InvestigationAdvisorTool:
         context: ToolExecutionContext,
         refs: tuple[UUID, ...],
     ) -> tuple[EvidenceObservation, ...]:
-        """Load the analyst-cited observations, ignoring unknown ones instead of rejecting.
-
-        Foreign or absent references are never included in the dossier; they are reported
-        back in the result. The call only fails when none of the cited references resolves.
-        """
+        """Load analyst-cited observations and reject any absent or foreign reference."""
         unique_refs = tuple(dict.fromkeys(refs))
         found: list[EvidenceObservation] = []
-        ignored: list[str] = []
         for ref in unique_refs:
             item = await self._observations.get(ref)
             if item is None or item.investigation_id != context.investigation_id:
-                ignored.append(str(ref))
-                continue
+                raise _AdvisorInputValidationError(
+                    "evidence_reference_not_found",
+                    reference=str(ref),
+                )
             found.append(item)
-        if unique_refs and not found:
-            raise _AdvisorInputValidationError("evidence_reference_not_found")
-        if ignored:
-            self._ignored_evidence_refs[context.idempotency_key] = (
-                *self._ignored_evidence_refs.get(context.idempotency_key, ()),
-                *ignored,
-            )
         return tuple(found)
 
     async def _load_evidence(
@@ -2772,6 +2785,7 @@ class InvestigationAdvisorTool:
                 investigation_id=investigation_id,
                 evidence=evidence,
                 prompt_data=base,
+                explicit_observation_ids=frozenset(explicit_observation_ids),
                 envelope=context.envelope,
             )
             base["evidence"] = evidence_payload
@@ -2944,6 +2958,7 @@ class InvestigationAdvisorTool:
                 (
                     row["content_excerpts"],
                     row["blob_read_verified"],
+                    row["blob_read_failure_reason"],
                 ) = await self._observation_content_projection(
                     item, include_unclassified=str(item.id) in explicit_observation_ids
                 )
@@ -3303,6 +3318,7 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         evidence: tuple[EvidenceObservation, ...],
         prompt_data: Mapping[str, Any],
+        explicit_observation_ids: frozenset[str] = frozenset(),
         envelope: InvestigationEnvelope | None = None,
     ) -> tuple[
         tuple[EvidenceObservation, ...],
@@ -3349,8 +3365,8 @@ class InvestigationAdvisorTool:
                 }:
                     add(str(reference["kind"]), reference.get("id"))
         explicit_observation_refs = {
-            identifier for kind, identifier in references if kind == "observation"
-        }
+            str(identifier) for kind, identifier in references if kind == "observation"
+        } | set(explicit_observation_ids)
         for observation in evidence:
             add("observation", observation.id)
         available_observation_ids = {item.id for item in evidence}
@@ -3411,8 +3427,9 @@ class InvestigationAdvisorTool:
             (
                 row["content_excerpts"],
                 row["blob_read_verified"],
+                row["blob_read_failure_reason"],
             ) = await self._observation_content_projection(
-                item, include_unclassified=item.id in explicit_observation_refs
+                item, include_unclassified=str(item.id) in explicit_observation_refs
             )
             observation_payload.append(row)
 
@@ -3951,50 +3968,106 @@ class InvestigationAdvisorTool:
         self, observation: EvidenceObservation
     ) -> list[dict[str, str]]:
         """Read only integrity-verified JSON evidence and retain its content facts."""
-        excerpts, _read_verified = await self._observation_content_projection(observation)
+        excerpts, _read_verified, _failure_reason = await self._observation_content_projection(
+            observation
+        )
         return excerpts
 
     async def _observation_content_projection(
         self, observation: EvidenceObservation, *, include_unclassified: bool = False
-    ) -> tuple[list[dict[str, str]], bool]:
+    ) -> tuple[list[dict[str, str]], bool, str | None]:
         """Return extracted facts and whether the canonical blob read verified."""
+        failure_reasons: list[str] = []
         try:
-            payload = await self._measurement_payload(observation)
+            payload = await self._measurement_payload(observation, failure_reasons=failure_reasons)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             payload = None
+            failure_reasons.append(
+                "Canonical observation blob is unreadable or is not valid JSON; restore or "
+                "repair the canonical blob before retrying."
+            )
         if payload is None:
-            return [], False
-        return extract_content_excerpts(payload, include_unclassified=include_unclassified), True
+            return (
+                [],
+                False,
+                failure_reasons[0]
+                if failure_reasons
+                else "Canonical observation blob is unreadable; restore or repair the canonical "
+                "blob before retrying.",
+            )
+        return (
+            extract_content_excerpts(payload, include_unclassified=include_unclassified),
+            True,
+            None,
+        )
 
     async def _measurement_payload(
-        self, observation: EvidenceObservation
+        self,
+        observation: EvidenceObservation,
+        *,
+        failure_reasons: list[str] | None = None,
     ) -> Mapping[str, Any] | None:
+        def failed(reason: str) -> None:
+            if failure_reasons is not None and not failure_reasons:
+                failure_reasons.append(reason)
+
         descriptor_reader = getattr(self._blobs, "get", None)
         if not callable(descriptor_reader):
+            failed(
+                "Canonical observation blob is unreadable because its blob descriptor is "
+                "unavailable; restore or repair the canonical blob before retrying."
+            )
             return None
         try:
             blob = await descriptor_reader(observation.blob_id)
         except Exception:
+            failed(
+                "Canonical observation blob is unreadable because its blob descriptor could not "
+                "be read; restore or repair the canonical blob before retrying."
+            )
             return None
         descriptor = getattr(blob, "descriptor", None)
         size = getattr(descriptor, "size", None)
-        if (
-            descriptor is None
-            or getattr(descriptor, "sha256", None) != observation.sha256
-            or type(size) is not int
-            or not 0
-            <= size
-            <= int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024))
-        ):
+        if descriptor is None:
+            failed(
+                "Canonical observation blob is unreadable because its blob descriptor is "
+                "missing; restore or repair the canonical blob before retrying."
+            )
+            return None
+        if getattr(descriptor, "sha256", None) != observation.sha256:
+            failed(
+                "Canonical observation SHA-256 mismatch: blob metadata does not match the cited "
+                "observation; restore the canonical blob or repair the observation reference."
+            )
+            return None
+        if type(size) is not int or size < 0:
+            failed(
+                "Canonical observation blob is unreadable because its size metadata is invalid; "
+                "restore or repair the canonical blob before retrying."
+            )
             return None
         try:
             raw = await self._artifact_store.read_bytes(
                 observation.blob_id,
-                max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+                max_bytes=size,
             )
         except Exception:
+            failed(
+                "Canonical observation blob is unreadable; restore or repair the canonical blob "
+                "before retrying."
+            )
             return None
-        if len(raw) != size or hashlib.sha256(raw).hexdigest() != observation.sha256:
+        if len(raw) != size:
+            failed(
+                "Canonical observation blob is unreadable because its stored size does not match "
+                "the verified descriptor; restore or repair the canonical blob."
+            )
+            return None
+        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            failed(
+                "Canonical observation SHA-256 mismatch: blob bytes do not match the cited "
+                "observation; restore the canonical blob or repair the observation reference."
+            )
             return None
         payload = json.loads(raw)
         if not isinstance(payload, Mapping):

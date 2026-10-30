@@ -4960,6 +4960,272 @@ async def test_draft_text_resolves_facts_from_assertion_refs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_draft_text_autoloads_explicit_article_observation_bodies_without_a_size_cap() -> (
+    None
+):
+    investigation_id = uuid4()
+    observations = []
+    raws = []
+    large_statement = "LargeArticleClaimMarker" + ("x" * (1_048_600 - 23))
+    for index in range(8):
+        statement = large_statement if index == 0 else f"Article claim marker {index}."
+        payload = {
+            "schema": "article-claim-capture.v1",
+            "summary": (
+                "[UNTRUSTED ARTICLE OR TOOL DATA]\n"
+                + json.dumps(
+                    [{"id": f"S{index + 2}P1.1", "statement": statement}],
+                    ensure_ascii=False,
+                )
+            ),
+        }
+        observation, raw = make_observation(investigation_id, payload)
+        observation = replace(
+            observation,
+            kind=EvidenceKind.OTHER,
+            source="article.claim.capture",
+            source_version="1",
+            object_type="article_claim",
+        )
+        observations.append(observation)
+        raws.append(raw)
+
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Draft consultation answer.")
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observations[0],
+        raw=raws[0],
+    )
+    for observation, raw in zip(observations[1:], raws[1:], strict=True):
+        tool._observations.observations[observation.id] = observation
+        tool._artifact_store.values[observation.blob_id] = raw
+        tool._blobs.add(
+            observation.blob_id,
+            sha256=observation.sha256,
+            size=len(raw),
+            logical_bucket="evidence",
+        )
+    findings = tuple(
+        InvestigationFinding(
+            investigation_id=investigation_id,
+            kind=FindingKind.CAPABILITY,
+            assessment=FindingAssessment.INCONCLUSIVE,
+            statement=f"Synthetic article finding {index}.",
+            observation_refs=(observation.id,),
+        )
+        for index, observation in enumerate(observations[:2], start=1)
+    )
+    tool._findings = FindingRepository(findings)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Draft text from the explicitly cited article observations.",
+            "evidence_refs": [str(item.id) for item in observations],
+        },
+        make_context(investigation_id, key="operator:advisor:draft-explicit-article-refs"),
+    )
+
+    provenance = result.output.get("bridge_provenance", result.output)
+    assert provenance.get("preflight_status") == "READY", result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert large_statement in prompt
+    manifest = provenance["completeness_manifest"]
+    for observation in observations:
+        row = next(
+            item
+            for item in manifest
+            if item["kind"] == "observation" and item["id"] == str(observation.id)
+        )
+        statuses = {item["status"] for item in row["statuses"]}
+        assert {"PRESENT_IN_CANONICAL", "IN_DOSSIER"} <= statuses
+        assert "MISSING" not in statuses
+    assert len(typed_prompt_payload(prompt)["findings"]) == 2
+
+
+@pytest.mark.parametrize(
+    "consultation_type", ["plan_investigation", "pivot_strategy", "review_text"]
+)
+@pytest.mark.asyncio
+async def test_explicit_article_observation_body_reaches_other_consultation_types(
+    consultation_type: str,
+) -> None:
+    investigation_id = uuid4()
+    body = "ExplicitArticleObservationMarker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "article-claim-capture.v1",
+            "summary": f'[UNTRUSTED ARTICLE OR TOOL DATA]\n[{{"statement":"{body}"}}]',
+        },
+    )
+    observation = replace(
+        observation,
+        kind=EvidenceKind.OTHER,
+        source="article.claim.capture",
+        source_version="1",
+        object_type="article_claim",
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Consultation answer.")
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": consultation_type,
+            "question": "Use the explicitly cited article observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(
+            investigation_id,
+            key=f"operator:advisor:explicit-article-{consultation_type}",
+        ),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    assert body in transport.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_draft_text_explicit_observation_sha_mismatch_has_precise_refusal() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "article-claim-capture.v1", "summary": "Synthetic cited claim body."},
+    )
+    observation = replace(
+        observation,
+        kind=EvidenceKind.OTHER,
+        source="article.claim.capture",
+        source_version="1",
+        object_type="article_claim",
+    )
+    transport = Transport(None)
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._blobs.descriptors[observation.blob_id].descriptor.sha256 = "0" * 64
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Use the cited article observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:draft-sha-mismatch"),
+    )
+
+    assert transport.calls == []
+    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
+    assert str(observation.id) in result.output["preflight_cause"]["ref"]
+    assert "SHA-256 mismatch" in result.output["preflight_cause"]["reason"]
+    assert "restore the canonical blob" in result.output["preflight_cause"]["reason"]
+    assert len(result.output["missing_refs"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_draft_text_explicit_observation_operational_secret_is_still_refused() -> None:
+    investigation_id = uuid4()
+    operator_secret = "autowork_fixture_" + "Z" * 48
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "article-claim-capture.v1",
+            "summary": f"Operator API token: {operator_secret}",
+        },
+    )
+    observation = replace(
+        observation,
+        kind=EvidenceKind.OTHER,
+        source="article.claim.capture",
+        source_version="1",
+        object_type="article_claim",
+    )
+    transport = Transport(None)
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._settings.operator_api_token = SecretStr(operator_secret)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Use the cited article observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:draft-secret-refusal"),
+    )
+
+    assert transport.calls == []
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["failure_reason"] == "autowork_credential_or_signed_url_detected"
+    assert result.output["confirmed_non_execution"] is True
+    assert operator_secret not in repr(result.output)
+
+
+@pytest.mark.parametrize("restriction", [{"external_llm_allowed": False}, {"tlp": TLP.RED}])
+@pytest.mark.asyncio
+async def test_draft_text_explicit_observation_keeps_disclosure_restrictions(restriction) -> None:
+    investigation_id = uuid4()
+    sample_hash = "c" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "article-claim-capture.v1",
+            "sample_sha256": sample_hash,
+            "summary": "Synthetic restricted article claim body.",
+        },
+    )
+    observation = replace(
+        observation,
+        kind=EvidenceKind.OTHER,
+        source="article.claim.capture",
+        source_version="1",
+        object_type="article_claim",
+        object_id=sample_hash,
+    )
+    transport = Transport(None)
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash, **restriction)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Use the cited article observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:draft-restricted-refusal"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["failure_reason"] == "sample_disclosure_policy"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+
+
+@pytest.mark.asyncio
 async def test_draft_text_assertion_ref_to_restricted_sample_is_vetoed_after_resolution() -> None:
     investigation_id = uuid4()
     sample_hash = "d" * 64
@@ -7855,7 +8121,6 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
-            # Unknown references are ignored; the call is refused only when none resolves.
             "evidence_refs": [str(missing_observation_id)],
         },
         make_context(investigation_id),
@@ -7864,8 +8129,10 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_input_invalid"
     assert result.output["advisor_status"] == "invalid_input"
-    assert result.output["input_error_code"] == "evidence_reference_not_found"
+    assert result.output.get("input_error_code") == "evidence_reference_not_found", result.output
+    assert result.output["preflight_cause"]["ref"] == str(missing_observation_id)
     assert "canonical observation from this investigation" in result.message
+    assert str(missing_observation_id) in result.message
     assert result.output["failure_stage"] == "pre_transport_validation"
     assert result.output["confirmed_non_execution"] is True
     assert result.output["provider_usage"] == {"status": "not_submitted"}
@@ -7899,8 +8166,53 @@ async def test_cross_investigation_evidence_reference_is_rejected_before_bridge(
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_input_invalid"
     assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["preflight_cause"]["ref"] == str(foreign_observation.id)
+    assert "another investigation" in result.output["preflight_cause"]["reason"]
     assert result.output["confirmed_non_execution"] is True
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_valid_and_cross_investigation_refs_are_rejected_with_pointer() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, {"content": "Synthetic valid body."})
+    foreign, foreign_raw = make_observation(uuid4(), {"content": "Synthetic foreign body."})
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Synthetic answer.", [str(observation.id)]),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._observations.observations[foreign.id] = foreign
+    tool._artifact_store.values[foreign.blob_id] = foreign_raw
+    tool._blobs.add(
+        foreign.blob_id,
+        sha256=foreign.sha256,
+        size=len(foreign_raw),
+        logical_bucket="evidence",
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use the cited canonical observations.",
+            "evidence_refs": [str(observation.id), str(foreign.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:mixed-cross-investigation-refs"),
+    )
+
+    assert transport.calls == []
+    assert result.output.get("input_error_code") == "evidence_reference_not_found", result.output
+    assert result.output["preflight_cause"]["ref"] == str(foreign.id)
+    assert "another investigation" in result.output["preflight_cause"]["reason"]
+    assert str(foreign.id) in result.message
+    assert "Choose a canonical observation" in result.message
 
 
 def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
@@ -8037,12 +8349,14 @@ def test_cited_unknown_evidence_ref_has_a_specific_provenance_error() -> None:
     tool._ignored_evidence_refs = {}
     context = SimpleNamespace(investigation_id=case, idempotency_key="key-1")
 
-    found = asyncio.run(tool._load_cited_evidence(context, (known, foreign, missing)))
-
+    found = asyncio.run(tool._load_cited_evidence(context, (known,)))
     assert [item.id for item in found] == [known]
-    assert tool._ignored_evidence_refs["key-1"] == (str(foreign), str(missing))
-    with pytest.raises(ValueError, match="evidence_reference_not_found"):
+    with pytest.raises(ValueError, match="evidence_reference_not_found") as error:
+        asyncio.run(tool._load_cited_evidence(context, (known, foreign, missing)))
+    assert error.value.reference == str(foreign)
+    with pytest.raises(ValueError, match="evidence_reference_not_found") as error:
         asyncio.run(tool._load_cited_evidence(context, (foreign, missing)))
+    assert error.value.reference == str(foreign)
 
 
 @pytest.mark.asyncio
