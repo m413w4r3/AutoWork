@@ -18,6 +18,13 @@ import {
 } from "../../api/investigation";
 import { InvestigationApiError } from "../../api/investigation";
 import {
+  useInvestigationActivity,
+  useInvestigationActivityHistory,
+  type InvestigationActivityBlockerKind,
+  type InvestigationActivityInvocation,
+  type InvestigationActivityPage,
+} from "../../api/investigationOperator";
+import {
   useInvestigationSamples,
   useQualifyInvestigationSample,
   type InvestigationSampleDetail,
@@ -1066,4 +1073,740 @@ function DetectionRate({
       </dd>
     </div>
   );
+}
+
+const ACTIVITY_BUDGET_ORDER: BudgetDimension[] = [
+  "bridge_turns",
+  "vt_units",
+  "downloads",
+  "tool_seconds",
+  "context_tokens",
+  "context_bytes",
+  "shodan_credits",
+];
+
+const ACTIVITY_BUDGET_LABELS: Record<BudgetDimension, string> = {
+  bridge_turns: "Tours Bridge",
+  vt_units: "Unités VT",
+  shodan_credits: "Crédits Shodan",
+  downloads: "Téléchargements",
+  tool_seconds: "Secondes d’analyse locale",
+  context_tokens: "Tokens de contexte",
+  context_bytes: "Octets de contexte",
+};
+
+const BLOCKER_LABELS: Record<InvestigationActivityBlockerKind, string> = {
+  permission_missing: "Permission manquante",
+  service_unavailable: "Service externe indisponible",
+  external_effect_ambiguous: "Effet externe ambigu — réconciliation",
+  budget_limit: "Limite de budget",
+  evidence_insufficient: "Preuve insuffisante",
+  analytical_limitation: "Limitation analytique",
+  policy_block: "Blocage de politique",
+  tool_not_executable: "Outil non exécutable",
+  technical_block: "Blocage technique",
+};
+
+const ANALYTIC_STAGES = [
+  { id: 0, label: "Acquisition / VT initial" },
+  { id: 1, label: "Plan Bridge" },
+  { id: 2, label: "Analyse statique" },
+  { id: 3, label: "Protocole / crypto" },
+  { id: 4, label: "YARA Bridge" },
+  { id: 5, label: "Validation YARA" },
+  { id: 6, label: "Pivots VT" },
+  { id: 7, label: "Nouveaux candidats" },
+  { id: 8, label: "Boucle de revalidation" },
+  { id: 9, label: "Note de l’analyste" },
+] as const;
+
+type ActivityStageId = (typeof ANALYTIC_STAGES)[number]["id"];
+type ActivityStageStatus =
+  | "todo"
+  | "in_progress"
+  | "partial"
+  | "blocked"
+  | "complete"
+  | "not_applicable"
+  | "unknown";
+
+const ACTIVITY_STAGE_STATUS_LABELS: Record<ActivityStageStatus, string> = {
+  todo: "À faire",
+  in_progress: "En cours",
+  partial: "Partielle · clôture inconnue",
+  blocked: "Bloquée",
+  complete: "Terminée",
+  not_applicable: "Non applicable",
+  unknown: "Non déterminée",
+};
+
+export function InvestigationActivityCockpit({
+  investigationId,
+  onOpenJournal,
+}: {
+  investigationId: string;
+  onOpenJournal: () => void;
+}) {
+  const [historyEnabled, setHistoryEnabled] = useState(false);
+  const activityQuery = useInvestigationActivity(investigationId);
+  const firstPage = activityQuery.data;
+  const historyQuery = useInvestigationActivityHistory(
+    investigationId,
+    firstPage?.next_cursor ?? null,
+    historyEnabled,
+  );
+  const historyPages = historyQuery.data?.pages ?? [];
+  const canLoadOlder = historyEnabled
+    ? Boolean(historyQuery.hasNextPage)
+    : Boolean(firstPage?.has_more);
+  const invocations = deduplicateInvocations(
+    [...(firstPage ? [firstPage] : []), ...historyPages].flatMap(
+      (page) => page.timeline,
+    ),
+  );
+  const latestActivityAt = firstPage?.last_activity_at ?? null;
+  const stageGroups = new Map<
+    ActivityStageId,
+    InvestigationActivityInvocation[]
+  >();
+  const unclassified: InvestigationActivityInvocation[] = [];
+  for (const invocation of invocations) {
+    const stageId = activityStageFor(invocation);
+    if (stageId === null) {
+      unclassified.push(invocation);
+      continue;
+    }
+    stageGroups.set(stageId, [...(stageGroups.get(stageId) ?? []), invocation]);
+  }
+  const activeStageIds = new Set(
+    [...stageGroups.entries()]
+      .filter(([, stageInvocations]) =>
+        stageInvocations.some(
+          (invocation) =>
+            invocation.status === "pending" || invocation.status === "running",
+        ),
+      )
+      .map(([stageId]) => stageId),
+  );
+  const activeStageLabels = ANALYTIC_STAGES.filter((stage) =>
+    activeStageIds.has(stage.id),
+  ).map((stage) => `${stage.id}. ${stage.label}`);
+
+  if (activityQuery.isPending && !firstPage) {
+    return <p role="status">Chargement de l’activité persistée…</p>;
+  }
+  if (!firstPage) {
+    return (
+      <p className="error-message" role="alert">
+        La projection compacte d’activité est indisponible
+        {activityQuery.error ? ` : ${activityQuery.error.message}` : "."}
+      </p>
+    );
+  }
+
+  const investigation = firstPage.investigation;
+  const budget = firstPage.budget;
+  const openHypotheses = firstPage.working_state?.open_hypothesis_count;
+
+  return (
+    <div className="investigation-activity">
+      <section className="job-card" aria-labelledby="activity-summary-heading">
+        <h2 id="activity-summary-heading">Investigation en cours</h2>
+        {activityQuery.isError ? (
+          <p className="verification-warning" role="note">
+            L’actualisation a échoué; les dernières données persistées reçues
+            sont affichées.
+          </p>
+        ) : null}
+        <p>
+          {activityStatusLabel(investigation.status, investigation.stop_reason)}{" "}
+          · version d’état canonique{" "}
+          {firstPage.working_state?.version ?? "inconnue"} · version CAS{" "}
+          {investigation.version}
+        </p>
+        <dl>
+          <div>
+            <dt>Enquête</dt>
+            <dd>
+              <code>{investigation.id}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Synthèse</dt>
+            <dd>
+              <code>{investigation.synthesis_artifact_id}</code> · SHA-256{" "}
+              <code>{investigation.synthesis_sha256 ?? "Indisponible"}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Responsable principal</dt>
+            <dd>
+              {firstPage.operator.principal ?? "Non renseigné par AutoWork"}
+            </dd>
+          </div>
+          <div>
+            <dt>Dernière activité persistée</dt>
+            <dd>
+              {latestActivityAt
+                ? formatActivityTime(latestActivityAt)
+                : "Inconnue"}
+              {latestActivityAt
+                ? ` · ${activitySourceLabel(firstPage.last_activity_source)}`
+                : null}
+            </dd>
+          </div>
+          <div>
+            <dt>Étape(s) avec invocation en cours</dt>
+            <dd>
+              {activeStageLabels.length > 0
+                ? activeStageLabels.join(" · ")
+                : "Aucune invocation active dans les opérations chargées; étape actuelle inconnue"}
+            </dd>
+          </div>
+          <div>
+            <dt>Jobs AutoWork actifs</dt>
+            <dd>{firstPage.active_backend_job_count}</dd>
+          </div>
+          <div>
+            <dt>Sous-agents actifs</dt>
+            <dd>
+              {firstPage.operator.active_subagent_count ??
+                "Inconnu — non mesurable"}
+            </dd>
+          </div>
+          <div>
+            <dt>Hypothèses ouvertes</dt>
+            <dd>{openHypotheses ?? "Inconnu"}</dd>
+          </div>
+        </dl>
+        {!latestActivityAt ? (
+          <p className="verification-warning" role="note">
+            Aucune activité récente n’est disponible dans cette projection. Cela
+            ne permet pas de conclure que l’agent est arrêté.
+          </p>
+        ) : null}
+      </section>
+
+      <section className="job-card" aria-labelledby="activity-steps-heading">
+        <h2 id="activity-steps-heading">
+          Progression analytique · étapes 0 à 9
+        </h2>
+        <p role="note">
+          Les rattachements d’activité reposent sur les noms d’outils et
+          l’objectif déclaré. Une invocation réussie ne clôt pas une étape;
+          aucun état de clôture analytique fiable n’est persisté pour ces dix
+          étapes. Les compteurs et coûts par étape couvrent les opérations
+          chargées; l’historique peut être étendu.
+        </p>
+        <ol className="activity-stage-list">
+          {ANALYTIC_STAGES.map((stage) => {
+            const stageInvocations = stageGroups.get(stage.id) ?? [];
+            const stageStatus = activityStageStatus(stageInvocations);
+            const evidenceRefs = [
+              ...new Set(
+                stageInvocations.flatMap(
+                  (invocation) => invocation.observation_refs,
+                ),
+              ),
+            ];
+            return (
+              <li key={stage.id}>
+                <details>
+                  <summary>
+                    <strong>
+                      {stage.id}. {stage.label}
+                    </strong>
+                    <span>{ACTIVITY_STAGE_STATUS_LABELS[stageStatus]}</span>
+                    <span>{stageInvocations.length} activité(s)</span>
+                  </summary>
+                  <dl>
+                    <div>
+                      <dt>Responsable</dt>
+                      <dd>Inconnu</dd>
+                    </div>
+                    <div>
+                      <dt>Activités chargées</dt>
+                      <dd>
+                        {stageInvocations.length || "Aucun signal rattaché"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Preuves liées</dt>
+                      <dd>
+                        {evidenceRefs.length > 0
+                          ? evidenceRefs.map((reference) => (
+                              <code key={reference}>{reference} </code>
+                            ))
+                          : "Aucune référence liée dans les opérations chargées"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Actions ouvertes</dt>
+                      <dd>
+                        {openHypotheses === undefined ? (
+                          "Non déterminées"
+                        ) : (
+                          <>
+                            {openHypotheses} hypothèse(s) ouverte(s);
+                            rattachement à cette étape inconnu
+                          </>
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Coût des opérations chargées</dt>
+                      <dd>{summarizeStageBudget(stageInvocations)}</dd>
+                    </div>
+                    <div>
+                      <dt>Blocages</dt>
+                      <dd>{summarizeStageBlockers(stageInvocations)}</dd>
+                    </div>
+                    {stageInvocations.length > 0 ? (
+                      <div>
+                        <dt>Résultats observés</dt>
+                        <dd>
+                          {stageInvocations.map((invocation) => (
+                            <span key={invocation.id}>
+                              {invocation.tool_name} · {invocation.status}{" "}
+                            </span>
+                          ))}
+                        </dd>
+                      </div>
+                    ) : null}
+                  </dl>
+                </details>
+              </li>
+            );
+          })}
+        </ol>
+        {unclassified.length > 0 ? (
+          <p>
+            {unclassified.length} activité(s) sans rattachement fiable à une
+            étape.
+          </p>
+        ) : null}
+      </section>
+
+      <section className="job-card" aria-labelledby="activity-timeline-heading">
+        <h2 id="activity-timeline-heading">Chronologie des opérations</h2>
+        {invocations.length === 0 ? (
+          <p>Aucune invocation persistée dans cette page.</p>
+        ) : (
+          <ol className="activity-timeline">
+            {invocations.map((invocation) => (
+              <li key={invocation.id}>
+                <details>
+                  <summary>
+                    <strong>{invocation.tool_name}</strong> ·{" "}
+                    {invocation.status} ·{" "}
+                    {formatActivityTime(invocation.created_at)}
+                  </summary>
+                  <p>
+                    Agent : non identifié · objectif déclaré :{" "}
+                    {invocation.purpose_excerpt || "inconnu"}
+                  </p>
+                  <p>
+                    Durée d’exécution : inconnue. Aucune mesure fiable n’est
+                    persistée.
+                  </p>
+                  <p>
+                    Coût/budget consommé :{" "}
+                    {formatInvocationBudget(invocation.consumed_budget)} ·
+                    réservé :{" "}
+                    {formatInvocationBudget(invocation.reserved_budget)}
+                  </p>
+                  {invocation.repeated_input_count_in_page > 1 ? (
+                    <p role="note">
+                      Entrée identique observée{" "}
+                      {invocation.repeated_input_count_in_page} fois dans cette
+                      page; les paramètres restent masqués.
+                    </p>
+                  ) : null}
+                  <p>
+                    Invocation canonique <code>{invocation.id}</code> v
+                    {invocation.version} · schéma {invocation.schema_version}
+                  </p>
+                  {invocation.observations.length > 0 ? (
+                    <section aria-label="Observations liées">
+                      <h3>Observations produites</h3>
+                      <ul>
+                        {invocation.observations.map((observation) => (
+                          <li key={observation.id}>
+                            <code>{observation.id}</code> · {observation.kind} ·
+                            SHA-256 <code>{observation.sha256}</code> ·{" "}
+                            {observation.source} v{observation.source_version}
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  ) : invocation.observation_refs.length > 0 ? (
+                    <p>
+                      Références d’observation canoniques :{" "}
+                      {invocation.observation_refs.map((id) => (
+                        <code key={id}>{id} </code>
+                      ))}
+                      Les métadonnées de cette page ne contiennent pas leur
+                      résumé.
+                    </p>
+                  ) : (
+                    <p>Aucune observation liée à cette invocation.</p>
+                  )}
+                </details>
+              </li>
+            ))}
+          </ol>
+        )}
+        {canLoadOlder ? (
+          <button
+            type="button"
+            className="button button--secondary"
+            disabled={
+              historyQuery.isFetchingNextPage ||
+              (historyEnabled && historyQuery.isPending)
+            }
+            onClick={() => {
+              if (!historyEnabled) setHistoryEnabled(true);
+              else void historyQuery.fetchNextPage();
+            }}
+          >
+            {historyQuery.isFetchingNextPage ||
+            (historyEnabled && historyQuery.isPending)
+              ? "Chargement…"
+              : "Charger les opérations précédentes"}
+          </button>
+        ) : null}
+        {historyQuery.isError ? (
+          <div className="error-message" role="alert">
+            Les opérations précédentes n’ont pas pu être chargées.
+            <button
+              type="button"
+              className="button button--secondary"
+              onClick={() => void historyQuery.refetch()}
+            >
+              Réessayer
+            </button>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="job-card" aria-labelledby="activity-agents-heading">
+        <h2 id="activity-agents-heading">Agents et délégations</h2>
+        <p>
+          AutoWork ne reçoit pas les événements de sessions Paseo. L’identité de
+          session, le modèle, l’effort, la mission et les résultats de
+          délégation sont donc inconnus; les métadonnées d’orchestration ne
+          constituent pas des preuves CTI.
+        </p>
+        <p>
+          Sous-agents actifs : inconnu — non mesurable dans les sources AutoWork
+          disponibles.
+        </p>
+        <p>
+          Jobs de traitement AutoWork actifs :{" "}
+          {firstPage.active_backend_job_count}; ce compteur ne mesure pas les
+          sous-agents.
+        </p>
+      </section>
+
+      <section className="job-card" aria-labelledby="activity-blockers-heading">
+        <h2 id="activity-blockers-heading">Blocages et limites</h2>
+        {firstPage.blockers.length === 0 ? (
+          <p>Aucun blocage typé n’est présent dans les signaux consultés.</p>
+        ) : (
+          <ul>
+            {firstPage.blockers.map((blocker, index) => (
+              <li key={`${blocker.code}-${blocker.invocation_id ?? index}`}>
+                <strong>{BLOCKER_LABELS[blocker.kind]}</strong> ·{" "}
+                {blocker.message}
+                {blocker.invocation_id ? (
+                  <>
+                    {" "}
+                    · invocation <code>{blocker.invocation_id}</code>
+                  </>
+                ) : null}
+                {blocker.kind === "external_effect_ambiguous" ? (
+                  <p>
+                    État externe réel :{" "}
+                    {blocker.external_effect_state ?? "Inconnu"}.
+                  </p>
+                ) : null}
+                <p>Prochaine action : {blocker.next_action}</p>
+                {blocker.kind === "permission_missing" ? (
+                  <button
+                    type="button"
+                    className="button button--secondary"
+                    onClick={onOpenJournal}
+                  >
+                    Ouvrir le journal de revue
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="job-card" aria-labelledby="activity-costs-heading">
+        <h2 id="activity-costs-heading">Budgets et répétitions</h2>
+        {budget ? (
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Dimension</th>
+                  <th>Consommé</th>
+                  <th>Réservé</th>
+                  <th>Restant</th>
+                  <th>Limite</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ACTIVITY_BUDGET_ORDER.map((dimension) => {
+                  const amount = budget[dimension];
+                  return (
+                    <tr key={dimension}>
+                      <th scope="row">{ACTIVITY_BUDGET_LABELS[dimension]}</th>
+                      <td>{amount.consumed}</td>
+                      <td>{amount.reserved}</td>
+                      <td>{amount.remaining ?? "Inconnu"}</td>
+                      <td>{amount.limit ?? "Inconnue"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p role="note">
+            Budget : consommé, réservé et restant inconnus (aucune enveloppe
+            lisible).
+          </p>
+        )}
+        <p>
+          Les estimations monétaires ou de coût fournisseur ne sont pas
+          disponibles dans cette projection.
+        </p>
+        <p>
+          Les répétitions sont comptées par empreinte interne des paramètres sur
+          la page chargée; aucune entrée brute n’est exposée.
+        </p>
+        <h3>Invocations avec consommation enregistrée</h3>
+        {invocations.some((invocation) => hasMeasuredSpend(invocation)) ? (
+          <ul>
+            {invocations
+              .filter((invocation) => hasMeasuredSpend(invocation))
+              .map((invocation) => (
+                <li key={invocation.id}>
+                  {formatActivityTime(invocation.created_at)} ·{" "}
+                  {invocation.tool_name} ·{" "}
+                  {formatInvocationBudget(invocation.consumed_budget)}
+                  {invocation.repeated_input_count_in_page > 1
+                    ? ` · répété ${invocation.repeated_input_count_in_page} fois sur cette page`
+                    : ""}
+                </li>
+              ))}
+          </ul>
+        ) : (
+          <p>Aucun coût individuel mesuré dans les opérations chargées.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function deduplicateInvocations(
+  invocations: InvestigationActivityInvocation[],
+): InvestigationActivityInvocation[] {
+  const byId = new Map<string, InvestigationActivityInvocation>();
+  for (const invocation of invocations) byId.set(invocation.id, invocation);
+  return [...byId.values()].sort((left, right) =>
+    right.created_at.localeCompare(left.created_at),
+  );
+}
+
+function activityStageFor(
+  invocation: InvestigationActivityInvocation,
+): ActivityStageId | null {
+  const tool = invocation.tool_name.toLocaleLowerCase("fr-FR");
+  const purpose = invocation.purpose_excerpt.toLocaleLowerCase("fr-FR");
+  if (tool === "advisor.consult") {
+    if (purpose.includes("yara") || purpose.includes("règle")) return 4;
+    if (purpose.includes("plan")) return 1;
+    if (purpose.includes("revalid")) return 8;
+    if (purpose.includes("note") || purpose.includes("avis")) return 9;
+    return null;
+  }
+  if (tool === "vt.file_report") return 0;
+  if (
+    tool === "opinion.compose" ||
+    tool === "opinion.note" ||
+    tool === "opinion.revise"
+  ) {
+    return 9;
+  }
+  if (
+    tool === "vt.relationships" ||
+    tool === "vt.intelligence_search" ||
+    tool === "vt.object_report"
+  ) {
+    return 6;
+  }
+  if (
+    tool === "sample.analyze" ||
+    tool.startsWith("assembly.") ||
+    tool === "types.list" ||
+    tool === "methods.list" ||
+    tool === "method.decompile" ||
+    tool === "strings.list" ||
+    tool === "resources.list" ||
+    tool === "references.imports"
+  ) {
+    return 2;
+  }
+  if (tool.startsWith("network.protocol.") || tool.includes("crypto")) return 3;
+  if (tool === "rule.propose_bridge") return 4;
+  if (tool.startsWith("rule.")) return 5;
+  if (tool.includes("yara") || tool.includes("ruleworkbench")) return 5;
+  if (tool === "vt.download_sample" || tool === "sample.set_qualification")
+    return 7;
+  if (purpose.includes("revalid")) return 8;
+  if (
+    purpose.includes("analyst note") ||
+    purpose.includes("note de l’analyste")
+  )
+    return 9;
+  return null;
+}
+
+function activityStageStatus(
+  invocations: InvestigationActivityInvocation[],
+): ActivityStageStatus {
+  if (invocations.length === 0) return "unknown";
+  if (
+    invocations.some(
+      (item) => item.status === "pending" || item.status === "running",
+    )
+  ) {
+    return "in_progress";
+  }
+  const latest = [...invocations].sort((left, right) =>
+    right.updated_at.localeCompare(left.updated_at),
+  )[0];
+  if (
+    latest &&
+    ["needs_review", "policy_denied", "unavailable", "failed"].includes(
+      latest.status,
+    )
+  ) {
+    return "blocked";
+  }
+  return "partial";
+}
+
+function summarizeStageBudget(
+  invocations: InvestigationActivityInvocation[],
+): string {
+  if (invocations.length === 0) return "Inconnu";
+  const consumed = new Map<BudgetDimension, number>();
+  const reserved = new Map<BudgetDimension, number>();
+  for (const invocation of invocations) {
+    for (const [dimension, amount] of Object.entries(
+      invocation.consumed_budget,
+    )) {
+      if (amount) {
+        const key = dimension as BudgetDimension;
+        consumed.set(key, (consumed.get(key) ?? 0) + amount);
+      }
+    }
+    for (const [dimension, amount] of Object.entries(
+      invocation.reserved_budget,
+    )) {
+      if (amount) {
+        const key = dimension as BudgetDimension;
+        reserved.set(key, (reserved.get(key) ?? 0) + amount);
+      }
+    }
+  }
+  return `consommé : ${formatBudgetMap(consumed)} · réservé : ${formatBudgetMap(reserved)}`;
+}
+
+function summarizeStageBlockers(
+  invocations: InvestigationActivityInvocation[],
+): string {
+  const ambiguous = invocations.filter(
+    (item) => item.status === "needs_review",
+  );
+  if (ambiguous.length > 0) {
+    return ambiguous
+      .map((item) => `${item.tool_name} · needs_review`)
+      .join("; ");
+  }
+  const latest = [...invocations].sort((left, right) =>
+    right.updated_at.localeCompare(left.updated_at),
+  )[0];
+  if (
+    latest &&
+    ["policy_denied", "unavailable", "failed"].includes(latest.status)
+  ) {
+    return `Dernière invocation : ${latest.tool_name} · ${latest.status}; motif détaillé non disponible`;
+  }
+  return "Aucun blocage opérationnel explicite";
+}
+
+function formatInvocationBudget(
+  values: Partial<Record<BudgetDimension, number>>,
+): string {
+  const valuesByDimension = new Map<BudgetDimension, number>();
+  for (const dimension of ACTIVITY_BUDGET_ORDER) {
+    const value = values[dimension];
+    if (value) valuesByDimension.set(dimension, value);
+  }
+  return formatBudgetMap(valuesByDimension);
+}
+
+function hasMeasuredSpend(
+  invocation: InvestigationActivityInvocation,
+): boolean {
+  return Object.values(invocation.consumed_budget).some(
+    (amount) => typeof amount === "number" && amount > 0,
+  );
+}
+
+function formatBudgetMap(values: Map<BudgetDimension, number>): string {
+  const parts = ACTIVITY_BUDGET_ORDER.flatMap((dimension) => {
+    const value = values.get(dimension);
+    return value ? [`${ACTIVITY_BUDGET_LABELS[dimension]} : ${value}`] : [];
+  });
+  return parts.length > 0 ? parts.join(" · ") : "0 mesuré";
+}
+
+function formatActivityTime(value: string): string {
+  return new Intl.DateTimeFormat("fr-FR", {
+    dateStyle: "short",
+    timeStyle: "medium",
+  }).format(new Date(value));
+}
+
+function activitySourceLabel(source: string | null): string {
+  if (source === "investigation_record")
+    return "mise à jour du dossier AutoWork";
+  if (source === "invocation") return "invocation persistée";
+  if (source === "observation") return "observation persistée";
+  if (source === "backend_job_heartbeat") return "heartbeat du job AutoWork";
+  return "source inconnue";
+}
+
+function activityStatusLabel(
+  status: InvestigationActivityPage["investigation"]["status"],
+  stopReason: InvestigationActivityPage["investigation"]["stop_reason"],
+): string {
+  if (stopReason === "permission_required") return "Permission requise";
+  if (stopReason === "model_unavailable") return "Service modèle indisponible";
+  if (status === "queued") return "En attente";
+  if (status === "running") return "En cours";
+  if (status === "awaiting_review") return "À réviser";
+  if (status === "completed") return "Terminée";
+  if (status === "exhausted") return "Budget atteint";
+  if (status === "failed") return "Interrompue";
+  return "Annulée";
 }

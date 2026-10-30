@@ -602,11 +602,6 @@ export function useInvestigation(investigationId: string | null) {
     queryKey: investigationQueryKeys.detail(investigationId ?? "none"),
     queryFn: () => getInvestigation(investigationId ?? ""),
     enabled: Boolean(investigationId),
-    refetchInterval: (query) =>
-      query.state.data?.status === "queued" ||
-      query.state.data?.status === "running"
-        ? 2_000
-        : false,
   });
 }
 
@@ -703,6 +698,9 @@ function useInvestigationAction(
       );
       void queryClient.invalidateQueries({
         queryKey: investigationQueryKeys.detail(result.investigation.id),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["investigation-activity", result.investigation.id],
       });
       void queryClient.invalidateQueries({
         queryKey: investigationQueryKeys.subject(
