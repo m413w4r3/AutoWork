@@ -1665,8 +1665,10 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert bridge_claim.bridge_turn_id is not None
             assert bridge_claim.model_run_id is not None
             assert bridge_claim.evidence_refs
-            assert {item.get("id") for item in bridge_claim.evidence_refs} == {
-                str(analysis_observation.id)
+            # The server now assembles the dossier from canonical state: the explicitly
+            # requested observation must be present, alongside automatically attached ones.
+            assert str(analysis_observation.id) in {
+                item.get("id") for item in bridge_claim.evidence_refs
             }
             assert len(model_runs) == 1
             model_run = model_runs[0]
@@ -1674,8 +1676,8 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert model_run.status == "succeeded"
             provenance = model_run.parameters[BRIDGE_SOURCE_PROVENANCE_KEY]
             assert provenance["family"] == "advisor.consultation.v1"
-            assert {item["id"] for item in provenance["evidence_refs"]} == {
-                str(analysis_observation.id)
+            assert str(analysis_observation.id) in {
+                item["id"] for item in provenance["evidence_refs"]
             }
             assert len(turns) == 1
             bridge_turn = turns[0]

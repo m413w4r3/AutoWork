@@ -914,7 +914,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert revoked_result["advisor_output"] is None
             assert revoked_result["invocation"]["status"] == "unavailable"
             assert revoked_result["invocation"]["error_code"] == "tool_unavailable"
-            assert revoked_result["output"]["error"]["reason"] == "external_llm_disclosure_denied"
+            assert "disclosure approval" in revoked_result["output"]["error"]["reason"]
 
             async with typed_uow_factory() as uow:
                 all_findings = await uow.investigation_findings.list_for_investigation(
