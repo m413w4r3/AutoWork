@@ -2283,6 +2283,83 @@ async def test_identical_operations_are_deduplicated_only_for_read_effects(
 
 
 @pytest.mark.asyncio
+async def test_sample_analysis_reuses_same_versioned_result_across_turns() -> None:
+    association_id = str(uuid4())
+    first = _tool_call("sample.analyze", "same sample entry", "analyze this entry")
+    second = _tool_call("sample.analyze", "same sample entry", "analyze it again")
+    first["arguments"]["association_id"] = association_id
+    second["arguments"]["association_id"] = association_id
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="analyze the quarantined sample", next_action="continue", tools=(first,)
+            ),
+            _decision(
+                goal="repeat the same analysis", next_action="continue", tools=(second,)
+            ),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(
+            (
+                "sample.analyze",
+                "sample",
+                ToolEffect.LOCAL_COMPUTE,
+                "investigation.sample_analysis",
+                {BudgetDimension.TOOL_SECONDS: 5},
+            ),
+        ),
+    )
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="a" * 64,
+        source="sample.analyze",
+        source_version="analysis-v1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id="a" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    fixture.tools["sample.analyze"].result = ToolResult(
+        ToolInvocationStatus.PARTIAL,
+        observation_refs=(observation.id,),
+        budget_consumed={BudgetDimension.TOOL_SECONDS: 1},
+        output={"analysis_seconds_status": "MEASURED"},
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    observations = await fixture.observations.list_for_investigation(state.investigation_id)
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert envelope is not None
+    consumed_before_replay = dict(envelope.budget.consumed)
+    observation_ids_before_replay = {item.id for item in observations}
+    replay, replay_refs, stop = await fixture.service._replay_invocation(invocations[0])
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(fixture.tools["sample.analyze"].calls) == 1
+    assert len(invocations) == 1
+    assert envelope.budget.consumed[BudgetDimension.TOOL_SECONDS] == 1
+    assert len(observations) == 2
+    assert len(invocations[0].response_refs) == 2
+    assert observation.id in invocations[0].response_refs
+    assert set(invocations[0].response_refs) == observation_ids_before_replay
+    assert replay_refs == invocations[0].response_refs
+    assert {
+        item.id
+        for item in await fixture.observations.list_for_investigation(state.investigation_id)
+    } == observation_ids_before_replay
+    envelope_after_replay = await fixture.envelopes.get(state.investigation_id)
+    assert envelope_after_replay is not None
+    assert envelope_after_replay.budget.consumed == consumed_before_replay
+    assert stop is None
+    assert "Already executed" in replay.message
+    assert str(observation.id) in replay.message
+
+
+@pytest.mark.asyncio
 async def test_operator_view_proposes_advisor_checkpoint_as_nonblocking_action() -> None:
     fixture = _Fixture(responses=[], tools=())
     initial_state = await fixture.start()

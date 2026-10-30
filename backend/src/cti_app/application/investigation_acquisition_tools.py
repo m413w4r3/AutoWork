@@ -202,6 +202,10 @@ class LocalSampleAnalysisService:
     def operation_cache_identity(self) -> Mapping[str, Any]:
         return confined_analysis_operation_cache_identity(self._confined_analysis)
 
+    @property
+    def analysis_timeout_seconds(self) -> float:
+        return self._analysis_timeout_seconds
+
     async def describe(self, association_id: UUID) -> Mapping[str, Any]:
         """Return quarantine metadata without reading the sample bytes."""
         sample = await self._hits.resolve_quarantined_sample(association_id)
@@ -586,6 +590,19 @@ class _SampleAnalyzeAdapter:
         self._hits = hits
         self._analyzer = analyzer
 
+    async def reservation_cost(
+        self, _arguments: Mapping[str, Any], _context: ToolExecutionContext
+    ) -> Mapping[BudgetDimension, int]:
+        timeout_seconds = getattr(self._analyzer, "analysis_timeout_seconds", 120.0)
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int | float)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            return {BudgetDimension.TOOL_SECONDS: 120}
+        return {BudgetDimension.TOOL_SECONDS: max(1, math.ceil(timeout_seconds))}
+
     @property
     def operation_cache_identity(self) -> Mapping[str, Any]:
         identity = getattr(self._analyzer, "operation_cache_identity", None)
@@ -596,6 +613,7 @@ class _SampleAnalyzeAdapter:
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
+        analysis_started: float | None = None
         try:
             association_id = UUID(str(arguments["association_id"]))
             evidence_refs = _uuid_refs(arguments.get("evidence_refs", ()))
@@ -604,21 +622,76 @@ class _SampleAnalyzeAdapter:
                     ToolInvocationStatus.UNAVAILABLE,
                     suggested_alternatives=("vt.file_report", "vt.relationships"),
                     message="No local sample analysis service is registered.",
-                    output={"association_id": str(association_id)},
+                    output={
+                        "association_id": str(association_id),
+                        "analysis_seconds": None,
+                        "analysis_seconds_status": "UNKNOWN",
+                        "analysis_tool_seconds_consumed": 0,
+                    },
+                    budget_consumed={BudgetDimension.TOOL_SECONDS: 0},
                 )
             await self._hits.validate_evidence_refs(context.investigation_id, evidence_refs)
             association = await self._hits.require_association(
                 context.investigation_id, association_id
             )
+            analysis_started = time.monotonic()
             outcome = await self._analyzer.analyze(
                 association_id=association.id,
                 invocation_ref=None,
             )
         except (ValueError, HitAcquisitionError) as exc:
+            elapsed = (
+                max(0.0, time.monotonic() - analysis_started)
+                if analysis_started is not None
+                else None
+            )
+            consumed_seconds = math.ceil(elapsed) if elapsed is not None else 0
             return ToolResult(
                 ToolInvocationStatus.FAILED,
-                message=f"Sample analysis input was rejected ({type(exc).__name__}).",
+                message=(
+                    f"Sample analysis input was rejected ({type(exc).__name__})."
+                    if elapsed is None
+                    else f"Sample analysis failed locally ({type(exc).__name__}); "
+                    "check the analysis-worker and retry."
+                ),
+                output={
+                    "analysis_seconds": round(elapsed, 3) if elapsed is not None else None,
+                    "analysis_seconds_status": "MEASURED" if elapsed is not None else "UNKNOWN",
+                    "analysis_tool_seconds_consumed": consumed_seconds,
+                },
+                budget_consumed={BudgetDimension.TOOL_SECONDS: consumed_seconds},
+                exception_class=type(exc).__name__,
+                error_code=(
+                    "sample_analysis_input_rejected"
+                    if elapsed is None
+                    else "sample_analysis_failed"
+                ),
             )
+        except Exception as exc:
+            elapsed = (
+                max(0.0, time.monotonic() - analysis_started)
+                if analysis_started is not None
+                else None
+            )
+            consumed_seconds = math.ceil(elapsed) if elapsed is not None else 0
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                message=(
+                    "Sample analysis failed locally "
+                    f"({type(exc).__name__}); check the analysis-worker and retry."
+                ),
+                output={
+                    "analysis_seconds": round(elapsed, 3) if elapsed is not None else None,
+                    "analysis_seconds_status": "MEASURED" if elapsed is not None else "UNKNOWN",
+                    "analysis_tool_seconds_consumed": consumed_seconds,
+                },
+                budget_consumed={BudgetDimension.TOOL_SECONDS: consumed_seconds},
+                exception_class=type(exc).__name__,
+                error_code="sample_analysis_failed",
+            )
+        assert analysis_started is not None
+        elapsed = max(0.0, time.monotonic() - analysis_started)
+        consumed_seconds = math.ceil(elapsed)
         output = dict(outcome.output)
         describe = getattr(self._analyzer, "describe", None)
         if callable(describe):
@@ -631,6 +704,9 @@ class _SampleAnalyzeAdapter:
                     value = metadata.get(key)
                     if value is not None:
                         output.setdefault(key, value)
+        output["analysis_seconds"] = round(elapsed, 3)
+        output["analysis_seconds_status"] = "MEASURED"
+        output["analysis_tool_seconds_consumed"] = consumed_seconds
         return ToolResult(
             status=outcome.status,
             observation_refs=outcome.observation_refs,
@@ -642,7 +718,7 @@ class _SampleAnalyzeAdapter:
                 else ()
             ),
             message=outcome.message,
-            budget_consumed={},
+            budget_consumed={BudgetDimension.TOOL_SECONDS: consumed_seconds},
         )
 
 

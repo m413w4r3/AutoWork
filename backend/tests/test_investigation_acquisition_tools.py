@@ -1236,6 +1236,12 @@ async def test_sample_analyze_records_bounded_binary_observations() -> None:
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["sample_sha256"] == sha256
     assert result.output["qualification"] == "candidate"
+    assert result.output["analysis_seconds_status"] == "MEASURED"
+    assert isinstance(result.output["analysis_seconds"], float)
+    assert result.output["analysis_tool_seconds_consumed"] == result.budget_consumed[
+        BudgetDimension.TOOL_SECONDS
+    ]
+    assert 0 <= result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 120
     assert len(worker.requests) == 1
     assert worker.requests[0].tool is ConfinedAnalysisTool.SAMPLE_ANALYSIS
     assert worker.requests[0].sha256 == sha256
