@@ -1194,9 +1194,13 @@ def build_advisor_dossier(
         score = _relevance_score(task_terms, body)
         if _numeric_targets_conflict(relevance_text, body):
             score = 0
+        explicitly_selected_measurement = prompt_data.get(
+            "explicit_measurement_selection"
+        ) is True or _measurement_explicitly_targeted(item, relevance_text)
         if (
             score > 0
             or ("observation", evidence_id) in explicitly_referenced
+            or explicitly_selected_measurement
             or (
                 consultation_type in {"yara_draft", "pivot_strategy"}
                 and not _numeric_targets_conflict(relevance_text, body)
@@ -1845,6 +1849,15 @@ def evaluate_advisor_evidence_preflight(
     ]
     for item in measurements:
         identifier = _as_text(item.get("measurement_id"))
+        explicitly_selected = prompt_data.get(
+            "explicit_measurement_selection"
+        ) is True or _measurement_explicitly_targeted(item, task)
+        selected_in_dossier = any(
+            row.get("kind") == "measurement" and row.get("id") == identifier
+            for row in dossier.manifest
+        )
+        type_requires_measurements = consultation_type in {"yara_draft", "pivot_strategy"}
+        required = type_requires_measurements and (explicitly_selected or selected_in_dossier)
         digest = hashlib.sha256(
             json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"
@@ -1863,14 +1876,17 @@ def evaluate_advisor_evidence_preflight(
             digest,
             {"kind": "measurement", "id": identifier, "sha256": digest},
             bool(_as_text(item.get("value"))),
-            consultation_type in {"yara_draft", "pivot_strategy"},
-            "Sample SHA, offset, value, and source observation SHA are required for YARA drafting."
-            if consultation_type == "yara_draft"
-            else "Measurement is not required by this question.",
+            required,
+            "Measurement is explicitly selected by the invocation or named in the question."
+            if explicitly_selected
+            else "Measurement was selected for this consultation."
+            if required
+            else "Measurement was not selected or explicitly targeted for this question.",
             sample_sha256=item.get("sample_sha256"),
             offset=item.get("offset"),
             evidence_id=item.get("evidence_id"),
             evidence_sha256=item.get("evidence_sha256"),
+            informational=type_requires_measurements and not required,
             verified=(
                 bool(re.fullmatch(r"[0-9a-f]{64}", _as_text(item.get("sample_sha256"))))
                 and type(item.get("offset")) is int
@@ -2241,14 +2257,14 @@ def evaluate_advisor_evidence_preflight(
             mark(
                 AdvisorEvidenceStatus.NOT_VERIFIED,
                 (
-                    "The bounded lexical selection did not include this proof; semantic "
+                    "The task relevance selection did not include this proof; semantic "
                     "relevance to the question was not verified."
                 ),
             )
             mark(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
                 (
-                    "Canonical proof was omitted by bounded lexical selection; this omission "
+                    "Canonical proof was omitted by task relevance selection; this omission "
                     "does not establish semantic irrelevance."
                 ),
             )
@@ -2778,6 +2794,25 @@ def _numeric_targets_conflict(task: str, candidate: str) -> bool:
     requested = set(re.findall(r"\b\d{3,}\b", task))
     actual = set(re.findall(r"\b\d{3,}\b", candidate))
     return bool(requested and requested.isdisjoint(actual))
+
+
+def _measurement_explicitly_targeted(measurement: Mapping[str, Any], task: str) -> bool:
+    measurement_id = _as_text(measurement.get("measurement_id"))
+    if measurement_id and re.search(
+        rf"(?<![\w]){re.escape(measurement_id)}(?![\w])", task, re.IGNORECASE
+    ):
+        return True
+    offset = measurement.get("offset")
+    if (
+        type(offset) is int
+        and offset >= 0
+        and re.search(
+            rf"\b(?:offset|address|position)\s*(?:[:=#]\s*)?{offset}\b", task, re.IGNORECASE
+        )
+    ):
+        return True
+    value = _as_text(measurement.get("value"))
+    return bool(value and value.casefold() in task.casefold())
 
 
 def _requires_contradiction(task: str) -> bool:

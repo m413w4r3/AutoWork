@@ -156,7 +156,7 @@ class _AdvisorInputValidationError(ValueError):
         reason_code: str,
         *,
         reference: str | None = None,
-        measurement_errors: tuple[dict[str, int | str], ...] = (),
+        measurement_errors: tuple[dict[str, Any], ...] = (),
         valid_targets: tuple[dict[str, Any], ...] = (),
         valid_article_claim_ids: tuple[str, ...] = (),
         invalid_article_claim_ids: tuple[str, ...] = (),
@@ -2072,7 +2072,7 @@ class InvestigationAdvisorTool:
         *,
         reference: str | None = None,
         observation_refs: tuple[UUID, ...] = (),
-        measurement_errors: tuple[dict[str, int | str], ...] = (),
+        measurement_errors: tuple[dict[str, Any], ...] = (),
         internal_detail: Mapping[str, str | int] | None = None,
         valid_targets: tuple[dict[str, Any], ...] = (),
         valid_article_claim_ids: tuple[str, ...] = (),
@@ -3084,6 +3084,7 @@ class InvestigationAdvisorTool:
                 "evidence": base["evidence"],
                 "measured_facts": base["measured_facts"],
                 "measurements": measurements,
+                "explicit_measurement_selection": candidates is not None,
                 "tools": tool_inventory,
                 "candidate_rules": candidate_rules,
                 "gaps": base["gaps"],
@@ -3197,6 +3198,7 @@ class InvestigationAdvisorTool:
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
+            base["explicit_measurement_selection"] = candidates is not None
         sample_rows = await self._sample_inventory(investigation_id, evidence, context.envelope)
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
@@ -3867,7 +3869,46 @@ class InvestigationAdvisorTool:
         *,
         content_patterns: Mapping[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]]:
-        errors: list[dict[str, int | str]] = []
+        pattern_shape = {"content_pattern_id"}
+        measurement_shape = {"blob_id", "kind", "offset", "value"}
+        accepted_shapes = [
+            {
+                "name": "content_pattern",
+                "keys": sorted(pattern_shape),
+                "value_rule": "exactly 64 lowercase hexadecimal characters",
+            },
+            {
+                "name": "measurement",
+                "keys": sorted(measurement_shape),
+                "value_rule": (
+                    "blob_id and kind are strings, offset is a non-negative integer, "
+                    "and value is a non-empty string"
+                ),
+            },
+        ]
+
+        def invalid_shape(index: int, candidate: object) -> dict[str, Any]:
+            error: dict[str, Any] = {
+                "index": index,
+                "reason": "measurement_shape_invalid",
+                "accepted_shapes": accepted_shapes,
+            }
+            if isinstance(candidate, Mapping):
+                candidate_keys = {str(key) for key in candidate}
+                error["shape_differences"] = [
+                    {
+                        "shape": name,
+                        "missing_keys": sorted(expected_keys - candidate_keys),
+                        "extra_keys": sorted(candidate_keys - expected_keys),
+                    }
+                    for name, expected_keys in (
+                        ("content_pattern", pattern_shape),
+                        ("measurement", measurement_shape),
+                    )
+                ]
+            return error
+
+        errors: list[dict[str, Any]] = []
         if not isinstance(candidates, (tuple, list)) or not candidates:
             raise _AdvisorInputValidationError(
                 "measurements_invalid",
@@ -3887,7 +3928,7 @@ class InvestigationAdvisorTool:
         seen_patterns: set[str] = set()
         for index, candidate in enumerate(candidates):
             if not isinstance(candidate, Mapping):
-                errors.append({"index": index, "reason": "measurement_shape_invalid"})
+                errors.append(invalid_shape(index, candidate))
                 continue
             if set(candidate) == {"content_pattern_id"}:
                 pattern_id = candidate.get("content_pattern_id")
@@ -3907,8 +3948,8 @@ class InvestigationAdvisorTool:
                     continue
                 selected.extend(pattern_rows)
                 continue
-            if set(candidate) != {"blob_id", "kind", "offset", "value"}:
-                errors.append({"index": index, "reason": "measurement_shape_invalid"})
+            if set(candidate) != measurement_shape:
+                errors.append(invalid_shape(index, candidate))
                 continue
             blob_id = candidate["blob_id"]
             kind = candidate["kind"]
