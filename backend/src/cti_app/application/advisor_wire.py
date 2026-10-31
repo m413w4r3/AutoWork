@@ -376,10 +376,13 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             and not offsets[candidate][2].rstrip().endswith("``")
             and not offsets[candidate][2].lstrip().startswith("```")
         ]
-        if len(closing) != 1:
+        if not closing:
             blocks.append(_RawSourceBlock(language, None, start, len(text)))
             wrapped_spans.append((start, len(text)))
             continue
+        # The span opened by the single backtick ends at the FIRST line ending with one:
+        # later prose may legitimately contain more inline-code lines (table cells such
+        # as "`CreateRunspace`") that are not part of the rule.
         closing_index = closing[0]
         _close_start, close_end, close_line = offsets[closing_index]
         opening_content = opening_line[prefix_length + 1 :]

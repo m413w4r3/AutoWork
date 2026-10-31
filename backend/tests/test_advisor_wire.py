@@ -934,6 +934,28 @@ def test_yara_unfenced_bridge_shape_extracts_and_links_both_measured_strings() -
     assert [item["name"] for item in parsed["motifs"]] == ["$a", "$b"]
 
 
+def test_backtick_wrapped_yara_rule_is_extracted_when_later_prose_has_inline_code_lines() -> None:
+    source = """rule CTI_Example_Exact_Candidate
+{
+    strings:
+        $a = "CreateRunspace" ascii
+    condition:
+        filesize == 6144 and $a at 2744
+}"""
+    raw = (
+        "### 1. Règle YARA candidate\n\nyara\n\n`"
+        + source
+        + "`\n\n### 2. Justification\n\nMarqueur\n |\nIdentifiant `1F4F22C4-...`\n |\n"
+        "`CreateRunspace`\n |\nVérifier la règle sur `l'échantillon`\n"
+    )
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source == source
+    assert document.source_language == "yara"
+    assert document.source_count == 1
+
+
 def test_unfenced_yara_scanner_balances_tags_strings_comments_regex_and_hex() -> None:
     source = """rule TaggedCandidate : first_tag, second_tag {
     meta:
