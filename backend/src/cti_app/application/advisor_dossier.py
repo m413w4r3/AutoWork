@@ -659,7 +659,7 @@ def build_advisor_dossier(
         score = _relevance_score(task_terms, f"{claim_id} {heading} {text}")
         if claim_id.casefold() in explicit_claims:
             score += 100
-        if score > 0:
+        if score > 0 or ("article", article_ref) in explicitly_referenced:
             candidates.append(
                 _candidate(
                     kind="article",
@@ -1200,6 +1200,7 @@ def build_advisor_dossier(
         if (
             score > 0
             or ("observation", evidence_id) in explicitly_referenced
+            or ("measurement", measurement_id) in explicitly_referenced
             or explicitly_selected_measurement
             or (
                 consultation_type in {"yara_draft", "pivot_strategy"}
@@ -1227,7 +1228,11 @@ def build_advisor_dossier(
                     ),
                     body=body,
                     score=max(
-                        score, 1 if ("observation", evidence_id) in explicitly_referenced else 0
+                        score,
+                        1
+                        if ("observation", evidence_id) in explicitly_referenced
+                        or ("measurement", measurement_id) in explicitly_referenced
+                        else 0,
                     ),
                     origin="typed_measurement",
                     extra={
@@ -1664,6 +1669,7 @@ def evaluate_advisor_evidence_preflight(
             article_ref,
             bool(_as_text(item.get("text"))),
             bool(claim_id and claim_id.casefold() in claim_ids)
+            or ("article", article_id) in references
             or (
                 consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}
                 and _relevance_score(
@@ -1674,6 +1680,7 @@ def evaluate_advisor_evidence_preflight(
             ),
             "Question or target cites or selects this claim passage."
             if claim_id.casefold() in claim_ids
+            or ("article", article_id) in references
             or (
                 consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}
                 and _relevance_score(
@@ -1857,7 +1864,9 @@ def evaluate_advisor_evidence_preflight(
             for row in dossier.manifest
         )
         type_requires_measurements = consultation_type in {"yara_draft", "pivot_strategy"}
-        required = type_requires_measurements and (explicitly_selected or selected_in_dossier)
+        required = ("measurement", identifier) in references or (
+            type_requires_measurements and (explicitly_selected or selected_in_dossier)
+        )
         digest = hashlib.sha256(
             json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"
@@ -2029,6 +2038,8 @@ def evaluate_advisor_evidence_preflight(
             proof_reason,
         )
     useful_text_kinds = {"observation", "finding", "article"}
+    if consultation_type == "draft_text":
+        useful_text_kinds.add("measurement")
     if consultation_type == "review_text":
         useful_text_kinds.add("opinion")
     if consultation_type in {"draft_text", "review_text"} and not any(
@@ -2645,10 +2656,42 @@ def _explicit_reference_ids(data: Mapping[str, Any]) -> list[tuple[str, str]]:
         if not isinstance(item, Mapping):
             continue
         for ref in item.get("refs", ()):
-            if isinstance(ref, Mapping) and ref.get("kind") in {"observation", "finding"}:
-                row = (str(ref["kind"]), _as_text(ref.get("id")))
+            if isinstance(ref, Mapping) and ref.get("kind") in {
+                "observation",
+                "finding",
+                "article",
+                "measurement",
+            }:
+                identifier = _as_text(ref.get("id"))
+                if ref.get("kind") == "article" and identifier.startswith("article:"):
+                    identifier = identifier.partition(":")[2]
+                row = (str(ref["kind"]), identifier)
                 if row not in result:
                     result.append(row)
+    reference_groups = [data.get("_explicit_assertion_refs", ())]
+    reference_groups.extend(
+        assertion.get("refs", ())
+        for unit in _target_rows(data)
+        for assertion in unit.get("assertions", ())
+        if isinstance(assertion, Mapping)
+    )
+    for references in reference_groups:
+        if not isinstance(references, (list, tuple)):
+            continue
+        for ref in references:
+            if not isinstance(ref, Mapping) or ref.get("kind") not in {
+                "observation",
+                "finding",
+                "article",
+                "measurement",
+            }:
+                continue
+            identifier = _as_text(ref.get("id"))
+            if ref.get("kind") == "article" and identifier.startswith("article:"):
+                identifier = identifier.partition(":")[2]
+            row = (str(ref["kind"]), identifier)
+            if row not in result:
+                result.append(row)
     for item in data.get("findings", ()):
         if not isinstance(item, Mapping):
             continue

@@ -45,6 +45,7 @@ from cti_app.application.investigation_tools import (
     RegistryToolDispatcher,
     ToolExecutionContext,
     ToolResult,
+    validate_json_schema,
 )
 from cti_app.domain.analyst_opinion import (
     ImplantMaterialEditorialV1,
@@ -68,6 +69,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     TLPLevel,
     ToolInvocationStatus,
+    thaw_json,
 )
 
 
@@ -638,6 +640,56 @@ def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> 
     assert "maxItems" not in schema["units"]
     assert "maxItems" not in schema["measurements"]
     assert "maxItems" not in schema["evidence_refs"]
+
+
+def test_advisor_registered_schema_accepts_canonical_editorial_assertion_refs() -> None:
+    tool, _ = make_tool(investigation_id=uuid4(), transport=Transport(None))
+
+    class CaptureRegistry:
+        def __init__(self):
+            self.definitions = []
+
+        def register(self, definition, adapter):
+            self.definitions.append(definition)
+
+    registry = CaptureRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+    schema = thaw_json(registry.definitions[0].input_schema)
+    observation_id = str(uuid4())
+    finding_id = str(uuid4())
+    article_sha256 = "a" * 64
+    measurement_sha256 = "b" * 64
+    arguments = {
+        "consultation_type": "draft_text",
+        "units": [
+            {
+                "id": "U1",
+                "block_type": "key_findings",
+                "form": "body",
+                "anchor": None,
+                "assertions": [
+                    {
+                        "id": "canonical-refs",
+                        "text": "Synthetic assertion with canonical references.",
+                        "nature": "deduction",
+                        "refs": [
+                            {"kind": "observation", "id": observation_id, "sha256": "c" * 64},
+                            {"kind": "finding", "id": finding_id},
+                            {"kind": "experiment", "id": str(uuid4())},
+                            {"kind": "article", "id": article_sha256, "sha256": article_sha256},
+                            {"kind": "measurement", "id": "m001", "sha256": measurement_sha256},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    validate_json_schema(arguments, schema)
+
+    arguments["units"][0]["assertions"][0]["refs"][0]["id"] = "not-a-uuid"
+    with pytest.raises(ValueError):
+        validate_json_schema(arguments, schema)
 
 
 def test_verified_advisor_measurements_accept_more_than_sixty_four_items() -> None:
@@ -5351,6 +5403,319 @@ async def test_draft_text_explicit_observation_keeps_disclosure_restrictions(res
     assert result.output["advisor_status"] == "disclosure_restricted"
     assert result.output["failure_reason"] == "sample_disclosure_policy"
     assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+
+
+@pytest.mark.asyncio
+async def test_draft_text_unit_assertion_refs_load_canonical_observations_and_findings() -> None:
+    investigation_id = uuid4()
+    observations = []
+    payloads = {}
+    for index in range(6):
+        observation, raw = make_observation(
+            investigation_id,
+            {
+                "schema": "article-claim-capture.v1",
+                "summary": f"Synthetic unit evidence body {index + 1}.",
+            },
+        )
+        observations.append(observation)
+        payloads[observation.blob_id] = raw
+
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="Synthetic canonical finding body for U6.",
+        observation_refs=(observations[-1].id,),
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Synthetic advisory draft.")
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observations[0],
+        raw=payloads[observations[0].blob_id],
+    )
+    tool._observations = ObservationRepository(observations)
+    tool._findings = FindingRepository((finding,))
+    tool._artifact_store.values.update(payloads)
+    for observation in observations[1:]:
+        raw = payloads[observation.blob_id]
+        tool._blobs.add(
+            observation.blob_id,
+            sha256=observation.sha256,
+            size=len(raw),
+            logical_bucket="evidence",
+        )
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article.short_summary = ""
+    snapshot.article_passages = ()
+    tool._article_snapshots.resolve = async_get(snapshot)
+
+    block_types = [
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    ][:6]
+    units = []
+    for index, block_type in enumerate(block_types):
+        reference = (
+            {"kind": "finding", "id": str(finding.id)}
+            if index == 5
+            else {"kind": "observation", "id": str(observations[index].id)}
+        )
+        units.append(
+            {
+                "id": f"U{index + 1}",
+                "block_type": block_type.value,
+                "form": "body",
+                "anchor": None,
+                "assertions": [
+                    {
+                        "id": f"assertion-{index + 1}",
+                        "text": f"Synthetic assertion for unit U{index + 1}.",
+                        "nature": "deduction",
+                        "refs": [reference],
+                    }
+                ],
+            }
+        )
+
+    result = await tool.execute(
+        {"consultation_type": "draft_text", "units": units},
+        make_context(investigation_id, key="operator:advisor:unit-assertion-evidence"),
+    )
+
+    assert len(transport.calls) == 1, result.output["batch_statuses"][0].get("preflight_cause")
+    prompt = transport.calls[0]["prompt"]
+    for index in range(6):
+        assert f"Synthetic unit evidence body {index + 1}." in prompt
+    assert "Synthetic canonical finding body for U6." in prompt
+    batch = result.output["batch_statuses"][0]
+    assert batch["preflight_status"] == "READY"
+    manifest = result.output["bridge_provenance"]["batches"][0]["dossier_manifest"]
+    assert {item["id"] for item in manifest if item["kind"] == "observation"} == {
+        str(item.id) for item in observations
+    }
+    assert any(item["kind"] == "finding" and item["id"] == str(finding.id) for item in manifest)
+
+
+@pytest.mark.parametrize("reference_kind", ["article", "measurement"])
+@pytest.mark.asyncio
+async def test_draft_text_unit_assertion_refs_load_article_and_measurement_bodies(
+    reference_kind: str,
+) -> None:
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Synthetic advisory draft.")
+    )
+    observation = None
+    if reference_kind == "measurement":
+        sample_hash = "b" * 64
+        observation, raw = make_observation(
+            investigation_id,
+            {
+                "schema": "sample-obfuscated-strings.v1",
+                "sample_sha256": sample_hash,
+                "strings": [{"value": "SyntheticUnitMeasurementMarker", "offset": 128}],
+            },
+        )
+        tool, sample_blob_id = make_tool(
+            investigation_id=investigation_id,
+            transport=transport,
+            observation=observation,
+            raw=raw,
+        )
+        _attach_sample_policy(tool, sample_blob_id, sample_hash)
+        reference = {"kind": "measurement", "id": "m001"}
+        expected_body = "SyntheticUnitMeasurementMarker"
+    else:
+        tool, _sample_blob_id = make_tool(
+            investigation_id=investigation_id,
+            transport=transport,
+        )
+        snapshot = await tool._article_snapshots.resolve(uuid4())
+        reference = {
+            "kind": "article",
+            "id": snapshot.synthesis_sha256,
+            "sha256": snapshot.synthesis_sha256,
+        }
+        expected_body = "The article describes Blackwood behavior and evidence markers."
+
+    block_types = [
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    ][:2]
+    units = [
+        {
+            "id": f"U{index + 1}",
+            "block_type": block_type.value,
+            "form": "body",
+            "anchor": None,
+            "assertions": [
+                {
+                    "id": f"{reference_kind}-{index + 1}",
+                    "text": "Synthetic assertion with a canonical source reference.",
+                    "nature": "deduction",
+                    "refs": [reference],
+                }
+            ],
+        }
+        for index, block_type in enumerate(block_types)
+    ]
+
+    result = await tool.execute(
+        {"consultation_type": "draft_text", "units": units},
+        make_context(
+            investigation_id,
+            key=f"operator:advisor:unit-{reference_kind}-reference",
+        ),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    assert expected_body in transport.calls[0]["prompt"]
+    assert result.output["batch_statuses"][0]["preflight_status"] == "READY"
+    manifest = result.output["bridge_provenance"]["batches"][0]["dossier_manifest"]
+    assert any(item["kind"] == reference_kind for item in manifest)
+
+
+@pytest.mark.parametrize("bad_reference", ["sha_mismatch", "foreign_observation"])
+@pytest.mark.asyncio
+async def test_draft_text_unit_assertion_reference_failure_is_visible_in_batch(
+    bad_reference: str,
+) -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "article-claim-capture.v1", "summary": "Synthetic local evidence."},
+    )
+    foreign_observation = None
+    reference_id = observation.id
+    reference_sha = observation.sha256
+    if bad_reference == "sha_mismatch":
+        reference_sha = "0" * 64
+    else:
+        foreign_observation, _foreign_raw = make_observation(
+            uuid4(),
+            {"schema": "article-claim-capture.v1", "summary": "Synthetic foreign evidence."},
+        )
+        reference_id = foreign_observation.id
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    if foreign_observation is not None:
+        tool._observations.observations[foreign_observation.id] = foreign_observation
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article.short_summary = ""
+    snapshot.article_passages = ()
+    tool._article_snapshots.resolve = async_get(snapshot)
+    units = []
+    for index, block_type in enumerate(
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    ):
+        if index == 2:
+            break
+        units.append(
+            {
+                "id": f"U{index + 1}",
+                "block_type": block_type.value,
+                "form": "body",
+                "anchor": None,
+                "assertions": [
+                    {
+                        "id": f"assertion-{index + 1}",
+                        "text": "Synthetic editorial assertion.",
+                        "nature": "deduction",
+                        "refs": [
+                            {
+                                "kind": "observation",
+                                "id": str(reference_id if index == 0 else observation.id),
+                                "sha256": reference_sha if index == 0 else observation.sha256,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    result = await tool.execute(
+        {"consultation_type": "draft_text", "units": units},
+        make_context(
+            investigation_id,
+            key=f"operator:advisor:unit-assertion-{bad_reference}",
+        ),
+    )
+
+    assert transport.calls == []
+    assert result.output["preflight_cause"]["ref"] == str(reference_id)
+    statuses = result.output["batch_statuses"]
+    assert statuses[0]["preflight_cause"]["ref"] == str(reference_id)
+    assert statuses[0]["additional_missing_ref_count"] == 0
+    assert statuses[0]["refusal_guidance"]
+    assert result.output["additional_missing_ref_count"] == 0
+    assert result.output["refusal_guidance"]
+
+
+@pytest.mark.asyncio
+async def test_draft_text_with_118_explicit_observations_is_not_truncated_or_refused() -> None:
+    investigation_id = uuid4()
+    observations = []
+    raw_by_blob = {}
+    for index in range(118):
+        observation, raw = make_observation(
+            investigation_id,
+            {
+                "schema": "article-claim-capture.v1",
+                "summary": f"Synthetic evidence row {index + 1:03d}.",
+            },
+        )
+        observations.append(observation)
+        raw_by_blob[observation.blob_id] = raw
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Synthetic advisory draft.")
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observations[0],
+        raw=raw_by_blob[observations[0].blob_id],
+    )
+    tool._observations = ObservationRepository(observations)
+    tool._artifact_store.values.update(raw_by_blob)
+    for observation in observations[1:]:
+        raw = raw_by_blob[observation.blob_id]
+        tool._blobs.add(
+            observation.blob_id,
+            sha256=observation.sha256,
+            size=len(raw),
+            logical_bucket="evidence",
+        )
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article.short_summary = ""
+    snapshot.article_passages = ()
+    tool._article_snapshots.resolve = async_get(snapshot)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "evidence_refs": [str(item.id) for item in observations],
+        },
+        make_context(investigation_id, key="operator:advisor:118-explicit-evidence"),
+    )
+
+    assert len(transport.calls) == 1
+    assert result.output["bridge_provenance"]["preflight_status"] == "READY"
+    manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    assert len([item for item in manifest if item["kind"] == "observation"]) == 118
+    assert "Synthetic evidence row 118." in transport.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
