@@ -14,6 +14,7 @@ from cti_app.application.bridge_investigator import (
     make_investigation_turn_idempotency_key,
 )
 from cti_app.application.investigation_vt_tools import (
+    VT_PASSIVE_RETRY_TOOL_NAMES,
     VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
@@ -173,6 +174,7 @@ def build_investigation_operator_view(
     pending_bridge_turn_error_code: str | None = None,
     pending_bridge_turn_key: str | None = None,
     provider_response_ids: Mapping[UUID, str] | None = None,
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> InvestigationOperatorView:
     (
         projected_available_tools,
@@ -387,7 +389,41 @@ def build_investigation_operator_view(
         advisor_guidance=guidance,
         available_tools=projected_available_tools,
         retryable_vt_tool_versions=retryable_vt_tool_versions,
+        operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
     )
+    if state.execution_mode is InvestigationExecutionMode.OPERATOR_LED:
+        next_analytic_action = _operator_led_next_analytic_action(
+            investigation_id=investigation.id,
+            state=state,
+            generation=generation,
+            active_jobs=active_jobs,
+            advisor_guidance=guidance,
+        )
+        if next_action.get("code") == OperatorNextAction.RECONCILE_TOOL_INVOCATION.value:
+            action_invocation = next(
+                (item for item in unresolved if item.id == next_action.get("invocation_id")),
+                None,
+            )
+            if (
+                action_invocation is not None
+                and action_invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+            ):
+                next_action = {
+                    **next_action,
+                    "blocks_other_tools": False,
+                    "analytic_action_available": True,
+                }
+    else:
+        next_analytic_action = next_action
+
+    reconciliation_tasks = [
+        _reconciliation_task(
+            invocation,
+            investigation_id=investigation.id,
+            operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
+        )
+        for invocation in unresolved
+    ]
     return InvestigationOperatorView(
         payload={
             "investigation_id": investigation.id,
@@ -436,6 +472,7 @@ def build_investigation_operator_view(
                     working_state_version=state.version,
                     available_tools=projected_available_tools,
                     retryable_vt_tool_versions=retryable_vt_tool_versions,
+                    operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
                 )
                 for item in ordered_invocations
             ],
@@ -447,6 +484,7 @@ def build_investigation_operator_view(
                     working_state_version=state.version,
                     available_tools=projected_available_tools,
                     retryable_vt_tool_versions=retryable_vt_tool_versions,
+                    operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
                 )
                 for item in ambiguous
             ],
@@ -458,6 +496,7 @@ def build_investigation_operator_view(
                     working_state_version=state.version,
                     available_tools=projected_available_tools,
                     retryable_vt_tool_versions=retryable_vt_tool_versions,
+                    operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
                 )
                 for item in unresolved
             ],
@@ -512,6 +551,8 @@ def build_investigation_operator_view(
                 "unavailable": list(projected_unavailable_tools),
             },
             "advisor_guidance": guidance,
+            "reconciliation_tasks": reconciliation_tasks,
+            "next_analytic_action": next_analytic_action,
             "next_idempotent_action": next_action,
         }
     )
@@ -678,10 +719,15 @@ def _invocation_view(
     working_state_version: int | None = None,
     available_tools: tuple[str, ...] = (),
     retryable_vt_tool_versions: frozenset[tuple[str, str]] = frozenset(),
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     needs_reconciliation = invocation.status is ToolInvocationStatus.NEEDS_REVIEW
     reconciliation_action = (
-        _reconciliation_action(invocation, investigation_id=investigation_id)
+        _reconciliation_action(
+            invocation,
+            investigation_id=investigation_id,
+            operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
+        )
         if investigation_id is not None and needs_reconciliation
         else None
     )
@@ -726,10 +772,57 @@ def _invocation_view(
     }
 
 
+def _reconciliation_task(
+    invocation: ToolInvocation,
+    *,
+    investigation_id: UUID,
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
+        # PENDING/RUNNING may belong to a live adapter call: the reconcile route only
+        # accepts needs_review, so no action is offered until the status settles.
+        return {
+            "invocation_id": invocation.id,
+            "tool_name": invocation.tool_name,
+            "status": invocation.status.value,
+            "reconciliation_action": None,
+            "requires_verified_human_operator": False,
+            "response_persisted": bool(invocation.response_refs),
+        }
+    action = _reconciliation_action(
+        invocation,
+        investigation_id=investigation_id,
+        operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
+    )
+    return {
+        "invocation_id": invocation.id,
+        "tool_name": invocation.tool_name,
+        "status": invocation.status.value,
+        "reconciliation_action": action,
+        "requires_verified_human_operator": bool(
+            action.get("requires_verified_human_operator", False)
+        ),
+        "response_persisted": bool(invocation.response_refs),
+    }
+
+
+def _is_operator_reconcilable_passive_vt(
+    invocation: ToolInvocation,
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None,
+) -> bool:
+    return (
+        operator_reconciliation_vt_tool_versions is not None
+        and invocation.tool_name in VT_PASSIVE_RETRY_TOOL_NAMES
+        and (invocation.tool_name, invocation.schema_version)
+        in operator_reconciliation_vt_tool_versions
+    )
+
+
 def _reconciliation_action(
     invocation: ToolInvocation,
     *,
     investigation_id: UUID,
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     prefix = f"/api/investigations/{investigation_id}"
     if invocation.tool_name == "advisor.consult":
@@ -737,6 +830,25 @@ def _reconciliation_action(
             "method": "POST",
             "path": f"{prefix}/operator/invocations/{invocation.id}/reconcile",
             "expected_version": invocation.version,
+            "resubmission_allowed": False,
+        }
+    if _is_operator_reconcilable_passive_vt(invocation, operator_reconciliation_vt_tool_versions):
+        accepted_outcomes = (
+            ["executed_with_result", "abandon"]
+            if invocation.response_refs
+            else ["not_executed", "abandon"]
+        )
+        return {
+            "method": "POST",
+            "path": f"{prefix}/operator/invocations/{invocation.id}/reconcile",
+            "expected_version": invocation.version,
+            "accepted_outcomes": accepted_outcomes,
+            "reason_required": True,
+            "response_refs_required": True,
+            "response_refs_allowed_for": "executed_with_result",
+            "idempotency_key_header": "Idempotency-Key",
+            "requires_idempotency_key": True,
+            "requires_verified_human_operator": False,
             "resubmission_allowed": False,
         }
     return {
@@ -749,6 +861,45 @@ def _reconciliation_action(
         "idempotency_key_header": "Idempotency-Key",
         "requires_verified_human_operator": True,
         "resubmission_allowed": False,
+    }
+
+
+def _operator_led_next_analytic_action(
+    *,
+    investigation_id: UUID,
+    state: InvestigationWorkingState,
+    generation: int,
+    active_jobs: tuple[Job, ...],
+    advisor_guidance: dict[str, Any],
+) -> dict[str, Any]:
+    prefix = f"/api/investigations/{investigation_id}"
+    if active_jobs:
+        return {
+            "code": OperatorNextAction.WAIT_FOR_WORKER.value,
+            "method": "GET",
+            "path": f"{prefix}/operator-status",
+            "job_id": active_jobs[0].id,
+            "generation": generation,
+        }
+    suggested = advisor_guidance.get("suggested_consultation_type")
+    if advisor_guidance.get("checkpoint_due") and isinstance(suggested, str):
+        return {
+            "code": OperatorNextAction.ADVISOR_CHECKPOINT_DUE.value,
+            "reason": advisor_guidance.get("reason"),
+            "blocking": False,
+            "tool_name": "advisor.consult",
+            "method": "POST",
+            "path": f"{prefix}/operator/tools/advisor.consult",
+            "arguments": {"consultation_type": suggested},
+            "purpose": "Bounded advisor checkpoint; validate suggestions before acting.",
+            "expected_version": state.version,
+            "requires_idempotency_key": True,
+        }
+    return {
+        "code": OperatorNextAction.OPERATOR_ACTION_REQUIRED.value,
+        "method": "GET",
+        "path": f"{prefix}/operator/context",
+        "expected_version": state.version,
     }
 
 
@@ -771,6 +922,7 @@ def _next_action(
     advisor_guidance: dict[str, Any],
     available_tools: tuple[str, ...],
     retryable_vt_tool_versions: frozenset[tuple[str, str]],
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     prefix = f"/api/investigations/{investigation.id}"
     if active_jobs:
@@ -791,25 +943,34 @@ def _next_action(
                 available_tools=available_tools,
                 retryable_vt_tool_versions=retryable_vt_tool_versions,
             )
-            if retry_action is not None:
+            is_operator_reconcilable_vt = _is_operator_reconcilable_passive_vt(
+                invocation, operator_reconciliation_vt_tool_versions
+            )
+            if retry_action is not None and not is_operator_reconcilable_vt:
                 return {
                     "code": OperatorNextAction.RETRY_PASSIVE_READ.value,
                     "invocation_id": invocation.id,
                     **retry_action,
                 }
-            return {
+            reconciliation = {
                 "code": OperatorNextAction.RECONCILE_TOOL_INVOCATION.value,
                 "invocation_id": invocation.id,
-                **_reconciliation_action(invocation, investigation_id=investigation.id),
+                **_reconciliation_action(
+                    invocation,
+                    investigation_id=investigation.id,
+                    operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
+                ),
             }
+            if retry_action is not None:
+                reconciliation["retry_action"] = retry_action
+            return reconciliation
         return {
-            "code": OperatorNextAction.RECONCILE_TOOL_INVOCATION.value,
-            "method": "POST",
-            "path": f"{prefix}/invocations/{invocation.id}/reconcile",
+            "code": OperatorNextAction.WAIT_FOR_WORKER.value,
+            "method": "GET",
+            "path": f"{prefix}/operator-status",
             "invocation_id": invocation.id,
-            "expected_version": invocation.version,
-            "accepted_outcomes": ["executed_with_result", "not_executed", "abandon"],
-            "requires_idempotency_key": True,
+            "status": invocation.status.value,
+            "generation": generation,
         }
     if state.execution_mode is InvestigationExecutionMode.OPERATOR_LED:
         suggested = advisor_guidance.get("suggested_consultation_type")

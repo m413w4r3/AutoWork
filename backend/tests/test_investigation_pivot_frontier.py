@@ -12,8 +12,10 @@ from cti_app.api.investigation import (
     PivotFrontierResponseV1,
     get_investigation_pivot_frontier,
 )
+from cti_app.application import investigation_pivots as investigation_pivots_module
 from cti_app.application.investigation_contracts import (
     ArticleContextV1,
+    AvailablePivotV1,
     ConfirmedIOCContextV1,
     ToolEffect,
     ToolSummaryV1,
@@ -36,6 +38,7 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocation,
     ToolInvocationStatus,
+    canonical_json_bytes,
 )
 from cti_app.domain.investigation_pivot_frontier import (
     PivotExecutionState,
@@ -784,6 +787,237 @@ def test_discovered_hash_becomes_report_pivot_without_reprocessing_covered_artic
     assert [(item.tool_name, item.indicator_value) for item in pivots] == [
         ("vt.file_report", candidate_hash)
     ]
+
+
+def test_available_pivots_prioritize_latest_observation_over_hash_order_and_expose_coverage() -> (
+    None
+):
+    earlier_hash = "a" * 64
+    later_hash = "f" * 64
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in (earlier_hash, later_hash)
+    )
+    earlier_observation = replace(
+        _relation_observation(earlier_hash, "1" * 64),
+        observed_at=datetime(2026, 10, 20, tzinfo=UTC),
+    )
+    later_observation = replace(
+        _relation_observation(later_hash, "2" * 64),
+        observed_at=datetime(2026, 10, 30, tzinfo=UTC),
+    )
+    successful_coverage = ToolInvocation(
+        investigation_id=later_observation.investigation_id,
+        operation_key="successful-behaviour-read",
+        tool_name="vt.behaviour",
+        schema_version="1",
+        normalized_parameters={"file_hash": later_hash},
+        purpose="Synthetic successful read",
+        status=ToolInvocationStatus.EMPTY,
+    )
+    failed_coverage = ToolInvocation(
+        investigation_id=later_observation.investigation_id,
+        operation_key="failed-sample-read",
+        tool_name="sample.read",
+        schema_version="1",
+        normalized_parameters={"file_hash": later_hash},
+        purpose="Synthetic failed read",
+        status=ToolInvocationStatus.FAILED,
+    )
+
+    pivots, truncated = available_investigation_pivots(
+        inventory=inventory,
+        tools=_frontier_tools(),
+        tool_coverage=(),
+        invocations=(successful_coverage, failed_coverage),
+        observations=(earlier_observation, later_observation),
+    )
+
+    assert truncated is False
+    assert [item.indicator_value for item in pivots] == [later_hash, earlier_hash]
+    assert pivots[0].source_observation_ids == (later_observation.id,)
+    assert pivots[0].covered_by_tools == ("vt.behaviour",)
+
+
+def test_available_pivot_truncation_round_robins_recent_indicators(monkeypatch) -> None:
+    hashes = ("a" * 64, "b" * 64, "f" * 64)
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in hashes
+    )
+    observations = tuple(
+        replace(
+            _relation_observation(value, f"{index + 1:x}" * 64),
+            observed_at=datetime(2026, 10, 20 + index * 5, tzinfo=UTC),
+        )
+        for index, value in enumerate(hashes)
+    )
+    tools = (
+        *_frontier_tools(),
+        ToolSummaryV1(
+            name="vt.relationships",
+            schema_version="1",
+            effect=ToolEffect.EXTERNAL_READ,
+            arguments_schema={
+                "type": "object",
+                "properties": {
+                    "object_type": {"type": "string"},
+                    "object_id": {"type": "string"},
+                    "relation": {"type": "string"},
+                },
+                "required": ["object_type", "object_id", "relation"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(investigation_pivots_module, "MAX_AVAILABLE_PIVOTS", 5)
+
+    pivots, truncated = available_investigation_pivots(
+        inventory=inventory,
+        tools=tools,
+        tool_coverage=(),
+        invocations=(),
+        observations=observations,
+    )
+
+    assert truncated is True
+    counts = {value: sum(pivot.indicator_value == value for pivot in pivots) for value in hashes}
+    assert counts == {"a" * 64: 1, "b" * 64: 2, "f" * 64: 2}
+    assert pivots[0].indicator_value == "f" * 64
+
+
+def test_default_pivot_budget_keeps_every_pivot_of_a_large_inventory() -> None:
+    values = tuple(f"{index:064x}" for index in range(1, 221))
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in values
+    )
+    observations = tuple(
+        replace(
+            _relation_observation(value, f"{index % 15 + 1:x}" * 64),
+            observed_at=datetime(2026, 10, 1 + index % 25, tzinfo=UTC),
+        )
+        for index, value in enumerate(values)
+    )
+
+    pivots, truncated = available_investigation_pivots(
+        inventory=inventory,
+        tools=_frontier_tools(),
+        tool_coverage=(),
+        invocations=(),
+        observations=observations,
+    )
+
+    total_bytes = sum(
+        len(canonical_json_bytes(item.model_dump(mode="json"))) + 1 for item in pivots
+    )
+    assert total_bytes > 24 * 1024
+    assert truncated is False
+    assert {item.indicator_value for item in pivots} == set(values)
+
+
+def test_available_pivots_precede_blocked_pivots() -> None:
+    linked_hash = "f" * 64
+    unlinked_hash = "a" * 64
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in (unlinked_hash, linked_hash)
+    )
+    observation = _relation_observation(linked_hash, "3" * 64)
+
+    pivots, _ = available_investigation_pivots(
+        inventory=inventory,
+        tools=_frontier_tools(),
+        tool_coverage=(),
+        invocations=(),
+        observations=(observation,),
+    )
+
+    assert [item.execution_state for item in pivots] == ["available", "blocked"]
+    assert [item.indicator_value for item in pivots] == [linked_hash, unlinked_hash]
+
+
+def test_byte_truncation_never_lets_blocked_pivot_displace_available_pivot(monkeypatch) -> None:
+    linked_hashes = ("f" * 64, "e" * 64)
+    unlinked_hash = "a" * 64
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in (*linked_hashes, unlinked_hash)
+    )
+    observations = tuple(
+        replace(
+            _relation_observation(value, f"{index + 1:x}" * 64),
+            observed_at=datetime(2026, 10, 20 + index, tzinfo=UTC),
+        )
+        for index, value in enumerate(linked_hashes)
+    )
+    arguments = {
+        "inventory": inventory,
+        "tools": _frontier_tools(),
+        "tool_coverage": (),
+        "invocations": (),
+        "observations": observations,
+    }
+    full, _ = available_investigation_pivots(**arguments)
+    assert [item.execution_state for item in full] == ["available", "available", "blocked"]
+
+    def size(item: AvailablePivotV1) -> int:
+        return len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
+
+    assert size(full[2]) < size(full[1])
+    monkeypatch.setattr(
+        investigation_pivots_module,
+        "MAX_AVAILABLE_PIVOTS_BYTES",
+        2 + size(full[0]) + size(full[2]),
+    )
+
+    pivots, truncated = available_investigation_pivots(**arguments)
+
+    assert truncated is True
+    assert [item.indicator_value for item in pivots] == [full[0].indicator_value]
+
+
+def test_available_pivot_contract_accepts_legacy_payload_without_additive_fields() -> None:
+    pivot = AvailablePivotV1(
+        tool_name="vt.file_report",
+        schema_version="1",
+        indicator_type="sha256",
+        indicator_value="a" * 64,
+        arguments={"file_hash": "a" * 64},
+    )
+
+    assert pivot.source_observation_ids == ()
+    assert pivot.covered_by_tools == ()
 
 
 def test_md5_file_pivots_without_provenance_are_blocked_and_relations_stay_distinct() -> None:

@@ -94,9 +94,11 @@ from cti_app.application.investigation_pivot_frontier import (
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.investigation_tools import (
+    ToolEffect,
     ToolExecutionContext,
     project_tool_availability,
 )
+from cti_app.application.investigation_vt_tools import VT_PASSIVE_RETRY_TOOL_NAMES
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.application.model_conversations import ModelConversationReconciliationError
 from cti_app.application.network_protocol_model import render_protocol_model
@@ -866,7 +868,29 @@ class InvestigationOperatorStatusResponse(BaseModel):
     dependencies: dict[str, list[str]]
     tool_inventory: dict[str, list[str]]
     advisor_guidance: AdvisorGuidanceV1
+    reconciliation_tasks: list[dict[str, Any]]
+    next_analytic_action: dict[str, Any]
     next_idempotent_action: dict[str, Any]
+
+
+class InvestigationOperatorStatusCompactResponse(BaseModel):
+    """Token-conscious summary of the read-only operator projection."""
+
+    investigation_id: UUID
+    working_state_version: int
+    working_state_sha256: str
+    investigation_status: str
+    execution_mode: InvestigationExecutionMode
+    stop_reason: StopReason | None
+    g2: dict[str, Any]
+    budget: dict[str, Any]
+    invocation_counts_by_status: dict[str, int]
+    invocations: list[dict[str, Any]]
+    reconciliation_tasks: list[dict[str, Any]]
+    next_analytic_action: dict[str, Any]
+    next_idempotent_action: dict[str, Any]
+    evidence_checkpoint: dict[str, Any]
+    budget_reservation_counts: dict[str, int]
 
 
 class InvestigationActivityObservationView(BaseModel):
@@ -2037,12 +2061,13 @@ async def get_investigation_operator_observation(
 
 @router.get(
     "/investigations/{investigation_id}/operator-status",
-    response_model=InvestigationOperatorStatusResponse,
+    response_model=InvestigationOperatorStatusResponse | InvestigationOperatorStatusCompactResponse,
 )
 async def get_investigation_operator_status(
     investigation_id: UUID,
     request: Request,
-) -> InvestigationOperatorStatusResponse:
+    view: Literal["full", "compact"] = Query(default="full"),
+) -> InvestigationOperatorStatusResponse | InvestigationOperatorStatusCompactResponse:
     """Read durable checkpoints without changing versions.
 
     Stable error codes are ``investigation_not_found`` (404),
@@ -2063,6 +2088,14 @@ async def get_investigation_operator_status(
             uow,
             investigation_id,
             operator_mode=state.execution_mode is InvestigationExecutionMode.OPERATOR_LED,
+        )
+        registry = getattr(composition, "registry", None)
+        registered_tools = getattr(registry, "list_registered", None)
+        operator_reconciliation_vt_tool_versions = frozenset(
+            (definition.name, definition.schema_version)
+            for definition in (registered_tools() if callable(registered_tools) else ())
+            if definition.name in VT_PASSIVE_RETRY_TOOL_NAMES
+            and definition.effect is ToolEffect.EXTERNAL_READ
         )
         try:
             snapshot = await composition.tool_dependencies.article_snapshots.resolve(
@@ -2192,7 +2225,7 @@ async def get_investigation_operator_status(
                     )
                 if abandoned_turn_id is not None:
                     pending_bridge_turn = await uow.model_conversation_turns.get(abandoned_turn_id)
-        view = build_investigation_operator_view(
+        operator_view = build_investigation_operator_view(
             investigation=investigation,
             state=state,
             synthesis_sha256=snapshot.synthesis_sha256,
@@ -2222,14 +2255,55 @@ async def get_investigation_operator_status(
                 pending_bridge_turn.idempotency_key if pending_bridge_turn else None
             ),
             provider_response_ids=provider_response_ids,
+            operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
         )
         invocation_costs = await _operator_bridge_invocation_costs(
             invocations=invocations,
             observations=observations,
             evidence_summaries=evidence_summaries,
         )
-        _attach_operator_invocation_costs(view.payload, invocation_costs)
-        return InvestigationOperatorStatusResponse.model_validate(view.payload)
+        _attach_operator_invocation_costs(operator_view.payload, invocation_costs)
+        if view == "compact":
+            payload = operator_view.payload
+            invocation_counts_by_status: dict[str, int] = {}
+            for invocation in payload["invocations"]:
+                invocation_status = invocation["status"]
+                invocation_counts_by_status[invocation_status] = (
+                    invocation_counts_by_status.get(invocation_status, 0) + 1
+                )
+            reservations = payload["budget_reservations"]
+            budget_reservation_counts = {"total": len(reservations)}
+            for reservation in reservations:
+                reservation_status = reservation["status"]
+                budget_reservation_counts[reservation_status] = (
+                    budget_reservation_counts.get(reservation_status, 0) + 1
+                )
+            compact_payload = {
+                "investigation_id": payload["investigation_id"],
+                "working_state_version": payload["working_state_version"],
+                "working_state_sha256": payload["working_state_sha256"],
+                "investigation_status": payload["investigation_status"],
+                "execution_mode": payload["execution_mode"],
+                "stop_reason": payload["stop_reason"],
+                "g2": {
+                    "approved": payload["g2"]["approved"],
+                    "revoked": payload["g2"]["revoked"],
+                    "version": payload["g2"]["version"],
+                },
+                "budget": payload["budget"],
+                "invocation_counts_by_status": invocation_counts_by_status,
+                "invocations": payload["invocations"][-10:],
+                "reconciliation_tasks": payload["reconciliation_tasks"],
+                "next_analytic_action": payload["next_analytic_action"],
+                "next_idempotent_action": payload["next_idempotent_action"],
+                "evidence_checkpoint": {
+                    "observation_count": payload["evidence_checkpoint"]["observation_count"],
+                    "sha256": payload["evidence_checkpoint"]["sha256"],
+                },
+                "budget_reservation_counts": budget_reservation_counts,
+            }
+            return InvestigationOperatorStatusCompactResponse.model_validate(compact_payload)
+        return InvestigationOperatorStatusResponse.model_validate(operator_view.payload)
 
 
 @router.get("/investigations/{investigation_id}/envelope", response_model=EnvelopeView)
@@ -4488,10 +4562,13 @@ class InvocationReconciliationResponse(BaseModel):
     response_refs: tuple[UUID, ...]
 
 
-class OperatorAdvisorReconciliationRequest(BaseModel):
+class OperatorInvocationReconciliationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
+    outcome: Literal["executed_with_result", "not_executed", "abandon"] | None = None
+    reason: str | None = Field(default=None, min_length=1, max_length=4_000)
+    response_refs: tuple[UUID, ...] = Field(default=(), max_length=128)
 
 
 class OperatorAdvisorReconciliationResponse(BaseModel):
@@ -4512,21 +4589,32 @@ class OperatorAdvisorReconciliationResponse(BaseModel):
     resubmission_allowed: bool = False
 
 
+def _operator_reconciliation_not_permitted(tool_name: str) -> HTTPException:
+    return _http_error(
+        422,
+        "operator_reconciliation_not_permitted_for_tool",
+        f"Reconciliation for {tool_name} requires a verified human operator.",
+    )
+
+
 @router.post(
     "/investigations/{investigation_id}/operator/invocations/{invocation_id}/reconcile",
-    response_model=OperatorAdvisorReconciliationResponse,
+    response_model=OperatorAdvisorReconciliationResponse | InvocationReconciliationResponse,
 )
 async def reconcile_operator_advisor_invocation(
     investigation_id: UUID,
     invocation_id: UUID,
-    payload: OperatorAdvisorReconciliationRequest,
+    payload: OperatorInvocationReconciliationRequest,
     request: Request,
-) -> OperatorAdvisorReconciliationResponse:
-    """Recover an exact advisor response through the configured server transport.
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", min_length=1, max_length=255),
+    ] = None,
+) -> OperatorAdvisorReconciliationResponse | InvocationReconciliationResponse:
+    """Reconcile an advisor response or passive VT read without tool replay.
 
-    This action never resubmits a request or treats observation references as
-    provider results. A missing or unavailable response leaves the invocation
-    in NEEDS_REVIEW.
+    Advisor responses retain their existing server transport recovery. Passive
+    VT reads use the shared canonical reconciliation service.
     """
     identity = await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
@@ -4538,12 +4626,78 @@ async def reconcile_operator_advisor_invocation(
             or invocation.investigation_id != investigation_id
         ):
             raise _http_error(404, "invocation_not_found")
+        if invocation.tool_name in VT_PASSIVE_RETRY_TOOL_NAMES:
+            composition = _composition_factory(request).build(uow, investigation_id)
+            registry = getattr(composition, "registry", None)
+            registered = (
+                registry.get(invocation.tool_name, invocation.schema_version)
+                if registry is not None
+                else None
+            )
+            if (
+                registered is None
+                or registered[0].name != invocation.tool_name
+                or registered[0].effect is not ToolEffect.EXTERNAL_READ
+            ):
+                raise _operator_reconciliation_not_permitted(invocation.tool_name)
+            if (
+                payload.outcome is None
+                or payload.reason is None
+                or not payload.reason.strip()
+                or "response_refs" not in payload.model_fields_set
+            ):
+                raise _http_error(
+                    422,
+                    "operator_reconciliation_fields_required",
+                    "Passive VT reconciliation requires outcome, non-empty reason, "
+                    "and response_refs.",
+                )
+            if idempotency_key is None:
+                raise _http_error(
+                    422,
+                    "idempotency_key_required",
+                    "Passive VT reconciliation requires the Idempotency-Key header.",
+                )
+
+            from cti_app.application.investigation_service import InvocationReconciliationOutcome
+
+            try:
+                invocation = await composition.service.reconcile_invocation(
+                    investigation_id,
+                    invocation_id,
+                    outcome=InvocationReconciliationOutcome(payload.outcome),
+                    actor=identity.actor_id,
+                    reason=payload.reason,
+                    response_refs=payload.response_refs,
+                    expected_version=payload.expected_version,
+                    idempotency_key=_decision_correlation(
+                        f"invocation:{invocation_id}", idempotency_key
+                    ),
+                    actor_provenance="operator_client",
+                )
+                await uow.commit()
+            except LookupError as exc:
+                raise _http_error(404, "invocation_not_found") from exc
+            except VersionConflictError as exc:
+                raise _http_error(409, "stale_invocation_version") from exc
+            except ValueError as exc:
+                raise _http_error(409, "invocation_reconciliation_conflict") from exc
+            except RuntimeError as exc:
+                raise _http_error(503, "invocation_audit_unavailable") from exc
+
+            return InvocationReconciliationResponse(
+                invocation_id=invocation.id,
+                status=invocation.status,
+                version=invocation.version,
+                response_refs=invocation.response_refs,
+            )
+
+        if invocation.tool_name != "advisor.consult":
+            raise _operator_reconciliation_not_permitted(invocation.tool_name)
         if invocation.version != payload.expected_version:
             raise _http_error(409, "stale_invocation_version")
         if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
             raise _http_error(409, "invocation_reconciliation_not_required")
-        if invocation.tool_name != "advisor.consult":
-            raise _http_error(422, "provider_reconciliation_unsupported")
 
         coordinator = getattr(request.app.state, "external_effect_coordinator", None)
         claim_lookup = getattr(coordinator, "advisor_claims_for_invocation", None)

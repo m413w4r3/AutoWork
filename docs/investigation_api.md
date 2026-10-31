@@ -68,13 +68,27 @@ crée ni seconde demande ni second job.
 ## Réconcilier une invocation ambiguë
 
 `POST /api/investigations/{investigation_id}/invocations/{invocation_id}/reconcile`
-termine une invocation `needs_review` après vérification humaine. La requête
+termine une invocation `needs_review` après vérification humaine. Cette route
+reste la voie de réconciliation pour tous les outils. La requête
 contient `expected_version`, `outcome` (`executed_with_result`, `not_executed`
 ou `abandon`), `reason` et éventuellement `response_refs` pour
 `executed_with_result`. L’acteur vient du fournisseur d’identité et
 `Idempotency-Key` protège les reprises. Le CAS, la réservation de budget et la
 décision d’audit sont commités ensemble. Une enquête ne peut reprendre qu’après
 la réconciliation de ses invocations ambiguës.
+
+Le client opérateur peut aussi réconcilier, sur la route déjà autorisée par le
+relais, `POST /api/investigations/{investigation_id}/operator/invocations/{invocation_id}/reconcile`.
+Outre le flux existant `advisor.consult`, cette route accepte uniquement les
+lectures passives VT dont la définition et la version enregistrées ont l’effet
+`EXTERNAL_READ`. Pour VT, la requête exige les mêmes champs, une raison non
+vide et `Idempotency-Key`. `executed_with_result` exige une ou plusieurs
+observations déjà persistées sur cette invocation; `not_executed` est permis
+uniquement sans réponse persistée. `abandon` reste permis dans les deux cas.
+Les références doivent appartenir à l’enquête et à cette invocation. Les autres
+outils exigent la route humaine vérifiée (422); `PENDING` et `RUNNING` restent
+non réconciliables (409). Cette décision ne relance pas VirusTotal et ne
+déclenche aucun fournisseur.
 
 ## Job durable
 

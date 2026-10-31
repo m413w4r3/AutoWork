@@ -1062,7 +1062,7 @@ async def test_passive_retry_readiness_is_bound_to_exact_schema_version(monkeypa
 
 @pytest.mark.asyncio
 async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliation() -> None:
-    fixture, state, _registry, _summaries, _service, _tools, identifiers = await _seeded_fixture()
+    fixture, state, registry, _summaries, _service, _tools, identifiers = await _seeded_fixture()
     now = datetime.now(UTC)
     passive = ToolInvocation(
         investigation_id=fixture.investigation_id,
@@ -1104,6 +1104,16 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
         response_refs=(next(iter(identifiers["linked_observations"].values())).id,),
         created_at=now + timedelta(seconds=2),
     )
+    passive_without_result = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key="needs-review-passive-read-without-result",
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters={"file_hash": "e" * 64},
+        purpose="Uncertain passive VT read without a stored result.",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        created_at=now + timedelta(seconds=3),
+    )
     investigation = await fixture.investigations.get(fixture.investigation_id)
     assert investigation is not None
     envelope = await fixture.envelopes.get(fixture.investigation_id)
@@ -1112,7 +1122,7 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
         state=state,
         synthesis_sha256=fixture.snapshot.synthesis_sha256,
         envelope=envelope,
-        invocations=(passive, advisor, unsupported_schema_passive),
+        invocations=(passive, advisor, unsupported_schema_passive, passive_without_result),
         observations=tuple(
             await fixture.observations.list_for_investigation(fixture.investigation_id)
         ),
@@ -1120,6 +1130,11 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
         jobs=(),
         available_tools=("vt.file_report", "advisor.consult"),
         unavailable_tools=("vt.file_report@1:passive_retry_ready",),
+        operator_reconciliation_vt_tool_versions=frozenset(
+            (definition.name, definition.schema_version)
+            for definition in registry.list_registered()
+            if definition.effect is ToolEffect.EXTERNAL_READ
+        ),
     ).payload
 
     todo = view["invocations_requiring_reconciliation"]
@@ -1127,6 +1142,7 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
         passive.id,
         advisor.id,
         unsupported_schema_passive.id,
+        passive_without_result.id,
     }
     passive_view = next(item for item in todo if item["id"] == passive.id)
     advisor_view = next(item for item in todo if item["id"] == advisor.id)
@@ -1136,6 +1152,16 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
     assert passive_view["retry_action"]["path"].endswith("/operator/tools/vt.file_report")
     assert passive_view["retry_action"]["arguments"] == {"file_hash": "d" * 64}
     assert passive_view["retry_action"]["idempotency_key"] != passive.operation_key
+    assert passive_view["reconciliation_action"]["path"].endswith(
+        f"/operator/invocations/{passive.id}/reconcile"
+    )
+    assert passive_view["reconciliation_action"]["accepted_outcomes"] == [
+        "executed_with_result",
+        "abandon",
+    ]
+    assert passive_view["reconciliation_action"]["requires_verified_human_operator"] is False
+    assert passive_view["reconciliation_action"]["requires_idempotency_key"] is True
+    assert passive_view["reconciliation_action"]["response_refs_required"] is True
     assert advisor_view["response_refs"]
     assert advisor_view["resubmission_allowed"] is False
     assert advisor_view["retry_action"] is None
@@ -1148,8 +1174,167 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
     assert unsupported_view["resubmission_allowed"] is False
     assert unsupported_view["retry_action"] is None
     assert unsupported_view["reconciliation_action"]["resubmission_allowed"] is False
-    assert view["next_idempotent_action"]["path"].endswith("/operator/tools/vt.file_report")
+    assert unsupported_view["reconciliation_action"]["requires_verified_human_operator"] is True
+    no_result_view = next(item for item in todo if item["id"] == passive_without_result.id)
+    assert no_result_view["reconciliation_action"]["accepted_outcomes"] == [
+        "not_executed",
+        "abandon",
+    ]
+    unverified_registry_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=state,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=envelope,
+        invocations=(passive,),
+        observations=tuple(
+            await fixture.observations.list_for_investigation(fixture.investigation_id)
+        ),
+        opinion=None,
+        jobs=(),
+        available_tools=("vt.file_report",),
+        unavailable_tools=(),
+    ).payload
+    unverified_reconciliation = unverified_registry_view["invocations_requiring_reconciliation"][0][
+        "reconciliation_action"
+    ]
+    assert unverified_reconciliation["path"].endswith(f"/invocations/{passive.id}/reconcile")
+    assert unverified_reconciliation["requires_verified_human_operator"] is True
+    assert unverified_registry_view["next_idempotent_action"]["path"].endswith(
+        f"/invocations/{passive.id}/reconcile"
+    )
+    assert (
+        unverified_registry_view["next_idempotent_action"]["requires_verified_human_operator"]
+        is True
+    )
+    assert view["next_idempotent_action"]["path"].endswith(
+        f"/operator/invocations/{passive.id}/reconcile"
+    )
+    assert view["next_idempotent_action"]["retry_action"]["path"].endswith(
+        "/operator/tools/vt.file_report"
+    )
     assert "vt.file_report@1:passive_retry_ready" not in view["tool_inventory"]["unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_operator_led_needs_review_keeps_analytic_action_separate() -> None:
+    fixture, state, _registry, _summaries, _service, _tools, _identifiers = await _seeded_fixture()
+    now = datetime.now(UTC)
+    reviewed = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key="needs-review-local-analysis",
+        tool_name="sample.analyze",
+        schema_version="1",
+        normalized_parameters={"association_id": str(uuid4())},
+        purpose="Synthetic ambiguous local analysis.",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        response_refs=(uuid4(),),
+        created_at=now,
+    )
+    succeeded = tuple(
+        ToolInvocation(
+            investigation_id=fixture.investigation_id,
+            operation_key=f"completed-local-analysis-{index}",
+            tool_name="sample.analyze",
+            schema_version="1",
+            normalized_parameters={"association_id": str(uuid4())},
+            purpose="Synthetic completed local analysis.",
+            status=ToolInvocationStatus.SUCCEEDED,
+            created_at=now + timedelta(seconds=index + 1),
+        )
+        for index in range(2)
+    )
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    observations = tuple(
+        await fixture.observations.list_for_investigation(fixture.investigation_id)
+    )
+
+    def build_view(
+        execution_state: Any,
+        invocations: tuple[ToolInvocation, ...],
+        *,
+        advisor_guidance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return build_investigation_operator_view(
+            investigation=investigation,
+            state=execution_state,
+            synthesis_sha256=fixture.snapshot.synthesis_sha256,
+            envelope=envelope,
+            invocations=invocations,
+            observations=observations,
+            opinion=None,
+            jobs=(),
+            available_tools=("sample.analyze",),
+            unavailable_tools=(),
+            advisor_guidance=advisor_guidance,
+        ).payload
+
+    operator_view = build_view(state, (reviewed, *succeeded))
+    task = operator_view["reconciliation_tasks"][0]
+    assert len(operator_view["reconciliation_tasks"]) == 1
+    assert task["invocation_id"] == reviewed.id
+    assert task["tool_name"] == "sample.analyze"
+    assert task["status"] == "needs_review"
+    assert task["requires_verified_human_operator"] is True
+    assert task["response_persisted"] is True
+    assert operator_view["next_analytic_action"] == {
+        "code": "operator_action_required",
+        "method": "GET",
+        "path": f"/api/investigations/{fixture.investigation_id}/operator/context",
+        "expected_version": state.version,
+    }
+    assert operator_view["next_idempotent_action"] == {
+        "code": "reconcile_tool_invocation",
+        "invocation_id": reviewed.id,
+        "method": "POST",
+        "path": (
+            f"/api/investigations/{fixture.investigation_id}/invocations/{reviewed.id}/reconcile"
+        ),
+        "expected_version": reviewed.version,
+        "accepted_outcomes": ["executed_with_result", "not_executed", "abandon"],
+        "reason_required": True,
+        "response_refs_allowed_for": "executed_with_result",
+        "idempotency_key_header": "Idempotency-Key",
+        "requires_verified_human_operator": True,
+        "resubmission_allowed": False,
+        "blocks_other_tools": False,
+        "analytic_action_available": True,
+    }
+
+    due_guidance = {
+        "checkpoint_due": True,
+        "suggested_consultation_type": "review_text",
+        "reason": "synthetic checkpoint",
+    }
+    advisor_view = build_view(state, (reviewed,), advisor_guidance=due_guidance)
+    assert advisor_view["next_analytic_action"]["code"] == "advisor_checkpoint_due"
+    assert advisor_view["next_idempotent_action"]["code"] == "reconcile_tool_invocation"
+
+    running = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key="running-local-analysis",
+        tool_name="sample.analyze",
+        schema_version="1",
+        normalized_parameters={"association_id": str(uuid4())},
+        purpose="Synthetic in-flight local analysis.",
+        status=ToolInvocationStatus.RUNNING,
+    )
+    running_view = build_view(state, (running,))
+    assert running_view["next_idempotent_action"]["code"] == "wait_for_worker"
+    assert running_view["next_idempotent_action"]["invocation_id"] == running.id
+    assert running_view["next_idempotent_action"]["path"].endswith("/operator-status")
+    assert running_view["next_analytic_action"]["code"] == "operator_action_required"
+    (running_task,) = running_view["reconciliation_tasks"]
+    assert running_task["status"] == "running"
+    assert running_task["reconciliation_action"] is None
+    assert running_task["requires_verified_human_operator"] is False
+
+    bridge_state = replace(state, execution_mode=InvestigationExecutionMode.BRIDGE_LED)
+    bridge_view = build_view(bridge_state, (reviewed,))
+    assert bridge_view["next_idempotent_action"]["code"] == "reconcile_tool_invocation"
+    assert "blocks_other_tools" not in bridge_view["next_idempotent_action"]
+    assert bridge_view["next_analytic_action"] == bridge_view["next_idempotent_action"]
 
 
 @pytest.mark.asyncio

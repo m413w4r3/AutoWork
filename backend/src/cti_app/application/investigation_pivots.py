@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from cti_app.application.investigation_contracts import (
     AvailablePivotV1,
@@ -21,8 +23,8 @@ from cti_app.domain.investigation import (
     thaw_json,
 )
 
-MAX_AVAILABLE_PIVOTS = 128
-MAX_AVAILABLE_PIVOTS_BYTES = 24 * 1024
+MAX_AVAILABLE_PIVOTS = 2048
+MAX_AVAILABLE_PIVOTS_BYTES = 500 * 1024
 _COVERED_STATUSES = frozenset(
     {
         ToolInvocationStatus.PENDING,
@@ -93,6 +95,9 @@ def available_investigation_pivots(
             )
         )
     visible_coverage = {item.invocation_id: item for item in tool_coverage}
+    covered_tools_by_indicator: dict[tuple[str, str], tuple[str, ...]] = {}
+    latest_observation_by_indicator: dict[tuple[str, str], EvidenceObservation] = {}
+    indicator_order: dict[tuple[str, str], int] = {}
     retryable_tools = retryable_vt_tool_versions
     if retryable_tools is None:
         retryable_tools = frozenset(
@@ -116,6 +121,7 @@ def available_investigation_pivots(
         )
     }
     observation_ids_by_indicator: dict[tuple[str, str], list[str]] = {}
+    observations_by_id = {str(item.id): item for item in observations}
     for observation in observations:
         object_type = observation.object_type.casefold()
         object_value = (
@@ -141,6 +147,8 @@ def available_investigation_pivots(
         arguments: Mapping[str, Any],
         schema_version: str | None = None,
         blocked_reason: str | None = None,
+        source_observation_ids: tuple[UUID, ...] = (),
+        covered_by_tools: tuple[str, ...] = (),
     ) -> None:
         normalized = canonical_json_bytes(dict(arguments))
         matching_tools = (
@@ -178,6 +186,8 @@ def available_investigation_pivots(
                 arguments=dict(arguments),
                 execution_state="blocked" if effective_block else "available",
                 blocked_reason=effective_block,
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_by_tools,
             )
             candidates[(tool_name, tool.schema_version, normalized.decode("utf-8"))] = pivot
 
@@ -186,8 +196,19 @@ def available_investigation_pivots(
     )
 
     for kind, value in indicator_values:
+        indicator_key = (kind, _indicator_value_key(kind, value))
+        indicator_order.setdefault(indicator_key, len(indicator_order))
         linked_evidence = _linked_observations(
             kind, value, observations, observation_ids_by_indicator
+        )
+        source_observation_ids = tuple(UUID(item) for item in linked_evidence[:16])
+        if linked_evidence:
+            latest_observation_by_indicator[indicator_key] = observations_by_id[linked_evidence[-1]]
+        covered_tools_by_indicator[indicator_key] = _covered_tools_for_indicator(
+            kind,
+            value,
+            invocations,
+            visible_coverage,
         )
         source_available = (
             bool(linked_evidence)
@@ -205,6 +226,8 @@ def available_investigation_pivots(
                 indicator_value=value,
                 arguments={"file_hash": value},
                 blocked_reason=blocked_reason,
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
             for relation in ("contacted_ips", "contacted_domains"):
                 add(
@@ -217,6 +240,8 @@ def available_investigation_pivots(
                         "relation": relation,
                     },
                     blocked_reason=blocked_reason,
+                    source_observation_ids=source_observation_ids,
+                    covered_by_tools=covered_tools_by_indicator[indicator_key],
                 )
         elif kind == "ipv4":
             add(
@@ -229,12 +254,16 @@ def available_investigation_pivots(
                     "relation": "resolutions",
                 },
                 blocked_reason=(None if source_available else "source_references_required"),
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
             add(
                 tool_name="shodan.host",
                 indicator_type=kind,
                 indicator_value=value,
                 arguments={"ip": value},
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
         elif kind == "domain":
             add(
@@ -247,6 +276,8 @@ def available_investigation_pivots(
                     "relation": "resolutions",
                 },
                 blocked_reason=(None if source_available else "source_references_required"),
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
         elif kind == "url":
             add(
@@ -259,6 +290,8 @@ def available_investigation_pivots(
                     "relation": "communicating_files",
                 },
                 blocked_reason=(None if source_available else "source_references_required"),
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
 
         if linked_evidence and kind in {"md5", "sha1", "sha256", "ipv4", "domain"}:
@@ -272,6 +305,8 @@ def available_investigation_pivots(
                 indicator_type=kind,
                 indicator_value=value,
                 arguments=exact_search_arguments,
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
             if kind in {"ipv4", "domain"}:
                 add(
@@ -279,6 +314,8 @@ def available_investigation_pivots(
                     indicator_type=kind,
                     indicator_value=value,
                     arguments=exact_search_arguments,
+                    source_observation_ids=source_observation_ids,
+                    covered_by_tools=covered_tools_by_indicator[indicator_key],
                 )
 
     # A reviewed passive behaviour read can be offered again as a distinct
@@ -306,6 +343,13 @@ def available_investigation_pivots(
             linked_evidence = _linked_observations(
                 kind, value, observations, observation_ids_by_indicator
             )
+            indicator_key = (kind, _indicator_value_key(kind, value))
+            indicator_order.setdefault(indicator_key, len(indicator_order))
+            source_observation_ids = tuple(UUID(item) for item in linked_evidence[:16])
+            covered_tools_by_indicator.setdefault(
+                indicator_key,
+                _covered_tools_for_indicator(kind, value, invocations, visible_coverage),
+            )
             source_available = (
                 bool(linked_evidence)
                 or (
@@ -329,21 +373,31 @@ def available_investigation_pivots(
                 arguments={"file_hash": value},
                 schema_version=invocation.schema_version,
                 blocked_reason=retry_blocker,
+                source_observation_ids=source_observation_ids,
+                covered_by_tools=covered_tools_by_indicator[indicator_key],
             )
 
-    ordered = tuple(
-        candidates[key] for key in sorted(candidates, key=lambda item: (item[0], item[1], item[2]))
+    ordered = _order_candidates_fairly(
+        candidates.values(),
+        latest_observation_by_indicator=latest_observation_by_indicator,
+        indicator_order=indicator_order,
     )
     result: list[AvailablePivotV1] = []
     used_bytes = 2
     truncated = len(ordered) > MAX_AVAILABLE_PIVOTS
+    omitted_available = False
     for pivot in ordered:
         item_bytes = len(canonical_json_bytes(pivot.model_dump(mode="json"))) + 1
+        if omitted_available and pivot.execution_state == "blocked":
+            # A blocked pivot must never displace an available one that did not fit.
+            truncated = True
+            continue
         if (
             len(result) >= MAX_AVAILABLE_PIVOTS
             or used_bytes + item_bytes > MAX_AVAILABLE_PIVOTS_BYTES
         ):
             truncated = True
+            omitted_available = omitted_available or pivot.execution_state == "available"
             continue
         result.append(pivot)
         used_bytes += item_bytes
@@ -412,6 +466,114 @@ def _linked_observations(
         for item in sorted(observations, key=lambda item: (item.observed_at, str(item.id)))
         if str(item.id) in ids
     ]
+    return tuple(ordered)
+
+
+def _covered_tools_for_indicator(
+    indicator_type: str,
+    value: str,
+    invocations: Sequence[ToolInvocation],
+    visible_coverage: Mapping[UUID, ToolCoverageEntryV1],
+) -> tuple[str, ...]:
+    successful_statuses = {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.EMPTY}
+    covered: set[str] = set()
+    for invocation in invocations:
+        coverage = visible_coverage.get(invocation.id)
+        status = coverage.status if coverage is not None else invocation.status
+        if status in successful_statuses and _invocation_matches_indicator(
+            invocation, indicator_type, value
+        ):
+            covered.add(invocation.tool_name)
+    return tuple(sorted(covered)[:256])
+
+
+def _invocation_matches_indicator(
+    invocation: ToolInvocation,
+    indicator_type: str,
+    value: str,
+) -> bool:
+    parameters = _tool_arguments(invocation.normalized_parameters)
+    if not isinstance(parameters, Mapping):
+        return False
+
+    expected = _indicator_value_key(indicator_type, value)
+
+    def matches(candidate: Any) -> bool:
+        return (
+            isinstance(candidate, str)
+            and _indicator_value_key(indicator_type, candidate) == expected
+        )
+
+    direct_keys = {
+        "md5": ("file_hash", "query"),
+        "sha1": ("file_hash", "query"),
+        "sha256": ("file_hash", "query"),
+        "ipv4": ("ip", "ip_address", "query"),
+        "domain": ("domain", "query"),
+        "url": ("url", "query"),
+    }[indicator_type]
+    if any(matches(parameters.get(key)) for key in direct_keys):
+        return True
+
+    object_type = parameters.get("object_type")
+    object_id = parameters.get("object_id")
+    aliases = {
+        "md5": {"file", "files"},
+        "sha1": {"file", "files"},
+        "sha256": {"file", "files"},
+        "ipv4": {"ip", "ip_address", "ip_addresses", "ipv4"},
+        "domain": {"domain", "domains"},
+        "url": {"url", "urls"},
+    }[indicator_type]
+    return isinstance(object_type, str) and object_type.casefold() in aliases and matches(object_id)
+
+
+def _order_candidates_fairly(
+    candidates: Iterable[AvailablePivotV1],
+    *,
+    latest_observation_by_indicator: Mapping[tuple[str, str], EvidenceObservation],
+    indicator_order: Mapping[tuple[str, str], int],
+) -> tuple[AvailablePivotV1, ...]:
+    groups: dict[tuple[str, str], list[AvailablePivotV1]] = {}
+    for pivot in candidates:
+        indicator_key = (
+            pivot.indicator_type,
+            _indicator_value_key(pivot.indicator_type, pivot.indicator_value),
+        )
+        groups.setdefault(indicator_key, []).append(pivot)
+
+    ordered: list[AvailablePivotV1] = []
+    for state in ("available", "blocked"):
+        for has_source in (True, False):
+            group_keys = [
+                key
+                for key, pivots in groups.items()
+                if bool(pivots[0].source_observation_ids) is has_source
+                and any(pivot.execution_state == state for pivot in pivots)
+            ]
+            group_keys.sort(key=lambda key: indicator_order.get(key, 0))
+            if has_source:
+
+                def observation_recency(key: tuple[str, str]) -> tuple[datetime, str]:
+                    observation = latest_observation_by_indicator[key]
+                    return observation.observed_at, str(observation.id)
+
+                group_keys.sort(key=observation_recency, reverse=True)
+
+            queues: dict[tuple[str, str], list[AvailablePivotV1]] = {}
+            for key in group_keys:
+                queues[key] = sorted(
+                    (pivot for pivot in groups[key] if pivot.execution_state == state),
+                    key=lambda pivot: (
+                        pivot.tool_name,
+                        pivot.schema_version,
+                        canonical_json_bytes(pivot.arguments),
+                    ),
+                )
+            while any(queues.values()):
+                for key in group_keys:
+                    if queues[key]:
+                        ordered.append(queues[key].pop(0))
     return tuple(ordered)
 
 

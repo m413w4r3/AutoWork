@@ -5,7 +5,7 @@ import base64
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -25,6 +25,7 @@ from cti_app.application.bridge_investigator import make_investigation_conversat
 from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
+from cti_app.application.investigation_tools import ToolEffect
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.application.model_conversations import ModelConversationReconciliationError
 from cti_app.config import Settings
@@ -489,22 +490,28 @@ class _InvestigationService:
         response_refs: tuple[UUID, ...],
         expected_version: int,
         idempotency_key: str,
+        actor_provenance: str | None = None,
     ):
-        self.uow._store.reconciliations.append(
-            {
-                "investigation_id": investigation_id,
-                "invocation_id": invocation_id,
-                "outcome": outcome.value,
-                "actor": actor,
-                "reason": reason,
-                "response_refs": response_refs,
-                "expected_version": expected_version,
-                "idempotency_key": idempotency_key,
-            }
-        )
+        reconciliation = {
+            "investigation_id": investigation_id,
+            "invocation_id": invocation_id,
+            "outcome": outcome.value,
+            "actor": actor,
+            "reason": reason,
+            "response_refs": response_refs,
+            "expected_version": expected_version,
+            "idempotency_key": idempotency_key,
+        }
+        if actor_provenance is not None:
+            reconciliation["actor_provenance"] = actor_provenance
+        self.uow._store.reconciliations.append(reconciliation)
         return SimpleNamespace(
             id=invocation_id,
-            status=ToolInvocationStatus.SUCCEEDED,
+            status=(
+                ToolInvocationStatus.SUCCEEDED
+                if outcome.value == "executed_with_result"
+                else ToolInvocationStatus.FAILED
+            ),
             version=expected_version + 1,
             response_refs=response_refs,
         )
@@ -1126,6 +1133,80 @@ def test_operator_status_reconciles_needs_review_even_with_refs_and_links_reserv
     )
 
 
+def test_operator_status_compact_view_limits_invocations_and_payload_size() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].version = 1
+    store.states.rows[INVESTIGATION_ID] = replace(
+        _working_state(), execution_mode=InvestigationExecutionMode.OPERATOR_LED
+    )
+    reservation_key = "compact-view-reservation"
+    budget = InvestigationBudget(limits={BudgetDimension.BRIDGE_TURNS: 4})
+    budget.reserve(reservation_key, {BudgetDimension.BRIDGE_TURNS: 1})
+    store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
+        investigation_id=INVESTIGATION_ID,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.AMBER, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
+    base_time = datetime.now(UTC)
+    store.invocations.extend(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key=f"compact-view-invocation-{index}",
+            tool_name="sample.analyze",
+            schema_version="1",
+            normalized_parameters={"association_id": str(uuid4())},
+            purpose="Synthetic compact-view payload measurement.",
+            status=ToolInvocationStatus.SUCCEEDED,
+            created_at=base_time + timedelta(seconds=index),
+        )
+        for index in range(60)
+    )
+
+    full_response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
+    compact_response = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator-status",
+        params={"view": "compact"},
+    )
+
+    assert full_response.status_code == 200, full_response.text
+    assert compact_response.status_code == 200, compact_response.text
+    full, compact = full_response.json(), compact_response.json()
+    assert len(full["invocations"]) == 60
+    assert compact["invocations"] == full["invocations"][-10:]
+    assert compact["invocation_counts_by_status"] == {"succeeded": 60}
+    assert compact["investigation_id"] == str(INVESTIGATION_ID)
+    assert compact["working_state_version"] == full["working_state_version"]
+    assert compact["working_state_sha256"] == full["working_state_sha256"]
+    assert compact["investigation_status"] == full["investigation_status"]
+    assert compact["execution_mode"] == "operator_led"
+    assert compact["stop_reason"] == full["stop_reason"]
+    assert compact["g2"] == {
+        "approved": True,
+        "revoked": False,
+        "version": 1,
+    }
+    assert compact["budget"] == full["budget"]
+    assert compact["reconciliation_tasks"] == []
+    assert compact["next_analytic_action"] == full["next_analytic_action"]
+    assert compact["next_idempotent_action"] == full["next_idempotent_action"]
+    assert compact["evidence_checkpoint"] == {
+        "observation_count": full["evidence_checkpoint"]["observation_count"],
+        "sha256": full["evidence_checkpoint"]["sha256"],
+    }
+    assert compact["budget_reservation_counts"] == {"total": 1, "reserved": 1}
+    assert len(compact_response.content) < len(full_response.content) // 2
+
+    invalid_response = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator-status",
+        params={"view": "summary"},
+    )
+    assert invalid_response.status_code == 422
+
+
 def test_reconciliation_summary_keeps_older_completed_claim_authoritative() -> None:
     invocation_id = uuid4()
     completed_claim = SimpleNamespace(
@@ -1176,6 +1257,238 @@ def test_reconciliation_summary_keeps_older_completed_claim_authoritative() -> N
 
     assert summary.external_transport_occurred is True
     assert summary.next_action["resubmission_allowed"] is False
+
+
+def test_operator_client_reconciles_passive_vt_read_through_existing_route() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:agent-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class PassiveRegistry:
+        def get(self, tool_name, schema_version):
+            return (
+                SimpleNamespace(
+                    name=tool_name,
+                    schema_version=schema_version,
+                    effect=ToolEffect.EXTERNAL_READ,
+                ),
+                object(),
+            )
+
+    class PassiveFactory(_CompositionFactory):
+        def build(self, uow, investigation_id, *, operator_mode=False):
+            composition = super().build(uow, investigation_id, operator_mode=operator_mode)
+            composition.registry = PassiveRegistry()
+            return composition
+
+    invocation_id = uuid4()
+    factory = PassiveFactory(_SnapshotPort())
+    client, store = _client(factory=factory)
+    client.app.state.identity_provider = OperatorIdentityProvider()
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key="operator-passive-vt-read",
+            tool_name="vt.file_report",
+            schema_version="1",
+            normalized_parameters={"file_hash": "d" * 64},
+            purpose="Reconcile an ambiguous passive VT read.",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            id=invocation_id,
+            version=3,
+        )
+    )
+    path = f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile"
+
+    response = client.post(
+        path,
+        json={
+            "expected_version": 3,
+            "outcome": "not_executed",
+            "reason": "The read did not produce a persisted provider result.",
+            "response_refs": [],
+        },
+        headers={"Idempotency-Key": "operator-passive-vt-once"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "invocation_id": str(invocation_id),
+        "status": "failed",
+        "version": 4,
+        "response_refs": [],
+    }
+    assert store.reconciliations[0]["actor"] == "operator:agent-client"
+    assert store.reconciliations[0]["actor_provenance"] == "operator_client"
+    assert store.reconciliations[0]["outcome"] == "not_executed"
+    assert store.reconciliations[0]["idempotency_key"].startswith(
+        f"invocation:{invocation_id}:idem:"
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["vt.download_sample", "sample.analyze", "advisor.other"])
+def test_operator_client_cannot_reconcile_other_tool_families(tool_name: str) -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:agent-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    invocation_id = uuid4()
+    client, store = _client()
+    client.app.state.identity_provider = OperatorIdentityProvider()
+    client_store_invocation = ToolInvocation(
+        investigation_id=INVESTIGATION_ID,
+        operation_key=f"operator-forbidden-{tool_name}",
+        tool_name=tool_name,
+        schema_version="1",
+        normalized_parameters={"input": "synthetic"},
+        purpose="Verify operator reconciliation eligibility.",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        id=invocation_id,
+        version=1,
+    )
+    store.invocations.append(client_store_invocation)
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile",
+        json={
+            "expected_version": 1,
+            "outcome": "abandon",
+            "reason": "The unsupported operation remains for human review.",
+        },
+        headers={"Idempotency-Key": "operator-forbidden-once"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "operator_reconciliation_not_permitted_for_tool"
+    assert "verified human operator" in response.json()["detail"]["message"]
+    assert store.reconciliations == []
+
+
+def test_operator_client_requires_idempotency_key_for_passive_vt_reconciliation() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:agent-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class PassiveRegistry:
+        def get(self, tool_name, schema_version):
+            return SimpleNamespace(name=tool_name, effect=ToolEffect.EXTERNAL_READ), object()
+
+    class PassiveFactory(_CompositionFactory):
+        def build(self, uow, investigation_id, *, operator_mode=False):
+            composition = super().build(uow, investigation_id, operator_mode=operator_mode)
+            composition.registry = PassiveRegistry()
+            return composition
+
+    invocation_id = uuid4()
+    client, store = _client(factory=PassiveFactory(_SnapshotPort()))
+    client.app.state.identity_provider = OperatorIdentityProvider()
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key="operator-passive-vt-missing-idempotency",
+            tool_name="vt.file_report",
+            schema_version="1",
+            normalized_parameters={"file_hash": "d" * 64},
+            purpose="Verify the idempotency requirement.",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            id=invocation_id,
+            version=1,
+        )
+    )
+
+    fields_missing = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile",
+        json={"expected_version": 1},
+        headers={"Idempotency-Key": "operator-vt-fields-missing"},
+    )
+    assert fields_missing.status_code == 422
+    assert fields_missing.json()["detail"]["code"] == "operator_reconciliation_fields_required"
+    response_refs_missing = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile",
+        json={
+            "expected_version": 1,
+            "outcome": "abandon",
+            "reason": "Close the unresolved passive read.",
+        },
+        headers={"Idempotency-Key": "operator-vt-refs-missing"},
+    )
+    assert response_refs_missing.status_code == 422
+    assert (
+        response_refs_missing.json()["detail"]["code"] == "operator_reconciliation_fields_required"
+    )
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile",
+        json={
+            "expected_version": 1,
+            "outcome": "abandon",
+            "reason": "Close the unresolved passive read.",
+            "response_refs": [],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "idempotency_key_required"
+    assert store.reconciliations == []
+
+
+def test_operator_client_requires_registered_passive_vt_external_read_effect() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:agent-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class NonReadRegistry:
+        def get(self, tool_name, schema_version):
+            return SimpleNamespace(name=tool_name, effect=ToolEffect.EXTERNAL_ACTIVE), object()
+
+    class NonReadFactory(_CompositionFactory):
+        def build(self, uow, investigation_id, *, operator_mode=False):
+            composition = super().build(uow, investigation_id, operator_mode=operator_mode)
+            composition.registry = NonReadRegistry()
+            return composition
+
+    invocation_id = uuid4()
+    client, store = _client(factory=NonReadFactory(_SnapshotPort()))
+    client.app.state.identity_provider = OperatorIdentityProvider()
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key="operator-vt-wrong-effect",
+            tool_name="vt.file_report",
+            schema_version="1",
+            normalized_parameters={"file_hash": "d" * 64},
+            purpose="Verify that effect is checked from the recorded definition.",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            id=invocation_id,
+            version=1,
+        )
+    )
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/invocations/{invocation_id}/reconcile",
+        json={
+            "expected_version": 1,
+            "outcome": "abandon",
+            "reason": "The registered definition is not a passive external read.",
+        },
+        headers={"Idempotency-Key": "operator-vt-wrong-effect"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "operator_reconciliation_not_permitted_for_tool"
+    assert store.reconciliations == []
 
 
 def test_operator_client_recovers_exact_advisor_response_without_resubmitting() -> None:
