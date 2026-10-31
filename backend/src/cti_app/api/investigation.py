@@ -866,7 +866,29 @@ class InvestigationOperatorStatusResponse(BaseModel):
     dependencies: dict[str, list[str]]
     tool_inventory: dict[str, list[str]]
     advisor_guidance: AdvisorGuidanceV1
+    reconciliation_tasks: list[dict[str, Any]]
+    next_analytic_action: dict[str, Any]
     next_idempotent_action: dict[str, Any]
+
+
+class InvestigationOperatorStatusCompactResponse(BaseModel):
+    """Token-conscious summary of the read-only operator projection."""
+
+    investigation_id: UUID
+    working_state_version: int
+    working_state_sha256: str
+    investigation_status: str
+    execution_mode: InvestigationExecutionMode
+    stop_reason: StopReason | None
+    g2: dict[str, Any]
+    budget: dict[str, Any]
+    invocation_counts_by_status: dict[str, int]
+    invocations: list[dict[str, Any]]
+    reconciliation_tasks: list[dict[str, Any]]
+    next_analytic_action: dict[str, Any]
+    next_idempotent_action: dict[str, Any]
+    evidence_checkpoint: dict[str, Any]
+    budget_reservation_counts: dict[str, int]
 
 
 class InvestigationActivityObservationView(BaseModel):
@@ -2037,12 +2059,13 @@ async def get_investigation_operator_observation(
 
 @router.get(
     "/investigations/{investigation_id}/operator-status",
-    response_model=InvestigationOperatorStatusResponse,
+    response_model=InvestigationOperatorStatusResponse | InvestigationOperatorStatusCompactResponse,
 )
 async def get_investigation_operator_status(
     investigation_id: UUID,
     request: Request,
-) -> InvestigationOperatorStatusResponse:
+    view: Literal["full", "compact"] = Query(default="full"),
+) -> InvestigationOperatorStatusResponse | InvestigationOperatorStatusCompactResponse:
     """Read durable checkpoints without changing versions.
 
     Stable error codes are ``investigation_not_found`` (404),
@@ -2192,7 +2215,7 @@ async def get_investigation_operator_status(
                     )
                 if abandoned_turn_id is not None:
                     pending_bridge_turn = await uow.model_conversation_turns.get(abandoned_turn_id)
-        view = build_investigation_operator_view(
+        operator_view = build_investigation_operator_view(
             investigation=investigation,
             state=state,
             synthesis_sha256=snapshot.synthesis_sha256,
@@ -2228,8 +2251,48 @@ async def get_investigation_operator_status(
             observations=observations,
             evidence_summaries=evidence_summaries,
         )
-        _attach_operator_invocation_costs(view.payload, invocation_costs)
-        return InvestigationOperatorStatusResponse.model_validate(view.payload)
+        _attach_operator_invocation_costs(operator_view.payload, invocation_costs)
+        if view == "compact":
+            payload = operator_view.payload
+            invocation_counts_by_status: dict[str, int] = {}
+            for invocation in payload["invocations"]:
+                invocation_status = invocation["status"]
+                invocation_counts_by_status[invocation_status] = (
+                    invocation_counts_by_status.get(invocation_status, 0) + 1
+                )
+            reservations = payload["budget_reservations"]
+            budget_reservation_counts = {"total": len(reservations)}
+            for reservation in reservations:
+                reservation_status = reservation["status"]
+                budget_reservation_counts[reservation_status] = (
+                    budget_reservation_counts.get(reservation_status, 0) + 1
+                )
+            compact_payload = {
+                "investigation_id": payload["investigation_id"],
+                "working_state_version": payload["working_state_version"],
+                "working_state_sha256": payload["working_state_sha256"],
+                "investigation_status": payload["investigation_status"],
+                "execution_mode": payload["execution_mode"],
+                "stop_reason": payload["stop_reason"],
+                "g2": {
+                    "approved": payload["g2"]["approved"],
+                    "revoked": payload["g2"]["revoked"],
+                    "version": payload["g2"]["version"],
+                },
+                "budget": payload["budget"],
+                "invocation_counts_by_status": invocation_counts_by_status,
+                "invocations": payload["invocations"][-10:],
+                "reconciliation_tasks": payload["reconciliation_tasks"],
+                "next_analytic_action": payload["next_analytic_action"],
+                "next_idempotent_action": payload["next_idempotent_action"],
+                "evidence_checkpoint": {
+                    "observation_count": payload["evidence_checkpoint"]["observation_count"],
+                    "sha256": payload["evidence_checkpoint"]["sha256"],
+                },
+                "budget_reservation_counts": budget_reservation_counts,
+            }
+            return InvestigationOperatorStatusCompactResponse.model_validate(compact_payload)
+        return InvestigationOperatorStatusResponse.model_validate(operator_view.payload)
 
 
 @router.get("/investigations/{investigation_id}/envelope", response_model=EnvelopeView)
