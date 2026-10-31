@@ -5,7 +5,7 @@ import base64
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -1124,6 +1124,80 @@ def test_operator_status_reconciles_needs_review_even_with_refs_and_links_reserv
     assert body["next_idempotent_action"]["path"].endswith(
         f"/operator/invocations/{invocation_id}/reconcile"
     )
+
+
+def test_operator_status_compact_view_limits_invocations_and_payload_size() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].version = 1
+    store.states.rows[INVESTIGATION_ID] = replace(
+        _working_state(), execution_mode=InvestigationExecutionMode.OPERATOR_LED
+    )
+    reservation_key = "compact-view-reservation"
+    budget = InvestigationBudget(limits={BudgetDimension.BRIDGE_TURNS: 4})
+    budget.reserve(reservation_key, {BudgetDimension.BRIDGE_TURNS: 1})
+    store.envelopes.rows[INVESTIGATION_ID] = InvestigationEnvelope(
+        investigation_id=INVESTIGATION_ID,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.AMBER, external_llm_allowed=True),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst:test",
+    )
+    base_time = datetime.now(UTC)
+    store.invocations.extend(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key=f"compact-view-invocation-{index}",
+            tool_name="sample.analyze",
+            schema_version="1",
+            normalized_parameters={"association_id": str(uuid4())},
+            purpose="Synthetic compact-view payload measurement.",
+            status=ToolInvocationStatus.SUCCEEDED,
+            created_at=base_time + timedelta(seconds=index),
+        )
+        for index in range(60)
+    )
+
+    full_response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
+    compact_response = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator-status",
+        params={"view": "compact"},
+    )
+
+    assert full_response.status_code == 200, full_response.text
+    assert compact_response.status_code == 200, compact_response.text
+    full, compact = full_response.json(), compact_response.json()
+    assert len(full["invocations"]) == 60
+    assert compact["invocations"] == full["invocations"][-10:]
+    assert compact["invocation_counts_by_status"] == {"succeeded": 60}
+    assert compact["investigation_id"] == str(INVESTIGATION_ID)
+    assert compact["working_state_version"] == full["working_state_version"]
+    assert compact["working_state_sha256"] == full["working_state_sha256"]
+    assert compact["investigation_status"] == full["investigation_status"]
+    assert compact["execution_mode"] == "operator_led"
+    assert compact["stop_reason"] == full["stop_reason"]
+    assert compact["g2"] == {
+        "approved": True,
+        "revoked": False,
+        "version": 1,
+    }
+    assert compact["budget"] == full["budget"]
+    assert compact["reconciliation_tasks"] == []
+    assert compact["next_analytic_action"] == full["next_analytic_action"]
+    assert compact["next_idempotent_action"] == full["next_idempotent_action"]
+    assert compact["evidence_checkpoint"] == {
+        "observation_count": full["evidence_checkpoint"]["observation_count"],
+        "sha256": full["evidence_checkpoint"]["sha256"],
+    }
+    assert compact["budget_reservation_counts"] == {"total": 1, "reserved": 1}
+    assert len(compact_response.content) < len(full_response.content) // 2
+
+    invalid_response = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator-status",
+        params={"view": "summary"},
+    )
+    assert invalid_response.status_code == 422
 
 
 def test_reconciliation_summary_keeps_older_completed_claim_authoritative() -> None:
