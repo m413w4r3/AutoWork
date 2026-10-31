@@ -551,7 +551,7 @@ def test_lexically_omitted_alias_is_reported_as_unverified_selection() -> None:
     statuses = {row["status"] for row in omitted["statuses"]}
     reasons = " ".join(row["reason"] for row in omitted["statuses"]).casefold()
     assert {"NOT_VERIFIED", "INTENTIONALLY_OMITTED"} <= statuses
-    assert "bounded lexical selection" in reasons
+    assert "task relevance selection" in reasons
     assert "semantic relevance" in reasons
     assert "question does not require" not in reasons
 
@@ -594,7 +594,7 @@ def test_unrequired_canonical_proof_omission_has_count_and_reason() -> None:
     assert preflight["counts"]["omitted"] == 1
     omitted = _item(preflight, "observation", optional_id)
     status = next(row for row in omitted["statuses"] if row["status"] == "INTENTIONALLY_OMITTED")
-    assert "bounded lexical selection" in status["reason"]
+    assert "task relevance selection" in status["reason"]
     assert "semantic irrelevance" in status["reason"]
 
 
@@ -848,6 +848,101 @@ def test_measurement_dossier_labels_fragment_digest_and_complete_provenance(
         assert label in dossier.text
     assert sample_digest not in dossier.text
     assert evidence_digest not in dossier.text
+
+
+def test_yara_required_measurements_survive_numeric_lexical_selection() -> None:
+    evidence_id = str(uuid4())
+    data = _planning_data(
+        question="Draft a YARA rule for offset 128.",
+        evidence=[
+            {
+                "evidence_id": evidence_id,
+                "sha256": "c" * 64,
+                "source": "synthetic.fixture",
+                "object_type": "observation",
+                "blob_read_verified": True,
+                "content_excerpts": [
+                    {
+                        "kind": "text",
+                        "title": "Offset 128 target",
+                        "text": "Synthetic source excerpt for offset 128.",
+                    }
+                ],
+            }
+        ],
+        findings=[],
+    )
+    data["consultation_type"] = "yara_draft"
+    data["evidence_refs"] = []
+    data["measurements"] = [
+        {
+            "measurement_id": f"m{index:03d}",
+            "sample_sha256": "a" * 64,
+            "offset": 128 if index == 1 else 10_000 + index,
+            "value": f"SyntheticMarker{index:03d}",
+            "evidence_id": evidence_id,
+            "evidence_sha256": "c" * 64,
+            "kind": "string",
+        }
+        for index in range(1, 221)
+    ]
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
+
+    assert preflight["status"] == "READY"
+    assert preflight["missing_refs"] == []
+    assert {item["id"] for item in dossier.manifest if item["kind"] == "measurement"} == {"m001"}
+    required_measurements = {
+        item["id"]
+        for item in preflight["items"]
+        if item["kind"] == "measurement" and item["required"]
+    }
+    assert required_measurements == {"m001"}
+    omitted = next(
+        item
+        for item in preflight["items"]
+        if item["kind"] == "measurement" and item["id"] == "m002"
+    )
+    assert {row["status"] for row in omitted["statuses"]} >= {
+        "INFORMATIONAL",
+        "INTENTIONALLY_OMITTED",
+    }
+    omitted_reasons = " ".join(row["reason"] for row in omitted["statuses"])
+    assert "not selected or explicitly targeted" in omitted_reasons
+
+
+def test_multi_megabyte_yara_dossier_keeps_every_required_measurement() -> None:
+    data = _planning_data(
+        question="Draft a YARA rule from these synthetic measurements.",
+        evidence=[],
+        findings=[],
+    )
+    data["consultation_type"] = "yara_draft"
+    data["measurements"] = [
+        {
+            "measurement_id": f"m{index:03d}",
+            "sample_sha256": "a" * 64,
+            "offset": index,
+            "value": f"synthetic-{index}-" + ("x" * 600_000),
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "b" * 64,
+            "kind": "string",
+        }
+        for index in range(1, 5)
+    ]
+
+    dossier = build_advisor_dossier(data)
+    preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text, submitted=True)
+
+    assert dossier.byte_size > 2_000_000
+    assert len(dossier.text.encode("utf-8")) == dossier.byte_size
+    assert preflight["status"] == "READY"
+    assert preflight["missing_refs"] == []
+    assert {item["id"] for item in dossier.manifest if item["kind"] == "measurement"} == {
+        f"m{index:03d}" for index in range(1, 5)
+    }
+    assert all(dossier.text.count(item["value"]) == 1 for item in data["measurements"])
 
 
 def test_equal_text_under_distinct_labels_is_not_deduplicated() -> None:

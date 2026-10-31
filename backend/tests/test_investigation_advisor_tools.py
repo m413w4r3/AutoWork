@@ -3911,6 +3911,117 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
 
 
 @pytest.mark.asyncio
+async def test_yara_draft_includes_every_required_measurement_from_cited_observation() -> None:
+    investigation_id = uuid4()
+    sample_sha256 = "e" * 64
+    strings = [
+        {"value": f"SyntheticMarker{index:03d}", "offset": 10_000 + index} for index in range(220)
+    ]
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_sha256,
+            "strings": strings,
+        },
+    )
+    rule_source = 'rule Synthetic { strings: $marker = "SyntheticMarker000" condition: $marker }'
+    transport = Transport(
+        lambda call: TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=typed_yara_response(call["prompt"], rule_source=rule_source),
+            bridge_invocation_id=str(uuid4()),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._sample_associations.list_for_investigation = async_get(
+        (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
+    )
+    tool._samples.list_for_subject = async_get(
+        (
+            SimpleNamespace(
+                expected_hash=sample_sha256,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=sample_blob_id,
+            ),
+        )
+    )
+    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Draft a rule for offset 128 using the cited observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:all-required-measurements"),
+    )
+
+    assert len(transport.calls) == 1
+    assert result.output["bridge_provenance"]["preflight_status"] == "READY"
+    dossier_manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    measurement_ids = {item["id"] for item in dossier_manifest if item["kind"] == "measurement"}
+    assert measurement_ids == {f"m{index:03d}" for index in range(1, 221)}
+    assert result.output["bridge_provenance"]["completeness_counts"]["missing"] == 0
+
+
+@pytest.mark.asyncio
+async def test_yara_measurement_source_sha_mismatch_has_precise_refusal() -> None:
+    investigation_id = uuid4()
+    sample_sha256 = "f" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_sha256,
+            "strings": [{"value": "SyntheticShaMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(None)
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._sample_associations.list_for_investigation = async_get(
+        (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
+    )
+    tool._samples.list_for_subject = async_get(
+        (
+            SimpleNamespace(
+                expected_hash=sample_sha256,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=sample_blob_id,
+            ),
+        )
+    )
+    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.descriptors[observation.blob_id].descriptor.sha256 = "0" * 64
+
+    result = await tool.execute(
+        {
+            "consultation_type": "yara_draft",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:yara-source-sha-mismatch"),
+    )
+
+    assert transport.calls == []
+    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
+    assert str(observation.id) in result.output["preflight_cause"]["ref"]
+    assert "SHA-256 mismatch" in result.output["preflight_cause"]["reason"]
+    assert "restore the canonical blob" in result.output["preflight_cause"]["reason"]
+
+
+@pytest.mark.asyncio
 async def test_yara_draft_uses_canonical_static_observation_without_sample_association() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
@@ -4457,10 +4568,27 @@ async def test_measurement_rejections_report_indexes_without_echoing_candidate_s
     )
 
     assert result.status is ToolInvocationStatus.FAILED
-    assert [dict(item) for item in result.output["measurement_errors"]] == [
-        {"index": 0, "reason": "measurement_not_verified"},
-        {"index": 1, "reason": "measurement_shape_invalid"},
-    ]
+    measurement_errors = [dict(item) for item in result.output["measurement_errors"]]
+    assert measurement_errors[0] == {"index": 0, "reason": "measurement_not_verified"}
+    shape_error = measurement_errors[1]
+    assert shape_error["index"] == 1
+    assert shape_error["reason"] == "measurement_shape_invalid"
+    accepted_shapes = shape_error["accepted_shapes"]
+    assert [item["name"] for item in accepted_shapes] == ["content_pattern", "measurement"]
+    assert tuple(accepted_shapes[0]["keys"]) == ("content_pattern_id",)
+    assert tuple(accepted_shapes[1]["keys"]) == ("blob_id", "kind", "offset", "value")
+    assert accepted_shapes[0]["value_rule"] == ("exactly 64 lowercase hexadecimal characters")
+    assert accepted_shapes[1]["value_rule"] == (
+        "blob_id and kind are strings, offset is a non-negative integer, "
+        "and value is a non-empty string"
+    )
+    differences = shape_error["shape_differences"]
+    assert differences[0]["shape"] == "content_pattern"
+    assert tuple(differences[0]["missing_keys"]) == ("content_pattern_id",)
+    assert tuple(differences[0]["extra_keys"]) == ("unknown",)
+    assert differences[1]["shape"] == "measurement"
+    assert tuple(differences[1]["missing_keys"]) == ("blob_id", "kind", "offset", "value")
+    assert tuple(differences[1]["extra_keys"]) == ("unknown",)
     assert "PRIVATE-MEASUREMENT" not in result.message
     assert "PRIVATE-MEASUREMENT" not in repr(result.output)
     assert "PRIVATE-SHAPE" not in repr(result.output)
