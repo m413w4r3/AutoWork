@@ -21,8 +21,10 @@ Sources : code au HEAD ; mesures live en lecture seule sur l'enquête `5e90caa2-
 `(tool_name, schema_version, arguments JSON)` puis tronque à 128 pivots / 24 Kio (`:24-25`, `:339-351`).
 Mécanisme : l'ordre revient à l'ordre alphabétique du hash ; disponibles et bloqués sont mêlés ; aucune
 provenance ni couverture n'est exposée. Impact : la troncature (ou la pagination à 20) retire des pivots selon la valeur d'un hash.
-En M08 la limite de 128 n'a pas mordu (68 pivots) mais `available_pivots_truncated=true`
-(`research_context_builder.py:1396`, via les 512 observations sources). Correctif minimal : ordre explicite et
+En M08 la limite de 128 n'a pas mordu, mais **le plafond de 24 Kio a mordu** : la liste live de référence fait
+24 483 / 24 576 octets (68 pivots = 41 `vt.file_report`, 7 `vt.intelligence_search`, 20 `vt.relationships`),
+`available_pivots_truncated=true`. Les pivots IP/domaine/URL se classant après les hashes, **aucun des 13 IPv4,
+15 domaines et 6 URL de l'inventaire n'était atteignable** par l'opérateur (mesure du 2026-10-31, avant correctif). Correctif minimal : ordre explicite et
 explicable (disponible avant bloqué, puis lien à une observation source, puis récence), troncature après
 ordonnancement équitable par indicateur, et exposition de la provenance/couverture (faits, pas de score).
 
