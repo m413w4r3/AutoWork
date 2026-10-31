@@ -19,6 +19,7 @@ from cti_app.application.investigation_advisor_tools import (
     ADVISOR_REPARSE_SCHEMA_VERSION,
     ADVISOR_REPARSE_TOOL_NAME,
     ReparsePersistedAdvisorOutputTool,
+    _advisor_bridge_measurement_catalog,
     register_advisor_reparse_tool,
 )
 from cti_app.application.investigation_tools import InMemoryToolRegistry
@@ -150,24 +151,31 @@ def _harness(
     stored_parser_version: str = "advisor-source-parser.v3",
     reparse_context: dict | None = None,
     settings: object | None = None,
+    consultation_type: str = "draft_text",
+    input_refs: list[dict] | None = None,
+    measurement_catalog: list[dict] | None = None,
 ):
     investigation_id = uuid4()
     original_id = uuid4()
     invocation_id = str(uuid4())
-    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    selected_input_refs = input_refs or [
+        {"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}
+    ]
     output_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     raw_blob_id = uuid4()
     bridge_provenance = {
         "bridge_invocation_id": invocation_id,
         "bridge_invocation_id_kind": "conversation_turn",
         "input_sha256": "c" * 64,
-        "input_refs": input_refs,
+        "input_refs": selected_input_refs,
         "output_sha256": output_sha256,
         "provider_usage": {"status": "unknown"},
     }
+    if measurement_catalog is not None:
+        bridge_provenance["measurement_catalog"] = measurement_catalog
     output = {
         "schema": response_schema,
-        "consultation_type": "draft_text",
+        "consultation_type": consultation_type,
         "parser_version": stored_parser_version,
         "status": "succeeded",
         "usable": True,
@@ -177,19 +185,21 @@ def _harness(
     persisted = {
         "schema": "operator-advisor-call.v1",
         "advisor_response_schema": response_schema,
-        "consultation_type": "draft_text",
+        "consultation_type": consultation_type,
         "advisor_status": "succeeded",
         "bridge_invocation_id": invocation_id,
         "bridge_invocation_id_kind": "conversation_turn",
         "idempotency_key": "original-call-key",
         "input_sha256": "c" * 64,
-        "input_refs": input_refs,
+        "input_refs": selected_input_refs,
         "input_observation_refs": [],
         "input_source_refs": [],
         "output_sha256": output_sha256,
         "provider_usage": {"status": "unknown"},
         "output": output,
     }
+    if measurement_catalog is not None:
+        persisted["measurement_catalog"] = measurement_catalog
     if reparse_context is not None:
         persisted["reparse_context"] = reparse_context
     persisted_bytes = json.dumps(
@@ -205,7 +215,7 @@ def _harness(
         source_version="advisor-consult.v1",
         observed_at=datetime.now(UTC),
         object_type="advisor_call",
-        object_id="draft_text",
+        object_id=consultation_type,
     )
     recorder = Recorder()
     artifact_store = ArtifactStore(
@@ -256,6 +266,134 @@ async def test_legacy_v3_reparse_returns_full_advisory_text_without_new_observat
         raw_blob_id not in store.values
         or hashlib.sha256(store.values[raw_blob_id]).hexdigest() == output_sha256
     )
+
+
+@pytest.mark.asyncio
+async def test_v3_yara_reparse_persists_local_prose_normalization_with_v3_versions() -> None:
+    source = (
+        'rule ReparsedCandidate { strings: $marker = "SyntheticReparseMarker" '
+        "condition: $marker }\n"
+    )
+    raw = "Règle consultative basée sur la mesure.\n```yara\n" + source + "```\n"
+    measurement = {
+        "evidence_id": "observation:synthetic-1",
+        "evidence_sha256": "a" * 64,
+        "sample_sha256": "b" * 64,
+        "offset": 12,
+        "length": len(b"SyntheticReparseMarker"),
+        "kind": "string",
+        "encoding": "ascii",
+        "value": "SyntheticReparseMarker",
+        "measurement_id": "m001",
+    }
+    measurement_sha256 = hashlib.sha256(
+        json.dumps(measurement, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    input_refs = [
+        {"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64},
+        {"kind": "measurement", "id": "m001", "sha256": measurement_sha256},
+    ]
+    reparse_context = {
+        "consultation_type": "yara_draft",
+        "question": "Relier le motif à la mesure transmise.",
+        "measurements": [measurement],
+        "transmitted_refs": input_refs,
+    }
+    measurement_catalog = _advisor_bridge_measurement_catalog(reparse_context)
+    tool, recorder, original, context, output_sha256, _store, _raw_blob_id = _harness(
+        raw,
+        consultation_type="yara_draft",
+        input_refs=input_refs,
+        measurement_catalog=measurement_catalog,
+        reparse_context=reparse_context,
+    )
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["usable"] is True
+    assert result.output["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
+    assert result.output["output_sha256"] == output_sha256
+    assert result.output["new_observation_written"] is True
+    assert result.output["output"]["schema"] == "advisor-response.v3"
+    assert result.output["output"]["rule_source"] == source
+    assert result.output["output"]["motifs"][0]["measurement_refs"][0]["measurement_id"] == ("m001")
+    assert "parser_version_mismatch_raw_text_returned" not in result.output["warnings"]
+    assert len(recorder.calls) == 1
+    recorded = recorder.calls[0]
+    assert recorded["source_version"] == ADVISOR_SOURCE_PARSER_VERSION
+    assert recorded["payload"]["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
+    assert recorded["payload"]["output"]["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
+    assert recorded["payload"]["output"]["bridge_provenance"]["measurement_catalog"] == (
+        measurement_catalog
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_yara_reparse_rejects_measurement_catalog_hash_drift() -> None:
+    source = (
+        'rule ReparsedCandidate { strings: $marker = "SyntheticReparseMarker" '
+        "condition: $marker }\n"
+    )
+    raw = "Règle consultative basée sur la mesure.\n```yara\n" + source + "```\n"
+    measurement = {
+        "evidence_id": "observation:synthetic-1",
+        "evidence_sha256": "a" * 64,
+        "sample_sha256": "b" * 64,
+        "offset": 12,
+        "length": len(b"SyntheticReparseMarker"),
+        "kind": "string",
+        "encoding": "ascii",
+        "value": "SyntheticReparseMarker",
+        "measurement_id": "m001",
+    }
+    measurement_sha256 = hashlib.sha256(
+        json.dumps(measurement, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    input_refs = [
+        {"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64},
+        {"kind": "measurement", "id": "m001", "sha256": measurement_sha256},
+    ]
+    reparse_context = {
+        "consultation_type": "yara_draft",
+        "question": "Relier le motif à la mesure transmise.",
+        "measurements": [measurement],
+        "transmitted_refs": input_refs,
+    }
+    stale_catalog = _advisor_bridge_measurement_catalog(reparse_context)
+    stale_catalog[0]["sha256"] = measurement["evidence_sha256"]
+    tool, recorder, original, context, _output_sha256, _store, _raw_blob_id = _harness(
+        raw,
+        consultation_type="yara_draft",
+        input_refs=input_refs,
+        measurement_catalog=stale_catalog,
+        reparse_context=reparse_context,
+    )
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["usable"] is False
+    assert result.output["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
+    assert result.output["output"]["rule_source"] == source
+    assert result.output["output"]["motifs"] == ()
+    assert (
+        "$marker:measurement_reference_not_transmitted"
+        in result.output["output"]["normalization_errors"]
+    )
+    assert len(recorder.calls) == 1
 
 
 @pytest.mark.asyncio
