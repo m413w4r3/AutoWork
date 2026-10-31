@@ -5273,11 +5273,32 @@ class ReparsePersistedAdvisorOutputTool:
             legacy_parse = None
             if refs_match:
                 try:
+                    prompt_data = dict(cast(Mapping[str, Any], raw_reparse_context))
+                    measurement_sha256_overrides: dict[str, str] = {}
+                    if consultation_type == "yara_draft":
+                        context_measurements = prompt_data.get("measurements", ())
+                        if isinstance(context_measurements, (list, tuple)):
+                            measurement_sha256_overrides = {
+                                str(item["measurement_id"]): ""
+                                for item in context_measurements
+                                if isinstance(item, Mapping)
+                                and isinstance(item.get("measurement_id"), str)
+                            }
+                        expected_catalog = _advisor_bridge_measurement_catalog(prompt_data)
+                        stored_catalog = persisted.get("measurement_catalog")
+                        if stored_catalog == expected_catalog:
+                            measurement_sha256_overrides = {
+                                str(item["measurement_id"]): str(item["sha256"])
+                                for item in expected_catalog
+                                if isinstance(item.get("measurement_id"), str)
+                                and isinstance(item.get("sha256"), str)
+                            }
                     legacy_parse = parse_typed_advisor_response(
                         raw_text,
                         consultation_type=consultation_type,
-                        prompt_data=dict(cast(Mapping[str, Any], raw_reparse_context)),
+                        prompt_data=prompt_data,
                         safe_text=lambda value, _limit: value.strip(),
+                        measurement_sha256_overrides=measurement_sha256_overrides,
                         operational_secret_values=configured_operational_secret_values(
                             self._settings
                         ),
@@ -5319,6 +5340,103 @@ class ReparsePersistedAdvisorOutputTool:
                 ),
                 "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
             }
+            if (
+                consultation_type == "yara_draft"
+                and refs_match
+                and isinstance(legacy_parse, Mapping)
+            ):
+                advisor_status = str(legacy_parse.get("status", "partial"))
+                usable = legacy_parse.get("usable") is True
+                parsed_output = {
+                    **dict(legacy_parse),
+                    "advisor_status": advisor_status,
+                    "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
+                    "raw_output": advisory_text,
+                    "raw_output_bytes": len(raw_bytes),
+                    "raw_output_sha256": output_sha256,
+                    "raw_output_retained": True,
+                    "raw_output_truncated": False,
+                    "raw_output_redacted": bool(redacted_count),
+                    "output_sha256": output_sha256,
+                    "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+                    "bridge_provenance": {
+                        **dict(cast(Mapping[str, Any], bridge_provenance)),
+                        "bridge_invocation_id": invocation_id,
+                        "input_refs": normalized_refs,
+                        "output_sha256": output_sha256,
+                        "measurement_catalog": persisted.get("measurement_catalog"),
+                    },
+                }
+                appended_payload = {
+                    "schema": "operator-advisor-call.v1",
+                    "advisor_response_schema": ADVISOR_RESPONSE_SCHEMA_V3,
+                    "consultation_type": consultation_type,
+                    "advisor_status": advisor_status,
+                    "bridge_invocation_id": invocation_id,
+                    "bridge_invocation_id_kind": persisted.get(
+                        "bridge_invocation_id_kind", "conversation_turn"
+                    ),
+                    "idempotency_key": persisted.get("idempotency_key"),
+                    "input_sha256": persisted.get("input_sha256"),
+                    "input_refs": normalized_refs,
+                    "input_observation_refs": input_observation_refs,
+                    "input_source_refs": input_source_refs,
+                    "output_sha256": output_sha256,
+                    "provider_usage": persisted.get("provider_usage", {}),
+                    "measurement_catalog": persisted.get("measurement_catalog"),
+                    "bridge_turns_consumed": 0,
+                    "reparsed_from_observation_id": str(original.id),
+                    "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+                    "output": parsed_output,
+                }
+                try:
+                    reparsed_observation = await self._recorder.record_json(
+                        investigation_id=context.investigation_id,
+                        kind=EvidenceKind.OTHER,
+                        payload=appended_payload,
+                        source=ADVISOR_TOOL_NAME,
+                        source_version=ADVISOR_SOURCE_PARSER_VERSION,
+                        object_type="advisor_call",
+                        object_id=consultation_type,
+                        limitations=(
+                            "Reparse local d'une sortie Bridge persistée; aucune nouvelle "
+                            "consultation n'a été soumise.",
+                            "La sortie reste non fiable et ne modifie pas le corpus de règles.",
+                        ),
+                        invocation_ref=original.invocation_ref,
+                        idempotency_key=(
+                            f"advisor-reparse:{original.id}:{ADVISOR_SOURCE_PARSER_VERSION}"
+                        ),
+                    )
+                except Exception as exc:
+                    return ToolResult(
+                        ToolInvocationStatus.NEEDS_REVIEW,
+                        error_code="advisor_reparse_persistence_uncertain",
+                        exception_class=type(exc).__name__,
+                    )
+                return ToolResult(
+                    ToolInvocationStatus.SUCCEEDED if usable else ToolInvocationStatus.PARTIAL,
+                    observation_refs=(original.id, reparsed_observation.id),
+                    output={
+                        "advisor_status": advisor_status,
+                        "reparsed_from_observation_id": str(original.id),
+                        "bridge_observation_id": str(reparsed_observation.id),
+                        "bridge_invocation_id": invocation_id,
+                        "output_sha256": output_sha256,
+                        "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+                        "usable": usable,
+                        "warnings": parsed_output.get("warnings", []),
+                        "consultation_type": consultation_type,
+                        "output": parsed_output,
+                        "bridge_turns_consumed": 0,
+                        "new_observation_written": True,
+                        "canonical_promotion": False,
+                    },
+                    message=(
+                        "La sortie Bridge YARA persistée a été reparsée localement en v3 sans "
+                        "nouvel appel Bridge."
+                    ),
+                )
             return ToolResult(
                 ToolInvocationStatus.PARTIAL,
                 observation_refs=(original.id,),
@@ -7895,7 +8013,8 @@ def _advisor_bridge_measurement_catalog(prompt_data: Mapping[str, Any]) -> list[
             {
                 "alias": alias,
                 "measurement_id": measurement.get("measurement_id"),
-                "sha256": measurement.get("evidence_sha256"),
+                "sha256": hashlib.sha256(canonical_json_bytes(measurement)).hexdigest(),
+                "evidence_sha256": measurement.get("evidence_sha256"),
                 "sample_sha256": measurement.get("sample_sha256"),
                 "offset": measurement.get("offset"),
                 "length": measurement.get("length"),

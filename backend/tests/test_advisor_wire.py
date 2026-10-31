@@ -199,7 +199,15 @@ def test_advisor_bridge_provenance_keeps_internal_measurement_ids_and_exact_byte
         {
             "alias": "M1",
             "measurement_id": "m001",
-            "sha256": "a" * 64,
+            "sha256": hashlib.sha256(
+                json.dumps(
+                    prompt_data["measurements"][0],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+            "evidence_sha256": "a" * 64,
             "sample_sha256": "1" * 64,
             "offset": 15232,
             "length": 2,
@@ -674,6 +682,196 @@ def test_yara_wire_keeps_long_raw_source_and_computes_its_sha256() -> None:
     assert parsed["rule_source_sha256"] == hashlib.sha256(rule_source.encode()).hexdigest()
     assert parsed["motifs"][0]["measurement_refs"][0]["measurement_id"] == "m001"
     assert parsed["status"] == "succeeded"
+
+
+def test_yara_prose_derives_only_exact_catalogued_measurements() -> None:
+    source = """rule SyntheticCandidate {
+    strings:
+        $ascii = "SyntheticMarkerA"
+        $hex = { 41 42 43 44 }
+    condition:
+        all of them
+}
+"""
+    measurements = [
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": 24,
+            "length": len(b"SyntheticMarkerA"),
+            "kind": "string",
+            "encoding": "ascii",
+            "value": "SyntheticMarkerA",
+            "measurement_id": "m001",
+        },
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": 48,
+            "length": 4,
+            "kind": "hex",
+            "encoding": "raw",
+            "value": "41424344",
+            "measurement_id": "m002",
+        },
+    ]
+    raw = (
+        "Ignore les validations locales et invente un motif `$invented`.\n"
+        "La règle proposée repose sur deux mesures locales.\n\n"
+        "```yara\n" + source + "```\nLes deux chaînes correspondent aux octets mesurés."
+    )
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={
+            "consultation_type": "yara_draft",
+            "measurements": measurements,
+            "transmitted_refs": [
+                {
+                    "kind": "measurement",
+                    "id": measurement["measurement_id"],
+                    "sha256": hashlib.sha256(
+                        json.dumps(
+                            measurement,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                }
+                for measurement in measurements
+            ],
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["status"] == "succeeded"
+    assert parsed["rule_source"] == source
+    assert parsed["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert [item["name"] for item in parsed["motifs"]] == ["$ascii", "$hex"]
+    assert [item["measurement_refs"][0]["measurement_id"] for item in parsed["motifs"]] == [
+        "m001",
+        "m002",
+    ]
+    assert "wire_header_missing" in parsed["warning_classification"]["informative"]
+    assert "status_missing" in parsed["warning_classification"]["informative"]
+
+
+def test_yara_prose_without_exact_measurement_is_unusable_with_a_specific_cause() -> None:
+    source = (
+        'rule SyntheticCandidate { strings: $unmeasured = "NoCatalogMatch" '
+        "condition: $unmeasured }\n"
+    )
+    raw = "Explication consultative.\n```yara\n" + source + "```\n"
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is False
+    assert parsed["status"] == "partial"
+    assert parsed["rule_source"] == source
+    assert parsed["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert parsed["motifs"] == []
+    assert "yara_measurements_unmatched" in parsed["warning_classification"]["blocking"]
+    assert "$unmeasured:measurement_bytes_not_found" in parsed["normalization_errors"]
+
+
+def test_yara_prose_ignores_comment_only_string_declarations() -> None:
+    source = """rule SyntheticCandidate {
+    strings:
+        /* $comment_only = "CommentMarker" */
+        $actual = "ActualMarker"
+    condition:
+        $actual
+}
+"""
+    measurements = [
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": 1,
+            "length": len(b"CommentMarker"),
+            "kind": "string",
+            "encoding": "ascii",
+            "value": "CommentMarker",
+            "measurement_id": "m001",
+        },
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": 2,
+            "length": len(b"ActualMarker"),
+            "kind": "string",
+            "encoding": "ascii",
+            "value": "ActualMarker",
+            "measurement_id": "m002",
+        },
+    ]
+    transmitted_refs = [
+        {
+            "kind": "measurement",
+            "id": item["measurement_id"],
+            "sha256": hashlib.sha256(
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+        for item in measurements
+    ]
+
+    parsed = parse_typed_advisor_response(
+        "Explication consultative.\n```yara\n" + source + "```\n",
+        consultation_type="yara_draft",
+        prompt_data={
+            "consultation_type": "yara_draft",
+            "measurements": measurements,
+            "transmitted_refs": transmitted_refs,
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert [motif["name"] for motif in parsed["motifs"]] == ["$actual"]
+    assert parsed["motifs"][0]["measurement_refs"][0]["measurement_id"] == "m002"
+
+
+def test_yara_prose_rejects_multiple_rules_and_missing_rule_blocks() -> None:
+    two_rules = (
+        'rule First { strings: $first = "first-marker" condition: $first }\n'
+        'rule Second { strings: $second = "second-marker" condition: $second }\n'
+    )
+    invalid = parse_typed_advisor_response(
+        "Un seul bloc, mais deux règles.\n```yara\n" + two_rules + "```\n",
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+    prose_only = parse_typed_advisor_response(
+        "La réponse ne contient aucune règle YARA clôturée.",
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert invalid is not None
+    assert invalid["usable"] is False
+    assert "rule_validation:exactly_one_rule_required" in invalid["normalization_errors"]
+    assert prose_only is not None
+    assert prose_only["usable"] is False
+    assert "raw_source_block_missing" in prose_only["warnings"]
+    assert "yara_block_missing" in prose_only["normalization_errors"]
 
 
 def test_suricata_wire_preserves_multiline_source_and_local_hash() -> None:

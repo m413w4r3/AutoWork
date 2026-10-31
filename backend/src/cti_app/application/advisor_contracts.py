@@ -14,6 +14,12 @@ from cti_app.application.advisor_wire import (
     parse_advisor_wire,
 )
 from cti_app.application.publication_secret_guard import redact_explicit_operational_secrets
+from cti_app.application.rule_workbench import validate_single_rule_candidate
+from cti_app.application.yara_measurements import (
+    exact_yara_string_bytes,
+    measurement_value_bytes,
+    yara_string_names,
+)
 from cti_app.domain.advisor_figure_plan import AdvisorFigurePlanV1
 
 ADVISOR_RESPONSE_SCHEMA_V3 = "advisor-response.v3"
@@ -772,6 +778,14 @@ def _classify_advisor_warnings(result: dict[str, Any] | None) -> dict[str, Any] 
     classified = dict(result)
     warnings = classified.get("warnings", [])
     classification = _warning_classification(warnings)
+    if (
+        classified.get("consultation_type") == "yara_draft"
+        and classified.get("normalization_method") == "local_yara_prose_v1"
+    ):
+        for warning in ("status_missing",):
+            if warning in classification["blocking"]:
+                classification["blocking"].remove(warning)
+                classification["informative"].append(warning)
     if classified.get("consultation_type") == "review_text":
         reference_warnings = [
             item for item in classification["blocking"] if item in _REVIEW_STATUS_NEUTRAL_WARNINGS
@@ -1091,6 +1105,154 @@ def _unique_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def _normalize_prose_yara_wire(
+    *,
+    common: Mapping[str, Any],
+    source: str | None,
+    source_count: int,
+    source_language: str | None,
+    aliases: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    prompt_data: Mapping[str, Any],
+    safe_text: Callable[[str, int], str],
+    warnings: list[str],
+    measurement_sha256_overrides: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """Derive YARA motif links from source bytes and transmitted measurements only."""
+
+    def warn(code: str) -> None:
+        if code not in warnings:
+            warnings.append(code)
+
+    normalization_errors: list[str] = []
+    if source_count > 1:
+        warn("raw_source_multiple_blocks")
+        normalization_errors.append("exactly_one_yara_block_required")
+        source = None
+    elif source is None:
+        warn("raw_source_block_missing")
+        normalization_errors.append("yara_block_missing")
+    elif source_language != "yara":
+        warn("raw_source_language_mismatch")
+        normalization_errors.append("yara_block_language_mismatch")
+        source = None
+    if source is not None and safe_text(source, len(source) + 1).strip() != source.strip():
+        warn("raw_source_contains_filtered_content")
+        normalization_errors.append("yara_source_filtered_by_local_safety_check")
+        source = None
+
+    source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest() if source is not None else None
+    motifs: list[dict[str, Any]] = []
+    source_names = yara_string_names(source) if source is not None else ()
+    source_issues = validate_single_rule_candidate(source) if source is not None else ()
+    if source_issues:
+        warn("yara_rule_validation_failed")
+        normalization_errors.extend(f"rule_validation:{issue}" for issue in source_issues)
+
+    transmitted_measurements = {
+        (str(item.get("id")), str(item.get("sha256")))
+        for item in prompt_data.get("transmitted_refs", ())
+        if isinstance(item, Mapping)
+        and item.get("kind") == "measurement"
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("sha256"), str)
+    }
+    unmatched_names: list[str] = []
+    if source is not None and not source_issues:
+        for name in source_names:
+            actual_bytes = exact_yara_string_bytes(source, name)
+            matched_refs: list[dict[str, str]] = []
+            exact_but_untransmitted = False
+            if actual_bytes is not None:
+                for alias, measurement in aliases.get("measurements", {}).items():
+                    measurement_id = measurement.get("measurement_id")
+                    evidence_sha256 = measurement.get("evidence_sha256")
+                    sample_sha256 = measurement.get("sample_sha256")
+                    offset = measurement.get("offset")
+                    length = measurement.get("length")
+                    if (
+                        re.fullmatch(r"M[1-9][0-9]*", alias) is None
+                        or not isinstance(measurement_id, str)
+                        or re.fullmatch(r"m[0-9]{3}", measurement_id) is None
+                        or not isinstance(evidence_sha256, str)
+                        or re.fullmatch(_SHA256, evidence_sha256) is None
+                        or not isinstance(sample_sha256, str)
+                        or re.fullmatch(_SHA256, sample_sha256) is None
+                        or isinstance(offset, bool)
+                        or not isinstance(offset, int)
+                        or offset < 0
+                        or isinstance(length, bool)
+                        or not isinstance(length, int)
+                        or length < 1
+                    ):
+                        continue
+                    measured_bytes = measurement_value_bytes(measurement)
+                    if measured_bytes != actual_bytes:
+                        continue
+                    measurement_sha256 = (measurement_sha256_overrides or {}).get(measurement_id)
+                    if measurement_sha256 is None:
+                        measurement_sha256 = hashlib.sha256(
+                            json.dumps(
+                                measurement,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    identity = (measurement_id, measurement_sha256)
+                    if identity not in transmitted_measurements:
+                        exact_but_untransmitted = True
+                        continue
+                    matched_refs.append(
+                        {"measurement_id": measurement_id, "sha256": measurement_sha256}
+                    )
+            if matched_refs:
+                motifs.append({"name": name, "measurement_refs": matched_refs})
+            else:
+                unmatched_names.append(name)
+                reason = (
+                    "measurement_reference_not_transmitted"
+                    if exact_but_untransmitted
+                    else "measurement_bytes_not_found"
+                )
+                normalization_errors.append(f"{name}:{reason}")
+
+    if unmatched_names:
+        warn("yara_measurements_unmatched")
+    if source is not None and not source_names:
+        warn("yara_strings_missing")
+        normalization_errors.append("yara_strings_missing")
+    warn("invariants_missing")
+
+    usable = (
+        source is not None
+        and not source_issues
+        and bool(source_names)
+        and not unmatched_names
+        and len(motifs) == len(source_names)
+    )
+    if not usable and not normalization_errors:
+        normalization_errors.append("local_yara_normalization_incomplete")
+    limitations = [
+        "La règle et ses liens de mesure restent consultatifs; "
+        "compilation, tests et revue humaine sont requis."
+    ]
+    limitations.extend(f"Wire recovery: {item}." for item in warnings)
+    return {
+        **common,
+        "status": "succeeded" if usable else "partial",
+        "rule_source": source,
+        "rule_source_sha256": source_hash,
+        "motifs": motifs,
+        "invariants": [],
+        "limitations": limitations,
+        "normalization_status": "complete" if usable else "partial",
+        "normalization_method": "local_yara_prose_v1",
+        "normalization_errors": normalization_errors,
+        "warnings": warnings,
+        "usable": usable,
+    }
+
+
 def _parse_typed_advisor_wire(
     raw: str,
     *,
@@ -1250,6 +1412,19 @@ def _parse_typed_advisor_wire(
         "consultation_type": consultation_type,
         "untrusted": True,
     }
+
+    if consultation_type == "yara_draft" and not document.has_header:
+        return _normalize_prose_yara_wire(
+            common=common,
+            source=document.source,
+            source_count=document.source_count,
+            source_language=document.source_language,
+            aliases=aliases,
+            prompt_data=prompt_data,
+            safe_text=safe_text,
+            warnings=warnings,
+            measurement_sha256_overrides=measurement_sha256_overrides,
+        )
 
     if consultation_type == "review_text":
         requested_units = prompt_data.get("units")

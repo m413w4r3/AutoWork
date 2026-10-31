@@ -52,6 +52,13 @@ from cti_app.application.rule_workbench import (
     validate_single_rule_candidate,
 )
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
+from cti_app.application.yara_measurements import (
+    exact_yara_string_bytes as _exact_yara_string_bytes,
+)
+from cti_app.application.yara_measurements import (
+    measurement_value_bytes as _bridge_measurement_bytes,
+)
+from cti_app.application.yara_measurements import yara_string_names
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.code_features import CodeFeatureSet
 from cti_app.domain.goodware import GoodwareFeature
@@ -1232,7 +1239,13 @@ class _RuleTools:
                     else None
                 )
             except Exception as exc:
-                raise _ToolFailed("bridge_yara_reparse_link_unverified") from exc
+                raise _ToolFailed(
+                    "bridge_yara_reparse_original_unreadable",
+                    agent_message=(
+                        "The original advisor observation could not be read. Reparse the original "
+                        "advisor call and retry with its linked observation."
+                    ),
+                ) from exc
             original_output = (
                 original_payload.get("output") if isinstance(original_payload, Mapping) else None
             )
@@ -1253,46 +1266,138 @@ class _RuleTools:
                 or not isinstance(original_payload, Mapping)
                 or original_payload.get("schema") != "operator-advisor-call.v1"
                 or original_payload.get("reparsed_from_observation_id") is not None
-                or original_payload.get("output_sha256") != persisted.get("output_sha256")
-                or original_payload.get("input_refs") != persisted.get("input_refs")
-                or original_payload.get("measurement_catalog")
-                != persisted.get("measurement_catalog")
-                or original_payload.get("bridge_invocation_id") != persisted_invocation_id
-                or not isinstance(original_provenance, Mapping)
-                or original_provenance.get("bridge_invocation_id") != persisted_invocation_id
-                or original_provenance.get("output_sha256") != persisted.get("output_sha256")
-                or not isinstance(bridge_provenance, Mapping)
-                or original_provenance.get("measurement_catalog")
-                != bridge_provenance.get("measurement_catalog")
-                or not isinstance(output, Mapping)
+            ):
+                raise _ToolFailed(
+                    "bridge_yara_reparse_original_invalid",
+                    agent_message=(
+                        "The reparsed result does not link to a valid original YARA advisor call. "
+                        "Use advisor.reparse on the original advisor observation."
+                    ),
+                )
+            if original_payload.get("output_sha256") != persisted.get("output_sha256"):
+                raise _ToolFailed(
+                    "bridge_yara_reparse_output_hash_mismatch",
+                    agent_message=(
+                        "The reparsed result and original advisor call have different output "
+                        "hashes. Reparse the original call again."
+                    ),
+                )
+            if original_payload.get("input_refs") != persisted.get("input_refs"):
+                raise _ToolFailed(
+                    "bridge_yara_reparse_input_refs_mismatch",
+                    agent_message=(
+                        "The reparsed result changed the original input references. Reparse the "
+                        "original call without changing its input context."
+                    ),
+                )
+            if original_payload.get("measurement_catalog") != persisted.get("measurement_catalog"):
+                raise _ToolFailed(
+                    "bridge_yara_measurement_catalog_mismatch",
+                    agent_message=(
+                        "The reparsed result has a different measurement catalog. Reparse the "
+                        "original call with its stored catalog."
+                    ),
+                )
+            if original_payload.get("bridge_invocation_id") != persisted_invocation_id:
+                raise _ToolFailed("bridge_yara_invocation_id_mismatch")
+            if not isinstance(original_provenance, Mapping):
+                raise _ToolFailed("bridge_yara_original_provenance_missing")
+            if original_provenance.get("bridge_invocation_id") != persisted_invocation_id:
+                raise _ToolFailed("bridge_yara_invocation_id_mismatch")
+            if original_provenance.get("output_sha256") != persisted.get("output_sha256"):
+                raise _ToolFailed("bridge_yara_reparse_output_hash_mismatch")
+            if not isinstance(bridge_provenance, Mapping):
+                raise _ToolFailed("bridge_yara_provenance_missing")
+            if original_provenance.get("measurement_catalog") != bridge_provenance.get(
+                "measurement_catalog"
+            ):
+                raise _ToolFailed("bridge_yara_measurement_catalog_mismatch")
+            if (
+                not isinstance(output, Mapping)
                 or output.get("status") not in {"partial", "succeeded"}
                 or output.get("advisor_status") not in {"partial", "succeeded"}
                 or persisted.get("advisor_status") not in {"partial", "succeeded"}
             ):
-                raise _ToolFailed("bridge_yara_reparse_link_unverified")
+                raise _ToolFailed("bridge_yara_advisor_status_not_succeeded")
             parse_status_allowed = True
+        if persisted.get("schema") != "operator-advisor-call.v1":
+            raise _ToolFailed("bridge_yara_observation_schema_mismatch")
         if (
-            persisted.get("schema") != "operator-advisor-call.v1"
-            or persisted.get("consultation_type") != "yara_draft"
-            or not parse_status_allowed
-            or persisted.get("advisor_response_schema") != "advisor-response.v3"
+            persisted.get("advisor_response_schema") != "advisor-response.v3"
             or not isinstance(output, Mapping)
             or output.get("schema") != "advisor-response.v3"
-            or output.get("consultation_type") != "yara_draft"
-            or output.get("usable") is not True
-            or not isinstance(bridge_provenance, Mapping)
-            or bridge_provenance.get("bridge_invocation_id") != str(requested_invocation_id)
-            or bridge_provenance.get("measurement_catalog") != persisted.get("measurement_catalog")
-            or (
-                reparsed
-                and (
-                    bridge_provenance.get("output_sha256") != persisted.get("output_sha256")
-                    or bridge_provenance.get("input_refs") != persisted.get("input_refs")
-                )
-            )
-            or persisted_invocation_id != str(requested_invocation_id)
         ):
-            raise _ToolFailed("bridge_yara_provenance_not_succeeded")
+            raise _ToolFailed(
+                "bridge_yara_response_schema_mismatch",
+                agent_message=(
+                    "The advisor result does not use advisor-response.v3. Reparse the persisted "
+                    "advisor output with the v3 parser before proposing it."
+                ),
+            )
+        if (
+            persisted.get("consultation_type") != "yara_draft"
+            or output.get("consultation_type") != "yara_draft"
+        ):
+            raise _ToolFailed(
+                "bridge_yara_consultation_type_mismatch",
+                agent_message="Provide a persisted yara_draft advisor consultation.",
+            )
+        if output.get("usable") is not True:
+            raw_classification = output.get("warning_classification")
+            raw_blocking = (
+                raw_classification.get("blocking")
+                if isinstance(raw_classification, Mapping)
+                else None
+            )
+            raw_warnings = output.get("warnings")
+            blocking_warnings = (
+                [item for item in raw_blocking if isinstance(item, str)]
+                if isinstance(raw_blocking, Sequence) and not isinstance(raw_blocking, str | bytes)
+                else [item for item in raw_warnings if isinstance(item, str)]
+                if isinstance(raw_warnings, Sequence) and not isinstance(raw_warnings, str | bytes)
+                else []
+            )
+            raise _ToolFailed(
+                "bridge_yara_output_unusable",
+                agent_message=(
+                    "The local advisor normalization marked this YARA output unusable. Inspect "
+                    "its blocking warnings and ensure every rule string matches a transmitted "
+                    "measurement exactly; reparse after correcting the stored parse context."
+                ),
+                diagnostic={"blocking_warnings": blocking_warnings},
+            )
+        if not parse_status_allowed:
+            raise _ToolFailed(
+                "bridge_yara_advisor_status_not_succeeded",
+                agent_message=(
+                    "The advisor parse status is not succeeded. Reparse the original YARA "
+                    "response and resolve its normalization warnings."
+                ),
+            )
+        if not isinstance(bridge_provenance, Mapping):
+            raise _ToolFailed("bridge_yara_provenance_missing")
+        if persisted_invocation_id != str(requested_invocation_id) or bridge_provenance.get(
+            "bridge_invocation_id"
+        ) != str(requested_invocation_id):
+            raise _ToolFailed(
+                "bridge_yara_invocation_id_mismatch",
+                agent_message=(
+                    "The requested invocation ID does not match this advisor call. Use the "
+                    "bridge_invocation_id persisted on the selected observation."
+                ),
+            )
+        if bridge_provenance.get("measurement_catalog") != persisted.get("measurement_catalog"):
+            raise _ToolFailed(
+                "bridge_yara_measurement_catalog_mismatch",
+                agent_message=(
+                    "The advisor provenance and persisted measurement catalogs differ. Reparse "
+                    "the original call without changing its catalog."
+                ),
+            )
+        if reparsed and bridge_provenance.get("output_sha256") != persisted.get("output_sha256"):
+            raise _ToolFailed("bridge_yara_reparse_output_hash_mismatch")
+        if reparsed and bridge_provenance.get("input_refs") != persisted.get("input_refs"):
+            raise _ToolFailed("bridge_yara_reparse_input_refs_mismatch")
         if output.get("truncation_status") or output.get("truncated") is True:
             raise _ToolFailed("bridge_yara_source_truncated")
         source = output.get("rule_source")
@@ -1437,13 +1542,7 @@ class _RuleTools:
                     observation_refs=observation_refs,
                 )
             )
-        source_strings = re.search(r"(?is)\bstrings\s*:\s*(.*?)\bcondition\s*:", source)
-        source_names = set(
-            re.findall(
-                r"(\$[A-Za-z_][A-Za-z0-9_]*)\s*=",
-                source_strings.group(1) if source_strings else "",
-            )
-        )
+        source_names = set(yara_string_names(source))
         condition_match = re.search(r"(?is)\bcondition\s*:\s*(.*?)(?:\}\s*)?$", source)
         condition_text = condition_match.group(1) if condition_match else ""
         condition_names = set(re.findall(r"\$[A-Za-z_][A-Za-z0-9_]*", condition_text))
@@ -4038,101 +4137,6 @@ def _bridge_measurement_catalog(
             return None
         result[identity] = row
     return result or None
-
-
-def _bridge_measurement_bytes(row: Mapping[str, Any] | None) -> bytes | None:
-    if row is None:
-        return None
-    value = row.get("value")
-    kind = row.get("kind")
-    encoding = row.get("encoding")
-    if not isinstance(value, str) or not isinstance(kind, str) or not isinstance(encoding, str):
-        return None
-    try:
-        if kind == "hex" or encoding == "raw":
-            compact = "".join(value.split())
-            if not compact or len(compact) % 2 or re.fullmatch(r"[0-9a-fA-F]+", compact) is None:
-                return None
-            measured = bytes.fromhex(compact)
-        elif kind == "wide" or encoding in {"wide", "utf16le"}:
-            measured = value.encode("utf-16le", errors="strict")
-        elif encoding == "ascii":
-            measured = value.encode("ascii", errors="strict")
-        elif encoding in {"utf8", "utf-8"}:
-            measured = value.encode("utf-8", errors="strict")
-        else:
-            return None
-    except (UnicodeEncodeError, ValueError):
-        return None
-    return measured if len(measured) == row.get("length") else None
-
-
-def _exact_yara_string_bytes(source: str, identifier: str) -> bytes | None:
-    strings_match = re.search(r"(?is)\bstrings\s*:(.*?)\bcondition\s*:", source)
-    if strings_match is None:
-        return None
-    declaration = re.compile(
-        rf'(?s){re.escape(identifier)}\s*=\s*(\{{.*?\}}|"(?:\\.|[^"\\])*"|/(?:\\.|[^/\\])*/)([^\r\n]*)'
-    )
-    matches = list(declaration.finditer(strings_match.group(1)))
-    if len(matches) != 1:
-        return None
-    pattern, raw_modifiers = matches[0].groups()
-    modifiers = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", raw_modifiers, flags=re.S)
-    modifier_set = set(modifiers.split())
-    if pattern.startswith("{"):
-        body = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", pattern[1:-1], flags=re.S)
-        byte_pairs = body.split()
-        if not byte_pairs or any(
-            re.fullmatch(r"[0-9a-fA-F]{2}", item) is None for item in byte_pairs
-        ):
-            return None
-        if modifier_set:
-            return None
-        return bytes.fromhex("".join(byte_pairs))
-    if not pattern.startswith('"') or modifier_set - {"ascii", "wide", "fullword"}:
-        return None
-    decoded = _decode_yara_string_literal(pattern)
-    if decoded is None or {"ascii", "wide"}.issubset(modifier_set):
-        return None
-    text, raw_bytes = decoded
-    if "wide" in modifier_set:
-        return text.encode("utf-16le", errors="strict")
-    return raw_bytes
-
-
-def _decode_yara_string_literal(literal: str) -> tuple[str, bytes] | None:
-    if len(literal) < 2 or literal[0] != '"' or literal[-1] != '"':
-        return None
-    text: list[str] = []
-    index = 1
-    while index < len(literal) - 1:
-        character = literal[index]
-        index += 1
-        if character != "\\":
-            text.append(character)
-            continue
-        if index >= len(literal) - 1:
-            return None
-        escape = literal[index]
-        index += 1
-        escaped = {"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}.get(escape)
-        if escaped is not None:
-            text.append(escaped)
-            continue
-        if escape == "x" and index + 2 <= len(literal) - 1:
-            digits = literal[index : index + 2]
-            if re.fullmatch(r"[0-9a-fA-F]{2}", digits) is None:
-                return None
-            text.append(chr(int(digits, 16)))
-            index += 2
-            continue
-        return None
-    decoded = "".join(text)
-    try:
-        return decoded, decoded.encode("utf-8", errors="strict")
-    except UnicodeEncodeError:
-        return None
 
 
 def _safe_rule_test_diagnostic_reason(value: str) -> str:

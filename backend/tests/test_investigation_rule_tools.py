@@ -13,8 +13,15 @@ from uuid import UUID, uuid4, uuid5
 
 import pytest
 
-from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
+from cti_app.application.advisor_contracts import (
+    ADVISOR_SOURCE_PARSER_VERSION,
+    parse_typed_advisor_response,
+)
 from cti_app.application.bridge_investigator import BridgeInvestigator, ScriptedTurnTransport
+from cti_app.application.investigation_advisor_tools import (
+    _advisor_bridge_measurement_catalog,
+    _safe_text,
+)
 from cti_app.application.investigation_persistence import (
     InMemoryDetectionCandidateRepository,
     InMemoryEvidenceObservationRepository,
@@ -748,6 +755,146 @@ async def _bridge_yara_observation(
         idempotency_key=f"bridge-yara:{invocation_id}",
     )
     return observation.id, invocation_id, source_sha256
+
+
+@pytest.mark.asyncio
+async def test_prose_yara_local_normalization_produces_acceptable_bridge_provenance() -> None:
+    source = """rule SyntheticCandidate {
+    strings:
+        $ascii = "SyntheticMarkerA"
+        $hex = { 41 42 43 44 }
+    condition:
+        all of them
+}
+"""
+    measurements = [
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": 24,
+            "length": len(b"SyntheticMarkerA"),
+            "kind": "string",
+            "encoding": "ascii",
+            "value": "SyntheticMarkerA",
+            "measurement_id": "m001",
+        },
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": 48,
+            "length": 4,
+            "kind": "hex",
+            "encoding": "raw",
+            "value": "41424344",
+            "measurement_id": "m002",
+        },
+    ]
+    transmitted_refs = [
+        {
+            "kind": "measurement",
+            "id": item["measurement_id"],
+            "sha256": hashlib.sha256(
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+        for item in measurements
+    ]
+    prompt_data = {
+        "consultation_type": "yara_draft",
+        "measurements": measurements,
+        "transmitted_refs": transmitted_refs,
+    }
+    parsed = parse_typed_advisor_response(
+        "Règle consultative.\n```yara\n" + source + "```\n",
+        consultation_type="yara_draft",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+    assert parsed is not None and parsed["usable"] is True
+    measurement_catalog = _advisor_bridge_measurement_catalog(prompt_data)
+    assert [item["sha256"] for item in measurement_catalog] == [
+        item["sha256"] for item in transmitted_refs
+    ]
+
+    harness = _harness(samples={})
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness,
+        source=source,
+        measurement_catalog=measurement_catalog,
+        motifs=parsed["motifs"],
+    )
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["bridge_invocation_id"] == str(invocation_id)
+    assert proposed.output["source_sha256"] == source_sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("response_schema", "bridge_yara_response_schema_mismatch"),
+        ("unusable", "bridge_yara_output_unusable"),
+        ("invocation_id", "bridge_yara_invocation_id_mismatch"),
+        ("measurement_catalog", "bridge_yara_measurement_catalog_mismatch"),
+    ],
+)
+async def test_bridge_yara_provenance_failures_have_distinct_actionable_codes(
+    failure: str, expected_code: str
+) -> None:
+    harness = _harness(samples={})
+    source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+    observation = await harness.evidence.repository.get(observation_id)
+    assert observation is not None
+    payload = harness.evidence.payloads[observation.blob_id]
+    output = payload["output"]
+    requested_invocation_id = invocation_id
+    if failure == "response_schema":
+        payload["advisor_response_schema"] = "advisor-response.v4"
+    elif failure == "unusable":
+        output["usable"] = False
+        output["warnings"] = ["yara_measurements_unmatched"]
+        output["warning_classification"] = {
+            "blocking": ["yara_measurements_unmatched"],
+            "informative": [],
+        }
+    elif failure == "invocation_id":
+        requested_invocation_id = uuid4()
+    else:
+        output["bridge_provenance"]["measurement_catalog"] = []
+
+    rejected = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(requested_invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == expected_code
+    if failure == "unusable":
+        assert tuple(rejected.output["diagnostic"]["blocking_warnings"]) == (
+            "yara_measurements_unmatched",
+        )
 
 
 @pytest.mark.asyncio
