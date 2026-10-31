@@ -1199,6 +1199,13 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
     ]
     assert unverified_reconciliation["path"].endswith(f"/invocations/{passive.id}/reconcile")
     assert unverified_reconciliation["requires_verified_human_operator"] is True
+    assert unverified_registry_view["next_idempotent_action"]["path"].endswith(
+        f"/invocations/{passive.id}/reconcile"
+    )
+    assert (
+        unverified_registry_view["next_idempotent_action"]["requires_verified_human_operator"]
+        is True
+    )
     assert view["next_idempotent_action"]["path"].endswith(
         f"/operator/invocations/{passive.id}/reconcile"
     )
