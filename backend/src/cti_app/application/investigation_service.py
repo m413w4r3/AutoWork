@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid5
 
 from cti_app.application.analyst_handoff import AnalystHandoffPolicy, AnalystPostSynthesisService
@@ -67,6 +67,7 @@ from cti_app.application.investigation_tools import (
     tool_operation_cache_identity,
 )
 from cti_app.application.investigation_vt_tools import (
+    VT_PASSIVE_RETRY_TOOL_NAMES,
     VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
     _normalize_object_id,
     is_trusted_vt_passive_read_adapter,
@@ -3132,6 +3133,7 @@ class InvestigationService:
         response_refs: tuple[UUID, ...] = (),
         expected_version: int | None = None,
         idempotency_key: str | None = None,
+        actor_provenance: Literal["operator_client"] | None = None,
     ) -> ToolInvocation:
         if not actor.strip() or not reason.strip():
             raise ValueError("Invocation reconciliation requires an actor and reason")
@@ -3140,20 +3142,51 @@ class InvestigationService:
         invocation = await self._invocations.get(invocation_id)
         if invocation is None or invocation.investigation_id != investigation_id:
             raise LookupError("Tool invocation does not belong to the investigation")
+        if actor_provenance is not None and invocation.tool_name not in VT_PASSIVE_RETRY_TOOL_NAMES:
+            raise ValueError("Operator-client reconciliation is limited to passive VT reads")
         refs = await self._valid_observation_refs(investigation_id, tuple(response_refs))
         if len(refs) != len(set(response_refs)):
             raise ValueError("Reconciliation response references must exist in this investigation")
         if outcome is not InvocationReconciliationOutcome.EXECUTED_WITH_RESULT and refs:
             raise ValueError("Only executed_with_result may attach response references")
+        if actor_provenance == "operator_client":
+            if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
+                if not invocation.response_refs:
+                    raise ValueError("Passive VT response has no persisted result to reconcile")
+                if not refs or not set(refs).issubset(invocation.response_refs):
+                    raise ValueError(
+                        "Passive VT reconciliation must use persisted response references"
+                    )
+                for ref in refs:
+                    observation = await self._observations.get(ref)
+                    if (
+                        observation is None
+                        or observation.investigation_id != investigation_id
+                        or observation.invocation_ref != invocation.id
+                    ):
+                        raise ValueError(
+                            "Passive VT response references must belong to this invocation"
+                        )
+            elif (
+                outcome is InvocationReconciliationOutcome.NOT_EXECUTED and invocation.response_refs
+            ):
+                raise ValueError(
+                    "A persisted passive VT response cannot be reconciled as not_executed"
+                )
         if self._audit_decisions is None:
             raise RuntimeError("Invocation reconciliation audit repository is unavailable")
 
-        details = {
+        details: dict[str, Any] = {
             "outcome": outcome.value,
             "invocation_id": str(invocation.id),
             "operation_key": invocation.operation_key,
             "response_refs": [str(item) for item in refs],
         }
+        if actor_provenance is not None:
+            details["actor_provenance"] = {
+                "client": actor_provenance,
+                "actor_id": actor.strip(),
+            }
         request_identity = {
             **details,
             "investigation_id": str(investigation_id),

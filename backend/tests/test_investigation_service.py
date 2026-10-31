@@ -1021,6 +1021,285 @@ async def test_trusted_vt_source_refs_normalize_case_and_are_replay_stable() -> 
     assert first == replay == (expected,)
 
 
+async def _seed_operator_passive_vt_reconciliation(*, persisted_response_count: int = 0):
+    fixture = _Fixture(responses=[], tools=(("vt.file_report", "vt"),))
+    await fixture.start()
+    operation_key = f"operator-vt-reconcile-{uuid4()}"
+    reserved_budget = {BudgetDimension.VT_UNITS: 1}
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    envelope.budget.reserve(operation_key, reserved_budget)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+    response_refs = tuple(uuid4() for _ in range(persisted_response_count))
+    invocation = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key=operation_key,
+        tool_name="vt.file_report",
+        schema_version="1",
+        normalized_parameters={"file_hash": "d" * 64},
+        purpose="Resolve an ambiguous passive VT read.",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        reserved_budget=reserved_budget,
+        response_refs=response_refs,
+        version=3,
+    )
+    await fixture.invocations.add_if_absent(invocation)
+    observations = tuple(
+        EvidenceObservation(
+            id=ref,
+            investigation_id=fixture.investigation_id,
+            kind=EvidenceKind.OTHER,
+            blob_id=uuid4(),
+            sha256=("a" if index % 2 == 0 else "b") * 64,
+            source="vt.file_report",
+            source_version="1",
+            observed_at=datetime.now(UTC),
+            object_type="file",
+            object_id="d" * 64,
+            invocation_ref=invocation.id,
+        )
+        for index, ref in enumerate(response_refs)
+    )
+    for observation in observations:
+        await fixture.observations.append_if_absent(observation)
+    return fixture, invocation, observations
+
+
+@pytest.mark.asyncio
+async def test_operator_passive_vt_reconciliation_only_adopts_its_persisted_results() -> None:
+    fixture, invocation, observations = await _seed_operator_passive_vt_reconciliation(
+        persisted_response_count=2
+    )
+    with pytest.raises(ValueError, match="cannot be reconciled as not_executed"):
+        await fixture.service.reconcile_invocation(
+            fixture.investigation_id,
+            invocation.id,
+            outcome=InvocationReconciliationOutcome.NOT_EXECUTED,
+            actor="operator:agent-client",
+            reason="The stored response proves that the read occurred.",
+            expected_version=invocation.version,
+            idempotency_key="operator-vt-not-executed-with-result",
+            actor_provenance="operator_client",
+        )
+
+    resolved = await fixture.service.reconcile_invocation(
+        fixture.investigation_id,
+        invocation.id,
+        outcome=InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+        actor="operator:agent-client",
+        reason="Adopt the persisted provider response.",
+        response_refs=(observations[0].id,),
+        expected_version=invocation.version,
+        idempotency_key="operator-vt-executed-with-result",
+        actor_provenance="operator_client",
+    )
+    assert resolved.status is ToolInvocationStatus.SUCCEEDED
+    assert resolved.response_refs == (observations[0].id,)
+    reservation = next(
+        item
+        for item in (await fixture.envelopes.get(fixture.investigation_id)).budget.reservations
+        if item.operation_key == invocation.operation_key
+    )
+    assert reservation.status.value == "committed"
+    assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+    decision = fixture.analyst_decisions.items[0]
+    assert decision.actor_id == "operator:agent-client"
+    assert decision.details["actor_provenance"] == {
+        "client": "operator_client",
+        "actor_id": "operator:agent-client",
+    }
+    assert fixture.tools["vt.file_report"].calls == []
+
+    replay = await fixture.service.reconcile_invocation(
+        fixture.investigation_id,
+        invocation.id,
+        outcome=InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+        actor="operator:agent-client",
+        reason="Adopt the persisted provider response.",
+        response_refs=(observations[0].id,),
+        expected_version=invocation.version,
+        idempotency_key="operator-vt-executed-with-result",
+        actor_provenance="operator_client",
+    )
+    assert replay == resolved
+    with pytest.raises(VersionConflictError):
+        await fixture.service.reconcile_invocation(
+            fixture.investigation_id,
+            invocation.id,
+            outcome=InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+            actor="operator:agent-client",
+            reason="Adopt the persisted provider response.",
+            response_refs=(observations[0].id,),
+            expected_version=invocation.version,
+            idempotency_key="operator-vt-executed-with-another-key",
+            actor_provenance="operator_client",
+        )
+    assert len(fixture.analyst_decisions.items) == 1
+
+    abandon_fixture, abandon_invocation, _ = await _seed_operator_passive_vt_reconciliation(
+        persisted_response_count=1
+    )
+    abandoned = await abandon_fixture.service.reconcile_invocation(
+        abandon_fixture.investigation_id,
+        abandon_invocation.id,
+        outcome=InvocationReconciliationOutcome.ABANDON,
+        actor="operator:agent-client",
+        reason="Abandon the invocation whose response cannot be adopted.",
+        expected_version=abandon_invocation.version,
+        idempotency_key="operator-vt-persisted-abandon",
+        actor_provenance="operator_client",
+    )
+    assert abandoned.status is ToolInvocationStatus.FAILED
+    assert abandon_fixture.tools["vt.file_report"].calls == []
+    persisted_abandon_reservation = next(
+        item
+        for item in (
+            await abandon_fixture.envelopes.get(abandon_fixture.investigation_id)
+        ).budget.reservations
+        if item.operation_key == abandon_invocation.operation_key
+    )
+    assert persisted_abandon_reservation.status.value == "committed"
+    assert persisted_abandon_reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+
+
+@pytest.mark.asyncio
+async def test_operator_passive_vt_without_persisted_response_releases_or_commits_by_outcome() -> (
+    None
+):
+    fixture, invocation, _ = await _seed_operator_passive_vt_reconciliation()
+    unattached = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="c" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="d" * 64,
+        invocation_ref=invocation.id,
+    )
+    await fixture.observations.append_if_absent(unattached)
+    with pytest.raises(ValueError, match="no persisted result"):
+        await fixture.service.reconcile_invocation(
+            fixture.investigation_id,
+            invocation.id,
+            outcome=InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+            actor="operator:agent-client",
+            reason="There is no persisted result to adopt.",
+            response_refs=(unattached.id,),
+            expected_version=invocation.version,
+            idempotency_key="operator-vt-no-result-executed",
+            actor_provenance="operator_client",
+        )
+
+    resolved = await fixture.service.reconcile_invocation(
+        fixture.investigation_id,
+        invocation.id,
+        outcome=InvocationReconciliationOutcome.NOT_EXECUTED,
+        actor="operator:agent-client",
+        reason="The read did not execute.",
+        expected_version=invocation.version,
+        idempotency_key="operator-vt-no-result-not-executed",
+        actor_provenance="operator_client",
+    )
+    assert resolved.status is ToolInvocationStatus.FAILED
+    reservation = next(
+        item
+        for item in (await fixture.envelopes.get(fixture.investigation_id)).budget.reservations
+        if item.operation_key == invocation.operation_key
+    )
+    assert reservation.status.value == "released"
+    assert reservation.committed_amounts == {}
+
+    abandon_fixture, abandon_invocation, _ = await _seed_operator_passive_vt_reconciliation()
+    abandoned = await abandon_fixture.service.reconcile_invocation(
+        abandon_fixture.investigation_id,
+        abandon_invocation.id,
+        outcome=InvocationReconciliationOutcome.ABANDON,
+        actor="operator:agent-client",
+        reason="The unresolved read is abandoned.",
+        expected_version=abandon_invocation.version,
+        idempotency_key="operator-vt-no-result-abandon",
+        actor_provenance="operator_client",
+    )
+    assert abandoned.status is ToolInvocationStatus.FAILED
+    abandon_reservation = next(
+        item
+        for item in (
+            await abandon_fixture.envelopes.get(abandon_fixture.investigation_id)
+        ).budget.reservations
+        if item.operation_key == abandon_invocation.operation_key
+    )
+    assert abandon_reservation.status.value == "committed"
+    assert abandon_reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_investigation", [False, True])
+async def test_operator_passive_vt_rejects_refs_from_other_invocations_or_investigations(
+    foreign_investigation: bool,
+) -> None:
+    fixture, invocation, _ = await _seed_operator_passive_vt_reconciliation()
+    foreign_ref = uuid4()
+    foreign_observation = EvidenceObservation(
+        id=foreign_ref,
+        investigation_id=uuid4() if foreign_investigation else fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="d" * 64,
+        invocation_ref=uuid4() if not foreign_investigation else invocation.id,
+    )
+    await fixture.observations.append_if_absent(foreign_observation)
+    invocation = await fixture.invocations.update_if_version(
+        replace(invocation, response_refs=(foreign_ref,), version=invocation.version + 1),
+        expected_version=invocation.version,
+    )
+
+    with pytest.raises(ValueError):
+        await fixture.service.reconcile_invocation(
+            fixture.investigation_id,
+            invocation.id,
+            outcome=InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+            actor="operator:agent-client",
+            reason="Reject a result from another source invocation.",
+            response_refs=(foreign_ref,),
+            expected_version=invocation.version,
+            idempotency_key=f"operator-vt-foreign-ref-{foreign_investigation}",
+            actor_provenance="operator_client",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [ToolInvocationStatus.PENDING, ToolInvocationStatus.RUNNING])
+async def test_operator_passive_vt_reconciliation_rejects_inflight_invocations(status) -> None:
+    fixture, invocation, _ = await _seed_operator_passive_vt_reconciliation()
+    inflight = await fixture.invocations.update_if_version(
+        replace(invocation, status=status, version=invocation.version + 1),
+        expected_version=invocation.version,
+    )
+
+    with pytest.raises(VersionConflictError):
+        await fixture.service.reconcile_invocation(
+            fixture.investigation_id,
+            inflight.id,
+            outcome=InvocationReconciliationOutcome.ABANDON,
+            actor="operator:agent-client",
+            reason="An invocation still in flight cannot be resolved.",
+            expected_version=inflight.version,
+            idempotency_key=f"operator-vt-inflight-{status.value}",
+            actor_provenance="operator_client",
+        )
+    assert fixture.analyst_decisions.items == []
+    assert fixture.tools["vt.file_report"].calls == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "arguments"),
