@@ -203,6 +203,23 @@ def make_observation(investigation_id, payload):
     )
 
 
+def install_advisor_evidence(tool, observations, payloads, *, associated_sample_hashes=()):
+    tool._observations = ObservationRepository(observations)
+    tool._artifact_store.values.update(payloads)
+    for observation in observations:
+        raw = payloads[observation.blob_id]
+        tool._blobs.add(
+            observation.blob_id,
+            sha256=observation.sha256,
+            size=len(raw),
+            logical_bucket="evidence",
+        )
+    associations = tuple(
+        SimpleNamespace(sample_sha256=sample_hash) for sample_hash in associated_sample_hashes
+    )
+    tool._sample_associations.list_for_investigation = async_get(associations)
+
+
 def make_tool(
     *,
     investigation_id,
@@ -947,12 +964,13 @@ async def test_args_hint_contract_is_bounded_and_normalization_is_recorded(
             ),
         )
     )
-    tool, _sample_blob = make_tool(
+    tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
         observation=observation,
         raw=raw,
     )
+    _attach_sample_policy(tool, sample_blob_id, "7" * 64)
     tool._registry = Registry(
         (
             SimpleNamespace(
@@ -1067,6 +1085,7 @@ async def test_args_hint_is_normalized_against_recommended_tool_schema(
         observation=observation,
         raw=raw,
     )
+    tool._sample_associations = _SampleAssociations(["7" * 64])
     tool._registry = Registry(
         (
             SimpleNamespace(
@@ -4808,6 +4827,7 @@ async def test_review_text_passes_cited_refs_without_internal_provenance() -> No
         observation=observation,
         raw=raw,
     )
+    tool._sample_associations = _SampleAssociations(["7" * 64])
     tool._registry = Registry(
         (
             SimpleNamespace(
@@ -4973,6 +4993,9 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
         raw=b"{}",
     )
     tool._observations = ObservationRepository(observations)
+    tool._sample_associations = _SampleAssociations(
+        [f"{index + 1:x}" * 64 for index in range(len(observations))]
+    )
     tool._findings = FindingRepository(findings)
 
     async def measurement_rows(item: EvidenceObservation) -> list[dict[str, object]]:
@@ -5061,6 +5084,7 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
         deduped_evidence,
         deduped_measurements,
         deduped_findings,
+        _deduped_omissions,
     ) = await tool._editorial_reference_facts(
         investigation_id=investigation_id,
         evidence=(),
@@ -5092,12 +5116,13 @@ async def test_draft_text_resolves_facts_from_assertion_refs() -> None:
     transport = Transport(
         TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="response is not used")
     )
-    tool, _ = make_tool(
+    tool, _sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
         observation=observation,
         raw=raw,
     )
+    tool._sample_associations = _SampleAssociations(["d" * 64])
     tool._findings = FindingRepository((finding,))
 
     await tool.execute(
@@ -5403,6 +5428,310 @@ async def test_draft_text_explicit_observation_keeps_disclosure_restrictions(res
     assert result.output["advisor_status"] == "disclosure_restricted"
     assert result.output["failure_reason"] == "sample_disclosure_policy"
     assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+
+
+@pytest.mark.asyncio
+async def test_draft_text_omits_implicit_unassociated_sample_observation_with_reason() -> None:
+    investigation_id = uuid4()
+    associated_hash = "a" * 64
+    unassociated_hash = "b" * 64
+    associated, associated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": associated_hash,
+            "summary": (
+                "The shared marker is visible in the sample analysis; AssociatedOnlyMarker."
+            ),
+        },
+    )
+    unassociated, unassociated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": unassociated_hash,
+            "summary": (
+                "The shared marker is visible in the sample analysis; UnassociatedOnlyMarker."
+            ),
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Synthetic advisory draft.")
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=associated,
+        raw=associated_raw,
+    )
+    install_advisor_evidence(
+        tool,
+        (associated, unassociated),
+        {associated.blob_id: associated_raw, unassociated.blob_id: unassociated_raw},
+        associated_sample_hashes=(associated_hash,),
+    )
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article.short_summary = ""
+    snapshot.article_passages = ()
+    tool._article_snapshots.resolve = async_get(snapshot)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Draft about the shared marker in the sample analysis.",
+            "evidence_refs": [str(associated.id)],
+            "assertions": [
+                {
+                    "id": "associated-marker",
+                    "text": "The shared marker is present.",
+                    "nature": "deduction",
+                    "refs": [{"kind": "observation", "id": str(associated.id)}],
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:implicit-unassociated-sample"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert "AssociatedOnlyMarker" in prompt
+    assert "UnassociatedOnlyMarker" not in prompt
+    provenance = result.output["bridge_provenance"]
+    assert not any(item["id"] == str(unassociated.id) for item in provenance["dossier_manifest"])
+    assert not any(item["id"] == str(unassociated.id) for item in provenance["input_refs"])
+    omission = next(
+        item
+        for item in provenance["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(unassociated.id)
+    )
+    assert omission["required"] is False
+    assert any(
+        row["status"] == "INTENTIONALLY_OMITTED"
+        and "intentionally omitted: not disclosable under current policy"
+        in row["reason"].casefold()
+        for row in omission["statuses"]
+    )
+    assert result.output["preflight_status"] == "READY"
+
+
+@pytest.mark.parametrize("citation", ["evidence_refs", "top_level_assertion", "unit_assertion"])
+@pytest.mark.asyncio
+async def test_draft_text_explicit_unassociated_sample_reference_is_refused_before_bridge(
+    citation: str,
+) -> None:
+    investigation_id = uuid4()
+    associated_hash = "c" * 64
+    unassociated_hash = "d" * 64
+    associated, associated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": associated_hash,
+            "summary": "Associated sample marker.",
+        },
+    )
+    unassociated, unassociated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": unassociated_hash,
+            "summary": "Unassociated sample marker.",
+        },
+    )
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=associated,
+        raw=associated_raw,
+    )
+    install_advisor_evidence(
+        tool,
+        (associated, unassociated),
+        {associated.blob_id: associated_raw, unassociated.blob_id: unassociated_raw},
+        associated_sample_hashes=(associated_hash,),
+    )
+    references = [
+        {"kind": "observation", "id": str(associated.id)},
+        {"kind": "observation", "id": str(unassociated.id)},
+    ]
+    arguments: dict[str, Any] = {
+        "consultation_type": "draft_text",
+        "question": "Use both sample observations.",
+    }
+    if citation == "evidence_refs":
+        arguments["evidence_refs"] = [str(associated.id), str(unassociated.id)]
+    else:
+        assertion = {
+            "id": "sample-reference",
+            "text": "Both observations show the sample marker.",
+            "nature": "deduction",
+            "refs": references,
+            "block_type": "uncertainties_and_next_leads",
+            "form": "body",
+            "anchor": None,
+        }
+        if citation == "top_level_assertion":
+            arguments["assertions"] = [assertion]
+        else:
+            arguments["units"] = [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [assertion],
+                }
+            ]
+
+    result = await tool.execute(
+        arguments,
+        make_context(investigation_id, key=f"operator:advisor:explicit-unassociated-{citation}"),
+    )
+
+    assert transport.calls == []
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["input_error_code"] == "advisor_observation_sample_not_associated"
+    assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["preflight_cause"]["ref"] == str(unassociated.id)
+    cause_reason = result.output["preflight_cause"]["reason"].casefold()
+    assert "sample hash" in cause_reason
+    assert "not associated with this investigation" in cause_reason
+    assert "associate" in cause_reason and "remove" in cause_reason
+    assert len(result.output["missing_refs"]) == 1
+    assert dict(result.output["missing_refs"][0]) == dict(result.output["preflight_cause"])
+    assert str(unassociated.id) in result.message
+
+
+@pytest.mark.asyncio
+async def test_draft_text_omits_implicit_restricted_source_document_with_reason() -> None:
+    investigation_id = uuid4()
+    associated_hash = "e" * 64
+    associated, associated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": associated_hash,
+            "summary": "The shared marker is visible in the analysis; AssociatedDocumentControl.",
+        },
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "source-document-extract.v1",
+            "summary": "The shared marker is visible in the report; RestrictedDocumentOnlyMarker.",
+        },
+    )
+    document_id = uuid4()
+    observation = replace(observation, object_type="source_document", object_id=str(document_id))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(
+            TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Synthetic draft.")
+        ),
+        observation=associated,
+        raw=associated_raw,
+    )
+    investigation = await tool._investigations.get(investigation_id)
+    tool._source_documents = SimpleNamespace(
+        get=async_get(
+            SimpleNamespace(
+                id=document_id,
+                subject_id=investigation.subject_id,
+                tlp="clear",
+                external_llm_allowed=False,
+                license_restriction=None,
+            )
+        )
+    )
+    install_advisor_evidence(
+        tool,
+        (associated, observation),
+        {associated.blob_id: associated_raw, observation.blob_id: raw},
+        associated_sample_hashes=(associated_hash,),
+    )
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    snapshot.article.short_summary = ""
+    snapshot.article_passages = ()
+    tool._article_snapshots.resolve = async_get(snapshot)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Draft about the shared marker in these sources.",
+            "evidence_refs": [str(associated.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:implicit-restricted-document"),
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL, result.output
+    assert len(tool._transport.calls) == 1
+    assert "AssociatedDocumentControl" in tool._transport.calls[0]["prompt"]
+    assert "RestrictedDocumentOnlyMarker" not in tool._transport.calls[0]["prompt"]
+    omission = next(
+        item
+        for item in result.output["bridge_provenance"]["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(observation.id)
+    )
+    assert any(
+        row["status"] == "INTENTIONALLY_OMITTED" and "external_llm_disallowed" in row["reason"]
+        for row in omission["statuses"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_text_explicit_restricted_source_document_is_refused_before_bridge() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "source-document-extract.v1", "summary": "Restricted document."},
+    )
+    document_id = uuid4()
+    observation = replace(observation, object_type="source_document", object_id=str(document_id))
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    investigation = await tool._investigations.get(investigation_id)
+    tool._source_documents = SimpleNamespace(
+        get=async_get(
+            SimpleNamespace(
+                id=document_id,
+                subject_id=investigation.subject_id,
+                tlp="clear",
+                external_llm_allowed=False,
+                license_restriction=None,
+            )
+        )
+    )
+    install_advisor_evidence(tool, (observation,), {observation.blob_id: raw})
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Use this source document.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:explicit-restricted-document"),
+    )
+
+    assert transport.calls == []
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["input_error_code"] == "advisor_observation_disclosure_restricted"
+    assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert result.output["preflight_cause"]["ref"] == str(observation.id)
+    assert "source document" in result.output["preflight_cause"]["reason"]
+    assert "external_llm_disallowed" in result.output["preflight_cause"]["reason"]
+    assert "remove the reference" in result.output["preflight_cause"]["reason"]
 
 
 @pytest.mark.asyncio
@@ -6014,6 +6343,7 @@ async def test_editorial_measurements_keep_fragment_provenance_for_byte_represen
         evidence_rows,
         measured_rows,
         _finding_rows,
+        _disclosure_omissions,
     ) = await tool._editorial_reference_facts(
         investigation_id=investigation_id,
         evidence=(),
@@ -7029,12 +7359,13 @@ async def test_draft_text_batches_units_and_keeps_provenance_per_unit() -> None:
         )
 
     transport = Transport(response_for_call)
-    tool, _sample_blob = make_tool(
+    tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
         observation=observation,
         raw=raw,
     )
+    _attach_sample_policy(tool, sample_blob_id, "7" * 64)
     units = []
     for index in range(1, 20):
         block_type = block_types[(index - 1) % len(block_types)]
@@ -7248,13 +7579,7 @@ async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> No
         observation=observation,
         raw=raw,
     )
-    sample_inventory_calls: list[UUID] = []
-
-    async def list_samples(case_id):
-        sample_inventory_calls.append(case_id)
-        return ()
-
-    tool._sample_associations = SimpleNamespace(list_for_investigation=list_samples)
+    tool._sample_associations = _SampleAssociations(["6" * 64])
     units = []
     for index, block_type in enumerate(
         (*ordinary_types, OpinionBlockType.IMPLANT_MATERIALS), start=1
@@ -7296,7 +7621,6 @@ async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> No
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert len(transport.calls) == 1
-    assert sample_inventory_calls == []
     payload = typed_prompt_payload(transport.calls[0]["prompt"])
     assert attacker_token in transport.calls[0]["prompt"], transport.calls[0]["prompt"]
     assert len(payload["units"]) == 6
@@ -7510,12 +7834,13 @@ async def test_draft_text_uses_compact_context_for_multiple_units() -> None:
         )
 
     transport = Transport(response_for_call)
-    tool, _sample_blob = make_tool(
+    tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
         observation=observation,
         raw=raw,
     )
+    _attach_sample_policy(tool, sample_blob_id, "8" * 64)
     units = []
     for unit_index, block_type in enumerate(block_types, start=1):
         assertions = [
@@ -7595,12 +7920,13 @@ async def test_draft_text_preserves_bridge_output_above_legacy_limit() -> None:
         )
 
     transport = Transport(response_for_call)
-    tool, _sample_blob = make_tool(
+    tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
         observation=observation,
         raw=raw,
     )
+    _attach_sample_policy(tool, sample_blob_id, "9" * 64)
     units = [
         {
             "id": f"U{index}",
