@@ -28,7 +28,10 @@ from cti_app.application.identity import IdentityProvider
 from cti_app.application.investigation_article_snapshot import ProductionArticleSnapshotAdapter
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.network_protocol_model import render_protocol_model
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.application.protocol_diagram_projection import (
     ProtocolDiagramProjectionError,
     compile_protocol_render_result,
@@ -290,6 +293,8 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.IDEMPOTENCY_CONFLICT: status.HTTP_409_CONFLICT,
     }[exc.code]
     detail: dict[str, Any] = {"code": exc.code.value}
+    if str(exc) != exc.code.value:
+        detail["message"] = str(exc)
     if exc.citation_violations:
         detail["citation_violations"] = [
             {
@@ -301,6 +306,16 @@ def _raise_opinion_error(exc: OpinionError) -> None:
             for item in exc.citation_violations
         ]
     raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+def _raise_opinion_storage_unavailable(exc: ProductionReuseStorageUnavailableError) -> None:
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "code": "storage_unavailable",
+            "message": "Bridge provenance storage is temporarily unavailable; retry the operation.",
+        },
+    ) from exc
 
 
 def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
@@ -420,6 +435,8 @@ async def compose_investigation_opinion(
     )
     try:
         opinion = await _opinion_service(request).compose_from_findings(investigation_id, selection)
+    except ProductionReuseStorageUnavailableError as exc:
+        _raise_opinion_storage_unavailable(exc)
     except OpinionError as exc:
         _raise_opinion_error(exc)
     return {"draft": _opinion_payload(opinion)}
@@ -481,6 +498,8 @@ async def revise_opinion(
             actor_id,
             expected_sha256=payload.expected_sha256,
         )
+    except ProductionReuseStorageUnavailableError as exc:
+        _raise_opinion_storage_unavailable(exc)
     except OpinionError as exc:
         _raise_opinion_error(exc)
     return {"draft": _opinion_payload(opinion)}

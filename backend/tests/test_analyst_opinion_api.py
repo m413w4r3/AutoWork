@@ -5,18 +5,57 @@ from uuid import UUID
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 
-from cti_app.api.analyst_opinion import OpinionBlockEdit, router
+from cti_app.api.analyst_opinion import (
+    OpinionBlockEdit,
+    _raise_opinion_error,
+    _raise_opinion_storage_unavailable,
+    router,
+)
 from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
-from cti_app.application.analyst_opinion_service import AnalystOpinionService
+from cti_app.application.analyst_opinion_service import (
+    AnalystOpinionService,
+    OpinionError,
+    OpinionErrorCode,
+)
 from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.identity import Identity
+from cti_app.application.production_artifact_store import ProductionReuseStorageUnavailableError
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
 from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from tests.test_analyst_opinion_service import make_opinion_harness
+
+
+def test_opinion_api_includes_actionable_bridge_provenance_error_message() -> None:
+    error = OpinionError(
+        OpinionErrorCode.INVALID_SELECTION,
+        message="Bridge invocation draft-1: observation SHA-256 mismatch",
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        _raise_opinion_error(error)
+
+    assert raised.value.status_code == 422
+    assert raised.value.detail == {
+        "code": "invalid_selection",
+        "message": "Bridge invocation draft-1: observation SHA-256 mismatch",
+    }
+
+
+def test_opinion_api_maps_retryable_bridge_storage_failure_to_503() -> None:
+    error = ProductionReuseStorageUnavailableError("temporary internal detail")
+
+    with pytest.raises(HTTPException) as raised:
+        _raise_opinion_storage_unavailable(error)
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == {
+        "code": "storage_unavailable",
+        "message": "Bridge provenance storage is temporarily unavailable; retry the operation.",
+    }
 
 
 def test_opinion_api_reports_review_text_stale_when_sha_differs_from_target_text() -> None:

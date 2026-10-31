@@ -88,7 +88,9 @@ class ProductionArtifactStore:
     async def read_text(self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> str:
         return (await self.read_bytes(blob_id, max_bytes=max_bytes)).decode("utf-8")
 
-    async def read_bytes(self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+    async def read_bytes(
+        self, blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+    ) -> bytes:
         try:
             return await self._catalog.read(blob_id, max_bytes=max_bytes)
         except BlobStorageUnavailableError as exc:
