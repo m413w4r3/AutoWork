@@ -307,7 +307,7 @@ class InvestigationContextV1(_StrictContract):
     investigation: ContextInvestigationV1
     operator_requests: tuple[InvestigationUserRequestV1, ...] = Field(default=(), max_length=32)
     indicator_inventory: IndicatorInventoryV1 = Field(default_factory=IndicatorInventoryV1)
-    available_pivots: tuple[AvailablePivotV1, ...] = Field(default=(), max_length=128)
+    available_pivots: tuple[AvailablePivotV1, ...] = Field(default=(), max_length=2048)
     available_pivots_truncated: bool = False
     delta: InvestigationDeltaV1 | None = None
     available_tools: tuple[ToolSummaryV1, ...] = Field(max_length=256)

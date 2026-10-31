@@ -23,8 +23,8 @@ from cti_app.domain.investigation import (
     thaw_json,
 )
 
-MAX_AVAILABLE_PIVOTS = 128
-MAX_AVAILABLE_PIVOTS_BYTES = 24 * 1024
+MAX_AVAILABLE_PIVOTS = 2048
+MAX_AVAILABLE_PIVOTS_BYTES = 500 * 1024
 _COVERED_STATUSES = frozenset(
     {
         ToolInvocationStatus.PENDING,

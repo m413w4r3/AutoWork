@@ -2028,7 +2028,10 @@ async def test_context_lists_exact_uncovered_passive_pivots_from_verified_invent
     assert ip_search.arguments["evidence_refs"] == [str(linked_observations[ip_value].id)]
 
 
-def test_available_pivot_matrix_is_capped_and_uses_only_inventory_values() -> None:
+def test_available_pivot_matrix_is_capped_and_uses_only_inventory_values(monkeypatch) -> None:
+    from cti_app.application import investigation_pivots as pivots_module
+
+    monkeypatch.setattr(pivots_module, "MAX_AVAILABLE_PIVOTS", 128)
     inventory = tuple(
         ConfirmedIOCContextV1(
             indicator_type="sha256",

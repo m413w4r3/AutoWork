@@ -898,6 +898,42 @@ def test_available_pivot_truncation_round_robins_recent_indicators(monkeypatch) 
     assert pivots[0].indicator_value == "f" * 64
 
 
+def test_default_pivot_budget_keeps_every_pivot_of_a_large_inventory() -> None:
+    values = tuple(f"{index:064x}" for index in range(1, 221))
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in values
+    )
+    observations = tuple(
+        replace(
+            _relation_observation(value, f"{index % 15 + 1:x}" * 64),
+            observed_at=datetime(2026, 10, 1 + index % 25, tzinfo=UTC),
+        )
+        for index, value in enumerate(values)
+    )
+
+    pivots, truncated = available_investigation_pivots(
+        inventory=inventory,
+        tools=_frontier_tools(),
+        tool_coverage=(),
+        invocations=(),
+        observations=observations,
+    )
+
+    total_bytes = sum(
+        len(canonical_json_bytes(item.model_dump(mode="json"))) + 1 for item in pivots
+    )
+    assert total_bytes > 24 * 1024
+    assert truncated is False
+    assert {item.indicator_value for item in pivots} == set(values)
+
+
 def test_available_pivots_precede_blocked_pivots() -> None:
     linked_hash = "f" * 64
     unlinked_hash = "a" * 64
