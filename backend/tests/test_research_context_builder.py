@@ -2032,6 +2032,7 @@ def test_available_pivot_matrix_is_capped_and_uses_only_inventory_values(monkeyp
     from cti_app.application import investigation_pivots as pivots_module
 
     monkeypatch.setattr(pivots_module, "MAX_AVAILABLE_PIVOTS", 128)
+    monkeypatch.setattr(pivots_module, "MAX_AVAILABLE_PIVOTS_BYTES", 24 * 1024)
     inventory = tuple(
         ConfirmedIOCContextV1(
             indicator_type="sha256",
