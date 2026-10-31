@@ -2093,10 +2093,14 @@ class InvestigationAdvisorTool:
                 "Choose a canonical observation from this investigation or correct/remove the "
                 "reference."
             ),
+            "editorial_reference_unavailable": (
+                "The cited editorial source is missing or belongs to another investigation. "
+                "Choose a current canonical source from this investigation or remove the "
+                "reference."
+            ),
             "advisor_evidence_reference_mismatch": (
-                "A stored evidence link no longer matches a canonical observation in this "
-                "investigation. Repair the source link or remove the affected finding before "
-                "retrying."
+                "The cited source ID and SHA-256 do not match the current canonical source. "
+                "Correct the reference or repair the canonical source before retrying."
             ),
             "figure_finding_refs_invalid": (
                 "Figure finding references must be a list of unique finding IDs. Remove "
@@ -2144,18 +2148,25 @@ class InvestigationAdvisorTool:
             )
         if reference:
             message += f" Reference: {reference}."
-        reference_cause = (
-            {
+        reference_cause = None
+        if reference and reason_code in {
+            "evidence_reference_not_found",
+            "editorial_reference_unavailable",
+            "advisor_evidence_reference_mismatch",
+            "editorial_reference_invalid",
+        }:
+            reference_cause = {
                 "ref": reference,
                 "reason": (
-                    "The explicit observation reference is missing or belongs to another "
-                    "investigation; choose a canonical observation from this investigation "
-                    "or remove the reference."
+                    "The cited source ID and SHA-256 do not match the current canonical source."
+                    if reason_code == "advisor_evidence_reference_mismatch"
+                    else "The cited canonical source is missing or belongs to another "
+                    "investigation."
+                    if reason_code
+                    in {"evidence_reference_not_found", "editorial_reference_unavailable"}
+                    else "The cited canonical source reference is malformed."
                 ),
             }
-            if reason_code == "evidence_reference_not_found" and reference
-            else None
-        )
         result = await self._persist_preflight_failure(
             context,
             consultation_type="unknown",
@@ -2166,7 +2177,12 @@ class InvestigationAdvisorTool:
                 "failure_stage": "pre_transport_validation",
                 "failure_reason": reason_code,
                 **(
-                    {"preflight_cause": reference_cause, "missing_refs": [reference_cause]}
+                    {
+                        "preflight_cause": reference_cause,
+                        "missing_refs": [reference_cause],
+                        "additional_missing_ref_count": 0,
+                        "refusal_guidance": message,
+                    }
                     if reference_cause is not None
                     else {}
                 ),
@@ -2404,6 +2420,15 @@ class InvestigationAdvisorTool:
         question: str,
     ) -> dict[str, Any]:
         raw_observation_refs = arguments.get("evidence_refs", ())
+        unit_assertion_refs = (
+            _unit_assertion_references(arguments.get("units", ()))
+            if consultation_type == "draft_text"
+            else []
+        )
+        assertion_refs_by_unit: dict[str, list[dict[str, str]]] = {}
+        for raw_unit in arguments.get("units", ()):
+            if isinstance(raw_unit, Mapping) and isinstance(raw_unit.get("id"), str):
+                assertion_refs_by_unit[raw_unit["id"]] = _unit_assertion_references((raw_unit,))
         explicit_observation_ids = (
             {
                 str(reference)
@@ -2412,6 +2437,9 @@ class InvestigationAdvisorTool:
             }
             if isinstance(raw_observation_refs, (list, tuple))
             else set()
+        )
+        explicit_observation_ids.update(
+            item["id"] for item in unit_assertion_refs if item["kind"] == "observation"
         )
         article_passages = _consultation_article_passages(snapshot, question)
         base: dict[str, Any] = {
@@ -2431,6 +2459,29 @@ class InvestigationAdvisorTool:
             "gaps": [],
             "truncation": {},
         }
+        if consultation_type == "draft_text":
+            base["_explicit_assertion_refs"] = [dict(item) for item in unit_assertion_refs]
+            article_sha256 = snapshot.synthesis_sha256
+            for reference in base["_explicit_assertion_refs"]:
+                if reference["kind"] != "article":
+                    continue
+                identifier = reference["id"]
+                canonical_id = (
+                    identifier.partition(":")[2]
+                    if identifier.startswith("article:")
+                    else identifier
+                )
+                if canonical_id != article_sha256:
+                    raise _AdvisorInputValidationError(
+                        "editorial_reference_unavailable", reference=identifier
+                    )
+                declared_sha256 = reference.get("sha256")
+                if declared_sha256 is not None and declared_sha256 != article_sha256:
+                    raise _AdvisorInputValidationError(
+                        "advisor_evidence_reference_mismatch", reference=identifier
+                    )
+                reference["id"] = article_sha256
+                reference["sha256"] = article_sha256
         editorial = consultation_type in {"draft_text", "review_text"}
         if editorial:
             # Local availability state is not an investigation fact Bridge can verify.
@@ -2712,11 +2763,34 @@ class InvestigationAdvisorTool:
                         "anchor": raw_unit.get("anchor"),
                     }
                     raw_unit_assertions = raw_unit.get("assertions")
+                    normalized_assertions: list[Mapping[str, Any]] = []
+                    if isinstance(raw_unit_assertions, (list, tuple)):
+                        for raw_assertion in raw_unit_assertions:
+                            if not isinstance(raw_assertion, Mapping):
+                                continue
+                            normalized_assertion = dict(raw_assertion)
+                            normalized_assertion.setdefault("block_type", target["block_type"])
+                            normalized_assertion.setdefault("form", target["form"])
+                            normalized_assertion.setdefault("anchor", target["anchor"])
+                            raw_assertion_refs = normalized_assertion.get("refs")
+                            if not isinstance(raw_assertion_refs, (list, tuple)) or any(
+                                not isinstance(reference, Mapping)
+                                or reference.get("kind")
+                                not in {"observation", "finding", "experiment"}
+                                for reference in raw_assertion_refs
+                            ):
+                                continue
+                            normalized_assertion["refs"] = [
+                                {"kind": reference["kind"], "id": reference.get("id")}
+                                for reference in raw_assertion_refs
+                            ]
+                            normalized_assertions.append(normalized_assertion)
                     try:
                         validated = (
-                            await self._validated_assertions(investigation_id, raw_unit_assertions)
-                            if isinstance(raw_unit_assertions, (list, tuple))
-                            and raw_unit_assertions
+                            await self._validated_assertions(
+                                investigation_id, normalized_assertions
+                            )
+                            if normalized_assertions
                             else []
                         )
                     except ValueError:
@@ -2733,6 +2807,7 @@ class InvestigationAdvisorTool:
                         seen_assertion_ids.add(assertion["id"])
                         draft_assertions.append({**assertion, "unit_id": unit_id})
                     unit_refs = [ref for assertion in validated for ref in assertion["refs"]]
+                    unit_refs.extend(assertion_refs_by_unit.get(unit_id, ()))
                     target["evidence_refs"] = list(
                         dict.fromkeys(
                             ref["id"] for ref in unit_refs if ref["kind"] == "observation"
@@ -2796,6 +2871,38 @@ class InvestigationAdvisorTool:
                 for item in evidence
                 if "rule" in item.source.casefold() or "rule" in item.object_type.casefold()
             ]
+            expected_assertion_sha256 = {
+                (item["kind"], item["id"]): item.get("sha256")
+                for item in unit_assertion_refs
+                if item.get("sha256")
+            }
+            actual_assertion_sha256 = {
+                ("observation", item["evidence_id"]): item["sha256"]
+                for item in evidence_payload
+                if isinstance(item.get("evidence_id"), str) and isinstance(item.get("sha256"), str)
+            }
+            actual_assertion_sha256.update(
+                {
+                    ("finding", item["finding_id"]): item["sha256"]
+                    for item in finding_payload
+                    if isinstance(item.get("finding_id"), str)
+                    and isinstance(item.get("sha256"), str)
+                }
+            )
+            for reference in base.get("_explicit_assertion_refs", ()):
+                key = (reference["kind"], reference["id"])
+                if reference["kind"] in {"observation", "finding"}:
+                    actual_sha256 = actual_assertion_sha256.get(key)
+                    if actual_sha256 is None:
+                        raise _AdvisorInputValidationError(
+                            "editorial_reference_unavailable", reference=reference["id"]
+                        )
+                    declared_sha256 = expected_assertion_sha256.get(key)
+                    if declared_sha256 is not None and declared_sha256 != actual_sha256:
+                        raise _AdvisorInputValidationError(
+                            "advisor_evidence_reference_mismatch", reference=reference["id"]
+                        )
+                    reference["sha256"] = actual_sha256
 
         async def verified_measurements() -> tuple[
             list[dict[str, Any]], dict[str, list[dict[str, Any]]]
@@ -3050,17 +3157,62 @@ class InvestigationAdvisorTool:
             ]
         elif consultation_type == "draft_text":
             measurement_candidates = arguments.get("measurements")
-            if measurement_candidates is not None:
+            measurement_assertion_refs = {
+                item["id"] for item in unit_assertion_refs if item["kind"] == "measurement"
+            }
+            if measurement_candidates is not None or measurement_assertion_refs:
                 measurements, content_patterns = await verified_measurements()
-                measurements = self._select_verified_measurements(
-                    measurements,
-                    measurement_candidates,
-                    content_patterns=content_patterns,
-                )
-                base["measurements"] = [
+                if measurement_candidates is not None:
+                    measurements = self._select_verified_measurements(
+                        measurements,
+                        measurement_candidates,
+                        content_patterns=content_patterns,
+                    )
+                else:
+                    measurements = self._select_discriminating_measurements(measurements)
+                measurement_rows = [
                     {**measurement, "measurement_id": f"m{index:03d}"}
                     for index, measurement in enumerate(measurements, start=1)
                 ]
+                measurement_by_id = {str(item["measurement_id"]): item for item in measurement_rows}
+                if measurement_candidates is None:
+                    missing_measurement_ids = measurement_assertion_refs.difference(
+                        measurement_by_id
+                    )
+                    if missing_measurement_ids:
+                        missing_measurement_id = sorted(missing_measurement_ids)[0]
+                        raise _AdvisorInputValidationError(
+                            "editorial_reference_unavailable",
+                            reference=missing_measurement_id,
+                        )
+                    measurement_rows = [
+                        measurement_by_id[reference["id"]]
+                        for reference in base.get("_explicit_assertion_refs", ())
+                        if reference["kind"] == "measurement"
+                    ]
+                base["measurements"] = measurement_rows
+                for reference in base.get("_explicit_assertion_refs", ()):
+                    if reference["kind"] != "measurement":
+                        continue
+                    measurement_row = measurement_by_id.get(reference["id"])
+                    if measurement_row is None:
+                        raise _AdvisorInputValidationError(
+                            "editorial_reference_unavailable", reference=reference["id"]
+                        )
+                    actual_sha256 = hashlib.sha256(
+                        json.dumps(
+                            measurement_row,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    declared_sha256 = reference.get("sha256")
+                    if declared_sha256 is not None and declared_sha256 != actual_sha256:
+                        raise _AdvisorInputValidationError(
+                            "advisor_evidence_reference_mismatch", reference=reference["id"]
+                        )
+                    reference["sha256"] = actual_sha256
         elif consultation_type == "yara_draft":
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")
@@ -3344,6 +3496,8 @@ class InvestigationAdvisorTool:
                 seen.add(key)
                 references.append(key)
 
+        explicit_finding_ids: set[str] = set()
+
         def add_unit(unit: object) -> None:
             if not isinstance(unit, Mapping):
                 return
@@ -3351,6 +3505,7 @@ class InvestigationAdvisorTool:
                 add("observation", raw_id)
             for raw_id in unit.get("finding_refs", ()):
                 add("finding", raw_id)
+                explicit_finding_ids.add(str(raw_id))
 
         for unit in prompt_data.get("units", ()):
             add_unit(unit)
@@ -3366,20 +3521,36 @@ class InvestigationAdvisorTool:
                     "finding",
                 }:
                     add(str(reference["kind"]), reference.get("id"))
-        explicit_observation_refs = {
-            str(identifier) for kind, identifier in references if kind == "observation"
-        } | set(explicit_observation_ids)
+                    if reference["kind"] == "finding":
+                        explicit_finding_ids.add(str(reference.get("id")))
+        for reference in prompt_data.get("_explicit_assertion_refs", ()):
+            if isinstance(reference, Mapping) and reference.get("kind") in {
+                "observation",
+                "finding",
+            }:
+                add(str(reference["kind"]), reference.get("id"))
+                if reference["kind"] == "finding":
+                    explicit_finding_ids.add(str(reference.get("id")))
         for observation in evidence:
             add("observation", observation.id)
         available_observation_ids = {item.id for item in evidence}
         listing = getattr(self._findings, "list_for_investigation", None)
         if callable(listing):
-            current_findings = self._latest_findings(tuple(await listing(investigation_id)))
+            listed_findings = tuple(await listing(investigation_id))
+            current_findings = self._latest_findings(listed_findings)
+            for finding in listed_findings:
+                if str(finding.id) in explicit_finding_ids:
+                    for observation_ref in getattr(finding, "observation_refs", ()):
+                        add("observation", observation_ref)
             for finding in current_findings:
                 if set(getattr(finding, "observation_refs", ())).issubset(
                     available_observation_ids
                 ):
                     add("finding", finding.id)
+
+        explicit_observation_refs = {
+            str(identifier) for kind, identifier in references if kind == "observation"
+        } | set(explicit_observation_ids)
 
         observations_by_id = {item.id: item for item in evidence}
         finding_items: list[Any] = []
@@ -3407,13 +3578,17 @@ class InvestigationAdvisorTool:
                 if item is None:
                     item = await find_one(self._observations, identifier)
                 if item is None or item.investigation_id != investigation_id:
-                    raise _AdvisorInputValidationError("editorial_reference_unavailable")
+                    raise _AdvisorInputValidationError(
+                        "evidence_reference_not_found", reference=str(identifier)
+                    )
                 observations_by_id[identifier] = item
                 observation_items.append(item)
             else:
                 item = await find_one(self._findings, identifier)
                 if item is None or item.investigation_id != investigation_id:
-                    raise _AdvisorInputValidationError("editorial_reference_unavailable")
+                    raise _AdvisorInputValidationError(
+                        "editorial_reference_unavailable", reference=str(identifier)
+                    )
                 finding_items.append(item)
 
         observation_payload: list[dict[str, Any]] = []
@@ -4909,7 +5084,43 @@ def register_investigation_advisor_tool(
         "required": ["kind", "id"],
         "additionalProperties": False,
     }
-    assertion_schema = {
+    editorial_assertion_ref_schema = {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["observation", "finding", "experiment", "article", "measurement"],
+            },
+            "id": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        },
+        "required": ["kind", "id"],
+        "additionalProperties": False,
+        "oneOf": [
+            {
+                "properties": {
+                    "kind": {"enum": ["observation", "finding", "experiment"]},
+                    "id": uuid_schema,
+                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                }
+            },
+            {
+                "properties": {
+                    "kind": {"const": "article"},
+                    "id": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                }
+            },
+            {
+                "properties": {
+                    "kind": {"const": "measurement"},
+                    "id": {"type": "string", "pattern": r"^m[0-9]{3,}$"},
+                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                }
+            },
+        ],
+    }
+    assertion_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "id": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]{0,63}$"},
@@ -4938,6 +5149,19 @@ def register_investigation_advisor_tool(
         "required": ["id", "text", "nature", "refs", "block_type", "form", "anchor"],
         "additionalProperties": False,
     }
+    editorial_assertion_schema = {
+        **assertion_schema,
+        "properties": {
+            **assertion_schema["properties"],
+            "refs": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": editorial_assertion_ref_schema,
+            },
+        },
+        "required": ["id", "text", "nature", "refs"],
+    }
     editorial_unit_schema = {
         "type": "object",
         "properties": {
@@ -4955,7 +5179,7 @@ def register_investigation_advisor_tool(
             "assertions": {
                 "type": "array",
                 "minItems": 1,
-                "items": assertion_schema,
+                "items": editorial_assertion_schema,
             },
         },
         "required": ["id", "block_type", "form", "anchor"],
@@ -5854,6 +6078,73 @@ def _validate_editorial_unit_targets(
         seen_targets.add(target)
 
 
+def _unit_assertion_references(units: object) -> list[dict[str, str]]:
+    """Extract exact canonical refs from optional draft annotations on editorial units."""
+    if not isinstance(units, (list, tuple)):
+        return []
+    allowed_kinds = {"observation", "finding", "article", "measurement"}
+    references: dict[tuple[str, str], dict[str, str]] = {}
+    for unit in units:
+        if not isinstance(unit, Mapping):
+            continue
+        assertions = unit.get("assertions", ())
+        if not isinstance(assertions, (list, tuple)):
+            continue
+        for assertion in assertions:
+            if not isinstance(assertion, Mapping):
+                continue
+            raw_refs = assertion.get("refs", ())
+            if not isinstance(raw_refs, (list, tuple)):
+                continue
+            for raw_ref in raw_refs:
+                if not isinstance(raw_ref, Mapping):
+                    continue
+                kind = raw_ref.get("kind")
+                if kind not in allowed_kinds:
+                    continue
+                raw_identifier = raw_ref.get("id")
+                if not isinstance(raw_identifier, (str, UUID)) or not str(raw_identifier).strip():
+                    raise _AdvisorInputValidationError(
+                        "editorial_reference_invalid", reference="invalid-id"
+                    )
+                identifier = str(raw_identifier)
+                if kind in {"observation", "finding"}:
+                    try:
+                        identifier = str(UUID(identifier))
+                    except ValueError:
+                        raise _AdvisorInputValidationError(
+                            "editorial_reference_invalid", reference=identifier[:128]
+                        ) from None
+                declared_sha256 = raw_ref.get("sha256")
+                if declared_sha256 is not None and (
+                    not isinstance(declared_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
+                ):
+                    raise _AdvisorInputValidationError(
+                        "advisor_evidence_reference_mismatch", reference=identifier[:128]
+                    )
+                key = (str(kind), identifier)
+                previous = references.get(key)
+                if previous is not None:
+                    previous_sha256 = previous.get("sha256")
+                    if (
+                        previous_sha256 is not None
+                        and declared_sha256 is not None
+                        and previous_sha256 != declared_sha256
+                    ):
+                        raise _AdvisorInputValidationError(
+                            "advisor_evidence_reference_mismatch", reference=identifier[:128]
+                        )
+                    if previous_sha256 is None and declared_sha256 is not None:
+                        previous["sha256"] = declared_sha256
+                    continue
+                reference = {"kind": str(kind), "id": identifier}
+                if isinstance(declared_sha256, str):
+                    reference["sha256"] = declared_sha256
+                references[key] = reference
+    return list(references.values())
+
+
 def _opinion_review_targets(opinion: Any) -> tuple[dict[str, Any], ...]:
     targets: list[dict[str, Any]] = []
     for source_block in getattr(opinion, "blocks", ()):
@@ -6603,6 +6894,37 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
                     if isinstance(item.output.get("failure_reason"), str)
                     else {}
                 ),
+                **(
+                    {"preflight_status": item.output["preflight_status"]}
+                    if isinstance(item.output.get("preflight_status"), str)
+                    else {}
+                ),
+                **(
+                    {"preflight_cause": dict(item.output["preflight_cause"])}
+                    if isinstance(item.output.get("preflight_cause"), Mapping)
+                    else {}
+                ),
+                **(
+                    {"missing_refs": list(item.output["missing_refs"])}
+                    if isinstance(item.output.get("missing_refs"), (list, tuple))
+                    else {}
+                ),
+                **(
+                    {"additional_missing_ref_count": item.output["additional_missing_ref_count"]}
+                    if isinstance(item.output.get("additional_missing_ref_count"), int)
+                    and not isinstance(item.output.get("additional_missing_ref_count"), bool)
+                    else {}
+                ),
+                **(
+                    {"refusal_guidance": item.output["refusal_guidance"]}
+                    if isinstance(item.output.get("refusal_guidance"), str)
+                    else {}
+                ),
+                **(
+                    {"next_action": item.output["next_action"]}
+                    if isinstance(item.output.get("next_action"), str)
+                    else {}
+                ),
             }
             for item in results
         ],
@@ -6615,6 +6937,16 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
         output["failure_stage"] = first_failure["failure_stage"]
         output["failure_reason"] = first_failure.get("failure_reason", "unspecified")
         output["confirmed_non_execution"] = first_failure.get("confirmed_non_execution") is True
+        for key in (
+            "preflight_status",
+            "preflight_cause",
+            "missing_refs",
+            "additional_missing_ref_count",
+            "refusal_guidance",
+            "next_action",
+        ):
+            if key in first_failure:
+                output[key] = first_failure[key]
     batches: list[dict[str, Any]] = []
     unit_provenance: dict[str, Any] = {}
     redacted_count = 0
