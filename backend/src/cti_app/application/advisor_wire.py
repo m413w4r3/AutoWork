@@ -375,6 +375,8 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             if offsets[candidate][2].rstrip().endswith("`")
             and not offsets[candidate][2].rstrip().endswith("``")
             and not offsets[candidate][2].lstrip().startswith("```")
+            # A lone opening backtick on its own line is not also a closing one.
+            and not (candidate == opening_index and offsets[candidate][2].strip() == "`")
         ]
         if not closing:
             blocks.append(_RawSourceBlock(language, None, start, len(text)))

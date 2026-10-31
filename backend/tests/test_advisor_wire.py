@@ -976,6 +976,25 @@ def test_backtick_wrapped_yara_rule_with_backtick_inside_a_quoted_string_is_extr
     assert document.source_count == 1
 
 
+def test_backtick_wrapper_on_its_own_lines_yields_one_yara_rule() -> None:
+    source = """rule PsProxy_Specimen_Experimental_Candidate
+{
+    meta:
+        statut = "candidate_experimentale_non_validee"
+    strings:
+        $module = "PsProxy.dll" ascii
+    condition:
+        $module
+}"""
+    raw = "yara\n\n`\n" + source + "\n`"
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source == source
+    assert document.source_language == "yara"
+    assert document.source_count == 1
+
+
 def test_unfenced_yara_scanner_balances_tags_strings_comments_regex_and_hex() -> None:
     source = """rule TaggedCandidate : first_tag, second_tag {
     meta:
