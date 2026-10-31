@@ -806,6 +806,18 @@ def _reconciliation_task(
     }
 
 
+def _is_operator_reconcilable_passive_vt(
+    invocation: ToolInvocation,
+    operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None,
+) -> bool:
+    return (
+        operator_reconciliation_vt_tool_versions is not None
+        and invocation.tool_name in VT_PASSIVE_RETRY_TOOL_NAMES
+        and (invocation.tool_name, invocation.schema_version)
+        in operator_reconciliation_vt_tool_versions
+    )
+
+
 def _reconciliation_action(
     invocation: ToolInvocation,
     *,
@@ -820,12 +832,7 @@ def _reconciliation_action(
             "expected_version": invocation.version,
             "resubmission_allowed": False,
         }
-    operator_reconcilable_vt_versions = (
-        operator_reconciliation_vt_tool_versions
-        if operator_reconciliation_vt_tool_versions is not None
-        else frozenset((name, invocation.schema_version) for name in VT_PASSIVE_RETRY_TOOL_NAMES)
-    )
-    if (invocation.tool_name, invocation.schema_version) in operator_reconcilable_vt_versions:
+    if _is_operator_reconcilable_passive_vt(invocation, operator_reconciliation_vt_tool_versions):
         accepted_outcomes = (
             ["executed_with_result", "abandon"]
             if invocation.response_refs
@@ -936,10 +943,8 @@ def _next_action(
                 available_tools=available_tools,
                 retryable_vt_tool_versions=retryable_vt_tool_versions,
             )
-            is_operator_reconcilable_vt = invocation.tool_name in VT_PASSIVE_RETRY_TOOL_NAMES and (
-                operator_reconciliation_vt_tool_versions is None
-                or (invocation.tool_name, invocation.schema_version)
-                in operator_reconciliation_vt_tool_versions
+            is_operator_reconcilable_vt = _is_operator_reconcilable_passive_vt(
+                invocation, operator_reconciliation_vt_tool_versions
             )
             if retry_action is not None and not is_operator_reconcilable_vt:
                 return {

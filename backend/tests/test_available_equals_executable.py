@@ -1180,6 +1180,25 @@ async def test_needs_review_is_listed_with_passive_retry_or_advisor_reconciliati
         "not_executed",
         "abandon",
     ]
+    unverified_registry_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=state,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=envelope,
+        invocations=(passive,),
+        observations=tuple(
+            await fixture.observations.list_for_investigation(fixture.investigation_id)
+        ),
+        opinion=None,
+        jobs=(),
+        available_tools=("vt.file_report",),
+        unavailable_tools=(),
+    ).payload
+    unverified_reconciliation = unverified_registry_view["invocations_requiring_reconciliation"][0][
+        "reconciliation_action"
+    ]
+    assert unverified_reconciliation["path"].endswith(f"/invocations/{passive.id}/reconcile")
+    assert unverified_reconciliation["requires_verified_human_operator"] is True
     assert view["next_idempotent_action"]["path"].endswith(
         f"/operator/invocations/{passive.id}/reconcile"
     )
