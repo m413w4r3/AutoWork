@@ -38,6 +38,7 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocation,
     ToolInvocationStatus,
+    canonical_json_bytes,
 )
 from cti_app.domain.investigation_pivot_frontier import (
     PivotExecutionState,
@@ -922,6 +923,52 @@ def test_available_pivots_precede_blocked_pivots() -> None:
 
     assert [item.execution_state for item in pivots] == ["available", "blocked"]
     assert [item.indicator_value for item in pivots] == [linked_hash, unlinked_hash]
+
+
+def test_byte_truncation_never_lets_blocked_pivot_displace_available_pivot(monkeypatch) -> None:
+    linked_hashes = ("f" * 64, "e" * 64)
+    unlinked_hash = "a" * 64
+    inventory = tuple(
+        ConfirmedIOCContextV1(
+            indicator_type="sha256",
+            value=value,
+            extraction_artifact_id=uuid4(),
+            extraction_artifact_version=1,
+            source_document_ids=(),
+        )
+        for value in (*linked_hashes, unlinked_hash)
+    )
+    observations = tuple(
+        replace(
+            _relation_observation(value, f"{index + 1:x}" * 64),
+            observed_at=datetime(2026, 10, 20 + index, tzinfo=UTC),
+        )
+        for index, value in enumerate(linked_hashes)
+    )
+    arguments = {
+        "inventory": inventory,
+        "tools": _frontier_tools(),
+        "tool_coverage": (),
+        "invocations": (),
+        "observations": observations,
+    }
+    full, _ = available_investigation_pivots(**arguments)
+    assert [item.execution_state for item in full] == ["available", "available", "blocked"]
+
+    def size(item: AvailablePivotV1) -> int:
+        return len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
+
+    assert size(full[2]) < size(full[1])
+    monkeypatch.setattr(
+        investigation_pivots_module,
+        "MAX_AVAILABLE_PIVOTS_BYTES",
+        2 + size(full[0]) + size(full[2]),
+    )
+
+    pivots, truncated = available_investigation_pivots(**arguments)
+
+    assert truncated is True
+    assert [item.indicator_value for item in pivots] == [full[0].indicator_value]
 
 
 def test_available_pivot_contract_accepts_legacy_payload_without_additive_fields() -> None:

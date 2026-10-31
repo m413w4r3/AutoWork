@@ -385,13 +385,19 @@ def available_investigation_pivots(
     result: list[AvailablePivotV1] = []
     used_bytes = 2
     truncated = len(ordered) > MAX_AVAILABLE_PIVOTS
+    omitted_available = False
     for pivot in ordered:
         item_bytes = len(canonical_json_bytes(pivot.model_dump(mode="json"))) + 1
+        if omitted_available and pivot.execution_state == "blocked":
+            # A blocked pivot must never displace an available one that did not fit.
+            truncated = True
+            continue
         if (
             len(result) >= MAX_AVAILABLE_PIVOTS
             or used_bytes + item_bytes > MAX_AVAILABLE_PIVOTS_BYTES
         ):
             truncated = True
+            omitted_available = omitted_available or pivot.execution_state == "available"
             continue
         result.append(pivot)
         used_bytes += item_bytes

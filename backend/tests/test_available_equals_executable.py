@@ -1262,6 +1262,10 @@ async def test_operator_led_needs_review_keeps_analytic_action_separate() -> Non
     assert running_view["next_idempotent_action"]["invocation_id"] == running.id
     assert "blocks_other_tools" not in running_view["next_idempotent_action"]
     assert running_view["next_analytic_action"]["code"] == "operator_action_required"
+    (running_task,) = running_view["reconciliation_tasks"]
+    assert running_task["status"] == "running"
+    assert running_task["reconciliation_action"] is None
+    assert running_task["requires_verified_human_operator"] is False
 
     bridge_state = replace(state, execution_mode=InvestigationExecutionMode.BRIDGE_LED)
     bridge_view = build_view(bridge_state, (reviewed,))

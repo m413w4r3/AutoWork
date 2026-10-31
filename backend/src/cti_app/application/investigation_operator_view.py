@@ -771,6 +771,17 @@ def _reconciliation_task(
     available_tools: tuple[str, ...],
     retryable_vt_tool_versions: frozenset[tuple[str, str]],
 ) -> dict[str, Any]:
+    if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
+        # PENDING/RUNNING may belong to a live adapter call: the reconcile route only
+        # accepts needs_review, so no action is offered until the status settles.
+        return {
+            "invocation_id": invocation.id,
+            "tool_name": invocation.tool_name,
+            "status": invocation.status.value,
+            "reconciliation_action": None,
+            "requires_verified_human_operator": False,
+            "response_persisted": bool(invocation.response_refs),
+        }
     action = _passive_retry_action(
         invocation,
         investigation_id=investigation_id,
