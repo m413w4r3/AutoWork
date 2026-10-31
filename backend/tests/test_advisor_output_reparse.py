@@ -271,10 +271,9 @@ async def test_legacy_v3_reparse_returns_full_advisory_text_without_new_observat
 @pytest.mark.asyncio
 async def test_v3_yara_reparse_persists_local_prose_normalization_with_v3_versions() -> None:
     source = (
-        'rule ReparsedCandidate { strings: $marker = "SyntheticReparseMarker" '
-        "condition: $marker }\n"
+        'rule ReparsedCandidate { strings: $marker = "SyntheticReparseMarker" condition: $marker }'
     )
-    raw = "Règle consultative basée sur la mesure.\n```yara\n" + source + "```\n"
+    raw = "Règle consultative basée sur la mesure.\n\nyara\n\n`" + source + "`\n"
     measurement = {
         "evidence_id": "observation:synthetic-1",
         "evidence_sha256": "a" * 64,

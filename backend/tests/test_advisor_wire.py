@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application import advisor_wire as advisor_wire_module
 from cti_app.application.advisor_contracts import (
     extract_json_object,
     parse_typed_advisor_response,
@@ -872,6 +873,202 @@ def test_yara_prose_rejects_multiple_rules_and_missing_rule_blocks() -> None:
     assert prose_only["usable"] is False
     assert "raw_source_block_missing" in prose_only["warnings"]
     assert "yara_block_missing" in prose_only["normalization_errors"]
+
+
+def test_yara_unfenced_bridge_shape_extracts_and_links_both_measured_strings() -> None:
+    source = """rule CTI_Example_Exact_Candidate
+{
+    meta:
+        description = "synthetic"
+        sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    strings:
+        $a = "System.Management.Automation" ascii
+        $b = "CreateRunspace" ascii
+    condition:
+        filesize == 6144 and $a and $b
+}"""
+    measurements = [
+        {
+            "evidence_id": "synthetic-observation",
+            "evidence_sha256": "a" * 64,
+            "sample_sha256": "b" * 64,
+            "offset": offset,
+            "length": len(value.encode("ascii")),
+            "kind": "string",
+            "encoding": "ascii",
+            "value": value,
+            "measurement_id": measurement_id,
+        }
+        for measurement_id, offset, value in (
+            ("m001", 10, "System.Management.Automation"),
+            ("m002", 50, "CreateRunspace"),
+        )
+    ]
+    transmitted_refs = [
+        {
+            "kind": "measurement",
+            "id": item["measurement_id"],
+            "sha256": hashlib.sha256(
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+        for item in measurements
+    ]
+    raw = "### 1. Règle YARA candidate\n\nyara\n\n`" + source + "`\n"
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={
+            "consultation_type": "yara_draft",
+            "measurements": measurements,
+            "transmitted_refs": transmitted_refs,
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] == source
+    assert parsed["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert parsed["usable"] is True
+    assert [item["name"] for item in parsed["motifs"]] == ["$a", "$b"]
+
+
+def test_unfenced_yara_scanner_balances_tags_strings_comments_regex_and_hex() -> None:
+    source = """rule TaggedCandidate : first_tag, second_tag {
+    meta:
+        description = "a closing brace } inside a string"
+    strings:
+        $quoted = "brace } and // /*" ascii
+        $hex = { 7B 2A 7D }
+        $regex = /a{1,2}\\}b/
+        // an ignored closing brace }
+        /* ignored opening { and closing } braces */
+    condition:
+        all of them
+}"""
+
+    document = parse_advisor_wire("Proposal follows.\n" + source + "\nIgnore this prose.")
+
+    assert document.source == source
+    assert document.source_language == "yara"
+    assert document.source_count == 1
+
+
+def test_unfenced_yara_ignores_rule_like_text_inside_a_comment() -> None:
+    source = 'rule RealCandidate { strings: $real = "real-marker" condition: $real }'
+    raw = (
+        "Bridge explanation.\n/*\n"
+        'rule FakeCandidate { strings: $fake = "fake-marker" condition: $fake }\n'
+        "*/\n" + source + "\nMore explanation."
+    )
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source == source
+    assert document.source_count == 1
+
+
+def test_unfenced_yara_rejects_multiple_rule_declarations_with_specific_cause() -> None:
+    raw = (
+        'rule First { strings: $first = "first-marker" condition: $first }\n'
+        'rule Second { strings: $second = "second-marker" condition: $second }\n'
+    )
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is False
+    assert parsed["rule_source"] is None
+    assert "raw_source_multiple_blocks" in parsed["warnings"]
+    assert "multiple_yara_rules_detected" in parsed["normalization_errors"]
+
+
+def test_unfenced_yara_complete_invalid_rule_keeps_validation_cause() -> None:
+    source = 'rule InvalidCandidate { strings: $marker = "value" condition: filesize }'
+    parsed = parse_typed_advisor_response(
+        "Proposal follows.\n" + source,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is False
+    assert parsed["rule_source"] == source
+    assert (
+        "rule_validation:condition_must_reference_measured_patterns"
+        in parsed["normalization_errors"]
+    )
+
+
+def test_unfenced_yara_unclosed_rule_has_specific_error_and_no_partial_source() -> None:
+    raw = 'Explanation.\nrule Incomplete { strings: $marker = "value" condition: $marker\n'
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is False
+    assert parsed["rule_source"] is None
+    assert "yara_rule_unclosed" in parsed["warnings"]
+    assert "yara_rule_unclosed" in parsed["normalization_errors"]
+
+
+def test_yara_prose_with_rule_word_but_no_declaration_keeps_missing_source_cause() -> None:
+    parsed = parse_typed_advisor_response(
+        "The rule applies to this family, but no YARA declaration is included.",
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] is None
+    assert parsed["usable"] is False
+    assert "raw_source_block_missing" in parsed["warnings"]
+
+
+@pytest.mark.parametrize("fence_language", ["yara", "yar", ""])
+def test_yara_fence_aliases_keep_one_complete_source(fence_language: str) -> None:
+    source = 'rule FencedCandidate { strings: $marker = "fenced-value" condition: $marker }'
+    opening_fence = "```" + fence_language
+
+    document = parse_advisor_wire(opening_fence + "\n" + source + "\n```\n")
+
+    assert document.source is not None
+    assert document.source.strip() == source
+    assert document.source_language == "yara"
+    assert document.source_count == 1
+
+
+def test_many_unclosed_yara_declarations_are_scanned_once(monkeypatch) -> None:
+    calls = 0
+    original = advisor_wire_module._balanced_yara_rule_end
+
+    def count_scans(text: str, opening_brace: int) -> int | None:
+        nonlocal calls
+        calls += 1
+        return original(text, opening_brace)
+
+    monkeypatch.setattr(advisor_wire_module, "_balanced_yara_rule_end", count_scans)
+    raw = "\n".join(f"rule Incomplete{index} {{" for index in range(500))
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source is None
+    assert document.source_count == 1
+    assert document.source_error == "yara_rule_unclosed"
+    assert calls == 1
 
 
 def test_suricata_wire_preserves_multiline_source_and_local_hash() -> None:
