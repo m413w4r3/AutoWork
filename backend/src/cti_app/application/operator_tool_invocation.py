@@ -1870,6 +1870,14 @@ class OperatorToolInvocationService:
                     required_capability=required_capability,
                 ),
             }
+            # The tool's own refusal code (e.g. sample_not_associated) tells the
+            # operator what to fix; it is only published when it is a plain
+            # identifier that is neither a secret nor an echoed argument.
+            detail_code = _safe_operator_error_code(
+                getattr(tool_result, "message", None), invocation.normalized_parameters
+            )
+            if detail_code is not None and detail_code != output["error"]["code"]:
+                output["error"]["detail_code"] = detail_code
             if error_code == "invalid_tool_arguments":
                 output["error"]["correction"] = (
                     "Use the published arguments_schema in available_tools and correct the "

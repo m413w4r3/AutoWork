@@ -2176,6 +2176,50 @@ async def test_untrusted_adapter_cannot_unlock_equivalent_fresh_key_retry() -> N
 
 
 @pytest.mark.asyncio
+async def test_policy_denied_publishes_only_a_safe_tool_refusal_detail_code() -> None:
+    fixture, state, service = await _fixture()
+    _authorize_framework_refusal_proof_adapter(fixture.tools["vt.file_report"])
+    fixture.tools["vt.file_report"].result = ToolResult(
+        status=ToolInvocationStatus.POLICY_DENIED,
+        message="sample_not_associated",
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    denied = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "detail code"},
+        purpose="The refusal cause must reach the operator.",
+        expected_version=state.version,
+        idempotency_key="policy-detail-code",
+    )
+
+    assert denied.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert denied.output["error"]["code"] == "tool_policy_denied"
+    assert denied.output["error"]["detail_code"] == "sample_not_associated"
+
+    fixture.tools["vt.file_report"].result = ToolResult(
+        status=ToolInvocationStatus.POLICY_DENIED,
+        message="refused for sample 0123456789abcdef: /host/path token=abc",
+        framework_pre_submission_proof=(
+            FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        ),
+    )
+    unsafe = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "unsafe detail"},
+        purpose="A free-text message is never published.",
+        expected_version=denied.working_state_version,
+        idempotency_key="policy-detail-unsafe",
+    )
+
+    assert unsafe.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert "detail_code" not in unsafe.output["error"]
+
+
+@pytest.mark.asyncio
 async def test_proven_presend_refusal_releases_budget_and_allows_new_invocation() -> None:
     fixture, state, service = await _fixture()
     arguments = {"query": "typed pre-consume refusal"}
