@@ -1111,6 +1111,7 @@ def _normalize_prose_yara_wire(
     source: str | None,
     source_count: int,
     source_language: str | None,
+    source_error: str | None,
     aliases: Mapping[str, Mapping[str, Mapping[str, Any]]],
     prompt_data: Mapping[str, Any],
     safe_text: Callable[[str, int], str],
@@ -1127,10 +1128,15 @@ def _normalize_prose_yara_wire(
     if source_count > 1:
         warn("raw_source_multiple_blocks")
         normalization_errors.append("exactly_one_yara_block_required")
+        normalization_errors.append("multiple_yara_rules_detected")
         source = None
     elif source is None:
-        warn("raw_source_block_missing")
-        normalization_errors.append("yara_block_missing")
+        if source_error is None:
+            warn("raw_source_block_missing")
+            normalization_errors.append("yara_block_missing")
+        else:
+            warn(source_error)
+            normalization_errors.append(source_error)
     elif source_language != "yara":
         warn("raw_source_language_mismatch")
         normalization_errors.append("yara_block_language_mismatch")
@@ -1419,6 +1425,7 @@ def _parse_typed_advisor_wire(
             source=document.source,
             source_count=document.source_count,
             source_language=document.source_language,
+            source_error=document.source_error,
             aliases=aliases,
             prompt_data=prompt_data,
             safe_text=safe_text,

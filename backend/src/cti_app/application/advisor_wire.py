@@ -31,6 +31,7 @@ class AdvisorWireDocument:
     source_language: str | None
     source_count: int
     ignored_prose: bool = False
+    source_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,7 @@ class _RawSourceBlock:
     source: str | None
     start: int
     end: int
+    error: str | None = None
 
 
 def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
@@ -48,6 +50,7 @@ def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
     region = text[header.end() :] if header else text
     source_blocks = _raw_source_blocks(region)
     source, language, source_count = _source_result(source_blocks)
+    source_error = source_blocks[0].error if len(source_blocks) == 1 else None
     fields: dict[str, list[str]] = defaultdict(list)
     records: list[tuple[str, str]] = []
     ignored_prose = False
@@ -84,6 +87,7 @@ def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
         source_language=language,
         source_count=source_count,
         ignored_prose=ignored_prose,
+        source_error=source_error,
     )
 
 
@@ -346,13 +350,8 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
         offsets.append((cursor, cursor + len(line), line.rstrip("\n")))
         cursor += len(line)
 
-    def covered(start: int, end: int) -> bool:
-        return any(
-            start < block_end and end > block_start for block_start, block_end in wrapped_spans
-        )
-
     for index, (start, _end, raw_line) in enumerate(offsets):
-        if covered(start, start + len(raw_line)):
+        if any(block_start <= start < block_end for block_start, block_end in wrapped_spans):
             continue
         label = raw_line.strip().casefold()
         if label not in {"yara", "suricata"}:
@@ -404,24 +403,29 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
         wrapped_spans.append((start, close_end))
 
     masked = _mask_source_spans(text, wrapped_spans)
-    yara_declarations = list(
-        re.finditer(
-            r"(?im)^[ \t]*(?:(?:private|global)[ \t]+)*rule[ \t]+[A-Za-z_][A-Za-z0-9_]*"
-            r"[ \t]*(?:\n[ \t]*)?\{",
-            masked,
-        )
+    yara_declaration = re.compile(
+        r"(?im)^[ \t]*(?:(?:private|global)[ \t]+)*rule[ \t]+[A-Za-z_][A-Za-z0-9_]*"
+        r"[ \t]*(?::[ \t]*[A-Za-z_][A-Za-z0-9_]*"
+        r"(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)?[ \t]*(?:\n[ \t]*)?\{"
     )
+    declaration_text = _mask_yara_comments(masked)
+    yara_declarations = list(yara_declaration.finditer(declaration_text))
     yara_spans: list[tuple[int, int]] = []
+    current_yara_end = -1
     for match in yara_declarations:
-        if covered(match.start(), match.end()):
+        if match.start() < current_yara_end:
             continue
         end = _balanced_yara_rule_end(text, match.end() - 1)
         if end is None:
-            blocks.append(_RawSourceBlock("yara", None, match.start(), len(text)))
+            blocks.append(
+                _RawSourceBlock("yara", None, match.start(), len(text), error="yara_rule_unclosed")
+            )
             yara_spans.append((match.start(), len(text)))
+            break
         else:
             blocks.append(_RawSourceBlock("yara", text[match.start() : end], match.start(), end))
             yara_spans.append((match.start(), end))
+            current_yara_end = end
     masked = _mask_source_spans(text, [*wrapped_spans, *yara_spans])
 
     action_line = re.compile(r"(?i)^[ \t]*(?:alert|drop|pass)\b[^\n]*;[ \t]*$")
@@ -451,6 +455,70 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             blocks.append(_RawSourceBlock("suricata", text[start:end].rstrip("\n"), start, end))
 
     return sorted(blocks, key=lambda block: (block.start, block.end))
+
+
+def _mask_yara_comments(text: str) -> str:
+    """Hide comments and literals while locating declarations in surrounding prose."""
+    output = list(text)
+    state = "plain"
+    escaped = False
+    previous = ""
+    index = 0
+    while index < len(text):
+        character = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if state == "line_comment":
+            if character == "\n":
+                state = "plain"
+                previous = ""
+            else:
+                output[index] = " "
+            index += 1
+            continue
+        if state == "block_comment":
+            if character == "*" and following == "/":
+                output[index] = output[index + 1] = " "
+                index += 2
+                state = "plain"
+                continue
+            if character != "\n":
+                output[index] = " "
+            index += 1
+            continue
+        if state in {"quoted_string", "regex"}:
+            delimiter = '"' if state == "quoted_string" else "/"
+            if character != "\n":
+                output[index] = " "
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == delimiter:
+                state = "plain"
+            index += 1
+            continue
+        if character == "/" and following == "/":
+            output[index] = output[index + 1] = " "
+            index += 2
+            state = "line_comment"
+            continue
+        if character == "/" and following == "*":
+            output[index] = output[index + 1] = " "
+            index += 2
+            state = "block_comment"
+            continue
+        if character == '"':
+            output[index] = " "
+            state = "quoted_string"
+        elif character == "/" and previous == "=":
+            output[index] = " "
+            state = "regex"
+        if not character.isspace():
+            previous = character
+        elif character == "\n":
+            previous = ""
+        index += 1
+    return "".join(output)
 
 
 def _mask_source_spans(text: str, spans: list[tuple[int, int]]) -> str:
