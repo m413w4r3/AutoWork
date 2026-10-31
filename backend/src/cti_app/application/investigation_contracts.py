@@ -103,6 +103,8 @@ class AvailablePivotV1(_StrictContract):
     arguments: dict[str, Any]
     execution_state: Literal["available", "blocked"] = "available"
     blocked_reason: str | None = Field(default=None, min_length=1, max_length=96)
+    source_observation_ids: tuple[UUID, ...] = Field(default=(), max_length=16)
+    covered_by_tools: tuple[str, ...] = Field(default=(), max_length=256)
 
 
 class EvidenceSummaryV1(_StrictContract):

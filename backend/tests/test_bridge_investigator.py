@@ -24,6 +24,7 @@ from cti_app.application.investigation_advisor_tools import (
 from cti_app.application.investigation_contracts import (
     ArticleClaimV1,
     ArticleContextV1,
+    AvailablePivotV1,
     ContextInvestigationV1,
     IndicatorInventoryV1,
     InvestigationContextV1,
@@ -371,6 +372,46 @@ def test_rendered_prompt_discloses_truncated_ioc_inventory_and_counts() -> None:
     assert "evidence index truncated: oui" in prompt
     assert "truncation counts" in prompt
     assert "evidence index=3" in prompt
+
+
+def test_rendered_prompt_selects_pivots_by_open_question_and_allows_recorded_stop() -> None:
+    prompt = bridge_module.render_investigation_prompt(_context(uuid4()))
+
+    assert "Select pivots for their ability to distinguish an open question" in prompt
+    assert "considering cost, duplication, and coverage already acquired" in prompt
+    assert "You may stop a line of inquiry when you record the reason" in prompt
+    assert "do not execute the list by default" in prompt
+    assert "Do not alter or invent their parameters" in prompt
+    assert "Execute relevant listed pivots before finishing" not in prompt
+
+
+def test_pivot_metadata_participates_in_canonical_context_fingerprint() -> None:
+    pivot = AvailablePivotV1(
+        tool_name="vt.file_report",
+        schema_version="1",
+        indicator_type="sha256",
+        indicator_value="a" * 64,
+        arguments={"file_hash": "a" * 64},
+    )
+    context = _context(uuid4())
+    without_metadata = context.model_copy(update={"available_pivots": (pivot,)})
+    with_metadata = context.model_copy(
+        update={
+            "available_pivots": (
+                pivot.model_copy(
+                    update={
+                        "source_observation_ids": (uuid4(),),
+                        "covered_by_tools": ("vt.behaviour",),
+                    }
+                ),
+            )
+        }
+    )
+
+    assert (
+        hashlib.sha256(without_metadata.canonical_bytes()).hexdigest()
+        != hashlib.sha256(with_metadata.canonical_bytes()).hexdigest()
+    )
 
 
 @pytest.mark.asyncio
