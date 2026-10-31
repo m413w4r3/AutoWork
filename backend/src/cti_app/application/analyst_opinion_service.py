@@ -26,7 +26,10 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -123,11 +126,12 @@ class OpinionError(ValueError):
         *,
         citation_violations: tuple[CitationViolation, ...] = (),
         field_path: str | None = None,
+        message: str | None = None,
     ) -> None:
         self.code = code
         self.citation_violations = citation_violations
         self.field_path = field_path
-        super().__init__(code.value)
+        super().__init__(message or code.value)
 
 
 class _OperatorOpinionInputError(ValueError):
@@ -1034,29 +1038,148 @@ class AnalystOpinionService:
 
         persisted = await uow.evidence_observations.list_for_investigation(opinion.investigation_id)
         advisor_calls: dict[str, Mapping[str, Any]] = {}
+        referenced_invocations: dict[str, set[str]] = {"draft_text": set(), "review_text": set()}
+        observation_failures: dict[str, list[tuple[UUID, str, str | None]]] = {
+            "draft_text": [],
+            "review_text": [],
+        }
+        for _, _, _, draft_ref, review_ref in requested:
+            draft_invocation_id = getattr(draft_ref, "invocation_id", None)
+            if isinstance(draft_invocation_id, str):
+                referenced_invocations["draft_text"].add(draft_invocation_id)
+            review_invocation_id = getattr(review_ref, "invocation_id", None)
+            if isinstance(review_invocation_id, str):
+                referenced_invocations["review_text"].add(review_invocation_id)
         for observation in persisted:
             if observation.investigation_id != opinion.investigation_id:
                 continue
             if observation.source != "advisor.consult" or observation.object_type != "advisor_call":
                 continue
+            expected_ids = referenced_invocations.get(observation.object_id, set())
+            if not expected_ids:
+                continue
             try:
-                raw = await self._artifact_store.read_bytes(
-                    observation.blob_id, max_bytes=160 * 1024
+                # None asks BlobCatalogService to use the canonical descriptor size.
+                raw = await self._artifact_store.read_bytes(observation.blob_id, max_bytes=None)
+            except ProductionReuseStorageUnavailableError:
+                observation_failures[observation.object_id].append(
+                    (observation.blob_id, "temporarily unavailable", None)
                 )
-                if hashlib.sha256(raw).hexdigest() != observation.sha256:
-                    continue
+                continue
+            except (OSError, ValueError, TypeError) as exc:
+                observation_failures[observation.object_id].append(
+                    (observation.blob_id, f"unreadable ({type(exc).__name__})", None)
+                )
+                continue
+            actual_sha256 = hashlib.sha256(raw).hexdigest()
+            if actual_sha256 != observation.sha256:
+                try:
+                    unverified_payload = json.loads(raw)
+                except (ValueError, TypeError):
+                    unverified_payload = None
+                unverified_id = (
+                    unverified_payload.get("bridge_invocation_id")
+                    if isinstance(unverified_payload, Mapping)
+                    else None
+                )
+                reason = "observation SHA-256 mismatch"
+                if isinstance(unverified_id, str) and unverified_id in expected_ids:
+                    raise OpinionError(
+                        OpinionErrorCode.INVALID_SELECTION,
+                        message=f"Bridge invocation {unverified_id}: {reason}",
+                    )
+                observation_failures[observation.object_id].append(
+                    (
+                        observation.blob_id,
+                        reason,
+                        unverified_id if isinstance(unverified_id, str) else None,
+                    )
+                )
+                continue
+            try:
                 payload = json.loads(raw)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            except (ValueError, TypeError) as exc:
+                observation_failures[observation.object_id].append(
+                    (observation.blob_id, f"invalid JSON ({exc})", None)
+                )
                 continue
             if (
                 not isinstance(payload, Mapping)
                 or payload.get("schema") != "operator-advisor-call.v1"
                 or payload.get("consultation_type") != observation.object_id
             ):
+                payload_invocation = (
+                    payload.get("bridge_invocation_id") if isinstance(payload, Mapping) else None
+                )
+                if isinstance(payload_invocation, str) and payload_invocation in expected_ids:
+                    raise OpinionError(
+                        OpinionErrorCode.INVALID_SELECTION,
+                        message=(
+                            f"Bridge invocation {payload_invocation}: payload consultation "
+                            "type/schema does not match observation"
+                        ),
+                    )
+                if not isinstance(payload_invocation, str):
+                    observation_failures[observation.object_id].append(
+                        (
+                            observation.blob_id,
+                            "payload schema/consultation type mismatch",
+                            None,
+                        )
+                    )
                 continue
             invocation_id = payload.get("bridge_invocation_id")
             if isinstance(invocation_id, str):
                 advisor_calls[invocation_id] = payload
+
+        for consultation_type, invocation_ids in referenced_invocations.items():
+            for invocation_id in invocation_ids - advisor_calls.keys():
+                failures = observation_failures[consultation_type]
+                if failures:
+                    retryable_failure = next(
+                        (
+                            failure
+                            for failure in failures
+                            if failure[1].startswith("temporarily unavailable")
+                            and failure[2] in {None, invocation_id}
+                        ),
+                        None,
+                    )
+                    if retryable_failure is not None:
+                        blob_id, reason, _ = retryable_failure
+                        raise ProductionReuseStorageUnavailableError(
+                            f"Bridge invocation {invocation_id}: candidate observation "
+                            f"blob {blob_id} was {reason}"
+                        )
+                    identified_failure = next(
+                        (failure for failure in failures if failure[2] == invocation_id),
+                        None,
+                    )
+                    if identified_failure is not None:
+                        blob_id, reason, _ = identified_failure
+                        raise OpinionError(
+                            OpinionErrorCode.INVALID_SELECTION,
+                            message=(
+                                f"Bridge invocation {invocation_id}: observation blob "
+                                f"{blob_id} could not be validated ({reason})"
+                            ),
+                        )
+                    blob_id, reason, _ = failures[0]
+                    raise OpinionError(
+                        OpinionErrorCode.INVALID_SELECTION,
+                        message=(
+                            f"Bridge invocation {invocation_id}: no matching persisted call "
+                            f"was found; candidate observation blob {blob_id} could not be "
+                            f"attributed because it was {reason}"
+                        ),
+                    )
+                raise OpinionError(
+                    OpinionErrorCode.INVALID_SELECTION,
+                    message=(
+                        f"Bridge invocation {invocation_id}: no persisted advisor_call "
+                        "payload matched this invocation"
+                    ),
+                )
 
         for text_value, block_type, anchor, draft_ref, review_ref in requested:
             text_sha256 = hashlib.sha256(text_value.encode("utf-8")).hexdigest()
@@ -1549,7 +1672,7 @@ class OperatorOpinionToolAdapter:
                 ToolInvocationStatus.FAILED,
                 error_code=code,
                 output={"error_code": code},
-                message=code,
+                message=str(exc),
             )
         except (TypeError, ValueError) as exc:
             code = "invalid_note_anchor" if "anchor" in str(exc).casefold() else "invalid_opinion"

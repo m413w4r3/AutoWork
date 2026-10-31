@@ -20,7 +20,10 @@ from cti_app.application.analyst_opinion_service import (
 )
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_tools import ToolExecutionContext
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
     AnalystObservationState,
@@ -624,6 +627,8 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
             "input_refs": input_refs,
         }
         payload["output"] = output
+        if payload["consultation_type"] == "draft_text":
+            payload["large_bridge_context"] = "x" * 1_500_000
         raw = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode()
@@ -673,6 +678,29 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
                 ],
             },
         }
+    )
+    unrelated_call = json.dumps(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "draft_text",
+            "bridge_invocation_id": str(uuid4()),
+        }
+    ).encode()
+    unrelated_blob_id = uuid4()
+    harness.store.blobs[unrelated_blob_id] = unrelated_call
+    harness.observations.items = (
+        *harness.observations.items,
+        EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=unrelated_blob_id,
+            sha256="0" * 64,
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id="draft_text",
+        ),
     )
     persist_call(
         {
@@ -1069,6 +1097,37 @@ async def test_compose_and_revise_accept_per_unit_refs_from_batched_advisor_call
             },
         }
     )
+    transient_call = json.dumps(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "draft_text",
+            "bridge_invocation_id": str(uuid4()),
+        }
+    ).encode()
+    transient_blob_id = uuid4()
+    harness.store.blobs[transient_blob_id] = transient_call
+    harness.observations.items = (
+        *harness.observations.items,
+        EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=transient_blob_id,
+            sha256=hashlib.sha256(transient_call).hexdigest(),
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id="draft_text",
+        ),
+    )
+    original_read_bytes = harness.store.read_bytes
+
+    async def fail_unrelated_read(blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        if blob_id == transient_blob_id:
+            raise ProductionReuseStorageUnavailableError("temporary blob storage outage")
+        return await original_read_bytes(blob_id, max_bytes=max_bytes)
+
+    harness.store.read_bytes = fail_unrelated_read  # type: ignore[method-assign]
     body = OpinionBlock(
         block_type=OpinionBlockType.KEY_FINDINGS,
         text=body_text,
@@ -1118,10 +1177,187 @@ async def test_compose_and_revise_accept_per_unit_refs_from_batched_advisor_call
 
 
 @pytest.mark.asyncio
+async def test_opinion_revision_reports_bridge_observation_sha_mismatch() -> None:
+    harness = make_opinion_harness()
+    current = await harness.service.compose_from_findings(harness.investigation.id)
+    invocation_id = str(uuid4())
+    text = "Le constat conserve sa provenance Bridge."
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    raw = json.dumps(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "draft_text",
+            "bridge_invocation_id": invocation_id,
+        }
+    ).encode()
+    blob_id = uuid4()
+    harness.store.blobs[blob_id] = raw
+    harness.observations.items = (
+        EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=blob_id,
+            sha256="0" * 64,
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id="draft_text",
+        ),
+    )
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(invocation_id, text_sha256),
+    )
+
+    with pytest.raises(OpinionError) as error:
+        await harness.service.revise(
+            current.id,
+            current.version,
+            OpinionRevisionEdits((block,)),
+            "editor:one",
+            expected_sha256=current.content_sha256,
+        )
+
+    assert error.value.code is OpinionErrorCode.INVALID_SELECTION
+    assert invocation_id in str(error.value)
+    assert "SHA-256 mismatch" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_opinion_revision_reports_bridge_consultation_type_mismatch() -> None:
+    harness = make_opinion_harness()
+    current = await harness.service.compose_from_findings(harness.investigation.id)
+    invocation_id = str(uuid4())
+    text = "Le constat conserve sa provenance Bridge."
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    raw = json.dumps(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "review_text",
+            "bridge_invocation_id": invocation_id,
+        }
+    ).encode()
+    blob_id = uuid4()
+    harness.store.blobs[blob_id] = raw
+    harness.observations.items = (
+        EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=blob_id,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id="draft_text",
+        ),
+    )
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(invocation_id, text_sha256),
+    )
+
+    with pytest.raises(OpinionError) as error:
+        await harness.service.revise(
+            current.id,
+            current.version,
+            OpinionRevisionEdits((block,)),
+            "editor:one",
+            expected_sha256=current.content_sha256,
+        )
+
+    assert error.value.code is OpinionErrorCode.INVALID_SELECTION
+    assert invocation_id in str(error.value)
+    assert "consultation type/schema" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_opinion_revision_preserves_retryable_bridge_blob_storage_error() -> None:
+    harness = make_opinion_harness()
+    current = await harness.service.compose_from_findings(harness.investigation.id)
+    invocation_id = str(uuid4())
+    text = "Le constat conserve sa provenance Bridge."
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    raw = json.dumps(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "draft_text",
+            "bridge_invocation_id": invocation_id,
+        }
+    ).encode()
+    blob_id = uuid4()
+    harness.store.blobs[blob_id] = raw
+    harness.observations.items = (
+        EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=blob_id,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id="draft_text",
+        ),
+    )
+
+    async def fail_read(_blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        raise ProductionReuseStorageUnavailableError("temporary blob storage outage")
+
+    harness.store.read_bytes = fail_read  # type: ignore[method-assign]
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(invocation_id, text_sha256),
+    )
+
+    with pytest.raises(ProductionReuseStorageUnavailableError):
+        await harness.service.revise(
+            current.id,
+            current.version,
+            OpinionRevisionEdits((block,)),
+            "editor:one",
+            expected_sha256=current.content_sha256,
+        )
+
+
+@pytest.mark.asyncio
 async def test_opinion_revision_rejects_unpersisted_bridge_invocation() -> None:
     harness = make_opinion_harness()
     current = await harness.service.compose_from_findings(harness.investigation.id)
     text = "Le finding mesuré est repris dans ce brouillon."
+    invocation_id = str(uuid4())
+    unrelated_raw = b"not valid advisor JSON"
+    unrelated_blob_id = uuid4()
+    harness.store.blobs[unrelated_blob_id] = unrelated_raw
+    harness.observations.items = (
+        EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=unrelated_blob_id,
+            sha256="0" * 64,
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id="draft_text",
+        ),
+    )
     block = OpinionBlock(
         block_type=OpinionBlockType.KEY_FINDINGS,
         text=text,
@@ -1130,7 +1366,7 @@ async def test_opinion_revision_rejects_unpersisted_bridge_invocation() -> None:
         qualification=OpinionClaimQualification.FACT,
         bridge_authored=True,
         bridge_draft_ref=BridgeDraftReferenceV1(
-            str(uuid4()), hashlib.sha256(text.encode()).hexdigest()
+            invocation_id, hashlib.sha256(text.encode()).hexdigest()
         ),
     )
 
@@ -1144,6 +1380,9 @@ async def test_opinion_revision_rejects_unpersisted_bridge_invocation() -> None:
         )
 
     assert error.value.code is OpinionErrorCode.INVALID_SELECTION
+    assert invocation_id in str(error.value)
+    assert "no matching persisted call" in str(error.value)
+    assert "could not be attributed" in str(error.value)
 
 
 @pytest.mark.asyncio
