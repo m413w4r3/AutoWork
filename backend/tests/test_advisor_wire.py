@@ -956,6 +956,26 @@ def test_backtick_wrapped_yara_rule_is_extracted_when_later_prose_has_inline_cod
     assert document.source_count == 1
 
 
+def test_backtick_wrapped_yara_rule_with_backtick_inside_a_quoted_string_is_extracted() -> None:
+    source = """rule EXP_Example_Specimen
+{
+    meta:
+        status = "experimental"
+    strings:
+        $ps_1 = "PSDataCollection`1" ascii
+        $ps_2 = "CreateRunspace" ascii
+    condition:
+        all of them
+}"""
+    raw = "yara\n\n`" + source + "`\n\nJustification: `CreateRunspace` et `PSDataCollection`1`.\n"
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source == source
+    assert document.source_language == "yara"
+    assert document.source_count == 1
+
+
 def test_unfenced_yara_scanner_balances_tags_strings_comments_regex_and_hex() -> None:
     source = """rule TaggedCandidate : first_tag, second_tag {
     meta:

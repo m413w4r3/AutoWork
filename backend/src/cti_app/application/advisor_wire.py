@@ -402,32 +402,45 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             body_lines.append(close_content)
         source_text = "\n".join(body_lines).strip("\n")
         source_value: str | None = source_text if "`" not in source_text else None
+        if source_value is None and language == "yara":
+            # A rule may legitimately hold a backtick inside a quoted string (e.g. the .NET
+            # generic arity in "PSDataCollection`1"); the string-aware declaration scanner
+            # below extracts it, so the wrapper must not void the block.
+            continue
         blocks.append(_RawSourceBlock(language, source_value, start, close_end))
         wrapped_spans.append((start, close_end))
 
     masked = _mask_source_spans(text, wrapped_spans)
     yara_declaration = re.compile(
-        r"(?im)^[ \t]*(?:(?:private|global)[ \t]+)*rule[ \t]+[A-Za-z_][A-Za-z0-9_]*"
+        r"(?im)^[ \t]*`?[ \t]*(?P<decl>(?:(?:private|global)[ \t]+)*rule[ \t]+"
+        r"[A-Za-z_][A-Za-z0-9_]*"
         r"[ \t]*(?::[ \t]*[A-Za-z_][A-Za-z0-9_]*"
-        r"(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)?[ \t]*(?:\n[ \t]*)?\{"
+        r"(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)?[ \t]*(?:\n[ \t]*)?\{)"
     )
     declaration_text = _mask_yara_comments(masked)
     yara_declarations = list(yara_declaration.finditer(declaration_text))
     yara_spans: list[tuple[int, int]] = []
     current_yara_end = -1
     for match in yara_declarations:
-        if match.start() < current_yara_end:
+        # Anchor on the declaration itself: an optional leading wrapper backtick is not part
+        # of the rule text.
+        declaration_start = match.start("decl")
+        if declaration_start < current_yara_end:
             continue
         end = _balanced_yara_rule_end(text, match.end() - 1)
         if end is None:
             blocks.append(
-                _RawSourceBlock("yara", None, match.start(), len(text), error="yara_rule_unclosed")
+                _RawSourceBlock(
+                    "yara", None, declaration_start, len(text), error="yara_rule_unclosed"
+                )
             )
-            yara_spans.append((match.start(), len(text)))
+            yara_spans.append((declaration_start, len(text)))
             break
         else:
-            blocks.append(_RawSourceBlock("yara", text[match.start() : end], match.start(), end))
-            yara_spans.append((match.start(), end))
+            blocks.append(
+                _RawSourceBlock("yara", text[declaration_start:end], declaration_start, end)
+            )
+            yara_spans.append((declaration_start, end))
             current_yara_end = end
     masked = _mask_source_spans(text, [*wrapped_spans, *yara_spans])
 
