@@ -3182,11 +3182,21 @@ class InvestigationService:
             "operation_key": invocation.operation_key,
             "response_refs": [str(item) for item in refs],
         }
+        # An operator abandon keeps the invocation's persisted provider response
+        # linked for audit; only attached (executed) references are ever new.
+        retained_refs = (
+            invocation.response_refs
+            if actor_provenance is not None and outcome is InvocationReconciliationOutcome.ABANDON
+            else refs
+        )
         if actor_provenance is not None:
             details["actor_provenance"] = {
                 "client": actor_provenance,
                 "actor_id": actor.strip(),
             }
+            if outcome is InvocationReconciliationOutcome.ABANDON:
+                details["persisted_response_refs"] = [str(item) for item in retained_refs]
+            details["budget_settlement"] = "committed_conservatively"
         request_identity = {
             **details,
             "investigation_id": str(investigation_id),
@@ -3231,7 +3241,10 @@ class InvestigationService:
                 if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
                 else ToolInvocationStatus.FAILED
             )
-            if invocation.status is not expected_status or invocation.response_refs != refs:
+            if (
+                invocation.status is not expected_status
+                or invocation.response_refs != retained_refs
+            ):
                 raise VersionConflictError("Reconciled invocation has since changed")
             return invocation
 
@@ -3254,7 +3267,9 @@ class InvestigationService:
             if reservation is None and invocation.reserved_budget:
                 raise ValueError("Ambiguous invocation has no durable budget reservation")
             if reservation is not None:
-                if outcome in {
+                # A client-declared "not executed" is not proof: settle the reservation
+                # as consumed so that a later read can never be silently unaccounted.
+                if actor_provenance is not None or outcome in {
                     InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
                     InvocationReconciliationOutcome.ABANDON,
                 }:
@@ -3271,7 +3286,7 @@ class InvestigationService:
         resolved = replace(
             invocation,
             status=status,
-            response_refs=refs,
+            response_refs=retained_refs,
             consumed_budget=consumed,
             updated_at=datetime.now(UTC),
             version=invocation.version + 1,

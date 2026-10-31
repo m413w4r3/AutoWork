@@ -1151,6 +1151,23 @@ async def test_operator_passive_vt_reconciliation_only_adopts_its_persisted_resu
         actor_provenance="operator_client",
     )
     assert abandoned.status is ToolInvocationStatus.FAILED
+    assert abandoned.response_refs == abandon_invocation.response_refs
+    assert len(abandoned.response_refs) == 1
+    abandon_details = abandon_fixture.analyst_decisions.items[-1].details
+    assert abandon_details["persisted_response_refs"] == [
+        str(item) for item in abandon_invocation.response_refs
+    ]
+    replayed_abandon = await abandon_fixture.service.reconcile_invocation(
+        abandon_fixture.investigation_id,
+        abandon_invocation.id,
+        outcome=InvocationReconciliationOutcome.ABANDON,
+        actor="operator:agent-client",
+        reason="Abandon the invocation whose response cannot be adopted.",
+        expected_version=abandon_invocation.version,
+        idempotency_key="operator-vt-persisted-abandon",
+        actor_provenance="operator_client",
+    )
+    assert replayed_abandon == abandoned
     assert abandon_fixture.tools["vt.file_report"].calls == []
     persisted_abandon_reservation = next(
         item
@@ -1210,8 +1227,11 @@ async def test_operator_passive_vt_without_persisted_response_releases_or_commit
         for item in (await fixture.envelopes.get(fixture.investigation_id)).budget.reservations
         if item.operation_key == invocation.operation_key
     )
-    assert reservation.status.value == "released"
-    assert reservation.committed_amounts == {}
+    assert reservation.status.value == "committed"
+    assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+    assert fixture.analyst_decisions.items[-1].details["budget_settlement"] == (
+        "committed_conservatively"
+    )
 
     abandon_fixture, abandon_invocation, _ = await _seed_operator_passive_vt_reconciliation()
     abandoned = await abandon_fixture.service.reconcile_invocation(
