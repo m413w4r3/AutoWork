@@ -156,6 +156,7 @@ class _AdvisorInputValidationError(ValueError):
         reason_code: str,
         *,
         reference: str | None = None,
+        cause_reason: str | None = None,
         measurement_errors: tuple[dict[str, Any], ...] = (),
         valid_targets: tuple[dict[str, Any], ...] = (),
         valid_article_claim_ids: tuple[str, ...] = (),
@@ -163,6 +164,7 @@ class _AdvisorInputValidationError(ValueError):
     ) -> None:
         self.reason_code = reason_code
         self.reference = reference
+        self.cause_reason = cause_reason
         self.measurement_errors = measurement_errors
         self.valid_targets = valid_targets
         self.valid_article_claim_ids = valid_article_claim_ids
@@ -441,6 +443,8 @@ class InvestigationAdvisorTool:
             return await self._input_failure(
                 context,
                 exc.reason_code,
+                reference=exc.reference,
+                cause_reason=exc.cause_reason,
                 valid_targets=exc.valid_targets,
             )
         except (KeyError, TypeError, ValueError):
@@ -739,6 +743,26 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            if restricted_evidence:
+                existing_omissions = list(prompt_data.get("_disclosure_omissions", ()))
+                existing_omissions.extend(
+                    {
+                        "kind": "observation",
+                        "id": str(item.id),
+                        "sha256": item.sha256,
+                        "source_ref": {
+                            "kind": "observation",
+                            "id": str(item.id),
+                            "sha256": item.sha256,
+                        },
+                        "reason": (
+                            "Intentionally omitted: not disclosable under current policy "
+                            "because its associated sample is restricted."
+                        ),
+                    }
+                    for item in restricted_evidence
+                )
+                prompt_data["_disclosure_omissions"] = existing_omissions
             if restricted_sample_hashes:
                 resolved_evidence_ref_values: list[UUID] = []
                 for item in prompt_data.get("evidence", ()):
@@ -1286,6 +1310,7 @@ class InvestigationAdvisorTool:
                 valid_article_claim_ids=exc.valid_article_claim_ids,
                 invalid_article_claim_ids=exc.invalid_article_claim_ids,
                 reference=exc.reference,
+                cause_reason=exc.cause_reason,
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(
@@ -2071,6 +2096,7 @@ class InvestigationAdvisorTool:
         reason_code: str,
         *,
         reference: str | None = None,
+        cause_reason: str | None = None,
         observation_refs: tuple[UUID, ...] = (),
         measurement_errors: tuple[dict[str, Any], ...] = (),
         internal_detail: Mapping[str, str | int] | None = None,
@@ -2080,6 +2106,16 @@ class InvestigationAdvisorTool:
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
         actionable = {
+            "advisor_observation_sample_not_associated": (
+                "The cited observation references a sample hash that is not associated with "
+                "this investigation. Associate the sample through investigation intake or "
+                "qualification, or remove the reference."
+            ),
+            "advisor_observation_disclosure_restricted": (
+                "The cited observation resolves to a source that is restricted under current "
+                "disclosure policy. Remove the reference or correct the canonical source "
+                "disclosure metadata before retrying."
+            ),
             "sample_hash_not_associated": (
                 "The selected hash is not associated with this investigation. Add it through "
                 "the investigation sample intake, then run sample.analyze on that hash."
@@ -2148,24 +2184,34 @@ class InvestigationAdvisorTool:
             )
         if reference:
             message += f" Reference: {reference}."
+        reference_reason = {
+            "advisor_observation_sample_not_associated": (
+                "The cited observation references a sample hash that is not associated "
+                "with this investigation; associate the sample through investigation "
+                "intake or qualification, or remove this reference."
+            ),
+            "advisor_observation_disclosure_restricted": (
+                cause_reason
+                or "The cited observation resolves to a source that is restricted under "
+                "current disclosure policy; remove the reference or correct its canonical "
+                "disclosure metadata."
+            ),
+            "advisor_evidence_reference_mismatch": (
+                "The cited source ID and SHA-256 do not match the current canonical source."
+            ),
+            "evidence_reference_not_found": (
+                "The cited canonical source is missing or belongs to another investigation."
+            ),
+            "editorial_reference_unavailable": (
+                "The cited canonical source is missing or belongs to another investigation."
+            ),
+            "editorial_reference_invalid": "The cited canonical source reference is malformed.",
+        }.get(reason_code)
         reference_cause = None
-        if reference and reason_code in {
-            "evidence_reference_not_found",
-            "editorial_reference_unavailable",
-            "advisor_evidence_reference_mismatch",
-            "editorial_reference_invalid",
-        }:
+        if reference and reference_reason is not None:
             reference_cause = {
                 "ref": reference,
-                "reason": (
-                    "The cited source ID and SHA-256 do not match the current canonical source."
-                    if reason_code == "advisor_evidence_reference_mismatch"
-                    else "The cited canonical source is missing or belongs to another "
-                    "investigation."
-                    if reason_code
-                    in {"evidence_reference_not_found", "editorial_reference_unavailable"}
-                    else "The cited canonical source reference is malformed."
-                ),
+                "reason": reference_reason,
             }
         result = await self._persist_preflight_failure(
             context,
@@ -2176,6 +2222,15 @@ class InvestigationAdvisorTool:
                 "input_error_code": reason_code,
                 "failure_stage": "pre_transport_validation",
                 "failure_reason": reason_code,
+                **(
+                    {"preflight_status": "POLICY_BLOCKED"}
+                    if reason_code
+                    in {
+                        "advisor_observation_sample_not_associated",
+                        "advisor_observation_disclosure_restricted",
+                    }
+                    else {}
+                ),
                 **(
                     {
                         "preflight_cause": reference_cause,
@@ -2441,6 +2496,18 @@ class InvestigationAdvisorTool:
         explicit_observation_ids.update(
             item["id"] for item in unit_assertion_refs if item["kind"] == "observation"
         )
+        raw_assertions = arguments.get("assertions", ())
+        if consultation_type == "draft_text" and isinstance(raw_assertions, (list, tuple)):
+            for assertion in raw_assertions:
+                if not isinstance(assertion, Mapping):
+                    continue
+                for reference in assertion.get("refs", ()):
+                    if (
+                        isinstance(reference, Mapping)
+                        and reference.get("kind") == "observation"
+                        and isinstance(reference.get("id"), (str, UUID))
+                    ):
+                        explicit_observation_ids.add(str(reference["id"]))
         article_passages = _consultation_article_passages(snapshot, question)
         base: dict[str, Any] = {
             "investigation_id": str(investigation_id),
@@ -2856,8 +2923,10 @@ class InvestigationAdvisorTool:
                 evidence_payload,
                 measured_facts,
                 finding_payload,
+                disclosure_omissions,
             ) = await self._editorial_reference_facts(
                 investigation_id=investigation_id,
+                subject_id=getattr(investigation, "subject_id", None),
                 evidence=evidence,
                 prompt_data=base,
                 explicit_observation_ids=frozenset(explicit_observation_ids),
@@ -2866,6 +2935,7 @@ class InvestigationAdvisorTool:
             base["evidence"] = evidence_payload
             base["measured_facts"] = measured_facts
             base["findings"] = finding_payload
+            base["_disclosure_omissions"] = disclosure_omissions
             base["candidate_rules"] = [
                 await self._candidate_rule_summary(item)
                 for item in evidence
@@ -3470,12 +3540,14 @@ class InvestigationAdvisorTool:
         self,
         *,
         investigation_id: UUID,
+        subject_id: UUID | None = None,
         evidence: tuple[EvidenceObservation, ...],
         prompt_data: Mapping[str, Any],
         explicit_observation_ids: frozenset[str] = frozenset(),
         envelope: InvestigationEnvelope | None = None,
     ) -> tuple[
         tuple[EvidenceObservation, ...],
+        list[dict[str, Any]],
         list[dict[str, Any]],
         list[dict[str, Any]],
         list[dict[str, Any]],
@@ -3531,9 +3603,136 @@ class InvestigationAdvisorTool:
                 add(str(reference["kind"]), reference.get("id"))
                 if reference["kind"] == "finding":
                     explicit_finding_ids.add(str(reference.get("id")))
+        explicit_observation_refs = {
+            str(identifier) for kind, identifier in references if kind == "observation"
+        } | set(explicit_observation_ids)
+        observations_by_id = {item.id: item for item in evidence}
+        association_list = getattr(self._sample_associations, "list_for_investigation", None)
+        associations = (
+            tuple(await association_list(investigation_id)) if callable(association_list) else ()
+        )
+        associated_hashes = {
+            sample_hash
+            for association in associations
+            if isinstance((sample_hash := getattr(association, "sample_sha256", None)), str)
+        }
+        sample_list = getattr(self._samples, "list_for_subject", None)
+        samples = (
+            tuple(await sample_list(subject_id)) if subject_id and callable(sample_list) else ()
+        )
+        samples_by_hash: dict[str, list[Any]] = {}
+        for sample in samples:
+            for sample_hash in (
+                getattr(sample, "expected_hash", None),
+                getattr(sample, "source_object_id", None),
+            ):
+                if isinstance(sample_hash, str) and sample_hash:
+                    samples_by_hash.setdefault(sample_hash.casefold(), []).append(sample)
+        disclosure_omissions: list[dict[str, Any]] = []
+        omitted_observation_ids: set[UUID] = set()
+        finding_linked_observation_refs: set[UUID] = set()
+
+        async def observation_disclosure_block(
+            observation: EvidenceObservation,
+        ) -> tuple[str, str] | None:
+            unassociated_hashes = (
+                await self._observation_referenced_sample_hashes(observation)
+            ) - associated_hashes
+            if unassociated_hashes:
+                return (
+                    "advisor_observation_sample_not_associated",
+                    "its sample hash is not associated with this investigation",
+                )
+            object_type = observation.object_type.casefold()
+            if object_type in {"sample", "file", "sample_observation", "sha256"}:
+                sample_hashes = await self._observation_referenced_sample_hashes(observation)
+                for sample_hash in sample_hashes:
+                    restrictions = {
+                        source
+                        for sample in samples_by_hash.get(sample_hash, ())
+                        for source in _sample_disclosure_restriction_sources(sample, envelope)
+                    }
+                    if restrictions:
+                        names = ", ".join(sorted(restrictions))
+                        return (
+                            "advisor_observation_disclosure_restricted",
+                            "its associated sample is blocked by current disclosure policy "
+                            f"({names})",
+                        )
+            if object_type in {"source_document", "document"}:
+                try:
+                    document_id = UUID(observation.object_id)
+                except (TypeError, ValueError):
+                    return (
+                        "advisor_observation_disclosure_restricted",
+                        "its source document reference is malformed; correct or remove "
+                        "the reference",
+                    )
+                getter = getattr(self._source_documents, "get", None)
+                document = await getter(document_id) if callable(getter) else None
+                if document is None or (
+                    subject_id is not None and document.subject_id != subject_id
+                ):
+                    return (
+                        "advisor_observation_disclosure_restricted",
+                        "its source document is unavailable for this investigation; restore "
+                        "the canonical "
+                        "document association or remove the reference",
+                    )
+                document_restrictions = _sample_disclosure_restriction_sources(document, envelope)
+                if document_restrictions:
+                    names = ", ".join(sorted(document_restrictions))
+                    return (
+                        "advisor_observation_disclosure_restricted",
+                        f"its source document is blocked by current disclosure policy ({names})",
+                    )
+            return None
+
+        async def consider_observation(observation: EvidenceObservation, *, explicit: bool) -> bool:
+            block = await observation_disclosure_block(observation)
+            if block is None:
+                add("observation", observation.id)
+                return True
+            if explicit and "associated sample is blocked" in block[1]:
+                # The consultation-level disclosure gate returns the established sample-policy
+                # refusal, including its restriction trace, for explicitly cited samples.
+                add("observation", observation.id)
+                return True
+            if explicit:
+                raise _AdvisorInputValidationError(
+                    block[0],
+                    reference=str(observation.id),
+                    cause_reason=(
+                        f"The cited observation {observation.id} cannot be disclosed because "
+                        f"{block[1]}; remove the reference or correct the canonical source policy."
+                    ),
+                )
+            if observation.id not in omitted_observation_ids:
+                omitted_observation_ids.add(observation.id)
+                disclosure_omissions.append(
+                    {
+                        "kind": "observation",
+                        "id": str(observation.id),
+                        "sha256": observation.sha256,
+                        "source_ref": {
+                            "kind": "observation",
+                            "id": str(observation.id),
+                            "sha256": observation.sha256,
+                        },
+                        "reason": (
+                            "Intentionally omitted: not disclosable under current policy "
+                            f"because {block[1]}."
+                        ),
+                    }
+                )
+            return False
+
         for observation in evidence:
-            add("observation", observation.id)
-        available_observation_ids = {item.id for item in evidence}
+            await consider_observation(
+                observation,
+                explicit=str(observation.id) in explicit_observation_refs,
+            )
+        available_observation_ids = set(observations_by_id) - omitted_observation_ids
         listing = getattr(self._findings, "list_for_investigation", None)
         if callable(listing):
             listed_findings = tuple(await listing(investigation_id))
@@ -3541,18 +3740,21 @@ class InvestigationAdvisorTool:
             for finding in listed_findings:
                 if str(finding.id) in explicit_finding_ids:
                     for observation_ref in getattr(finding, "observation_refs", ()):
-                        add("observation", observation_ref)
+                        linked_observation = observations_by_id.get(observation_ref)
+                        if linked_observation is None:
+                            add("observation", observation_ref)
+                        else:
+                            included = await consider_observation(
+                                linked_observation,
+                                explicit=str(linked_observation.id) in explicit_observation_refs,
+                            )
+                            if included:
+                                finding_linked_observation_refs.add(linked_observation.id)
             for finding in current_findings:
                 if set(getattr(finding, "observation_refs", ())).issubset(
                     available_observation_ids
                 ):
                     add("finding", finding.id)
-
-        explicit_observation_refs = {
-            str(identifier) for kind, identifier in references if kind == "observation"
-        } | set(explicit_observation_ids)
-
-        observations_by_id = {item.id: item for item in evidence}
         finding_items: list[Any] = []
         observation_items: list[EvidenceObservation] = []
 
@@ -3581,6 +3783,10 @@ class InvestigationAdvisorTool:
                     raise _AdvisorInputValidationError(
                         "evidence_reference_not_found", reference=str(identifier)
                     )
+                if not await consider_observation(
+                    item, explicit=str(identifier) in explicit_observation_refs
+                ):
+                    continue
                 observations_by_id[identifier] = item
                 observation_items.append(item)
             else:
@@ -3606,7 +3812,11 @@ class InvestigationAdvisorTool:
                 row["blob_read_verified"],
                 row["blob_read_failure_reason"],
             ) = await self._observation_content_projection(
-                item, include_unclassified=str(item.id) in explicit_observation_refs
+                item,
+                include_unclassified=(
+                    str(item.id) in explicit_observation_refs
+                    or item.id in finding_linked_observation_refs
+                ),
             )
             observation_payload.append(row)
 
@@ -3724,13 +3934,21 @@ class InvestigationAdvisorTool:
                 "kind": item.kind.value,
                 "assessment": item.assessment.value,
                 "line": item.statement,
-                "observation_refs": [str(ref) for ref in item.observation_refs],
+                "observation_refs": [
+                    str(ref) for ref in item.observation_refs if ref not in omitted_observation_ids
+                ],
                 "claim_refs": list(item.claim_refs),
                 "limitations": list(item.limitations),
             }
             for item in finding_items
         ]
-        return tuple(observation_items), observation_payload, measured_payload, finding_payload
+        return (
+            tuple(observation_items),
+            observation_payload,
+            measured_payload,
+            finding_payload,
+            disclosure_omissions,
+        )
 
     async def _sample_inventory(
         self,
@@ -4571,6 +4789,17 @@ class InvestigationAdvisorTool:
             self._reference_answers.clear()
         self._reference_answers[answer_key] = answer
         return answer
+
+    async def _observation_referenced_sample_hashes(
+        self, observation: EvidenceObservation
+    ) -> set[str]:
+        object_type = observation.object_type.casefold()
+        if object_type not in {"sample", "file", "sample_observation", "sha256"}:
+            return set()
+        object_hash = observation.object_id.casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", object_hash) is None:
+            return set()
+        return {object_hash}
 
     async def _load_observation_json_payload(self, observation: EvidenceObservation) -> Any | None:
         blob = await self._blobs.get(observation.blob_id)

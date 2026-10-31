@@ -1798,6 +1798,28 @@ def evaluate_advisor_evidence_preflight(
                 ),
             )
 
+    for item in prompt_data.get("_disclosure_omissions", ()):
+        if not isinstance(item, Mapping):
+            continue
+        identifier = _as_text(item.get("id"))
+        if not identifier or ("observation", identifier) in {
+            (row["kind"], row["id"]) for row in records
+        }:
+            continue
+        reason = _as_text(item.get("reason")) or (
+            "Intentionally omitted: not disclosable under current policy."
+        )
+        add(
+            "observation",
+            identifier,
+            _as_text(item.get("sha256")),
+            item.get("source_ref"),
+            False,
+            False,
+            reason,
+            policy_omission=True,
+        )
+
     canonical_observation_ids = {item["id"] for item in records if item["kind"] == "observation"}
     for item in (
         *[row for row in prompt_data.get("measurements", ()) if isinstance(row, Mapping)],
@@ -2200,12 +2222,17 @@ def evaluate_advisor_evidence_preflight(
         ) -> None:
             output.append({"status": status.value, "reason": reason})
 
-        if item["required"]:
+        policy_omission = item.get("policy_omission") is True
+        if policy_omission:
+            mark(AdvisorEvidenceStatus.INTENTIONALLY_OMITTED, item["reason"])
+        elif item["required"]:
             mark(AdvisorEvidenceStatus.REQUIRED, item["reason"])
         elif item.get("informational"):
             mark(AdvisorEvidenceStatus.INFORMATIONAL, item["reason"])
         verified = item.get("verified", True)
-        if item["body_present"] and sha_valid and verified:
+        if policy_omission:
+            pass
+        elif item["body_present"] and sha_valid and verified:
             mark(
                 AdvisorEvidenceStatus.PRESENT_IN_CANONICAL,
                 "Canonical body is available with a valid SHA-256 in this consultation snapshot.",
@@ -2323,7 +2350,8 @@ def evaluate_advisor_evidence_preflight(
                 }
             )
         if (
-            item["required"]
+            not policy_omission
+            and item["required"]
             and not item.get("blob_read_failure_reason")
             and any(row["status"] == AdvisorEvidenceStatus.NOT_VERIFIED.value for row in statuses)
         ):
@@ -2334,7 +2362,8 @@ def evaluate_advisor_evidence_preflight(
                 }
             )
         elif (
-            not item["required"]
+            not policy_omission
+            and not item["required"]
             and item["kind"] == "observation"
             and item.get("blob_read_verified") is False
         ):
@@ -2346,7 +2375,12 @@ def evaluate_advisor_evidence_preflight(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
                 "This optional reference was omitted after its canonical blob read failed.",
             )
-        elif not item["required"] and not item["body_present"] and not item.get("informational"):
+        elif (
+            not policy_omission
+            and not item["required"]
+            and not item["body_present"]
+            and not item.get("informational")
+        ):
             mark(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
                 "This unrequired reference has no body loaded in the consultation snapshot.",
