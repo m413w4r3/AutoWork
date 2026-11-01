@@ -7,7 +7,8 @@ module intentionally does not modify or depend on application/persistence.py.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -39,6 +40,10 @@ class VersionConflictError(RuntimeError):
 
 
 class ToolInvocationRepository(Protocol):
+    def lock_operation_prefix(
+        self, operation_prefix: str
+    ) -> AbstractAsyncContextManager[None]: ...
+
     async def get(self, invocation_id: UUID) -> ToolInvocation | None: ...
 
     async def list_for_investigation(
@@ -263,6 +268,13 @@ class InMemoryToolInvocationRepository:
         self._items: dict[UUID, ToolInvocation] = {}
         self._by_operation: dict[str, UUID] = {}
         self._lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def lock_operation_prefix(self, operation_prefix: str) -> AsyncIterator[None]:
+        # The service-level asyncio lock is the in-memory implementation's
+        # admission fence; there is no cross-process transaction to serialize.
+        del operation_prefix
+        yield
 
     async def get(self, invocation_id: UUID) -> ToolInvocation | None:
         return self._items.get(invocation_id)

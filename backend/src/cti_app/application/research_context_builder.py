@@ -112,6 +112,20 @@ MAX_CONTEXT_TOOL_COVERAGE = 200
 MAX_CONTEXT_ACQUIRED_SAMPLES = 64
 MAX_CONTEXT_LATEST_TOOL_RESULTS = 16
 MAX_CONTEXT_OPINION_NOTES = 24
+MAX_SAMPLE_LOCAL_ACTIVITY_TOOLS = 16
+MAX_SAMPLE_LOCAL_ACTIVITY_TOOL_NAME_LENGTH = 128
+MAX_SAMPLE_LOCAL_ACTIVITY_OBSERVATIONS = 8
+_SAMPLE_LOCAL_TOOL_NAMES = frozenset(
+    {
+        "assembly.inspect",
+        "types.list",
+        "methods.list",
+        "method.decompile",
+        "strings.list",
+        "references.imports",
+        "resources.list",
+    }
+)
 _OPERATOR_OPINION_BLOCK_TITLES = {
     OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
     OpinionBlockType.ADDITIONAL_SAMPLES: "Échantillons complémentaires",
@@ -3250,6 +3264,12 @@ class ResearchContextBuilder:
                         "analysis_status": "not_analyzed",
                         "analysis_engines": [],
                         "observation_ids": [],
+                        "local_activity": {
+                            "invocation_counts": {},
+                            "observation_ids": [],
+                            "truncated_tool_names": 0,
+                            "truncated_observation_ids": 0,
+                        },
                     }
         completed = {
             ToolInvocationStatus.SUCCEEDED,
@@ -3392,6 +3412,15 @@ class ResearchContextBuilder:
                     "analysis_status": previous.get("analysis_status", "not_analyzed"),
                     "analysis_engines": previous.get("analysis_engines", []),
                     "observation_ids": previous.get("observation_ids", []),
+                    "local_activity": previous.get(
+                        "local_activity",
+                        {
+                            "invocation_counts": {},
+                            "observation_ids": [],
+                            "truncated_tool_names": 0,
+                            "truncated_observation_ids": 0,
+                        },
+                    ),
                 }
                 continue
 
@@ -3423,6 +3452,12 @@ class ResearchContextBuilder:
                     "analysis_status": "not_analyzed",
                     "analysis_engines": [],
                     "observation_ids": [],
+                    "local_activity": {
+                        "invocation_counts": {},
+                        "observation_ids": [],
+                        "truncated_tool_names": 0,
+                        "truncated_observation_ids": 0,
+                    },
                 }
                 rows[association_id] = row
             engines = set(row["analysis_engines"])
@@ -3440,6 +3475,58 @@ class ResearchContextBuilder:
             row["observation_ids"] = sorted(
                 {*row["observation_ids"], *(str(item.id) for item in analysis_observations)}
             )[:8]
+
+        activity_by_association: dict[str, dict[str, Any]] = {}
+        for invocation in sorted(invocations, key=lambda item: (item.created_at, item.id.hex)):
+            if (
+                invocation.investigation_id != investigation_id
+                or invocation.status not in completed
+                or not (
+                    invocation.tool_name.startswith("local.")
+                    or invocation.tool_name in _SAMPLE_LOCAL_TOOL_NAMES
+                )
+            ):
+                continue
+            parameters = thaw_json(invocation.normalized_parameters)
+            sample_sha256 = (
+                parameters.get("sample_sha256") if isinstance(parameters, Mapping) else None
+            )
+            if not _is_sample_hash(sample_sha256):
+                continue
+            linked_observations = tuple(
+                observation
+                for observation_id in invocation.response_refs
+                if (observation := observation_by_id.get(observation_id)) is not None
+                and observation.investigation_id == investigation_id
+            )
+            if not linked_observations:
+                continue
+            for association_id, row in rows.items():
+                if row["sha256"] != sample_sha256.lower():
+                    continue
+                activity = activity_by_association.setdefault(
+                    association_id,
+                    {"invocation_counts": {}, "observation_ids": set()},
+                )
+                tool_name = _truncate(
+                    invocation.tool_name, MAX_SAMPLE_LOCAL_ACTIVITY_TOOL_NAME_LENGTH
+                )
+                activity["invocation_counts"][tool_name] = (
+                    activity["invocation_counts"].get(tool_name, 0) + 1
+                )
+                activity["observation_ids"].update(str(item.id) for item in linked_observations)
+
+        for association_id, activity in activity_by_association.items():
+            tool_counts = sorted(activity["invocation_counts"].items())
+            observation_ids = sorted(activity["observation_ids"])
+            rows[association_id]["local_activity"] = {
+                "invocation_counts": dict(tool_counts[:MAX_SAMPLE_LOCAL_ACTIVITY_TOOLS]),
+                "observation_ids": observation_ids[:MAX_SAMPLE_LOCAL_ACTIVITY_OBSERVATIONS],
+                "truncated_tool_names": max(0, len(tool_counts) - MAX_SAMPLE_LOCAL_ACTIVITY_TOOLS),
+                "truncated_observation_ids": max(
+                    0, len(observation_ids) - MAX_SAMPLE_LOCAL_ACTIVITY_OBSERVATIONS
+                ),
+            }
 
         ordered = sorted(rows.values(), key=lambda item: (item["sha256"], item["association_id"]))
         return (

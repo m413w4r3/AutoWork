@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid5
 
@@ -74,6 +75,63 @@ _CANONICAL_UUID_REFERENCE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 _SAFE_EXPERIMENT_INPUT_TYPES = frozenset({"sample_sha256", "capture_sha256"})
+
+
+class _ExperimentDiagnostic(StrEnum):
+    OBSERVATION_INVOCATION_NOT_CITED = "observation_invocation_not_cited"
+    EXPERIMENT_VERSION_STALE = "experiment_version_stale"
+    INVOCATION_VERSION_MISMATCH = "invocation_version_mismatch"
+    INVOCATION_TOOL_MISMATCH = "invocation_tool_mismatch"
+    NEXT_PIVOT_INVALID = "next_pivot_invalid"
+    TIMESTAMP_ORDER_INVALID = "timestamp_order_invalid"
+    FIELD_INVALID = "field_invalid"
+
+
+_EXPERIMENT_DIAGNOSTICS: Mapping[_ExperimentDiagnostic, tuple[str, str]] = {
+    _ExperimentDiagnostic.OBSERVATION_INVOCATION_NOT_CITED: (
+        "observation_refs",
+        "Cite the tool invocation that produced each observation, or remove that observation "
+        "reference.",
+    ),
+    _ExperimentDiagnostic.EXPERIMENT_VERSION_STALE: (
+        "expected_version",
+        "Call experiment.list to load the current timeline version, then retry with that version.",
+    ),
+    _ExperimentDiagnostic.INVOCATION_VERSION_MISMATCH: (
+        "tool_invocation_refs",
+        "Use the persisted version of each cited tool invocation.",
+    ),
+    _ExperimentDiagnostic.INVOCATION_TOOL_MISMATCH: (
+        "tool_name",
+        "Use the tool name and schema version recorded by a cited invocation.",
+    ),
+    _ExperimentDiagnostic.NEXT_PIVOT_INVALID: (
+        "next_pivots",
+        "Use lowercase SHA-256 values for next_pivots.",
+    ),
+    _ExperimentDiagnostic.TIMESTAMP_ORDER_INVALID: (
+        "started_at",
+        "Set started_at no later than completed_at, and completed_at no later than the recorded "
+        "time.",
+    ),
+    _ExperimentDiagnostic.FIELD_INVALID: (
+        "arguments",
+        "Correct the experiment record fields to match the published arguments schema.",
+    ),
+}
+
+
+EXPERIMENT_PUBLIC_DIAGNOSTICS: Mapping[str, tuple[str, str]] = {
+    key.value: value for key, value in _EXPERIMENT_DIAGNOSTICS.items()
+}
+
+
+class _ExperimentValidationError(ValueError):
+    def __init__(self, detail: _ExperimentDiagnostic) -> None:
+        self.detail = detail
+        super().__init__(detail.value)
+
+
 _CANONICAL_EXPERIMENT_OBSERVATION_INPUT_TYPES = {
     (EvidenceKind.BINARY_ANALYSIS.value, "sample"): "sample_sha256",
     (EvidenceKind.BINARY_STRING.value, "sample"): "sample_sha256",
@@ -975,8 +1033,18 @@ class OperatorExperimentToolAdapter:
         try:
             return await self._execute(arguments, context)
         except VersionConflictError:
+            current_version = await self._experiments.version(context.investigation_id)
             return ToolResult(
                 ToolInvocationStatus.FAILED,
+                output={
+                    "error_code": "stale_experiment_version",
+                    "detail_code": _ExperimentDiagnostic.EXPERIMENT_VERSION_STALE.value,
+                    "field": "expected_version",
+                    "correction": _EXPERIMENT_DIAGNOSTICS[
+                        _ExperimentDiagnostic.EXPERIMENT_VERSION_STALE
+                    ][1],
+                    "current_stream_version": current_version,
+                },
                 error_code="stale_experiment_version",
                 message="The experiment timeline changed; reload it before recording.",
             )
@@ -1001,11 +1069,22 @@ class OperatorExperimentToolAdapter:
                 message=exc.message,
             )
         except (KeyError, TypeError, ValueError) as exc:
+            detail = (
+                exc.detail
+                if isinstance(exc, _ExperimentValidationError)
+                else _ExperimentDiagnostic.FIELD_INVALID
+            )
+            field, correction = _EXPERIMENT_DIAGNOSTICS[detail]
             return ToolResult(
                 ToolInvocationStatus.FAILED,
-                output={"error_code": "experiment_invalid"},
+                output={
+                    "error_code": "experiment_invalid",
+                    "detail_code": detail.value,
+                    "field": field,
+                    "correction": correction,
+                },
                 error_code="experiment_invalid",
-                message=str(exc),
+                message=detail.value,
             )
 
     async def _execute(
@@ -1067,7 +1146,7 @@ class OperatorExperimentToolAdapter:
             if invocation is None or invocation.investigation_id != context.investigation_id:
                 raise ValueError("tool invocation does not belong to this investigation")
             if invocation.version != invocation_reference.version:
-                raise ValueError("tool invocation version does not match persisted invocation")
+                raise _ExperimentValidationError(_ExperimentDiagnostic.INVOCATION_VERSION_MISMATCH)
             invocations[invocation_reference.invocation_id] = invocation
 
         for observation in observations.values():
@@ -1075,13 +1154,15 @@ class OperatorExperimentToolAdapter:
                 observation.invocation_ref is not None
                 and observation.invocation_ref not in invocations
             ):
-                raise ValueError("observation tool invocation was not cited")
+                raise _ExperimentValidationError(
+                    _ExperimentDiagnostic.OBSERVATION_INVOCATION_NOT_CITED
+                )
         if invocation_refs and not any(
             item.tool_name == arguments["tool_name"]
             and item.schema_version == arguments["tool_schema_version"]
             for item in invocations.values()
         ):
-            raise ValueError("tool name or schema version does not match persisted invocation")
+            raise _ExperimentValidationError(_ExperimentDiagnostic.INVOCATION_TOOL_MISMATCH)
 
         input_refs = tuple(
             ExperimentInputRefV1(
@@ -1091,6 +1172,16 @@ class OperatorExperimentToolAdapter:
             )
             for item in arguments["input_refs"]
         )
+        next_pivots = arguments["next_pivots"]
+        if not isinstance(next_pivots, (tuple, list)) or any(
+            not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
+            for item in next_pivots
+        ):
+            raise _ExperimentValidationError(_ExperimentDiagnostic.NEXT_PIVOT_INVALID)
+        started_at = _datetime(arguments["started_at"])
+        completed_at = _datetime(arguments["completed_at"])
+        if completed_at < started_at:
+            raise _ExperimentValidationError(_ExperimentDiagnostic.TIMESTAMP_ORDER_INVALID)
         experiment = InvestigationExperimentV1(
             id=uuid5(_EXPERIMENT_NAMESPACE, context.idempotency_key),
             investigation_id=context.investigation_id,
@@ -1118,13 +1209,13 @@ class OperatorExperimentToolAdapter:
             actual=str(arguments["actual"]),
             actual_outcome=ObservationOutcome(str(arguments["actual_outcome"])),
             observation_coverage=ObservationCoverage(str(arguments["observation_coverage"])),
-            started_at=_datetime(arguments["started_at"]),
-            completed_at=_datetime(arguments["completed_at"]),
+            started_at=started_at,
+            completed_at=completed_at,
             scope=str(arguments["scope"]),
             limitations=tuple(str(item) for item in arguments["limitations"]),
             verdict=ExperimentVerdict(str(arguments["verdict"])),
             implication=str(arguments["implication"]),
-            next_pivots=tuple(str(item) for item in arguments["next_pivots"]),
+            next_pivots=tuple(next_pivots),
             author="operator-led",
             origin=EXPERIMENT_RECORD_TOOL,
             supersedes_experiment_ids=tuple(

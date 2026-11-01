@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import replace
@@ -463,6 +464,338 @@ async def test_same_key_replays_durable_result_and_changed_payload_conflicts() -
     with pytest.raises(OperatorToolInvocationError) as error:
         await service.invoke(**{**request, "purpose": "different payload"})
     assert error.value.code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_independent_local_tools_do_not_conflict_on_working_state() -> None:
+    sample_a = "a" * 64
+    sample_b = "b" * 64
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "sample.analysis.read",
+                {BudgetDimension.TOOL_SECONDS: 3},
+            ),
+            (
+                "sample.inspect",
+                "local",
+                ToolEffect.LOCAL_READ,
+                "sample.inspection.read",
+                {BudgetDimension.TOOL_SECONDS: 5},
+            ),
+        ),
+    )
+    fixture.envelope = replace(
+        fixture.envelope,
+        budget=InvestigationBudget(
+            limits={
+                **fixture.envelope.budget.limits,
+                BudgetDimension.TOOL_SECONDS: 20,
+            }
+        ),
+    )
+    for name, sample_sha256 in (
+        ("sample.analyze", sample_a),
+        ("sample.inspect", sample_b),
+    ):
+        fixture.tools[name].observation_object_type = "sample"
+        fixture.tools[name].observation_object_id = sample_sha256
+
+    initial_state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+
+    base_envelopes = fixture.envelopes
+    base_states = fixture.states
+    initial_state_reads = 0
+    state_reads_ready = asyncio.Event()
+    initial_envelope_reads = 0
+    envelope_reads_ready = asyncio.Event()
+    local_dispatches = 0
+    dispatches_ready = asyncio.Event()
+
+    def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
+        copied = InvestigationBudget(limits=dict(budget.limits))
+        for reservation in budget.reservations:
+            copied.restore_reservation(reservation)
+        return copied
+
+    class _DetachedEnvelopeRepository:
+        async def get(self, investigation_id):
+            nonlocal initial_envelope_reads
+            current = await base_envelopes.get(investigation_id)
+            if initial_envelope_reads < 2:
+                initial_envelope_reads += 1
+                if initial_envelope_reads == 2:
+                    envelope_reads_ready.set()
+                await envelope_reads_ready.wait()
+            return replace(current, budget=_copy_budget(current.budget)) if current else None
+
+        async def get_for_update(self, investigation_id):
+            return await self.get(investigation_id)
+
+        async def save_if_version(self, envelope, *, expected_version):
+            stored = await base_envelopes.save_if_version(
+                replace(envelope, budget=_copy_budget(envelope.budget)),
+                expected_version=expected_version,
+            )
+            return replace(stored, budget=_copy_budget(stored.budget))
+
+    class _BarrierStateRepository:
+        async def get(self, investigation_id):
+            nonlocal initial_state_reads
+            current = await base_states.get(investigation_id)
+            if initial_state_reads < 2:
+                initial_state_reads += 1
+                if initial_state_reads == 2:
+                    state_reads_ready.set()
+                await state_reads_ready.wait()
+            return current
+
+        async def save_if_version(self, state, *, expected_version):
+            return await base_states.save_if_version(state, expected_version=expected_version)
+
+    fixture.envelopes = _DetachedEnvelopeRepository()
+    fixture.states = _BarrierStateRepository()
+    fixture.service._envelopes = fixture.envelopes
+    fixture.service._states = fixture.states
+    for tool in fixture.tools.values():
+
+        async def _wait_for_both_local_dispatches() -> None:
+            nonlocal local_dispatches
+            local_dispatches += 1
+            if local_dispatches == 2:
+                dispatches_ready.set()
+            await asyncio.wait_for(dispatches_ready.wait(), timeout=5)
+
+        tool.after_execute = _wait_for_both_local_dispatches
+    requests = (
+        {
+            "tool_name": "sample.analyze",
+            "schema_version": "1",
+            "arguments": {"query": sample_a},
+            "purpose": "Inspect the first independent sample locally.",
+            "expected_version": initial_state.version,
+            "expected_sha256": initial_state.sha256,
+            "idempotency_key": "local-analysis-a",
+        },
+        {
+            "tool_name": "sample.inspect",
+            "schema_version": "1",
+            "arguments": {"query": sample_b},
+            "purpose": "Inspect the second independent sample locally.",
+            "expected_version": initial_state.version,
+            "expected_sha256": initial_state.sha256,
+            "idempotency_key": "local-inspection-b",
+        },
+    )
+    services = (_service(fixture), _service(fixture))
+
+    results = await asyncio.gather(
+        *(service.invoke(**request) for service, request in zip(services, requests, strict=True)),
+        return_exceptions=True,
+    )
+
+    stale_conflicts = [
+        result
+        for result in results
+        if isinstance(result, OperatorToolInvocationError) and result.code == "stale_working_state"
+    ]
+    assert not stale_conflicts, (
+        f"stale_working_state 409 count: {len(stale_conflicts)} / {len(requests)}; "
+        f"results={[getattr(result, 'code', type(result).__name__) for result in results]}"
+    )
+    assert all(not isinstance(result, BaseException) for result in results)
+    assert all(result.invocation.status is ToolInvocationStatus.SUCCEEDED for result in results)
+    assert all(not result.idempotent_replay for result in results)
+
+    invocations = await fixture.invocations.list_for_investigation(fixture.investigation_id)
+    observations = await fixture.observations.list_for_investigation(fixture.investigation_id)
+    assert len(invocations) == 2
+    assert {item.source for item in observations} == {"sample.analyze", "sample.inspect"}
+    assert {item.object_id for item in observations} == {sample_a, sample_b}
+    assert fixture.tools["sample.analyze"].calls == [{"query": sample_a}]
+    assert fixture.tools["sample.inspect"].calls == [{"query": sample_b}]
+
+    final_state = await fixture.states.get(fixture.investigation_id)
+    final_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert final_state is not None
+    assert final_state.version == initial_state.version
+    assert final_state.sha256 == initial_state.sha256
+    assert final_state.recent_actions == initial_state.recent_actions
+    assert final_envelope is not None
+    assert final_envelope.budget.consumed[BudgetDimension.TOOL_SECONDS] == 8
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "capability"),
+    (
+        ("hypothesis.declare", "operator.write"),
+        ("experiment.record", "operator.write"),
+        ("finding.propose", "operator.write"),
+        ("opinion.note", "operator.write"),
+        ("rule.propose", "rule.propose"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_analytic_local_writers_keep_strict_working_state_cas(
+    tool_name: str, capability: str
+) -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=((tool_name, "local", ToolEffect.LOCAL_COMPUTE, capability, {}),),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    service = _service(fixture)
+    changed_state = state.with_operator_tool_action("operator_tool:concurrent_analytic_change")
+    await fixture.states.save_if_version(changed_state, expected_version=state.version)
+
+    with pytest.raises(OperatorToolInvocationError) as stale:
+        await service.invoke(
+            tool_name=tool_name,
+            schema_version="1",
+            arguments={"query": "synthetic input"},
+            purpose="Keep the analytic mutation behind its working-state CAS.",
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+            idempotency_key=f"strict-writer-{tool_name}",
+        )
+
+    assert stale.value.code == "stale_working_state"
+    assert fixture.tools[tool_name].calls == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_running_operation_key_is_returned_as_replay() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "sample.analysis.read",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert envelope is not None
+    assert investigation is not None
+    operation_key = "operator:concurrent-identical-request"
+    existing = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key=operation_key,
+        tool_name="sample.analyze",
+        schema_version="1",
+        normalized_parameters={"query": "same sample"},
+        purpose="Analyze the same sample locally.",
+        status=ToolInvocationStatus.RUNNING,
+    )
+    await fixture.invocations.add_if_absent(existing)
+
+    invocation, result, _refs, _uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="sample.analyze",
+        schema_version="1",
+        arguments={"query": "same sample"},
+        purpose="Analyze the same sample locally.",
+        operation_key=operation_key,
+        check_stop_before_dispatch=False,
+    )
+
+    assert invocation.status is ToolInvocationStatus.RUNNING
+    assert result.idempotent_replay is True
+    assert fixture.tools["sample.analyze"].calls == []
+    assert (await fixture.invocations.get(existing.id)).status is ToolInvocationStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_adapter_replay_flag_does_not_mark_first_operator_invocation_as_replay() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "sample.analysis.read",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    fixture.tools["sample.analyze"].result = ToolResult(
+        status=ToolInvocationStatus.SUCCEEDED,
+        idempotent_replay=True,
+    )
+
+    result = await _service(fixture).invoke(
+        tool_name="sample.analyze",
+        schema_version="1",
+        arguments={"query": "first adapter result"},
+        purpose="Run one local analysis.",
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        idempotency_key="adapter-replay-flag",
+    )
+
+    assert result.idempotent_replay is False
+    assert fixture.tools["sample.analyze"].calls == [{"query": "first adapter result"}]
+
+
+@pytest.mark.asyncio
+async def test_same_idempotency_prefix_with_changed_concurrent_payload_has_one_effect() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "sample.analysis.read",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    requests = tuple(
+        {
+            "tool_name": "sample.analyze",
+            "schema_version": "1",
+            "arguments": {"query": query},
+            "purpose": "Analyze one requested sample locally.",
+            "expected_version": state.version,
+            "expected_sha256": state.sha256,
+            "idempotency_key": "shared-client-operation-key",
+        }
+        for query in ("sample-a", "sample-b")
+    )
+    results = await asyncio.gather(
+        *(_service(fixture).invoke(**request) for request in requests),
+        return_exceptions=True,
+    )
+
+    successes = [result for result in results if not isinstance(result, BaseException)]
+    conflicts = [
+        result
+        for result in results
+        if isinstance(result, OperatorToolInvocationError) and result.code == "idempotency_conflict"
+    ]
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert fixture.tools["sample.analyze"].calls in (
+        [{"query": "sample-a"}],
+        [{"query": "sample-b"}],
+    )
+    assert len(await fixture.invocations.list_for_investigation(fixture.investigation_id)) == 1
 
 
 @pytest.mark.asyncio

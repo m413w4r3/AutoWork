@@ -1522,6 +1522,28 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results() -> Non
         object_type="sample",
         object_id=sample_sha256,
     )
+    dotnet_observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="dotnet.ilspy",
+        source_version="ilspy-v1",
+        observed_at=datetime.now(UTC),
+        object_type="dotnet_analysis",
+        object_id=f"{sample_sha256}:method.decompile:{'f' * 64}",
+    )
+    foreign_dotnet_observation = EvidenceObservation(
+        investigation_id=uuid4(),
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="f" * 64,
+        source="dotnet.ilspy",
+        source_version="ilspy-v1",
+        observed_at=datetime.now(UTC),
+        object_type="dotnet_analysis",
+        object_id=f"{sample_sha256}:method.decompile:{'e' * 64}",
+    )
     download_result = EvidenceObservation(
         investigation_id=investigation_id,
         kind=EvidenceKind.OTHER,
@@ -1556,7 +1578,14 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results() -> Non
         object_id="sample.analyze",
     )
     observations = InMemoryEvidenceObservationRepository()
-    for observation in (downloaded_sample, download_result, analysis_observation, analysis_result):
+    for observation in (
+        downloaded_sample,
+        download_result,
+        analysis_observation,
+        analysis_result,
+        dotnet_observation,
+        foreign_dotnet_observation,
+    ):
         await observations.append_if_absent(observation)
     download_invocation = ToolInvocation(
         investigation_id=investigation_id,
@@ -1578,9 +1607,61 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results() -> Non
         status=ToolInvocationStatus.PARTIAL,
         response_refs=(analysis_observation.id, analysis_result.id),
     )
+    dotnet_invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="dotnet-operation",
+        tool_name="method.decompile",
+        schema_version="1",
+        normalized_parameters={"sample_sha256": sample_sha256},
+        purpose="Inspect a synthetic method.",
+        status=ToolInvocationStatus.SUCCEEDED,
+        response_refs=(dotnet_observation.id, foreign_dotnet_observation.id),
+        created_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    failed_local_invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="failed-local-operation",
+        tool_name="local.failed_probe",
+        schema_version="1",
+        normalized_parameters={"sample_sha256": sample_sha256},
+        purpose="A failed local action must not count as activity.",
+        status=ToolInvocationStatus.FAILED,
+        response_refs=(dotnet_observation.id,),
+        created_at=datetime.now(UTC) - timedelta(seconds=2),
+    )
     invocations = InMemoryToolInvocationRepository()
     await invocations.add_if_absent(download_invocation)
     await invocations.add_if_absent(analysis_invocation)
+    await invocations.add_if_absent(dotnet_invocation)
+    await invocations.add_if_absent(failed_local_invocation)
+    local_activity_observation_ids = [dotnet_observation.id]
+    for index in range(17):
+        local_observation = EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=EvidenceKind.BINARY_ANALYSIS,
+            blob_id=uuid4(),
+            sha256=f"{index + 10:064x}",
+            source="local.analysis",
+            source_version="1",
+            observed_at=datetime.now(UTC),
+            object_type="sample_analysis",
+            object_id=sample_sha256,
+        )
+        await observations.append_if_absent(local_observation)
+        local_activity_observation_ids.append(local_observation.id)
+        await invocations.add_if_absent(
+            ToolInvocation(
+                investigation_id=investigation_id,
+                operation_key=f"local-operation-{index}",
+                tool_name=f"local.tool_{index:02}",
+                schema_version="1",
+                normalized_parameters={"sample_sha256": sample_sha256},
+                purpose="Record bounded synthetic local activity.",
+                status=ToolInvocationStatus.SUCCEEDED,
+                response_refs=(local_observation.id,),
+                created_at=datetime.now(UTC) - timedelta(seconds=3),
+            )
+        )
 
     class SampleSummaries:
         async def summary(self, observation):
@@ -1655,6 +1736,14 @@ async def test_context_indexes_acquired_samples_and_recent_tool_results() -> Non
     assert sample["analysis_status"] == "analyzed"
     assert sample["analysis_engines"] == ["static@static-v1"]
     assert str(analysis_observation.id) in sample["observation_ids"]
+    assert len(sample["local_activity"]["invocation_counts"]) == 16
+    assert sample["local_activity"]["truncated_tool_names"] == 2
+    assert len(sample["local_activity"]["observation_ids"]) == 8
+    assert sample["local_activity"]["truncated_observation_ids"] == 10
+    assert set(sample["local_activity"]["observation_ids"]).issubset(
+        {str(item) for item in local_activity_observation_ids}
+    )
+    assert str(foreign_dotnet_observation.id) not in sample["local_activity"]["observation_ids"]
     assert result.tool_name == "sample.analyze"
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output_ids["association_id"] == str(association_id)
@@ -1735,6 +1824,12 @@ async def test_context_indexes_canonical_operator_imports_before_analysis() -> N
             "analysis_status": "not_analyzed",
             "analysis_engines": [],
             "observation_ids": [],
+            "local_activity": {
+                "invocation_counts": {},
+                "observation_ids": [],
+                "truncated_tool_names": 0,
+                "truncated_observation_ids": 0,
+            },
         },
     )
 

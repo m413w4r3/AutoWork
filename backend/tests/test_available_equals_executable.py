@@ -17,6 +17,10 @@ from cti_app.application.investigation_acquisition_tools import (
     VT_DOWNLOAD_SAMPLE_SCHEMA,
     VT_FILE_DOWNLOAD_CAPABILITY,
 )
+from cti_app.application.investigation_composition import (
+    FAMILY_CAPABILITY_KEYS,
+    OPTIONAL_TOOL_NAMES,
+)
 from cti_app.application.investigation_contracts import ConfirmedIOCContextV1
 from cti_app.application.investigation_operator_view import build_investigation_operator_view
 from cti_app.application.investigation_rule_tools import RULE_PROPOSE_SCHEMA
@@ -63,6 +67,12 @@ from cti_app.domain.investigation import (
     tool_operation_key,
 )
 from tests.test_investigation_service import _Fixture
+
+
+def test_dotnet_field_data_tool_is_composed_under_the_existing_dotnet_capability() -> None:
+    assert "field.data.read" in OPTIONAL_TOOL_NAMES
+    assert "field.data.read" in FAMILY_CAPABILITY_KEYS
+    assert "investigation.dotnet" in FAMILY_CAPABILITY_KEYS
 
 
 class _RecordingTool:

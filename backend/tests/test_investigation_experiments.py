@@ -489,12 +489,14 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     )
 
     class _Invocations:
-        async def get(self, _item_id):
-            return None
+        items = (unlinked_invocation,)
+
+        async def get(self, item_id):
+            return next((item for item in self.items if item.id == item_id), None)
 
         async def list_for_investigation(self, item_id):
             assert item_id == investigation_id
-            return (unlinked_invocation,)
+            return self.items
 
     experiments = InMemoryInvestigationExperimentRepository()
     adapter = OperatorExperimentToolAdapter(
@@ -697,6 +699,99 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     )
     assert rejected_observation.error_code == "experiment_observation_ref_mismatch"
     assert "another investigation" in rejected_observation.message
+
+    # Corrected payload: every observation comes from a cited invocation, and
+    # the declared tool identity matches the persisted invocation unchanged.
+    cited_invocation_id = uuid4()
+    cited_invocation = SimpleNamespace(
+        id=cited_invocation_id,
+        investigation_id=investigation_id,
+        version=3,
+        tool_name="protocol.validate",
+        schema_version="protocol-validation.v1",
+    )
+    observations.items = (
+        SimpleNamespace(**{**vars(observation), "invocation_ref": cited_invocation_id}),
+    )
+    adapter._invocations.items = (cited_invocation,)
+    corrected = dict(
+        arguments,
+        expected_version=1,
+        tool_name="protocol.validate",
+        tool_schema_version="protocol-validation.v1",
+        tool_invocation_refs=[{"invocation_id": str(cited_invocation_id), "version": 3}],
+        observation_refs=[{"observation_id": str(observation_id), "sha256": "b" * 64}],
+    )
+    corrected_result = await adapter.execute(
+        corrected, replace(context, idempotency_key="corrected-synthetic-provenance")
+    )
+    assert corrected_result.status is ToolInvocationStatus.SUCCEEDED
+
+    wrong_invocation_version = dict(
+        corrected,
+        expected_version=2,
+        tool_invocation_refs=[{"invocation_id": str(cited_invocation_id), "version": 4}],
+    )
+    mismatch = await adapter.execute(
+        wrong_invocation_version,
+        replace(context, idempotency_key="wrong-synthetic-invocation-version"),
+    )
+    assert mismatch.output["detail_code"] == "invocation_version_mismatch"
+
+    wrong_tool = dict(corrected, expected_version=2, tool_name="another.tool")
+    tool_mismatch = await adapter.execute(
+        wrong_tool, replace(context, idempotency_key="wrong-synthetic-tool-identity")
+    )
+    assert tool_mismatch.output["detail_code"] == "invocation_tool_mismatch"
+
+    observations.items = (SimpleNamespace(**{**vars(observation), "invocation_ref": uuid4()}),)
+    uncited = await adapter.execute(
+        arguments, replace(context, idempotency_key="uncited-synthetic-invocation")
+    )
+    assert uncited.error_code == "experiment_invalid"
+    assert uncited.output == {
+        "error_code": "experiment_invalid",
+        "detail_code": "observation_invocation_not_cited",
+        "field": "observation_refs",
+        "correction": (
+            "Cite the tool invocation that produced each observation, or remove that "
+            "observation reference."
+        ),
+    }
+    observations.items = (observation,)
+
+    invalid_pivot = dict(arguments, next_pivots=["not-a-sha256"])
+    bad_pivot = await adapter.execute(
+        invalid_pivot, replace(context, idempotency_key="invalid-synthetic-pivot")
+    )
+    assert bad_pivot.output["detail_code"] == "next_pivot_invalid"
+    assert bad_pivot.output["field"] == "next_pivots"
+
+    reversed_dates = dict(
+        arguments,
+        started_at=(NOW + timedelta(seconds=2)).isoformat(),
+        completed_at=(NOW + timedelta(seconds=1)).isoformat(),
+    )
+    bad_dates = await adapter.execute(
+        reversed_dates, replace(context, idempotency_key="reversed-synthetic-dates")
+    )
+    assert bad_dates.output["detail_code"] == "timestamp_order_invalid"
+
+    missing_field = dict(arguments)
+    del missing_field["prediction"]
+    missing = await adapter.execute(
+        missing_field, replace(context, idempotency_key="missing-synthetic-field")
+    )
+    assert missing.output["detail_code"] == "field_invalid"
+    assert "prediction" not in repr(missing.output)
+
+    stale = await adapter.execute(
+        dict(arguments, expected_version=7),
+        replace(context, idempotency_key="stale-synthetic-stream"),
+    )
+    assert stale.error_code == "stale_experiment_version"
+    assert stale.output["detail_code"] == "experiment_version_stale"
+    assert stale.output["current_stream_version"] == 2
 
 
 @pytest.mark.asyncio
