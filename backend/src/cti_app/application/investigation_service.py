@@ -65,6 +65,7 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
     tool_operation_cache_identity,
+    uses_nonblocking_local_freshness,
 )
 from cti_app.application.investigation_vt_tools import (
     VT_PASSIVE_RETRY_TOOL_NAMES,
@@ -1481,6 +1482,11 @@ class InvestigationService:
             ToolEffect.EXTERNAL_ACTIVE,
             ToolEffect.EXTERNAL_SUBMIT,
         }
+        local_effect = definition is not None and definition.effect in {
+            ToolEffect.LOCAL_READ,
+            ToolEffect.LOCAL_COMPUTE,
+        }
+        independent_local_effect = uses_nonblocking_local_freshness(tool_name, definition)
         invocation_parameters: Mapping[str, Any] = arguments
         external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
         if tool_name in _VT_COORDINATED_READ_TOOLS:
@@ -1537,6 +1543,11 @@ class InvestigationService:
             if tool_name in _VT_PASSIVE_READ_TOOLS and existing is None
             else None
         )
+        if envelope is not None and independent_local_effect:
+            # Independent local tools may retry envelope admission after a CAS
+            # race; keep their in-memory budget snapshot private until retry.
+            budget = _copy_investigation_budget(budget)
+            envelope = replace(envelope, budget=budget)
         invocation = ToolInvocation(
             investigation_id=investigation.id,
             operation_key=operation_key,
@@ -1592,7 +1603,7 @@ class InvestigationService:
         else:
             # A durable record wins over dispatcher memory. Never turn an existing
             # invocation into a second external call.
-            if invocation.status is ToolInvocationStatus.RUNNING:
+            if invocation.status is ToolInvocationStatus.RUNNING and not local_effect:
                 reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
                 invocation = await self._invocations.update_if_version(
                     reviewed, expected_version=invocation.version
@@ -1609,12 +1620,25 @@ class InvestigationService:
                     invocation.response_refs,
                     external_effect,
                 )
+            if invocation.status is ToolInvocationStatus.RUNNING:
+                return (
+                    invocation,
+                    ToolResult(
+                        status=ToolInvocationStatus.RUNNING,
+                        observation_refs=invocation.response_refs,
+                        message="The durable invocation is still running; it was not redispatched.",
+                        idempotent_replay=True,
+                    ),
+                    invocation.response_refs,
+                    external_effect,
+                )
             return (
                 invocation,
                 ToolResult(
                     status=invocation.status,
                     observation_refs=invocation.response_refs,
                     message="Reused durable tool invocation; it was not redispatched.",
+                    idempotent_replay=True,
                 ),
                 invocation.response_refs,
                 False,
@@ -1622,9 +1646,27 @@ class InvestigationService:
 
         cost = invocation.reserved_budget
         if envelope is not None:
-            try:
-                envelope = await self._save_envelope_version(envelope)
-            except VersionConflictError:
+            saved_envelope = False
+            for attempt in range(3):
+                try:
+                    envelope = await self._save_envelope_version(envelope)
+                    saved_envelope = True
+                    break
+                except VersionConflictError:
+                    if not independent_local_effect or attempt == 2:
+                        break
+                    current_envelope = await self._envelopes.get(investigation.id)
+                    if current_envelope is None:
+                        break
+                    budget = _copy_investigation_budget(current_envelope.budget)
+                    envelope = replace(current_envelope, budget=budget)
+                    try:
+                        admission_reservation = budget.reserve(operation_key, cost)
+                    except BudgetExceeded:
+                        # Let the dispatcher produce the established typed
+                        # pre-dispatch budget refusal against this current snapshot.
+                        admission_reservation = None
+            if not saved_envelope:
                 # Admission did not reach durable storage, so the adapter is
                 # provably unreachable. Persist that pre-submission outcome rather
                 # than leaving a RUNNING invocation that would block a safe retry.

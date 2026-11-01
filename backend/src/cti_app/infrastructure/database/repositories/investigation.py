@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -164,6 +165,23 @@ def _keyset_predicate(
 class SqlAlchemyToolInvocationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    @asynccontextmanager
+    async def lock_operation_prefix(self, operation_prefix: str) -> AsyncIterator[None]:
+        """Serialize idempotency-prefix admission across database workers.
+
+        PostgreSQL releases this transaction-scoped lock at the invocation's
+        RUNNING commit, after which a retry sees the durable row before it can
+        dispatch another effect.
+        """
+        digest = hashlib.blake2b(
+            operation_prefix.encode("utf-8"), digest_size=8, person=b"autowork-op-key"
+        ).digest()
+        lock_key = int.from_bytes(digest, byteorder="big", signed=True)
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key}
+        )
+        yield
 
     async def get(self, invocation_id: UUID) -> ToolInvocation | None:
         row = await self._session.scalar(
