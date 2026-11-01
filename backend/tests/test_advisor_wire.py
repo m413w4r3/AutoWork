@@ -2237,15 +2237,12 @@ def test_plain_draft_maps_to_the_only_explicit_target_without_changing_text() ->
     assert parsed["usable"] is True
     assert parsed["unit_assignment_status"] == "single_requested_unit"
     assert parsed["blocks"][0]["block_type"] == "key_findings"
-    assert parsed["blocks"][0]["sentences"] == [
-        {"text": raw, "assertion_ids": []}
-    ]
+    assert parsed["blocks"][0]["sentences"] == [{"text": raw, "assertion_ids": []}]
 
 
 def test_plain_draft_multiple_targets_are_not_guessed_by_section_order() -> None:
     raw = (
-        "### 1. Échantillon A\nObservation une. [E1]\n"
-        "### 2. Échantillon B\nObservation deux. [E2]"
+        "### 1. Échantillon A\nObservation une. [E1]\n### 2. Échantillon B\nObservation deux. [E2]"
     )
     parsed = parse_typed_advisor_response(
         raw,
@@ -2274,9 +2271,7 @@ def test_draft_prompt_requests_literal_unit_headings_in_prose() -> None:
         "draft_text",
         {
             "question": "Rédiger des faits techniques.",
-            "units": [
-                {"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}
-            ],
+            "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}],
         },
     )
     assert "Ne pas remplacer U1/U2" in prompt
@@ -2327,3 +2322,23 @@ def test_yara_dossier_keeps_measured_bytes_and_article_context() -> None:
     assert "offset 0" in dossier.text
     assert "Canal GitHub" in dossier.text
     assert any(row["kind"] == "measurement" for row in dossier.manifest)
+
+
+def test_draft_prose_maps_explicit_named_sections_not_guessing_order() -> None:
+    parsed = parse_typed_advisor_response(
+        "### 2. Détections proposées\nYARA expérimentale. [E2]\n"
+        "### 1. Faits clés\nLe code est statique. [E1]",
+        consultation_type="draft_text",
+        prompt_data={
+            "units": [
+                {"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None},
+                {"id": "U2", "block_type": "proposed_detections", "form": "body", "anchor": None},
+            ]
+        },
+        safe_text=_safe_text,
+    )
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assigned = {block["block_type"]: block for block in parsed["blocks"]}
+    assert "YARA expérimentale" in assigned["proposed_detections"]["sentences"][0]["text"]
+    assert "Le code est statique" in assigned["key_findings"]["sentences"][0]["text"]

@@ -195,18 +195,38 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
         return guidance
     if consultation_type == "yara_draft":
         return [
-            ("Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara."),
-            ("Ancrer chaque motif prétendu mesuré dans les octets/mesures et alias "
-            "effectivement fournis. Un motif jokerisé extrapolé peut être proposé "
-            "comme hypothèse mais pas présenté comme une mesure vérifiée."),
-            ("La critique de règle et les idées d'invariants restent utiles même "
-            "si une nouvelle source YARA ne peut pas encore être canonisée."),
+            (
+                "Proposer une règle YARA complète à partir des octets et chaînes discriminants, "
+                "des offsets, du type de fichier, du code et des décodages vérifiés."
+            ),
+            (
+                "La règle proposée doit être compilée et testée par l'opérateur sur les "
+                "échantillons mesurables ; suggérer aussi les tests positifs, contre-exemples "
+                "et pivots YARA/VT pour découvrir des variantes."
+            ),
+            "Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara.",
+            (
+                "Ancrer chaque motif présenté comme mesuré dans les octets/mesures et alias "
+                "effectivement transmis. Les motifs jokerisés extrapolés peuvent être "
+                "proposés comme hypothèses à tester, non comme mesures vérifiées."
+            ),
+            (
+                "Une critique de condition ou de spécificité reste utile même si une "
+                "nouvelle source YARA n'est pas encore canonisable."
+            ),
             "Ne pas exécuter, téléverser, analyser, ou appeler d\u2019outil.",
         ]
     if consultation_type == "suricata_draft":
         return [
-            ("Placer toute règle Suricata proposée, complète, dans un bloc clôturé ```suricata."),
-            ("Expliquer en prose les faits réseau qui la justifient et les limites des mesures."),
+            (
+                "Exploiter endpoints, séquences, champs et formats du protocole C2, octets "
+                "réseau pertinents si disponibles, et distinguer statique/observé."
+            ),
+            "Placer toute règle Suricata proposée, complète, dans un bloc clôturé ```suricata.",
+            (
+                "Expliciter la visibilité TLS, les champs réellement observables, les "
+                "faux positifs possibles et le test sur PCAP à réaliser si une capture existe."
+            ),
             (
                 "Ne pas inférer le contenu des paquets, le sens du flux, ni une activité C2 "
                 "non observée."
