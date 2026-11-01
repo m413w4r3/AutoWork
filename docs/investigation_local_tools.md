@@ -104,7 +104,9 @@ Les schémas sont en JSON Schema Draft 2020-12, refusent les propriétés
 inconnues à leur niveau et utilisent uniquement les mots-clés compris par le
 validateur du registre. Les requêtes et options sont bornées ; les champs
 credential-like, valeurs de credential et URL signées sont refusés ou
-assainis. Les réponses ne contiennent ni octets bruts ni secret.
+assainis. Les réponses Ghidra ne contiennent ni octets bruts ni secret.
+`field.data.read` retourne explicitement les données du champ en hexadécimal,
+comme décrit ci-dessous.
 
 ## États, preuves et reprise
 
@@ -148,3 +150,33 @@ Le catalogue F1 projette `zip_members` et les commandes 7-Zip seulement lorsque
 leurs familles sont présentes et attestées dans le worker. Les extracteurs PE
 structurés existants ne reçoivent pas d’identifiants distincts; F2 conserve le
 comportement d’`objdump` déjà catalogué.
+
+## Lecture d’un champ de données statique .NET
+
+`field.data.read` utilise la capacité existante `investigation.dotnet` et le
+worker d’analyse confiné. L’entrée adresse un sample par son SHA-256, qui doit
+être associé à l’enquête courante et présent dans le bucket de quarantaine. Le
+champ est sélectionné par un token `0x04xxxxxx` ou par le nom exact du type et
+du champ; ces identifiants suivent des motifs stricts. Aucun chemin de fichier
+n’est accepté.
+
+Le worker inspecte les métadonnées PE/CLI sans charger l’assembly. Il résout
+`FieldRVA` vers une section et un offset fichier, vérifie les limites de fichier
+et de section, puis renvoie au plus 4 096 octets avec le token et le nom du
+champ, le RVA, la section, l’offset, les bornes fichier, la longueur, le
+SHA-256, l’hexadump et un marqueur `truncated`. La lecture est bornée à 16 MiB
+de métadonnées, 16 MiB de chaînes décodées, 200 000 lignes de métadonnées au
+total et 8 192 lignes `FieldRVA`. Si la signature désigne un type valeur dont
+`ClassLayout.ClassSize` est connu, sa taille borne la lecture; sinon `length`
+est obligatoire. Une demande explicite supérieure à 4 096 est refusée avec un
+`detail_code` stable. `size_known` indique si la taille du champ est établie;
+`completeness` vaut `complete`, `partial` ou `unknown`. Une taille inconnue ne
+signifie pas une troncature: `truncated` n’est vrai que si une borne connue a
+réduit la lecture. Quand la taille est inconnue, la borne de fin du champ reste
+`null`; les bornes fichier rapportent alors uniquement la plage effectivement
+demandée et lue.
+
+Les octets sont des données binaires non fiables. Le résultat suit le chemin
+normal des observations `dotnet.*`: le JSON canonique porte le SHA-256 du
+résultat et `invocation_ref`, et l’invocation renvoie la référence
+d’observation. Le contenu n’est jamais exécuté.

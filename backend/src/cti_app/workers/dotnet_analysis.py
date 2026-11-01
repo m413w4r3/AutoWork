@@ -10,6 +10,7 @@ import tempfile
 import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
@@ -44,6 +45,12 @@ _IL_CLASS_NAME = re.compile(r"(?:^|[ \t])(?P<name>'(?:\\.|[^'])*'|[^ \t]+)[ \t]*
 _IL_CLASS_END = re.compile(r"^\s*\}\s*// end of class(?:\s+.*)?$")
 _IL_IDENTIFIER_ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|.)")
 _MAX_SAMPLE_BYTES = 64 * 1024 * 1024
+_MAX_METADATA_SCAN_BYTES = 16 * 1024 * 1024
+_MAX_METADATA_ROWS = 200_000
+_MAX_DECODED_METADATA_STRING_BYTES = 16 * 1024 * 1024
+_MAX_FIELD_RVA_ROWS = 8_192
+_MAX_PE_SECTIONS = 96
+_FIELD_DATA_MAX_BYTES = 4096
 _PAGE_SIZE_MAX = 200
 _PAGE_CHARS_MAX = 16 * 1024
 _METHOD_RID_MAX = 0xFFFFFF
@@ -61,8 +68,77 @@ _MACHINE_ARCHITECTURE = {
     0x5128: "RISC-V 128",
 }
 _OPERATIONS = frozenset(
-    {"assembly", "types", "methods", "decompile", "references", "strings", "resources"}
+    {
+        "assembly",
+        "types",
+        "methods",
+        "decompile",
+        "references",
+        "strings",
+        "resources",
+        "field_data",
+    }
 )
+_FIELD_TOKEN = re.compile(r"^0x04[0-9a-fA-F]{6}$")
+_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>./+`-]{1,256}$")
+_FIELD_NAME = re.compile(r"^[A-Za-z0-9_$<>.`-]{1,256}$")
+
+_CODED_INDEX_TABLES: dict[str, tuple[int, tuple[int, ...]]] = {
+    "ResolutionScope": (2, (0, 26, 35, 1)),
+    "TypeDefOrRef": (2, (2, 1, 27)),
+    "MemberRefParent": (3, (2, 1, 26, 6, 27)),
+    "HasConstant": (2, (4, 8, 23)),
+    "HasCustomAttribute": (
+        5,
+        (6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42, 44, 43),
+    ),
+    "CustomAttributeType": (3, (6, 10)),
+    "HasFieldMarshal": (1, (4, 8)),
+    "HasDeclSecurity": (2, (2, 6, 32)),
+    "HasSemantics": (1, (20, 23)),
+    "MethodDefOrRef": (1, (6, 10)),
+    "MemberForwarded": (1, (4, 6)),
+}
+_METADATA_TABLE_COLUMNS: dict[int, tuple[str, ...]] = {
+    0: ("u2", "string", "guid", "guid", "guid"),
+    1: ("coded:ResolutionScope", "string", "string"),
+    2: ("u4", "string", "string", "coded:TypeDefOrRef", "table:4", "table:6"),
+    3: ("table:4",),
+    4: ("u2", "string", "blob"),
+    5: ("table:6",),
+    6: ("u4", "u2", "u2", "string", "blob", "table:8"),
+    7: ("table:8",),
+    8: ("u2", "u2", "string"),
+    9: ("table:2", "coded:TypeDefOrRef"),
+    10: ("coded:MemberRefParent", "string", "blob"),
+    11: ("u1", "u1", "coded:HasConstant", "blob"),
+    12: ("coded:HasCustomAttribute", "coded:CustomAttributeType", "blob"),
+    13: ("coded:HasFieldMarshal", "blob"),
+    14: ("u2", "coded:HasDeclSecurity", "blob"),
+    15: ("u2", "u4", "table:2"),
+    16: ("u4", "table:4"),
+    17: ("blob",),
+    18: ("table:2", "table:20"),
+    19: ("table:20",),
+    20: ("u2", "string", "coded:TypeDefOrRef"),
+    21: ("table:2", "table:23"),
+    22: ("table:23",),
+    23: ("u2", "string", "blob"),
+    24: ("u2", "table:6", "coded:HasSemantics"),
+    25: ("table:2", "coded:MethodDefOrRef", "coded:MethodDefOrRef"),
+    26: ("string",),
+    27: ("blob",),
+    28: ("u2", "coded:MemberForwarded", "string", "table:26"),
+    29: ("u4", "table:4"),
+}
+
+
+class _FieldDataError(ValueError):
+    def __init__(self, detail_code: str) -> None:
+        super().__init__(detail_code)
+        self.detail_code = detail_code
+
+
 _SUBPROCESS_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "LANG": "C",
@@ -118,6 +194,8 @@ async def _run_dotnet_analysis(
             sample_sha256=hashlib.sha256(payload).hexdigest(),
             recommended_native_tool="native.inspect",
         )
+    if operation == "field_data":
+        return _read_field_data(payload, parameters.analysis_parameters)
     if operation == "decompile":
         method_rid = _bounded_int(
             parameters.analysis_parameters.get("method_rid"), 1, _METHOD_RID_MAX
@@ -333,6 +411,618 @@ def probe_ilspycmd(settings: Settings | None = None) -> tuple[str | None, str | 
     if provenance is None:
         return None, None
     return ILSPYCMD_VERSION, ILSPYCMD_PACKAGE_SHA512
+
+
+def _read_field_data(payload: bytes, parameters: Mapping[str, str]) -> dict[str, Any]:
+    try:
+        token = parameters.get("field_token")
+        type_name = parameters.get("type_name")
+        field_name = parameters.get("field_name")
+        has_token = "field_token" in parameters
+        has_type_name = "type_name" in parameters
+        has_field_name = "field_name" in parameters
+        has_names = has_type_name and has_field_name
+        if (has_token and (has_type_name or has_field_name)) or (not has_token and not has_names):
+            raise _FieldDataError("dotnet_field_selector_invalid")
+        if has_token and (not isinstance(token, str) or _FIELD_TOKEN.fullmatch(token) is None):
+            raise _FieldDataError("dotnet_field_selector_invalid")
+        if has_names and (
+            not isinstance(type_name, str)
+            or not isinstance(field_name, str)
+            or _FIELD_TYPE_NAME.fullmatch(type_name) is None
+            or _FIELD_NAME.fullmatch(field_name) is None
+        ):
+            raise _FieldDataError("dotnet_field_selector_invalid")
+
+        field_offset_value = _field_parameter_int(parameters, "offset", 0, 0xFFFFFFFF, default=0)
+        if field_offset_value is None:
+            raise _FieldDataError("dotnet_field_offset_invalid")
+        field_offset = field_offset_value
+        requested_length = _field_parameter_int(parameters, "length", 1, 0xFFFFFFFF, required=False)
+        if requested_length is not None and requested_length > _FIELD_DATA_MAX_BYTES:
+            raise _FieldDataError("dotnet_field_data_length_exceeds_cap")
+
+        pe = pefile.PE(data=payload, fast_load=True)
+        try:
+            cli_index = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
+            directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+            if len(directories) <= cli_index:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            cli_directory = directories[cli_index]
+            cli_rva = int(cli_directory.VirtualAddress)
+            if cli_rva <= 0 or int(cli_directory.Size) < 72:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            cli_offset, _, _ = _rva_to_file_offset(pe, len(payload), cli_rva, 72)
+            cor_header = struct.unpack_from("<IHH16I", payload, cli_offset)
+            if cor_header[0] < 72:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            metadata_rva = int(cor_header[3])
+            metadata_size = int(cor_header[4])
+            if metadata_rva <= 0 or metadata_size < 4:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            if metadata_size > _MAX_METADATA_SCAN_BYTES:
+                raise _FieldDataError("dotnet_field_metadata_limit_exceeded")
+            metadata_offset, _, _ = _rva_to_file_offset(
+                pe, len(payload), metadata_rva, metadata_size
+            )
+            streams = _metadata_streams(payload, metadata_offset, metadata_size)
+            tables = streams.get("#~")
+            if tables is None:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            field_records, type_defs, type_refs, layouts, field_rvas = _parse_field_tables(
+                tables, streams.get("#Strings", b""), streams.get("#Blob", b"")
+            )
+            selected = _select_field(
+                field_records,
+                type_defs,
+                field_rvas,
+                token=token,
+                type_name=type_name,
+                field_name=field_name,
+            )
+            if selected["rva"] == 0:
+                raise _FieldDataError("dotnet_field_rva_zero")
+
+            field_type_size = _field_value_type_size(
+                bytes(streams["#Blob"]), selected["signature_index"], type_defs, type_refs, layouts
+            )
+            if field_offset > 0xFFFFFFFF - int(selected["rva"]):
+                raise _FieldDataError("dotnet_field_offset_invalid")
+            if field_type_size is not None and field_offset >= field_type_size:
+                raise _FieldDataError("dotnet_field_range_out_of_bounds")
+            if field_type_size is None and requested_length is None:
+                raise _FieldDataError("dotnet_field_data_length_required")
+
+            first_offset, section_name, _ = _rva_to_file_offset(
+                pe, len(payload), int(selected["rva"]), 1
+            )
+            if field_type_size is not None:
+                _rva_to_file_offset(pe, len(payload), int(selected["rva"]), field_type_size)
+                remaining = field_type_size - field_offset
+                read_length = min(
+                    requested_length if requested_length is not None else remaining,
+                    remaining,
+                    _FIELD_DATA_MAX_BYTES,
+                )
+            else:
+                read_length = requested_length or 0
+            if read_length < 1:
+                raise _FieldDataError("dotnet_field_range_out_of_bounds")
+            read_rva = int(selected["rva"]) + field_offset
+            read_offset, read_section, _ = _rva_to_file_offset(
+                pe, len(payload), read_rva, read_length
+            )
+            if read_section != section_name or read_offset != first_offset + field_offset:
+                raise _FieldDataError("dotnet_field_rva_invalid")
+            raw = payload[read_offset : read_offset + read_length]
+            if len(raw) != read_length:
+                raise _FieldDataError("dotnet_field_file_bounds_invalid")
+            return {
+                "status": "SUCCEEDED",
+                "operation": "field_data",
+                "engine": "pefile-field-rva",
+                "version": pefile.__version__,
+                "field_token": f"0x{0x04000000 | int(selected['rid']):08x}",
+                "field_name": selected["name"],
+                "type_name": selected["type_name"],
+                "rva": int(selected["rva"]),
+                "section_name": section_name,
+                "file_offset": first_offset,
+                "field_size_bytes": field_type_size,
+                "size_known": field_type_size is not None,
+                "completeness": (
+                    "unknown"
+                    if field_type_size is None
+                    else "partial"
+                    if field_offset + len(raw) < field_type_size
+                    else "complete"
+                ),
+                "size_in_file_bounds": {
+                    "file_size_bytes": len(payload),
+                    "field_start": first_offset,
+                    # FieldRVA gives an address, not an extent. Report the end
+                    # only when the field's explicit value-type layout supplied it.
+                    "field_end_exclusive": (
+                        first_offset + field_type_size if field_type_size is not None else None
+                    ),
+                    "read_start": read_offset,
+                    "read_end_exclusive": read_offset + len(raw),
+                },
+                "offset": field_offset,
+                "length_returned": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "hex_dump": raw.hex(" "),
+                "truncated": (
+                    field_offset + len(raw) < field_type_size
+                    if field_type_size is not None
+                    else False
+                ),
+            }
+        finally:
+            pe.close()
+    except _FieldDataError as exc:
+        denied = exc.detail_code in {
+            "dotnet_field_selector_invalid",
+            "dotnet_field_selector_ambiguous",
+            "dotnet_field_not_found",
+            "dotnet_field_rva_missing",
+            "dotnet_field_data_length_required",
+            "dotnet_field_data_length_exceeds_cap",
+            "dotnet_field_offset_invalid",
+            "dotnet_field_range_out_of_bounds",
+        }
+        status = "POLICY_DENIED" if denied else "FAILED"
+        return _failure(
+            status,
+            exc.detail_code,
+            detail_code=exc.detail_code,
+            operation="field_data",
+            engine="pefile-field-rva",
+            version=pefile.__version__,
+        )
+    except Exception as exc:
+        return _failure(
+            "FAILED",
+            "dotnet_field_metadata_invalid",
+            detail_code="dotnet_field_metadata_invalid",
+            operation="field_data",
+            engine="pefile-field-rva",
+            version=pefile.__version__,
+            error_type=type(exc).__name__,
+        )
+
+
+def _field_parameter_int(
+    parameters: Mapping[str, str],
+    key: str,
+    minimum: int,
+    maximum: int,
+    *,
+    default: int | None = None,
+    required: bool = True,
+) -> int | None:
+    value = parameters.get(key)
+    if value is None:
+        if required:
+            return default
+        return None
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        code = "dotnet_field_offset_invalid" if key == "offset" else "dotnet_field_length_invalid"
+        raise _FieldDataError(code)
+    parsed = int(value)
+    if not minimum <= parsed <= maximum:
+        code = "dotnet_field_offset_invalid" if key == "offset" else "dotnet_field_length_invalid"
+        raise _FieldDataError(code)
+    return parsed
+
+
+def _rva_to_file_offset(pe: Any, file_size: int, rva: int, length: int) -> tuple[int, str, int]:
+    if (
+        isinstance(rva, bool)
+        or not isinstance(rva, int)
+        or rva <= 0
+        or rva > 0xFFFFFFFF
+        or isinstance(length, bool)
+        or not isinstance(length, int)
+        or length < 1
+        or length > 0xFFFFFFFF
+        or rva + length > 0x1_0000_0000
+    ):
+        raise _FieldDataError("dotnet_field_rva_invalid")
+    try:
+        headers_size = int(pe.OPTIONAL_HEADER.SizeOfHeaders)
+        sections = tuple(pe.sections)
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise _FieldDataError("dotnet_field_pe_sections_invalid") from exc
+    if not 0 < headers_size <= file_size or len(sections) > _MAX_PE_SECTIONS:
+        raise _FieldDataError("dotnet_field_pe_sections_invalid")
+
+    virtual_ranges: list[tuple[int, int]] = []
+    raw_ranges: list[tuple[int, int]] = []
+    parsed_sections: list[tuple[int, int, int, int, int, str]] = []
+    for section in sections:
+        try:
+            virtual_address = int(section.VirtualAddress)
+            virtual_size = int(section.Misc_VirtualSize)
+            raw_size = int(section.SizeOfRawData)
+            raw_offset = int(section.PointerToRawData)
+            name_bytes = bytes(section.Name)
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise _FieldDataError("dotnet_field_pe_sections_invalid") from exc
+        span = max(virtual_size, raw_size)
+        if min(virtual_address, virtual_size, raw_size, raw_offset) < 0:
+            raise _FieldDataError("dotnet_field_pe_sections_invalid")
+        if any(
+            value > 0xFFFFFFFF for value in (virtual_address, virtual_size, raw_size, raw_offset)
+        ):
+            raise _FieldDataError("dotnet_field_pe_sections_invalid")
+        virtual_end = virtual_address + span
+        raw_end = raw_offset + raw_size
+        if virtual_end > 0x1_0000_0000 or raw_end > file_size:
+            raise _FieldDataError("dotnet_field_pe_sections_invalid")
+        if span and virtual_address < headers_size:
+            raise _FieldDataError("dotnet_field_pe_sections_invalid")
+        if raw_size and raw_offset < headers_size:
+            raise _FieldDataError("dotnet_field_pe_sections_invalid")
+        if span:
+            virtual_ranges.append((virtual_address, virtual_end))
+        if raw_size:
+            raw_ranges.append((raw_offset, raw_end))
+        section_name = name_bytes.split(b"\0", maxsplit=1)[0].decode("ascii", "replace")
+        parsed_sections.append(
+            (virtual_address, virtual_end, virtual_size, raw_size, raw_offset, section_name)
+        )
+    for ranges in (virtual_ranges, raw_ranges):
+        ordered = sorted(ranges)
+        if any(current[0] < previous[1] for previous, current in pairwise(ordered)):
+            raise _FieldDataError("dotnet_field_pe_sections_invalid")
+
+    end_rva = rva + length
+    if rva < headers_size:
+        if end_rva > headers_size or end_rva > file_size:
+            raise _FieldDataError("dotnet_field_file_bounds_invalid")
+        return rva, "headers", headers_size - rva
+    for virtual_start, virtual_end, _virtual_size, raw_size, raw_offset, name in parsed_sections:
+        if virtual_start <= rva < virtual_end:
+            section_delta = rva - virtual_start
+            if section_delta >= raw_size:
+                raise _FieldDataError("dotnet_field_rva_uninitialized")
+            if section_delta + length > raw_size:
+                raise _FieldDataError("dotnet_field_file_bounds_invalid")
+            file_offset = raw_offset + section_delta
+            file_end = file_offset + length
+            if file_end > file_size:
+                raise _FieldDataError("dotnet_field_file_bounds_invalid")
+            return file_offset, name, raw_size - section_delta
+    raise _FieldDataError("dotnet_field_rva_not_mapped")
+
+
+def _metadata_streams(payload: bytes, offset: int, size: int) -> dict[str, bytes]:
+    if size > _MAX_METADATA_SCAN_BYTES or size < 20 or offset < 0 or offset + size > len(payload):
+        raise _FieldDataError("dotnet_field_metadata_limit_exceeded")
+    data = payload[offset : offset + size]
+    if data[:4] != b"BSJB":
+        raise _FieldDataError("dotnet_field_metadata_invalid")
+    try:
+        version_size = struct.unpack_from("<I", data, 12)[0]
+        cursor = 16 + version_size
+        cursor = (cursor + 3) & ~3
+        if cursor + 4 > len(data):
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+        _flags, stream_count = struct.unpack_from("<HH", data, cursor)
+        cursor += 4
+        if stream_count > 32:
+            raise _FieldDataError("dotnet_field_metadata_limit_exceeded")
+        headers: list[tuple[str, int, int]] = []
+        for _ in range(stream_count):
+            if cursor + 8 > len(data):
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            stream_offset, stream_size = struct.unpack_from("<II", data, cursor)
+            cursor += 8
+            name_end = data.find(b"\0", cursor, min(len(data), cursor + 33))
+            if name_end < 0:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            try:
+                stream_name = data[cursor:name_end].decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise _FieldDataError("dotnet_field_metadata_invalid") from exc
+            cursor = (name_end + 4) & ~3
+            if stream_offset + stream_size > size:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            headers.append((stream_name, stream_offset, stream_size))
+        headers_end = cursor
+        if len({name for name, _offset, _size in headers}) != len(headers):
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+        ranges = sorted(
+            (stream_offset, stream_offset + stream_size)
+            for _name, stream_offset, stream_size in headers
+            if stream_size
+        )
+        if any(start < headers_end for start, _end in ranges) or any(
+            current[0] < previous[1] for previous, current in pairwise(ranges)
+        ):
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+        return {
+            name: data[stream_offset : stream_offset + stream_size]
+            for name, stream_offset, stream_size in headers
+        }
+    except struct.error as exc:
+        raise _FieldDataError("dotnet_field_metadata_invalid") from exc
+
+
+def _parse_field_tables(
+    table_stream: bytes, strings_heap: bytes, blob_heap: bytes
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[int, int],
+    list[dict[str, int]],
+]:
+    if len(table_stream) > _MAX_METADATA_SCAN_BYTES or len(table_stream) < 24:
+        raise _FieldDataError("dotnet_field_metadata_limit_exceeded")
+    try:
+        heap_sizes = table_stream[6]
+        valid_mask = struct.unpack_from("<Q", table_stream, 8)[0]
+        count_cursor = 24
+        row_counts = [0] * 64
+        for table_id in range(64):
+            if valid_mask & (1 << table_id):
+                if count_cursor + 4 > len(table_stream):
+                    raise _FieldDataError("dotnet_field_metadata_invalid")
+                row_counts[table_id] = struct.unpack_from("<I", table_stream, count_cursor)[0]
+                count_cursor += 4
+        if sum(row_counts) > _MAX_METADATA_ROWS:
+            raise _FieldDataError("dotnet_field_metadata_limit_exceeded")
+        if row_counts[29] > _MAX_FIELD_RVA_ROWS:
+            raise _FieldDataError("dotnet_field_metadata_limit_exceeded")
+        if row_counts[3] or row_counts[5] or row_counts[7] or row_counts[19] or row_counts[22]:
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+
+        table_ranges: dict[int, tuple[int, int, int]] = {}
+        cursor = count_cursor
+        if heap_sizes & 0x40:
+            if cursor + 4 > len(table_stream):
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            cursor += 4
+        for table_id in range(30):
+            count = row_counts[table_id]
+            if not count:
+                continue
+            columns = _METADATA_TABLE_COLUMNS.get(table_id)
+            if columns is None:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            row_size = sum(
+                _metadata_column_size(column, row_counts, heap_sizes) for column in columns
+            )
+            table_size = row_size * count
+            if cursor + table_size > len(table_stream):
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            table_ranges[table_id] = (cursor, row_size, count)
+            cursor += table_size
+
+        decoded_string_bytes = 0
+
+        def decode_metadata_string(index: int) -> str:
+            nonlocal decoded_string_bytes
+            decoded = _metadata_string(strings_heap, index)
+            if index:
+                end = strings_heap.find(b"\0", index, min(len(strings_heap), index + 1025))
+                decoded_string_bytes += end - index
+                if decoded_string_bytes > _MAX_DECODED_METADATA_STRING_BYTES:
+                    raise _FieldDataError("dotnet_field_metadata_decoded_strings_limit_exceeded")
+            return decoded
+
+        type_refs: list[dict[str, Any]] = [
+            {
+                "rid": rid,
+                "name": decode_metadata_string(row[1]),
+                "namespace": decode_metadata_string(row[2]),
+            }
+            for rid, row in _metadata_rows(table_stream, 1, table_ranges, row_counts, heap_sizes)
+        ]
+        type_defs: list[dict[str, Any]] = []
+        for rid, row in _metadata_rows(table_stream, 2, table_ranges, row_counts, heap_sizes):
+            type_defs.append(
+                {
+                    "rid": rid,
+                    "name": decode_metadata_string(row[1]),
+                    "namespace": decode_metadata_string(row[2]),
+                    "extends": row[3],
+                    "field_start": row[4],
+                }
+            )
+        field_records = [
+            {
+                "rid": rid,
+                "name": decode_metadata_string(row[1]),
+                "signature_index": row[2],
+            }
+            for rid, row in _metadata_rows(table_stream, 4, table_ranges, row_counts, heap_sizes)
+        ]
+        layouts: dict[int, int] = {}
+        for _rid, row in _metadata_rows(table_stream, 15, table_ranges, row_counts, heap_sizes):
+            class_size, parent = row[1], row[2]
+            if parent < 1 or parent > len(type_defs) or parent in layouts:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            layouts[parent] = class_size
+        field_rvas = [
+            {"rva": row[0], "field_rid": row[1]}
+            for _rid, row in _metadata_rows(table_stream, 29, table_ranges, row_counts, heap_sizes)
+        ]
+        if any(row["field_rid"] < 1 or row["field_rid"] > len(field_records) for row in field_rvas):
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+        if len({row["field_rid"] for row in field_rvas}) != len(field_rvas):
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+        previous_field_start = 1
+        for item in type_defs:
+            start = item["field_start"]
+            if start < previous_field_start or start > len(field_records) + 1:
+                raise _FieldDataError("dotnet_field_metadata_invalid")
+            previous_field_start = start
+        for index, item in enumerate(type_defs):
+            start = item["field_start"]
+            end = (
+                type_defs[index + 1]["field_start"]
+                if index + 1 < len(type_defs)
+                else len(field_records) + 1
+            )
+            item["full_name"] = (
+                f"{item['namespace']}.{item['name']}" if item["namespace"] else item["name"]
+            )
+            for rid in range(start, end):
+                field_records[rid - 1]["type_name"] = item["full_name"]
+        if any("type_name" not in item for item in field_records):
+            raise _FieldDataError("dotnet_field_metadata_invalid")
+        return field_records, type_defs, type_refs, layouts, field_rvas
+    except struct.error as exc:
+        raise _FieldDataError("dotnet_field_metadata_invalid") from exc
+
+
+def _metadata_column_size(column: str, rows: Sequence[int], heap_sizes: int) -> int:
+    if column == "u1":
+        return 1
+    if column == "u2":
+        return 2
+    if column == "u4":
+        return 4
+    if column == "string":
+        return 4 if heap_sizes & 0x01 else 2
+    if column == "guid":
+        return 4 if heap_sizes & 0x02 else 2
+    if column == "blob":
+        return 4 if heap_sizes & 0x04 else 2
+    if column.startswith("table:"):
+        return 4 if rows[int(column.partition(":")[2])] >= 0x10000 else 2
+    if column.startswith("coded:"):
+        name = column.partition(":")[2]
+        tag_bits, target_tables = _CODED_INDEX_TABLES[name]
+        threshold = 1 << (16 - tag_bits)
+        return 4 if max(rows[table] for table in target_tables) >= threshold else 2
+    raise _FieldDataError("dotnet_field_metadata_invalid")
+
+
+def _metadata_rows(
+    stream: bytes,
+    table_id: int,
+    table_ranges: Mapping[int, tuple[int, int, int]],
+    row_counts: Sequence[int],
+    heap_sizes: int,
+) -> list[tuple[int, tuple[int, ...]]]:
+    table_range = table_ranges.get(table_id)
+    if table_range is None:
+        return []
+    columns = _METADATA_TABLE_COLUMNS[table_id]
+    start, row_size, count = table_range
+    widths = [_metadata_column_size(column, row_counts, heap_sizes) for column in columns]
+    rows: list[tuple[int, tuple[int, ...]]] = []
+    for rid in range(1, count + 1):
+        cursor = start + (rid - 1) * row_size
+        values: list[int] = []
+        for width in widths:
+            values.append(int.from_bytes(stream[cursor : cursor + width], "little"))
+            cursor += width
+        rows.append((rid, tuple(values)))
+    return rows
+
+
+def _metadata_string(heap: bytes, index: int) -> str:
+    if index == 0:
+        return ""
+    if index < 0 or index >= len(heap):
+        raise _FieldDataError("dotnet_field_metadata_invalid")
+    end = heap.find(b"\0", index, min(len(heap), index + 1025))
+    if end < 0:
+        raise _FieldDataError("dotnet_field_metadata_invalid")
+    try:
+        return heap[index:end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _FieldDataError("dotnet_field_metadata_invalid") from exc
+
+
+def _metadata_blob(heap: bytes, index: int) -> bytes:
+    if index <= 0 or index >= len(heap):
+        raise _FieldDataError("dotnet_field_metadata_invalid")
+    size, cursor = _compressed_uint(heap, index)
+    if size > _MAX_METADATA_SCAN_BYTES or cursor + size > len(heap):
+        raise _FieldDataError("dotnet_field_metadata_invalid")
+    return heap[cursor : cursor + size]
+
+
+def _compressed_uint(data: bytes, offset: int) -> tuple[int, int]:
+    if offset >= len(data):
+        raise _FieldDataError("dotnet_field_metadata_invalid")
+    first = data[offset]
+    if first & 0x80 == 0:
+        return first, offset + 1
+    if first & 0xC0 == 0x80 and offset + 2 <= len(data):
+        return ((first & 0x3F) << 8) | data[offset + 1], offset + 2
+    if first & 0xE0 == 0xC0 and offset + 4 <= len(data):
+        value = ((first & 0x1F) << 24) | int.from_bytes(data[offset + 1 : offset + 4], "big")
+        return value, offset + 4
+    raise _FieldDataError("dotnet_field_metadata_invalid")
+
+
+def _select_field(
+    fields: list[dict[str, Any]],
+    types: list[dict[str, Any]],
+    field_rvas: list[dict[str, int]],
+    *,
+    token: str | None,
+    type_name: str | None,
+    field_name: str | None,
+) -> dict[str, Any]:
+    if token is not None:
+        field_rid = int(token[2:], 16) & 0x00FFFFFF
+        matches = [item for item in fields if item["rid"] == field_rid]
+    else:
+        matches = [
+            item for item in fields if item["type_name"] == type_name and item["name"] == field_name
+        ]
+    if not matches:
+        raise _FieldDataError("dotnet_field_not_found")
+    if len(matches) != 1:
+        raise _FieldDataError("dotnet_field_selector_ambiguous")
+    selected = matches[0]
+    rvas = [item["rva"] for item in field_rvas if item["field_rid"] == selected["rid"]]
+    if not rvas:
+        raise _FieldDataError("dotnet_field_rva_missing")
+    if len(rvas) != 1:
+        raise _FieldDataError("dotnet_field_rva_ambiguous")
+    return {**selected, "rva": rvas[0]}
+
+
+def _field_value_type_size(
+    blob_heap: bytes,
+    signature_index: int,
+    type_defs: list[dict[str, Any]],
+    type_refs: list[dict[str, Any]],
+    layouts: Mapping[int, int],
+) -> int | None:
+    signature = _metadata_blob(blob_heap, signature_index)
+    if len(signature) < 3 or signature[0] != 0x06:
+        return None
+    cursor = 1
+    while cursor < len(signature) and signature[cursor] in {0x1F, 0x20}:
+        _modifier, cursor = _compressed_uint(signature, cursor + 1)
+    if cursor >= len(signature) or signature[cursor] != 0x11:
+        return None
+    encoded_type, _cursor = _compressed_uint(signature, cursor + 1)
+    tag = encoded_type & 0x03
+    type_rid = encoded_type >> 2
+    if tag != 0 or type_rid < 1 or type_rid > len(type_defs):
+        return None
+    definition = type_defs[type_rid - 1]
+    extends = definition["extends"]
+    base_tag = extends & 0x03
+    base_rid = extends >> 2
+    if base_tag != 1 or base_rid < 1 or base_rid > len(type_refs):
+        return None
+    base_type = type_refs[base_rid - 1]
+    if base_type["namespace"] != "System" or base_type["name"] not in {"ValueType", "Enum"}:
+        return None
+    class_size = layouts.get(type_rid)
+    return class_size if isinstance(class_size, int) and 0 < class_size <= 0xFFFFFFFF else None
 
 
 def _inspect_cli_image(payload: bytes) -> dict[str, Any] | None:
