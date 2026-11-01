@@ -165,12 +165,16 @@ Le worker inspecte les métadonnées PE/CLI sans charger l’assembly. Il résou
 et de section, puis renvoie au plus 4 096 octets avec le token et le nom du
 champ, le RVA, la section, l’offset, les bornes fichier, la longueur, le
 SHA-256, l’hexadump et un marqueur `truncated`. La lecture est bornée à 16 MiB
-de métadonnées et 8 192 lignes `FieldRVA`. Si la signature désigne un type
-valeur dont `ClassLayout.ClassSize` est connu, sa taille borne la lecture;
-sinon `length` est obligatoire. Une demande explicite supérieure à 4 096 est
-refusée avec un `detail_code` stable. Quand la taille est inconnue, la borne de
-fin du champ reste `null`; les bornes fichier rapportent alors uniquement la
-plage effectivement demandée et lue.
+de métadonnées, 16 MiB de chaînes décodées, 200 000 lignes de métadonnées au
+total et 8 192 lignes `FieldRVA`. Si la signature désigne un type valeur dont
+`ClassLayout.ClassSize` est connu, sa taille borne la lecture; sinon `length`
+est obligatoire. Une demande explicite supérieure à 4 096 est refusée avec un
+`detail_code` stable. `size_known` indique si la taille du champ est établie;
+`completeness` vaut `complete`, `partial` ou `unknown`. Une taille inconnue ne
+signifie pas une troncature: `truncated` n’est vrai que si une borne connue a
+réduit la lecture. Quand la taille est inconnue, la borne de fin du champ reste
+`null`; les bornes fichier rapportent alors uniquement la plage effectivement
+demandée et lue.
 
 Les octets sont des données binaires non fiables. Le résultat suit le chemin
 normal des observations `dotnet.*`: le JSON canonique porte le SHA-256 du

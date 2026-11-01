@@ -10,6 +10,7 @@ import pytest
 
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisJobParameters,
+    ConfinedAnalysisRequest,
     ConfinedAnalysisTool,
 )
 from cti_app.config import Settings
@@ -24,7 +25,13 @@ from cti_app.workers.dotnet_analysis import (
 )
 
 
-def _field_data_image(*, with_layout: bool = True) -> bytes:
+def _field_data_image(
+    *,
+    with_layout: bool = True,
+    class_size: int = 16,
+    section_raw_size: int | None = None,
+    file_overlay_size: int = 0,
+) -> bytes:
     """Build a synthetic PE/CLI with one 16-byte FieldRVA value type."""
     strings = bytearray(b"\0")
 
@@ -64,7 +71,7 @@ def _field_data_image(*, with_layout: bool = True) -> bytes:
     tables.extend(struct.pack("<IHHHHH", 0x00100000, data_type_name, 0, 5, 2, 1))
     tables.extend(struct.pack("<HHH", 0x0016, field_name, 1))
     if with_layout:
-        tables.extend(struct.pack("<HIH", 1, 16, 3))
+        tables.extend(struct.pack("<HIH", 1, class_size, 3))
     tables.extend(struct.pack("<IH", 0x1800, 1))
 
     streams = (
@@ -92,7 +99,8 @@ def _field_data_image(*, with_layout: bool = True) -> bytes:
         current_offset += len(data)
     metadata = bytes(prefix + stream_headers) + bytes(stream_data)
 
-    file_size = 0x2200
+    section_raw_size = section_raw_size or max(0x2000, 0x800 + class_size)
+    file_size = 0x200 + section_raw_size + file_overlay_size
     image = bytearray(file_size)
     image[:2] = b"MZ"
     struct.pack_into("<I", image, 0x3C, 0x80)
@@ -108,7 +116,7 @@ def _field_data_image(*, with_layout: bool = True) -> bytes:
     struct.pack_into("<II", image, optional + 96 + 14 * 8, 0x1000, 72)
     section = optional + 224
     image[section : section + 8] = b".data\0\0\0"
-    struct.pack_into("<IIII", image, section + 8, 0x2000, 0x1000, 0x2000, 0x200)
+    struct.pack_into("<IIII", image, section + 8, section_raw_size, 0x1000, section_raw_size, 0x200)
     struct.pack_into("<I", image, section + 36, 0xC0000040)
 
     struct.pack_into(
@@ -125,7 +133,9 @@ def _field_data_image(*, with_layout: bool = True) -> bytes:
         *([0] * 12),
     )
     image[0x300 : 0x300 + len(metadata)] = metadata
-    image[0xA00:0xA20] = bytes(range(1, 33))
+    image[0xA00 : min(file_size, 0xA00 + class_size)] = bytes(
+        index % 256 for index in range(1, min(file_size - 0xA00, class_size) + 1)
+    )
     return bytes(image)
 
 
@@ -164,6 +174,8 @@ def test_field_data_reader_resolves_field_rva_and_returns_synthetic_bytes() -> N
     assert result["section_name"] == ".data"
     assert result["file_offset"] == 0xA00
     assert result["length_returned"] == 16
+    assert result["size_known"] is True
+    assert result["completeness"] == "complete"
     assert result["sha256"] == hashlib.sha256(bytes(range(1, 17))).hexdigest()
     assert result["hex_dump"] == bytes(range(1, 17)).hex(" ")
     assert result["truncated"] is False
@@ -181,6 +193,26 @@ def test_field_data_reader_resolves_field_rva_and_returns_synthetic_bytes() -> N
     assert token_result["offset"] == 4
     assert token_result["hex_dump"] == "05 06 07 08"
     assert token_result["truncated"] is True
+
+
+def test_confined_field_data_parameters_reject_null_selector_keys() -> None:
+    valid = _parameters("field_data", field_token="0x04000001")
+    with pytest.raises(ValueError, match="dotnet field selector is invalid"):
+        ConfinedAnalysisRequest(
+            investigation_id=valid.investigation_id,
+            artifact_id=valid.artifact_id,
+            sha256=valid.artifact_sha256,
+            tool=valid.tool,
+            timeout_seconds=valid.timeout_seconds,
+            max_output_bytes=valid.max_output_bytes,
+            association_id=uuid4(),
+            sample_id=uuid4(),
+            analysis_parameters={
+                "operation": "field_data",
+                "field_token": "0x04000001",
+                "type_name": None,  # type: ignore[dict-item]
+            },
+        )
 
 
 def test_confined_worker_dispatch_reads_only_the_synthetic_field_data() -> None:
@@ -264,7 +296,80 @@ def test_unknown_field_size_requires_caller_length() -> None:
     assert bounded_read["size_in_file_bounds"]["field_end_exclusive"] is None
     assert bounded_read["size_in_file_bounds"]["read_start"] == 0xA00
     assert bounded_read["size_in_file_bounds"]["read_end_exclusive"] == 0xA04
-    assert bounded_read["truncated"] is True
+    assert bounded_read["size_known"] is False
+    assert bounded_read["completeness"] == "unknown"
+    assert bounded_read["truncated"] is False
+
+
+def _type_ref_table_stream(*, rows: int, name_index: int) -> bytes:
+    valid_mask = 1 << 1
+    table_stream = bytearray(struct.pack("<IBBBBQQI", 0, 2, 0, 0, 1, valid_mask, 0, rows))
+    table_stream.extend(struct.pack("<HHH", 0, name_index, name_index) * rows)
+    return bytes(table_stream)
+
+
+def test_type_ref_decoding_has_an_aggregate_string_budget() -> None:
+    long_heap = b"\0" + (b"N" * 1023) + b"\0"
+    repeated_refs = _type_ref_table_stream(rows=9_000, name_index=1)
+    with pytest.raises(_FieldDataError) as raised:
+        _parse_field_tables(repeated_refs, long_heap, b"\0")
+    assert raised.value.detail_code == "dotnet_field_metadata_decoded_strings_limit_exceeded"
+
+    normal_stream = _type_ref_table_stream(rows=1, name_index=1)
+    parsed = _parse_field_tables(normal_stream, b"\0Normal\0", b"\0")
+    assert parsed[2][0]["name"] == "Normal"
+
+
+def test_total_metadata_row_cap_is_independent_of_field_rva_cap() -> None:
+    total_rows = 200_001
+    table_stream = bytearray(
+        struct.pack(
+            "<IBBBBQQII",
+            0,
+            2,
+            0,
+            0,
+            1,
+            (1 << 1) | (1 << 29),
+            0,
+            total_rows - 1,
+            1,
+        )
+    )
+    with pytest.raises(_FieldDataError) as raised:
+        _parse_field_tables(bytes(table_stream), b"\0", b"\0")
+    assert raised.value.detail_code == "dotnet_field_metadata_limit_exceeded"
+
+
+def test_inferred_field_size_is_clamped_to_4096_bytes() -> None:
+    payload = _field_data_image(class_size=16_384)
+    result = asyncio.run(
+        run_dotnet_analysis(
+            _parameters("field_data", field_token="0x04000001"),
+            payload,
+            Settings(_env_file=None),
+            monodis_version=lambda: pytest.fail("field data must not invoke monodis"),
+            extract_monodis_method_body=lambda *_args: None,
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["length_returned"] == 4096
+    assert result["truncated"] is True
+
+
+def test_inferred_field_size_must_fit_section_raw_bounds() -> None:
+    payload = _field_data_image(class_size=8192, section_raw_size=0x2000, file_overlay_size=8192)
+    result = asyncio.run(
+        run_dotnet_analysis(
+            _parameters("field_data", field_token="0x04000001"),
+            payload,
+            Settings(_env_file=None),
+            monodis_version=lambda: pytest.fail("field data must not invoke monodis"),
+            extract_monodis_method_body=lambda *_args: None,
+        )
+    )
+    assert result["status"] == "FAILED"
+    assert result["detail_code"] == "dotnet_field_file_bounds_invalid"
 
 
 def _fake_pe(sections: tuple[SimpleNamespace, ...]) -> SimpleNamespace:

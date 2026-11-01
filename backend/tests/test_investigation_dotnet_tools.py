@@ -12,6 +12,8 @@ from cti_app.application.confined_analysis import ConfinedAnalysisFamilyStatus
 from cti_app.application.dotnet_analysis import ILSPYCMD_PACKAGE_SHA512, ILSPYCMD_VERSION
 from cti_app.application.investigation_dotnet_tools import (
     DOTNET_TOOL_NAMES,
+    _tool_schemas,
+    _validate_field_data_arguments,
     dotnet_tool_capabilities,
     register_dotnet_tools,
 )
@@ -20,6 +22,7 @@ from cti_app.application.investigation_tools import (
     RegistryToolDispatcher,
     ToolExecutionContext,
     project_tool_availability,
+    validate_json_schema,
 )
 from cti_app.config import Settings
 from cti_app.domain.entities import SampleState
@@ -326,6 +329,49 @@ async def test_dotnet_tools_use_canonical_blob_and_report_the_actual_engine() ->
     assert recorder.calls[-1]["payload"]["invocation_ref"] == "dotnet-field-data-read-001"
     assert recorder.calls[-1]["payload"]["result"]["sha256"] == execution.result["sha256"]
     assert field_data_result.observation_refs == (recorder.record_id,)
+
+    execution.result.update(
+        {
+            "field_size_bytes": None,
+            "size_known": False,
+            "completeness": "unknown",
+            "truncated": True,
+        }
+    )
+    unknown_size_result = await field_data_adapter.execute(
+        {
+            "sample_sha256": SAMPLE_SHA256,
+            "field_token": "0x04000001",
+            "length": 4,
+        },
+        context,
+    )
+    assert unknown_size_result.output["status"] == "complet"
+    assert unknown_size_result.output["result_truncated_by_response"] is False
+    assert recorder.calls[-1]["payload"]["result"]["completeness"] == "unknown"
+    assert recorder.calls[-1]["payload"]["result"]["truncated"] is False
+
+    schema = _tool_schemas()["field.data.read"]
+    valid_token = {"sample_sha256": SAMPLE_SHA256, "field_token": "0x04000001", "length": 4}
+    invalid_mixed_selector = {
+        "sample_sha256": SAMPLE_SHA256,
+        "field_token": "0x04000001",
+        "type_name": "Fixture",
+        "length": 4,
+    }
+    invalid_null_selector = {
+        "sample_sha256": SAMPLE_SHA256,
+        "field_token": "0x04000001",
+        "type_name": None,
+        "length": 4,
+    }
+    validate_json_schema(valid_token, schema)
+    with pytest.raises(ValueError):
+        validate_json_schema(invalid_mixed_selector, schema)
+    with pytest.raises(ValueError):
+        validate_json_schema(invalid_null_selector, schema)
+    assert _validate_field_data_arguments(invalid_mixed_selector) == "dotnet_field_selector_invalid"
+    assert _validate_field_data_arguments(invalid_null_selector) == "dotnet_field_selector_invalid"
 
     large_bytes = bytes(range(256)) * 16
     execution.result.update(

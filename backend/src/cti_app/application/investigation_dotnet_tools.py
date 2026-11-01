@@ -243,16 +243,26 @@ def _tool_schemas() -> dict[str, Mapping[str, Any]]:
         for name, (properties, required, title) in specs.items()
     }
     field_data_schema = dict(schemas["field.data.read"])
+    shared_field_properties = {
+        key: field_data_schema["properties"][key] for key in ("sample_sha256", "offset", "length")
+    }
     field_data_schema["oneOf"] = [
         {
-            "properties": {"field_token": {}},
+            "properties": {
+                **shared_field_properties,
+                "field_token": field_data_schema["properties"]["field_token"],
+            },
             "required": ["field_token"],
-            "additionalProperties": True,
+            "additionalProperties": False,
         },
         {
-            "properties": {"type_name": {}, "field_name": {}},
+            "properties": {
+                **shared_field_properties,
+                "type_name": field_data_schema["properties"]["type_name"],
+                "field_name": field_data_schema["properties"]["field_name"],
+            },
             "required": ["type_name", "field_name"],
-            "additionalProperties": True,
+            "additionalProperties": False,
         },
     ]
     schemas["field.data.read"] = field_data_schema
@@ -392,6 +402,13 @@ class _DotnetToolAdapter(ToolAdapter):
                     "operation": self._operation,
                 }
             )
+        unknown_field_completeness = (
+            self._operation == "field_data"
+            and raw_result.get("size_known") is False
+            and raw_result.get("completeness") == "unknown"
+        )
+        if unknown_field_completeness and raw_result.get("truncated") is True:
+            raw_result = {**raw_result, "truncated": False}
         sanitizer_truncated = _result_exceeds_sanitizer_limits(raw_result)
         safe_result = _sanitize_json_value(dict(raw_result))
         chunked_result, long_text_key = _preserve_long_text_fields(safe_result)
@@ -402,7 +419,9 @@ class _DotnetToolAdapter(ToolAdapter):
         )
         persisted_result = _restore_long_text_fields(normalized_result, long_text_key)
         result_truncated_by_tool = (
-            sanitizer_truncated or normalized_truncated or raw_result.get("truncated") is True
+            sanitizer_truncated
+            or normalized_truncated
+            or (raw_result.get("truncated") is True and not unknown_field_completeness)
         )
         result_json = json.dumps(
             persisted_result,
@@ -600,13 +619,18 @@ def _validate_field_data_arguments(arguments: Mapping[str, Any]) -> str | None:
     token = arguments.get("field_token")
     type_name = arguments.get("type_name")
     field_name = arguments.get("field_name")
-    if token is not None:
-        if type_name is not None or field_name is not None or not isinstance(token, str):
+    has_token = "field_token" in arguments
+    has_type_name = "type_name" in arguments
+    has_field_name = "field_name" in arguments
+    if has_token:
+        if has_type_name or has_field_name or not isinstance(token, str):
             return "dotnet_field_selector_invalid"
         if _FIELD_TOKEN.fullmatch(token) is None:
             return "dotnet_field_selector_invalid"
     elif (
-        not isinstance(type_name, str)
+        not has_type_name
+        or not has_field_name
+        or not isinstance(type_name, str)
         or not isinstance(field_name, str)
         or _FIELD_TYPE_NAME.fullmatch(type_name) is None
         or _FIELD_NAME.fullmatch(field_name) is None

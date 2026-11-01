@@ -47,6 +47,7 @@ _IL_IDENTIFIER_ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-f
 _MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 _MAX_METADATA_SCAN_BYTES = 16 * 1024 * 1024
 _MAX_METADATA_ROWS = 200_000
+_MAX_DECODED_METADATA_STRING_BYTES = 16 * 1024 * 1024
 _MAX_FIELD_RVA_ROWS = 8_192
 _MAX_PE_SECTIONS = 96
 _FIELD_DATA_MAX_BYTES = 4096
@@ -417,13 +418,11 @@ def _read_field_data(payload: bytes, parameters: Mapping[str, str]) -> dict[str,
         token = parameters.get("field_token")
         type_name = parameters.get("type_name")
         field_name = parameters.get("field_name")
-        has_token = token is not None
-        has_names = type_name is not None and field_name is not None
-        if (
-            (has_token and (type_name is not None or field_name is not None))
-            or (not has_token and not has_names)
-            or (type_name is None) != (field_name is None)
-        ):
+        has_token = "field_token" in parameters
+        has_type_name = "type_name" in parameters
+        has_field_name = "field_name" in parameters
+        has_names = has_type_name and has_field_name
+        if (has_token and (has_type_name or has_field_name)) or (not has_token and not has_names):
             raise _FieldDataError("dotnet_field_selector_invalid")
         if has_token and (not isinstance(token, str) or _FIELD_TOKEN.fullmatch(token) is None):
             raise _FieldDataError("dotnet_field_selector_invalid")
@@ -530,6 +529,14 @@ def _read_field_data(payload: bytes, parameters: Mapping[str, str]) -> dict[str,
                 "section_name": section_name,
                 "file_offset": first_offset,
                 "field_size_bytes": field_type_size,
+                "size_known": field_type_size is not None,
+                "completeness": (
+                    "unknown"
+                    if field_type_size is None
+                    else "partial"
+                    if field_offset + len(raw) < field_type_size
+                    else "complete"
+                ),
                 "size_in_file_bounds": {
                     "file_size_bytes": len(payload),
                     "field_start": first_offset,
@@ -548,7 +555,7 @@ def _read_field_data(payload: bytes, parameters: Mapping[str, str]) -> dict[str,
                 "truncated": (
                     field_offset + len(raw) < field_type_size
                     if field_type_size is not None
-                    else True
+                    else False
                 ),
             }
         finally:
@@ -794,11 +801,23 @@ def _parse_field_tables(
             table_ranges[table_id] = (cursor, row_size, count)
             cursor += table_size
 
+        decoded_string_bytes = 0
+
+        def decode_metadata_string(index: int) -> str:
+            nonlocal decoded_string_bytes
+            decoded = _metadata_string(strings_heap, index)
+            if index:
+                end = strings_heap.find(b"\0", index, min(len(strings_heap), index + 1025))
+                decoded_string_bytes += end - index
+                if decoded_string_bytes > _MAX_DECODED_METADATA_STRING_BYTES:
+                    raise _FieldDataError("dotnet_field_metadata_decoded_strings_limit_exceeded")
+            return decoded
+
         type_refs: list[dict[str, Any]] = [
             {
                 "rid": rid,
-                "name": _metadata_string(strings_heap, row[1]),
-                "namespace": _metadata_string(strings_heap, row[2]),
+                "name": decode_metadata_string(row[1]),
+                "namespace": decode_metadata_string(row[2]),
             }
             for rid, row in _metadata_rows(table_stream, 1, table_ranges, row_counts, heap_sizes)
         ]
@@ -807,8 +826,8 @@ def _parse_field_tables(
             type_defs.append(
                 {
                     "rid": rid,
-                    "name": _metadata_string(strings_heap, row[1]),
-                    "namespace": _metadata_string(strings_heap, row[2]),
+                    "name": decode_metadata_string(row[1]),
+                    "namespace": decode_metadata_string(row[2]),
                     "extends": row[3],
                     "field_start": row[4],
                 }
@@ -816,7 +835,7 @@ def _parse_field_tables(
         field_records = [
             {
                 "rid": rid,
-                "name": _metadata_string(strings_heap, row[1]),
+                "name": decode_metadata_string(row[1]),
                 "signature_index": row[2],
             }
             for rid, row in _metadata_rows(table_stream, 4, table_ranges, row_counts, heap_sizes)

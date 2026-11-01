@@ -207,12 +207,12 @@ class ConfinedAnalysisRequest:
                 field_token = parameters.get("field_token")
                 type_name = parameters.get("type_name")
                 field_name = parameters.get("field_name")
-                has_token = field_token is not None
-                has_names = type_name is not None and field_name is not None
-                if (
-                    (has_token and (type_name is not None or field_name is not None))
-                    or (not has_token and not has_names)
-                    or (type_name is None) != (field_name is None)
+                has_token = "field_token" in parameters
+                has_type_name = "type_name" in parameters
+                has_field_name = "field_name" in parameters
+                has_names = has_type_name and has_field_name
+                if (has_token and (has_type_name or has_field_name)) or (
+                    not has_token and not has_names
                 ):
                     raise ValueError("dotnet field selector is invalid")
                 if has_token and (
