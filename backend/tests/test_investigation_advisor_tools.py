@@ -1278,6 +1278,9 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     assert invalid.error_code == "advisor_input_invalid"
     assert invalid.output["advisor_status"] == "invalid_input"
     assert invalid.output["input_error_code"] == "measurements_invalid"
+    assert invalid.output["detail_code"] == "measurements_invalid"
+    assert "content_pattern_id" in invalid.output["correction"]
+    assert "measurement_errors" in invalid.output["correction"]
     assert [dict(item) for item in invalid.output["measurement_errors"]] == [
         {"index": 0, "reason": "measurement_not_verified"}
     ]
