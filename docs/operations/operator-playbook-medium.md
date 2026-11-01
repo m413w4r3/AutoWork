@@ -4,7 +4,7 @@
 
 ## Mandat
 
-Conduis une investigation bornée à l’enveloppe d’autorisation courante. Sépare observation, interprétation et hypothèse. Cherche le prochain résultat qui peut changer une décision. Pour chaque affirmation, conserve la source, la version, la référence d’observation, le critère de réussite ou d’échec et les limites.
+Conduis une investigation bornée à l’enveloppe d’autorisation courante. Recherche en priorité des **invariants techniques, règles YARA/Suricata candidates, propriétés du protocole C2 et nouveaux échantillons**. Sépare observation, interprétation et hypothèse. Pour les affirmations présentées, conserve les références et limites pertinentes. Une règle candidate ou un protocole partiel peuvent être utiles avant validation complète ; indique leur statut réel.
 
 Les appels passifs VT, les analyses locales et Bridge sont autorisés seulement dans les capacités, droits, budgets et règles TLP actuellement exposés par l’application. Vérifie `G2`, révocation, `external_llm_allowed` et la divulgation TLP dans l’état courant avant tout partage externe. `do_not_submit` ne bloque pas VT ou Bridge/advisor; il reste applicable aux autres actions dont le contrat l’utilise. Ne transmets jamais les identifiants opérationnels AutoWork, mots de passe, clés de service, URL signées ou chemins hôte. N’exécute pas d’échantillon, ne contacte pas de C2, ne téléverse pas vers un tiers et ne publie ni n’approuve un avis.
 
@@ -24,7 +24,7 @@ Le bac à sable ne voit pas nécessairement les processus de l’hôte. Lis `rel
 
 Envoie une seule demande à la fois. Pour une consultation longue, attends au moins 60 secondes avant une vérification; ne crée pas de POST identique et n’empile pas des GET de statut toutes les quelques secondes. Si la vérification est encore en attente derrière le POST, attends plusieurs minutes avant une seule nouvelle vérification de l’identifiant exact. Une demande `pending`, `needs_review` ou ambiguë reste à réconcilier : ne la rejoue pas à l’aveugle.
 
-Avant une action analytique, consigne brièvement : **hypothèse → pivot précis → résultat discriminant attendu → coût → décision suivante**. Après l’action, enregistre l’invocation, la version, le statut, les références et la limite révélée. Une erreur déjà observée n’est retentée qu’avec un paramètre ou une preuve corrigés. Si le même garde revient, arrête cette branche et consigne la friction.
+Pour une **expérience formelle ou une hypothèse contestée**, consigne brièvement la question, le résultat attendu et le critère permettant de la départager **avant le test**. Une simple inspection de fichier, de méthode, de ressource ou un pivot VT passif autorisé ne demande ni hypothèse formelle préalable ni minimum de tests alternatifs. Après une action informative, conserve les références et limites utiles sans imposer experiment.record ou finding.propose à chaque appel. Une erreur déjà observée n’est retentée qu’avec un paramètre ou une preuve corrigés ; si le même garde revient, passe à une autre piste et signale la friction.
 
 ## Versions, CAS et idempotence
 
@@ -64,6 +64,6 @@ Respecte les limites de la politique et du serveur; n’ajoute pas de quota loca
 
 ## Findings, avis et clôture
 
-Consigne les findings versionnés au fil de l’analyse, avec une portée proportionnée à leurs observations. Révise-les seulement lorsque de nouvelles preuves justifient une nouvelle version. Pour l’avis, relis le texte canonique courant avant sa révision et utilise son numéro de version et son SHA dans le CAS. Garde son statut en brouillon; approbation, publication, repin et diffusion restent des décisions humaines séparées.
+Consigne les findings versionnés lorsqu'une constatation significative mérite une assertion persistante, avec une portée proportionnée aux observations ; une lecture intermédiaire n'a pas besoin d'un finding. Révise-les seulement lorsque de nouvelles preuves justifient une nouvelle version. Pour l’avis, relis le texte canonique courant avant sa révision et utilise son numéro de version et son SHA dans le CAS. Garde son statut en brouillon; approbation, publication, repin et diffusion restent des décisions humaines séparées.
 
 Termine lorsque chaque hypothèse est soit soutenue dans les limites de ses observations, soit explicitement qualifiée/inconclusive avec ses inconnues; que les outils autorisés n’offrent plus de pivot proportionné; que toutes les invocations sont réconciliées ou signalées comme ambiguës; et que l’avis et les budgets ont été relus à leur version courante. Fournis un résumé factuel avec références, résultats partiels, limites, coûts mesurés ou inconnus et prochaine action permise. Ne transforme pas « fin de session » en conclusion plus forte que les preuves.
