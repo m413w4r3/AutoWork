@@ -1,30 +1,29 @@
 ---
 name: autowork-cti-investigation-loop
-description: Conduire un cycle CTI operator_led, de la question falsifiable à une expérience enregistrée, un finding éventuel et une décision d'arrêt. À charger en enquête CTI, pas pour coder AutoWork.
+description: Faire progresser l'enquête CTI vers les invariants, les règles YARA/Suricata, le protocole C2 et de nouveaux échantillons, sans rituel ni quotas de tests. Pour operator_led uniquement.
 ---
 
 # Boucle de décision CTI
 
 Autorité : contrats, schémas et enveloppe G2/TLP de CETTE enquête. Les observations versionnées font foi, pas ce skill, un rapport d'agent ou Bridge. Aucune autorisation nouvelle n'est conférée.
 
-## Préflight
+## Cap et mode opératoire
 
-1. Lire le statut compact et le contexte summary. Noter investigation ID, working_state version/SHA, G2 et révocation, TLP, budgets consommé/réservé/restant, invocations ambiguës.
-2. Parcourir available_tools, available_pivots et les sections ciblées avec les curseurs et CAS serveur. Ne pas relire le statut complet à chaque étape.
-3. Lire les observations, claims, associations, hypothèses et expériences canoniques déjà disponibles. Une ancienne enquête n'est pas une preuve de la nouvelle.
+Les livrables métier priment sur la conformité à une checklist : invariants de code/données/protocole, YARA candidate, Suricata candidate, description C2 et nouveaux échantillons qualifiés. Une découverte peut alimenter une règle, la règle un pivot, puis un nouvel échantillon une révision. Choisir une branche productive et suivre ses résultats.
 
-## Un cycle = une question décidable
+Au démarrage ou après un changement matériel, lire le statut et le contexte utiles : enquête, autorisations G2/TLP, capacités disponibles, budgets et éventuelles invocations ambiguës. Ne pas repaginer tous les outils ni relire tout le statut à chaque action.
 
-1. **Question :** définir l'objet précis et la propriété à vérifier ; « analyser davantage » n'est pas une question.
-2. **Alternatives :** formuler au moins deux hypothèses discriminables et une issue inconnue. Les déclarer avec hypothesis.declare AVANT un nouveau test lorsque le contrat le prévoit.
-3. **Couverture :** inventorier observations, contre-exemples et angles morts.
-4. **Candidats :** comparer plusieurs tests utiles, pas simplement plusieurs outils. Appliquer autowork-cti-pivot-strategy et autowork-tool-strategy.
-5. **Prédictions AVANT l'appel :** noter résultat attendu sous chaque hypothèse, falsificateur, coût et risque.
-6. **Exécution :** vérifier schéma/version, autorisation, budget, idempotence, CAS et effet réel avant POST.
-7. **Lecture :** retrouver les observations canoniques avec IDs, hashes, versions et limitations ; le résumé du sous-agent n'est pas la preuve.
-8. **Expérience :** lire experiment.list pour la version de FLUX, distincte du working state. Pour experiment.record reprendre les IDs/version des invocations, IDs/SHA observations, input_refs et champs exigés par le schéma réel ; aucune date ni référence inventée. Une erreur de validation exige une correction ciblée, pas une répétition.
-9. **Finding :** examiner tout fait atomique nouveau au moyen de autowork-evidence-to-finding, sans forcer son enregistrement.
-10. **Décision :** continuer, changer de branche, déléguer une question indépendante, arrêter avec limites ou clore.
+### Boucle souple
+
+1. **Choisir une cible utile :** octets opaques, méthode, message réseau, invariant candidat, règle ou nouveau hash. Dire brièvement ce qu'apporterait la prochaine lecture.
+2. **Faire l'analyse :** utiliser le meilleur outil réellement disponible. Une inspection directe d'une ressource ou d'une méthode ne nécessite ni liste de contre-hypothèses ni comparaison de trois tests.
+3. **Formaliser quand c'est utile :** pour une question causale disputée ou une expérience destinée au journal, expliciter hypothèse, alternative et critère discriminant **avant** le test. Déclarer via hypothesis.declare uniquement lorsque le contrat de l'action l'exige ou que cela aide réellement l'enquête. Ne pas antidater.
+4. **Lire le résultat :** conserver les observations canoniques pertinentes, l'objet, leur couverture, les réserves et les contre-exemples utiles ; ne pas recharger d'anciennes preuves sans besoin.
+5. **Exploiter immédiatement la découverte :** tester si elle fournit un invariant, un motif YARA, un critère Suricata, une étape du protocole C2 ou un pivot de découverte. Consigner le finding pertinent lorsqu'il existe, sans le rendre obligatoire pour chaque opération.
+6. **Persister au bon niveau :** une expérience formelle utilise experiment.record et la version du flux experiment.list, avec les références de provenance exactes. Un constat technique simple n'exige pas toujours un nouvel enregistrement formel ; utiliser les observations déjà produites par les outils.
+7. **Enchaîner ou changer de piste :** continuer tant qu'une décision ou un artefact de détection peut progresser ; arrêter une branche stérile sans immobiliser les autres objectifs.
+
+Une règle candidate ou un modèle C2 partiel sont des livrables utiles. L'absence de positifs indépendants, de goodware, de holdout, de capture ou de protocole complet **limite le verdict**, mais n'interdit pas une proposition expérimentale ou une exploration autorisée. Un résultat qualifié ne devient pas validé par simple intention.
 
 ## Lecture des résultats
 
@@ -38,19 +37,12 @@ Autorité : contrats, schémas et enveloppe G2/TLP de CETTE enquête. Les observ
 
 ## Coordination et clôture
 
-Une délégation porte sur UNE question, avec refs, permissions, oracle et critères d'arrêt. Les lectures peuvent être parallèles ; les mutations canoniques sont ordonnancées suivant les garanties effectives du backend. Le parent vérifie les observations avant tout finding.
+Déléguer si les recherches sont réellement indépendantes : analyse de méthodes .NET, données de configuration, hypothèses de protocole, signatures. Aucune obligation de créer des sous-agents. Les lectures peuvent se chevaucher ; conserver les garanties effectives de CAS/idempotence sur les mutations. Une synthèse d'enfant ne remplace pas les observations de l'enquête.
 
-Arrêter si les tests décisifs sont couverts, les alternatives restantes redondantes/disproportionnées, ou la capacité/preuve indispensable absente. Conserver hypothèses, expériences, conclusions bornées, coûts mesurés ou UNKNOWN et condition précise de reprise. La fin de session n'est pas un verdict CTI.
+Arrêter une branche quand elle n'apporte plus de nouveaux invariants, échantillons, preuves ou pistes de détection. Pour clôturer une session, dire brièvement : **découvert / détectable / encore incertain / prochaine piste utile**, avec références et coûts disponibles. Ne pas exiger la conclusion de tous les axes CTI ni la production d'un avis complet pour continuer.
 
-## Fiche de décision minimale
+## Note de travail facultative
 
-- Question / objet / claim
-- Hypothèses concurrentes et preuve antérieure
-- Trois tests envisagés, coût et justification du choix
-- Prédiction et falsificateur AVANT exécution
-- Invocation, résultat et observations canoniques
-- Interprétation, couverture, contre-exemples
-- Expérience / finding (ou justification de non-proposition)
-- Décision de branche et condition de reprise
+Question ou artefact → outil choisi → fait observé et couverture → invariant ou conséquence pour YARA/Suricata/C2/découverte → prochaine action. Ajouter hypothèse/contre-hypothèse, expérience et finding seulement si la nature du test ou le contrat le justifient.
 
-**Oracle :** lors d'un replay contrôlé, les prédictions précèdent tout test neuf, les preuves sont de la même enquête et une sortie empty/partial ne devient jamais une réfutation.
+**Oracle :** une inspection directe ne déclenche aucune cérémonie obligatoire ; un test formel conserve son hypothèse préalable ; une observation utile mène à un invariant, une détection candidate ou un pivot, sans transformer empty/partial en réfutation.

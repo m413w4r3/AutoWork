@@ -1,19 +1,18 @@
 ---
 name: autowork-artifact-triage
-description: Identifier le véritable format d'un artefact CTI et sélectionner le parcours statique PE natif, .NET, ELF, archive, document, script ou capture. Charger au premier triage d'un objet en operator_led.
+description: Triage CTI rapide par format et dispatch vers extraction d'invariants, C2, YARA/Suricata ou nouveaux échantillons, sans imposer une analyse exhaustive.
 ---
 
 # Routeur d'artefacts
 
 Ne déduire ni le format ni le comportement d'une simple extension, d'un nom VT ou d'un label AV. La preuve vient d'en-têtes/structures observés dans l'objet exact.
 
-## Parcours commun
+## Parcours orienté résultat
 
-1. Établir SHA-256, association à la présente enquête, origine, taille, version et observation. Documented hash ≠ octets acquis et associés.
-2. Relire les observations existantes, puis identifier statiquement le format réel via les capacités exposées (sample.get_feature_pack, sample.analyze, commande file si présente). Signaler polyglotte, corruption, données partielles.
-3. Formuler une question analytique ; ne pas lancer tous les outils par réflexe.
-4. Dispatcher selon la structure réellement observée, puis relier chaque nouveau résultat à son objet, son invocation et sa couverture.
-5. Pour chaque sous-objet extrait : créer/obtenir l'association autorisée et conserver parent→membre→hash, sans fusionner les preuves du conteneur et du contenu.
+1. Identifier l'objet exact (SHA-256/association) et son format réel depuis les observations déjà disponibles ; une extension ou un nom VT n'est qu'un indice.
+2. Choisir une piste présentant une valeur immédiate : configuration, constantes, code de communication, ressources, enfant d'archive ou indicateur discriminant. Lire le minimum nécessaire, pas tous les moteurs par principe.
+3. Extraire un invariant candidat et noter où il a été observé ; lorsqu'un membre est extrait, conserver la relation parent→membre→hash. Les observations d'une autre enquête ne deviennent pas des preuves par ressemblance.
+4. Router vers le guide spécialisé utile. Une analyse statique peut produire YARA ou hypothèses de protocole même sans capture ; elle ne démontre pas une communication réellement exécutée.
 
 ## Choix du parcours
 
@@ -26,7 +25,7 @@ Ne déduire ni le format ni le comportement d'une simple extension, d'un nom VT 
 | ZIP/7z/tar ou conteneur composite | Lister membres avant extraction ciblée | Vérifier hash, décompression, chemin et limites ; ne pas deviner |
 | PDF, Office, RTF, HTML, XML/MSBuild | Parser/lecture statique disponible ; examiner liens et embeds | Ne pas prétendre analyser des macros sans outil réel |
 | PowerShell, JS, VBS, shell, batch | AST/texte statique, paramètres, décodages, dépendances | Instruction conditionnelle ≠ exécution réussie |
-| PCAP, flux, rapport sandbox | Voie réseau si disponible | Conditions de collecte, horodatage et couverture |
+| PCAP, flux, rapport sandbox | autowork-network-protocol-detection ; inspect/reassemble/segment si exposés | Suricata replay seulement sur capture autorisée ; hypothèse C2 statique possible sans PCAP |
 | Chiffré/inconnu | Identité et couverture ; état inconclusive | Ne pas classer de force |
 
 ## Questions de triage
@@ -37,10 +36,10 @@ Ne déduire ni le format ni le comportement d'une simple extension, d'un nom VT 
 - Une absence de résultat vient-elle d'un outil, d'un filtre, d'une région non couverte ou d'une hypothèse fausse ?
 - Quel finding atomique est déjà vérifiable sans inférer de comportement ?
 
-Pour une donnée opaque, identifier stockage, plage et transformateur ; vérifier qu'une commande confinée comme xxd est annoncée et récupérer les octets par offset de fichier si possible, sans exécuter le malware.
+Pour une donnée opaque .NET, utiliser d'abord field.data.read si offert (FieldRVA → octets bornés) ; xxd reste une voie complémentaire si un offset fichier fiable est connu. Chercher ensuite chaînes/structures exploitables, invariants et pistes de pivot sans exécuter le malware.
 
 ## Sortie de triage
 
-object_id, sample SHA, format et observation exacts, provenance/parent, couverture, outils réellement disponibles, route choisie, question à trancher et première action proportionnée.
+Noter l'objet, le format étayé, la piste à forte valeur et le prochain outil. Dès qu'un motif, un indice de C2 ou un nouvel enfant est découvert, passer à la détection ou au pivot ; ne pas attendre un triage exhaustif.
 
 **Oracle :** une archive contenant un XML et un PE produit des objets distincts ; une DLL renommée n'est pas automatiquement .NET ; des macros Office non analysables restent UNKNOWN.

@@ -1,26 +1,26 @@
 ---
 name: autowork-yara-bridge-workflow
-description: Construire et réviser une règle YARA candidate via observations exactes et aide Bridge, puis compiler, tester et qualifier sur positifs/goodware/holdout. À charger lorsqu'une détection YARA est l'objectif.
+description: Produire tôt une YARA candidate à partir d'invariants observés, la tester avec le corpus disponible, l'améliorer via Bridge et les nouveaux échantillons sans exiger un holdout préalable.
 ---
 
 # YARA + Bridge : concevoir, éprouver, qualifier
 
-**Principe :** Bridge conseille, les moteurs locaux compilent/testent, les observations canoniques fondent les assertions, l'analyste qualifie. Un texte Bridge n'est pas un motif prouvé et un match sur le sample d'origine n'est pas une validation de famille.
+**Principe :** écrire **tôt** une YARA candidate utile, même sur un seul spécimen, puis élargir son évaluation au fil des pivots. Bridge conseille, le workbench compile et teste, les observations déterminent le niveau de confiance. Un match initial ne vaut pas validation de famille, mais constitue déjà un résultat exploitable.
 
-## 1. Prérequis
+## 1. Préparation légère
 
-- Vérifier G2/TLP, external_llm_allowed, autorisation de consultation, budgets et runtime ; aucun envoi Bridge si non autorisé.
-- Vérifier l'inventaire réel : rule.propose_bridge, rule.propose_from_candidates, rule.propose, rule.test, rule.revise, rule.compare, rule.get, advisor.consult et advisor.reparse sont optionnels selon les ports.
-- Vérifier samples associés, octets réellement lisibles, corpus positives, goodware, holdout et provenance. Unknown ou unavailable restent explicites.
-- Définir la cible de la règle : spécimen exact, groupe d'artefacts ou famille hypothétique. Ne pas promouvoir cette dernière sans positifs qualifiés.
+- Identifier l'objectif : détecter un spécimen, un sous-groupe ou une famille présumée. Choisir les motifs déjà observés et leur provenance, puis vérifier que les outils de proposition/test annoncés sont utilisables.
+- Pour Bridge, respecter G2/TLP, external_llm_allowed et les droits **actuels** ; ne pas ajouter d'autorisation locale spécifique, de plafond de message ni de quota arbitraire.
+- **Aucun minimum de positifs, de goodware ou de holdout pour écrire une candidate.** Si un corpus ou un moteur manque, préparer la proposition et dire ce qui n'a pas pu être compilé/testé ; ne pas baptiser « tested » une candidate non testée.
+- Ne pas exiger un finding supported ou un plan d'expérience complet avant de commencer la rédaction.
 
 ## 2. Sélectionner des motifs
 
 Extraire des observations mesurées : octets invariants d'une ressource, chaînes spécifiques, structures rares, associations de caractéristiques stables, signatures candidates de features.common / signatures.candidates.
 
-Pour chaque motif consigner sample SHA, offset/section ou référence de méthode, observation ID/SHA, degré d'ubiquité/banalité, transformations, encodage et risque de faux positifs. Écarter les chaînes de runtime, bibliothèques ou chemins génériques, les offsets non vérifiés, les marqueurs présents dans un seul échantillon sans justification et les données tronquées.
+Conserver pour les motifs retenus leur source (sample, observation et région/feature si disponible) et leur raison de discrimination. Éviter les motifs triviaux ou non mesurés. Un motif propre à un seul échantillon peut néanmoins servir à une **règle de spécimen**, explicitement bornée, au lieu d'être interdit.
 
-Comparer plusieurs échantillons et sous-ensembles si disponibles. Ne pas utiliser des chaînes non récupérables ou des « mesures » inventées pour satisfaire le validateur.
+Comparer plusieurs échantillons **si disponibles et utiles**, et élargir ensuite par pivot VT ou similarité. Ne jamais inventer de mesures ou de références pour satisfaire un validateur.
 
 ## 3. Consultation Bridge : si utile
 
@@ -35,13 +35,13 @@ Ne répéter aucune soumission ambiguë ; si une réponse persistée est mal int
 - Voie Bridge : rule.propose_bridge exige les champs réels bridge_observation_id, bridge_invocation_id et rule_source_sha256 du **rule_source complet persisté** ; ne pas les inventer à partir d'un résumé. Vérifier la version du schéma avant l'appel.
 - Voie mesurée locale : rule.propose_from_candidates seulement si les candidats et leurs provenances P09/L2 sont réellement disponibles ; sinon rule.propose avec motifs vérifiés et provenance compatible avec son schéma.
 - rule.operator_syntax_fix ne répare que la syntaxe YARA ; ne prouve ni qualité ni détection.
-- Une proposition peut compiler sans être validée : lancer explicitement rule.test, consulter rule.get et le rapport canonique.
-- Mesurer par hash et rôle : positifs qualifiés, candidats hors cluster, goodware, holdout indépendant. Distinguer matches, non_matches, non_measurable, erreurs et chevauchement des corpus. Un absent byte n'est PAS un non-match.
-- Un match goodware mesuré invalide la spécificité de la version testée ; un unique match initial sans autres positifs donne au mieux une règle expérimentale. Un holdout utilisé pour l'optimisation n'est plus indépendant.
+- Une proposition compilée ne prouve pas une couverture de famille : lancer rule.test **lorsque l'outil et au moins des octets mesurables sont disponibles** ; sinon garder la candidate avec sa limite.
+- Lire les mesures réellement présentes par hash et rôle (positif, candidat, goodware, holdout si disponibles). Distinguer matches, non_matches, non_measurable et erreurs ; les absences de bytes ne sont pas des non-matches.
+- Un match goodware mesuré remet en cause la spécificité ; un unique match initial produit une règle expérimentale si tel est le statut du workbench. Le holdout n'est pas un préalable à la première candidate ; s'il sert à l'optimisation, il cesse d'être indépendant.
 
-## 5. Réviser avec hypothèse de diagnostic
+## 5. Réviser avec un résultat mesuré
 
-Sur faux négatif confirmé, chercher si le motif est non invariant, la condition trop stricte ou l'échantillon hors cluster. Sur faux positif, identifier la sous-expression banale et son contexte. Changer une hypothèse à la fois ; utiliser rule.revise avec parent_version courant puis rule.test. Comparer les versions sur le même corpus avec rule.compare si disponible.
+Sur faux négatif réellement mesuré, chercher si le motif est non invariant, la condition trop stricte ou l'échantillon hors cluster. Sur faux positif, identifier la sous-expression banale. Réviser selon ce qui apporte de la valeur, via parent_version courant ; tester/comparer les versions quand les octets et capacités existent. Un nouvel échantillon peut devenir un nouveau positif, un contre-exemple ou un nouveau pivot.
 
 Ne pas optimiser au hasard jusqu'à faire matcher l'échantillon test. Le status candidate/experimental/tested/rejected reste défini par le workbench et la couverture effective, pas par l'intention de l'agent.
 
@@ -50,8 +50,8 @@ Ne pas optimiser au hasard jusqu'à faire matcher l'échantillon test. Le status
 - Objectif, périmètre et motivation des motifs.
 - SHA/version de source YARA et références des mesures.
 - Bridge invocation et observation si utilisées ; conseil accepté/rejeté avec raison.
-- Corpus exact par rôle, versions moteur, matches/non_matches/non_measurable et limites.
+- Résultats réellement disponibles : corpus exact par rôle, moteur s'il a exécuté, matches/non_matches/non_measurable et limites ; ne pas inventer les tests absents.
 - Détection candidate, statut de validation réel, risques de faux positifs et condition de reprise.
 - Approbation/publication : exclusivement humains, hors de ce skill.
 
-**Oracle :** la règle M08 qui matche 1/10 fichiers non qualifiés reste expérimentale/non validée, même après une consultation Bridge ; l'agent demande des positifs qualifiés, du goodware mesurable et un holdout indépendant avant de prétendre à une règle testée.
+**Oracle :** dès qu'un invariant discriminant est mesuré, l'agent produit une candidate YARA et la teste si possible, puis utilise ses résultats pour découvrir de nouveaux échantillons. Il ne confond pas candidate/experimental/tested, et l'absence de goodware/holdout ne bloque pas la première version.
