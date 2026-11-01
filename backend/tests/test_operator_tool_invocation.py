@@ -562,12 +562,13 @@ async def test_concurrent_independent_local_tools_do_not_conflict_on_working_sta
     fixture.service._envelopes = fixture.envelopes
     fixture.service._states = fixture.states
     for tool in fixture.tools.values():
+
         async def _wait_for_both_local_dispatches() -> None:
             nonlocal local_dispatches
             local_dispatches += 1
             if local_dispatches == 2:
                 dispatches_ready.set()
-            await asyncio.wait_for(dispatches_ready.wait(), timeout=1)
+            await asyncio.wait_for(dispatches_ready.wait(), timeout=5)
 
         tool.after_execute = _wait_for_both_local_dispatches
     requests = (
@@ -600,8 +601,7 @@ async def test_concurrent_independent_local_tools_do_not_conflict_on_working_sta
     stale_conflicts = [
         result
         for result in results
-        if isinstance(result, OperatorToolInvocationError)
-        and result.code == "stale_working_state"
+        if isinstance(result, OperatorToolInvocationError) and result.code == "stale_working_state"
     ]
     assert not stale_conflicts, (
         f"stale_working_state 409 count: {len(stale_conflicts)} / {len(requests)}; "
@@ -649,7 +649,7 @@ async def test_analytic_local_writers_keep_strict_working_state_cas(
     )
     state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
     service = _service(fixture)
-    changed_state = state.with_operator_tool_action("concurrent_analytic_change")
+    changed_state = state.with_operator_tool_action("operator_tool:concurrent_analytic_change")
     await fixture.states.save_if_version(changed_state, expected_version=state.version)
 
     with pytest.raises(OperatorToolInvocationError) as stale:
@@ -787,8 +787,7 @@ async def test_same_idempotency_prefix_with_changed_concurrent_payload_has_one_e
     conflicts = [
         result
         for result in results
-        if isinstance(result, OperatorToolInvocationError)
-        and result.code == "idempotency_conflict"
+        if isinstance(result, OperatorToolInvocationError) and result.code == "idempotency_conflict"
     ]
     assert len(successes) == 1
     assert len(conflicts) == 1

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal, Protocol, cast
@@ -48,6 +49,34 @@ class ToolEffect(StrEnum):
     # (e.g. a reviewed YARA rule). Provider and disclosure policy apply like an
     # external read; the tool itself enforces its own explicit human authorization.
     EXTERNAL_SUBMIT = "external_submit"
+
+
+_ANALYTIC_WRITE_TOOL_NAMES = frozenset(
+    {
+        "hypothesis.declare",
+        "experiment.record",
+        "rule.propose",
+        "rule.propose_bridge",
+        "rule.operator_syntax_fix",
+        "rule.revise",
+        "rule.propose_from_candidates",
+        "sample.set_qualification",
+    }
+)
+_ANALYTIC_WRITE_TOOL_PREFIXES = ("finding.", "opinion.")
+
+
+def uses_nonblocking_local_freshness(tool_name: str, definition: Any | None) -> bool:
+    """Identify local tools that cannot update analyst-authored state."""
+    if (
+        definition is None
+        or definition.effect not in {ToolEffect.LOCAL_READ, ToolEffect.LOCAL_COMPUTE}
+        or definition.capability_key == "operator.write"
+        or tool_name in _ANALYTIC_WRITE_TOOL_NAMES
+        or tool_name.startswith(_ANALYTIC_WRITE_TOOL_PREFIXES)
+    ):
+        return False
+    return True
 
 
 class ToolConfidentiality(StrEnum):
@@ -686,6 +715,22 @@ class RegistryToolDispatcher:
         self._registry = registry
         self._completed: dict[str, tuple[bytes, ToolResult]] = {}
         self._lock = asyncio.Lock()
+        self._operation_locks: dict[str, asyncio.Lock] = {}
+
+    @asynccontextmanager
+    async def _dispatch_lock(
+        self, operation_key: str, *, local_effect: bool
+    ) -> AsyncIterator[None]:
+        # Keep retries for one operation serialized while independent local
+        # operations can execute together. Non-local calls retain the existing
+        # dispatcher-wide serialization.
+        operation_lock = self._operation_locks.setdefault(operation_key, asyncio.Lock())
+        async with operation_lock:
+            if local_effect:
+                yield
+            else:
+                async with self._lock:
+                    yield
 
     async def dispatch(
         self,
@@ -702,7 +747,11 @@ class RegistryToolDispatcher:
         ]
         | None = None,
     ) -> ToolResult:
-        async with self._lock:
+        registered = self._registry.get(tool_name, schema_version)
+        local_effect = registered is not None and uses_nonblocking_local_freshness(
+            tool_name, registered[0]
+        )
+        async with self._dispatch_lock(operation_key, local_effect=local_effect):
             if not operation_key.strip() or not purpose.strip():
                 return self._local_result(
                     ToolInvocationStatus.FAILED,

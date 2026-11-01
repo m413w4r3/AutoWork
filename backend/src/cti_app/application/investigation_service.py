@@ -65,6 +65,7 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
     tool_operation_cache_identity,
+    uses_nonblocking_local_freshness,
 )
 from cti_app.application.investigation_vt_tools import (
     VT_PASSIVE_RETRY_TOOL_NAMES,
@@ -1485,6 +1486,7 @@ class InvestigationService:
             ToolEffect.LOCAL_READ,
             ToolEffect.LOCAL_COMPUTE,
         }
+        independent_local_effect = uses_nonblocking_local_freshness(tool_name, definition)
         invocation_parameters: Mapping[str, Any] = arguments
         external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
         if tool_name in _VT_COORDINATED_READ_TOOLS:
@@ -1541,9 +1543,9 @@ class InvestigationService:
             if tool_name in _VT_PASSIVE_READ_TOOLS and existing is None
             else None
         )
-        if envelope is not None:
-            # Envelope snapshots must be private: a failed database CAS must not
-            # mutate an in-memory repository's canonical budget before retry.
+        if envelope is not None and independent_local_effect:
+            # Independent local tools may retry envelope admission after a CAS
+            # race; keep their in-memory budget snapshot private until retry.
             budget = _copy_investigation_budget(budget)
             envelope = replace(envelope, budget=budget)
         invocation = ToolInvocation(
@@ -1651,7 +1653,7 @@ class InvestigationService:
                     saved_envelope = True
                     break
                 except VersionConflictError:
-                    if not local_effect or attempt == 2:
+                    if not independent_local_effect or attempt == 2:
                         break
                     current_envelope = await self._envelopes.get(investigation.id)
                     if current_envelope is None:

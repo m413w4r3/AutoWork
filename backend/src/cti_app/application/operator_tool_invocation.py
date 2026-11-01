@@ -54,6 +54,7 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolRegistry,
     ToolResult,
+    uses_nonblocking_local_freshness,
 )
 from cti_app.application.investigation_vt_tools import (
     VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
@@ -95,20 +96,6 @@ _LEGACY_SCHEMA_V1_TOOLS = frozenset(
         HYPOTHESIS_DECLARE_TOOL,
     }
 )
-_ANALYTIC_WRITE_TOOL_NAMES = frozenset(
-    {
-        HYPOTHESIS_DECLARE_TOOL,
-        "experiment.record",
-        "rule.propose",
-        "rule.propose_bridge",
-        "rule.operator_syntax_fix",
-        "rule.revise",
-        "rule.propose_from_candidates",
-        "sample.set_qualification",
-    }
-)
-_ANALYTIC_WRITE_TOOL_PREFIXES = ("finding.", "opinion.")
-
 _SECRET_FIELD = re.compile(
     r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|bearer|"
     r"token|secret|password|authorization|credential|cookie)",
@@ -223,9 +210,7 @@ _ACTIVE_OPERATOR_INVOCATIONS: dict[str, asyncio.Lock] = {}
 
 
 @asynccontextmanager
-async def _lock_operation_prefix(
-    invocations: Any, operation_prefix: str
-) -> AsyncIterator[None]:
+async def _lock_operation_prefix(invocations: Any, operation_prefix: str) -> AsyncIterator[None]:
     lock_factory = getattr(invocations, "lock_operation_prefix", None)
     if not callable(lock_factory):
         yield
@@ -546,19 +531,6 @@ def _stale_working_state_error(
             ),
         },
     )
-
-
-def _uses_nonblocking_local_freshness(tool_name: str, definition: Any | None) -> bool:
-    """Allow an older state token for local tools that do not write analytics."""
-    if (
-        definition is None
-        or definition.effect not in {ToolEffect.LOCAL_READ, ToolEffect.LOCAL_COMPUTE}
-        or definition.capability_key == "operator.write"
-        or tool_name in _ANALYTIC_WRITE_TOOL_NAMES
-        or tool_name.startswith(_ANALYTIC_WRITE_TOOL_PREFIXES)
-    ):
-        return False
-    return True
 
 
 def _operator_reconciliation_path(investigation_id: UUID, invocation: ToolInvocation) -> str:
@@ -1204,7 +1176,7 @@ class OperatorToolInvocationService:
         self._require_operator_mode(state.execution_mode)
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered is not None else None
-        nonblocking_local_freshness = _uses_nonblocking_local_freshness(tool_name, definition)
+        nonblocking_local_freshness = uses_nonblocking_local_freshness(tool_name, definition)
         stale_hint = expected_version > state.version or (
             expected_version == state.version
             and expected_sha256 is not None
