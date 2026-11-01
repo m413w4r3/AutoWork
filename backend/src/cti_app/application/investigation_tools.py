@@ -61,6 +61,8 @@ _ANALYTIC_WRITE_TOOL_NAMES = frozenset(
         "rule.revise",
         "rule.propose_from_candidates",
         "sample.set_qualification",
+        # Creates a derived quarantined Sample + association: keep strict CAS.
+        "archive.extract_member",
     }
 )
 _ANALYTIC_WRITE_TOOL_PREFIXES = ("finding.", "opinion.")
