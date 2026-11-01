@@ -2213,3 +2213,132 @@ REFS: E1
     assert parsed["status"] == "succeeded"
     assert parsed["limitations"] == []
     assert "limitations_missing" not in parsed["warnings"]
+
+
+def test_plain_draft_maps_to_the_only_explicit_target_without_changing_text() -> None:
+    raw = (
+        "### 1. Échantillon A\n"
+        "Les octets statiques indiquent un accès possible à GitHub Contents. [E1]\n"
+        "Cela ne prouve aucune connexion réelle."
+    )
+    target = {
+        "id": "U1",
+        "block_type": "key_findings",
+        "form": "body",
+        "anchor": None,
+    }
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="draft_text",
+        prompt_data={"units": [target]},
+        safe_text=_safe_text,
+    )
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["unit_assignment_status"] == "single_requested_unit"
+    assert parsed["blocks"][0]["block_type"] == "key_findings"
+    assert parsed["blocks"][0]["sentences"] == [{"text": raw, "assertion_ids": []}]
+
+
+def test_plain_draft_multiple_targets_are_not_guessed_by_section_order() -> None:
+    raw = (
+        "### 1. Échantillon A\nObservation une. [E1]\n### 2. Échantillon B\nObservation deux. [E2]"
+    )
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="draft_text",
+        prompt_data={
+            "units": [
+                {"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None},
+                {
+                    "id": "U2",
+                    "block_type": "proposed_detections",
+                    "form": "body",
+                    "anchor": None,
+                },
+            ]
+        },
+        safe_text=_safe_text,
+    )
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed.get("blocks", []) == []
+    assert parsed["unit_assignment_status"] == "unstructured_overall"
+
+
+def test_draft_prompt_requests_literal_unit_headings_in_prose() -> None:
+    prompt = render_advisor_prompt(
+        "draft_text",
+        {
+            "question": "Rédiger des faits techniques.",
+            "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}],
+        },
+    )
+    assert "Ne pas remplacer U1/U2" in prompt
+    assert "U1 — Faits clés" in prompt
+    assert prompt.index("Ne pas remplacer U1/U2") < prompt.index("FAITS TRANSMIS")
+
+
+def test_yara_dossier_keeps_measured_bytes_and_article_context() -> None:
+    evidence_id = str(uuid4())
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Détecter api.github.com et le motif 4d5a observé.",
+            "article_sha256": "a" * 64,
+            "article_passages": [
+                {
+                    "claim_id": "S1P1",
+                    "heading": "Canal GitHub",
+                    "text": "L'article décrit un canal api.github.com à vérifier.",
+                }
+            ],
+            "evidence": [
+                {
+                    "evidence_id": evidence_id,
+                    "sha256": "b" * 64,
+                    "source": "sample.analysis",
+                    "object_type": "file",
+                    "content_excerpts": [
+                        {"title": "Chaînes décodées", "text": "api.github.com"},
+                    ],
+                }
+            ],
+            "measurements": [
+                {
+                    "measurement_id": "m001",
+                    "evidence_id": evidence_id,
+                    "evidence_sha256": "b" * 64,
+                    "sample_sha256": "c" * 64,
+                    "kind": "hex",
+                    "offset": 0,
+                    "value": "4d5a",
+                }
+            ],
+        }
+    )
+    assert "api.github.com" in dossier.text
+    assert "4d5a" in dossier.text
+    assert "offset 0" in dossier.text
+    assert "Canal GitHub" in dossier.text
+    assert any(row["kind"] == "measurement" for row in dossier.manifest)
+
+
+def test_draft_prose_maps_explicit_named_sections_not_guessing_order() -> None:
+    parsed = parse_typed_advisor_response(
+        "### 2. Détections proposées\nYARA expérimentale. [E2]\n"
+        "### 1. Faits clés\nLe code est statique. [E1]",
+        consultation_type="draft_text",
+        prompt_data={
+            "units": [
+                {"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None},
+                {"id": "U2", "block_type": "proposed_detections", "form": "body", "anchor": None},
+            ]
+        },
+        safe_text=_safe_text,
+    )
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assigned = {block["block_type"]: block for block in parsed["blocks"]}
+    assert "YARA expérimentale" in assigned["proposed_detections"]["sentences"][0]["text"]
+    assert "Le code est statique" in assigned["key_findings"]["sentences"][0]["text"]

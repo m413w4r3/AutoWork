@@ -2257,6 +2257,18 @@ class InvestigationAdvisorTool:
             output={
                 "advisor_status": "invalid_input",
                 "input_error_code": reason_code,
+                "detail_code": reason_code,
+                **(
+                    {
+                        "correction": (
+                            "Choose one verified content_pattern_id or a measured "
+                            "blob_id/kind/offset/value quartet from the current catalogue; "
+                            "see measurement_errors for the rejected indices and shapes."
+                        )
+                    }
+                    if reason_code == "measurements_invalid"
+                    else {}
+                ),
                 "failure_stage": "pre_transport_validation",
                 "failure_reason": reason_code,
                 **(
@@ -3323,12 +3335,9 @@ class InvestigationAdvisorTool:
         elif consultation_type == "yara_draft":
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")
-            if candidates is not None:
-                measurements = self._select_verified_measurements(
-                    measurements, candidates, content_patterns=content_patterns
-                )
-            else:
-                measurements = self._select_discriminating_measurements(measurements)
+            measurements, selection_fallback = self._advisory_measurement_selection(
+                measurements, candidates, content_patterns=content_patterns
+            )
             measurements = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -3343,7 +3352,10 @@ class InvestigationAdvisorTool:
                 "evidence": base["evidence"],
                 "measured_facts": base["measured_facts"],
                 "measurements": measurements,
-                "explicit_measurement_selection": candidates is not None,
+                "explicit_measurement_selection": (
+                    candidates is not None and not selection_fallback
+                ),
+                "measurement_selection_fallback": selection_fallback,
                 "tools": tool_inventory,
                 "candidate_rules": candidate_rules,
                 "gaps": base["gaps"],
@@ -3447,18 +3459,32 @@ class InvestigationAdvisorTool:
         ):
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")
-            if candidates is not None:
-                measurements = self._select_verified_measurements(
-                    measurements, candidates, content_patterns=content_patterns
-                )
-            elif consultation_type == "pivot_strategy" or measurements:
-                measurements = self._select_discriminating_measurements(measurements)
+            measurements, selection_fallback = self._advisory_measurement_selection(
+                measurements, candidates, content_patterns=content_patterns
+            )
             base["measurements"] = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
-            base["explicit_measurement_selection"] = candidates is not None
-        sample_rows = await self._sample_inventory(investigation_id, evidence, context.envelope)
+            base["explicit_measurement_selection"] = (
+                candidates is not None and not selection_fallback
+            )
+            base["measurement_selection_fallback"] = selection_fallback
+        # Retain sample identity and provenance without attaching complete
+        # binaries to a Suricata, editorial or figure consultation by default.
+        # This is task-relevance selection, not a Bridge prompt size limit.
+        include_sample_content = consultation_type not in {
+            "draft_text",
+            "review_text",
+            "suricata_draft",
+            "figure_plan",
+        }
+        sample_rows = await self._sample_inventory(
+            investigation_id,
+            evidence,
+            context.envelope,
+            include_content=include_sample_content,
+        )
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
         mime_types_by_evidence: dict[str, list[str]] = {}
@@ -3539,7 +3565,7 @@ class InvestigationAdvisorTool:
                             matching_sample["content_omission_reason"] = (
                                 "included_as_cited_observation_fragment"
                             )
-                    else:
+                    elif matching_sample.get("content_status") != "not_requested_for_consultation":
                         evidence_row["blob_read_failure_reason"] = _sample_blob_failure_reason(
                             matching_sample.get("content_status")
                         )
@@ -3992,6 +4018,8 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         observations: tuple[EvidenceObservation, ...],
         envelope: InvestigationEnvelope | None,
+        *,
+        include_content: bool = True,
     ) -> list[dict[str, Any]]:
         investigation = await self._investigations.get(investigation_id)
         if investigation is None:
@@ -4094,20 +4122,22 @@ class InvestigationAdvisorTool:
             sample_origin = getattr(sample, "origin_kind", getattr(sample, "origin", "unknown"))
             sample_origin = getattr(sample_origin, "value", sample_origin)
             blob_content: bytes | None = None
-            content_status = "verified"
-            try:
-                blob_content = await self._artifact_store.read_bytes(
-                    blob_id, max_bytes=descriptor.size
-                )
-                if (
-                    not isinstance(blob_content, bytes)
-                    or len(blob_content) != descriptor.size
-                    or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
-                ):
-                    blob_content = None
-                    content_status = "sample_content_hash_mismatch"
-            except Exception:
-                content_status = "sample_blob_unreadable"
+            content_status = "not_requested_for_consultation"
+            if include_content:
+                content_status = "verified"
+                try:
+                    blob_content = await self._artifact_store.read_bytes(
+                        blob_id, max_bytes=descriptor.size
+                    )
+                    if (
+                        not isinstance(blob_content, bytes)
+                        or len(blob_content) != descriptor.size
+                        or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
+                    ):
+                        blob_content = None
+                        content_status = "sample_content_hash_mismatch"
+                except Exception:
+                    content_status = "sample_blob_unreadable"
             raw_mime_type = getattr(descriptor, "mime_type", "application/octet-stream")
             mime_type = (
                 raw_mime_type.strip()
@@ -4116,7 +4146,9 @@ class InvestigationAdvisorTool:
             )
             fragment = blob_content if blob_content is not None else b""
             omitted_range = ""
-            content_omission_reason = ""
+            content_omission_reason = (
+                "whole_sample_not_needed_for_consultation" if not include_content else ""
+            )
             rows.append(
                 {
                     "verified": True,
@@ -4349,6 +4381,31 @@ class InvestigationAdvisorTool:
             identity = (item.get("blob_id"), item.get("kind"), item.get("offset"), value)
             unique.setdefault(identity, item)
         return list(unique.values())
+
+    @classmethod
+    def _advisory_measurement_selection(
+        cls,
+        verified: list[dict[str, Any]],
+        candidates: object,
+        *,
+        content_patterns: Mapping[str, list[dict[str, Any]]] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Keep optional selection mistakes from blocking a Bridge conversation.
+
+        Invalid, unverified candidates are never forwarded. Only independently
+        verified catalogue measurements may replace them. This changes advice
+        preparation, not the provenance rules of the YARA workbench.
+        """
+        if candidates is None:
+            return cls._select_discriminating_measurements(verified), False
+        try:
+            return cls._select_verified_measurements(
+                verified, candidates, content_patterns=content_patterns
+            ), False
+        except _AdvisorInputValidationError as exc:
+            if exc.reason_code != "measurements_invalid":
+                raise
+            return cls._select_discriminating_measurements(verified), True
 
     @staticmethod
     def _select_verified_measurements(

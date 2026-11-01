@@ -26,7 +26,25 @@ def render_advisor_prompt(consultation_type: str, data: Mapping[str, Any]) -> st
     if not isinstance(targets, (list, tuple)):
         legacy_target = data.get("review_text")
         targets = [legacy_target] if isinstance(legacy_target, Mapping) else []
+    if data.get("measurement_selection_fallback") is True:
+        lines.append(
+            "MESURES : sélection facultative ignorée (candidats non vérifiés ou format "
+            "incorrect). Utiliser uniquement les mesures canoniques vérifiées et les "
+            "preuves citées dans le dossier ; ne pas présenter les motifs exclus comme mesurés."
+        )
     if targets:
+        if consultation_type == "draft_text":
+            lines.extend(
+                [
+                    "RÉDACTION PAR UNITÉ : chaque unité demandée constitue une section "
+                    "distincte de la réponse en prose.",
+                    "Commencer chaque section par son identifiant EXACT (par exemple "
+                    "'U1 — Faits clés'), puis le texte rédigé. Ne pas remplacer U1/U2 "
+                    "par des titres numérotés génériques.",
+                    "Ne pas fusionner deux unités ni répartir une réponse par leur "
+                    "ordre supposé. Les citations [E#] restent attachées aux phrases.",
+                ]
+            )
         lines.append("TEXTE CIBLE:")
         for index, target in enumerate(targets, start=1):
             if not isinstance(target, Mapping):
@@ -165,6 +183,8 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
         guidance = [
             "Rédiger un brouillon lisible à partir des éléments présents.",
             "Conserver les références de preuve disponibles à côté des affirmations concernées.",
+            "Pour une section ciblée, reproduire en tête son alias U1/U2 tel que demandé, "
+            "sans déplacer les propos vers une autre rubrique.",
             "Ce brouillon est consultatif et ne modifie aucune version d\u2019avis canonique.",
         ]
         if not isinstance(assertions, (list, tuple)) or not assertions:
@@ -175,14 +195,38 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
         return guidance
     if consultation_type == "yara_draft":
         return [
-            ("Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara."),
-            ("Expliquer en prose les marqueurs qui la justifient et les limites des mesures."),
+            (
+                "Proposer une règle YARA complète à partir des octets et chaînes discriminants, "
+                "des offsets, du type de fichier, du code et des décodages vérifiés."
+            ),
+            (
+                "La règle proposée doit être compilée et testée par l'opérateur sur les "
+                "échantillons mesurables ; suggérer aussi les tests positifs, contre-exemples "
+                "et pivots YARA/VT pour découvrir des variantes."
+            ),
+            "Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara.",
+            (
+                "Ancrer chaque motif présenté comme mesuré dans les octets/mesures et alias "
+                "effectivement transmis. Les motifs jokerisés extrapolés peuvent être "
+                "proposés comme hypothèses à tester, non comme mesures vérifiées."
+            ),
+            (
+                "Une critique de condition ou de spécificité reste utile même si une "
+                "nouvelle source YARA n'est pas encore canonisable."
+            ),
             "Ne pas exécuter, téléverser, analyser, ou appeler d\u2019outil.",
         ]
     if consultation_type == "suricata_draft":
         return [
-            ("Placer toute règle Suricata proposée, complète, dans un bloc clôturé ```suricata."),
-            ("Expliquer en prose les faits réseau qui la justifient et les limites des mesures."),
+            (
+                "Exploiter endpoints, séquences, champs et formats du protocole C2, octets "
+                "réseau pertinents si disponibles, et distinguer statique/observé."
+            ),
+            "Placer toute règle Suricata proposée, complète, dans un bloc clôturé ```suricata.",
+            (
+                "Expliciter la visibilité TLS, les champs réellement observables, les "
+                "faux positifs possibles et le test sur PCAP à réaliser si une capture existe."
+            ),
             (
                 "Ne pas inférer le contenu des paquets, le sens du flux, ni une activité C2 "
                 "non observée."

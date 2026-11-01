@@ -1274,17 +1274,13 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
         },
         make_context(investigation_id, key="operator:advisor:invalid-measurement"),
     )
-    assert invalid.status is ToolInvocationStatus.FAILED
-    assert invalid.error_code == "advisor_input_invalid"
-    assert invalid.output["advisor_status"] == "invalid_input"
-    assert invalid.output["input_error_code"] == "measurements_invalid"
-    assert [dict(item) for item in invalid.output["measurement_errors"]] == [
-        {"index": 0, "reason": "measurement_not_verified"}
-    ]
-    assert invalid.output["failure_stage"] == "pre_transport_validation"
-    assert invalid.output["confirmed_non_execution"] is True
-    assert invalid.output["provider_usage"] == {"status": "not_submitted"}
-    assert transport.calls == []
+    assert invalid.status is ToolInvocationStatus.SUCCEEDED
+    assert len(transport.calls) == 1
+    assert "sélection facultative ignorée" in transport.calls[0]["prompt"]
+    assert all(
+        item.get("value") != "4142434"
+        for item in typed_prompt_payload(transport.calls[0]["prompt"]).get("measurements", ())
+    )
 
     result = await tool.execute(
         {
@@ -1299,7 +1295,7 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     )
 
     assert result.status is ToolInvocationStatus.SUCCEEDED, dict(result.output)
-    prompt = transport.calls[0]["prompt"]
+    prompt = transport.calls[-1]["prompt"]
     assert "The first canonical passage describes the measured mutex marker." in prompt
     assert "The second canonical passage records the associated loader behavior." in prompt
     assert "bloc clôturé ```yara" in prompt
@@ -4638,32 +4634,16 @@ async def test_measurement_rejections_report_indexes_without_echoing_candidate_s
         make_context(investigation_id, key="operator:advisor:measurement-diagnostics"),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    measurement_errors = [dict(item) for item in result.output["measurement_errors"]]
-    assert measurement_errors[0] == {"index": 0, "reason": "measurement_not_verified"}
-    shape_error = measurement_errors[1]
-    assert shape_error["index"] == 1
-    assert shape_error["reason"] == "measurement_shape_invalid"
-    accepted_shapes = shape_error["accepted_shapes"]
-    assert [item["name"] for item in accepted_shapes] == ["content_pattern", "measurement"]
-    assert tuple(accepted_shapes[0]["keys"]) == ("content_pattern_id",)
-    assert tuple(accepted_shapes[1]["keys"]) == ("blob_id", "kind", "offset", "value")
-    assert accepted_shapes[0]["value_rule"] == ("exactly 64 lowercase hexadecimal characters")
-    assert accepted_shapes[1]["value_rule"] == (
-        "blob_id and kind are strings, offset is a non-negative integer, "
-        "and value is a non-empty string"
-    )
-    differences = shape_error["shape_differences"]
-    assert differences[0]["shape"] == "content_pattern"
-    assert tuple(differences[0]["missing_keys"]) == ("content_pattern_id",)
-    assert tuple(differences[0]["extra_keys"]) == ("unknown",)
-    assert differences[1]["shape"] == "measurement"
-    assert tuple(differences[1]["missing_keys"]) == ("blob_id", "kind", "offset", "value")
-    assert tuple(differences[1]["extra_keys"]) == ("unknown",)
-    assert "PRIVATE-MEASUREMENT" not in result.message
+    # Invalid optional measurement selections must not gate an advisory conversation;
+    # only independently verified catalogue facts may be sent.
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "sélection facultative ignorée" in prompt
+    assert "CreateMutexW" in prompt
+    assert "PRIVATE-MEASUREMENT" not in prompt
+    assert "PRIVATE-SHAPE" not in prompt
     assert "PRIVATE-MEASUREMENT" not in repr(result.output)
     assert "PRIVATE-SHAPE" not in repr(result.output)
-    assert transport.calls == []
 
 
 @pytest.mark.asyncio
@@ -9325,3 +9305,43 @@ async def test_suricata_draft_accepts_documented_protocol_model_with_its_status(
     prompt = transport.calls[0]["prompt"]
     assert "api.github.com" in prompt
     assert "documented_not_observed" in prompt
+
+
+@pytest.mark.asyncio
+async def test_editorial_sample_inventory_avoids_unrequested_whole_binary_bytes() -> None:
+    investigation_id = uuid4()
+    sample_content = bytes(range(256)) * 40
+    (
+        tool,
+        _transport,
+        observation,
+        sample_id,
+        association_id,
+        _blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(investigation_id, sample_content)
+
+    # This is a relevance selection for editorial/C2 use, not a sample-size cap.
+    rows = await tool._sample_inventory(
+        investigation_id,
+        (observation,),
+        make_context(investigation_id).envelope,
+        include_content=False,
+    )
+    assert len(rows) == 1
+    assert rows[0]["sample_id"] == str(sample_id)
+    assert rows[0]["association_id"] == str(association_id)
+    assert rows[0]["sha256"] == sample_hash
+    assert rows[0]["byte_length"] == len(sample_content)
+    assert rows[0]["content_base64"] == ""
+    assert rows[0]["content_status"] == "not_requested_for_consultation"
+    assert rows[0]["content_omission_reason"] == "whole_sample_not_needed_for_consultation"
+
+    full_rows = await tool._sample_inventory(
+        investigation_id,
+        (observation,),
+        make_context(investigation_id).envelope,
+        include_content=True,
+    )
+    assert full_rows[0]["content_status"] == "verified"
+    assert full_rows[0]["content_base64"] == base64.b64encode(sample_content).decode("ascii")

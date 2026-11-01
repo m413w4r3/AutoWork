@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
@@ -463,6 +464,37 @@ def _normalize_heuristic_draft(
     overall_text = safe_text(overall_text, len(overall_text) + 1)
     if not _review_text_is_useful(overall_text):
         return None
+    # A single explicitly requested target is unambiguous even when Bridge
+    # answers in free prose without a U1 marker. Preserve its EXACT text as
+    # one candidate block, rather than losing an otherwise usable draft.
+    # Multiple targets must never be assigned by response order or guesswork.
+    if len(units) == 1:
+        unit_id, unit = units[0]
+        return {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+            "consultation_type": "draft_text",
+            "status": "partial",
+            "untrusted": True,
+            "blocks": [
+                {
+                    "unit_id": unit_id,
+                    "block_type": unit.get("block_type"),
+                    "form": unit.get("form", "body"),
+                    "anchor": unit.get("anchor"),
+                    "sentences": [
+                        {"text": _bound_review_remark(overall_text), "assertion_ids": []}
+                    ],
+                    "warnings": ["unstructured_draft"],
+                    "usable": True,
+                    "assignment": "single_requested_unit",
+                }
+            ],
+            "summary": _bound_review_remark(overall_text),
+            "warnings": ["unstructured_draft"],
+            "normalization_status": "partial",
+            "unit_assignment_status": "single_requested_unit",
+            "usable": True,
+        }
     return {
         "schema": ADVISOR_RESPONSE_SCHEMA_V3,
         "consultation_type": "draft_text",
@@ -572,6 +604,31 @@ def _review_text_values(value: object) -> list[str]:
     return []
 
 
+def _human_review_target(value: str) -> str:
+    # Match an explicitly named section, never its guessed response position.
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    deaccented = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", " ", deaccented).strip()
+
+
+_REVIEW_TARGET_LABELS = {
+    "key_findings": ("faits cles", "key findings"),
+    "additional_samples": ("echantillons supplementaires", "additional samples"),
+    "infection_chain_and_capabilities": (
+        "chaine infection et capacites",
+        "chaine d infection et capacites",
+        "infection chain and capabilities",
+    ),
+    "network_and_infrastructure": ("reseau et infrastructure", "network and infrastructure"),
+    "claim_verification": ("verification d une affirmation", "claim verification"),
+    "proposed_detections": ("detections proposees", "proposed detections"),
+    "uncertainties_and_next_leads": (
+        "incertitudes et pistes suivantes",
+        "uncertainties and next leads",
+    ),
+}
+
+
 def _resolve_review_unit(
     label: object, units: list[tuple[str, Mapping[str, Any]]], order_index: int
 ) -> tuple[str | None, str]:
@@ -595,6 +652,14 @@ def _resolve_review_unit(
                 str(unit.get("anchor", "")).casefold(),
             }:
                 return unit_id, "block_type_or_anchor"
+        named = _human_review_target(re.sub(r"^\d+[.)]\s*", "", candidate))
+        matches = [
+            unit_id
+            for unit_id, unit in units
+            if named in _REVIEW_TARGET_LABELS.get(str(unit.get("block_type")), ())
+        ]
+        if len(matches) == 1:
+            return matches[0], "named_target"
     if 0 <= order_index < len(units):
         return units[order_index][0], "order"
     return None, "order"
