@@ -1885,6 +1885,7 @@ class OperatorToolInvocationService:
             diagnostic_code = result_output.get("detail_code")
             if (
                 invocation.tool_name == "experiment.record"
+                and isinstance(diagnostic_code, str)
                 and diagnostic_code in EXPERIMENT_PUBLIC_DIAGNOSTICS
             ):
                 field, correction = EXPERIMENT_PUBLIC_DIAGNOSTICS[diagnostic_code]
