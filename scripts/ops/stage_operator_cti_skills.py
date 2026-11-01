@@ -31,10 +31,15 @@ def stage(workspace: Path, *, claude: bool = False) -> dict[str, str]:
     if not workspace.is_dir() or workspace.is_symlink():
         raise ValueError("workspace must be an existing, non-symlink directory")
 
+    # Never traverse a pre-existing workspace-level symlink during staging.
+    for parent in (".agents", ".claude"):
+        if (workspace / parent).is_symlink():
+            raise ValueError(f"workspace {parent} must not be a symlink")
+
     target = workspace / ".agents" / "skills"
     if target.exists() or target.is_symlink():
         raise FileExistsError("skills bundle already exists; use a new session workspace")
-    if claude and (workspace / ".claude" / "skills").exists():
+    if claude and ((workspace / ".claude" / "skills").exists() or (workspace / ".claude" / "skills").is_symlink()):
         raise FileExistsError("Claude skills directory already exists; refusing overwrite")
 
     # Resolve the fixed allowlist before making any destination directory.
