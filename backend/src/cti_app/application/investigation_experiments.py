@@ -121,6 +121,11 @@ _EXPERIMENT_DIAGNOSTICS: Mapping[_ExperimentDiagnostic, tuple[str, str]] = {
 }
 
 
+EXPERIMENT_PUBLIC_DIAGNOSTICS: Mapping[str, tuple[str, str]] = {
+    key.value: value for key, value in _EXPERIMENT_DIAGNOSTICS.items()
+}
+
+
 class _ExperimentValidationError(ValueError):
     def __init__(self, detail: _ExperimentDiagnostic) -> None:
         self.detail = detail
@@ -1028,8 +1033,7 @@ class OperatorExperimentToolAdapter:
         try:
             return await self._execute(arguments, context)
         except VersionConflictError:
-            current = await self._experiments.list_for_investigation(context.investigation_id)
-            current_version = current[-1].version if current else 0
+            current_version = await self._experiments.version(context.investigation_id)
             return ToolResult(
                 ToolInvocationStatus.FAILED,
                 output={
