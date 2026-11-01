@@ -670,13 +670,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
             hash_references = tuple(
                 reference for reference in references if reference.kind == "sample_hash"
             )
-            return (
-                hash_references == (expected_reference,)
-                and all(
-                    reference.kind == "sample_hash"
-                    or reference.kind in permitted_additional_kinds
-                    for reference in references
-                )
+            return hash_references == (expected_reference,) and all(
+                reference.kind == "sample_hash" or reference.kind in permitted_additional_kinds
+                for reference in references
             )
 
         if (

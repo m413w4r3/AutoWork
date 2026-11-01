@@ -846,9 +846,7 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
         idempotency_key="documented-vt-file-report",
     )
     assert reported.invocation.status is ToolInvocationStatus.SUCCEEDED
-    source_refs = reported.invocation.normalized_parameters[
-        "_vt_external_effect_source_refs"
-    ]
+    source_refs = reported.invocation.normalized_parameters["_vt_external_effect_source_refs"]
     assert [reference["kind"] for reference in source_refs] == [
         "sample_hash",
         "source_document",

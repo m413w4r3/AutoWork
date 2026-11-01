@@ -3651,9 +3651,7 @@ async def test_document_backed_unassociated_osint_vt_hash_completes_external_eff
     sample_hash = "b" * 64
     document_id = uuid4()
     document_version = f"synthesis:{uuid4()}@1"
-    hash_reference = EvidenceReference(
-        "sample_hash", sample_hash, "sample-hash.v1", sample_hash
-    )
+    hash_reference = EvidenceReference("sample_hash", sample_hash, "sample-hash.v1", sample_hash)
     policy_service = OsintOpenPolicyService(
         lambda: SqlAlchemyUnitOfWork(session_factory), Settings(_env_file=None)
     )
@@ -3668,10 +3666,10 @@ async def test_document_backed_unassociated_osint_vt_hash_completes_external_eff
                     BudgetDimension.VT_UNITS: 1,
                     BudgetDimension.SHODAN_CREDITS: 0,
                     BudgetDimension.DOWNLOADS: 0,
-                    BudgetDimension.BRIDGE_TURNS: 0,
-                    BudgetDimension.TOOL_SECONDS: 0,
-                    BudgetDimension.CONTEXT_BYTES: 0,
-                    BudgetDimension.CONTEXT_TOKENS: 0,
+                    BudgetDimension.BRIDGE_TURNS: 1,
+                    BudgetDimension.TOOL_SECONDS: 1,
+                    BudgetDimension.CONTEXT_BYTES: 1,
+                    BudgetDimension.CONTEXT_TOKENS: 1,
                 },
                 acquire_hits_allowed=False,
                 disclosure=DisclosureBounds(

@@ -2625,9 +2625,7 @@ async def test_vt_policy_guard_unassociated_hash_requires_matching_service_refs(
     source_hash = "e" * 64 if case == "requested_hash_mismatch" else requested_hash
     subject_id = uuid4()
     document_id = uuid4()
-    hash_reference = EvidenceReference(
-        "sample_hash", source_hash, "sample-hash.v1", source_hash
-    )
+    hash_reference = EvidenceReference("sample_hash", source_hash, "sample-hash.v1", source_hash)
     document_reference = EvidenceReference(
         "source_document", str(document_id), "synthesis@3", "f" * 64
     )
@@ -2660,9 +2658,7 @@ async def test_vt_policy_guard_unassociated_hash_requires_matching_service_refs(
         conflict_reference = EvidenceReference(
             "evidence_observation", str(observation_id), "stale-version", "b" * 64
         )
-        persisted_refs.extend(
-            (conflict_reference.to_json(), observation_reference.to_json())
-        )
+        persisted_refs.extend((conflict_reference.to_json(), observation_reference.to_json()))
         prepared_refs = (conflict_reference, *prepared_refs, observation_reference)
     elif case == "duplicate_sample_hash":
         persisted_refs.insert(1, hash_reference.to_json())
