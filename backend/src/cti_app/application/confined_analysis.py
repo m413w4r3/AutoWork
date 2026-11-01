@@ -24,6 +24,9 @@ CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v2"
 ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX = "archive-member"
 _ARCHIVE_MEMBER_TRANSFER_BUCKET_MAX_LENGTH = 63
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DOTNET_FIELD_TOKEN = re.compile(r"^0x04[0-9a-fA-F]{6}$")
+_DOTNET_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>./+`-]{1,256}$")
+_DOTNET_FIELD_NAME = re.compile(r"^[A-Za-z0-9_$<>.`-]{1,256}$")
 
 
 class ConfinedAnalysisTool(StrEnum):
@@ -151,7 +154,11 @@ class ConfinedAnalysisRequest:
             ConfinedAnalysisTool.DOTNET_ILSPY: {
                 "operation",
                 "method_rid",
+                "field_token",
+                "type_name",
+                "field_name",
                 "offset",
+                "length",
                 "limit",
                 "max_chars",
             },
@@ -177,9 +184,13 @@ class ConfinedAnalysisRequest:
                 "references",
                 "strings",
                 "resources",
+                "field_data",
             }:
                 raise ValueError("dotnet operation is invalid")
-            if "offset" in parameters and not _bounded_decimal(parameters["offset"], 0, 10**7):
+            offset_max = 0xFFFFFFFF if parameters["operation"] == "field_data" else 10**7
+            if "offset" in parameters and not _bounded_decimal(
+                parameters["offset"], 0, offset_max
+            ):
                 raise ValueError("dotnet output offset is invalid")
             if "limit" in parameters and not _bounded_decimal(parameters["limit"], 1, 200):
                 raise ValueError("dotnet result limit is invalid")
@@ -192,6 +203,41 @@ class ConfinedAnalysisRequest:
                 raise ValueError("dotnet method RID is invalid")
             if (parameters["operation"] == "decompile") != has_rid:
                 raise ValueError("dotnet method RID is required only for decompile")
+            if parameters["operation"] == "field_data":
+                if any(key in parameters for key in ("method_rid", "limit", "max_chars")):
+                    raise ValueError("dotnet field parameters are invalid")
+                field_token = parameters.get("field_token")
+                type_name = parameters.get("type_name")
+                field_name = parameters.get("field_name")
+                has_token = field_token is not None
+                has_names = type_name is not None and field_name is not None
+                if (
+                    (has_token and (type_name is not None or field_name is not None))
+                    or (not has_token and not has_names)
+                    or (type_name is None) != (field_name is None)
+                ):
+                    raise ValueError("dotnet field selector is invalid")
+                if has_token and (
+                    not isinstance(field_token, str)
+                    or _DOTNET_FIELD_TOKEN.fullmatch(field_token) is None
+                ):
+                    raise ValueError("dotnet field token is invalid")
+                if has_names and (
+                    not isinstance(type_name, str)
+                    or not isinstance(field_name, str)
+                    or _DOTNET_FIELD_TYPE_NAME.fullmatch(type_name) is None
+                    or _DOTNET_FIELD_NAME.fullmatch(field_name) is None
+                ):
+                    raise ValueError("dotnet field name selector is invalid")
+                if "length" in parameters and not _bounded_decimal(
+                    parameters["length"], 1, 0xFFFFFFFF
+                ):
+                    raise ValueError("dotnet field length is invalid")
+            elif any(
+                key in parameters
+                for key in ("field_token", "type_name", "field_name", "length")
+            ):
+                raise ValueError("dotnet field parameters require field_data")
         if self.tool is ConfinedAnalysisTool.LOCAL_COMMAND:
             if len(self.arguments) != 1 or self.arguments[0] not in {
                 "file",

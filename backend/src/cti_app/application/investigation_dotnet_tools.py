@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Mapping
 from math import ceil
@@ -51,6 +52,7 @@ DOTNET_TOOL_NAMES = (
     "references.imports",
     "strings.list",
     "resources.list",
+    "field.data.read",
 )
 _TOOL_OUTPUT_BYTES = 24 * 1024
 _PERSISTED_RESULT_BYTES = 48 * 1024
@@ -60,6 +62,10 @@ _OBSERVATION_PAGE_LENGTH = 16 * 1024
 _NATIVE_STRING_LIMIT_CHARS = 16_384
 _TOOL_SECONDS = 60
 _MAX_SAMPLE_BYTES = 64 * 1024 * 1024
+_FIELD_DATA_MAX_BYTES = 4096
+_FIELD_TOKEN = re.compile(r"^0x04[0-9a-fA-F]{6}$")
+_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>./+`-]{1,256}$")
+_FIELD_NAME = re.compile(r"^[A-Za-z0-9_$<>.`-]{1,256}$")
 _LIMITATIONS = (
     "Lecture statique uniquement : le code de l'assembly n'est ni chargé ni exécuté.",
     ("Le worker est confine, en lecture seule et sans reseau; aucun restore NuGet a l'execution."),
@@ -71,6 +77,7 @@ _LIMITATIONS = (
         "Les references/imports seuls ne prouvent pas un C2; chaines obfusquees et blobs chiffres "
         "restent non resolus."
     ),
+    "Les octets lus depuis un champ statique sont des donnees binaires non fiables.",
     (
         "Un PE mixte suit aussi le chemin natif pour ses sections natives; les metadonnees "
         "gerees restent sur .NET."
@@ -196,8 +203,35 @@ def _tool_schemas() -> dict[str, Mapping[str, Any]]:
             ("sample_sha256",),
             "List embedded resource manifest metadata without extracting resource bytes",
         ),
+        "field.data.read": (
+            {
+                "sample_sha256": sha,
+                "field_token": {
+                    "type": "string",
+                    "minLength": 10,
+                    "maxLength": 10,
+                    "pattern": r"^0x04[0-9a-fA-F]{6}$",
+                },
+                "type_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[A-Za-z0-9_$<>./+`-]{1,256}$",
+                },
+                "field_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[A-Za-z0-9_$<>.`-]{1,256}$",
+                },
+                "offset": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "length": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+            },
+            ("sample_sha256",),
+            "Read a bounded range from one .NET FieldRVA static data field",
+        ),
     }
-    return {
+    schemas: dict[str, Mapping[str, Any]] = {
         name: {
             "$schema": JSON_SCHEMA_2020_12,
             "type": "object",
@@ -208,6 +242,21 @@ def _tool_schemas() -> dict[str, Mapping[str, Any]]:
         }
         for name, (properties, required, title) in specs.items()
     }
+    field_data_schema = dict(schemas["field.data.read"])
+    field_data_schema["oneOf"] = [
+        {
+            "properties": {"field_token": {}},
+            "required": ["field_token"],
+            "additionalProperties": True,
+        },
+        {
+            "properties": {"type_name": {}, "field_name": {}},
+            "required": ["type_name", "field_name"],
+            "additionalProperties": True,
+        },
+    ]
+    schemas["field.data.read"] = field_data_schema
+    return schemas
 
 
 class _DotnetToolAdapter(ToolAdapter):
@@ -235,6 +284,7 @@ class _DotnetToolAdapter(ToolAdapter):
             "references.imports": "references",
             "strings.list": "strings",
             "resources.list": "resources",
+            "field.data.read": "field_data",
         }[name]
 
     @property
@@ -267,14 +317,26 @@ class _DotnetToolAdapter(ToolAdapter):
                 else "dotnet_worker_unavailable",
             )
 
+        if self._operation == "field_data":
+            selector_error = _validate_field_data_arguments(arguments)
+            if selector_error is not None:
+                return ToolResult(
+                    ToolInvocationStatus.POLICY_DENIED,
+                    message=selector_error,
+                )
+
         identity = await self._canonical_sample(context.investigation_id, sample_sha256)
         if isinstance(identity, str):
-            return ToolResult(
+            identity_status = (
                 ToolInvocationStatus.UNAVAILABLE
                 if identity.endswith("unavailable")
-                else ToolInvocationStatus.POLICY_DENIED,
+                else ToolInvocationStatus.POLICY_DENIED
+            )
+            return ToolResult(
+                identity_status,
                 message=identity,
             )
+
         association_id, sample_id, blob_id, size_bytes = identity
         if size_bytes > min(
             _MAX_SAMPLE_BYTES, self._settings.analysis_local_monodis_max_sample_bytes
@@ -282,7 +344,16 @@ class _DotnetToolAdapter(ToolAdapter):
             return ToolResult(ToolInvocationStatus.POLICY_DENIED, message="dotnet_sample_too_large")
 
         params: dict[str, str] = {"operation": self._operation}
-        for key in ("method_rid", "offset", "limit", "max_chars"):
+        for key in (
+            "method_rid",
+            "field_token",
+            "type_name",
+            "field_name",
+            "offset",
+            "length",
+            "limit",
+            "max_chars",
+        ):
             value = arguments.get(key)
             if value is not None:
                 params[key] = str(value)
@@ -345,7 +416,9 @@ class _DotnetToolAdapter(ToolAdapter):
         result_json_chunks = _text_chunks(result_json, _RESULT_JSON_CHUNK_CHARS)
         operator_result, response_truncated = normalize_native_data(
             persisted_result,
-            max_output_bytes=_OPERATOR_RESULT_BYTES,
+            max_output_bytes=(
+                16 * 1024 if self._operation == "field_data" else _OPERATOR_RESULT_BYTES
+            ),
             max_items=MAX_NATIVE_RESULT_ITEMS,
         )
         worker_status = str(raw_result.get("status", "FAILED")).upper()
@@ -364,14 +437,19 @@ class _DotnetToolAdapter(ToolAdapter):
         engine_value = raw_result.get("engine")
         engine = (
             engine_value
-            if isinstance(engine_value, str) and engine_value in {"ilspycmd", "monodis-fallback"}
+            if isinstance(engine_value, str)
+            and engine_value in {"ilspycmd", "monodis-fallback", "pefile-field-rva"}
             else "monodis"
         )
         version_value = raw_result.get("version")
         engine_version = version_value if isinstance(version_value, str) and version_value else None
         if engine == "ilspycmd" and engine_version is None:
             engine_version = ILSPYCMD_VERSION
-        if engine_version is None and local_command_family is not None:
+        if (
+            engine_version is None
+            and local_command_family is not None
+            and engine != "pefile-field-rva"
+        ):
             engine_version = local_command_family.version
         observation: dict[str, Any] = {
             "schema_version": "dotnet-analysis-observation.v1",
@@ -384,7 +462,7 @@ class _DotnetToolAdapter(ToolAdapter):
                 "engine": engine,
                 "version": engine_version,
                 "monodis_version": local_command_family.version
-                if local_command_family is not None
+                if local_command_family is not None and engine != "pefile-field-rva"
                 else None,
             },
             "result": operator_result,
@@ -396,6 +474,8 @@ class _DotnetToolAdapter(ToolAdapter):
             "result_truncated_by_operator_response": response_truncated or result_truncated_by_tool,
             "limitations": list(_LIMITATIONS),
         }
+        if self._operation == "field_data":
+            observation["invocation_ref"] = context.idempotency_key
         identity_payload = json.dumps(
             {"tool": self._name, "arguments": dict(arguments)},
             sort_keys=True,
@@ -465,7 +545,12 @@ class _DotnetToolAdapter(ToolAdapter):
             observation_refs=(recorded.id,),
             budget_consumed={BudgetDimension.TOOL_SECONDS: elapsed},
             output=output,
-            message=f"dotnet_analysis_{analysis_status}",
+            message=(
+                str(raw_result["detail_code"])
+                if invocation_status is ToolInvocationStatus.POLICY_DENIED
+                and isinstance(raw_result.get("detail_code"), str)
+                else f"dotnet_analysis_{analysis_status}"
+            ),
         )
 
     async def _canonical_sample(
@@ -509,6 +594,35 @@ def _sanitize_json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_sanitize_json_value(item) for item in value[:MAX_NATIVE_RESULT_ITEMS]]
     return value
+
+
+def _validate_field_data_arguments(arguments: Mapping[str, Any]) -> str | None:
+    token = arguments.get("field_token")
+    type_name = arguments.get("type_name")
+    field_name = arguments.get("field_name")
+    if token is not None:
+        if type_name is not None or field_name is not None or not isinstance(token, str):
+            return "dotnet_field_selector_invalid"
+        if _FIELD_TOKEN.fullmatch(token) is None:
+            return "dotnet_field_selector_invalid"
+    elif (
+        not isinstance(type_name, str)
+        or not isinstance(field_name, str)
+        or _FIELD_TYPE_NAME.fullmatch(type_name) is None
+        or _FIELD_NAME.fullmatch(field_name) is None
+    ):
+        return "dotnet_field_selector_invalid"
+    offset = arguments.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 0xFFFFFFFF:
+        return "dotnet_field_offset_invalid"
+    length = arguments.get("length")
+    if length is not None and (
+        isinstance(length, bool) or not isinstance(length, int) or length < 1
+    ):
+        return "dotnet_field_length_invalid"
+    if isinstance(length, int) and length > _FIELD_DATA_MAX_BYTES:
+        return "dotnet_field_data_length_exceeds_cap"
+    return None
 
 
 def _result_exceeds_sanitizer_limits(value: Any) -> bool:
