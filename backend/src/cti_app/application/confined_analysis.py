@@ -188,9 +188,7 @@ class ConfinedAnalysisRequest:
             }:
                 raise ValueError("dotnet operation is invalid")
             offset_max = 0xFFFFFFFF if parameters["operation"] == "field_data" else 10**7
-            if "offset" in parameters and not _bounded_decimal(
-                parameters["offset"], 0, offset_max
-            ):
+            if "offset" in parameters and not _bounded_decimal(parameters["offset"], 0, offset_max):
                 raise ValueError("dotnet output offset is invalid")
             if "limit" in parameters and not _bounded_decimal(parameters["limit"], 1, 200):
                 raise ValueError("dotnet result limit is invalid")
@@ -234,8 +232,7 @@ class ConfinedAnalysisRequest:
                 ):
                     raise ValueError("dotnet field length is invalid")
             elif any(
-                key in parameters
-                for key in ("field_token", "type_name", "field_name", "length")
+                key in parameters for key in ("field_token", "type_name", "field_name", "length")
             ):
                 raise ValueError("dotnet field parameters require field_data")
         if self.tool is ConfinedAnalysisTool.LOCAL_COMMAND:

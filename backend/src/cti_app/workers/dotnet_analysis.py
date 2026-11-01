@@ -136,6 +136,8 @@ class _FieldDataError(ValueError):
     def __init__(self, detail_code: str) -> None:
         super().__init__(detail_code)
         self.detail_code = detail_code
+
+
 _SUBPROCESS_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "LANG": "C",
@@ -433,15 +435,11 @@ def _read_field_data(payload: bytes, parameters: Mapping[str, str]) -> dict[str,
         ):
             raise _FieldDataError("dotnet_field_selector_invalid")
 
-        field_offset_value = _field_parameter_int(
-            parameters, "offset", 0, 0xFFFFFFFF, default=0
-        )
+        field_offset_value = _field_parameter_int(parameters, "offset", 0, 0xFFFFFFFF, default=0)
         if field_offset_value is None:
             raise _FieldDataError("dotnet_field_offset_invalid")
         field_offset = field_offset_value
-        requested_length = _field_parameter_int(
-            parameters, "length", 1, 0xFFFFFFFF, required=False
-        )
+        requested_length = _field_parameter_int(parameters, "length", 1, 0xFFFFFFFF, required=False)
         if requested_length is not None and requested_length > _FIELD_DATA_MAX_BYTES:
             raise _FieldDataError("dotnet_field_data_length_exceeds_cap")
 
@@ -538,9 +536,7 @@ def _read_field_data(payload: bytes, parameters: Mapping[str, str]) -> dict[str,
                     # FieldRVA gives an address, not an extent. Report the end
                     # only when the field's explicit value-type layout supplied it.
                     "field_end_exclusive": (
-                        first_offset + field_type_size
-                        if field_type_size is not None
-                        else None
+                        first_offset + field_type_size if field_type_size is not None else None
                     ),
                     "read_start": read_offset,
                     "read_end_exclusive": read_offset + len(raw),
@@ -613,9 +609,7 @@ def _field_parameter_int(
     return parsed
 
 
-def _rva_to_file_offset(
-    pe: Any, file_size: int, rva: int, length: int
-) -> tuple[int, str, int]:
+def _rva_to_file_offset(pe: Any, file_size: int, rva: int, length: int) -> tuple[int, str, int]:
     if (
         isinstance(rva, bool)
         or not isinstance(rva, int)
@@ -652,8 +646,7 @@ def _rva_to_file_offset(
         if min(virtual_address, virtual_size, raw_size, raw_offset) < 0:
             raise _FieldDataError("dotnet_field_pe_sections_invalid")
         if any(
-            value > 0xFFFFFFFF
-            for value in (virtual_address, virtual_size, raw_size, raw_offset)
+            value > 0xFFFFFFFF for value in (virtual_address, virtual_size, raw_size, raw_offset)
         ):
             raise _FieldDataError("dotnet_field_pe_sections_invalid")
         virtual_end = virtual_address + span
@@ -965,9 +958,7 @@ def _select_field(
         matches = [item for item in fields if item["rid"] == field_rid]
     else:
         matches = [
-            item
-            for item in fields
-            if item["type_name"] == type_name and item["name"] == field_name
+            item for item in fields if item["type_name"] == type_name and item["name"] == field_name
         ]
     if not matches:
         raise _FieldDataError("dotnet_field_not_found")

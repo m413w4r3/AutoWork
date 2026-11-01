@@ -60,12 +60,8 @@ def _field_data_image(*, with_layout: bool = True) -> bytes:
             1,
         )
     )
-    tables.extend(
-        struct.pack("<IHHHHH", 0, owner_type_name, 0, 0, 1, 1)
-    )
-    tables.extend(
-        struct.pack("<IHHHHH", 0x00100000, data_type_name, 0, 5, 2, 1)
-    )
+    tables.extend(struct.pack("<IHHHHH", 0, owner_type_name, 0, 0, 1, 1))
+    tables.extend(struct.pack("<IHHHHH", 0x00100000, data_type_name, 0, 5, 2, 1))
     tables.extend(struct.pack("<HHH", 0x0016, field_name, 1))
     if with_layout:
         tables.extend(struct.pack("<HIH", 1, 16, 3))
