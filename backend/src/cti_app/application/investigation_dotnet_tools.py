@@ -64,7 +64,7 @@ _TOOL_SECONDS = 60
 _MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 _FIELD_DATA_MAX_BYTES = 4096
 _FIELD_TOKEN = re.compile(r"^0x04[0-9a-fA-F]{6}$")
-_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>./+`-]{1,256}$")
+_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>{}./+`-]{1,256}$")
 _FIELD_NAME = re.compile(r"^[A-Za-z0-9_$<>.`-]{1,256}$")
 _LIMITATIONS = (
     "Lecture statique uniquement : le code de l'assembly n'est ni chargé ni exécuté.",
@@ -216,7 +216,7 @@ def _tool_schemas() -> dict[str, Mapping[str, Any]]:
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256,
-                    "pattern": r"^[A-Za-z0-9_$<>./+`-]{1,256}$",
+                    "pattern": r"^[A-Za-z0-9_$<>{}./+`-]{1,256}$",
                 },
                 "field_name": {
                     "type": "string",

@@ -101,6 +101,9 @@ from cti_app.domain.investigation import (
     thaw_json,
 )
 
+_DOCUMENTED_PROTOCOL_FACT_LIMIT = 48
+_EDITORIAL_CONSULTATION_TYPES = frozenset({"draft_text", "review_text"})
+_SAMPLE_HASH_OBJECT_TYPES = frozenset({"sample", "file", "sample_observation", "sha256"})
 ADVISOR_TOOL_NAME = "advisor.consult"
 ADVISOR_SCHEMA_VERSION = "advisor-consult.v1"
 ADVISOR_REPARSE_TOOL_NAME = "advisor.reparse"
@@ -332,6 +335,10 @@ class InvestigationAdvisorTool:
             if restricted_ids.intersection(protected_refs):
                 return no_context_cost
             evidence = tuple(item for item in evidence if item.id not in restricted_ids)
+            if consultation_type not in _EDITORIAL_CONSULTATION_TYPES:
+                evidence, _omitted = await self._split_unassociated_hash_observations(
+                    context.investigation_id, evidence, protected_refs
+                )
             prompt_data = await self._consultation_data(
                 consultation_type=consultation_type,
                 investigation_id=context.investigation_id,
@@ -733,6 +740,14 @@ class InvestigationAdvisorTool:
                         )
                     ),
                 )
+            unassociated_hash_evidence: tuple[EvidenceObservation, ...] = ()
+            if consultation_type not in _EDITORIAL_CONSULTATION_TYPES:
+                (
+                    evidence,
+                    unassociated_hash_evidence,
+                ) = await self._split_unassociated_hash_observations(
+                    context.investigation_id, evidence, protected_refs
+                )
             prompt_data = await self._consultation_data(
                 consultation_type=consultation_type,
                 investigation_id=context.investigation_id,
@@ -743,6 +758,28 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            if unassociated_hash_evidence:
+                prompt_data["_disclosure_omissions"] = [
+                    *prompt_data.get("_disclosure_omissions", ()),
+                    *(
+                        {
+                            "kind": "observation",
+                            "id": str(item.id),
+                            "sha256": item.sha256,
+                            "source_ref": {
+                                "kind": "observation",
+                                "id": str(item.id),
+                                "sha256": item.sha256,
+                            },
+                            "reason": (
+                                "Intentionally omitted: not disclosable under current policy "
+                                "because its sample hash is not associated with this "
+                                "investigation."
+                            ),
+                        }
+                        for item in unassociated_hash_evidence
+                    ),
+                ]
             if restricted_evidence:
                 existing_omissions = list(prompt_data.get("_disclosure_omissions", ()))
                 existing_omissions.extend(
@@ -4143,6 +4180,62 @@ class InvestigationAdvisorTool:
             )
         return rows
 
+    async def _documented_protocol_model_facts(
+        self, observation: EvidenceObservation, summary: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Expose a persisted protocol model as facts that keep their evidence status.
+
+        A model derived from code is ``documented_not_observed``: it supports an
+        experimental, untested network draft, never a claim of observed traffic. Each fact
+        carries the model's validation status so the consultation cannot present it as a
+        capture measurement.
+        """
+        model_sha256 = summary.get("model_sha256")
+        try:
+            model_blob_id = UUID(str(summary.get("model_blob_id")))
+        except ValueError:
+            return []
+        if not isinstance(model_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", model_sha256) is None:
+            return []
+        raw = await self._artifact_store.read_bytes(
+            model_blob_id,
+            max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+        )
+        if hashlib.sha256(raw).hexdigest() != model_sha256:
+            return []
+        model = json.loads(raw)
+        if not isinstance(model, Mapping):
+            return []
+        status = str(model.get("validation_status", "unresolved"))
+        facts: list[dict[str, Any]] = []
+
+        def add(kind: str, item: object) -> None:
+            if len(facts) >= _DOCUMENTED_PROTOCOL_FACT_LIMIT:
+                return
+            rendered = json.dumps(
+                {"validation_status": status, "observed": status == "observed", "item": item},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            facts.append(
+                {
+                    "kind": f"documented_{kind}",
+                    "value": rendered[:2_000],
+                    "evidence_blob_id": str(observation.blob_id),
+                }
+            )
+
+        add(
+            "transport",
+            {"protocol": model.get("protocol"), "transport": model.get("transport")},
+        )
+        for key in ("endpoints", "messages", "fields", "transitions", "characteristics"):
+            values = model.get(key)
+            for item in values if isinstance(values, (list, tuple)) else ():
+                add(key, item)
+        return facts
+
     async def _measured_protocol_facts(
         self, observation: EvidenceObservation
     ) -> list[dict[str, Any]]:
@@ -4164,6 +4257,8 @@ class InvestigationAdvisorTool:
         payload = json.loads(raw)
         if not isinstance(payload, Mapping):
             return []
+        if payload.get("schema") == "ProtocolModelV1":
+            return await self._documented_protocol_model_facts(observation, payload)
         result = payload.get("result", payload)
         if not isinstance(result, Mapping):
             return []
@@ -4627,6 +4722,40 @@ class InvestigationAdvisorTool:
                     }
                 )
         return rows
+
+    async def _split_unassociated_hash_observations(
+        self,
+        investigation_id: UUID,
+        evidence: tuple[EvidenceObservation, ...],
+        protected_refs: set[UUID],
+    ) -> tuple[tuple[EvidenceObservation, ...], tuple[EvidenceObservation, ...]]:
+        """Separate file-hash observations whose sample is not associated with this investigation.
+
+        Provider search results leave such observations behind. The external-effect
+        coordinator refuses a model submission that cites them, so an automatic dossier
+        omits them (recorded in the manifest, like the editorial path). An observation the
+        operator cited explicitly stays, which keeps the coordinator's decision visible.
+        """
+        association_list = getattr(self._sample_associations, "list_for_investigation", None)
+        if not callable(association_list):
+            return evidence, ()
+        associated = {
+            association.sample_sha256 for association in await association_list(investigation_id)
+        }
+        kept: list[EvidenceObservation] = []
+        omitted: list[EvidenceObservation] = []
+        for item in evidence:
+            object_hash = item.object_id.casefold()
+            if (
+                item.id not in protected_refs
+                and item.object_type.casefold() in _SAMPLE_HASH_OBJECT_TYPES
+                and re.fullmatch(r"[0-9a-f]{64}", object_hash) is not None
+                and object_hash not in associated
+            ):
+                omitted.append(item)
+            else:
+                kept.append(item)
+        return tuple(kept), tuple(omitted)
 
     async def _restricted_sample_hashes(
         self,

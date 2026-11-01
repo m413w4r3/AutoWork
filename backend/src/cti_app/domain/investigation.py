@@ -384,6 +384,8 @@ _SECRET_KEY = re.compile(
     r"(?:^|[_-])(api[_-]?key|token|secret|password|authorization|credential|cookie|signature)(?:$|[_-])",
     re.IGNORECASE,
 )
+# ECMA-335 metadata tokens (0x04xxxxxx) are table/row handles, not credentials.
+_NON_SECRET_TOKEN_KEYS = frozenset({"field_token", "method_token"})
 _SIGNED_QUERY = re.compile(
     r"(?:[?&](?:x-amz-[^=]+|signature|sig|token|access_token|expires)=)", re.IGNORECASE
 )
@@ -396,7 +398,7 @@ def _validate_safe_parameters(value: Any, path: str = "parameters") -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("Normalized parameter keys must be strings")
-            if _SECRET_KEY.search(key.replace(" ", "_")):
+            if key not in _NON_SECRET_TOKEN_KEYS and _SECRET_KEY.search(key.replace(" ", "_")):
                 raise ValueError(f"{path}.{key} may contain a secret")
             _validate_safe_parameters(item, f"{path}.{key}")
     elif isinstance(value, (list, tuple)):

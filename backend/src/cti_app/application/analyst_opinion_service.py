@@ -1676,11 +1676,13 @@ class OperatorOpinionToolAdapter:
             )
         except (TypeError, ValueError) as exc:
             code = "invalid_note_anchor" if "anchor" in str(exc).casefold() else "invalid_opinion"
+            # Domain validation messages are fixed sentences about the contract, never content.
+            detail = " ".join(str(exc).split())[:200]
             return ToolResult(
                 ToolInvocationStatus.FAILED,
                 error_code=code,
-                output={"error_code": code},
-                message=code,
+                output={"error_code": code, **({"detail": detail} if detail else {})},
+                message=f"{code}: {detail}" if detail else code,
             )
 
     async def _compose(

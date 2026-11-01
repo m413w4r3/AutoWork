@@ -781,6 +781,9 @@ def _classify_advisor_warnings(result: dict[str, Any] | None) -> dict[str, Any] 
     if (
         classified.get("consultation_type") == "yara_draft"
         and classified.get("normalization_method") == "local_yara_prose_v1"
+    ) or (
+        classified.get("consultation_type") == "suricata_draft"
+        and classified.get("normalization_method") == "local_suricata_prose_v1"
     ):
         for warning in ("status_missing",):
             if warning in classification["blocking"]:
@@ -1802,10 +1805,29 @@ def _parse_typed_advisor_wire(
             fact_refs = list(
                 dict.fromkeys(ref for item in suricata_invariants for ref in item["fact_refs"])
             )
+        # Bridge usually answers in prose. Keep the rule it wrote when it cites the dossier
+        # (``[F2]`` facts, or ``[E7]`` evidence that carries facts); the draft stays untested.
+        prose_recovery = not document.has_header and source is not None
+        if prose_recovery and not fact_refs:
+            cited = {match.upper() for match in re.findall(r"\[\s*([FEfe][1-9][0-9]*)\s*\]", raw)}
+            cited_evidence_ids = {
+                str(item.get("id"))
+                for alias, item in aliases["evidence"].items()
+                if alias in cited and isinstance(item, Mapping)
+            }
+            for alias, fact in aliases["facts"].items():
+                fact_id = fact.get("fact_id")
+                if isinstance(fact_id, str) and (
+                    alias in cited or str(fact.get("evidence_id")) in cited_evidence_ids
+                ):
+                    if fact_id not in fact_refs:
+                        fact_refs.append(fact_id)
         if not fact_refs:
             warn("fact_references_missing")
+        elif prose_recovery and not suricata_invariants:
+            warn("invariants_missing")
         limits = limitations()
-        if source is None or not fact_refs or not suricata_invariants:
+        if source is None or not fact_refs or (not suricata_invariants and not prose_recovery):
             return _partial_typed_wire(
                 common,
                 warnings,
@@ -1825,6 +1847,7 @@ def _parse_typed_advisor_wire(
             "invariants": suricata_invariants,
             "limitations": limits,
             "normalization_status": "partial" if warnings else "complete",
+            **({"normalization_method": "local_suricata_prose_v1"} if prose_recovery else {}),
             "warnings": warnings,
             "usable": True,
         }

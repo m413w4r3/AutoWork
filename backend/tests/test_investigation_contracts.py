@@ -775,6 +775,31 @@ def test_context_rejects_signed_urls_and_secret_fields() -> None:
         )
 
 
+def test_context_accepts_cli_metadata_token_keys_but_rejects_other_token_keys() -> None:
+    def build(key: str) -> InvestigationContextV1:
+        return InvestigationContextV1(
+            view="full",
+            investigation_id=uuid4(),
+            source=_source(),
+            article=ArticleContextV1(
+                short_summary="Summary",
+                claims=(),
+                documented_samples=(),
+                known_chain=({key: "0x04000082"},),
+                open_questions=(),
+            ),
+            investigation=_investigation(),
+            available_tools=(),
+        )
+
+    assert build("field_token").article.known_chain[0]["field_token"] == "0x04000082"
+    assert build("method_token").article.known_chain[0]["method_token"] == "0x04000082"
+    with pytest.raises(ValueError, match="secret"):
+        build("access_token")
+    with pytest.raises(ValueError, match="secret"):
+        build("session_token")
+
+
 def test_context_rejects_signed_url_values() -> None:
     with pytest.raises(ValueError, match="signed URL"):
         InvestigationContextV1(

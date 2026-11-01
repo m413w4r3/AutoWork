@@ -80,7 +80,7 @@ _OPERATIONS = frozenset(
     }
 )
 _FIELD_TOKEN = re.compile(r"^0x04[0-9a-fA-F]{6}$")
-_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>./+`-]{1,256}$")
+_FIELD_TYPE_NAME = re.compile(r"^[A-Za-z0-9_$<>{}./+`-]{1,256}$")
 _FIELD_NAME = re.compile(r"^[A-Za-z0-9_$<>.`-]{1,256}$")
 
 _CODED_INDEX_TABLES: dict[str, tuple[int, tuple[int, ...]]] = {

@@ -447,3 +447,34 @@ async def _get_investigation(requested_id, expected_id, subject_id):
 
 async def _return(value):
     return value
+
+
+def test_dotnet_tool_schemas_pass_the_operator_context_secret_filter() -> None:
+    from cti_app.application.investigation_contracts import _reject_disallowed_payload
+    from cti_app.application.investigation_dotnet_tools import _tool_schemas
+
+    for name, schema in _tool_schemas().items():
+        _reject_disallowed_payload(schema, f"payload.available_tools.{name}.arguments_schema")
+
+
+def test_operator_payload_filter_accepts_metadata_token_but_not_credentials() -> None:
+    from cti_app.application.operator_tool_invocation import _require_safe_operator_payload
+
+    _require_safe_operator_payload({"sample_sha256": "a" * 64, "field_token": "0x04000072"})
+    _require_safe_operator_payload(
+        {"type_name": "<PrivateImplementationDetails>{0A1B2C3D-0000-0000-0000-000000000000}"}
+    )
+    with pytest.raises(ValueError):
+        _require_safe_operator_payload({"access_token": "x"})
+    with pytest.raises(ValueError):
+        _require_safe_operator_payload({"session_token": "x"})
+
+
+def test_domain_parameter_filter_accepts_metadata_token_but_not_credentials() -> None:
+    from cti_app.domain.investigation import _validate_safe_parameters
+
+    _validate_safe_parameters({"sample_sha256": "a" * 64, "field_token": "0x04000072"})
+    with pytest.raises(ValueError, match="secret"):
+        _validate_safe_parameters({"access_token": "x"})
+    with pytest.raises(ValueError, match="secret"):
+        _validate_safe_parameters({"session_token": "x"})

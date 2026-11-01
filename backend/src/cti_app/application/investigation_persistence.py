@@ -40,9 +40,7 @@ class VersionConflictError(RuntimeError):
 
 
 class ToolInvocationRepository(Protocol):
-    def lock_operation_prefix(
-        self, operation_prefix: str
-    ) -> AbstractAsyncContextManager[None]: ...
+    def lock_operation_prefix(self, operation_prefix: str) -> AbstractAsyncContextManager[None]: ...
 
     async def get(self, invocation_id: UUID) -> ToolInvocation | None: ...
 

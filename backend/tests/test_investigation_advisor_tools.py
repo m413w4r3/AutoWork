@@ -9206,3 +9206,122 @@ async def test_observation_sample_reference_check_loads_each_blob_once() -> None
 
     assert first == again
     assert loads == 1
+
+
+@pytest.mark.parametrize("consultation_type", ["plan_investigation", "yara_draft"])
+@pytest.mark.asyncio
+async def test_non_editorial_dossier_omits_unassociated_file_hash_observation(
+    consultation_type: str,
+) -> None:
+    investigation_id = uuid4()
+    associated_hash, unassociated_hash = "a" * 64, "b" * 64
+    associated, associated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": associated_hash,
+            "strings": [{"value": "SharedMarker", "offset": 64}],
+            "summary": "SharedMarker is visible in the associated sample; AssociatedOnlyMarker.",
+        },
+    )
+    unassociated, unassociated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": unassociated_hash,
+            "strings": [{"value": "SharedMarker", "offset": 64}],
+            "summary": "SharedMarker is visible in a provider hit; UnassociatedOnlyMarker.",
+        },
+    )
+    unassociated = replace(unassociated, object_type="file", object_id=unassociated_hash)
+    transport = Transport(
+        lambda call: TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=(
+                typed_yara_response(
+                    call["prompt"], rule_source='rule R { strings: $a = "x" condition: $a }'
+                )
+                if consultation_type == "yara_draft"
+                else "Synthetic advisory plan."
+            ),
+            bridge_invocation_id=str(uuid4()),
+        )
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=associated,
+        raw=associated_raw,
+    )
+    install_advisor_evidence(
+        tool,
+        (associated, unassociated),
+        {associated.blob_id: associated_raw, unassociated.blob_id: unassociated_raw},
+        associated_sample_hashes=(associated_hash,),
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": consultation_type,
+            "question": "Compare SharedMarker across the sample observations.",
+        },
+        make_context(investigation_id, key=f"operator:advisor:unassociated-{consultation_type}"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    provenance = result.output["bridge_provenance"]
+    assert not any(item["id"] == str(unassociated.id) for item in provenance["input_refs"])
+    assert "UnassociatedOnlyMarker" not in transport.calls[0]["prompt"]
+    omission = next(
+        item
+        for item in provenance["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(unassociated.id)
+    )
+    assert omission["required"] is False
+    assert any(
+        row["status"] == "INTENTIONALLY_OMITTED"
+        and "not associated with this investigation" in row["reason"]
+        for row in omission["statuses"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_suricata_draft_accepts_documented_protocol_model_with_its_status() -> None:
+    investigation_id = uuid4()
+    model = {
+        "schema_version": "ProtocolModelV1",
+        "validation_status": "documented_not_observed",
+        "protocol": "https",
+        "transport": "tcp",
+        "endpoints": [{"host": "api.github.com", "port": 443}],
+        "messages": [{"name": "contents_put", "method": "PUT"}],
+    }
+    model_raw = json.dumps(model, sort_keys=True).encode("utf-8")
+    model_blob_id = uuid4()
+    summary = {
+        "schema": "ProtocolModelV1",
+        "model_blob_id": str(model_blob_id),
+        "model_sha256": hashlib.sha256(model_raw).hexdigest(),
+        "summary": {"validation_status": "documented_not_observed"},
+    }
+    observation, raw = make_observation(investigation_id, summary)
+    observation = replace(observation, object_type="protocol_model")
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Draft."))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._artifact_store.values[model_blob_id] = model_raw
+
+    result = await tool.execute(
+        {"consultation_type": "suricata_draft", "evidence_refs": [str(observation.id)]},
+        make_context(investigation_id, key="operator:advisor:documented-model"),
+    )
+
+    assert result.output.get("preflight_status") != "INSUFFICIENT_EVIDENCE", result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "api.github.com" in prompt
+    assert "documented_not_observed" in prompt

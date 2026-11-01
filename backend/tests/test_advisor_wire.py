@@ -1162,6 +1162,44 @@ def test_suricata_wire_preserves_multiline_source_and_local_hash() -> None:
     assert parsed["status"] == "succeeded"
 
 
+def test_suricata_prose_reply_keeps_its_rule_when_it_cites_a_dossier_fact() -> None:
+    fact = {"fact_id": "nf001", "field": "documented_endpoints", "value": "api.github.com"}
+    source = (
+        'alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"SNI candidate"; flow:established,'
+        'to_server; tls.sni; content:"api.github.com"; nocase; sid:9901101; rev:2;)\n'
+    )
+    prose = (
+        "## Proposition Suricata\n\nRègle expérimentale, non testée. Le SNI est étayé par "
+        "l'analyse statique [F1].\n\n```suricata\n" + source + "```\n"
+    )
+    uncited = prose.replace("[F1]", "")
+    prompt_data = {"network_facts": [fact]}
+
+    parsed = parse_typed_advisor_response(
+        prose,
+        consultation_type="suricata_draft",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+    refused = parse_typed_advisor_response(
+        uncited,
+        consultation_type="suricata_draft",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["rule_source"] == source
+    assert parsed["fact_refs"] == ["nf001"]
+    assert parsed["normalization_method"] == "local_suricata_prose_v1"
+    assert "wire_header_missing" in parsed["warnings"]
+    assert not parsed["warning_classification"]["blocking"], parsed["warning_classification"]
+    assert refused is not None
+    assert refused["usable"] is False
+    assert "fact_references_missing" in refused["warnings"]
+
+
 def test_draft_wire_rejects_unknown_assertion_alias_as_a_unit_blocker() -> None:
     observation_id = str(uuid4())
     assertion = {

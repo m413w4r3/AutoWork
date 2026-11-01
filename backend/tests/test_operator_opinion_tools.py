@@ -358,3 +358,45 @@ def test_compose_and_revise_schemas_describe_bounded_protocol_figure_selection()
         "implant_materials": [typed_row],
     }
     validate_json_schema(compose_payload, definitions["opinion.compose"].input_schema)
+
+
+@pytest.mark.asyncio
+async def test_revise_reports_why_a_bridge_draft_reference_is_invalid() -> None:
+    investigation_id = uuid4()
+    opinion = current_opinion(investigation_id)
+    service = OpinionService(opinion)
+    adapter = OperatorOpinionToolAdapter(
+        service=service,
+        investigations=SimpleNamespace(),
+        article_snapshots=ArticleSnapshots(()),
+    )
+
+    result = await adapter.execute(
+        {
+            "action": "revise",
+            "opinion_id": str(opinion.id),
+            "expected_opinion_version": opinion.version,
+            "expected_opinion_sha256": opinion.content_sha256,
+            "blocks": [
+                {
+                    "block_type": "key_findings",
+                    "text": "A reworded statement that Bridge did not write verbatim.",
+                    "certainty": 0.9,
+                    "qualification": "fact",
+                    "finding_refs": [str(uuid4())],
+                    "evidence_refs": [str(uuid4())],
+                    "bridge_authored": True,
+                    "bridge_draft_ref": {
+                        "text_sha256": hashlib.sha256(b"the whole Bridge answer").hexdigest(),
+                        "invocation_id": str(uuid4()),
+                    },
+                }
+            ],
+        },
+        context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "invalid_opinion"
+    assert result.output["detail"] == "Bridge draft reference does not match opinion text"
+    assert service.revision is None

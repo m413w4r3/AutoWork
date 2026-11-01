@@ -104,6 +104,8 @@ _SECRET_FIELD = re.compile(
     r"token|secret|password|authorization|credential|cookie)",
     re.I,
 )
+# ECMA-335 metadata tokens (0x04xxxxxx) are table/row handles, not credentials.
+_NON_SECRET_TOKEN_FIELDS = frozenset({"field_token", "method_token"})
 _CREDENTIAL_TEXT = re.compile(
     r"(?:bearer\s+[A-Za-z0-9._~-]{20,}|(?:api[_-]?key|access[_-]?token|secret|"
     r"password|authorization)\s*[:=]\s*\S+)",
@@ -2216,7 +2218,11 @@ def _bounded_json_value(value: Any, *, max_bytes: int = 32 * 1024) -> Any:
 def _require_safe_operator_payload(value: Any) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
-            if isinstance(key, str) and _SECRET_FIELD.search(key):
+            if (
+                isinstance(key, str)
+                and key not in _NON_SECRET_TOKEN_FIELDS
+                and _SECRET_FIELD.search(key)
+            ):
                 raise ValueError("Sensitive tool argument is not accepted")
             _require_safe_operator_payload(item)
     elif isinstance(value, list | tuple):

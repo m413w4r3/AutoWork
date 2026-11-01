@@ -42,6 +42,8 @@ _SECRET_FIELD = re.compile(
     r"token|secret|password|authorization|credential|cookie)",
     re.I,
 )
+# ECMA-335 metadata tokens (0x04xxxxxx) are table/row handles, not credentials.
+_NON_SECRET_TOKEN_FIELDS = frozenset({"field_token", "method_token"})
 _SIGNED_URL = re.compile(r"[?&](?:x-amz-[^=]+|x-goog-[^=]+|signature|sig|access_token)=", re.I)
 _logger = logging.getLogger(__name__)
 _WIRE_MARKER = re.compile(r"^\s*@@\s*([A-Za-z_]+)\s*@@\s*$")
@@ -584,7 +586,7 @@ def _reject_disallowed_payload(value: Any, path: str = "payload") -> None:
         raise ValueError(f"{path} cannot contain bytes")
     if isinstance(value, Mapping):
         for key, item in value.items():
-            if _SECRET_FIELD.search(str(key)):
+            if str(key) not in _NON_SECRET_TOKEN_FIELDS and _SECRET_FIELD.search(str(key)):
                 raise ValueError(f"{path}.{key} may contain a secret")
             _reject_disallowed_payload(item, f"{path}.{key}")
     elif isinstance(value, (tuple, list)):
