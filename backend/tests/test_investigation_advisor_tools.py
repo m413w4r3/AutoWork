@@ -9325,3 +9325,43 @@ async def test_suricata_draft_accepts_documented_protocol_model_with_its_status(
     prompt = transport.calls[0]["prompt"]
     assert "api.github.com" in prompt
     assert "documented_not_observed" in prompt
+
+
+@pytest.mark.asyncio
+async def test_editorial_sample_inventory_avoids_unrequested_whole_binary_bytes() -> None:
+    investigation_id = uuid4()
+    sample_content = bytes(range(256)) * 40
+    (
+        tool,
+        _transport,
+        observation,
+        sample_id,
+        association_id,
+        _blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(investigation_id, sample_content)
+
+    # This is a relevance selection for editorial/C2 use, not a sample-size cap.
+    rows = await tool._sample_inventory(
+        investigation_id,
+        (observation,),
+        make_context(investigation_id).envelope,
+        include_content=False,
+    )
+    assert len(rows) == 1
+    assert rows[0]["sample_id"] == str(sample_id)
+    assert rows[0]["association_id"] == str(association_id)
+    assert rows[0]["sha256"] == sample_hash
+    assert rows[0]["byte_length"] == len(sample_content)
+    assert rows[0]["content_base64"] == ""
+    assert rows[0]["content_status"] == "not_requested_for_consultation"
+    assert rows[0]["content_omission_reason"] == "whole_sample_not_needed_for_consultation"
+
+    full_rows = await tool._sample_inventory(
+        investigation_id,
+        (observation,),
+        make_context(investigation_id).envelope,
+        include_content=True,
+    )
+    assert full_rows[0]["content_status"] == "verified"
+    assert full_rows[0]["content_base64"] == base64.b64encode(sample_content).decode("ascii")

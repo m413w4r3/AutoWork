@@ -463,6 +463,37 @@ def _normalize_heuristic_draft(
     overall_text = safe_text(overall_text, len(overall_text) + 1)
     if not _review_text_is_useful(overall_text):
         return None
+    # A single explicitly requested target is unambiguous even when Bridge
+    # answers in free prose without a U1 marker. Preserve its EXACT text as
+    # one candidate block, rather than losing an otherwise usable draft.
+    # Multiple targets must never be assigned by response order or guesswork.
+    if len(units) == 1:
+        unit_id, unit = units[0]
+        return {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+            "consultation_type": "draft_text",
+            "status": "partial",
+            "untrusted": True,
+            "blocks": [
+                {
+                    "unit_id": unit_id,
+                    "block_type": unit.get("block_type"),
+                    "form": unit.get("form", "body"),
+                    "anchor": unit.get("anchor"),
+                    "sentences": [
+                        {"text": _bound_review_remark(overall_text), "assertion_ids": []}
+                    ],
+                    "warnings": ["unstructured_draft"],
+                    "usable": True,
+                    "assignment": "single_requested_unit",
+                }
+            ],
+            "summary": _bound_review_remark(overall_text),
+            "warnings": ["unstructured_draft"],
+            "normalization_status": "partial",
+            "unit_assignment_status": "single_requested_unit",
+            "usable": True,
+        }
     return {
         "schema": ADVISOR_RESPONSE_SCHEMA_V3,
         "consultation_type": "draft_text",

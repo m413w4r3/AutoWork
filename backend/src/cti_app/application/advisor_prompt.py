@@ -27,6 +27,18 @@ def render_advisor_prompt(consultation_type: str, data: Mapping[str, Any]) -> st
         legacy_target = data.get("review_text")
         targets = [legacy_target] if isinstance(legacy_target, Mapping) else []
     if targets:
+        if consultation_type == "draft_text":
+            lines.extend(
+                [
+                    "RÉDACTION PAR UNITÉ : chaque unité demandée constitue une section "
+                    "distincte de la réponse en prose.",
+                    "Commencer chaque section par son identifiant EXACT (par exemple "
+                    "'U1 — Faits clés'), puis le texte rédigé. Ne pas remplacer U1/U2 "
+                    "par des titres numérotés génériques.",
+                    "Ne pas fusionner deux unités ni répartir une réponse par leur "
+                    "ordre supposé. Les citations [E#] restent attachées aux phrases.",
+                ]
+            )
         lines.append("TEXTE CIBLE:")
         for index, target in enumerate(targets, start=1):
             if not isinstance(target, Mapping):
@@ -165,6 +177,8 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
         guidance = [
             "Rédiger un brouillon lisible à partir des éléments présents.",
             "Conserver les références de preuve disponibles à côté des affirmations concernées.",
+            "Pour une section ciblée, reproduire en tête son alias U1/U2 tel que demandé, "
+            "sans déplacer les propos vers une autre rubrique.",
             "Ce brouillon est consultatif et ne modifie aucune version d\u2019avis canonique.",
         ]
         if not isinstance(assertions, (list, tuple)) or not assertions:
@@ -176,7 +190,11 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
     if consultation_type == "yara_draft":
         return [
             ("Placer toute règle YARA proposée, complète, dans un bloc clôturé ```yara."),
-            ("Expliquer en prose les marqueurs qui la justifient et les limites des mesures."),
+            ("Ancrer chaque motif prétendu mesuré dans les octets/mesures et alias "
+            "effectivement fournis. Un motif jokerisé extrapolé peut être proposé "
+            "comme hypothèse mais pas présenté comme une mesure vérifiée."),
+            ("La critique de règle et les idées d'invariants restent utiles même "
+            "si une nouvelle source YARA ne peut pas encore être canonisée."),
             "Ne pas exécuter, téléverser, analyser, ou appeler d\u2019outil.",
         ]
     if consultation_type == "suricata_draft":

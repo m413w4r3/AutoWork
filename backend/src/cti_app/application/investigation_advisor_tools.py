@@ -3539,7 +3539,7 @@ class InvestigationAdvisorTool:
                             matching_sample["content_omission_reason"] = (
                                 "included_as_cited_observation_fragment"
                             )
-                    else:
+                    elif matching_sample.get("content_status") != "not_requested_for_consultation":
                         evidence_row["blob_read_failure_reason"] = _sample_blob_failure_reason(
                             matching_sample.get("content_status")
                         )

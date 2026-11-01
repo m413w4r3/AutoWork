@@ -22,13 +22,13 @@ Conserver pour les motifs retenus leur source (sample, observation et région/fe
 
 Comparer plusieurs échantillons **si disponibles et utiles**, et élargir ensuite par pivot VT ou similarité. Ne jamais inventer de mesures ou de références pour satisfaire un validateur.
 
-## 3. Consultation Bridge : si utile
+## 3. Consultation Bridge : critique et production, sans rituel
 
-Employer advisor.consult avec consultation yara_draft si disponible et pertinente. Le dossier ciblé contient objectif en prose, faits observés et refs autorisées, motifs envisagés, absences de couverture, contre-exemples et objectif de généralisation.
+Utiliser `advisor.consult` avec `yara_draft` dès qu'une critique des marqueurs, de la condition ou des faux positifs possibles peut améliorer une première candidate : inutile d'attendre goodware et holdout. Le dossier ciblé contient règle actuelle, motifs **mesurés**, références canoniques, périmètre (spécimen/groupe) et question concrète. Des consultations de `pivot_strategy` peuvent aussi aider à rechercher de nouveaux échantillons. Aucune obligation de multiplier les tours.
 
 Demander à Bridge de critiquer spécificité, fragilité, faux positifs, conditions et propositions de règle **en prose / code YARA selon le contrat**, jamais de répondre en JSON ou de mettre la réponse dans un bloc JSON. Un contrat Bridge ou parseur peut produire des résultats partiels ; ne pas considérer un statut succeeded comme validation sémantique.
 
-Ne répéter aucune soumission ambiguë ; si une réponse persistée est mal interprétée, envisager advisor.reparse avec sa version de schéma réellement annoncée, sans nouvel effet externe.
+Une critique peut être exploitable **même si la règle proposée par Bridge n'est pas canonisable** : un motif jokerisé non relié au catalogue reste une proposition non mesurée ; employer la critique pour corriger une condition YARA sur des motifs locaux vérifiés, puis tester via le workbench. `rule.propose_bridge` demande une source persistée et les références exactes, pas une citation imaginaire. En cas de `measurements_invalid`, regarder `measurement_errors` (forme acceptée : `content_pattern_id` OU quartet `blob_id, kind, offset, value`). Ne répéter aucune soumission ambiguë ; si le texte a été persisté mais mal parsé, envisager `advisor.reparse` sans nouvel envoi.
 
 ## 4. Enregistrer et tester
 
