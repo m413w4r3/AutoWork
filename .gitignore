@@ -80,6 +80,7 @@ evidence_packs/
 
 !.codex
 !.agents
+!.codegraph
 
 # Local diagnostic trail: raw model answers and parser decisions.
 # Never commit — it mirrors external model output verbatim.
