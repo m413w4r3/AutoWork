@@ -2257,6 +2257,18 @@ class InvestigationAdvisorTool:
             output={
                 "advisor_status": "invalid_input",
                 "input_error_code": reason_code,
+                "detail_code": reason_code,
+                **(
+                    {
+                        "correction": (
+                            "Choose one verified content_pattern_id or a measured "
+                            "blob_id/kind/offset/value quartet from the current catalogue; "
+                            "see measurement_errors for the rejected indices and shapes."
+                        )
+                    }
+                    if reason_code == "measurements_invalid"
+                    else {}
+                ),
                 "failure_stage": "pre_transport_validation",
                 "failure_reason": reason_code,
                 **(
