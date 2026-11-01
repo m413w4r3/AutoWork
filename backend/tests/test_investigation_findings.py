@@ -8,9 +8,11 @@ import pytest
 
 from cti_app.application.investigation_contracts import ArticleClaimV1
 from cti_app.application.investigation_findings import (
+    SUPPORTED_OBJECT_LIMITATION,
     ClaimVerdict,
     FindingDowngradeReason,
     FindingService,
+    constrain_supported_assessment,
 )
 from cti_app.application.investigation_persistence import (
     InMemoryEvidenceObservationRepository,
@@ -53,6 +55,37 @@ def _observation(investigation_id, marker: str) -> EvidenceObservation:
         object_id="203.0.113.7",
         limitations=("Passive observation does not establish attribution.",),
     )
+
+
+def test_dotnet_observation_object_identity_downgrades_sample_subject_finding() -> None:
+    investigation_id = uuid4()
+    sample_sha256 = "a" * 64
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="b" * 64,
+        source="dotnet.ilspy",
+        source_version="ilspy-v1",
+        observed_at=datetime(2026, 10, 13, tzinfo=UTC),
+        object_type="dotnet_analysis",
+        object_id=f"{sample_sha256}:method.decompile:{'c' * 64}",
+    )
+
+    assessment, limitations = constrain_supported_assessment(
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        subject_ref=sample_sha256,
+        claim_refs=(),
+        observations=(observation,),
+        limitations=(),
+    )
+
+    assert observation.object_type == "dotnet_analysis"
+    assert observation.object_id == f"{sample_sha256}:method.decompile:{'c' * 64}"
+    assert observation.object_id != sample_sha256
+    assert assessment is FindingAssessment.QUALIFIED
+    assert limitations == (SUPPORTED_OBJECT_LIMITATION,)
 
 
 @pytest.mark.asyncio

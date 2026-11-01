@@ -54,6 +54,20 @@ refusent octets, champs de secrets et URLs signées. `AgentTurnDecisionV1` garde
 les arguments de tool libres : seul le schéma JSON réellement enregistré les
 valide dans `RegistryToolDispatcher`.
 
+Les lignes `sample_deltas` du contexte v1 sont des objets permissifs
+(`dict[str, Any]` côté backend) : le contrat accepte donc des clés de ligne
+additives et aucun type dédié côté frontend ne filtre leurs champs. Leur champ
+`analysis_status` conserve une sémantique étroite : `analyzed` signifie qu’une
+observation canonique a été reliée à une invocation `ghidra.*` ou
+`sample.analyze`; il ne résume pas toutes les observations statiques locales.
+`local_activity` expose séparément les invocations terminées `local.*` et les
+outils statiques .NET connus quand leurs paramètres normalisés portent le SHA
+du sample associé et qu’elles référencent au moins une observation de la même
+enquête. Le champ ne contient que des comptes par nom d’outil, des IDs
+d’observation bornés à huit et des compteurs de troncature ; il ne copie ni
+texte d’outil ni contenu d’observation. Les noms d’outil sont limités à 128
+caractères et à seize entrées.
+
 `InMemoryToolRegistry` rend visibles les outils dont l’adaptateur et la capacité
 sont présents. Ajouter ou retirer un tool ne change pas le dispatcher. Une
 capacité absente ou un tool inconnu rend `unavailable` localement ; permissions,
