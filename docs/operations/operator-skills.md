@@ -70,3 +70,4 @@ La sélection des consultations Bridge, les formes de mesures valides, les règl
 ## Règles de maintenance
 
 Un skill sert de routeur **méthodologique**, jamais de duplication d'un schéma backend ou d'une liste exhaustive de noms d'outils. Après évolution du backend, tester les déclencheurs et les cas réels avant d'éditer les guides. Conserver les règles de preuve et de gouvernance dans leurs contrats canoniques, sans les réécrire contradictoirement ici.
+Pour la dernière vérification opérationnelle avant archivage de R3, voir [le prompt de validation CTI et Bridge](cti-final-operational-validation-prompt.md) ; il mesure les livrables sans imposer de quotas de consultations.

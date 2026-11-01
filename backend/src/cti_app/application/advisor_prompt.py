@@ -26,6 +26,12 @@ def render_advisor_prompt(consultation_type: str, data: Mapping[str, Any]) -> st
     if not isinstance(targets, (list, tuple)):
         legacy_target = data.get("review_text")
         targets = [legacy_target] if isinstance(legacy_target, Mapping) else []
+    if data.get("measurement_selection_fallback") is True:
+        lines.append(
+            "MESURES : sélection facultative ignorée (candidats non vérifiés ou format "
+            "incorrect). Utiliser uniquement les mesures canoniques vérifiées et les "
+            "preuves citées dans le dossier ; ne pas présenter les motifs exclus comme mesurés."
+        )
     if targets:
         if consultation_type == "draft_text":
             lines.extend(

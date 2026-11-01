@@ -3335,12 +3335,9 @@ class InvestigationAdvisorTool:
         elif consultation_type == "yara_draft":
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")
-            if candidates is not None:
-                measurements = self._select_verified_measurements(
-                    measurements, candidates, content_patterns=content_patterns
-                )
-            else:
-                measurements = self._select_discriminating_measurements(measurements)
+            measurements, selection_fallback = self._advisory_measurement_selection(
+                measurements, candidates, content_patterns=content_patterns
+            )
             measurements = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -3355,7 +3352,10 @@ class InvestigationAdvisorTool:
                 "evidence": base["evidence"],
                 "measured_facts": base["measured_facts"],
                 "measurements": measurements,
-                "explicit_measurement_selection": candidates is not None,
+                "explicit_measurement_selection": (
+                    candidates is not None and not selection_fallback
+                ),
+                "measurement_selection_fallback": selection_fallback,
                 "tools": tool_inventory,
                 "candidate_rules": candidate_rules,
                 "gaps": base["gaps"],
@@ -3459,17 +3459,17 @@ class InvestigationAdvisorTool:
         ):
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")
-            if candidates is not None:
-                measurements = self._select_verified_measurements(
-                    measurements, candidates, content_patterns=content_patterns
-                )
-            elif consultation_type == "pivot_strategy" or measurements:
-                measurements = self._select_discriminating_measurements(measurements)
+            measurements, selection_fallback = self._advisory_measurement_selection(
+                measurements, candidates, content_patterns=content_patterns
+            )
             base["measurements"] = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
-            base["explicit_measurement_selection"] = candidates is not None
+            base["explicit_measurement_selection"] = (
+                candidates is not None and not selection_fallback
+            )
+            base["measurement_selection_fallback"] = selection_fallback
         # Retain sample identity and provenance without attaching complete
         # binaries to a Suricata, editorial or figure consultation by default.
         # This is task-relevance selection, not a Bridge prompt size limit.
@@ -4381,6 +4381,31 @@ class InvestigationAdvisorTool:
             identity = (item.get("blob_id"), item.get("kind"), item.get("offset"), value)
             unique.setdefault(identity, item)
         return list(unique.values())
+
+    @classmethod
+    def _advisory_measurement_selection(
+        cls,
+        verified: list[dict[str, Any]],
+        candidates: object,
+        *,
+        content_patterns: Mapping[str, list[dict[str, Any]]] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Keep optional selection mistakes from blocking a Bridge conversation.
+
+        Invalid, unverified candidates are never forwarded. Only independently
+        verified catalogue measurements may replace them. This changes advice
+        preparation, not the provenance rules of the YARA workbench.
+        """
+        if candidates is None:
+            return cls._select_discriminating_measurements(verified), False
+        try:
+            return cls._select_verified_measurements(
+                verified, candidates, content_patterns=content_patterns
+            ), False
+        except _AdvisorInputValidationError as exc:
+            if exc.reason_code != "measurements_invalid":
+                raise
+            return cls._select_discriminating_measurements(verified), True
 
     @staticmethod
     def _select_verified_measurements(

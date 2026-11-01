@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
@@ -603,6 +604,28 @@ def _review_text_values(value: object) -> list[str]:
     return []
 
 
+def _human_review_target(value: str) -> str:
+    # Match an explicitly named section, never its guessed response position.
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return re.sub(r"[^a-z0-9]+", " ", "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )).strip()
+
+
+_REVIEW_TARGET_LABELS = {
+    "key_findings": ("faits cles", "key findings"),
+    "additional_samples": ("echantillons supplementaires", "additional samples"),
+    "infection_chain_and_capabilities": (
+        "chaine infection et capacites", "chaine d infection et capacites",
+        "infection chain and capabilities",
+    ),
+    "network_and_infrastructure": ("reseau et infrastructure", "network and infrastructure"),
+    "claim_verification": ("verification d une affirmation", "claim verification"),
+    "proposed_detections": ("detections proposees", "proposed detections"),
+    "uncertainties_and_next_leads": ("incertitudes et pistes suivantes", "uncertainties and next leads"),
+}
+
+
 def _resolve_review_unit(
     label: object, units: list[tuple[str, Mapping[str, Any]]], order_index: int
 ) -> tuple[str | None, str]:
@@ -626,6 +649,13 @@ def _resolve_review_unit(
                 str(unit.get("anchor", "")).casefold(),
             }:
                 return unit_id, "block_type_or_anchor"
+        named = _human_review_target(re.sub(r"^\\d+[.)]\\s*", "", candidate))
+        matches = [
+            unit_id for unit_id, unit in units
+            if named in _REVIEW_TARGET_LABELS.get(str(unit.get("block_type")), ())
+        ]
+        if len(matches) == 1:
+            return matches[0], "named_target"
     if 0 <= order_index < len(units):
         return units[order_index][0], "order"
     return None, "order"

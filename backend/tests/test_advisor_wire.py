@@ -2282,3 +2282,48 @@ def test_draft_prompt_requests_literal_unit_headings_in_prose() -> None:
     assert "Ne pas remplacer U1/U2" in prompt
     assert "U1 — Faits clés" in prompt
     assert prompt.index("Ne pas remplacer U1/U2") < prompt.index("FAITS TRANSMIS")
+
+
+def test_yara_dossier_keeps_measured_bytes_and_article_context() -> None:
+    evidence_id = str(uuid4())
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Détecter api.github.com et le motif 4d5a observé.",
+            "article_sha256": "a" * 64,
+            "article_passages": [
+                {
+                    "claim_id": "S1P1",
+                    "heading": "Canal GitHub",
+                    "text": "L'article décrit un canal api.github.com à vérifier.",
+                }
+            ],
+            "evidence": [
+                {
+                    "evidence_id": evidence_id,
+                    "sha256": "b" * 64,
+                    "source": "sample.analysis",
+                    "object_type": "file",
+                    "content_excerpts": [
+                        {"title": "Chaînes décodées", "text": "api.github.com"},
+                    ],
+                }
+            ],
+            "measurements": [
+                {
+                    "measurement_id": "m001",
+                    "evidence_id": evidence_id,
+                    "evidence_sha256": "b" * 64,
+                    "sample_sha256": "c" * 64,
+                    "kind": "hex",
+                    "offset": 0,
+                    "value": "4d5a",
+                }
+            ],
+        }
+    )
+    assert "api.github.com" in dossier.text
+    assert "4d5a" in dossier.text
+    assert "offset 0" in dossier.text
+    assert "Canal GitHub" in dossier.text
+    assert any(row["kind"] == "measurement" for row in dossier.manifest)
