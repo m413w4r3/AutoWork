@@ -41,7 +41,9 @@ Bridge doit être utilisé utilement pour **stratégie de pivot, analyse critiqu
 
 - Ne pas assimiler « déployé » à « commité ». Sur le **main distant audité**, les correctifs M11 cités plus haut existent, mais le contenu du working tree hôte n'est pas visible par ce connecteur.
 - Sur l'hôte : consulter `git status --porcelain=v1`, `git diff --stat`, `git diff --cached --stat`, `git log -5 --oneline`, et l'inventaire des fichiers non suivis. Commettre ou archiver toute modification souhaitée **avant** nettoyage.
-- Ne pas nettoyer `.autowork-runs/m11`, les observations, le relais et les artefacts non exportés tant que la réconciliation des invocations et leur sauvegarde ne sont pas effectuées.
+- **`make clean` est un reset de données, pas un `git clean`** : le Makefile appelle `scripts/ops/safe_local_reset.py`, qui vise les volumes `postgres_data`, `redis_data`, `minio_data`, `var/diagnostics/runs`, `var/workspaces/editions`, `var/workspaces/subjects` et le journal d'événements local.
+- Le garde existant `run_started` **refuse** ce reset dès qu'une enveloppe G2 ou une invocation a été persistée ; `--confirm-initial-reset` ne le désactive pas. Sur une base contenant R3/M11, `make clean` devrait donc refuser, ce qui est à vérifier sur le statut réel ; ne pas le contourner sous prétexte de lancer une nouvelle livraison.
+- Avant de démarrer une nouvelle livraison, décider d'un chemin distinct d'**export/archivage des observations et données**, puis de réinitialisation autorisée ou d'environnement séparé. Ne pas nettoyer `.autowork-runs/m11`, les artefacts non exportés ou un relais actif avant réconciliation et sauvegarde.
 - Fusionner ou reprendre explicitement la PR d'audit et vérifier un checkout propre de la révision souhaitée. GitHub seul ne prouve ni l'état des conteneurs, ni la sauvegarde des runs, ni l'absence de correctifs locaux supplémentaires.
 
 **Non-objectifs :** pas de modification des garde-fous G2/TLP, de la politique de provenance, de l'extension `chatgpt-bridge`, ni d'autorisation d'effets externes supplémentaires.
