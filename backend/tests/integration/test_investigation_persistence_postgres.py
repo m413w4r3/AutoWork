@@ -606,6 +606,76 @@ async def test_concurrent_operation_key_replay_creates_one_invocation(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_operation_prefix_lock_serializes_separate_postgres_sessions(
+    migrated_postgres_url: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    investigation = await _make_investigation(session_factory)
+    prefix = f"operator:{uuid4().hex}:"
+    operation_key = f"{prefix}{uuid4().hex}"
+    invocation = ToolInvocation(
+        investigation_id=investigation.id,
+        operation_key=operation_key,
+        tool_name="sample.analyze",
+        schema_version="1",
+        normalized_parameters={"query": "independent local sample"},
+        purpose="verify cross-session operation-prefix admission",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    first_locked = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    second_locked = asyncio.Event()
+    prior: ToolInvocation | None = None
+
+    async def first_worker() -> None:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            async with uow.tool_invocations.lock_operation_prefix(prefix):
+                await uow.tool_invocations.add_if_absent(invocation)
+                first_locked.set()
+                await release_first.wait()
+                await uow.commit()
+
+    async def second_worker() -> None:
+        nonlocal prior
+        await first_locked.wait()
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            second_started.set()
+            async with uow.tool_invocations.lock_operation_prefix(prefix):
+                prior = next(
+                    (
+                        item
+                        for item in await uow.tool_invocations.list_for_investigation(
+                            investigation.id
+                        )
+                        if item.operation_key.startswith(prefix)
+                    ),
+                    None,
+                )
+                second_locked.set()
+                await uow.commit()
+
+    first_task = asyncio.create_task(first_worker())
+    second_task = asyncio.create_task(second_worker())
+    try:
+        await first_locked.wait()
+        await second_started.wait()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(second_locked.wait(), timeout=1)
+    finally:
+        release_first.set()
+    try:
+        await asyncio.gather(first_task, second_task)
+        assert second_locked.is_set()
+        assert prior == invocation
+        assert prior.operation_key == operation_key
+    finally:
+        await engine.dispose()
+
+
 async def _make_investigation(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AnalystInvestigation:

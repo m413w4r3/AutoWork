@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlsplit
@@ -94,6 +95,19 @@ _LEGACY_SCHEMA_V1_TOOLS = frozenset(
         HYPOTHESIS_DECLARE_TOOL,
     }
 )
+_ANALYTIC_WRITE_TOOL_NAMES = frozenset(
+    {
+        HYPOTHESIS_DECLARE_TOOL,
+        "experiment.record",
+        "rule.propose",
+        "rule.propose_bridge",
+        "rule.operator_syntax_fix",
+        "rule.revise",
+        "rule.propose_from_candidates",
+        "sample.set_qualification",
+    }
+)
+_ANALYTIC_WRITE_TOOL_PREFIXES = ("finding.", "opinion.")
 
 _SECRET_FIELD = re.compile(
     r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|bearer|"
@@ -206,6 +220,20 @@ _SIGNED_QUERY = frozenset(
     }
 )
 _ACTIVE_OPERATOR_INVOCATIONS: dict[str, asyncio.Lock] = {}
+
+
+@asynccontextmanager
+async def _lock_operation_prefix(
+    invocations: Any, operation_prefix: str
+) -> AsyncIterator[None]:
+    lock_factory = getattr(invocations, "lock_operation_prefix", None)
+    if not callable(lock_factory):
+        yield
+        return
+    async with lock_factory(operation_prefix):
+        yield
+
+
 _ADDITIONAL_CONTEXT_ITEM_SECTIONS = frozenset(
     {
         "finding_versions",
@@ -518,6 +546,19 @@ def _stale_working_state_error(
             ),
         },
     )
+
+
+def _uses_nonblocking_local_freshness(tool_name: str, definition: Any | None) -> bool:
+    """Allow an older state token for local tools that do not write analytics."""
+    if (
+        definition is None
+        or definition.effect not in {ToolEffect.LOCAL_READ, ToolEffect.LOCAL_COMPUTE}
+        or definition.capability_key == "operator.write"
+        or tool_name in _ANALYTIC_WRITE_TOOL_NAMES
+        or tool_name.startswith(_ANALYTIC_WRITE_TOOL_PREFIXES)
+    ):
+        return False
+    return True
 
 
 def _operator_reconciliation_path(investigation_id: UUID, invocation: ToolInvocation) -> str:
@@ -1012,18 +1053,19 @@ class OperatorToolInvocationService:
         operation_key = f"{operation_prefix}{payload_digest}"
         lock = _ACTIVE_OPERATOR_INVOCATIONS.setdefault(operation_prefix, asyncio.Lock())
         async with lock:
-            return await self._invoke_locked(
-                tool_name=tool_name,
-                schema_version=schema_version,
-                arguments=arguments,
-                purpose=purpose,
-                expected_version=expected_version,
-                expected_sha256=expected_sha256,
-                operation_prefix=operation_prefix,
-                operation_key=operation_key,
-                trace=trace,
-                actor_id=actor_id,
-            )
+            async with _lock_operation_prefix(self._invocations, operation_prefix):
+                return await self._invoke_locked(
+                    tool_name=tool_name,
+                    schema_version=schema_version,
+                    arguments=arguments,
+                    purpose=purpose,
+                    expected_version=expected_version,
+                    expected_sha256=expected_sha256,
+                    operation_prefix=operation_prefix,
+                    operation_key=operation_key,
+                    trace=trace,
+                    actor_id=actor_id,
+                )
 
     def _canonical_schema_version(self, tool_name: str, schema_version: str) -> str:
         """Accept the operator API's legacy generic v1 for typed operator tools.
@@ -1136,6 +1178,12 @@ class OperatorToolInvocationService:
     ) -> tuple[FrameworkPreSubmissionProof | None, str | None]:
         return await self._execution._framework_pre_submission_proof(invocation)
 
+    async def _reacquire_operation_prefix_lock(self, operation_prefix: str) -> None:
+        # Reconciliation can commit before a fresh invocation row exists. A
+        # transaction-scoped database lock must be reacquired after that commit.
+        async with _lock_operation_prefix(self._invocations, operation_prefix):
+            pass
+
     async def _invoke_locked(
         self,
         *,
@@ -1154,11 +1202,15 @@ class OperatorToolInvocationService:
         if state is None:
             raise OperatorToolInvocationError("investigation_not_started", 409)
         self._require_operator_mode(state.execution_mode)
-        if (
-            state.version == expected_version
+        registered = self._registry.get(tool_name, schema_version)
+        definition = registered[0] if registered is not None else None
+        nonblocking_local_freshness = _uses_nonblocking_local_freshness(tool_name, definition)
+        stale_hint = expected_version > state.version or (
+            expected_version == state.version
             and expected_sha256 is not None
             and state.sha256 != expected_sha256
-        ):
+        )
+        if stale_hint:
             raise _stale_working_state_error(expected_version, expected_sha256, state)
         investigation = await self._investigations.get(self._investigation_id)
         if investigation is None:
@@ -1171,8 +1223,6 @@ class OperatorToolInvocationService:
             snapshot, envelope
         )
         advisor_disclosure_denied = tool_name == "advisor.consult" and not advisor_external_allowed
-        registered = self._registry.get(tool_name, schema_version)
-        definition = registered[0] if registered is not None else None
         requires_external_disclosure = definition is not None and definition.effect in {
             ToolEffect.EXTERNAL_READ,
             ToolEffect.ACQUIRE,
@@ -1286,6 +1336,7 @@ class OperatorToolInvocationService:
                     uncertain=False,
                 )
                 await self._execution.commit_current_uow()
+                await self._reacquire_operation_prefix_lock(operation_prefix)
                 continue
             if existing.status is ToolInvocationStatus.NEEDS_REVIEW and trusted_passive_read:
                 # A passive VT GET can safely be attempted under a fresh
@@ -1293,6 +1344,7 @@ class OperatorToolInvocationService:
                 # coordinator still checks current authority, disclosure and
                 # budget before each physical request.
                 await self._settle_passive_read_reservation(existing)
+                await self._reacquire_operation_prefix_lock(operation_prefix)
                 continue
             details = _ambiguous_invocation_details(
                 existing,
@@ -1330,17 +1382,22 @@ class OperatorToolInvocationService:
         ):
             raise OperatorToolInvocationError("external_disclosure_denied", 403)
 
-        if state.version != expected_version or (
-            expected_sha256 is not None and state.sha256 != expected_sha256
+        if not nonblocking_local_freshness and (
+            state.version != expected_version
+            or (expected_sha256 is not None and state.sha256 != expected_sha256)
         ):
             raise _stale_working_state_error(expected_version, expected_sha256, state)
 
         record_purpose = purpose
         checkpoint = trace.get("checkpoint") if isinstance(trace, Mapping) else None
         guidance = None
+        guidance_state_version = state.version
         try:
-            operator_context = await self.get_context(expected_version=state.version)
+            operator_context = await self.get_context(
+                expected_version=None if nonblocking_local_freshness else state.version
+            )
             guidance = operator_context.context.advisor_guidance
+            guidance_state_version = operator_context.working_state_version
         except OperatorToolInvocationError as exc:
             if exc.code == "stale_working_state":
                 raise
@@ -1364,7 +1421,7 @@ class OperatorToolInvocationService:
         if guidance is not None:
             due_reason = guidance.reason if guidance.checkpoint_due else None
             expected_checkpoint_id = (
-                f"{due_reason}@{state.version}" if due_reason is not None else None
+                f"{due_reason}@{guidance_state_version}" if due_reason is not None else None
             )
             if isinstance(checkpoint, Mapping) and tool_name != "advisor.consult":
                 checkpoint_id = checkpoint.get("id")
@@ -1410,7 +1467,7 @@ class OperatorToolInvocationService:
                 )
         elif tool_name == "advisor.consult" and checkpoint is None:
             checkpoint = {
-                "id": f"operator_requested@{state.version}",
+                "id": f"operator_requested@{guidance_state_version}",
                 "status": "denied" if advisor_denial_reason else "consulted",
                 **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
             }
@@ -1437,9 +1494,11 @@ class OperatorToolInvocationService:
                     recommendation=trace.get("recommendation"),
                 )
 
-        updated_state = state.with_operator_tool_action(
-            f"operator_tool:{tool_name}:{operation_key[-16:]}"
-        )
+        updated_state = state
+        if not nonblocking_local_freshness:
+            updated_state = state.with_operator_tool_action(
+                f"operator_tool:{tool_name}:{operation_key[-16:]}"
+            )
         declaration_authorized = (
             tool_name == HYPOTHESIS_DECLARE_TOOL
             and schema_version == HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION
@@ -1476,15 +1535,16 @@ class OperatorToolInvocationService:
                         updated_state,
                         hypotheses=(*state.hypotheses, hypothesis),
                     )
-        try:
-            updated_state = await self._states.save_if_version(
-                updated_state, expected_version=state.version
-            )
-        except (VersionConflictError, InvestigationStateVersionConflict):
-            current_state = await self._states.get(self._investigation_id)
-            raise _stale_working_state_error(
-                expected_version, expected_sha256, current_state
-            ) from None
+        if not nonblocking_local_freshness:
+            try:
+                updated_state = await self._states.save_if_version(
+                    updated_state, expected_version=state.version
+                )
+            except (VersionConflictError, InvestigationStateVersionConflict):
+                current_state = await self._states.get(self._investigation_id)
+                raise _stale_working_state_error(
+                    expected_version, expected_sha256, current_state
+                ) from None
 
         budget = (
             envelope.budget
@@ -1529,10 +1589,13 @@ class OperatorToolInvocationService:
                 )
                 await self._execution.commit_current_uow()
             raise
+        response_state = updated_state
+        if nonblocking_local_freshness:
+            response_state = await self._states.get(self._investigation_id) or updated_state
         return await self._result(
             invocation,
-            updated_state.version,
-            updated_state.sha256,
+            response_state.version,
+            response_state.sha256,
             replay=False,
             tool_result=result,
             unavailable_reason=(

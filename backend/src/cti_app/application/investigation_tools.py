@@ -205,6 +205,7 @@ class ToolResult:
     exception_class: str | None = None
     error_code: str | None = None
     framework_pre_submission_proof: FrameworkPreSubmissionProof | None = None
+    idempotent_replay: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ToolInvocationStatus):
@@ -213,6 +214,8 @@ class ToolResult:
             self.framework_pre_submission_proof, FrameworkPreSubmissionProof
         ):
             raise TypeError("framework_pre_submission_proof must use FrameworkPreSubmissionProof")
+        if not isinstance(self.idempotent_replay, bool):
+            raise TypeError("idempotent_replay must be a bool")
         if not isinstance(self.output, Mapping):
             raise TypeError("output must be a JSON object")
         normalized: dict[BudgetDimension, int] = {}
