@@ -3522,9 +3522,7 @@ class ResearchContextBuilder:
             rows[association_id]["local_activity"] = {
                 "invocation_counts": dict(tool_counts[:MAX_SAMPLE_LOCAL_ACTIVITY_TOOLS]),
                 "observation_ids": observation_ids[:MAX_SAMPLE_LOCAL_ACTIVITY_OBSERVATIONS],
-                "truncated_tool_names": max(
-                    0, len(tool_counts) - MAX_SAMPLE_LOCAL_ACTIVITY_TOOLS
-                ),
+                "truncated_tool_names": max(0, len(tool_counts) - MAX_SAMPLE_LOCAL_ACTIVITY_TOOLS),
                 "truncated_observation_ids": max(
                     0, len(observation_ids) - MAX_SAMPLE_LOCAL_ACTIVITY_OBSERVATIONS
                 ),
