@@ -46,6 +46,15 @@ class StageSkillsTests(unittest.TestCase):
                 self.assertTrue(link.is_symlink())
                 self.assertTrue((link / "SKILL.md").is_file())
 
+    def test_rejects_symlinked_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            (workspace / "external").mkdir()
+            (workspace / ".agents").symlink_to("external", target_is_directory=True)
+            with self.assertRaises(ValueError):
+                module.stage(workspace)
+            self.assertEqual(list((workspace / "external").iterdir()), [])
+
     def test_existing_bundle_is_not_modified(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)
