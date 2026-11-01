@@ -1,19 +1,18 @@
 ---
 name: autowork-tool-strategy
-description: Choisir les capacités CTI réellement disponibles, vérifier schémas/prérequis/coûts, puis récupérer des erreurs CAS ou refus sans rejouer un effet ambigu. À utiliser en enquête avant un nouveau type d'outil ou après un échec.
+description: Choisir rapidement les outils CTI utiles à l'analyse, aux règles YARA/Suricata, aux pivots VT et au protocole C2, en récupérant les erreurs sans formalités superflues.
 ---
 
 # Stratégie d'outillage
 
 Ce skill n'est PAS un catalogue fixe. L'autorité est available_tools, unavailable_tools, blocked_capabilities, status et le schéma effectif de CETTE enquête. Un outil historique ne vaut pas permission actuelle.
 
-## Découverte et choix
+## Découverte proportionnée
 
-1. Lire status compact et les pages de available_tools avec le curseur et CAS exacts. Pour chaque candidat seulement : nom, schema_version, arguments required, effet, limites, coût et dépendances.
-2. Croiser available_pivots, indicator_inventory, documented_samples, sample_deltas et evidence_index. Un pivot « available » peut être refusé si ses références de provenance sont insuffisantes.
-3. Vérifier **pour cet objet exact** : association à l'enquête, octets en quarantaine, worker attesté, capacité du fournisseur, droits et budget.
-4. Distinguer GET de preuve, calcul local POST, lecture externe VT, acquisition et consultation Bridge. Un outil local peut créer des observations, consommer du budget et incrémenter le working state.
-5. Choisir le test qui peut changer la décision ; préférer la lecture canonique existante au calcul redondant et le calcul local à un appel externe si celui-ci suffit.
+1. Au début de la session, lire l'inventaire réel available_tools et les capacités importantes. Ensuite, consulter **seulement** le schéma de l'outil choisi lorsqu'il est inconnu, a changé ou refuse un argument ; éviter les relectures systématiques.
+2. Pour l'objet pertinent, vérifier association, octets, worker et droits uniquement si ce sont de vrais prérequis de l'appel. Le backend reste l'autorité d'admission et de budget ; ne pas inventer de nouvelle approbation, de limite de messages Bridge ni de quota par phase.
+3. Choisir la voie donnant un résultat métier : décoder des données, modéliser le C2, construire une candidate, rechercher une variante. Une lecture locale rapide est parfois préférable ; une recherche VT passive autorisée ou une consultation Bridge peut aussi être la meilleure prochaine action.
+4. Les outils locaux indépendants compatibles avec la logique M10 n'avancent pas nécessairement le working state ; les écritures analytiques, acquisitions et effets externes conservent leur contrat spécifique. Se baser sur le comportement réel, pas sur une règle uniforme « chaque POST incrémente le CAS ».
 
 ## Carte indicative à vérifier dans le registre
 
@@ -23,13 +22,13 @@ Ce skill n'est PAS un catalogue fixe. L'autorité est available_tools, unavailab
 | Statique PE/ELF | sample.get_feature_pack, sample.analyze, strings.list, local.run_command | Association + bytes + worker |
 | IL .NET | assembly.inspect, types.list, methods.list, method.decompile, resources.list, references.imports | Assembly managé, couverture de méthode |
 | Natif | ghidra.list_functions/imports, ghidra.xrefs, ghidra.decompile_function, ghidra.search | Service attesté, adresse valide |
-| Octets opaques | local.run_command avec commande xxd si annoncée | OFFSET FICHIER vérifié, taille bornée ; RVA ≠ offset |
+| Données .NET opaques | field.data.read si annoncé ; sinon local.run_command/xxd si offset connu | FieldRVA résolu par l'outil .NET, ou offset fichier établi ; RVA ≠ offset |
 | Archives | local.run_command zip_members/archive_list, archive.extract_member | Membre exact, hash et limites |
 | Similarité | samples.compare, features.common/explain, signatures.candidates | Samples comparables et mesures réelles |
 | VT | vt.file_report, vt.relationships, vt.behaviour, vt.intelligence_search | Source, G2/TLP, utilité du pivot |
-| Détection | rule.propose, rule.propose_bridge, rule.test, rule.compare | Workbench et corpus réellement disponibles |
+| YARA | rule.propose, rule.propose_bridge, rule.propose_from_candidates, rule.test, rule.compare | Candidate possible avec corpus incomplet ; statut selon résultats mesurés |
 | Bridge | advisor.consult, advisor.reparse | Dossier ciblé, droits, effet et coût |
-| Réseau | network.capture.inspect, network.stream.reassemble, network.protocol.* | Capture et provenance vérifiées |
+| C2 / Suricata | network.capture.inspect, network.stream.reassemble, network.messages.segment, network.protocol.*, network.suricata_*, advisor.consult (suricata_draft) | Analyse statique possible sans PCAP ; replay Suricata nécessite une capture associée et le moteur disponible |
 
 ## Réactions aux réponses
 
@@ -44,4 +43,4 @@ Ce skill n'est PAS un catalogue fixe. L'autorité est available_tools, unavailab
 
 Reporter les coûts fournisseur UNKNOWN si non mesurés ; ne pas transformer octets ou tokens estimés en facturation.
 
-**Oracle :** pour un blob .NET, essayer d'établir xxd et RVA→offset avant de demander un lecteur neuf ; pour un effet externe ambigu, aucun doublon n'est émis.
+**Oracle :** pour un champ .NET, découvrir field.data.read avant d'inventer un lecteur RVA ; un blocage YARA/Suricata ne bloque pas les autres pistes ; pour un effet externe ambigu, aucun doublon n'est émis.

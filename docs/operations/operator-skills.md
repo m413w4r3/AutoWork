@@ -1,12 +1,12 @@
 # Skills opérationnels CTI — lots 1 et 2
 
-**Statut : PROPOSED** — Guides statiques sans changement des politiques d'investigation. Intégration live à valider pour chaque runtime. Les contrats actifs et l'API prennent le pas sur les exemples de noms d'outils.
+**Statut : PROPOSED — révision anti-friction M11.** Guides métiers sans changement des politiques d'investigation. Intégration live à valider pour chaque runtime. Les contrats actifs et l'API prennent le pas sur les exemples de noms d'outils.
 
 ## Objectif
 
-Combler les lacunes observées durant M07–M09 : choix d'un outil de lecture binaire existant plutôt que demande d'un nouvel outil, hypothèses avant expérience, choix de pivots discriminants, finding atomique à partir de preuves, YARA non confondue avec validation de famille. Éviter le prompt géant de 60 outils : le registre dynamique available_tools, ses schémas, ses capabilities et ses blocked reasons sont la source de vérité.
+Favoriser **invariants techniques, règles YARA/Suricata candidates, description du protocole C2 et nouveaux échantillons**. Supprimer les obligations méthodologiques ajoutées sans nécessité : nombre minimal d'hypothèses/tests/pivots ; expérience ou finding à chaque lecture ; goodware et holdout préalables à la première candidate. L'inventaire available_tools, les schémas et les droits courants restent l'autorité.
 
-Les huit guides vivent dans .agents/skills et sont indexés dans .agents/skills/OPERATOR-CTI.md :
+Les neuf guides vivent dans .agents/skills et sont indexés dans .agents/skills/OPERATOR-CTI.md :
 - autowork-cti-investigation-loop
 - autowork-tool-strategy
 - autowork-artifact-triage
@@ -15,6 +15,7 @@ Les huit guides vivent dans .agents/skills et sont indexés dans .agents/skills/
 - autowork-dotnet-analysis
 - autowork-pe-native-analysis
 - autowork-yara-bridge-workflow
+- autowork-network-protocol-detection
 
 Les compétences métier sont génériques, sans constats historiques ni identifiants d'enquête embarqués. Les cas AppDomainManager et YARA M08 cités sont des exemples conceptuels, pas des résultats à injecter dans de nouvelles enquêtes.
 
@@ -32,7 +33,7 @@ Sur l'hôte d'orchestration autorisé, **avant de démarrer** l'opérateur :
 python3 scripts/ops/stage_operator_cti_skills.py --workspace /chemin/vers/session-autorisée
 ~~~
 
-Le script refuse d'écraser un bundle déjà présent. Il copie exclusivement les huit SKILL.md et crée un manifeste local contenant leurs SHA-256. Il ne lit pas les dossiers secrets, ne contacte aucun fournisseur et ne lit aucune trace d'investigation.
+Le script refuse d'écraser un bundle déjà présent. Il copie exclusivement les neuf SKILL.md et crée un manifeste local contenant leurs SHA-256. Il ne lit pas les dossiers secrets, ne contacte aucun fournisseur et ne lit aucune trace d'investigation.
 
 Pour une nouvelle session Claude Code, si son répertoire de travail est bien ce workspace, il est possible d'ajouter l'option --claude afin de créer des symlinks .claude/skills vers ce bundle. Pour Codex, vérifier la découverte .agents/skills sur la version installée ; un runtime CTI utilisant un autre mécanisme doit recevoir un pointeur explicite dans son prompt.
 
@@ -44,16 +45,17 @@ Dans le brief de la session, ajouter seulement : « Les guides métiers généri
 
 Tester avec fixtures ou replay hors ligne, sans appel de fournisseur live ni malware exécuté :
 
-1. **.NET opaque :** l'agent vérifie local.run_command/xxd et RVA→offset, lit les observations paginées si possible, n'invente pas de fonction d'extraction.
+1. **.NET opaque :** l'agent utilise field.data.read si offert ; xxd reste une alternative si un offset fichier est connu. Il valorise les octets pour invariants, YARA et pivots.
 2. **ETW :** un type AppDomainManager observé ne devient pas une désactivation ETW ou l'exécution de RuntimeBroker.exe.config ; un fait étroit peut être supported.
 3. **Pivots :** deux imports génériques partagés ne deviennent pas « même famille » ; l'agent choisit une comparaison discriminante.
 4. **Résultat VT empty :** conserve la couverture, ne conclut pas à une absence générale.
-5. **Expérience :** prédictions/hypothèses préalables, references canoniques et version de stream correctes.
-6. **YARA :** match unique sur spécimen de développement reste experimental/untested selon le rapport ; positives qualifiés, goodware et holdout nécessaires pour une validation plus forte.
+5. **Expérience :** la formalisation est correcte lorsqu'elle est utile ou requise par le contrat ; une inspection simple ne crée pas obligatoirement d'hypothèse, d'expérience ou de finding.
+6. **YARA :** première candidate possible avec un seul spécimen mesurable. Goodware et holdout renforcent la validation ultérieure mais ne sont pas prérequis à la rédaction/compilation.
 7. **Récupération :** ne double pas un POST ambigu ; corrige un CAS à partir d'une lecture de version.
-8. **Isolation :** un opérateur neuf découvre les guides, ne lit aucun ancien run, et conserve G2/TLP et l'API comme autorité.
+8. **C2 / Suricata :** sans capture, description statique du protocole et candidate non testée ; avec capture, validation/replay offline lorsque disponibles.
+9. **Isolation :** un opérateur neuf découvre les guides sans données d'une autre enquête et conserve G2/TLP et l'API comme autorité.
 
-Mesures utiles : choix de pivots discriminants, tentatives de commandes pertinentes, part de mutations rejetées, dédoublements évités, findings atomiques corrects, nombre de GET de statut redondants, coûts mesurés ou UNKNOWN. Ne pas mesurer la réussite au nombre de nouveaux IOCs ni de findings.
+Mesures utiles : invariants nouveaux, candidates YARA/Suricata produites, protocole C2 documenté, nouveaux candidats pertinents, règle améliorée grâce aux variantes et limites connues. Les scénarios de replay ci-dessus servent à mesurer la qualité des skills ; **ils ne constituent pas neuf formalités par investigation**.
 
 ## Validation automatique du paquet
 
@@ -61,7 +63,7 @@ Mesures utiles : choix de pivots discriminants, tentatives de commandes pertinen
 python3 scripts/ops/test_stage_operator_cti_skills.py
 ~~~
 
-Ce test contrôle la présence des huit guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
+Ce test contrôle la présence des neuf guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
 
 ## Règles de maintenance
 

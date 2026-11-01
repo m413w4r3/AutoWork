@@ -22,6 +22,7 @@ SKILL_NAMES = (
     "autowork-dotnet-analysis",
     "autowork-pe-native-analysis",
     "autowork-yara-bridge-workflow",
+    "autowork-network-protocol-detection",
 )
 
 
