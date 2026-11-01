@@ -56,6 +56,7 @@ separate approval and state/backup preflight.
 | Bridge advisor consultation preflight | [`advisor_preflight_catalog.md`](advisor_preflight_catalog.md) | ACTIVE_REFERENCE; reconcile with advisor code and G2/TLP guards |
 | CTI tools and loop | [`investigation_agent_loop.md`](investigation_agent_loop.md), [`investigation_operations.md`](investigation_operations.md), [`investigation_local_tools.md`](investigation_local_tools.md), [`investigation_rule_tools.md`](investigation_rule_tools.md), [`investigation_vt_tools.md`](investigation_vt_tools.md) | ACTIVE_REFERENCE; verify versions |
 | Operator-led workflows | [`operations/operator-playbook-medium.md`](operations/operator-playbook-medium.md) | ACTIVE_REFERENCE; verify deployment |
+| Operator CTI skill bundle (proposed) | [`operations/operator-skills.md`](operations/operator-skills.md) | PROPOSED; runtime loading and behavior gates pending |
 | Coding orchestration | [`operations/paseo-agent-orchestration.md`](operations/paseo-agent-orchestration.md) | ACTIVE_REFERENCE (recommended setup, not verified host config) |
 | Source collection | [`source_collection_and_evidence.md`](source_collection_and_evidence.md) | ACTIVE_REFERENCE; older workflow statements may be historical |
 | Other accepted ADRs | [`adr/`](adr/) | ACTIVE_REFERENCE unless expressly superseded; dated decisions must be interpreted in sequence |
