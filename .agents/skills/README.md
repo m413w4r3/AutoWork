@@ -24,6 +24,8 @@ Already installed AutoWork skills such as `autowork-ralph-gate` and
 Upstream optional skills `to-spec`, `tdd` and
 `setup-matt-pocock-skills` are not mandatory for these adaptations.
 
+**CTI operator skills (lots 1–2):** see [`OPERATOR-CTI.md`](OPERATOR-CTI.md) for the eight on-demand methodology and PE/YARA guides, plus [`docs/operations/operator-skills.md`](../../../docs/operations/operator-skills.md) for safe staging into an isolated investigation session. These are distinct from the curated coding skills above.
+
 Codex reads `.agents/skills/` in supporting versions. Claude Code's
 `.claude/skills/` directories point to the same files; no duplicate
 content. Paseo launches whichever provider's process loads these paths:
