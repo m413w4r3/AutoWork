@@ -729,7 +729,7 @@ async def test_available_pivots_and_exposed_families_execute_with_seeded_state()
 
 
 @pytest.mark.asyncio
-async def test_documented_download_is_available_executable_and_reports_ungrounded_hash() -> None:
+async def test_document_backed_hash_read_and_download_are_available_executable() -> None:
     (
         fixture,
         state,
@@ -820,6 +820,46 @@ async def test_documented_download_is_available_executable_and_reports_ungrounde
         }
     ]
 
+    documented_pivot = next(
+        item
+        for item in context.available_pivots
+        if item.tool_name == "vt.file_report"
+        and item.arguments.get("file_hash", "").casefold() == sample_hash
+    )
+    assert documented_pivot.execution_state == "available"
+    assert not any(
+        item.sample_sha256.casefold() == sample_hash
+        for item in await fixture.service._sample_associations.list_for_investigation(
+            fixture.investigation_id
+        )
+    )
+    assert not any(
+        item.object_id.casefold() == sample_hash
+        for item in await fixture.observations.list_for_investigation(fixture.investigation_id)
+    )
+    reported = await operator_service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"file_hash": sample_hash},
+        purpose="Read a document-backed synthetic hash report.",
+        expected_version=downloaded.working_state_version,
+        idempotency_key="documented-vt-file-report",
+    )
+    assert reported.invocation.status is ToolInvocationStatus.SUCCEEDED
+    source_refs = reported.invocation.normalized_parameters[
+        "_vt_external_effect_source_refs"
+    ]
+    assert [reference["kind"] for reference in source_refs] == [
+        "sample_hash",
+        "source_document",
+    ]
+    assert source_refs[0]["id"] == sample_hash
+    assert source_refs[1]["id"] == str(document_id)
+    assert source_refs[1]["version"] == (
+        f"{fixture.snapshot.synthesis_artifact_id}@{fixture.snapshot.synthesis_version or 1}"
+    )
+    assert source_refs[1]["sha256"] == fixture.snapshot.synthesis_sha256
+
     refused = await operator_service.invoke(
         tool_name="vt.download_sample",
         schema_version="1",
@@ -829,7 +869,7 @@ async def test_documented_download_is_available_executable_and_reports_ungrounde
             "evidence_refs": [],
         },
         purpose="Acquire an ungrounded synthetic sample.",
-        expected_version=downloaded.working_state_version,
+        expected_version=reported.working_state_version,
         idempotency_key="ungrounded-vt-download",
     )
     assert refused.invocation.status is ToolInvocationStatus.POLICY_DENIED

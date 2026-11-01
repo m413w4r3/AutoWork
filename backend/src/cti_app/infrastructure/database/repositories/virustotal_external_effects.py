@@ -405,11 +405,14 @@ class SqlAlchemyVirusTotalPolicyGuard:
         observation_hashes: set[str] = set()
         sample_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
-        observation_refs = {
-            reference.id: reference
-            for reference in context.prepared.evidence_refs
-            if reference.kind == "evidence_observation"
-        }
+        observation_refs: dict[str, EvidenceReference] = {}
+        for reference in context.prepared.evidence_refs:
+            if reference.kind != "evidence_observation":
+                continue
+            previous = observation_refs.get(reference.id)
+            if previous is not None and previous != reference:
+                return False
+            observation_refs[reference.id] = reference
         # Bridge cites associations by association id, as the claim store reads them.
         is_bridge = context.prepared.family.startswith(_BRIDGE_FAMILY_PREFIXES)
         association_refs: dict[UUID, EvidenceReference | None] = {}
@@ -658,9 +661,29 @@ class SqlAlchemyVirusTotalPolicyGuard:
         expected_reference = EvidenceReference(
             "sample_hash", sample_hash, "sample-hash.v1", sample_hash
         )
-        if _metadata_source_refs(invocation.normalized_parameters) != (
-            expected_reference,
-        ) or context.prepared.evidence_refs != (expected_reference,):
+
+        persisted_references = _metadata_source_refs(invocation.normalized_parameters)
+        prepared_references = context.prepared.evidence_refs
+        permitted_additional_kinds = {"source_document", "evidence_observation"}
+
+        def has_only_resolved_hash_sources(references: tuple[EvidenceReference, ...]) -> bool:
+            hash_references = tuple(
+                reference for reference in references if reference.kind == "sample_hash"
+            )
+            return (
+                hash_references == (expected_reference,)
+                and all(
+                    reference.kind == "sample_hash"
+                    or reference.kind in permitted_additional_kinds
+                    for reference in references
+                )
+            )
+
+        if (
+            not has_only_resolved_hash_sources(persisted_references)
+            or not has_only_resolved_hash_sources(prepared_references)
+            or frozenset(persisted_references) != frozenset(prepared_references)
+        ):
             return False
 
         parameters = invocation.normalized_parameters

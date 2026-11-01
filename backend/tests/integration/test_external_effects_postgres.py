@@ -63,12 +63,14 @@ from cti_app.domain.external_effects import (
     application_request_sha256,
     canonical_json_bytes,
     effect_key,
+    invocation_arguments_digest,
     occurrence_sha256,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
     DisclosureBounds,
+    EnvelopeAuthorityKind,
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationExecutionMode,
@@ -102,6 +104,7 @@ from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
 )
+from cti_app.infrastructure.database.models.osint_open_policy import OsintOpenInheritanceRow
 from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
 from cti_app.infrastructure.database.repositories.external_effects import (
     ExternalEffectFamilyBinding,
@@ -3633,6 +3636,199 @@ def _policy_authority(
         policy_version="osint-open.v1",
         pinned_subject_id=subject_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_document_backed_unassociated_osint_vt_hash_completes_external_effect(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    base_authority, _base_prepared = authorities[0]
+    invocation_id = base_authority.invocation_id
+    assert invocation_id is not None
+    sample_hash = "b" * 64
+    document_id = uuid4()
+    document_version = f"synthesis:{uuid4()}@1"
+    hash_reference = EvidenceReference(
+        "sample_hash", sample_hash, "sample-hash.v1", sample_hash
+    )
+    policy_service = OsintOpenPolicyService(
+        lambda: SqlAlchemyUnitOfWork(session_factory), Settings(_env_file=None)
+    )
+
+    try:
+        policy = await policy_service.activate(
+            scope_kind=OsintScopeKind.SUBJECT_SET,
+            scope_ref=str(subject_id),
+            capabilities=OsintCapabilities(
+                allowed_providers=("vt",),
+                budget_limits={
+                    BudgetDimension.VT_UNITS: 1,
+                    BudgetDimension.SHODAN_CREDITS: 0,
+                    BudgetDimension.DOWNLOADS: 0,
+                    BudgetDimension.BRIDGE_TURNS: 0,
+                    BudgetDimension.TOOL_SECONDS: 0,
+                    BudgetDimension.CONTEXT_BYTES: 0,
+                    BudgetDimension.CONTEXT_TOKENS: 0,
+                },
+                acquire_hits_allowed=False,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.CLEAR,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                ),
+                max_effect_claims_per_investigation=10,
+            ),
+            actor_id="human:m09-vt-document-integration",
+            reason="Authorize a synthetic document-backed passive VT read.",
+            correlation_id=f"m09-vt-document-policy:{investigation_id}:{uuid4()}",
+        )
+        now = datetime.now(UTC)
+        async with session_factory() as session:
+            async with session.begin():
+                blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+                assert blob is not None
+                invocation = await session.get(ToolInvocationRow, invocation_id)
+                assert invocation is not None
+                invocation.tool_name = "vt.file_report"
+                invocation.schema_version = "1"
+                document_reference = EvidenceReference(
+                    "source_document", str(document_id), document_version, blob.sha256
+                )
+                invocation.normalized_parameters = {
+                    "file_hash": sample_hash,
+                    "_vt_external_effect_source_refs": [
+                        hash_reference.to_json(),
+                        document_reference.to_json(),
+                    ],
+                }
+                envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
+                assert envelope is not None
+                envelope.allowed_providers = ["vt"]
+                envelope.acquire_hits_allowed = False
+                envelope.disclosure_tlp = "clear"
+                envelope.disclosure_do_not_submit = False
+                envelope.disclosure_external_llm_allowed = True
+                envelope.approval_decision_id = policy.event_id
+                envelope.authority_kind = EnvelopeAuthorityKind.OSINT_POLICY.value
+                envelope.inherited_policy_id = policy.policy_id
+                envelope.inherited_policy_version = policy.version
+                envelope.inherited_policy_event_id = policy.event_id
+                envelope.version += 1
+                envelope.updated_at = now
+                session.add(
+                    OsintOpenInheritanceRow(
+                        investigation_id=investigation_id,
+                        subject_id=subject_id,
+                        policy_id=policy.policy_id,
+                        policy_version=policy.version,
+                        policy_event_id=policy.event_id,
+                        correlation_id=f"m09-vt-document-inheritance:{investigation_id}:{uuid4()}",
+                        activation_correlation_id=policy.activation_correlation_id,
+                        status="active",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                session.add(
+                    SourceDocumentRow(
+                        id=document_id,
+                        subject_id=subject_id,
+                        blob_id=blob.id,
+                        original_name="document-backed-vt-hash.txt",
+                        origin="integration-test",
+                        acquired_at=datetime.now(UTC),
+                        license_restriction=None,
+                        tlp="CLEAR",
+                        do_not_submit=False,
+                        external_llm_allowed=True,
+                        logical_filename=None,
+                        source_collection_id=None,
+                        source_candidate_id=None,
+                        decoded_blob_id=None,
+                        title="Document-backed synthetic IOC",
+                        publisher=None,
+                        published_at=None,
+                        final_url=None,
+                        declared_mime_type=None,
+                        detected_mime_type=None,
+                        encoded_sha256=None,
+                        decoded_sha256=None,
+                        encoded_size=None,
+                        decoded_size=None,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+
+        authority = replace(
+            base_authority,
+            expected_envelope_version=5,
+            approval_decision_id=policy.event_id,
+            invocation_arguments_sha256=invocation_arguments_digest(
+                {
+                    "file_hash": sample_hash,
+                    "_vt_external_effect_source_refs": [
+                        hash_reference.to_json(),
+                        document_reference.to_json(),
+                    ],
+                }
+            ),
+            authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
+            policy_event_id=policy.event_id,
+            policy_version=str(policy.version),
+            pinned_subject_id=subject_id,
+        )
+        prepared = PreparedExternalRequest.build(
+            family="vt.file_report",
+            provider="vt",
+            provider_scope="default",
+            normalizer_version="vt-read.v1",
+            canonical_request={"path": f"/api/v3/files/{sample_hash}"},
+            application_request=FrozenWireRequest(
+                method=b"GET",
+                target=f"/api/v3/files/{sample_hash}".encode(),
+                headers=((b"accept", b"application/json"),),
+                body=b"",
+            ),
+            evidence_refs=(hash_reference, document_reference),
+            credential_parameter_names=("apikey",),
+        )
+
+        transport = _CountingTransport()
+        outcome = await create_external_effect_coordinator(session_factory).send_one(
+            authority, prepared, transport
+        )
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+        assert outcome.claim_id is not None
+
+        async with session_factory() as session:
+            async with session.begin():
+                association_count = await session.scalar(
+                    select(func.count())
+                    .select_from(SampleAssociationRow)
+                    .where(
+                        SampleAssociationRow.investigation_id == investigation_id,
+                        SampleAssociationRow.sample_sha256 == sample_hash,
+                    )
+                )
+                observation_count = await session.scalar(
+                    select(func.count())
+                    .select_from(EvidenceObservationRow)
+                    .where(
+                        EvidenceObservationRow.investigation_id == investigation_id,
+                        EvidenceObservationRow.object_id == sample_hash,
+                    )
+                )
+                assert association_count == 0
+                assert observation_count == 0
+                claim = await session.get(ExternalEffectClaimRow, outcome.claim_id)
+                assert claim is not None
+                assert claim.state == EffectClaimState.COMPLETED.value
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

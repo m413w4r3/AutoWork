@@ -2599,6 +2599,203 @@ async def test_vt_policy_guard_checks_unassociated_observation_for_passive_read(
     assert allowed is expected
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_allowed"),
+    [
+        ("valid_unordered_refs", True),
+        ("valid_observation_ref", True),
+        ("foreign_document", False),
+        ("foreign_observation", False),
+        ("conflicting_observation_refs", False),
+        ("document_tlp_red", False),
+        ("document_license", False),
+        ("unknown_reference_kind", False),
+        ("association_reference_kind", False),
+        ("document_alias", False),
+        ("duplicate_sample_hash", False),
+        ("requested_hash_mismatch", False),
+        ("persisted_prepared_mismatch", False),
+    ],
+)
+async def test_vt_policy_guard_unassociated_hash_requires_matching_service_refs(
+    case: str, expected_allowed: bool
+) -> None:
+    requested_hash = "d" * 64
+    source_hash = "e" * 64 if case == "requested_hash_mismatch" else requested_hash
+    subject_id = uuid4()
+    document_id = uuid4()
+    hash_reference = EvidenceReference(
+        "sample_hash", source_hash, "sample-hash.v1", source_hash
+    )
+    document_reference = EvidenceReference(
+        "source_document", str(document_id), "synthesis@3", "f" * 64
+    )
+    observation_id = uuid4()
+    observation_reference = EvidenceReference(
+        "evidence_observation", str(observation_id), "source-v1", "a" * 64
+    )
+    persisted_refs = [hash_reference.to_json(), document_reference.to_json()]
+    prepared_refs = (document_reference, hash_reference)
+    document_subject_id = subject_id
+    document_tlp = "GREEN"
+    document_license = None
+    observation_investigation_id = _INVESTIGATION_ID
+
+    if case in {"unknown_reference_kind", "association_reference_kind", "document_alias"}:
+        unknown_kind = {
+            "unknown_reference_kind": "url",
+            "association_reference_kind": "sample_association",
+            "document_alias": "document",
+        }[case]
+        unknown_reference = EvidenceReference(unknown_kind, str(uuid4()), "v1", "a" * 64)
+        persisted_refs.append(unknown_reference.to_json())
+        prepared_refs = (*prepared_refs, unknown_reference)
+    elif case in {"valid_observation_ref", "foreign_observation"}:
+        persisted_refs.append(observation_reference.to_json())
+        prepared_refs = (observation_reference, *prepared_refs)
+        if case == "foreign_observation":
+            observation_investigation_id = uuid4()
+    elif case == "conflicting_observation_refs":
+        conflict_reference = EvidenceReference(
+            "evidence_observation", str(observation_id), "stale-version", "b" * 64
+        )
+        persisted_refs.extend(
+            (conflict_reference.to_json(), observation_reference.to_json())
+        )
+        prepared_refs = (conflict_reference, *prepared_refs, observation_reference)
+    elif case == "duplicate_sample_hash":
+        persisted_refs.insert(1, hash_reference.to_json())
+        prepared_refs = (hash_reference, document_reference, hash_reference)
+    elif case == "persisted_prepared_mismatch":
+        prepared_refs = (hash_reference,)
+    elif case == "foreign_document":
+        document_subject_id = uuid4()
+    elif case == "document_tlp_red":
+        document_tlp = "RED"
+    elif case == "document_license":
+        document_license = "restricted"
+
+    invocation_parameters = {
+        "file_hash": requested_hash,
+        "_vt_external_effect_source_refs": persisted_refs,
+    }
+    invocation = SimpleNamespace(
+        normalized_parameters=invocation_parameters,
+        investigation_id=_INVESTIGATION_ID,
+        operation_key="op-1",
+        status="running",
+        tool_name="vt.file_report",
+        schema_version="1",
+    )
+    document = SimpleNamespace(
+        id=document_id,
+        subject_id=document_subject_id,
+        tlp=document_tlp,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        license_restriction=document_license,
+    )
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=observation_investigation_id,
+        source_version=observation_reference.version,
+        sha256=observation_reference.sha256,
+        object_type="source_document",
+        object_id=str(document_id),
+    )
+    authority = replace(_authority(policy=True), pinned_subject_id=subject_id)
+    prepared = PreparedExternalRequest.build(
+        family="vt.file_report",
+        provider="vt",
+        provider_scope="default",
+        normalizer_version="vt-read.v1",
+        canonical_request={"path": f"/api/v3/files/{requested_hash}"},
+        application_request=_wire(target=f"/api/v3/files/{requested_hash}".encode()),
+        evidence_refs=prepared_refs,
+        credential_parameter_names=("apikey",),
+    )
+
+    class _Session(AsyncSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scalars_count = 0
+
+        async def scalar(self, *args: object, **kwargs: object):
+            return invocation
+
+        async def scalars(self, *args: object, **kwargs: object):
+            self.scalars_count += 1
+            if case in {
+                "valid_observation_ref",
+                "foreign_observation",
+                "conflicting_observation_refs",
+            }:
+                if self.scalars_count == 1 and observation_investigation_id == _INVESTIGATION_ID:
+                    return [observation]
+                document_query = 4
+            else:
+                document_query = 3
+            # No sample association or sample row grounds this hash. Source
+            # documents are resolved last, after the invocation fallback.
+            if self.scalars_count == document_query and document_subject_id == subject_id:
+                return [document]
+            return []
+
+    context = ConsumePolicyContext(
+        authority=authority,
+        prepared=prepared,
+        effect_key="osint-document-backed-file-report",
+        database_session=_Session(),
+        investigation_subject_id=subject_id,
+    )
+
+    allowed = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(context)
+
+    assert allowed is expected_allowed
+
+
+@pytest.mark.asyncio
+async def test_bridge_document_external_llm_denial_remains_enforced() -> None:
+    subject_id = uuid4()
+    document_id = uuid4()
+    reference = EvidenceReference("source_document", str(document_id), "article@1", "a" * 64)
+    document = SimpleNamespace(
+        id=document_id,
+        subject_id=subject_id,
+        tlp="GREEN",
+        do_not_submit=False,
+        external_llm_allowed=False,
+        license_restriction=None,
+    )
+
+    class _Session(AsyncSession):
+        def __init__(self) -> None:
+            super().__init__()
+
+        async def scalars(self, *args: object, **kwargs: object):
+            return [document]
+
+    prepared = PreparedExternalRequest.build(
+        family="bridge.consult",
+        provider="bridge",
+        provider_scope="bridge.responses",
+        normalizer_version="1",
+        canonical_request={"request": "synthetic"},
+        application_request=_wire(target=b"/v1/responses"),
+        evidence_refs=(reference,),
+    )
+    context = ConsumePolicyContext(
+        authority=_authority(),
+        prepared=prepared,
+        effect_key="bridge-source-document-denial",
+        database_session=_Session(),
+        investigation_subject_id=subject_id,
+    )
+
+    assert not await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(context)
+
+
 @pytest.mark.parametrize(
     ("request_sandbox", "expected_sandbox", "denied"),
     [
