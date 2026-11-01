@@ -1601,6 +1601,23 @@ class InvestigationService:
         else:
             # A durable record wins over dispatcher memory. Never turn an existing
             # invocation into a second external call.
+            if invocation.status is ToolInvocationStatus.RUNNING and not local_effect:
+                reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
+                invocation = await self._invocations.update_if_version(
+                    reviewed, expected_version=invocation.version
+                )
+                await self._commit_current_uow()
+                return (
+                    invocation,
+                    ToolResult(
+                        status=ToolInvocationStatus.NEEDS_REVIEW,
+                        observation_refs=invocation.response_refs,
+                        message="Prior tool attempt needs reconciliation; it was not redispatched.",
+                        error_code="invocation_needs_review",
+                    ),
+                    invocation.response_refs,
+                    external_effect,
+                )
             if invocation.status is ToolInvocationStatus.RUNNING:
                 return (
                     invocation,
