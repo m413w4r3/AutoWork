@@ -3458,7 +3458,21 @@ class InvestigationAdvisorTool:
                 for index, measurement in enumerate(measurements, start=1)
             ]
             base["explicit_measurement_selection"] = candidates is not None
-        sample_rows = await self._sample_inventory(investigation_id, evidence, context.envelope)
+        # Retain sample identity and provenance without attaching complete
+        # binaries to a Suricata, editorial or figure consultation by default.
+        # This is task-relevance selection, not a Bridge prompt size limit.
+        include_sample_content = consultation_type not in {
+            "draft_text",
+            "review_text",
+            "suricata_draft",
+            "figure_plan",
+        }
+        sample_rows = await self._sample_inventory(
+            investigation_id,
+            evidence,
+            context.envelope,
+            include_content=include_sample_content,
+        )
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
         mime_types_by_evidence: dict[str, list[str]] = {}
@@ -3992,6 +4006,8 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         observations: tuple[EvidenceObservation, ...],
         envelope: InvestigationEnvelope | None,
+        *,
+        include_content: bool = True,
     ) -> list[dict[str, Any]]:
         investigation = await self._investigations.get(investigation_id)
         if investigation is None:
@@ -4094,20 +4110,22 @@ class InvestigationAdvisorTool:
             sample_origin = getattr(sample, "origin_kind", getattr(sample, "origin", "unknown"))
             sample_origin = getattr(sample_origin, "value", sample_origin)
             blob_content: bytes | None = None
-            content_status = "verified"
-            try:
-                blob_content = await self._artifact_store.read_bytes(
-                    blob_id, max_bytes=descriptor.size
-                )
-                if (
-                    not isinstance(blob_content, bytes)
-                    or len(blob_content) != descriptor.size
-                    or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
-                ):
-                    blob_content = None
-                    content_status = "sample_content_hash_mismatch"
-            except Exception:
-                content_status = "sample_blob_unreadable"
+            content_status = "not_requested_for_consultation"
+            if include_content:
+                content_status = "verified"
+                try:
+                    blob_content = await self._artifact_store.read_bytes(
+                        blob_id, max_bytes=descriptor.size
+                    )
+                    if (
+                        not isinstance(blob_content, bytes)
+                        or len(blob_content) != descriptor.size
+                        or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
+                    ):
+                        blob_content = None
+                        content_status = "sample_content_hash_mismatch"
+                except Exception:
+                    content_status = "sample_blob_unreadable"
             raw_mime_type = getattr(descriptor, "mime_type", "application/octet-stream")
             mime_type = (
                 raw_mime_type.strip()
@@ -4116,7 +4134,9 @@ class InvestigationAdvisorTool:
             )
             fragment = blob_content if blob_content is not None else b""
             omitted_range = ""
-            content_omission_reason = ""
+            content_omission_reason = (
+                "whole_sample_not_needed_for_consultation" if not include_content else ""
+            )
             rows.append(
                 {
                     "verified": True,
