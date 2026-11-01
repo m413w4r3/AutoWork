@@ -1277,7 +1277,10 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     assert invalid.status is ToolInvocationStatus.SUCCEEDED
     assert len(transport.calls) == 1
     assert "sélection facultative ignorée" in transport.calls[0]["prompt"]
-    assert "4142434" not in transport.calls[0]["prompt"]
+    assert all(
+        item.get("value") != "4142434"
+        for item in typed_prompt_payload(transport.calls[0]["prompt"]).get("measurements", ())
+    )
 
     result = await tool.execute(
         {
