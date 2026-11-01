@@ -1878,6 +1878,54 @@ class OperatorToolInvocationService:
             )
             if detail_code is not None and detail_code != output["error"]["code"]:
                 output["error"]["detail_code"] = detail_code
+            experiment_diagnostics = {
+                "observation_invocation_not_cited": (
+                    "observation_refs",
+                    "Cite the tool invocation that produced each observation, or remove that "
+                    "observation reference.",
+                ),
+                "experiment_version_stale": (
+                    "expected_version",
+                    "Call experiment.list to load the current timeline version, then retry with "
+                    "that version.",
+                ),
+                "invocation_version_mismatch": (
+                    "tool_invocation_refs",
+                    "Use the persisted version of each cited tool invocation.",
+                ),
+                "invocation_tool_mismatch": (
+                    "tool_name",
+                    "Use the tool name and schema version recorded by a cited invocation.",
+                ),
+                "next_pivot_invalid": (
+                    "next_pivots",
+                    "Use lowercase SHA-256 values for next_pivots.",
+                ),
+                "timestamp_order_invalid": (
+                    "started_at",
+                    "Set started_at no later than completed_at, and completed_at no later than "
+                    "the recorded time.",
+                ),
+                "field_invalid": (
+                    "arguments",
+                    "Correct the experiment record fields to match the published arguments schema.",
+                ),
+            }
+            result_output = tool_result.output if tool_result is not None else {}
+            diagnostic_code = result_output.get("detail_code")
+            if (
+                invocation.tool_name == "experiment.record"
+                and diagnostic_code in experiment_diagnostics
+            ):
+                field, correction = experiment_diagnostics[diagnostic_code]
+                output["error"].update(
+                    {"detail_code": diagnostic_code, "field": field, "correction": correction}
+                )
+                current_stream_version = result_output.get("current_stream_version")
+                if isinstance(current_stream_version, int) and not isinstance(
+                    current_stream_version, bool
+                ):
+                    output["error"]["current_stream_version"] = current_stream_version
             if error_code == "invalid_tool_arguments":
                 output["error"]["correction"] = (
                     "Use the published arguments_schema in available_tools and correct the "
