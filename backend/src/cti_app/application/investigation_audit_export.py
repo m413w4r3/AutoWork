@@ -239,9 +239,15 @@ def _enum_token(value: Any, enum_type: type[StrEnum]) -> str | None:
     return result if result in {member.value for member in enum_type} else None
 
 
+_REGISTRY_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}(?:\.[a-z0-9_]{1,40}){1,3}$", re.ASCII)
+
+
 def _safe_tool_name(value: Any) -> str:
+    """Tool names come from the server-side registry; anything not shaped like one stays hidden."""
     result = _text(value)
-    return result if result in _SAFE_TOOL_NAMES else "UNKNOWN"
+    if result in _SAFE_TOOL_NAMES or (result is not None and _REGISTRY_TOOL_NAME.fullmatch(result)):
+        return str(result)
+    return "UNKNOWN"
 
 
 def _safe_object_type(value: Any) -> str:
@@ -926,6 +932,48 @@ def _budget_amounts(value: Any) -> dict[str, int]:
     return dict(sorted(output.items()))
 
 
+_PARAMETER_KEY_BLOCKLIST = re.compile(r"(key|token|secret|password|credential|signature)", re.I)
+_MAX_OPERATOR_TEXT_CHARS = 1_024
+
+
+def _operator_text(invocation: Any) -> dict[str, Any]:
+    """Operator-written purpose and scalar tool parameters, redacted. Opt-in export only."""
+    from cti_app.application.publication_secret_guard import redact_operational_secrets
+
+    purpose = _get(invocation, "purpose")
+    human = ""
+    if isinstance(purpose, str):
+        try:
+            _trace, human = split_advisor_trace_purpose(
+                purpose, tool_name=_text(_get(invocation, "tool_name")), allow_server_denied=True
+            )
+        except ValueError:
+            human = purpose
+    parameters = _get(invocation, "normalized_parameters", {}) or {}
+    scalars: dict[str, Any] = {}
+    if isinstance(parameters, Mapping):
+        for name in sorted(parameters, key=str):
+            value = parameters[name]
+            if (
+                not isinstance(name, str)
+                or name.startswith("_")
+                or _PARAMETER_KEY_BLOCKLIST.search(name)
+                or len(scalars) >= 24
+            ):
+                continue
+            if isinstance(value, (bool, int)) or (isinstance(value, str) and len(value) <= 512):
+                scalars[name] = value
+    cleaned, redactions = redact_operational_secrets(
+        {"purpose": human[:_MAX_OPERATOR_TEXT_CHARS], "parameters": scalars},
+        include_host_paths=False,
+    )
+    return {
+        "human_purpose": cleaned["purpose"],
+        "tool_parameters": cleaned["parameters"],
+        "operator_text_redactions": redactions,
+    }
+
+
 def _operator_trace(invocation: Any) -> dict[str, Any]:
     """Project the validated Bridge checkpoint and recommendation decision of an invocation.
 
@@ -969,6 +1017,8 @@ def _invocation_event(
     invocation: Any,
     reservations: Mapping[str, Any],
     attachments: Mapping[str, list[dict[str, str]]],
+    *,
+    include_operator_text: bool = False,
 ) -> dict[str, Any]:
     invocation_id = _uuid_value(_get(invocation, "id"))
     operation_key = _text(_get(invocation, "operation_key"))
@@ -993,8 +1043,9 @@ def _invocation_event(
             "tool_name_sha256": _sha256_value(_get(invocation, "tool_name")),
             "schema_version_sha256": _sha256_value(_get(invocation, "schema_version")),
             "purpose_sha256": _sha256_value(_get(invocation, "purpose")),
-            "purpose_included": False,
+            "purpose_included": include_operator_text,
             "operator_trace": _operator_trace(invocation),
+            **(_operator_text(invocation) if include_operator_text else {}),
             "status_at_snapshot": _enum_token(status, ToolInvocationStatus) or "UNKNOWN",
             "admission": {
                 "requested": _unknown("requested budget amount is not stored on the invocation"),
@@ -1733,7 +1784,9 @@ def _budget_event(investigation_id: str, budget_snapshot: Any) -> dict[str, Any]
     )
 
 
-def project_audit_events(snapshot: AuditSourceSnapshot) -> list[dict[str, Any]]:
+def project_audit_events(
+    snapshot: AuditSourceSnapshot, *, include_operator_text: bool = False
+) -> list[dict[str, Any]]:
     """Build compact events using only known stored fields and explicit links."""
     investigation_id = _required_uuid(snapshot.investigation_id, "investigation_id")
     reservations = _reservation_map(snapshot.budget_snapshot)
@@ -1765,7 +1818,13 @@ def project_audit_events(snapshot: AuditSourceSnapshot) -> list[dict[str, Any]]:
         values.sort(key=lambda item: (item["opinion_id"], item["version"]))
 
     events = [
-        _invocation_event(investigation_id, item, reservations, attachments)
+        _invocation_event(
+            investigation_id,
+            item,
+            reservations,
+            attachments,
+            include_operator_text=include_operator_text,
+        )
         for item in snapshot.invocations
     ]
     events.extend(_observation_event(investigation_id, item) for item in snapshot.observations)
@@ -2635,9 +2694,11 @@ def _manifest_bytes(
     return _canonical_bytes(payload) + b"\n"
 
 
-def build_audit_bundle(snapshot: AuditSourceSnapshot) -> AuditBundle:
+def build_audit_bundle(
+    snapshot: AuditSourceSnapshot, *, include_operator_text: bool = False
+) -> AuditBundle:
     investigation_id = _required_uuid(snapshot.investigation_id, "investigation_id")
-    events = project_audit_events(snapshot)
+    events = project_audit_events(snapshot, include_operator_text=include_operator_text)
     events_bytes = _gzip_events(events)
     index_value = _resource_index(events, investigation_id)
     index_bytes = _canonical_bytes(index_value) + b"\n"
@@ -2696,8 +2757,13 @@ def write_audit_bundle(
     investigation_id: str,
     *,
     resume: bool = False,
+    include_operator_text: bool = False,
 ) -> AuditBundle:
-    """Write one coherent bundle; resume from the complete events checkpoint if present."""
+    """Write one coherent bundle; resume from the complete events checkpoint if present.
+
+    ``include_operator_text`` adds the operator-written purpose and scalar tool parameters
+    (redacted). It is for authorized internal audit only; the default export hashes them.
+    """
     investigation_id = _required_uuid(investigation_id, "investigation_id")
     directory = Path(output_dir)
     with _bundle_lock(directory):
@@ -2714,7 +2780,7 @@ def write_audit_bundle(
                 != investigation_id
             ):
                 raise ValueError("Snapshot investigation ID does not match export target")
-            bundle = build_audit_bundle(snapshot)
+            bundle = build_audit_bundle(snapshot, include_operator_text=include_operator_text)
             _atomic_write(events_path, bundle.events)
         _atomic_write(directory / "RUN_TRACE.md", bundle.trace)
         _atomic_write(directory / "RUN_INDEX.json", bundle.index)

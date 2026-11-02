@@ -496,3 +496,37 @@ def test_advisor_guidance_recap_is_counted_and_trimmed_by_context_budget_stage()
     assert truncated is True
     assert bounded.truncated is True
     assert len(canonical_json_bytes(bounded.model_dump(mode="json"))) <= 320
+
+
+@pytest.mark.asyncio
+async def test_first_decompilation_checkpoint_is_satisfied_by_a_later_yara_consultation():
+    base = datetime.now(UTC)
+    calls = [
+        invocation(
+            "advisor.consult",
+            created_at=base,
+            parameters={"consultation_type": "plan_investigation"},
+            consumed=1,
+        ),
+        invocation("sample.analyze", created_at=base + timedelta(seconds=1)),
+    ]
+
+    async def checkpoint():
+        return await build_advisor_guidance(
+            invocations=tuple(calls),
+            observations=(),
+            evidence_summaries=None,
+            available_tools=(),
+        )
+
+    assert (await checkpoint())["reason"] == "first_significant_decompilation"
+    calls.append(
+        invocation(
+            "advisor.consult",
+            created_at=base + timedelta(seconds=2),
+            parameters={"consultation_type": "yara_draft"},
+            consumed=1,
+        )
+    )
+    # The checkpoint no longer hides the next, more specific ones.
+    assert (await checkpoint())["reason"] != "first_significant_decompilation"

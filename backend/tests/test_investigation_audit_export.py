@@ -992,3 +992,76 @@ def test_invocation_event_trace_distinguishes_absent_from_invalid() -> None:
     assert _operator_trace(
         SimpleNamespace(purpose="[[advisor-trace.v1]]{broken\nwhy", tool_name="sample.analyze")
     ) == {"state": "invalid"}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("rule.test", "rule.test"),
+        ("archive.extract_member", "archive.extract_member"),
+        ("vt.retrohunt.submit", "vt.retrohunt.submit"),
+        ("PRIVATE_SYNTHETIC_TOOL_NAME_MARKER", "UNKNOWN"),
+        ("not a tool name", "UNKNOWN"),
+        ("a.b.c.d.e", "UNKNOWN"),
+        ("tool.with-secret-sk-abc", "UNKNOWN"),
+        (None, "UNKNOWN"),
+    ],
+)
+def test_registry_shaped_tool_names_stay_readable_in_the_audit_export(
+    name: str | None, expected: str
+) -> None:
+    from cti_app.application.investigation_audit_export import _safe_tool_name
+
+    assert _safe_tool_name(name) == expected
+
+
+def _operator_text_invocation() -> SimpleNamespace:
+    from cti_app.application.advisor_checkpoint import format_advisor_trace_purpose
+
+    purpose = format_advisor_trace_purpose(
+        "Pivot on the resource name found in the manifest.",
+        checkpoint={"id": "new_pivot_discovered@9", "status": "skipped", "reason": "local first"},
+    )
+    return SimpleNamespace(
+        id=_id("operator-text-invocation"),
+        operation_key="operator-text-key",
+        tool_name="vt.relationships",
+        schema_version="1",
+        purpose=purpose + " https://storage.example/sample?X-Goog-Signature=abcdef0123456789",
+        status="succeeded",
+        reserved_budget={},
+        consumed_budget={},
+        response_refs=(),
+        created_at=datetime(2026, 11, 2, tzinfo=UTC),
+        normalized_parameters={
+            "file_hash": "a" * 64,
+            "relationship": "contained_files",
+            "limit": 20,
+            "api_key_hint": "must-not-appear",
+            "_vt_external_effect_source_refs": [{"id": "x"}],
+            "nested": {"ignored": True},
+        },
+    )
+
+
+def test_operator_text_is_hashed_by_default_and_exported_redacted_on_request() -> None:
+    from cti_app.application.investigation_audit_export import _invocation_event
+
+    invocation = _operator_text_invocation()
+    default = _invocation_event(_INVESTIGATION_ID, invocation, {}, {})["details"]
+    assert default["purpose_included"] is False
+    assert "human_purpose" not in default and "tool_parameters" not in default
+
+    opted = _invocation_event(_INVESTIGATION_ID, invocation, {}, {}, include_operator_text=True)[
+        "details"
+    ]
+    assert opted["purpose_included"] is True
+    assert opted["human_purpose"].startswith("Pivot on the resource name found in the manifest.")
+    assert "X-Goog-Signature" not in json.dumps(opted)
+    assert opted["tool_parameters"] == {
+        "file_hash": "a" * 64,
+        "limit": 20,
+        "relationship": "contained_files",
+    }
+    assert opted["operator_text_redactions"] >= 1
+    assert opted["operator_trace"]["checkpoint"]["status"] == "skipped"

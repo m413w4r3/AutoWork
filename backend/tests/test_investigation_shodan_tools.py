@@ -350,6 +350,30 @@ async def test_invalid_shodan_count_arguments_are_definitive_local_failures() ->
 
 
 @pytest.mark.asyncio
+async def test_nested_call_envelope_in_arguments_gets_an_actionable_hint() -> None:
+    port = FakeShodanPort()
+    rig = _Rig(shodan=port)
+    nested = {
+        "schema_version": "1",
+        "arguments": {"query": "port:443", "justification": "x", "evidence_refs": []},
+        "purpose": "Count the listed hosts.",
+    }
+
+    result = await rig.dispatch("shodan.count", nested, operation_key="nested-envelope")
+    plain = await rig.dispatch(
+        "shodan.count",
+        {"query": "port:443", "evidence_refs": [], "unexpected": "extra"},
+        operation_key="plain-extra-property",
+    )
+
+    assert result.error_code == "invalid_tool_arguments"
+    assert "do not repeat the call envelope" in result.output["hint"]
+    assert "hint:" in result.message
+    assert "hint" not in plain.output
+    assert port.calls == []
+
+
+@pytest.mark.asyncio
 async def test_invalid_shodan_arguments_release_budget_and_reach_the_next_agent_turn() -> None:
     provider = FakeShodanPort()
     real_registry = _Rig(shodan=provider).registry

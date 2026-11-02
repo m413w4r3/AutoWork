@@ -873,12 +873,20 @@ class RegistryToolDispatcher:
                 f"{item['received']} ({item['value']})"
                 for item in validation_errors
             )
+            output: dict[str, Any] = {
+                "error_code": "invalid_tool_arguments",
+                "validation_errors": validation_errors,
+            }
+            if isinstance(arguments, Mapping) and "arguments" in arguments:
+                # The operator nested the whole call envelope inside ``arguments``.
+                output["hint"] = (
+                    "arguments must be the tool's own argument object; do not repeat the "
+                    "call envelope (schema_version, arguments, purpose, expected_version) in it."
+                )
+                summary = f"{summary}; hint: {output['hint']}"
             return ToolResult(
                 status=ToolInvocationStatus.FAILED,
-                output={
-                    "error_code": "invalid_tool_arguments",
-                    "validation_errors": validation_errors,
-                },
+                output=output,
                 message=f"invalid_tool_arguments: {summary or 'arguments do not match the schema'}",
                 exception_class=type(exc).__name__,
                 error_code="invalid_tool_arguments",

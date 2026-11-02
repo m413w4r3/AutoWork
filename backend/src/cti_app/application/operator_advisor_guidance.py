@@ -329,8 +329,11 @@ def _checkpoint(
             )
             if item.tool_name == ADVISOR_TOOL_NAME
         )
+        # Any analysis-informed consultation after the first analysis satisfies this
+        # checkpoint; a YARA draft is one, and waiting for a plan or pivot consultation
+        # would keep it due forever and hide every later checkpoint.
         if not any(
-            _consultation_type(item) in {"plan_investigation", "pivot_strategy"}
+            _consultation_type(item) in {"plan_investigation", "pivot_strategy", "yara_draft"}
             for _, item in later_consults
         ):
             return "first_significant_decompilation", "plan_investigation"
