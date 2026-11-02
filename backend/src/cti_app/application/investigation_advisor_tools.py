@@ -108,6 +108,7 @@ _DOCUMENTED_PROTOCOL_FACT_LIMIT = 48
 _EDITORIAL_CONSULTATION_TYPES = frozenset({"draft_text", "review_text"})
 _SAMPLE_HASH_OBJECT_TYPES = frozenset({"sample", "file", "sample_observation", "sha256"})
 ADVISOR_TOOL_NAME = "advisor.consult"
+ADVISOR_RESPONSE_SOURCE = "advisor.consult.response"
 ADVISOR_SCHEMA_VERSION = "advisor-consult.v1"
 ADVISOR_REPARSE_TOOL_NAME = "advisor.reparse"
 ADVISOR_REPARSE_SCHEMA_VERSION = "advisor-reparse.v1"
@@ -873,7 +874,11 @@ class InvestigationAdvisorTool:
             explicit_evidence = await self._load_cited_evidence(context, evidence_refs)
             auto_evidence = tuple(
                 sorted(
-                    (item for item in listed_observations if item.source != ADVISOR_TOOL_NAME),
+                    (
+                        item
+                        for item in listed_observations
+                        if item.source not in {ADVISOR_TOOL_NAME, ADVISOR_RESPONSE_SOURCE}
+                    ),
                     key=lambda item: (item.observed_at, str(item.id)),
                     reverse=True,
                 )
@@ -1094,6 +1099,7 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            input_warnings = prompt_data.pop("_input_warnings", [])
             if unassociated_hash_evidence:
                 prompt_data["_disclosure_omissions"] = [
                     *prompt_data.get("_disclosure_omissions", ()),
@@ -2036,7 +2042,7 @@ class InvestigationAdvisorTool:
                                 timing.stage_timestamps_utc if timing is not None else {}
                             ),
                         },
-                        source=ADVISOR_TOOL_NAME,
+                        source=ADVISOR_RESPONSE_SOURCE,
                         source_version=ADVISOR_SCHEMA_VERSION,
                         object_type="advisor_response_received",
                         object_id=context.idempotency_key,
@@ -2135,6 +2141,11 @@ class InvestigationAdvisorTool:
                     "response_observation_ref": str(response_link_observation.id),
                 },
             )
+        if input_warnings:
+            result = replace(
+                result,
+                output={**dict(result.output), "input_warnings": input_warnings},
+            )
         response_received = submission.output_text is not None
         response_state = _advisor_response_state(result, submission)
         result = replace(
@@ -2205,6 +2216,8 @@ class InvestigationAdvisorTool:
             "completeness_counts": evidence_preflight["counts"],
             "completeness_manifest": evidence_preflight["items"],
         }
+        if input_warnings:
+            provenance["input_warnings"] = input_warnings
         if restricted_evidence_refs:
             provenance["disclosure_restricted_refs"] = [
                 str(item) for item in restricted_evidence_refs
@@ -2903,7 +2916,11 @@ class InvestigationAdvisorTool:
         observations = await self._list_observations(investigation_id)
         return tuple(
             sorted(
-                (item for item in observations if item.source != ADVISOR_TOOL_NAME),
+                (
+                    item
+                    for item in observations
+                    if item.source not in {ADVISOR_TOOL_NAME, ADVISOR_RESPONSE_SOURCE}
+                ),
                 key=lambda item: (item.observed_at, str(item.id)),
                 reverse=True,
             )
@@ -3116,15 +3133,34 @@ class InvestigationAdvisorTool:
         question: str,
     ) -> dict[str, Any]:
         raw_observation_refs = arguments.get("evidence_refs", ())
-        unit_assertion_refs = (
-            _unit_assertion_references(arguments.get("units", ()))
-            if consultation_type == "draft_text"
-            else []
-        )
+        input_warnings: list[dict[str, str]] = []
+
+        def warn_input(field: str, code: str, detail_safe: str) -> None:
+            warning = {"field": field, "code": code, "detail_safe": detail_safe}
+            if warning not in input_warnings:
+                input_warnings.append(warning)
+
         assertion_refs_by_unit: dict[str, list[dict[str, str]]] = {}
-        for raw_unit in arguments.get("units", ()):
-            if isinstance(raw_unit, Mapping) and isinstance(raw_unit.get("id"), str):
-                assertion_refs_by_unit[raw_unit["id"]] = _unit_assertion_references((raw_unit,))
+        unit_assertion_refs: list[dict[str, str]] = []
+        ignored_assertion_ref_keys: set[tuple[str, str]] = set()
+        if consultation_type == "draft_text":
+            units = arguments.get("units", ())
+            if "units" in arguments and isinstance(units, (list, tuple)):
+                for raw_unit in units:
+                    if not isinstance(raw_unit, Mapping) or not isinstance(raw_unit.get("id"), str):
+                        continue
+                    unit_refs = _unit_assertion_references(
+                        (raw_unit,), warnings=input_warnings, field="units.assertions"
+                    )
+                    assertion_refs_by_unit[raw_unit["id"]] = unit_refs
+                    unit_assertion_refs.extend(unit_refs)
+            elif "units" not in arguments and "assertions" in arguments:
+                unit_assertion_refs = _unit_assertion_references(
+                    ({"assertions": arguments.get("assertions")},),
+                    warnings=input_warnings,
+                    field="assertions",
+                    require_target_fields=True,
+                )
         explicit_observation_ids = (
             {
                 str(reference)
@@ -3137,18 +3173,6 @@ class InvestigationAdvisorTool:
         explicit_observation_ids.update(
             item["id"] for item in unit_assertion_refs if item["kind"] == "observation"
         )
-        raw_assertions = arguments.get("assertions", ())
-        if consultation_type == "draft_text" and isinstance(raw_assertions, (list, tuple)):
-            for assertion in raw_assertions:
-                if not isinstance(assertion, Mapping):
-                    continue
-                for reference in assertion.get("refs", ()):
-                    if (
-                        isinstance(reference, Mapping)
-                        and reference.get("kind") == "observation"
-                        and isinstance(reference.get("id"), (str, UUID))
-                    ):
-                        explicit_observation_ids.add(str(reference["id"]))
         article_passages = _consultation_article_passages(snapshot, question)
         base: dict[str, Any] = {
             "investigation_id": str(investigation_id),
@@ -3167,6 +3191,20 @@ class InvestigationAdvisorTool:
             "gaps": [],
             "truncation": {},
         }
+        if arguments.get("measurements") is not None and consultation_type in {
+            "plan_investigation",
+            "review_text",
+        }:
+            input_warnings.append(
+                {
+                    "field": "measurements",
+                    "code": "optional_measurements_ignored",
+                    "detail_safe": (
+                        "This consultation does not use a measurement selector; canonical scope "
+                        "was left unchanged."
+                    ),
+                }
+            )
         if consultation_type == "draft_text":
             base["_explicit_assertion_refs"] = [dict(item) for item in unit_assertion_refs]
             article_sha256 = snapshot.synthesis_sha256
@@ -3185,11 +3223,16 @@ class InvestigationAdvisorTool:
                     )
                 declared_sha256 = reference.get("sha256")
                 if declared_sha256 is not None and declared_sha256 != article_sha256:
-                    raise _AdvisorInputValidationError(
-                        "advisor_evidence_reference_mismatch", reference=identifier
+                    warn_input(
+                        "units.assertions" if "units" in arguments else "assertions",
+                        "optional_draft_assertion_ignored",
+                        "An assertion with an unverifiable article hash was omitted.",
                     )
+                    ignored_assertion_ref_keys.add(("article", article_sha256))
+                    reference.pop("sha256", None)
                 reference["id"] = article_sha256
-                reference["sha256"] = article_sha256
+                if ("article", article_sha256) not in ignored_assertion_ref_keys:
+                    reference["sha256"] = article_sha256
         editorial = consultation_type in {"draft_text", "review_text"}
         if editorial:
             # Local availability state is not an investigation fact Bridge can verify.
@@ -3473,9 +3516,15 @@ class InvestigationAdvisorTool:
                     }
                     raw_unit_assertions = raw_unit.get("assertions")
                     normalized_assertions: list[Mapping[str, Any]] = []
+                    declared_hashes_by_assertion: dict[str, dict[tuple[str, str], str]] = {}
                     if isinstance(raw_unit_assertions, (list, tuple)):
                         for raw_assertion in raw_unit_assertions:
                             if not isinstance(raw_assertion, Mapping):
+                                warn_input(
+                                    "units.assertions",
+                                    "optional_draft_assertion_ignored",
+                                    "A malformed optional assertion was omitted.",
+                                )
                                 continue
                             normalized_assertion = dict(raw_assertion)
                             normalized_assertion.setdefault("block_type", target["block_type"])
@@ -3488,12 +3537,38 @@ class InvestigationAdvisorTool:
                                 not in {"observation", "finding", "experiment"}
                                 for reference in raw_assertion_refs
                             ):
+                                warn_input(
+                                    "units.assertions",
+                                    "optional_draft_assertion_ignored",
+                                    "A malformed optional assertion was omitted.",
+                                )
                                 continue
+                            assertion_id = normalized_assertion.get("id")
+                            declared_hashes: dict[tuple[str, str], str] = {}
+                            if isinstance(assertion_id, str):
+                                for reference in raw_assertion_refs:
+                                    declared_sha256 = reference.get("sha256")
+                                    raw_reference_id = reference.get("id")
+                                    if (
+                                        reference.get("kind") not in {"observation", "finding"}
+                                        or not isinstance(declared_sha256, str)
+                                        or not isinstance(raw_reference_id, (str, UUID))
+                                    ):
+                                        continue
+                                    try:
+                                        canonical_reference_id = str(UUID(str(raw_reference_id)))
+                                    except ValueError:
+                                        canonical_reference_id = str(raw_reference_id)
+                                    declared_hashes[(reference["kind"], canonical_reference_id)] = (
+                                        declared_sha256
+                                    )
+                                declared_hashes_by_assertion[assertion_id] = declared_hashes
                             normalized_assertion["refs"] = [
                                 {"kind": reference["kind"], "id": reference.get("id")}
                                 for reference in raw_assertion_refs
                             ]
                             normalized_assertions.append(normalized_assertion)
+                    validation_failed = False
                     try:
                         validated = (
                             await self._validated_assertions(
@@ -3505,17 +3580,66 @@ class InvestigationAdvisorTool:
                     except ValueError:
                         # Optional draft annotations do not gate consultive text generation.
                         validated = []
+                        validation_failed = True
+                        warn_input(
+                            "units.assertions",
+                            "optional_draft_assertion_ignored",
+                            "An unverifiable optional assertion was omitted.",
+                        )
+                    accepted_assertions: list[dict[str, Any]] = []
                     for assertion in validated:
+                        actual_hashes = {
+                            (reference["kind"], reference["id"]): reference["sha256"]
+                            for reference in assertion["refs"]
+                        }
+                        declared_hashes = declared_hashes_by_assertion.get(assertion["id"], {})
+                        if any(
+                            actual_hashes.get(key) != declared_sha256
+                            for key, declared_sha256 in declared_hashes.items()
+                        ):
+                            warn_input(
+                                "units.assertions",
+                                "optional_draft_assertion_ignored",
+                                "An assertion with an unverifiable canonical hash was omitted.",
+                            )
+                            continue
                         if assertion["id"] in seen_assertion_ids:
-                            raise ValueError("Assertion ids must be unique across editorial units")
+                            warn_input(
+                                "units.assertions",
+                                "optional_draft_assertion_ignored",
+                                "A duplicate optional assertion was omitted.",
+                            )
+                            continue
                         if any(
                             assertion[key] != target[key]
                             for key in ("block_type", "form", "anchor")
                         ):
-                            raise ValueError("Assertion target does not match its editorial unit")
+                            warn_input(
+                                "units.assertions",
+                                "optional_draft_assertion_ignored",
+                                "An assertion with a different target was omitted.",
+                            )
+                            continue
                         seen_assertion_ids.add(assertion["id"])
+                        accepted_assertions.append(assertion)
                         draft_assertions.append({**assertion, "unit_id": unit_id})
-                    unit_refs = [ref for assertion in validated for ref in assertion["refs"]]
+                    if not validation_failed:
+                        assertion_refs_by_unit[unit_id] = [
+                            {
+                                "kind": reference["kind"],
+                                "id": reference["id"],
+                                "sha256": reference["sha256"],
+                            }
+                            for assertion in accepted_assertions
+                            for reference in assertion["refs"]
+                        ] + [
+                            reference
+                            for reference in assertion_refs_by_unit.get(unit_id, ())
+                            if reference["kind"] in {"article", "measurement"}
+                        ]
+                    unit_refs = [
+                        ref for assertion in accepted_assertions for ref in assertion["refs"]
+                    ]
                     unit_refs.extend(assertion_refs_by_unit.get(unit_id, ()))
                     target["evidence_refs"] = list(
                         dict.fromkeys(
@@ -3538,9 +3662,28 @@ class InvestigationAdvisorTool:
                 except ValueError:
                     # These annotations are optional for consultation and are not promotion data.
                     draft_assertions = []
+                    warn_input(
+                        "assertions",
+                        "optional_draft_assertion_ignored",
+                        "An unverifiable optional assertion was omitted.",
+                    )
                 base["assertions"] = draft_assertions
             else:
                 base["assertions"] = []
+                if "assertions" in arguments and arguments.get("assertions") not in (None, (), []):
+                    warn_input(
+                        "assertions",
+                        "optional_draft_assertion_ignored",
+                        "A malformed optional assertion collection was omitted.",
+                    )
+
+        if consultation_type == "draft_text" and isinstance(arguments.get("units"), (list, tuple)):
+            unit_assertion_refs = [
+                reference
+                for unit_refs in assertion_refs_by_unit.values()
+                for reference in unit_refs
+            ]
+            base["_explicit_assertion_refs"] = [dict(item) for item in unit_assertion_refs]
 
         tool_inventory = (
             []
@@ -3611,10 +3754,52 @@ class InvestigationAdvisorTool:
                         )
                     declared_sha256 = expected_assertion_sha256.get(key)
                     if declared_sha256 is not None and declared_sha256 != actual_sha256:
-                        raise _AdvisorInputValidationError(
-                            "advisor_evidence_reference_mismatch", reference=reference["id"]
+                        warn_input(
+                            "units.assertions" if "units" in arguments else "assertions",
+                            "optional_draft_assertion_ignored",
+                            "An assertion with an unverifiable canonical hash was omitted.",
                         )
+                        ignored_assertion_ref_keys.add(key)
+                        continue
                     reference["sha256"] = actual_sha256
+            if ignored_assertion_ref_keys:
+                base["_explicit_assertion_refs"] = [
+                    reference
+                    for reference in base.get("_explicit_assertion_refs", ())
+                    if (reference["kind"], reference["id"]) not in ignored_assertion_ref_keys
+                ]
+                base["assertions"] = [
+                    assertion
+                    for assertion in base.get("assertions", ())
+                    if not any(
+                        (reference.get("kind"), reference.get("id")) in ignored_assertion_ref_keys
+                        for reference in assertion.get("refs", ())
+                    )
+                ]
+                for unit in base.get("units", ()):
+                    if not isinstance(unit, dict):
+                        continue
+                    unit_assertions = [
+                        assertion
+                        for assertion in base["assertions"]
+                        if assertion.get("unit_id") == unit.get("id")
+                    ]
+                    unit["evidence_refs"] = list(
+                        dict.fromkeys(
+                            reference["id"]
+                            for assertion in unit_assertions
+                            for reference in assertion.get("refs", ())
+                            if reference.get("kind") == "observation"
+                        )
+                    )
+                    unit["finding_refs"] = list(
+                        dict.fromkeys(
+                            reference["id"]
+                            for assertion in unit_assertions
+                            for reference in assertion.get("refs", ())
+                            if reference.get("kind") == "finding"
+                        )
+                    )
 
         async def verified_measurements() -> tuple[
             list[dict[str, Any]], dict[str, list[dict[str, Any]]]
@@ -3872,11 +4057,18 @@ class InvestigationAdvisorTool:
             if measurement_candidates is not None or measurement_assertion_refs:
                 measurements, content_patterns = await verified_measurements()
                 if measurement_candidates is not None:
-                    measurements = self._select_verified_measurements(
+                    measurements, selection_fallback = self._advisory_measurement_selection(
                         measurements,
                         measurement_candidates,
                         content_patterns=content_patterns,
                     )
+                    if selection_fallback:
+                        warn_input(
+                            "measurements",
+                            "optional_measurements_ignored",
+                            "Malformed or unverifiable selections were ignored; only canonical "
+                            "measurements were used.",
+                        )
                 else:
                     measurements = self._select_discriminating_measurements(measurements)
                 measurement_rows = [
@@ -3918,9 +4110,18 @@ class InvestigationAdvisorTool:
                     ).hexdigest()
                     declared_sha256 = reference.get("sha256")
                     if declared_sha256 is not None and declared_sha256 != actual_sha256:
-                        raise _AdvisorInputValidationError(
-                            "advisor_evidence_reference_mismatch", reference=reference["id"]
+                        warn_input(
+                            "units.assertions" if "units" in arguments else "assertions",
+                            "optional_draft_assertion_ignored",
+                            "An assertion with an unverifiable measurement hash was omitted.",
                         )
+                        ignored_assertion_ref_keys.add(("measurement", reference["id"]))
+                        base["_explicit_assertion_refs"] = [
+                            item
+                            for item in base.get("_explicit_assertion_refs", ())
+                            if (item["kind"], item["id"]) not in ignored_assertion_ref_keys
+                        ]
+                        continue
                     reference["sha256"] = actual_sha256
         elif consultation_type == "yara_draft":
             measurements, content_patterns = await verified_measurements()
@@ -3928,6 +4129,13 @@ class InvestigationAdvisorTool:
             measurements, selection_fallback = self._advisory_measurement_selection(
                 measurements, candidates, content_patterns=content_patterns
             )
+            if selection_fallback:
+                warn_input(
+                    "measurements",
+                    "optional_measurements_ignored",
+                    "Malformed or unverifiable selections were ignored; only canonical "
+                    "measurements were used.",
+                )
             measurements = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -4050,6 +4258,13 @@ class InvestigationAdvisorTool:
             measurements, selection_fallback = self._advisory_measurement_selection(
                 measurements, candidates, content_patterns=content_patterns
             )
+            if selection_fallback:
+                warn_input(
+                    "measurements",
+                    "optional_measurements_ignored",
+                    "Malformed or unverifiable selections were ignored; only canonical "
+                    "measurements were used.",
+                )
             base["measurements"] = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -4181,6 +4396,8 @@ class InvestigationAdvisorTool:
                 missing_provenance = [item for item in provenance if item not in title]
                 if missing_provenance:
                     excerpt["title"] = title + "; " + "; ".join(missing_provenance)
+        if input_warnings:
+            base["_input_warnings"] = input_warnings
         compacted = _compact_advisor_data(base, consultation_type)
         if consultation_type in {"draft_text", "yara_draft", "suricata_draft", "figure_plan"}:
             compacted["transmitted_refs"] = _typed_transmitted_refs(compacted, snapshot)
@@ -5984,7 +6201,7 @@ class InvestigationAdvisorTool:
         """Reuse a response link when a submitted turn is replayed after a crash."""
         for observation in await self._list_observations(context.investigation_id):
             if (
-                observation.source != ADVISOR_TOOL_NAME
+                observation.source != ADVISOR_RESPONSE_SOURCE
                 or observation.object_type != "advisor_response_received"
                 or observation.object_id != context.idempotency_key
             ):
@@ -6441,93 +6658,6 @@ def register_investigation_advisor_tool(
         "type": "string",
         "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
     }
-    assertion_ref_schema = {
-        "type": "object",
-        "properties": {
-            "kind": {"type": "string", "enum": ["observation", "finding", "experiment"]},
-            "id": uuid_schema,
-        },
-        "required": ["kind", "id"],
-        "additionalProperties": False,
-    }
-    editorial_assertion_ref_schema = {
-        "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["observation", "finding", "experiment", "article", "measurement"],
-            },
-            "id": {"type": "string", "minLength": 1},
-            "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-        },
-        "required": ["kind", "id"],
-        "additionalProperties": False,
-        "oneOf": [
-            {
-                "properties": {
-                    "kind": {"enum": ["observation", "finding", "experiment"]},
-                    "id": uuid_schema,
-                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-                }
-            },
-            {
-                "properties": {
-                    "kind": {"const": "article"},
-                    "id": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-                }
-            },
-            {
-                "properties": {
-                    "kind": {"const": "measurement"},
-                    "id": {"type": "string", "pattern": r"^m[0-9]{3,}$"},
-                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-                }
-            },
-        ],
-    }
-    assertion_schema: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "pattern": r"^[a-z][a-z0-9_-]{0,63}$"},
-            "text": {"type": "string", "minLength": 1},
-            "nature": {
-                "type": "string",
-                "enum": ["article", "analyse", "deduction", "contradiction", "insuffisant"],
-            },
-            "refs": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": True,
-                "items": assertion_ref_schema,
-            },
-            "block_type": {
-                "type": "string",
-                "enum": [
-                    item.value
-                    for item in OpinionBlockType
-                    if item is not OpinionBlockType.ANALYST_OBSERVATIONS
-                ],
-            },
-            "form": {"type": "string", "enum": ["body", "analyst_note"]},
-            "anchor": {"type": ["string", "null"], "maxLength": 128},
-        },
-        "required": ["id", "text", "nature", "refs", "block_type", "form", "anchor"],
-        "additionalProperties": False,
-    }
-    editorial_assertion_schema = {
-        **assertion_schema,
-        "properties": {
-            **assertion_schema["properties"],
-            "refs": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": True,
-                "items": editorial_assertion_ref_schema,
-            },
-        },
-        "required": ["id", "text", "nature", "refs"],
-    }
     editorial_unit_schema = {
         "type": "object",
         "properties": {
@@ -6543,9 +6673,8 @@ def register_investigation_advisor_tool(
             "form": {"type": "string", "enum": ["body", "analyst_note"]},
             "anchor": {"type": ["string", "null"], "maxLength": 128},
             "assertions": {
-                "type": "array",
-                "minItems": 1,
-                "items": editorial_assertion_schema,
+                "additionalProperties": True,
+                "items": {"additionalProperties": True},
             },
         },
         "required": ["id", "block_type", "form", "anchor"],
@@ -6577,21 +6706,7 @@ def register_investigation_advisor_tool(
                         "uniqueItems": True,
                         "items": uuid_schema,
                     },
-                    "measurements": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "blob_id": {"type": "string"},
-                                "kind": {"type": "string"},
-                                "offset": {"type": "integer"},
-                                "value": {"type": "string"},
-                                "content_pattern_id": {"type": "string"},
-                            },
-                            "additionalProperties": True,
-                        },
-                    },
+                    "measurements": {},
                     "opinion_id": uuid_schema,
                     "opinion_version": {"type": "integer", "minimum": 1},
                     "form": {"type": "string", "enum": ["body", "analyst_note"]},
@@ -6601,9 +6716,8 @@ def register_investigation_advisor_tool(
                         "enum": [item.value for item in OpinionBlockType],
                     },
                     "assertions": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": assertion_schema,
+                        "additionalProperties": True,
+                        "items": {"additionalProperties": True},
                     },
                     "units": {
                         "type": "array",
@@ -7493,8 +7607,26 @@ def _validate_editorial_unit_targets(
         seen_targets.add(target)
 
 
-def _unit_assertion_references(units: object) -> list[dict[str, str]]:
-    """Extract exact canonical refs from optional draft annotations on editorial units."""
+def _unit_assertion_references(
+    units: object,
+    *,
+    warnings: list[dict[str, str]] | None = None,
+    field: str = "units.assertions",
+    require_target_fields: bool = False,
+) -> list[dict[str, str]]:
+    """Extract only well-formed canonical refs from optional draft annotations."""
+
+    def warn() -> None:
+        if warnings is None:
+            return
+        item = {
+            "field": field,
+            "code": "optional_draft_assertion_ignored",
+            "detail_safe": "A malformed optional assertion or reference was omitted.",
+        }
+        if item not in warnings:
+            warnings.append(item)
+
     if not isinstance(units, (list, tuple)):
         return []
     allowed_kinds = {"observation", "finding", "article", "measurement"}
@@ -7504,40 +7636,92 @@ def _unit_assertion_references(units: object) -> list[dict[str, str]]:
             continue
         assertions = unit.get("assertions", ())
         if not isinstance(assertions, (list, tuple)):
+            if "assertions" in unit and assertions is not None:
+                warn()
             continue
         for assertion in assertions:
             if not isinstance(assertion, Mapping):
+                warn()
+                continue
+            assertion_id = assertion.get("id")
+            text = assertion.get("text")
+            nature = assertion.get("nature")
+            if (
+                not isinstance(assertion_id, str)
+                or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", assertion_id) is None
+                or not isinstance(text, str)
+                or not text.strip()
+                or nature not in {"article", "analyse", "deduction", "contradiction", "insuffisant"}
+            ):
+                warn()
+                continue
+            if require_target_fields and (
+                assertion.get("block_type")
+                not in {
+                    kind.value
+                    for kind in OpinionBlockType
+                    if kind is not OpinionBlockType.ANALYST_OBSERVATIONS
+                }
+                or assertion.get("form") not in {"body", "analyst_note"}
+                or (assertion.get("form") == "body" and assertion.get("anchor") is not None)
+                or (
+                    assertion.get("form") == "analyst_note"
+                    and not isinstance(assertion.get("anchor"), str)
+                )
+            ):
+                warn()
+                continue
+            target_mismatch = any(
+                key in assertion and assertion[key] != unit.get(key)
+                for key in ("block_type", "form", "anchor")
+                if key in unit
+            )
+            if target_mismatch:
+                warn()
                 continue
             raw_refs = assertion.get("refs", ())
-            if not isinstance(raw_refs, (list, tuple)):
+            if not isinstance(raw_refs, (list, tuple)) or not raw_refs:
+                warn()
                 continue
+            parsed_refs: list[tuple[str, str, str | None]] = []
+            valid_assertion = True
             for raw_ref in raw_refs:
                 if not isinstance(raw_ref, Mapping):
-                    continue
+                    valid_assertion = False
+                    break
                 kind = raw_ref.get("kind")
                 if kind not in allowed_kinds:
-                    continue
+                    valid_assertion = False
+                    break
                 raw_identifier = raw_ref.get("id")
                 if not isinstance(raw_identifier, (str, UUID)) or not str(raw_identifier).strip():
-                    raise _AdvisorInputValidationError(
-                        "editorial_reference_invalid", reference="invalid-id"
-                    )
+                    valid_assertion = False
+                    break
                 identifier = str(raw_identifier)
                 if kind in {"observation", "finding"}:
                     try:
                         identifier = str(UUID(identifier))
                     except ValueError:
-                        raise _AdvisorInputValidationError(
-                            "editorial_reference_invalid", reference=identifier[:128]
-                        ) from None
+                        valid_assertion = False
+                        break
                 declared_sha256 = raw_ref.get("sha256")
                 if declared_sha256 is not None and (
                     not isinstance(declared_sha256, str)
                     or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
                 ):
-                    raise _AdvisorInputValidationError(
-                        "advisor_evidence_reference_mismatch", reference=identifier[:128]
+                    valid_assertion = False
+                    break
+                parsed_refs.append(
+                    (
+                        str(kind),
+                        identifier,
+                        declared_sha256 if isinstance(declared_sha256, str) else None,
                     )
+                )
+            if not valid_assertion:
+                warn()
+                continue
+            for kind, identifier, declared_sha256 in parsed_refs:
                 key = (str(kind), identifier)
                 previous = references.get(key)
                 if previous is not None:
@@ -7547,9 +7731,8 @@ def _unit_assertion_references(units: object) -> list[dict[str, str]]:
                         and declared_sha256 is not None
                         and previous_sha256 != declared_sha256
                     ):
-                        raise _AdvisorInputValidationError(
-                            "advisor_evidence_reference_mismatch", reference=identifier[:128]
-                        )
+                        warn()
+                        continue
                     if previous_sha256 is None and declared_sha256 is not None:
                         previous["sha256"] = declared_sha256
                     continue
@@ -8356,6 +8539,15 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
             for item in results
         ],
     }
+    input_warnings: dict[bytes, dict[str, Any]] = {}
+    for result in results:
+        for warning in result.output.get("input_warnings", ()):
+            if not isinstance(warning, Mapping):
+                continue
+            warning_payload = dict(warning)
+            input_warnings.setdefault(canonical_json_bytes(warning_payload), warning_payload)
+    if input_warnings:
+        output["input_warnings"] = list(input_warnings.values())
     first_failure = next(
         (item.output for item in results if isinstance(item.output.get("failure_stage"), str)),
         None,
