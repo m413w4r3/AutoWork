@@ -810,7 +810,8 @@ def test_yara_prose_keeps_rule_candidate_when_business_measurement_linking_is_in
 
     assert parsed is not None
     assert parsed["usable"] is True
-    assert parsed["status"] == "partial"
+    assert parsed["status"] == "succeeded"
+    assert parsed["normalization_status"] == "partial"
     assert parsed["rule_source"] == source
     assert parsed["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
     assert parsed["canonicalization_eligible"] is False

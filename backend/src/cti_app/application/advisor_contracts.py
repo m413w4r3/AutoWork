@@ -1366,7 +1366,9 @@ def _normalize_prose_yara_wire(
     limitations.extend(f"Wire recovery: {item}." for item in warnings)
     return {
         **common,
-        "status": "succeeded" if canonicalization_eligible else "partial",
+        # For prose recovery, status describes successful technical extraction. Business
+        # measurement linkage remains independently gated by normalization/canonicalization.
+        "status": "succeeded" if usable else "partial",
         "rule_source": source,
         "rule_source_sha256": source_hash,
         "motifs": motifs,

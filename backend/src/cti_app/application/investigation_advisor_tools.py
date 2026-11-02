@@ -24,13 +24,13 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
+from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.advisor_contracts import (
     ADVISOR_RESPONSE_SCHEMA_V3,
     ADVISOR_SOURCE_PARSER_VERSION,
     extract_json_object,
     parse_typed_advisor_response,
 )
-from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
     _sample_disclosure_restriction_sources,
@@ -2203,15 +2203,6 @@ class InvestigationAdvisorTool:
             },
             "stage_timestamps_utc": (
                 dict(timing.stage_timestamps_utc) if timing is not None else {}
-            ),
-            "consult_status": derive_advisor_consult_status(
-                stage_timestamps_utc=(timing.stage_timestamps_utc if timing is not None else {}),
-                invocation_stage=invocation_stage,
-                submission_status=submission.status.value,
-                submission_state=submission.submission_state,
-                invocation_status=result.status,
-                response_received=submission.output_text is not None,
-                response_persisted=response_link_observation is not None,
             ),
             "diagnostics": dict(timing.counters) if timing is not None else {},
             "redacted_secret_count": redacted_secret_count,
@@ -9012,6 +9003,14 @@ def _advisor_output_result_status(
 ) -> tuple[str, ToolInvocationStatus]:
     """Map parser outcomes without treating explicit v4 failures as success."""
     status = parsed.get("status")
+    if (
+        parsed.get("normalization_method") == "local_yara_prose_v1"
+        and status == "succeeded"
+        and parsed.get("usable") is True
+        and isinstance(parsed.get("rule_source"), str)
+        and bool(parsed["rule_source"].strip())
+    ):
+        return "succeeded", ToolInvocationStatus.SUCCEEDED
     if parsed.get("parser_version") == ADVISOR_SOURCE_PARSER_VERSION_V4:
         if status == "refused":
             return "refused", ToolInvocationStatus.PARTIAL
