@@ -136,22 +136,19 @@ def derive_advisor_consult_status(
     submission_state: Any = None,
     invocation_status: Any = None,
     response_received: Any = False,
-    response_persisted: Any = False,
-    advisor_observation_present: Any = False,
+    response_observation_present: Any = False,
+    output_blob_present: Any = False,
     failure_stage: Any = None,
 ) -> str:
     """Map consultation facts using this precedence table:
 
     - needs-review or ambiguous submission -> ``ambiguous``
     - failed, denied, unavailable, or another failure -> ``error``
-    - persisted response -> ``response_persisted``
-    - received response without persistence -> ``response_received``
+    - response-link observation or verified ``manifest_persisted`` stage -> ``response_persisted``
+    - raw output blob or response-received flag/stage -> ``response_received``
     - prompt stored or Bridge post started -> ``sent_to_bridge``
     - advisor started or invocation running -> ``dossier_preparing``
     - no timestamps and not running -> ``received``
-
-    A succeeded/partial invocation with its advisor observation is persisted even if
-    legacy metadata has no timestamps.
     """
     stages = (
         {key for key, value in stage_timestamps_utc.items() if isinstance(key, str) and value}
@@ -189,18 +186,12 @@ def derive_advisor_consult_status(
         }
     ):
         return "error"
-    if (
-        response_persisted is True
-        or stages.intersection({"response_persisted", "manifest_persisted"})
-        or (
-            advisor_observation_present is True
-            and invocation_status
-            in {ToolInvocationStatus.SUCCEEDED.value, ToolInvocationStatus.PARTIAL.value}
-        )
-    ):
+    if response_observation_present is True or "manifest_persisted" in stages:
         return "response_persisted"
-    if response_received is True or stages.intersection(
-        {"bridge_response_received", "output_stored"}
+    if (
+        response_received is True
+        or output_blob_present is True
+        or stages.intersection({"bridge_response_received", "output_stored", "response_persisted"})
     ):
         return "response_received"
     if (

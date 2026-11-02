@@ -330,6 +330,7 @@ class InvestigationAdvisorTool:
         self._artifact_store = artifact_store
         self._registry = registry
         self._results: dict[str, ToolResult] = {}
+        self._response_archive_failures: dict[str, ToolResult] = {}
         self._preflight_refusals: dict[str, dict[str, Any]] = {}
         self._ignored_evidence_refs: dict[str, tuple[str, ...]] = {}
         self._reference_answers: dict[tuple[UUID, str, str], bool] = {}
@@ -1926,29 +1927,110 @@ class InvestigationAdvisorTool:
             )
         if sample_policy_failure is not None:
             return sample_policy_failure
+        archived_response_failure = self._response_archive_failures.get(context.idempotency_key)
+        if archived_response_failure is not None:
+            archived_output = archived_response_failure.output
+            if (
+                archived_output.get("prompt_sha256") == context_sha256
+                and archived_output.get("dossier_sha256") == dossier.sha256
+            ):
+                return self._finish(context, archived_response_failure)
+            return self._finish(
+                context,
+                ToolResult(
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                    error_code="advisor_idempotency_conflict",
+                    output={
+                        "advisor_status": "needs_review",
+                        "failure_stage": "response_archive_replay_conflict",
+                        "failure_reason": "idempotency_key_reused_with_new_inputs",
+                        "retry": False,
+                        "response_received": True,
+                    },
+                ),
+            )
         submission_started_at = time.perf_counter()
-        submission = await submit_bridge_consultation_once(
-            self._transport,
-            investigation_id=context.investigation_id,
-            subject_id=investigation.subject_id,
-            turn_index=turn_index,
-            context_sha256=context_sha256,
-            prompt=prompt,
-            external_llm_allowed=True,
-            settings=self._settings,
-            timeout_seconds=execution_timeout_seconds,
-            deadline_monotonic=execution_deadline_monotonic,
-            minimum_timeout_seconds=minimum_execution_seconds,
-            clock=execution_clock,
-            on_submission_started=lambda: timing.mark("bridge_post_started"),
-            external_effect_binding_context={
-                "authority_context": getattr(context, "external_effect_authority", None),
-                "invocation_arguments": dict(arguments),
-                "transmitted_refs": transmitted_refs,
-                "evidence_refs": external_effect_evidence_refs,
-                "reservation_operation_key": reservation_key,
-            },
-        )
+        response_link_observation: EvidenceObservation | None = None
+        output_blob_id: UUID | None = None
+        replayed_response_payload: Mapping[str, Any] | None = None
+        raw_output: str | None = None
+        try:
+            (
+                response_link_observation,
+                output_blob_id,
+                replayed_response_payload,
+            ) = await self._existing_response_link(
+                context,
+                consultation_type=consultation_type,
+                bridge_invocation_id=None,
+                output_sha256=None,
+                prompt_sha256=context_sha256,
+                dossier_sha256=dossier.sha256,
+            )
+            if replayed_response_payload is not None and output_blob_id is not None:
+                replayed_bytes = await self._artifact_store.read_bytes(
+                    output_blob_id,
+                    max_bytes=int(
+                        getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)
+                    ),
+                )
+                replayed_sha256 = hashlib.sha256(replayed_bytes).hexdigest()
+                if replayed_sha256 != replayed_response_payload.get("raw_response_sha256"):
+                    raise ValueError("Stored advisor response blob failed its SHA-256 check")
+                raw_output = replayed_bytes.decode("utf-8")
+                submission = self._submission_from_response_link(
+                    replayed_response_payload,
+                    output_text=raw_output,
+                    idempotency_key=context.idempotency_key,
+                )
+        except Exception as exc:
+            # A response link proves Bridge already replied. If its bytes or
+            # metadata cannot be recovered, stop for review instead of posting again.
+            return self._finish(
+                context,
+                ToolResult(
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                    observation_refs=(
+                        (response_link_observation.id,)
+                        if response_link_observation is not None
+                        else ()
+                    ),
+                    error_code="advisor_response_replay_uncertain",
+                    output={
+                        "advisor_status": "needs_review",
+                        "failure_stage": "response_link_replay",
+                        "failure_reason": type(exc).__name__,
+                        "confirmed_non_execution": False,
+                        "response_received": True,
+                        "retry": False,
+                        "bridge_turns_consumed": 0,
+                    },
+                    exception_class=type(exc).__name__,
+                ),
+            )
+        if replayed_response_payload is None:
+            submission = await submit_bridge_consultation_once(
+                self._transport,
+                investigation_id=context.investigation_id,
+                subject_id=investigation.subject_id,
+                turn_index=turn_index,
+                context_sha256=context_sha256,
+                prompt=prompt,
+                external_llm_allowed=True,
+                settings=self._settings,
+                timeout_seconds=execution_timeout_seconds,
+                deadline_monotonic=execution_deadline_monotonic,
+                minimum_timeout_seconds=minimum_execution_seconds,
+                clock=execution_clock,
+                on_submission_started=lambda: timing.mark("bridge_post_started"),
+                external_effect_binding_context={
+                    "authority_context": getattr(context, "external_effect_authority", None),
+                    "invocation_arguments": dict(arguments),
+                    "transmitted_refs": transmitted_refs,
+                    "evidence_refs": external_effect_evidence_refs,
+                    "reservation_operation_key": reservation_key,
+                },
+            )
         if timing is not None:
             if submission.output_text is not None:
                 timing.mark(
@@ -1971,8 +2053,6 @@ class InvestigationAdvisorTool:
         output_sha256 = (
             hashlib.sha256(raw_output_bytes).hexdigest() if raw_output_bytes is not None else None
         )
-        output_blob_id: UUID | None = None
-        response_link_observation: EvidenceObservation | None = None
         output_archive_error: Exception | None = None
         if raw_output is not None:
             output_store_started_at = time.perf_counter()
@@ -1985,14 +2065,19 @@ class InvestigationAdvisorTool:
                     )
                 except (TypeError, ValueError):
                     bridge_invocation_id = None
-                response_link_observation, output_blob_id = await self._existing_response_link(
-                    context,
-                    consultation_type=consultation_type,
-                    bridge_invocation_id=bridge_invocation_id,
-                    output_sha256=output_sha256 or "",
-                    prompt_sha256=context_sha256,
-                    dossier_sha256=dossier.sha256,
-                )
+                if response_link_observation is None:
+                    (
+                        response_link_observation,
+                        output_blob_id,
+                        _,
+                    ) = await self._existing_response_link(
+                        context,
+                        consultation_type=consultation_type,
+                        bridge_invocation_id=bridge_invocation_id,
+                        output_sha256=output_sha256,
+                        prompt_sha256=context_sha256,
+                        dossier_sha256=dossier.sha256,
+                    )
                 if response_link_observation is None:
                     output_blob_id = await self._artifact_store.put_bytes(
                         raw_output_bytes or b"",
@@ -5326,6 +5411,7 @@ class InvestigationAdvisorTool:
         except _AdvisorInputValidationError as exc:
             if exc.reason_code != "measurements_invalid":
                 raise
+            # Bad selectors use verified scope, as if the optional field were omitted.
             return cls._select_discriminating_measurements(verified), True
 
     @staticmethod
@@ -6230,10 +6316,10 @@ class InvestigationAdvisorTool:
         *,
         consultation_type: str,
         bridge_invocation_id: str | None,
-        output_sha256: str,
+        output_sha256: str | None,
         prompt_sha256: str,
         dossier_sha256: str,
-    ) -> tuple[EvidenceObservation | None, UUID | None]:
+    ) -> tuple[EvidenceObservation | None, UUID | None, Mapping[str, Any] | None]:
         """Reuse a response link when a submitted turn is replayed after a crash."""
         for observation in await self._list_observations(context.investigation_id):
             if (
@@ -6253,11 +6339,14 @@ class InvestigationAdvisorTool:
                 "operator-advisor-response-link.v1"
             ):
                 continue
-            if payload.get("raw_response_sha256") != output_sha256:
+            if output_sha256 is not None and payload.get("raw_response_sha256") != output_sha256:
                 raise ValueError("Advisor response idempotency key was reused with new text")
             if (
                 payload.get("consultation_type") != consultation_type
-                or payload.get("bridge_invocation_id") != bridge_invocation_id
+                or (
+                    bridge_invocation_id is not None
+                    and payload.get("bridge_invocation_id") != bridge_invocation_id
+                )
                 or payload.get("prompt_sha256") != prompt_sha256
                 or payload.get("dossier_sha256") != dossier_sha256
             ):
@@ -6266,8 +6355,41 @@ class InvestigationAdvisorTool:
                 raw_blob_id = UUID(str(payload["raw_response_blob_id"]))
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("Stored advisor response link has no valid blob ID") from exc
-            return observation, raw_blob_id
-        return None, None
+            return observation, raw_blob_id, payload
+        return None, None, None
+
+    @staticmethod
+    def _submission_from_response_link(
+        payload: Mapping[str, Any], *, output_text: str, idempotency_key: str
+    ) -> TurnSubmission:
+        """Rebuild the completed Bridge result recorded by a response link."""
+        try:
+            status = TurnSubmissionStatus(str(payload["submission_status"]))
+        except (KeyError, TypeError, ValueError):
+            status = TurnSubmissionStatus.NEEDS_REVIEW
+        conversation_id: UUID | None = None
+        try:
+            if payload.get("bridge_conversation_id") is not None:
+                conversation_id = UUID(str(payload["bridge_conversation_id"]))
+        except (TypeError, ValueError):
+            status = TurnSubmissionStatus.NEEDS_REVIEW
+        bridge_invocation_id = payload.get("bridge_invocation_id")
+        if not isinstance(bridge_invocation_id, str):
+            bridge_invocation_id = None
+        provider_usage = payload.get("provider_usage")
+        if not isinstance(provider_usage, Mapping):
+            provider_usage = None
+        return TurnSubmission(
+            status=status,
+            output_text=output_text,
+            idempotency_key=idempotency_key,
+            conversation_id=conversation_id,
+            submission_state=payload.get("submission_state"),
+            bridge_invocation_id=bridge_invocation_id,
+            provider_usage=provider_usage,
+            completed_response=True,
+            prior_submission_made=True,
+        )
 
     def _submission_result(
         self,
@@ -6676,9 +6798,29 @@ class InvestigationAdvisorTool:
             ),
             invocation_status=result.status,
             response_received=output.get("response_received") is True,
-            response_persisted=(
-                output.get("response_persisted") is True
-                or isinstance(status_metadata.get("response_observation_ref"), str)
+            response_observation_present=(
+                isinstance(
+                    output.get(
+                        "response_observation_ref",
+                        status_metadata.get("response_observation_ref"),
+                    ),
+                    str,
+                )
+                and output.get(
+                    "response_observation_ref",
+                    status_metadata.get("response_observation_ref"),
+                )
+                in {str(item) for item in result.observation_refs}
+            ),
+            output_blob_present=(
+                (
+                    isinstance(output.get("output_blob_id"), str)
+                    and bool(output["output_blob_id"].strip())
+                )
+                or (
+                    isinstance(status_metadata.get("output_blob_id"), str)
+                    and bool(status_metadata["output_blob_id"].strip())
+                )
             ),
             failure_stage=output.get("failure_stage"),
         )
@@ -6702,6 +6844,16 @@ class InvestigationAdvisorTool:
                 output={**dict(result.output), "ignored_evidence_refs": list(ignored)},
             )
         result = _attest_advisor_pre_submission(result)
+        if (
+            result.status is ToolInvocationStatus.NEEDS_REVIEW
+            and result.output.get("failure_stage") == "response_archival"
+            and result.output.get("response_received") is True
+            and result.output.get("raw_output_retained") is True
+            and isinstance(result.output.get("raw_output"), str)
+        ):
+            self._response_archive_failures[context.idempotency_key] = result
+            if len(self._response_archive_failures) > 128:
+                self._response_archive_failures.pop(next(iter(self._response_archive_failures)))
         self._results[context.idempotency_key] = result
         if len(self._results) > 128:
             self._results.pop(next(iter(self._results)))

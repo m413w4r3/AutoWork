@@ -746,6 +746,70 @@ async def test_advisor_raw_response_link_survives_result_manifest_persistence_fa
 
 
 @pytest.mark.asyncio
+async def test_response_link_write_failure_keeps_raw_text_and_replay_does_not_post_again(
+    monkeypatch,
+) -> None:
+    from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+
+    investigation_id = uuid4()
+    raw_output = "Bridge returned text before its response link write failed."
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "e" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+    record_json = ProductionEvidenceRecorder.record_json
+
+    async def fail_response_link(self, **kwargs):
+        if kwargs.get("object_type") == "advisor_response_received":
+            raise RuntimeError("synthetic response-link write failure")
+        return await record_json(self, **kwargs)
+
+    monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_response_link)
+    context = make_context(investigation_id, key="response-link-write-failure-replay")
+    arguments = {
+        "consultation_type": "pivot_strategy",
+        "evidence_refs": [str(evidence.id)],
+    }
+
+    first = await tool.execute(arguments, context)
+
+    assert first.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert first.output["failure_stage"] == "response_archival"
+    assert first.output["raw_output_retained"] is True
+    assert first.output["raw_output"] == raw_output
+    assert first.output["response_received"] is True
+    assert first.output["confirmed_non_execution"] is False
+    assert await _advisor_response_link_payloads(tool, investigation_id) == []
+    manifest_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.object_type == "advisor_call" and item.source == "advisor.consult"
+    )
+    manifest = json.loads(
+        await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
+    )
+    assert manifest["output"]["raw_output"] == raw_output
+
+    assert tool.take_result(context.idempotency_key) is not None
+    replay = await tool.execute(arguments, context)
+
+    assert replay.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert replay.output["raw_output"] == raw_output
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_advisor_raw_response_link_replay_does_not_duplicate(monkeypatch) -> None:
     from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 
@@ -775,18 +839,31 @@ async def test_advisor_raw_response_link_replay_does_not_duplicate(monkeypatch) 
 
     monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_call_manifest)
     context = make_context(investigation_id, key="response-link-replay")
+    response_link_appends: list[UUID] = []
+    append_if_absent = tool._observations.append_if_absent
+
+    async def record_response_link_append(observation):
+        if observation.source == "advisor.consult.response":
+            response_link_appends.append(observation.id)
+        return await append_if_absent(observation)
+
+    monkeypatch.setattr(tool._observations, "append_if_absent", record_response_link_append)
 
     arguments = {
         "consultation_type": "pivot_strategy",
         "evidence_refs": [str(evidence.id)],
     }
     first = await tool.execute(arguments, context)
+    first_response_ref = first.output["response_observation_ref"]
     assert tool.take_result(context.idempotency_key) is not None
     replay = await tool.execute(arguments, context)
 
     assert first.output["output_sha256"] == replay.output["output_sha256"]
-    assert len(transport.calls) == 2
-    assert len(await _advisor_response_link_payloads(tool, investigation_id)) == 1
+    assert len(transport.calls) == 1
+    links = await _advisor_response_link_payloads(tool, investigation_id)
+    assert len(links) == 1
+    assert replay.output["response_observation_ref"] == first_response_ref
+    assert response_link_appends == [UUID(first_response_ref)]
 
 
 @pytest.mark.asyncio
@@ -952,12 +1029,30 @@ async def test_malformed_optional_measurements_warn_for_every_consultation_type(
         {
             "consultation_type": consultation_type,
             "evidence_refs": [str(observation.id)],
-            "measurements": [{"blob_id": "unverified", "kind": "string"}],
+            "measurements": [
+                {
+                    "blob_id": "unverified-selector-sentinel",
+                    "kind": "string",
+                    "offset": 999,
+                    "value": "UnverifiedSelectorMarker",
+                }
+            ],
         },
         make_context(investigation_id, key=f"optional-measurements-{consultation_type}"),
     )
 
     assert len(transport.calls) == 1, result.output
+    if consultation_type in {
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "draft_text",
+        "suricata_draft",
+    }:
+        prompt = transport.calls[0]["prompt"]
+        assert "IndependentCanonicalMeasurement" in prompt
+        assert "UnverifiedSelectorMarker" not in prompt
+        assert "unverified-selector-sentinel" not in prompt
     warnings = [dict(item) for item in result.output["input_warnings"]]
     assert any(
         item["field"] == "measurements" and item["code"] == "optional_measurements_ignored"
@@ -972,6 +1067,109 @@ async def test_malformed_optional_measurements_warn_for_every_consultation_type(
         await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
     )
     assert manifest["input_warnings"] == warnings
+    assert manifest["output"]["input_warnings"] == warnings
+
+
+@pytest.mark.asyncio
+async def test_restricted_sample_measurements_never_reach_prompt_during_selector_fallback() -> None:
+    investigation_id = uuid4()
+    sample_hash = "f" * 64
+    restricted_marker = "RestrictedCanonicalMeasurementMarker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": restricted_marker, "offset": 512}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused restricted response")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash, tlp=TLP.RED)
+    context = make_context(investigation_id, key="restricted-measurement-selector-fallback")
+    assert context.envelope is not None
+    assert context.envelope.authority_kind is EnvelopeAuthorityKind.HUMAN_G2
+
+    result = await tool.execute(
+        {
+            "consultation_type": "yara_draft",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "string",
+                    "offset": 512,
+                    "value": "InvalidSelectorMarker",
+                }
+            ],
+        },
+        context,
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert restricted_marker not in repr(result.output)
+    assert "InvalidSelectorMarker" not in repr(result.output)
+
+
+@pytest.mark.parametrize(
+    "consultation_type",
+    [
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "draft_text",
+        "suricata_draft",
+    ],
+)
+@pytest.mark.asyncio
+async def test_empty_optional_measurement_selector_sends_only_canonical_measurements(
+    consultation_type: str,
+) -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "1" * 64,
+            "strings": [{"value": "CanonicalEmptySelectorMarker", "offset": 768}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Canonical evidence remains.")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, "1" * 64)
+
+    result = await tool.execute(
+        {
+            "consultation_type": consultation_type,
+            "evidence_refs": [str(observation.id)],
+            "measurements": [],
+        },
+        make_context(investigation_id, key=f"empty-measurements-{consultation_type}"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert "CanonicalEmptySelectorMarker" in prompt
+    assert "measurements=[]" not in prompt
+    assert any(
+        item["field"] == "measurements" and item["code"] == "optional_measurements_ignored"
+        for item in result.output["input_warnings"]
+    )
 
 
 @pytest.mark.asyncio
