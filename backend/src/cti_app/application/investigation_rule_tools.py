@@ -1414,7 +1414,7 @@ class _RuleTools:
             latest_test = await self._latest_explicit_test_report(context, latest)
             compile_check = self.workbench.compile_check(latest.source)
             validation_status = (
-                _rule_validation_status(latest_test)
+                RuleValidationStatus(_rule_validation_status(latest_test))
                 if latest_test is not None
                 else RuleValidationStatus.UNTESTED
             )
