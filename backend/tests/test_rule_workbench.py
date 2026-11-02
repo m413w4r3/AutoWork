@@ -198,6 +198,20 @@ def _workbench(
             "or_branches_disguised_as_multiple_rules_forbidden",
         ),
         (
+            'rule branch_gate { strings: $a = "marker" $b = "other" $c = "third" $d = "fourth" '
+            "condition: ($a and $b) or ($c and $d) }",
+            "or_branches_disguised_as_multiple_rules_forbidden",
+        ),
+        (
+            'rule branch_gate { strings: $a = "marker" $b = "other" $c = "third" '
+            "condition: $a and $b or $c }",
+            "or_branches_disguised_as_multiple_rules_forbidden",
+        ),
+        (
+            'rule branch_gate { strings: $a = "marker" $b = "other" condition: ($a or $b) }',
+            "or_branches_disguised_as_multiple_rules_forbidden",
+        ),
+        (
             'import "dotnet" rule clr_only { condition: dotnet.is_assembly }',
             "generic_dotnet_import_only_forbidden",
         ),
@@ -211,6 +225,41 @@ def test_single_rule_source_guard_rejects_cheating_shapes(
 
 def test_single_rule_source_guard_accepts_one_measured_rule_using_all_of_them() -> None:
     source = 'rule measured { strings: $a = "marker" condition: 1 of them }'
+    assert validate_single_rule_candidate(source) == ()
+
+
+def test_single_rule_source_guard_accepts_grouped_or_in_conjunctive_condition() -> None:
+    source = """
+rule bridge_candidate {
+    strings:
+        $cli = "cli"
+        $resource = "resource"
+        $loader = "loader"
+        $config = "config"
+        $enc_resource = "encrypted resource"
+        $enc_passphrase = "passphrase"
+        $enc_rc4key = "rc4key"
+    condition:
+        filesize > 6 * 1024 * 1024 and filesize < 16 * 1024 * 1024
+        and uint16(0) == 0x5A4D
+        and uint32(uint32(0x3C)) == 0x00004550
+        and $cli and $resource and $loader and $config
+        and $enc_resource and ( $enc_passphrase or $enc_rc4key )
+}
+"""
+    assert validate_single_rule_candidate(source) == ()
+
+
+@pytest.mark.parametrize(
+    "condition",
+    (
+        '$a and pe.version_info["or"] == "or"',
+        "$a and filename matches /or/",
+        "$a /* or in block comment */ // or in line comment",
+    ),
+)
+def test_single_rule_source_guard_ignores_or_in_literals_and_comments(condition: str) -> None:
+    source = f'rule measured {{ strings: $a = "marker" condition: {condition} }}'
     assert validate_single_rule_candidate(source) == ()
 
 

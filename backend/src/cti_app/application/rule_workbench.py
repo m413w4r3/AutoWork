@@ -122,6 +122,110 @@ def rule_validation_reason(report: RuleTestReport) -> RuleValidationReason:
     return RuleValidationReason.SAMPLE_BYTES_MISSING
 
 
+def _condition_has_disguised_or_branches(condition: str) -> bool:
+    depth = 0
+    index = 0
+    quote: str | None = None
+    escaped = False
+    in_regex = False
+    regex_expected = False
+    top_level_and = False
+    top_level_or = False
+    current_conjunct_has_pattern = False
+    current_conjunct_has_or = False
+    required_pattern_conjunct = False
+    has_or = False
+
+    def finish_conjunct() -> None:
+        nonlocal required_pattern_conjunct
+        if current_conjunct_has_pattern and not current_conjunct_has_or:
+            required_pattern_conjunct = True
+
+    while index < len(condition):
+        char = condition[index]
+        next_char = condition[index + 1] if index + 1 < len(condition) else ""
+
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if in_regex:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "/":
+                in_regex = False
+            index += 1
+            continue
+        if char == "/" and next_char == "*":
+            end = condition.find("*/", index + 2)
+            index = len(condition) if end < 0 else end + 2
+            continue
+        if char == "/" and next_char == "/":
+            end = condition.find("\n", index + 2)
+            index = len(condition) if end < 0 else end + 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            regex_expected = False
+            index += 1
+            continue
+        if char == "/" and regex_expected:
+            in_regex = True
+            regex_expected = False
+            index += 1
+            continue
+        if char.isspace():
+            index += 1
+            continue
+        if char == "(":
+            depth += 1
+            regex_expected = False
+            index += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            regex_expected = False
+            index += 1
+            continue
+        if char == "$":
+            pattern_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*", condition[index:])
+            if pattern_match:
+                current_conjunct_has_pattern = True
+                index += len(pattern_match.group(0))
+                regex_expected = False
+                continue
+        if char.isalpha() or char == "_":
+            end = index + 1
+            while end < len(condition) and (condition[end].isalnum() or condition[end] == "_"):
+                end += 1
+            keyword = condition[index:end].lower()
+            if keyword == "or":
+                has_or = True
+                current_conjunct_has_or = True
+                if depth == 0:
+                    top_level_or = True
+            elif keyword == "and" and depth == 0:
+                top_level_and = True
+                finish_conjunct()
+                current_conjunct_has_pattern = False
+                current_conjunct_has_or = False
+            regex_expected = keyword == "matches"
+            index = end
+            continue
+        regex_expected = False
+        index += 1
+
+    finish_conjunct()
+    return top_level_or or (has_or and not (top_level_and and required_pattern_conjunct))
+
+
 def validate_single_rule_candidate(rule_source: str) -> tuple[str, ...]:
     """Reject source shapes that cannot represent one evidence-led YARA candidate."""
     if not isinstance(rule_source, str) or not rule_source.strip():
@@ -155,7 +259,7 @@ def validate_single_rule_candidate(rule_source: str) -> tuple[str, ...]:
     )
     if not condition_identifiers and not refers_to_all_defined_patterns:
         reasons.append("condition_must_reference_measured_patterns")
-    if re.search(r"(?i)\bor\b", condition):
+    if _condition_has_disguised_or_branches(condition):
         reasons.append("or_branches_disguised_as_multiple_rules_forbidden")
     compact_condition = re.sub(r"\s+", "", condition).strip("()")
     if re.search(r"(?i)\bhash\.sha256\s*\(", condition):
