@@ -659,9 +659,18 @@ async def test_uncertain_passive_read_records_safe_failure_diagnostics(
     assert [record.claim_id for record in exchange_records] == [
         str(claim.id)[:8] for claim in claims
     ]
-    assert "must-not-be-logged" not in caplog.text
-    assert "secret=discard-me" not in caplog.text
-    assert "?x=1" not in caplog.text
+    # httpx's own INFO request line is configured globally by other tests; only the
+    # application logger's output is under the contract of this test.
+    application_log = "\n".join(
+        record.getMessage()
+        + " "
+        + " ".join(f"{key}={value}" for key, value in vars(record).items())
+        for record in caplog.records
+        if record.name.startswith("cti_app.")
+    )
+    assert "must-not-be-logged" not in application_log
+    assert "secret=discard-me" not in application_log
+    assert "?x=1" not in application_log
 
 
 @pytest.mark.asyncio
