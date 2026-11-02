@@ -60,7 +60,26 @@ G2 / TLP / divulgation / `external_llm_allowed` / révocations contrôlés avant
 
 ## 6. Tolérance aux réponses Bridge (lot T)
 
-Voir l'état final dans la PR : lien précoce réponse brute ↔ invocation ↔ dossier avant tout parsing, dégradation des champs facultatifs mal formés avec avertissement visible, extraction technique de YARA / Suricata en prose, statut de consultation dérivé (`received → dossier_preparing → sent_to_bridge → response_received → response_persisted`, `error`, `ambiguous`).
+- **Lien précoce :** dès la réception de la réponse, avant tout parsing, un enregistrement idempotent (`append_if_absent`) lie réponse brute (blob + SHA-256), invocation, références de dossier / prompt et horodatages. Un échec d'écriture de ce lien après une réponse réussie donne `needs_review` (jamais « non envoyé ») et un rejeu ne renvoie pas de POST.
+- **Champs facultatifs :** un `measurements` ou une annotation d'assertion mal formés sont ignorés avec `input_warnings` visibles ; la consultation continue avec les **seules mesures canoniques vérifiées** (celles qu'enverrait un sélecteur omis, dans l'enveloppe déjà autorisée). Les éléments invalides ne deviennent jamais des preuves. Les sélecteurs de portée (`evidence_refs`, `sample_sha256`, `finding_refs`, unités éditoriales, cible d'avis) et les références explicites inaccessibles restent des refus durs.
+- **Prose :** une règle YARA ou Suricata dans une réponse libre, sans référence ni en-tête `advisor-wire`, donne une source extraite + SHA-256 (candidate non testée). Les fences d'un autre langage sont ignorées ; une règle recopiée à l'identique depuis le dossier est marquée `echoed_from_dossier` et n'est pas attribuée à Bridge ; plusieurs règles différentes restent non attribuées. Une critique ou un avis d'attribution ambiguë reste un résumé consultatif non attribué (plus de duplication par unité, aucune attribution par rang).
+- **Statut :** `consult_status` dérivé (`received → dossier_preparing → sent_to_bridge → response_received → response_persisted`, `error`, `ambiguous`). Priorité : ambigu > erreur > réponse persistée (observation de réponse ou `manifest_persisted`) > réponse reçue (blob brut) > envoyé > préparation > reçu.
+- **Test d'acceptation de bout en bout** (`backend/tests/test_bridge_prose_to_candidate_e2e.py`, transport fictif) : réponse en prose avec bloc YARA → réponse brute inchangée (SHA égal) → source extraite → `rule.propose_bridge` → candidate `author=bridge` avec lacune pour la string non mesurée → compilation → `rule.test` → non approuvée. Variante Suricata en prose sans capture : conservée, provenance Bridge, non testée.
+- Le test `test_yara_draft_preserves_claims_and_sends_only_verified_offsets` (en échec sur `main`) attendait un seul appel de transport alors que la requête à `measurements` mal formé est désormais envoyée avec repli ; l'attente et l'assertion de motif ont été alignées.
+
+## 6 bis. Vérifications effectuées (environnement orchestrateur)
+
+| Contrôle | Résultat |
+|---|---|
+| Suite unitaire complète (hors `integration` et `workflow_emulator`), mono-processus | 5 763 réussis, 36 échecs, 4 skips. Les 36 échecs sont **tous** dans la liste de `main` (37 échecs : 34 Typst, `test_publication_detection_band`, `test_ioc_table`, `test_editorial_figures`, golden de prompt) ; un échec de `main` (`test_yara_draft_preserves_claims_and_sends_only_verified_offsets`) est corrigé ; **aucune nouvelle régression**. |
+| `ruff check`, `ruff format --check` sur les fichiers modifiés | OK |
+| `mypy src` (429 fichiers) | OK |
+| Tests du relais (`unittest`) | 6 OK |
+| Revues critiques indépendantes (Luna xhigh, lecture seule) | Y : APPROVE_WITH_FIXES → 4 correctifs. P : APPROVE_WITH_FIXES (1 HIGH cache de politique de sample périmé, 1 MEDIUM clé parent / enfant) → corrigés. T : REJECT (2 MEDIUM, 1 LOW) → provenance de la prose et statut corrigés ; le repli sur les mesures vérifiées est conservé par décision (mission §5.5) et prouvé par tests. |
+
+Les régressions que les agents de développement n'avaient pas vues (environnement sans `pefile` / moteur YARA) ont été trouvées par comparaison systématique avec la liste d'échecs de `main` : réservation du gros prompt (P), rejeu du pont de signature (Y), refus d'un brouillon à annotation invalide et statut compact (T).
+
+Skips de garde « dépendance indisponible dans le sandbox » ajoutés par les agents : retirés.
 
 ## 7. Non réalisé / reste à faire
 
