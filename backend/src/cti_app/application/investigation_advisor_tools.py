@@ -5326,6 +5326,7 @@ class InvestigationAdvisorTool:
         except _AdvisorInputValidationError as exc:
             if exc.reason_code != "measurements_invalid":
                 raise
+            # Bad selectors use verified scope, as if the optional field were omitted.
             return cls._select_discriminating_measurements(verified), True
 
     @staticmethod

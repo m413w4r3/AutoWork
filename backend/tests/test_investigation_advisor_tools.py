@@ -952,12 +952,30 @@ async def test_malformed_optional_measurements_warn_for_every_consultation_type(
         {
             "consultation_type": consultation_type,
             "evidence_refs": [str(observation.id)],
-            "measurements": [{"blob_id": "unverified", "kind": "string"}],
+            "measurements": [
+                {
+                    "blob_id": "unverified-selector-sentinel",
+                    "kind": "string",
+                    "offset": 999,
+                    "value": "UnverifiedSelectorMarker",
+                }
+            ],
         },
         make_context(investigation_id, key=f"optional-measurements-{consultation_type}"),
     )
 
     assert len(transport.calls) == 1, result.output
+    if consultation_type in {
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "draft_text",
+        "suricata_draft",
+    }:
+        prompt = transport.calls[0]["prompt"]
+        assert "IndependentCanonicalMeasurement" in prompt
+        assert "UnverifiedSelectorMarker" not in prompt
+        assert "unverified-selector-sentinel" not in prompt
     warnings = [dict(item) for item in result.output["input_warnings"]]
     assert any(
         item["field"] == "measurements" and item["code"] == "optional_measurements_ignored"
@@ -972,6 +990,109 @@ async def test_malformed_optional_measurements_warn_for_every_consultation_type(
         await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
     )
     assert manifest["input_warnings"] == warnings
+    assert manifest["output"]["input_warnings"] == warnings
+
+
+@pytest.mark.asyncio
+async def test_restricted_sample_measurements_never_reach_prompt_during_selector_fallback() -> None:
+    investigation_id = uuid4()
+    sample_hash = "f" * 64
+    restricted_marker = "RestrictedCanonicalMeasurementMarker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": restricted_marker, "offset": 512}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused restricted response")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash, tlp=TLP.RED)
+    context = make_context(investigation_id, key="restricted-measurement-selector-fallback")
+    assert context.envelope is not None
+    assert context.envelope.authority_kind is EnvelopeAuthorityKind.HUMAN_G2
+
+    result = await tool.execute(
+        {
+            "consultation_type": "yara_draft",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "string",
+                    "offset": 512,
+                    "value": "InvalidSelectorMarker",
+                }
+            ],
+        },
+        context,
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert restricted_marker not in repr(result.output)
+    assert "InvalidSelectorMarker" not in repr(result.output)
+
+
+@pytest.mark.parametrize(
+    "consultation_type",
+    [
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "draft_text",
+        "suricata_draft",
+    ],
+)
+@pytest.mark.asyncio
+async def test_empty_optional_measurement_selector_sends_only_canonical_measurements(
+    consultation_type: str,
+) -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "1" * 64,
+            "strings": [{"value": "CanonicalEmptySelectorMarker", "offset": 768}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Canonical evidence remains.")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, "1" * 64)
+
+    result = await tool.execute(
+        {
+            "consultation_type": consultation_type,
+            "evidence_refs": [str(observation.id)],
+            "measurements": [],
+        },
+        make_context(investigation_id, key=f"empty-measurements-{consultation_type}"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert "CanonicalEmptySelectorMarker" in prompt
+    assert "measurements=[]" not in prompt
+    assert any(
+        item["field"] == "measurements" and item["code"] == "optional_measurements_ignored"
+        for item in result.output["input_warnings"]
+    )
 
 
 @pytest.mark.asyncio
