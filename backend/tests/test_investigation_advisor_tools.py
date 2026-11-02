@@ -7966,6 +7966,172 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected_error_code", "expected_input_error"),
+    (
+        ("association_removed", "advisor_input_invalid", "sample_hash_not_associated"),
+        ("license_restricted", "advisor_disclosure_restricted", None),
+        ("tlp_restricted", "advisor_disclosure_restricted", None),
+        ("external_llm_disallowed", "advisor_disclosure_restricted", None),
+        ("state_changed", "advisor_input_invalid", "sample_hash_unavailable"),
+    ),
+)
+async def test_prompt_sample_policy_is_refreshed_before_transport(
+    change: str,
+    expected_error_code: str,
+    expected_input_error: str | None,
+) -> None:
+    investigation_id = uuid4()
+    sample_bytes = b"Synthetic sample whose policy may change before send."
+    sample_hash = hashlib.sha256(sample_bytes).hexdigest()
+    tool, transport, observation, _sample_id, association_id, _blob_id, _ = (
+        _make_downloaded_sample_fixture(investigation_id, sample_bytes)
+    )
+    sample = tool._samples.samples[0]
+
+    class MutableAssociations:
+        def __init__(self) -> None:
+            self.rows = (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+            self.reads = 0
+
+        async def list_for_investigation(self, _investigation_id):
+            self.reads += 1
+            return self.rows
+
+    class MutableSamples:
+        def __init__(self) -> None:
+            self.rows = (sample,)
+            self.reads = 0
+
+        async def list_for_subject(self, _subject_id):
+            self.reads += 1
+            return self.rows
+
+    associations = MutableAssociations()
+    samples = MutableSamples()
+    tool._sample_associations = associations
+    tool._samples = samples
+    put_bytes = tool._artifact_store.put_bytes
+
+    async def archive_and_change_policy(value, *, bucket, mime_type):
+        archived = await put_bytes(value, bucket=bucket, mime_type=mime_type)
+        if bucket == "advisor-prompts":
+            if change == "association_removed":
+                associations.rows = ()
+            elif change == "license_restricted":
+                sample.license_restriction = "synthetic restricted licence"
+            elif change == "tlp_restricted":
+                sample.tlp = TLP.RED
+            elif change == "external_llm_disallowed":
+                sample.external_llm_allowed = False
+            elif change == "state_changed":
+                sample.state = "accepted"
+        return archived
+
+    tool._artifact_store.put_bytes = archive_and_change_policy
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:sample-policy:{change}"),
+    )
+
+    assert associations.reads == 2
+    assert samples.reads == 2
+    assert transport.calls == []
+    assert result.error_code == expected_error_code
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["bridge_turns_consumed"] == 0
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+    if expected_input_error is not None:
+        assert result.output["input_error_code"] == expected_input_error
+
+
+@pytest.mark.asyncio
+async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -> None:
+    investigation_id = UUID("00000000-0000-0000-0000-000000000001")
+    sample_bytes = b"Synthetic sample whose policy remains unchanged."
+    sample_hash = hashlib.sha256(sample_bytes).hexdigest()
+    observation_id = UUID("00000000-0000-0000-0000-000000000002")
+    blob_id = UUID("00000000-0000-0000-0000-000000000003")
+    sample_id = UUID("00000000-0000-0000-0000-000000000004")
+    association_id = UUID("00000000-0000-0000-0000-000000000005")
+    observation = EvidenceObservation(
+        id=observation_id,
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=sample_hash,
+        source="virustotal.sample_download",
+        source_version="sample-acquisition.v1",
+        observed_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        object_type="binary_or_non_json",
+        object_id=sample_hash,
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The cited sample bytes were available.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._observations = ObservationRepository((observation,))
+    tool._blobs.add(
+        blob_id,
+        sha256=sample_hash,
+        size=len(sample_bytes),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[blob_id] = sample_bytes
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-sample.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:sample-policy-unchanged"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == (
+        "bbe1503c546ae78c9d2922da5f1dea2ed59129b2708b1258c0396151b9c7472f"
+    )
+    assert base64.b64encode(sample_bytes).decode("ascii") in prompt
+
+
+@pytest.mark.asyncio
 async def test_draft_text_uses_compact_context_for_multiple_units() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(

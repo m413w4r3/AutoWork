@@ -233,6 +233,9 @@ class _AdvisorConsultationContext:
     sample_hash_observations: dict[str, tuple[EvidenceObservation, ...]] | None = None
     verified_sample_bytes: dict[UUID, tuple[bytes | None, str]] = field(default_factory=dict)
     sample_blob_metadata: dict[str, tuple[UUID, str, str, str] | None] = field(default_factory=dict)
+    prompt_sample_hashes: set[str] = field(default_factory=set)
+    prompt_sample_record_ids_by_hash: dict[str, set[str]] = field(default_factory=dict)
+    prompt_sample_association_ids_by_hash: dict[str, set[str]] = field(default_factory=dict)
     counters: Counter[str] = field(default_factory=Counter)
 
 
@@ -1328,6 +1331,7 @@ class InvestigationAdvisorTool:
                 if item["kind"] == "observation"
             ]
             prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
+            self._record_prompt_sample_hashes(context.investigation_id, prompt, prompt_data)
             encoded = prompt.encode("utf-8")
             timing.record_elapsed("dossier_rendering_ms", time.perf_counter() - dossier_started_at)
             if timing is not None:
@@ -1885,6 +1889,31 @@ class InvestigationAdvisorTool:
         if timing is not None:
             timing.mark("admission_complete")
             timing.record_duration("admission", admission_started_at)
+        try:
+            sample_policy_failure = await self._revalidate_prompt_sample_policy(
+                context,
+                consultation_type=consultation_type,
+                evidence_refs=tuple(item.id for item in evidence),
+            )
+        except Exception as exc:
+            return await self._persist_preflight_failure(
+                context,
+                consultation_type=consultation_type,
+                evidence_refs=tuple(item.id for item in evidence),
+                output={
+                    "advisor_status": "refused",
+                    "preflight_status": "POLICY_BLOCKED",
+                    "failure_stage": "sample_disclosure_restricted",
+                    "failure_reason": "current_sample_policy_unavailable",
+                    "confirmed_non_execution": True,
+                    "bridge_turns_consumed": 0,
+                    "usable": False,
+                },
+                error_code="advisor_admission_recheck_unavailable",
+                exception_class=type(exc).__name__,
+            )
+        if sample_policy_failure is not None:
+            return sample_policy_failure
         submission_started_at = time.perf_counter()
         submission = await submit_bridge_consultation_once(
             self._transport,
@@ -4593,6 +4622,13 @@ class InvestigationAdvisorTool:
                         "content_base64": "",
                     }
                 )
+                if current is not None:
+                    self._remember_prompt_sample_source(
+                        current,
+                        sample_hash,
+                        sample_id=sample_id,
+                        association_id=association_id,
+                    )
 
             if not isinstance(blob_id, UUID):
                 append_unreadable("sample_blob_unavailable")
@@ -4723,6 +4759,13 @@ class InvestigationAdvisorTool:
                     ),
                 }
             )
+            if current is not None:
+                self._remember_prompt_sample_source(
+                    current,
+                    association.sample_sha256,
+                    sample_id=getattr(sample, "id", None),
+                    association_id=getattr(association, "id", None),
+                )
         return rows
 
     async def _documented_protocol_model_facts(
@@ -5600,10 +5643,7 @@ class InvestigationAdvisorTool:
         for sample in candidates:
             if sample.expected_hash != measured_hash and sample.source_object_id != measured_hash:
                 continue
-            if getattr(sample.state, "value", sample.state) not in {
-                "quarantined",
-                "review_candidate",
-            }:
+            if not _sample_state_allows_advisor_disclosure(sample):
                 continue
             if _sample_disclosure_restriction_sources(sample, envelope):
                 # A sample-level restriction binds this measurement even when
@@ -5631,9 +5671,208 @@ class InvestigationAdvisorTool:
             )
             if current is not None:
                 current.sample_blob_metadata[measured_hash] = value
+                self._remember_prompt_sample_source(
+                    current,
+                    measured_hash,
+                    sample_id=getattr(sample, "id", None),
+                    association_id=association_id,
+                )
             return value
         if current is not None:
             current.sample_blob_metadata[measured_hash] = None
+        return None
+
+    def _record_prompt_sample_hashes(
+        self,
+        investigation_id: UUID,
+        prompt: str,
+        prompt_data: Mapping[str, Any],
+    ) -> None:
+        current = self._consultation_context(investigation_id)
+        if current is None:
+            return
+        prompt_folded = prompt.casefold()
+        candidate_hashes = set(current.associations_by_hash).intersection(
+            current.samples_by_hash
+        ) | {
+            sample_hash
+            for sample_hash, metadata in current.sample_blob_metadata.items()
+            if metadata is not None
+        }
+        current.prompt_sample_hashes.update(
+            sample_hash
+            for sample_hash in candidate_hashes
+            if re.fullmatch(r"(?i)[0-9a-f]{64}", sample_hash)
+            and sample_hash.casefold() in prompt_folded
+        )
+
+        def include_serialized_sample_bytes(value: object) -> None:
+            if isinstance(value, Mapping):
+                sample_hash = value.get("sample_sha256")
+                if value.get("verified") is True:
+                    sample_hash = value.get("sha256")
+                encoded_content = value.get("content_base64")
+                if (
+                    isinstance(sample_hash, str)
+                    and re.fullmatch(r"(?i)[0-9a-f]{64}", sample_hash)
+                    and isinstance(encoded_content, str)
+                    and encoded_content
+                    and encoded_content in prompt
+                ):
+                    current.prompt_sample_hashes.add(sample_hash.casefold())
+                for item in value.values():
+                    include_serialized_sample_bytes(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    include_serialized_sample_bytes(item)
+
+        include_serialized_sample_bytes(prompt_data)
+
+    @staticmethod
+    def _remember_prompt_sample_source(
+        context: _AdvisorConsultationContext,
+        sample_hash: str,
+        *,
+        sample_id: object = None,
+        association_id: object = None,
+    ) -> None:
+        if sample_id is not None and str(sample_id) not in {"", "unknown"}:
+            context.prompt_sample_record_ids_by_hash.setdefault(sample_hash, set()).add(
+                str(sample_id)
+            )
+        if association_id is not None and str(association_id) not in {"", "unknown"}:
+            context.prompt_sample_association_ids_by_hash.setdefault(sample_hash, set()).add(
+                str(association_id)
+            )
+
+    async def _revalidate_prompt_sample_policy(
+        self,
+        context: ToolExecutionContext,
+        *,
+        consultation_type: str,
+        evidence_refs: tuple[UUID, ...],
+    ) -> ToolResult | None:
+        consultation_context = self._consultation_context(context.investigation_id)
+        if consultation_context is None or not consultation_context.prompt_sample_hashes:
+            return None
+
+        association_list = getattr(self._sample_associations, "list_for_investigation", None)
+        sample_list = getattr(self._samples, "list_for_subject", None)
+        subject_id = getattr(consultation_context.investigation, "subject_id", None)
+        if not callable(association_list) or not callable(sample_list) or subject_id is None:
+            return await self._persist_preflight_failure(
+                context,
+                consultation_type=consultation_type,
+                evidence_refs=evidence_refs,
+                output={
+                    "advisor_status": "refused",
+                    "preflight_status": "POLICY_BLOCKED",
+                    "failure_stage": "sample_disclosure_restricted",
+                    "failure_reason": "current_sample_policy_unavailable",
+                    "confirmed_non_execution": True,
+                    "bridge_turns_consumed": 0,
+                    "usable": False,
+                },
+                error_code="advisor_admission_recheck_unavailable",
+            )
+
+        self._record_repo_call()
+        associations = tuple(await association_list(context.investigation_id))
+        self._record_repo_call()
+        samples = tuple(await sample_list(subject_id))
+        associations_by_hash: dict[str, list[Any]] = {}
+        associations_by_id: dict[str, Any] = {}
+        for association in associations:
+            sample_hash = getattr(association, "sample_sha256", None)
+            if isinstance(sample_hash, str):
+                associations_by_hash.setdefault(sample_hash, []).append(association)
+            association_id = getattr(association, "id", None)
+            if association_id is not None:
+                associations_by_id[str(association_id)] = association
+        samples_by_hash: dict[str, list[Any]] = {}
+        for sample in samples:
+            for sample_hash in (
+                getattr(sample, "expected_hash", None),
+                getattr(sample, "source_object_id", None),
+            ):
+                if isinstance(sample_hash, str):
+                    samples_by_hash.setdefault(sample_hash, []).append(sample)
+
+        for sample_hash in sorted(consultation_context.prompt_sample_hashes):
+            matching_associations = associations_by_hash.get(sample_hash, [])
+            expected_association_ids = (
+                consultation_context.prompt_sample_association_ids_by_hash.get(sample_hash, set())
+            )
+            if expected_association_ids:
+                association_still_current = all(
+                    association_id in associations_by_id
+                    and getattr(associations_by_id[association_id], "sample_sha256", None)
+                    == sample_hash
+                    for association_id in expected_association_ids
+                )
+            else:
+                association_still_current = bool(matching_associations)
+            if not association_still_current:
+                return await self._input_failure(
+                    context,
+                    "sample_hash_not_associated",
+                    observation_refs=evidence_refs,
+                )
+
+            matching_samples = tuple(samples_by_hash.get(sample_hash, ()))
+            expected_sample_ids = consultation_context.prompt_sample_record_ids_by_hash.get(
+                sample_hash, set()
+            )
+            if expected_sample_ids:
+                samples_by_id = {
+                    str(sample_id): sample
+                    for sample in matching_samples
+                    if (sample_id := getattr(sample, "id", None)) is not None
+                }
+                if not expected_sample_ids.issubset(samples_by_id):
+                    return await self._input_failure(
+                        context,
+                        "sample_hash_unavailable",
+                        observation_refs=evidence_refs,
+                    )
+                matching_samples = tuple(samples_by_id[item] for item in expected_sample_ids)
+            if not matching_samples:
+                return await self._input_failure(
+                    context,
+                    "sample_hash_unavailable",
+                    observation_refs=evidence_refs,
+                )
+
+            invalid_state = tuple(
+                sample
+                for sample in matching_samples
+                if not _sample_state_allows_advisor_disclosure(sample)
+            )
+            if invalid_state:
+                return await self._input_failure(
+                    context,
+                    "sample_hash_unavailable",
+                    observation_refs=evidence_refs,
+                )
+            if any(
+                _sample_disclosure_restriction_sources(sample, context.envelope)
+                for sample in matching_samples
+            ):
+                return await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=evidence_refs,
+                    output={
+                        "advisor_status": "disclosure_restricted",
+                        "preflight_status": "POLICY_BLOCKED",
+                        "failure_stage": "sample_disclosure_restricted",
+                        "failure_reason": "sample_disclosure_policy",
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code="advisor_disclosure_restricted",
+                )
         return None
 
     _prompt = staticmethod(render_advisor_prompt)
@@ -9612,6 +9851,13 @@ def _is_downloaded_sample_bytes_observation(observation: EvidenceObservation) ->
         "virustotal.sample_download",
         "investigation.subject_sample_reuse",
     } and observation.object_type.casefold() in {"binary_or_non_json", "sample"}
+
+
+def _sample_state_allows_advisor_disclosure(sample: Any) -> bool:
+    return getattr(sample.state, "value", sample.state) in {
+        "quarantined",
+        "review_candidate",
+    }
 
 
 def _sample_blob_failure_reason(value: object) -> str:

@@ -468,9 +468,10 @@ async def test_m12_q_reservation_and_execution_characterization(
     assert execution_builds[0]["dossier_sha256"] == expected["dossier_sha256"]
     assert execution_builds[0]["manifest_refs_sha256"] == expected["manifest_refs_sha256"]
     assert execution_prompts[0]["prompt_sha256"] == expected["prompt_sha256"]
-    assert execution_counts["calls"].get("sample_associations.list_for_investigation") == 1
+    assert execution_counts["calls"].get("sample_associations.list_for_investigation") == 2
+    assert execution_counts["calls"].get("samples.list_for_subject") == 2
     assert reservation_counts["calls"].get("sample_associations.list_for_investigation") == 1
-    assert execution_counts["association_sql_queries"] == 3
+    assert execution_counts["association_sql_queries"] == 6
     assert reservation_counts["association_sql_queries"] == 3
     assert execution_counts["max_observation_blob_reads"] <= 1
     assert execution_counts["observation_blob_reads"] <= len(counter.observation_blob_ids)
