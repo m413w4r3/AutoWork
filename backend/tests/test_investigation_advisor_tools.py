@@ -4855,10 +4855,10 @@ async def test_prompt_archive_failure_persists_reached_advisor_timing_stages() -
         raw=raw,
     )
 
-    async def fail_prompt_storage(value: str, *, bucket: str) -> UUID:
+    async def fail_prompt_storage(value: bytes, *, bucket: str, mime_type: str) -> UUID:
         raise OSError("synthetic prompt archive failure")
 
-    tool._artifact_store.put_text = fail_prompt_storage
+    tool._artifact_store.put_bytes = fail_prompt_storage
     result = await tool.execute(
         {"consultation_type": "plan_investigation", "evidence_refs": [str(observation.id)]},
         make_context(investigation_id, key="operator:advisor:prompt-archive-failure"),
@@ -6778,13 +6778,13 @@ async def test_revocation_during_prompt_preparation_stops_before_fake_transport(
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
     registry = InMemoryToolRegistry()
     register_investigation_advisor_tool(registry, adapter=tool)
-    original_put_text = tool._artifact_store.put_text
+    original_put_bytes = tool._artifact_store.put_bytes
     admission_checks = 0
     revoked = False
 
-    async def archive_and_revoke(value, *, bucket):
+    async def archive_and_revoke(value, *, bucket, mime_type):
         nonlocal revoked
-        blob_id = await original_put_text(value, bucket=bucket)
+        blob_id = await original_put_bytes(value, bucket=bucket, mime_type=mime_type)
         revoked = True
         return blob_id
 
@@ -6793,7 +6793,7 @@ async def test_revocation_during_prompt_preparation_stops_before_fake_transport(
         admission_checks += 1
         return FrameworkPreSubmissionProof.ENVELOPE_REVOKED if revoked else None
 
-    tool._artifact_store.put_text = archive_and_revoke
+    tool._artifact_store.put_bytes = archive_and_revoke
     result = await RegistryToolDispatcher(registry).dispatch(
         context,
         tool_name="advisor.consult",
@@ -6908,11 +6908,11 @@ async def test_service_current_envelope_recheck_preserves_needs_review_recovery(
     tool._consultation_data = prepared_context
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
-    original_put_text = tool._artifact_store.put_text
+    original_put_bytes = tool._artifact_store.put_bytes
     revocations = []
 
-    async def archive_then_revoke(value, *, bucket):
-        blob_id = await original_put_text(value, bucket=bucket)
+    async def archive_then_revoke(value, *, bucket, mime_type):
+        blob_id = await original_put_bytes(value, bucket=bucket, mime_type=mime_type)
         current = await fixture.envelopes.get(investigation_id)
         assert current is not None
         revoked = replace(
@@ -6928,7 +6928,7 @@ async def test_service_current_envelope_recheck_preserves_needs_review_recovery(
         revocations.append(revoked.version)
         return blob_id
 
-    tool._artifact_store.put_text = archive_then_revoke
+    tool._artifact_store.put_bytes = archive_then_revoke
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(

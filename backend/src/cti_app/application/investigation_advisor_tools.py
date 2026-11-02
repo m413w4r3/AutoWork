@@ -1708,7 +1708,11 @@ class InvestigationAdvisorTool:
         prompt_sha256 = context_sha256
         prompt_store_started_at = time.perf_counter()
         try:
-            prompt_blob_id = await self._artifact_store.put_text(prompt, bucket="advisor-prompts")
+            prompt_blob_id = await self._artifact_store.put_bytes(
+                encoded,
+                bucket="advisor-prompts",
+                mime_type="text/plain; charset=utf-8",
+            )
         except Exception as exc:
             if timing is not None:
                 timing.record_duration("prompt_store", prompt_store_started_at)
