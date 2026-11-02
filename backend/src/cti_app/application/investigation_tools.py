@@ -277,6 +277,13 @@ class ToolExecutionContext:
     external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
     actor_id: str | None = None
     purpose: str | None = None
+    reservation_adjuster: (
+        Callable[
+            [ToolExecutionContext, Mapping[BudgetDimension, int]],
+            Awaitable[ToolExecutionContext | FrameworkPreSubmissionProof],
+        ]
+        | None
+    ) = None
     pre_transport_check: (
         Callable[[ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]] | None
     ) = None
@@ -897,13 +904,31 @@ class RegistryToolDispatcher:
         try:
             context.budget.reserve(operation_key, reserved_amounts)
         except BudgetExceeded as exc:
-            return self._local_result(
-                ToolInvocationStatus.NEEDS_REVIEW,
-                f"Budget limit reached for {exc.dimension.value}.",
-                alternatives,
-                request_permission=True,
-                pre_submission_proof=FrameworkPreSubmissionProof.BUDGET_REJECTED,
-            )
+            provisionally_reserved = False
+            if (
+                reservation_amounts is None
+                and definition.name == "advisor.consult"
+                and exc.dimension is BudgetDimension.CONTEXT_TOKENS
+            ):
+                remaining = context.budget.remaining.get(BudgetDimension.CONTEXT_TOKENS)
+                if remaining is not None:
+                    provisional = dict(reserved_amounts)
+                    provisional[BudgetDimension.CONTEXT_TOKENS] = remaining
+                    try:
+                        context.budget.reserve(operation_key, provisional)
+                    except BudgetExceeded:
+                        pass
+                    else:
+                        reserved_amounts = provisional
+                        provisionally_reserved = True
+            if not provisionally_reserved:
+                return self._local_result(
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                    f"Budget limit reached for {exc.dimension.value}.",
+                    alternatives,
+                    request_permission=True,
+                    pre_submission_proof=FrameworkPreSubmissionProof.BUDGET_REJECTED,
+                )
         if pre_dispatch_check is not None:
             proof = await pre_dispatch_check(context)
             if proof is not None:

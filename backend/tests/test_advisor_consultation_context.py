@@ -38,6 +38,13 @@ SAMPLE_COUNT = 40
 OBSERVATIONS_PER_SAMPLE = 6
 SAMPLE_BYTES = 64 * 1024
 CONSULTATION_TYPES = ("yara_draft", "pivot_strategy", "suricata_draft", "draft_text")
+RESERVATION_PROPERTY_TYPES = (
+    "yara_draft",
+    "pivot_strategy",
+    "suricata_draft",
+    "draft_text",
+    "plan_investigation",
+)
 # The first build is the dossier actually used for the prompt. Later base-code
 # builds came from redundant alias generation and are not the consultation dossier.
 BASELINE_EXECUTION = {
@@ -475,3 +482,65 @@ async def test_m12_q_reservation_and_execution_characterization(
     assert diagnostics["bytes_read"] == execution_counts["bytes_read"]
     assert diagnostics["observations"] == 240
     assert diagnostics["samples"] == SAMPLE_COUNT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consultation_type", RESERVATION_PROPERTY_TYPES)
+@pytest.mark.parametrize("include_sample_content", (False, True))
+async def test_reservation_estimate_covers_measured_prompt(
+    consultation_type: str,
+    include_sample_content: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(globals(), "SAMPLE_COUNT", 1)
+    monkeypatch.setitem(globals(), "OBSERVATIONS_PER_SAMPLE", 6)
+    monkeypatch.setitem(globals(), "SAMPLE_BYTES", 256 * 1024)
+    tool, transport, _counter = _m12_q_fixture()
+    if not include_sample_content:
+        for blob_id, blob in tool._blobs._target.descriptors.items():
+            if blob.descriptor.logical_bucket == "samples-quarantine":
+                blob.descriptor.size = 0
+                tool._artifact_store._target.values[blob_id] = b""
+
+    operation_key = f"advisor-reservation-property:{consultation_type}:{include_sample_content}"
+    arguments = {
+        "consultation_type": consultation_type,
+        "question": "Compare only the fixed synthetic evidence in this offline fixture.",
+    }
+    estimate_context = make_context(INVESTIGATION_ID, key=operation_key)
+    reserved = await tool.reservation_cost(arguments, estimate_context)
+    budget = InvestigationBudget(limits={})
+    budget.reserve(
+        operation_key,
+        {
+            BudgetDimension.BRIDGE_TURNS: 1,
+            BudgetDimension.TOOL_SECONDS: 3_600,
+            **reserved,
+        },
+    )
+    context = replace(
+        estimate_context,
+        budget=budget,
+        envelope=replace(estimate_context.envelope, budget=budget),
+    )
+    await tool.execute(arguments, context)
+
+    assert len(transport.calls) == 1
+    prompt_bytes = len(transport.calls[0]["prompt"].encode("utf-8"))
+    actual_tokens = (prompt_bytes + 3) // 4
+    reserved_bytes = reserved[BudgetDimension.CONTEXT_BYTES]
+    reserved_tokens = reserved[BudgetDimension.CONTEXT_TOKENS]
+    ratio = reserved_bytes / prompt_bytes
+    print(
+        f"reservation_ratio type={consultation_type} sample_content={include_sample_content} "
+        f"ratio={ratio:.4f} reserved_bytes={reserved_bytes} actual_bytes={prompt_bytes}"
+    )
+    assert reserved_bytes >= prompt_bytes
+    assert reserved_tokens >= actual_tokens
+    if include_sample_content and consultation_type in {
+        "yara_draft",
+        "pivot_strategy",
+        "plan_investigation",
+    }:
+        assert "content_status=verified" in transport.calls[0]["prompt"]
+        assert ratio <= 1.35

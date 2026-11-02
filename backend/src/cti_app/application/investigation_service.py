@@ -1471,6 +1471,17 @@ class InvestigationService:
                         type(exc).__name__,
                     )
                 requested_cost.update(dynamic_cost)
+                if tool_name == "advisor.consult":
+                    token_limit_remaining = budget.remaining.get(BudgetDimension.CONTEXT_TOKENS)
+                    estimated_tokens = requested_cost.get(BudgetDimension.CONTEXT_TOKENS, 0)
+                    if (
+                        token_limit_remaining is not None
+                        and estimated_tokens > token_limit_remaining
+                    ):
+                        # Keep the operation dispatchable so the advisor can build
+                        # its one real prompt, then resize this provisional amount
+                        # to the measured cost before the provider handoff.
+                        requested_cost[BudgetDimension.CONTEXT_TOKENS] = token_limit_remaining
                 advisor_preflight_refusal_expected = (
                     tool_name == "advisor.consult"
                     and dynamic_cost.get(BudgetDimension.CONTEXT_BYTES, 0) == 0
@@ -1873,6 +1884,109 @@ class InvestigationService:
                 if not self.bridge_disclosure_allowed(snapshot, current_envelope):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
+
+        async def adjust_measured_reservation(
+            _context: ToolExecutionContext,
+            measured_amounts: Mapping[BudgetDimension, int],
+        ) -> ToolExecutionContext | FrameworkPreSubmissionProof:
+            nonlocal budget, cost, envelope, external_effect_authority, invocation
+            nonlocal reservation_persisted, tool_envelope
+            if tool_name != "advisor.consult" or _context.idempotency_key != operation_key:
+                return FrameworkPreSubmissionProof.BUDGET_REJECTED
+            if set(measured_amounts) != {
+                BudgetDimension.CONTEXT_BYTES,
+                BudgetDimension.CONTEXT_TOKENS,
+            }:
+                return FrameworkPreSubmissionProof.BUDGET_REJECTED
+            requested = dict(cost)
+            requested.update(measured_amounts)
+            if requested == dict(cost):
+                return _context
+
+            # Recheck the approved envelope and the current reservation before
+            # changing its amount. A concurrent revocation or reservation edit
+            # prevents the adjustment and therefore prevents transport.
+            admission_proof = await check_current_admission(_context)
+            if admission_proof is not None:
+                return admission_proof
+            if envelope is None:
+                try:
+                    budget.adjust_reservation(operation_key, requested)
+                    tool_budget.adjust_reservation(operation_key, requested)
+                except (BudgetExceeded, KeyError, ValueError):
+                    return FrameworkPreSubmissionProof.BUDGET_REJECTED
+                revised = replace(
+                    invocation,
+                    reserved_budget=requested,
+                    updated_at=datetime.now(UTC),
+                    version=invocation.version + 1,
+                )
+                invocation = await self._invocations.update_if_version(
+                    revised, expected_version=invocation.version
+                )
+                cost = requested
+                reservation_persisted = True
+                await self._commit_current_uow()
+                return replace(_context, budget=tool_budget)
+
+            current_envelope = await self._envelopes.get(investigation.id)
+            current_reservation = next(
+                (
+                    item
+                    for item in (current_envelope.budget.reservations if current_envelope else ())
+                    if item.operation_key == operation_key
+                ),
+                None,
+            )
+            if (
+                current_envelope is None
+                or current_reservation is None
+                or current_reservation.status is not BudgetReservationStatus.RESERVED
+                or dict(current_reservation.amounts) != dict(cost)
+            ):
+                return FrameworkPreSubmissionProof.RESERVATION_CHANGED
+            adjusted_budget = _copy_investigation_budget(current_envelope.budget)
+            try:
+                adjusted_budget.adjust_reservation(operation_key, requested)
+                tool_budget.adjust_reservation(operation_key, requested)
+            except (BudgetExceeded, KeyError, ValueError):
+                return FrameworkPreSubmissionProof.BUDGET_REJECTED
+            try:
+                envelope = await self._save_envelope_version(
+                    replace(current_envelope, budget=adjusted_budget)
+                )
+            except VersionConflictError:
+                return FrameworkPreSubmissionProof.RESERVATION_CHANGED
+            budget = envelope.budget
+            revised = replace(
+                invocation,
+                reserved_budget=requested,
+                updated_at=datetime.now(UTC),
+                version=invocation.version + 1,
+            )
+            invocation = await self._invocations.update_if_version(
+                revised, expected_version=invocation.version
+            )
+            cost = requested
+            reservation_persisted = True
+            tool_envelope = replace(envelope, budget=tool_budget)
+            if external_effect_authority is not None:
+                external_effect_authority = replace(
+                    external_effect_authority,
+                    reservation_amounts={
+                        dimension.value: amount for dimension, amount in requested.items()
+                    },
+                    expected_envelope_version=envelope.version,
+                )
+            await self._commit_current_uow()
+            return replace(
+                _context,
+                envelope=tool_envelope,
+                budget=tool_budget,
+                external_effect_authority=external_effect_authority,
+            )
+
+        tool_context = replace(tool_context, reservation_adjuster=adjust_measured_reservation)
 
         result = await self._dispatcher.dispatch(
             tool_context,

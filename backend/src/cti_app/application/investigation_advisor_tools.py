@@ -93,6 +93,7 @@ from cti_app.domain.analyst_opinion import (
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetExceeded,
     BudgetReservation,
     BudgetReservationStatus,
     EvidenceKind,
@@ -604,14 +605,10 @@ class InvestigationAdvisorTool:
                 )
 
             descriptor_reader = getattr(self._blobs, "get", None)
-            source_bytes = 0
+            observation_source_bytes = 0
             seen_blob_ids: set[UUID] = set()
             if callable(descriptor_reader):
-                blob_ids = (
-                    *(item.blob_id for item in observations),
-                    *(getattr(item, "blob_id", None) for item in samples),
-                )
-                for blob_id in blob_ids:
+                for blob_id in (item.blob_id for item in observations):
                     if not isinstance(blob_id, UUID) or blob_id in seen_blob_ids:
                         continue
                     seen_blob_ids.add(blob_id)
@@ -619,7 +616,38 @@ class InvestigationAdvisorTool:
                     descriptor = getattr(blob, "descriptor", None)
                     size = getattr(descriptor, "size", None)
                     if type(size) is int and size >= 0:
-                        source_bytes += size
+                        observation_source_bytes += size
+
+            sample_source_bytes = 0
+            include_sample_content = consultation_type not in {
+                "draft_text",
+                "review_text",
+                "suricata_draft",
+                "figure_plan",
+            }
+            if callable(descriptor_reader) and include_sample_content:
+                association_counts: dict[str, int] = {}
+                for association in associations:
+                    sample_hash = getattr(association, "sample_sha256", None)
+                    if isinstance(sample_hash, str):
+                        association_counts[sample_hash] = association_counts.get(sample_hash, 0) + 1
+                first_sample_by_hash: dict[str, Any] = {}
+                for sample in samples:
+                    sample_hash = getattr(sample, "expected_hash", None) or getattr(
+                        sample, "source_object_id", None
+                    )
+                    if isinstance(sample_hash, str) and sample_hash in association_counts:
+                        first_sample_by_hash.setdefault(sample_hash, sample)
+                for sample_hash, association_count in association_counts.items():
+                    sample = first_sample_by_hash.get(sample_hash)
+                    blob_id = getattr(sample, "blob_id", None)
+                    if not isinstance(blob_id, UUID):
+                        continue
+                    blob = await descriptor_reader(blob_id)
+                    descriptor = getattr(blob, "descriptor", None)
+                    size = getattr(descriptor, "size", None)
+                    if type(size) is int and size >= 0:
+                        sample_source_bytes += size * association_count
 
             structural_bytes = _advisor_structural_size(arguments)
             structural_bytes += _advisor_structural_size(
@@ -632,9 +660,18 @@ class InvestigationAdvisorTool:
                     samples,
                 )
             )
-            # Source payloads may appear in evidence, measurements, aliases and
-            # verified sample fragments. Execute will charge the exact prompt.
-            estimated_bytes = max(4_096, (source_bytes + structural_bytes + 1) * 64)
+            # Sample bytes enter the prompt as Base64 (4/3 expansion). Observation
+            # payloads can be rendered as escaped excerpts and measured facts, so
+            # budget six times their stored JSON size plus twice the structural
+            # metadata and fixed prompt scaffolding. The measured prompt is used
+            # to resize this estimate before transport.
+            estimated_bytes = max(
+                4_096,
+                ((sample_source_bytes + 2) // 3) * 4
+                + observation_source_bytes * 6
+                + structural_bytes * 2
+                + 4_096,
+            )
         except Exception:
             return no_context_cost
         return {
@@ -1306,10 +1343,73 @@ class InvestigationAdvisorTool:
                 or BudgetDimension.CONTEXT_TOKENS in reservation.amounts
             ):
                 measured_tokens = max(1, (len(encoded) + 3) // 4)
-                if (
-                    reservation.amounts.get(BudgetDimension.CONTEXT_BYTES, 0) < len(encoded)
-                    or reservation.amounts.get(BudgetDimension.CONTEXT_TOKENS, 0) < measured_tokens
-                ):
+                measured_amounts = {
+                    BudgetDimension.CONTEXT_BYTES: len(encoded),
+                    BudgetDimension.CONTEXT_TOKENS: measured_tokens,
+                }
+                exact_reservation = dict(reservation.amounts)
+                exact_reservation.update(measured_amounts)
+                if exact_reservation != dict(reservation.amounts):
+                    try:
+                        if context.reservation_adjuster is not None:
+                            adjustment = await context.reservation_adjuster(
+                                context, measured_amounts
+                            )
+                            if isinstance(adjustment, FrameworkPreSubmissionProof):
+                                return await self._persist_preflight_failure(
+                                    context,
+                                    consultation_type=consultation_type,
+                                    evidence_refs=tuple(item.id for item in evidence),
+                                    output={
+                                        "advisor_status": "budget_refused",
+                                        "preflight_status": "BUDGET_BLOCKED",
+                                        "failure_stage": "g2_context_reservation",
+                                        "failure_reason": "measured_prompt_reservation_failed",
+                                        "reservation_check_code": adjustment.value,
+                                        "reserved_context_bytes": reservation.amounts.get(
+                                            BudgetDimension.CONTEXT_BYTES, 0
+                                        ),
+                                        "measured_context_bytes": len(encoded),
+                                        "reserved_context_tokens": reservation.amounts.get(
+                                            BudgetDimension.CONTEXT_TOKENS, 0
+                                        ),
+                                        "measured_context_tokens": measured_tokens,
+                                        "confirmed_non_execution": True,
+                                        "bridge_turns_consumed": 0,
+                                        "usable": False,
+                                    },
+                                    error_code="advisor_context_reservation_mismatch",
+                                )
+                            context = adjustment
+                        else:
+                            context.budget.adjust_reservation(reservation_key, exact_reservation)
+                    except (BudgetExceeded, KeyError, ValueError):
+                        return await self._persist_preflight_failure(
+                            context,
+                            consultation_type=consultation_type,
+                            evidence_refs=tuple(item.id for item in evidence),
+                            output={
+                                "advisor_status": "budget_refused",
+                                "preflight_status": "BUDGET_BLOCKED",
+                                "failure_stage": "g2_context_reservation",
+                                "failure_reason": "measured_prompt_reservation_failed",
+                                "reserved_context_bytes": reservation.amounts.get(
+                                    BudgetDimension.CONTEXT_BYTES, 0
+                                ),
+                                "measured_context_bytes": len(encoded),
+                                "reserved_context_tokens": reservation.amounts.get(
+                                    BudgetDimension.CONTEXT_TOKENS, 0
+                                ),
+                                "measured_context_tokens": measured_tokens,
+                                "confirmed_non_execution": True,
+                                "bridge_turns_consumed": 0,
+                                "usable": False,
+                            },
+                            error_code="advisor_context_reservation_mismatch",
+                        )
+                    reservation = _advisor_context_reservation(context, reservation_key)
+                reserved_amounts = dict(reservation.amounts) if reservation is not None else {}
+                if reserved_amounts != exact_reservation:
                     return await self._persist_preflight_failure(
                         context,
                         consultation_type=consultation_type,
@@ -1319,11 +1419,11 @@ class InvestigationAdvisorTool:
                             "preflight_status": "BUDGET_BLOCKED",
                             "failure_stage": "g2_context_reservation",
                             "failure_reason": "measured_prompt_cost_does_not_match_reservation",
-                            "reserved_context_bytes": reservation.amounts.get(
+                            "reserved_context_bytes": reserved_amounts.get(
                                 BudgetDimension.CONTEXT_BYTES, 0
                             ),
                             "measured_context_bytes": len(encoded),
-                            "reserved_context_tokens": reservation.amounts.get(
+                            "reserved_context_tokens": reserved_amounts.get(
                                 BudgetDimension.CONTEXT_TOKENS, 0
                             ),
                             "measured_context_tokens": measured_tokens,

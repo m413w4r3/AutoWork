@@ -327,6 +327,26 @@ class InvestigationBudget:
         self._reservations[reservation.operation_key] = reservation
         return reservation
 
+    def adjust_reservation(
+        self, operation_key: str, amounts: Mapping[BudgetDimension, int]
+    ) -> BudgetReservation:
+        """Adjust an active reservation before its external effect is dispatched."""
+        existing = self._reservations.get(operation_key)
+        if existing is None:
+            raise KeyError(operation_key)
+        if existing.status is not BudgetReservationStatus.RESERVED:
+            raise ValueError("Only an active reservation can be adjusted")
+        requested = _budget_values(amounts)
+        for dimension, limit in self.limits.items():
+            if dimension in (BudgetDimension.CONTEXT_BYTES, BudgetDimension.TOOL_SECONDS):
+                continue
+            other_reserved = self.reserved[dimension] - existing.amounts.get(dimension, 0)
+            if self.consumed[dimension] + other_reserved + requested.get(dimension, 0) > limit:
+                raise BudgetExceeded(dimension)
+        adjusted = replace(existing, amounts=requested)
+        self._reservations[operation_key] = adjusted
+        return adjusted
+
     def commit(
         self,
         operation_key: str,

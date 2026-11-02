@@ -1874,7 +1874,7 @@ async def test_unknown_basis_refs_are_removed_and_traced_when_valid_refs_remain(
         if item.source == "advisor.consult"
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=32 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=20 * 1024)
     )
     assert persisted["output"]["normalization_status"] == "partial"
     assert persisted["output"]["normalizations"] == list(normalizations)
@@ -6657,8 +6657,8 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
             if item.operation_key == context.idempotency_key
         )
         assert reservation.status.value == "reserved"
-        assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] >= prompt_bytes
-        assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] >= (prompt_bytes + 3) // 4
+        assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+        assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
         return TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
             output_text=advisor_response(
@@ -6695,8 +6695,8 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
         if item.operation_key == context.idempotency_key
     )
     assert reservation.status.value == "committed"
-    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] >= prompt_bytes
-    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] >= (prompt_bytes + 3) // 4
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
     assert result.budget_consumed[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -7845,6 +7845,34 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     tool._samples = LargeSamples()
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "evidence_refs": [str(observation.id)],
+    }
+    estimate_context = replace(
+        make_dispatch_context(investigation_id), idempotency_key=operation_key
+    )
+    estimated_cost = await tool.reservation_cost(arguments, estimate_context)
+    estimated_tokens = estimated_cost[BudgetDimension.CONTEXT_TOKENS]
+    current_envelope = await fixture.envelopes.get(investigation_id)
+    assert current_envelope is not None
+    limited_budget = InvestigationBudget(
+        limits={
+            **dict(current_envelope.budget.limits),
+            BudgetDimension.CONTEXT_TOKENS: estimated_tokens - 1,
+        }
+    )
+    for prior_reservation in current_envelope.budget.reservations:
+        limited_budget.restore_reservation(prior_reservation)
+    limited_envelope = replace(
+        current_envelope,
+        version=current_envelope.version + 1,
+        budget=limited_budget,
+    )
+    await fixture.envelopes.save_if_version(
+        limited_envelope, expected_version=current_envelope.version
+    )
+    fixture.envelope = limited_envelope
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
@@ -7854,10 +7882,7 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
         state=state,
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
-        arguments={
-            "consultation_type": "plan_investigation",
-            "evidence_refs": [str(observation.id)],
-        },
+        arguments=arguments,
         purpose="Review an authorized large sample placeholder with exact G2 accounting.",
         operation_key=operation_key,
     )
@@ -7879,6 +7904,8 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert "length=3200000" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] >= prompt_bytes
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] / prompt_bytes <= 1.35
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert invocation.consumed_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -7891,6 +7918,8 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
+    assert estimated_tokens > limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
+    assert prompt_tokens <= limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
 
 
 @pytest.mark.asyncio
