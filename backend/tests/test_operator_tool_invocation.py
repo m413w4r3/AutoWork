@@ -1720,7 +1720,6 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     assert guidance["last_advice"] is not None
     assert guidance["last_advice"]["invocation_id"] == advice.invocation.id
 
-
     assert guidance["last_advice"]["consultation_type"] == "pivot_strategy"
     assert isinstance(guidance["last_advice"]["date"], datetime)
     assert isinstance(guidance["last_advice"]["key_points"], tuple)
