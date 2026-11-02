@@ -1703,6 +1703,55 @@ class _RuleTools:
                     },
                 ),
             )
+        candidate_value = _empty_optional_value(arguments.get("candidate_id"))
+        import_identity = (
+            f"{context.investigation_id}:{observation.id}:"
+            f"{requested_invocation_id}:{observed_sha256}"
+        )
+        candidate_id = (
+            UUID(candidate_value)
+            if candidate_value is not None
+            else uuid5(_UUID_NAMESPACE, f"bridge-rule-import:{import_identity}")
+        )
+        version_id = uuid5(
+            _UUID_NAMESPACE,
+            f"bridge-rule-import-version:{candidate_id}:{import_identity}",
+        )
+        existing_versions = await self.candidates.list_for_candidate(candidate_id)
+        matching_import = next(
+            (
+                item
+                for item in existing_versions
+                if _is_same_bridge_import(
+                    item,
+                    investigation_id=context.investigation_id,
+                    observation_id=observation.id,
+                    invocation_id=requested_invocation_id,
+                    source_sha256=observed_sha256,
+                )
+            ),
+            None,
+        )
+        if matching_import is not None:
+            output_value, status = self._bridge_import_output(matching_import, replayed=True)
+            return (
+                output_value,
+                status,
+                tuple(
+                    dict.fromkeys(
+                        reference
+                        for motif in matching_import.motif_provenance
+                        for reference in motif.observation_refs
+                    )
+                ),
+            )
+        if existing_versions:
+            self._raise_bridge_import_identity_conflict(
+                candidate_id=candidate_id,
+                existing_versions=existing_versions,
+                requested_source_sha256=observed_sha256,
+                explicit_candidate_id=candidate_value is not None,
+            )
         raw_measurement_catalog = bridge_provenance.get("measurement_catalog")
         measurement_catalog = _bridge_measurement_catalog(raw_measurement_catalog)
 
@@ -1766,6 +1815,10 @@ class _RuleTools:
             catalog=measurement_catalog,
             transmitted_measurements=transmitted_measurements,
         )
+        corpus = await self._build_corpus(context.investigation_id)
+        compile_check = self.workbench.compile_check(source)
+        source_attribution["compile_status"] = compile_check.status.value
+        source_attribution["compile_diagnostic"] = _execution_diagnostic(compile_check)
         for name in yara_string_names(source):
             measurement_links = verified_links_by_name.get(name, ())
             justification_status = "verified" if measurement_links else "gap"
@@ -1796,20 +1849,8 @@ class _RuleTools:
                 )
             )
 
-        candidate_value = _empty_optional_value(arguments.get("candidate_id"))
-        candidate_id = UUID(candidate_value) if candidate_value is not None else uuid4()
-        if await self.candidates.list_for_candidate(candidate_id):
-            raise _ToolFailed(
-                "candidate_id_already_exists",
-                diagnostic=_rule_diagnostic(
-                    stage=RuleDiagnosticStage.PERSISTENCE,
-                    status=RuleDiagnosticStatus.FAILED,
-                    reason_code="candidate_id_already_exists",
-                ),
-            )
-        corpus = await self._build_corpus(context.investigation_id)
-        compile_check = self.workbench.compile_check(source)
         version = DetectionCandidateVersion(
+            id=version_id,
             investigation_id=context.investigation_id,
             candidate_id=candidate_id,
             source=source,
@@ -1820,59 +1861,155 @@ class _RuleTools:
             test_refs=tuple(dict.fromkeys(case.id for case in corpus.cases)),
         )
         try:
-            stored = await self.candidates.append_version(version, expected_previous_id=None)
+            stored, replayed = await self.candidates.append_version_idempotently(version)
         except Exception as exc:
-            raise _ToolFailed(
-                "bridge_rule_persistence_failed",
-                diagnostic=_rule_diagnostic(
-                    stage=RuleDiagnosticStage.PERSISTENCE,
-                    status=RuleDiagnosticStatus.FAILED,
-                    reason_code="bridge_rule_persistence_failed",
-                    details={"exception_class": _safe_exception_type_name(exc)},
+            # A concurrent v1 insert is arbitrated by the repository's unique
+            # (candidate_id, version) constraint. Re-read after its savepoint
+            # rollback and turn the exact same import into a replay.
+            raced_versions = await self.candidates.list_for_candidate(candidate_id)
+            raced_import = next(
+                (
+                    item
+                    for item in raced_versions
+                    if _is_same_bridge_import(
+                        item,
+                        investigation_id=context.investigation_id,
+                        observation_id=observation.id,
+                        invocation_id=requested_invocation_id,
+                        source_sha256=observed_sha256,
+                    )
                 ),
-            ) from exc
+                None,
+            )
+            if raced_import is not None:
+                stored, replayed = raced_import, True
+            elif raced_versions:
+                self._raise_bridge_import_identity_conflict(
+                    candidate_id=candidate_id,
+                    existing_versions=raced_versions,
+                    requested_source_sha256=observed_sha256,
+                    explicit_candidate_id=candidate_value is not None,
+                )
+            else:
+                raise _ToolFailed(
+                    "bridge_rule_persistence_failed",
+                    diagnostic=_rule_diagnostic(
+                        stage=RuleDiagnosticStage.PERSISTENCE,
+                        status=RuleDiagnosticStatus.FAILED,
+                        reason_code="bridge_rule_persistence_failed",
+                        details={"exception_class": _safe_exception_type_name(exc)},
+                    ),
+                ) from exc
+        output_value, status = self._bridge_import_output(stored, replayed=replayed)
+        return (
+            output_value,
+            status,
+            (observation.id, *source_observation_refs),
+        )
+
+    def _bridge_import_output(
+        self, version: DetectionCandidateVersion, *, replayed: bool
+    ) -> tuple[dict[str, Any], ToolInvocationStatus]:
+        assert self.workbench is not None
+        attribution = _source_attribution_from_version(version) or {}
+        compile_status_value = attribution.get("compile_status")
+        compile_diagnostic = attribution.get("compile_diagnostic")
+        try:
+            if not isinstance(compile_status_value, str):
+                raise ValueError("persisted compile status is missing")
+            compile_status = YaraExecutionStatus(compile_status_value)
+            if not isinstance(compile_diagnostic, Mapping):
+                raise ValueError("persisted compile diagnostic is missing")
+            compile_diagnostic = dict(compile_diagnostic)
+        except (TypeError, ValueError):
+            compile_check = self.workbench.compile_check(version.source)
+            compile_status = compile_check.status
+            compile_diagnostic = _execution_diagnostic(compile_check)
+        bridge_warning_findings = attribution.get("bridge_warning_findings", ())
+        if not isinstance(bridge_warning_findings, Sequence) or isinstance(
+            bridge_warning_findings, str | bytes
+        ):
+            bridge_warning_findings = ()
+        validator_findings = attribution.get("validator_findings", ())
+        if not isinstance(validator_findings, Sequence) or isinstance(
+            validator_findings, str | bytes
+        ):
+            validator_findings = ()
+        invocation_id = attribution.get("bridge_invocation_id")
+        observation_id = attribution.get("bridge_observation_id")
         output_value = {
-            "candidate_id": str(stored.candidate_id),
-            "version_id": str(stored.id),
-            "version": stored.version_label,
-            "parent_version_id": None,
-            "source_sha256": stored.source_sha256,
-            "candidate_status": stored.status.value,
+            "candidate_id": str(version.candidate_id),
+            "version_id": str(version.id),
+            "version": version.version_label,
+            "parent_version_id": str(version.parent_version_id)
+            if version.parent_version_id
+            else None,
+            "source_sha256": version.source_sha256,
+            "candidate_status": version.status.value,
             "source_change_kind": "bridge_yara_draft",
-            **_version_provenance_output(stored),
-            "bridge_warning_findings": list(source_attribution["bridge_warning_findings"]),
+            **_version_provenance_output(version),
+            "bridge_warning_findings": list(bridge_warning_findings),
             "limitations": _bridge_candidate_limitations(
-                stored.motif_provenance,
-                advisory_issues,
-                source_attribution["bridge_warning_findings"],
+                version.motif_provenance,
+                tuple(item for item in validator_findings if isinstance(item, str)),
+                tuple(item for item in bridge_warning_findings if isinstance(item, str)),
             ),
             "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
             "lifecycle": derive_rule_lifecycle(
-                compile_check.status,
+                compile_status,
                 has_test_report=False,
                 validation_status=RuleValidationStatus.UNTESTED,
             ).value,
             "validation_status": RuleValidationStatus.UNTESTED.value,
             "validation_reason": RuleValidationReason.EXPLICIT_TEST_REQUIRED.value,
             "validation_reasons": ["explicit_rule_test_required"],
-            "bridge_invocation_id": str(requested_invocation_id),
-            "bridge_observation_id": str(observation.id),
-            "bridge_rule_source_sha256": observed_sha256,
-            "compile_status": compile_check.status.value,
-            "compile_diagnostic": _execution_diagnostic(compile_check),
-            "test_refs": [str(reference) for reference in stored.test_refs],
+            "bridge_invocation_id": invocation_id,
+            "bridge_observation_id": observation_id,
+            "bridge_rule_source_sha256": attribution.get("bridge_rule_source_sha256"),
+            "compile_status": compile_status.value,
+            "compile_diagnostic": compile_diagnostic,
+            "test_refs": [str(reference) for reference in version.test_refs],
             "evaluation_status": (
                 ToolInvocationStatus.SUCCEEDED.value
-                if compile_check.status is YaraExecutionStatus.OK
+                if compile_status is YaraExecutionStatus.OK
                 else ToolInvocationStatus.PARTIAL.value
             ),
+            "replayed": replayed,
         }
         return (
             output_value,
             ToolInvocationStatus.SUCCEEDED
-            if compile_check.status is YaraExecutionStatus.OK
+            if compile_status is YaraExecutionStatus.OK
             else ToolInvocationStatus.PARTIAL,
-            (observation.id, *source_observation_refs),
+        )
+
+    @staticmethod
+    def _raise_bridge_import_identity_conflict(
+        *,
+        candidate_id: UUID,
+        existing_versions: Sequence[DetectionCandidateVersion],
+        requested_source_sha256: str,
+        explicit_candidate_id: bool,
+    ) -> None:
+        existing = existing_versions[0]
+        source_differs = existing.source_sha256 != requested_source_sha256
+        reason_code = (
+            "candidate_id_already_exists_with_different_source"
+            if source_differs and explicit_candidate_id
+            else "candidate_id_already_exists_for_different_bridge_import"
+        )
+        raise _ToolFailed(
+            reason_code,
+            diagnostic=_rule_diagnostic(
+                stage=RuleDiagnosticStage.PERSISTENCE,
+                status=RuleDiagnosticStatus.FAILED,
+                reason_code=reason_code,
+                details={
+                    "candidate_id": str(candidate_id),
+                    "existing_source_sha256": existing.source_sha256,
+                    "requested_source_sha256": requested_source_sha256,
+                },
+            ),
         )
 
     async def operator_syntax_fix(
@@ -4590,6 +4727,28 @@ def _source_attribution_from_version(
         if isinstance(attribution, Mapping):
             return attribution
     return None
+
+
+def _is_same_bridge_import(
+    version: DetectionCandidateVersion,
+    *,
+    investigation_id: UUID,
+    observation_id: UUID,
+    invocation_id: UUID,
+    source_sha256: str,
+) -> bool:
+    attribution = _source_attribution_from_version(version)
+    return (
+        version.version == 1
+        and version.parent_version_id is None
+        and version.investigation_id == investigation_id
+        and version.source_sha256 == source_sha256
+        and attribution is not None
+        and attribution.get("change_kind") == "bridge_yara_draft"
+        and attribution.get("bridge_observation_id") == str(observation_id)
+        and attribution.get("bridge_invocation_id") == str(invocation_id)
+        and attribution.get("bridge_rule_source_sha256") == source_sha256
+    )
 
 
 def _version_provenance_output(version: DetectionCandidateVersion) -> dict[str, Any]:

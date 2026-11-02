@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import json
 import re
@@ -1093,6 +1094,110 @@ async def test_bridge_yara_proposal_verifies_observation_source_and_operator_fix
     assert attribution["author"] == "operator:analyst-42"
     assert attribution["change_kind"] == "operator_syntax_fix"
     assert "operator_diff" in attribution
+
+
+@pytest.mark.asyncio
+async def test_bridge_import_replays_by_identity_and_rejects_explicit_id_source_conflict() -> None:
+    harness = _harness(samples={})
+    source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+    args = {
+        "bridge_observation_id": str(observation_id),
+        "bridge_invocation_id": str(invocation_id),
+        "rule_source_sha256": source_sha256,
+    }
+
+    first = await _call(harness, "rule.propose_bridge", args)
+    compile_count = harness.engine.compile_count
+    replay = await _call(harness, "rule.propose_bridge", args)
+
+    assert first.status is ToolInvocationStatus.SUCCEEDED
+    assert first.output["replayed"] is False
+    assert replay.status is ToolInvocationStatus.SUCCEEDED
+    assert replay.output["replayed"] is True
+    assert replay.output["candidate_id"] == first.output["candidate_id"]
+    assert replay.output["version_id"] == first.output["version_id"]
+    assert replay.output["source_sha256"] == source_sha256
+    assert replay.output["compile_status"] == first.output["compile_status"]
+    assert replay.output["lifecycle"] == first.output["lifecycle"]
+    assert harness.engine.compile_count == compile_count
+    assert len(await harness.candidates.list_for_candidate(UUID(first.output["candidate_id"]))) == 1
+
+    explicit_replay = await _call(
+        harness,
+        "rule.propose_bridge",
+        {**args, "candidate_id": first.output["candidate_id"]},
+    )
+    assert explicit_replay.status is ToolInvocationStatus.SUCCEEDED
+    assert explicit_replay.output["replayed"] is True
+    assert harness.engine.compile_count == compile_count
+
+    changed_source = (
+        'rule bridge_candidate { strings: $marker = "DifferentMarker" condition: $marker }'
+    )
+    other_observation, other_invocation, other_sha256 = await _bridge_yara_observation(
+        harness, source=changed_source
+    )
+    conflict = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(other_observation),
+            "bridge_invocation_id": str(other_invocation),
+            "rule_source_sha256": other_sha256,
+            "candidate_id": first.output["candidate_id"],
+        },
+    )
+    assert conflict.status is ToolInvocationStatus.FAILED
+    assert conflict.error_code == "candidate_id_already_exists_with_different_source"
+    assert conflict.output["diagnostic"]["existing_source_sha256"] == source_sha256
+    assert conflict.output["diagnostic"]["requested_source_sha256"] == other_sha256
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bridge_imports_converge_on_one_version() -> None:
+    harness = _harness(samples={})
+    source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+    args = {
+        "bridge_observation_id": str(observation_id),
+        "bridge_invocation_id": str(invocation_id),
+        "rule_source_sha256": source_sha256,
+    }
+    original_list = harness.candidates.list_for_candidate
+    both_read = asyncio.Barrier(2)
+    initial_reads = 0
+
+    async def synchronized_list(candidate_id: UUID):
+        nonlocal initial_reads
+        versions = await original_list(candidate_id)
+        if initial_reads < 2:
+            initial_reads += 1
+            await both_read.wait()
+        return versions
+
+    harness.candidates.list_for_candidate = synchronized_list
+    first, second = await asyncio.gather(
+        harness.rule_tools.propose_from_bridge(args, harness.context),
+        harness.rule_tools.propose_from_bridge(args, harness.context),
+    )
+
+    first_output, first_status, _first_refs = first
+    second_output, second_status, _second_refs = second
+    assert first_status is ToolInvocationStatus.SUCCEEDED
+    assert second_status is ToolInvocationStatus.SUCCEEDED
+    assert sorted((first_output["replayed"], second_output["replayed"])) == [False, True]
+    assert first_output["version_id"] == second_output["version_id"]
+    candidate_id = UUID(first_output["candidate_id"])
+    assert len(await original_list(candidate_id)) == 1
 
 
 @pytest.mark.asyncio

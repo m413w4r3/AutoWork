@@ -11,6 +11,7 @@ from uuid import UUID
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -23,6 +24,7 @@ from cti_app.application.context_pagination import (
 from cti_app.application.investigation_persistence import (
     InvestigationBudgetSnapshot,
     VersionConflictError,
+    _same_detection_candidate_version,
 )
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.domain.analyst_opinion import (
@@ -1097,6 +1099,44 @@ class SqlAlchemyDetectionCandidateRepository:
             )
         )
         return tuple([await self._candidate_from_row(row) for row in rows])
+
+    async def append_version_idempotently(
+        self, version: DetectionCandidateVersion
+    ) -> tuple[DetectionCandidateVersion, bool]:
+        if version.version != 1 or version.parent_version_id is not None:
+            raise ValueError("Idempotent candidate imports must create a first version")
+
+        existing_versions = await self.list_for_candidate(version.candidate_id)
+        if existing_versions:
+            existing = existing_versions[0]
+            if _same_detection_candidate_version(existing, version):
+                return existing, True
+            raise VersionConflictError("Detection candidate import identity already exists")
+
+        try:
+            # The savepoint keeps a uniqueness race from poisoning the caller's UoW.
+            # uq_detection_candidate_version is the cross-process CAS for candidate v1.
+            async with self._session.begin_nested():
+                stored = await self.append_version(version, expected_previous_id=None)
+        except (IntegrityError, ValueError, VersionConflictError) as exc:
+            existing_by_id = await self.get(version.id)
+            if existing_by_id is not None and _same_detection_candidate_version(
+                existing_by_id, version
+            ):
+                return existing_by_id, True
+            existing_versions = await self.list_for_candidate(version.candidate_id)
+            if any(_same_detection_candidate_version(item, version) for item in existing_versions):
+                return next(
+                    item
+                    for item in existing_versions
+                    if _same_detection_candidate_version(item, version)
+                ), True
+            if existing_versions:
+                raise VersionConflictError(
+                    "Detection candidate import identity already exists"
+                ) from exc
+            raise
+        return stored, False
 
     async def append_version(
         self, version: DetectionCandidateVersion, *, expected_previous_id: UUID | None
