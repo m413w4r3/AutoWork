@@ -49,6 +49,19 @@ def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool
     return do_not_submit and not family.startswith(("vt.", *_BRIDGE_FAMILY_PREFIXES))
 
 
+def bridge_may_cite_provider_report_hash_without_sample(*, family: str, observation: Any) -> bool:
+    """Whether a Bridge dossier may cite a provider report about a not-yet-acquired hash.
+
+    A VirusTotal report is provider metadata, not bytes of an acquired sample, so a fresh
+    investigation holding only reports can still consult Bridge. The hash stays subject to
+    the restrictions of any sample the subject already holds under it; observations derived
+    from local analysis keep requiring an associated, resolvable sample.
+    """
+    if not family.startswith(_BRIDGE_FAMILY_PREFIXES):
+        return False
+    return str(getattr(observation, "source", "") or "").casefold().startswith("vt.")
+
+
 def osint_vt_search_may_cite_unassociated_observation_hash(
     *, authority_kind: ExternalEffectAuthorityKind, provider: str, family: str
 ) -> bool:

@@ -29,6 +29,7 @@ from cti_app.application.external_effects import (
     ReuseDecision,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
+    bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
     osint_vt_search_may_cite_unassociated_observation_hash,
 )
@@ -1516,6 +1517,7 @@ class SqlAlchemyExternalEffectClaimStore:
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
+        provider_report_hashes: set[str] = set()
         observation_file_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
@@ -1628,7 +1630,12 @@ class SqlAlchemyExternalEffectClaimStore:
                     if vt_file_hash_read:
                         observation_file_hashes.add(normalized_observation_hash)
                     if len(normalized_observation_hash) == 64:
-                        observation_hashes.add(normalized_observation_hash)
+                        if bridge_may_cite_provider_report_hash_without_sample(
+                            family=prepared.family, observation=observation
+                        ):
+                            provider_report_hashes.add(normalized_observation_hash)
+                        else:
+                            observation_hashes.add(normalized_observation_hash)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
@@ -1728,6 +1735,22 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("sample_not_associated_with_investigation")
 
+        report_hash_samples: list[SampleRow] = []
+        if provider_report_hashes:
+            # A report about a hash is not that hash's bytes, but any sample the subject
+            # already holds under it keeps its TLP, licence and external-model restrictions.
+            report_hash_samples = list(
+                await session.scalars(
+                    select(SampleRow)
+                    .join(BlobRow, BlobRow.id == SampleRow.blob_id)
+                    .where(
+                        SampleRow.subject_id == subject_id,
+                        BlobRow.sha256.in_(sorted(provider_report_hashes)),
+                    )
+                    .order_by(SampleRow.id)
+                    .with_for_update()
+                )
+            )
         if (vt_file_hash_read or prepared.family == "vt.intelligence_search") and source_hashes:
             hash_samples = list(
                 await session.scalars(
@@ -1761,7 +1784,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 .execution_options(populate_existing=True)
             )
         )
-        for sample in samples:
+        for sample in [*samples, *report_hash_samples]:
             if (
                 sample.subject_id != subject_id
                 or sample.tlp.casefold() == "red"

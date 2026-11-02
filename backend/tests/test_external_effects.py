@@ -37,6 +37,7 @@ from cti_app.application.external_effects import (
     TransportResponse,
     _NoHandoffProofVerifier,
     _PermitRegistry,
+    bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
     osint_vt_search_may_cite_unassociated_observation_hash,
 )
@@ -3102,3 +3103,25 @@ def test_acquisition_dispatch_migration_refuses_to_drop_persisted_lineage(
     assert operations.bind.statements[0].startswith("LOCK TABLE")
     assert "effect_acquisition_dispatch_links" in operations.bind.statements[0]
     assert "SELECT EXISTS" in operations.bind.statements[1]
+
+
+@pytest.mark.parametrize(
+    ("family", "source", "expected"),
+    [
+        ("advisor.consultation.v1", "vt.file_report", True),
+        ("bridge.investigation_turn.v1", "VT.behaviour", True),
+        ("advisor.consultation.v1", "sample.analyze", False),
+        ("advisor.consultation.v1", None, False),
+        ("vt.file_report", "vt.file_report", False),
+        ("advisor.consultation.v1", "advisor.consult", False),
+    ],
+)
+def test_only_bridge_may_cite_a_provider_report_without_an_acquired_sample(
+    family: str, source: str | None, expected: bool
+) -> None:
+    assert (
+        bridge_may_cite_provider_report_hash_without_sample(
+            family=family, observation=SimpleNamespace(source=source)
+        )
+        is expected
+    )

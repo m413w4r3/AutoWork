@@ -109,6 +109,7 @@ from cti_app.infrastructure.database.models.production import AnalystInvestigati
 from cti_app.infrastructure.database.repositories.external_effects import (
     ExternalEffectFamilyBinding,
     SqlAlchemyExternalEffectClaimStore,
+    _ConsumeDenied,
 )
 from cti_app.infrastructure.database.repositories.investigation import _budget_to_payload
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
@@ -4000,5 +4001,213 @@ async def test_crash_after_consume_seals_review_and_replay_never_sends(
         assert (
             amount is not None and amount.reserved_amount == 1 and amount.committed_amount is None
         )
+    finally:
+        await engine.dispose()
+
+
+async def _seed_bridge_report_case(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    investigation_id: UUID,
+    subject_id: UUID,
+    report_hash: str,
+    observation_source: str,
+    sample_flags: dict[str, Any] | None,
+) -> EvidenceReference:
+    """Persist a sha256 observation (and optionally a subject sample) for a Bridge citation."""
+    observation_id = uuid4()
+    observation_sha256 = "e" * 64
+    async with session_factory() as session:
+        async with session.begin():
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert blob is not None
+            if sample_flags is not None:
+                sample_blob = BlobRow(
+                    id=uuid4(),
+                    sha256=report_hash,
+                    size=1,
+                    mime_type="application/octet-stream",
+                    logical_bucket="samples",
+                    object_key=f"samples/{report_hash}",
+                    created_at=datetime.now(UTC),
+                )
+                session.add(sample_blob)
+                await session.flush()
+                session.add(
+                    SampleRow(
+                        id=uuid4(),
+                        subject_id=subject_id,
+                        blob_id=sample_blob.id,
+                        original_name="previously-acquired.bin",
+                        origin="test",
+                        acquired_at=datetime.now(UTC),
+                        license_restriction=sample_flags.get("license_restriction"),
+                        tlp=sample_flags.get("tlp", "CLEAR"),
+                        do_not_submit=True,
+                        external_llm_allowed=sample_flags.get("external_llm_allowed", True),
+                        origin_kind="manual",
+                        state="quarantined",
+                        source_service=None,
+                        source_object_id=report_hash,
+                        expected_hash=report_hash,
+                        validation_actor=None,
+                        validation_date=None,
+                        validation_reason=None,
+                        imphash=None,
+                        ssdeep=None,
+                        tlsh=None,
+                        rich_header_hash=None,
+                        vhash=None,
+                        main_icon_dhash=None,
+                        imphash_source=None,
+                        ssdeep_source=None,
+                        tlsh_source=None,
+                        rich_header_hash_source=None,
+                        vhash_source=None,
+                        main_icon_dhash_source=None,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+            session.add(
+                EvidenceObservationRow(
+                    id=observation_id,
+                    investigation_id=investigation_id,
+                    kind="other",
+                    blob_id=blob.id,
+                    sha256=observation_sha256,
+                    source=observation_source,
+                    source_version="report-v1",
+                    observed_at=datetime.now(UTC),
+                    object_type="sha256",
+                    object_id=report_hash,
+                    limitations=[],
+                    invocation_ref=None,
+                )
+            )
+    return EvidenceReference(
+        "evidence_observation", str(observation_id), "report-v1", observation_sha256
+    )
+
+
+_BRIDGE_REPORT_CASES = [
+    # (observation source, existing subject sample, expected: Bridge may cite it)
+    pytest.param("vt.file_report", None, True, id="vt-report-of-unacquired-hash"),
+    pytest.param("sample.analyze", None, False, id="local-analysis-needs-an-associated-sample"),
+    pytest.param(
+        "vt.file_report",
+        {"external_llm_allowed": False},
+        False,
+        id="vt-report-keeps-the-external-llm-veto-of-a-held-sample",
+    ),
+    pytest.param(
+        "vt.file_report",
+        {"license_restriction": "restricted"},
+        False,
+        id="vt-report-keeps-the-licence-of-a-held-sample",
+    ),
+    pytest.param(
+        "vt.file_report", {"tlp": "RED"}, False, id="vt-report-keeps-tlp-red-of-a-held-sample"
+    ),
+]
+
+
+def _bridge_prepared(reference: EvidenceReference) -> PreparedExternalRequest:
+    return PreparedExternalRequest.build(
+        family="advisor.consultation.v1",
+        provider="bridge",
+        provider_scope="bridge.responses",
+        normalizer_version="1",
+        canonical_request={"bridge_request_id": "fresh-investigation-first-consult"},
+        application_request=FrozenWireRequest(
+            method=b"POST",
+            target=b"/v1/responses",
+            headers=((b"content-type", b"application/json"),),
+            body=b"{}",
+        ),
+        evidence_refs=(reference,),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("observation_source", "sample_flags", "allowed"), _BRIDGE_REPORT_CASES)
+async def test_osint_guard_bridge_may_cite_provider_report_of_unacquired_hash(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    observation_source: str,
+    sample_flags: dict[str, Any] | None,
+    allowed: bool,
+) -> None:
+    # A fresh investigation only holds VT reports: its first Bridge consultation cites them.
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=uuid4().hex + uuid4().hex,
+            observation_source=observation_source,
+            sample_flags=sample_flags,
+        )
+        prepared = _bridge_prepared(reference)
+        async with session_factory() as session:
+            async with session.begin():
+                result = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(
+                    ConsumePolicyContext(
+                        authority=authority,
+                        prepared=prepared,
+                        effect_key=effect_key(authority.investigation_id, prepared),
+                        database_session=session,
+                        investigation_subject_id=subject_id,
+                    )
+                )
+        assert result is allowed
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("observation_source", "sample_flags", "allowed"), _BRIDGE_REPORT_CASES)
+async def test_bridge_source_restrictions_accept_provider_report_of_unacquired_hash(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    observation_source: str,
+    sample_flags: dict[str, Any] | None,
+    allowed: bool,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=uuid4().hex + uuid4().hex,
+            observation_source=observation_source,
+            sample_flags=sample_flags,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True)
+        async with session_factory() as session:
+            async with session.begin():
+                try:
+                    await store._check_source_restrictions(
+                        session, authority, prepared, subject_id, binding
+                    )
+                    refused: str | None = None
+                except _ConsumeDenied as exc:
+                    refused = exc.reason
+        assert (refused is None) is allowed, refused
     finally:
         await engine.dispose()

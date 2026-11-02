@@ -13,6 +13,7 @@ from cti_app.application.external_effects import (
     ConsumePolicyContext,
     ExternalEffectClaim,
     ReuseDecision,
+    bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
     osint_vt_search_may_cite_unassociated_observation_hash,
 )
@@ -403,6 +404,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             if reference.kind == "sample_hash"
         }
         observation_hashes: set[str] = set()
+        provider_report_hashes: set[str] = set()
         sample_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
         observation_refs: dict[str, EvidenceReference] = {}
@@ -490,7 +492,12 @@ class SqlAlchemyVirusTotalPolicyGuard:
                     ):
                         return False
                     if len(normalized_observation_hash) == 64:
-                        observation_hashes.add(normalized_observation_hash)
+                        if bridge_may_cite_provider_report_hash_without_sample(
+                            family=context.prepared.family, observation=observation
+                        ):
+                            provider_report_hashes.add(normalized_observation_hash)
+                        else:
+                            observation_hashes.add(normalized_observation_hash)
                 elif observation.object_type.casefold() in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
@@ -574,13 +581,14 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 for item in samples
             ):
                 return False
-        if source_hashes:
-            sample_hash_terms = [BlobRow.sha256.in_(sorted(source_hashes))]
+        restricted_hashes = source_hashes | provider_report_hashes
+        if restricted_hashes:
+            sample_hash_terms = [BlobRow.sha256.in_(sorted(restricted_hashes))]
             if context.prepared.family in _VT_HASH_READ_FAMILIES | {"vt.intelligence_search"}:
                 sample_hash_terms.extend(
                     (
-                        SampleRow.expected_hash.in_(sorted(source_hashes)),
-                        SampleRow.source_object_id.in_(sorted(source_hashes)),
+                        SampleRow.expected_hash.in_(sorted(restricted_hashes)),
+                        SampleRow.source_object_id.in_(sorted(restricted_hashes)),
                     )
                 )
             hash_samples = list(
