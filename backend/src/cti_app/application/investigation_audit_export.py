@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.domain.advisor_completeness import AdvisorEvidenceStatus, AdvisorPreflightStatus
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
@@ -682,6 +683,7 @@ def project_advisor_call_blob_metadata(
         "submission_status": "UNKNOWN",
         "submission_state": "UNKNOWN",
         "invocation_stage": "UNKNOWN",
+        "consult_status": "UNKNOWN",
         "preflight_status": "UNKNOWN",
         "completeness_counts": {},
         "completeness_counts_available": False,
@@ -734,6 +736,23 @@ def project_advisor_call_blob_metadata(
                 "invocation_stage": _text(payload.get("invocation_stage"))
                 if _text(payload.get("invocation_stage")) in _ADVISOR_INVOCATION_STAGES
                 else "UNKNOWN",
+                "consult_status": derive_advisor_consult_status(
+                    stage_timestamps_utc=payload.get("stage_timestamps_utc"),
+                    invocation_stage=payload.get("invocation_stage"),
+                    submission_status=payload.get("submission_status"),
+                    submission_state=payload.get("submission_state"),
+                    invocation_status=(
+                        ToolInvocationStatus.NEEDS_REVIEW.value
+                        if payload.get("advisor_status") == "needs_review"
+                        else None
+                    ),
+                    response_received=(
+                        isinstance(payload.get("output"), Mapping)
+                        and payload["output"].get("response_received") is True
+                    ),
+                    response_persisted=isinstance(payload.get("response_observation_ref"), str),
+                    failure_stage=payload.get("failure_stage"),
+                ),
                 "preflight_status": _enum_token(
                     payload.get("preflight_status"), AdvisorPreflightStatus
                 )

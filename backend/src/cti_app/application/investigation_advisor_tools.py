@@ -30,6 +30,7 @@ from cti_app.application.advisor_contracts import (
     extract_json_object,
     parse_typed_advisor_response,
 )
+from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
     _sample_disclosure_restriction_sources,
@@ -2202,6 +2203,15 @@ class InvestigationAdvisorTool:
             },
             "stage_timestamps_utc": (
                 dict(timing.stage_timestamps_utc) if timing is not None else {}
+            ),
+            "consult_status": derive_advisor_consult_status(
+                stage_timestamps_utc=(timing.stage_timestamps_utc if timing is not None else {}),
+                invocation_stage=invocation_stage,
+                submission_status=submission.status.value,
+                submission_state=submission.submission_state,
+                invocation_status=result.status,
+                response_received=submission.output_text is not None,
+                response_persisted=response_link_observation is not None,
             ),
             "diagnostics": dict(timing.counters) if timing is not None else {},
             "redacted_secret_count": redacted_secret_count,
@@ -6620,8 +6630,33 @@ class InvestigationAdvisorTool:
 
     def _finish(self, context: ToolExecutionContext, result: ToolResult) -> ToolResult:
         timing = _CURRENT_ADVISOR_TIMING.get()
+        output = dict(result.output)
         if timing is not None:
-            result = replace(result, output=timing.enrich(result.output))
+            output = timing.enrich(output)
+        provenance = output.get("bridge_provenance")
+        status_metadata = provenance if isinstance(provenance, Mapping) else output
+        output["consult_status"] = derive_advisor_consult_status(
+            stage_timestamps_utc=output.get("stage_timestamps_utc")
+            if isinstance(output.get("stage_timestamps_utc"), Mapping)
+            else status_metadata.get("stage_timestamps_utc"),
+            invocation_stage=output.get(
+                "invocation_stage", status_metadata.get("invocation_stage")
+            ),
+            submission_status=output.get(
+                "submission_status", status_metadata.get("submission_status")
+            ),
+            submission_state=output.get(
+                "submission_state", status_metadata.get("submission_state")
+            ),
+            invocation_status=result.status,
+            response_received=output.get("response_received") is True,
+            response_persisted=(
+                output.get("response_persisted") is True
+                or isinstance(status_metadata.get("response_observation_ref"), str)
+            ),
+            failure_stage=output.get("failure_stage"),
+        )
+        result = replace(result, output=output)
         if (
             "response_state" not in result.output
             and result.output.get("confirmed_non_execution") is True

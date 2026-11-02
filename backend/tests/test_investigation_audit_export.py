@@ -475,10 +475,12 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
         ],
         "output_blob_id": _id("advisor-response-blob"),
         "output_sha256": _RAW_HASH,
+        "response_observation_ref": _id("advisor-response-observation"),
         "response_bytes": 789,
         "submission_status": "succeeded",
         "submission_state": "post_submission",
         "invocation_stage": "run_confirmed",
+        "stage_timestamps_utc": {"response_persisted": "2026-10-23T04:00:00Z"},
         "durations_ms": {"submission": 81, "parse": 22, "persistence": 15},
         "provider_usage": {"input_tokens": 123, "output_tokens": 45, "token_marker": 999},
         "bridge_turns_consumed": 1,
@@ -730,6 +732,7 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
     assert advisor_metadata["dossier_bytes"] == 321
     assert advisor_metadata["raw_response_bytes"] == 789
     assert advisor_metadata["transport_state"] == "result_obtained"
+    assert advisor_metadata["consult_status"] == "response_persisted"
     assert advisor_metadata["materials"]["dossier"]["sha256"]["value"] == _NORMALIZED_HASH
     assert advisor_metadata["materials"]["rendered_prompt"]["sha256"]["value"] == _INPUT_HASH
     assert advisor_metadata["materials"]["raw_response"]["sha256"]["value"] == _RAW_HASH

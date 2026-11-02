@@ -128,6 +128,70 @@ def format_advisor_trace_purpose(
     return result
 
 
+def derive_advisor_consult_status(
+    *,
+    stage_timestamps_utc: Mapping[str, Any] | None = None,
+    invocation_stage: Any = None,
+    submission_status: Any = None,
+    submission_state: Any = None,
+    invocation_status: Any = None,
+    response_received: Any = False,
+    response_persisted: Any = False,
+    failure_stage: Any = None,
+) -> str:
+    """Derive a compact Bridge consultation status from persisted stage facts."""
+    stages = (
+        {key for key, value in stage_timestamps_utc.items() if isinstance(key, str) and value}
+        if isinstance(stage_timestamps_utc, Mapping)
+        else set()
+    )
+    invocation_status = getattr(invocation_status, "value", invocation_status)
+    invocation_stage = getattr(invocation_stage, "value", invocation_stage)
+    submission_status = getattr(submission_status, "value", submission_status)
+    submission_state = getattr(submission_state, "value", submission_state)
+    failure_stage = getattr(failure_stage, "value", failure_stage)
+    invocation_stage = invocation_stage if isinstance(invocation_stage, str) else None
+    submission_status = submission_status if isinstance(submission_status, str) else None
+    submission_state = submission_state if isinstance(submission_state, str) else None
+    invocation_status = invocation_status if isinstance(invocation_status, str) else None
+    failure_stage = failure_stage if isinstance(failure_stage, str) else None
+    if (
+        invocation_status == ToolInvocationStatus.NEEDS_REVIEW.value
+        or submission_state == "external_state_unknown"
+        or invocation_stage == "timeout_ambiguous"
+    ):
+        return "ambiguous"
+    if response_persisted is True or stages.intersection(
+        {"response_persisted", "manifest_persisted"}
+    ):
+        return "response_persisted"
+    if response_received is True or stages.intersection(
+        {"bridge_response_received", "output_stored"}
+    ):
+        return "response_received"
+    if (
+        failure_stage
+        or submission_status in {"failed", "blocked", "invalid_output", "unavailable"}
+        or invocation_stage in {"pretransport_failure", "submission_failed", "prevalidation"}
+        or invocation_status
+        in {
+            ToolInvocationStatus.FAILED.value,
+            ToolInvocationStatus.UNAVAILABLE.value,
+            ToolInvocationStatus.POLICY_DENIED.value,
+        }
+    ):
+        return "error"
+    if (
+        "bridge_post_started" in stages
+        or invocation_stage in {"submitted", "run_confirmed"}
+        or submission_state in {"submission_attempted", "post_submission", "result_obtained"}
+    ):
+        return "sent_to_bridge"
+    if stages or invocation_status == ToolInvocationStatus.RUNNING.value:
+        return "dossier_preparing"
+    return "received"
+
+
 def advisor_checkpoint_summary(invocation: Any) -> str | None:
     """Render persisted checkpoint and recommendation links into tool coverage."""
     purpose = getattr(invocation, "purpose", None)
@@ -193,6 +257,7 @@ def _bounded_reason(value: Any) -> bool:
 __all__ = [
     "PURPOSE_MARKER",
     "advisor_checkpoint_summary",
+    "derive_advisor_consult_status",
     "format_advisor_trace_purpose",
     "split_advisor_trace_purpose",
 ]

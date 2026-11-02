@@ -1799,6 +1799,10 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         operator_status = await client.get(
             f"/api/investigations/{fixture.investigation_id}/operator-status"
         )
+        operator_status_compact = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator-status",
+            params={"view": "compact"},
+        )
         operator_context = await client.get(
             f"/api/investigations/{fixture.investigation_id}/operator/context",
             params={
@@ -1809,6 +1813,13 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         )
 
     assert operator_status.status_code == 200, operator_status.text
+    assert operator_status_compact.status_code == 200, operator_status_compact.text
+    compact_advisor = next(
+        item
+        for item in operator_status_compact.json()["invocations"]
+        if item["id"] == str(advice.invocation.id)
+    )
+    assert compact_advisor["consult_status"] == "response_persisted"
     last_advice = operator_status.json()["advisor_guidance"]["last_advice"]
     assert last_advice is not None
     assert last_advice["consultation_type"] == "pivot_strategy"
