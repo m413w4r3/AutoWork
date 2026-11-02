@@ -14,7 +14,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from cti_app.application.publication_secret_guard import is_operational_secret_field_name
@@ -185,14 +185,21 @@ _GENERIC_METADATA_KEYS = frozenset(
 class AdvisorDossier:
     text: str
     manifest: tuple[dict[str, Any], ...]
+    _encoded: bytes = field(init=False, repr=False, compare=False)
+    _digest: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        encoded = self.text.encode("utf-8")
+        object.__setattr__(self, "_encoded", encoded)
+        object.__setattr__(self, "_digest", hashlib.sha256(encoded).hexdigest())
 
     @property
     def byte_size(self) -> int:
-        return len(self.text.encode("utf-8"))
+        return len(self._encoded)
 
     @property
     def sha256(self) -> str:
-        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+        return self._digest
 
 
 def extract_content_excerpts(

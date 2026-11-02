@@ -1874,7 +1874,7 @@ async def test_unknown_basis_refs_are_removed_and_traced_when_valid_refs_remain(
         if item.source == "advisor.consult"
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=20 * 1024)
     )
     assert persisted["output"]["normalization_status"] == "partial"
     assert persisted["output"]["normalizations"] == list(normalizations)
@@ -4769,8 +4769,23 @@ async def test_large_invalid_advisor_output_is_archived_without_content_limit() 
     assert manifest["response_bytes"] == len(raw_output.encode())
     assert manifest["provider_usage"] == {"status": "usage_unavailable"}
     assert manifest["durations_ms"]["submission"] >= 0
+    assert {
+        "repo_calls",
+        "blob_reads",
+        "bytes_read",
+        "observations",
+        "samples",
+    } <= manifest["diagnostics"].keys()
+    assert manifest["diagnostics"]["blob_reads"] > 0
+    assert manifest["diagnostics"]["bytes_read"] > 0
     expected_stages = {
         "advisor_started",
+        "evidence_listing",
+        "association_resolution",
+        "blob_reads",
+        "measurement_extraction",
+        "sample_selection",
+        "dossier_rendering",
         "dossier_ready",
         "prompt_stored",
         "admission_complete",
@@ -4785,6 +4800,12 @@ async def test_large_invalid_advisor_output_is_archived_without_content_limit() 
         datetime.fromisoformat(stage_timestamps[name].replace("Z", "+00:00"))
         for name in (
             "advisor_started",
+            "evidence_listing",
+            "association_resolution",
+            "blob_reads",
+            "measurement_extraction",
+            "sample_selection",
+            "dossier_rendering",
             "dossier_ready",
             "prompt_stored",
             "admission_complete",
@@ -4799,6 +4820,12 @@ async def test_large_invalid_advisor_output_is_archived_without_content_limit() 
     assert set(manifest["stage_timestamps_utc"]) == expected_stages - {"manifest_persisted"}
     for duration in (
         "dossier_build",
+        "evidence_listing_ms",
+        "association_resolution_ms",
+        "blob_reads_ms",
+        "measurement_extraction_ms",
+        "sample_selection_ms",
+        "dossier_rendering_ms",
         "prompt_store",
         "admission",
         "submission",
@@ -4828,17 +4855,26 @@ async def test_prompt_archive_failure_persists_reached_advisor_timing_stages() -
         raw=raw,
     )
 
-    async def fail_prompt_storage(value: str, *, bucket: str) -> UUID:
+    async def fail_prompt_storage(value: bytes, *, bucket: str, mime_type: str) -> UUID:
         raise OSError("synthetic prompt archive failure")
 
-    tool._artifact_store.put_text = fail_prompt_storage
+    tool._artifact_store.put_bytes = fail_prompt_storage
     result = await tool.execute(
         {"consultation_type": "plan_investigation", "evidence_refs": [str(observation.id)]},
         make_context(investigation_id, key="operator:advisor:prompt-archive-failure"),
     )
 
     assert result.output["advisor_status"] == "prompt_archive_failed"
-    assert set(result.output["stage_timestamps_utc"]) == {"advisor_started", "dossier_ready"}
+    assert set(result.output["stage_timestamps_utc"]) == {
+        "advisor_started",
+        "evidence_listing",
+        "association_resolution",
+        "blob_reads",
+        "measurement_extraction",
+        "sample_selection",
+        "dossier_rendering",
+        "dossier_ready",
+    }
     assert "prompt_stored" not in result.output["stage_timestamps_utc"]
     assert result.output["durations_ms"]["prompt_store"] >= 0
     persisted_observation = tool._observations.observations[result.observation_refs[-1]]
@@ -6668,6 +6704,49 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
 
 
 @pytest.mark.asyncio
+async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failure() -> None:
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id)
+    reserved = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 3_600,
+        BudgetDimension.CONTEXT_BYTES: 1,
+        BudgetDimension.CONTEXT_TOKENS: 1,
+    }
+    context.budget.reserve(context.idempotency_key, reserved)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+    )
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+
+    async def fail_adjustment(_context, _reservation_operation_key, _measured_amounts):
+        raise RuntimeError("injected reservation adjustment failure")
+
+    context = replace(context, reservation_adjuster=fail_adjustment)
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={"consultation_type": "plan_investigation", "evidence_refs": []},
+        purpose="Verify reservation adjustment failure is known to precede transport.",
+        operation_key=context.idempotency_key,
+        reservation_amounts=reserved,
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.error_code == "advisor_context_reservation_mismatch"
+    assert result.output["failure_stage"] == "g2_context_reservation"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.framework_pre_submission_proof is (
+        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_sends_prompt_above_context_accounting_limit() -> None:
     investigation_id = uuid4()
     context = make_dispatch_context(investigation_id, context_byte_limit=1)
@@ -6742,13 +6821,13 @@ async def test_revocation_during_prompt_preparation_stops_before_fake_transport(
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
     registry = InMemoryToolRegistry()
     register_investigation_advisor_tool(registry, adapter=tool)
-    original_put_text = tool._artifact_store.put_text
+    original_put_bytes = tool._artifact_store.put_bytes
     admission_checks = 0
     revoked = False
 
-    async def archive_and_revoke(value, *, bucket):
+    async def archive_and_revoke(value, *, bucket, mime_type):
         nonlocal revoked
-        blob_id = await original_put_text(value, bucket=bucket)
+        blob_id = await original_put_bytes(value, bucket=bucket, mime_type=mime_type)
         revoked = True
         return blob_id
 
@@ -6757,7 +6836,7 @@ async def test_revocation_during_prompt_preparation_stops_before_fake_transport(
         admission_checks += 1
         return FrameworkPreSubmissionProof.ENVELOPE_REVOKED if revoked else None
 
-    tool._artifact_store.put_text = archive_and_revoke
+    tool._artifact_store.put_bytes = archive_and_revoke
     result = await RegistryToolDispatcher(registry).dispatch(
         context,
         tool_name="advisor.consult",
@@ -6872,11 +6951,11 @@ async def test_service_current_envelope_recheck_preserves_needs_review_recovery(
     tool._consultation_data = prepared_context
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
-    original_put_text = tool._artifact_store.put_text
+    original_put_bytes = tool._artifact_store.put_bytes
     revocations = []
 
-    async def archive_then_revoke(value, *, bucket):
-        blob_id = await original_put_text(value, bucket=bucket)
+    async def archive_then_revoke(value, *, bucket, mime_type):
+        blob_id = await original_put_bytes(value, bucket=bucket, mime_type=mime_type)
         current = await fixture.envelopes.get(investigation_id)
         assert current is not None
         revoked = replace(
@@ -6892,7 +6971,7 @@ async def test_service_current_envelope_recheck_preserves_needs_review_recovery(
         revocations.append(revoked.version)
         return blob_id
 
-    tool._artifact_store.put_text = archive_then_revoke
+    tool._artifact_store.put_bytes = archive_then_revoke
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
@@ -7809,6 +7888,34 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     tool._samples = LargeSamples()
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "evidence_refs": [str(observation.id)],
+    }
+    estimate_context = replace(
+        make_dispatch_context(investigation_id), idempotency_key=operation_key
+    )
+    estimated_cost = await tool.reservation_cost(arguments, estimate_context)
+    estimated_tokens = estimated_cost[BudgetDimension.CONTEXT_TOKENS]
+    current_envelope = await fixture.envelopes.get(investigation_id)
+    assert current_envelope is not None
+    limited_budget = InvestigationBudget(
+        limits={
+            **dict(current_envelope.budget.limits),
+            BudgetDimension.CONTEXT_TOKENS: estimated_tokens - 1,
+        }
+    )
+    for prior_reservation in current_envelope.budget.reservations:
+        limited_budget.restore_reservation(prior_reservation)
+    limited_envelope = replace(
+        current_envelope,
+        version=current_envelope.version + 1,
+        budget=limited_budget,
+    )
+    await fixture.envelopes.save_if_version(
+        limited_envelope, expected_version=current_envelope.version
+    )
+    fixture.envelope = limited_envelope
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
@@ -7818,10 +7925,7 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
         state=state,
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
-        arguments={
-            "consultation_type": "plan_investigation",
-            "evidence_refs": [str(observation.id)],
-        },
+        arguments=arguments,
         purpose="Review an authorized large sample placeholder with exact G2 accounting.",
         operation_key=operation_key,
     )
@@ -7843,6 +7947,8 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert "length=3200000" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] >= prompt_bytes
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] / prompt_bytes <= 1.35
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert invocation.consumed_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -7855,6 +7961,437 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
+    assert estimated_tokens > limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
+    assert prompt_tokens <= limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected_error_code", "expected_input_error"),
+    (
+        ("association_removed", "advisor_input_invalid", "sample_hash_not_associated"),
+        ("license_restricted", "advisor_disclosure_restricted", None),
+        ("tlp_restricted", "advisor_disclosure_restricted", None),
+        ("external_llm_disallowed", "advisor_disclosure_restricted", None),
+        ("state_changed", "advisor_input_invalid", "sample_hash_unavailable"),
+    ),
+)
+async def test_prompt_sample_policy_is_refreshed_before_transport(
+    change: str,
+    expected_error_code: str,
+    expected_input_error: str | None,
+) -> None:
+    investigation_id = uuid4()
+    sample_bytes = b"Synthetic sample whose policy may change before send."
+    sample_hash = hashlib.sha256(sample_bytes).hexdigest()
+    tool, transport, observation, _sample_id, association_id, _blob_id, _ = (
+        _make_downloaded_sample_fixture(investigation_id, sample_bytes)
+    )
+    sample = tool._samples.samples[0]
+
+    class MutableAssociations:
+        def __init__(self) -> None:
+            self.rows = (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+            self.reads = 0
+
+        async def list_for_investigation(self, _investigation_id):
+            self.reads += 1
+            return self.rows
+
+    class MutableSamples:
+        def __init__(self) -> None:
+            self.rows = (sample,)
+            self.reads = 0
+
+        async def list_for_subject(self, _subject_id):
+            self.reads += 1
+            return self.rows
+
+    associations = MutableAssociations()
+    samples = MutableSamples()
+    tool._sample_associations = associations
+    tool._samples = samples
+    put_bytes = tool._artifact_store.put_bytes
+
+    async def archive_and_change_policy(value, *, bucket, mime_type):
+        archived = await put_bytes(value, bucket=bucket, mime_type=mime_type)
+        if bucket == "advisor-prompts":
+            if change == "association_removed":
+                associations.rows = ()
+            elif change == "license_restricted":
+                sample.license_restriction = "synthetic restricted licence"
+            elif change == "tlp_restricted":
+                sample.tlp = TLP.RED
+            elif change == "external_llm_disallowed":
+                sample.external_llm_allowed = False
+            elif change == "state_changed":
+                sample.state = "accepted"
+        return archived
+
+    tool._artifact_store.put_bytes = archive_and_change_policy
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:sample-policy:{change}"),
+    )
+
+    assert associations.reads == 2
+    assert samples.reads == 2
+    assert transport.calls == []
+    assert result.error_code == expected_error_code
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["bridge_turns_consumed"] == 0
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+    if expected_input_error is not None:
+        assert result.output["input_error_code"] == expected_input_error
+
+
+@pytest.mark.asyncio
+async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -> None:
+    investigation_id = UUID("00000000-0000-0000-0000-000000000001")
+    sample_bytes = b"Synthetic sample whose policy remains unchanged."
+    sample_hash = hashlib.sha256(sample_bytes).hexdigest()
+    observation_id = UUID("00000000-0000-0000-0000-000000000002")
+    blob_id = UUID("00000000-0000-0000-0000-000000000003")
+    sample_id = UUID("00000000-0000-0000-0000-000000000004")
+    association_id = UUID("00000000-0000-0000-0000-000000000005")
+    observation = EvidenceObservation(
+        id=observation_id,
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=sample_hash,
+        source="virustotal.sample_download",
+        source_version="sample-acquisition.v1",
+        observed_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        object_type="binary_or_non_json",
+        object_id=sample_hash,
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The cited sample bytes were available.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._observations = ObservationRepository((observation,))
+    tool._blobs.add(
+        blob_id,
+        sha256=sample_hash,
+        size=len(sample_bytes),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[blob_id] = sample_bytes
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-sample.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:sample-policy-unchanged"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == (
+        "bbe1503c546ae78c9d2922da5f1dea2ed59129b2708b1258c0396151b9c7472f"
+    )
+    assert base64.b64encode(sample_bytes).decode("ascii") in prompt
+
+
+@pytest.mark.asyncio
+async def test_service_commits_aggregate_measured_reservation_for_editorial_children() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    from cti_app.domain.investigation_state import Hypothesis
+
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="editorial-reservation", statement="A measured assertion."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    operation_key = "operator:advisor:multi-unit-reservation"
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Synthetic editorial evidence."},
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    def response_for_call(call):
+        payload = typed_prompt_payload(call["prompt"])
+        lines = ["advisor-wire.v1", "TYPE: draft_text", "STATUS: succeeded"]
+        for unit in payload["units"]:
+            assertion = next(
+                item for item in payload["assertions"] if item["unit_id"] == unit["id"]
+            )
+            lines.extend(
+                [
+                    f"UNIT: {unit['id']}",
+                    f"S: Section {unit['id']} is supported. [{assertion['id']}]",
+                ]
+            )
+        lines.append("LIMITATION: none")
+        return TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="\n".join(lines),
+            bridge_invocation_id=str(uuid4()),
+        )
+
+    transport = Transport(response_for_call)
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+    execute_editorial_batches = tool._execute_editorial_batches
+
+    async def one_unit_per_child(
+        arguments,
+        context,
+        units,
+        *,
+        maximum_units,
+        execution_timeout_seconds=MAX_ADVISOR_TOOL_SECONDS,
+        execution_deadline_monotonic=None,
+        bridge_turns_remaining=None,
+    ):
+        return await execute_editorial_batches(
+            arguments,
+            context,
+            units,
+            maximum_units=1,
+            execution_timeout_seconds=execution_timeout_seconds,
+            execution_deadline_monotonic=execution_deadline_monotonic,
+            bridge_turns_remaining=bridge_turns_remaining,
+        )
+
+    tool._execute_editorial_batches = one_unit_per_child
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    definition, _adapter = fixture.registry.get("advisor.consult", "advisor-consult.v1")
+    object.__setattr__(
+        definition,
+        "cost_model",
+        {
+            **dict(definition.cost_model),
+            BudgetDimension.BRIDGE_TURNS: 2,
+        },
+    )
+    block_types = [
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    ][:2]
+    units = [
+        {
+            "id": f"U{index}",
+            "block_type": block_type.value,
+            "form": "body",
+            "anchor": None,
+            "assertions": [
+                {
+                    "id": f"a{index}",
+                    "text": f"Unit {index} assertion is grounded in the fixture.",
+                    "nature": "analyse",
+                    "refs": [{"kind": "observation", "id": str(observation.id)}],
+                    "block_type": block_type.value,
+                    "form": "body",
+                    "anchor": None,
+                }
+            ],
+        }
+        for index, block_type in enumerate(block_types, start=1)
+    ]
+    arguments = {
+        "consultation_type": "draft_text",
+        "evidence_refs": [str(observation.id)],
+        "units": units,
+    }
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments=arguments,
+        purpose="Measure each editorial child and account for their aggregate prompts.",
+        operation_key=operation_key,
+    )
+
+    measured_bytes = sum(len(call["prompt"].encode("utf-8")) for call in transport.calls)
+    measured_tokens = sum(
+        (len(call["prompt"].encode("utf-8")) + 3) // 4 for call in transport.calls
+    )
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output.get("batch_statuses")
+    assert invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert uncertain is False
+    assert result.output["advisor_status"] == "succeeded"
+    assert len(transport.calls) == len(units)
+    latest_envelope = await fixture.envelopes.get(investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status.value == "committed"
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == measured_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == measured_tokens
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == measured_bytes
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == measured_tokens
+
+
+@pytest.mark.asyncio
+async def test_service_reservation_persistence_failure_is_pre_send_and_retryable() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    from cti_app.domain.investigation_state import Hypothesis
+
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="reservation-retry", statement="A measured assertion."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Synthetic retry evidence."},
+    )
+    await fixture.observations.append_if_absent(observation)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The evidence is available.", [str(observation.id)]),
+        )
+    )
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    original_save_envelope = fixture.service._save_envelope_version
+    save_calls = 0
+
+    async def fail_measured_adjustment_once(envelope):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise RuntimeError("injected reservation adjustment persistence failure")
+        return await original_save_envelope(envelope)
+
+    fixture.service._save_envelope_version = fail_measured_adjustment_once
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "evidence_refs": [str(observation.id)],
+    }
+    operation_key = "operator:advisor:reservation-persistence-failure"
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments=arguments,
+        purpose="Verify a failed measured reservation cannot reach Bridge.",
+        operation_key=operation_key,
+    )
+
+    assert save_calls >= 2
+    assert transport.calls == []
+    assert invocation.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_context_reservation_mismatch"
+    assert result.output["confirmed_non_execution"] is True
+    assert uncertain is False
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+
+    fixture.service._save_envelope_version = original_save_envelope
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    retry_state = await fixture.states.get(investigation_id)
+    retried, retry_result, _retry_refs, retry_uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=retry_state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments=arguments,
+        purpose="Retry after the confirmed pre-send persistence failure.",
+        operation_key=f"{operation_key}:retry",
+    )
+    assert retried.status is ToolInvocationStatus.SUCCEEDED
+    assert retry_result.status is ToolInvocationStatus.SUCCEEDED
+    assert retry_uncertain is False
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.asyncio

@@ -5,12 +5,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from cti_app.application.advisor_dossier import AdvisorDossier
 from cti_app.application.advisor_wire import advisor_wire_aliases, render_advisor_wire_input
 
 
-def render_advisor_prompt(consultation_type: str, data: Mapping[str, Any]) -> str:
+def render_advisor_prompt(
+    consultation_type: str,
+    data: Mapping[str, Any],
+    *,
+    dossier: AdvisorDossier | None = None,
+) -> str:
     """Render the exact Advisor prompt text from prepared data."""
-    aliases = advisor_wire_aliases(data)
+    aliases = advisor_wire_aliases(data, dossier=dossier)
     task = str(data.get("question", "")).strip() or _advisor_task_description(consultation_type)
     lines = [
         (
