@@ -120,6 +120,10 @@ def _checkpoint_reminder(reason: str | None, consultation_type: str | None) -> s
             "Blocage répété: hypothèse → pivot → succès/échec → coût; autre mesure; "
             "absence ≠ négatif."
         ),
+        "before_vt_pivot_campaign": (
+            "Règle mesurée: demander une stratégie de pivots discriminants avant la campagne VT; "
+            "hypothèse → pivot → succès/échec → coût; absence ≠ négatif."
+        ),
         "editorial_draft_due": (
             "Brouillon modifié: texte courant seul; avis obsolète. Hypothèse → pivot → "
             "succès/échec → coût; pas d'historique."
@@ -360,6 +364,10 @@ def _checkpoint(
         )
         if not any(_consultation_type(item) == "yara_draft" for item in later_yara_advice):
             return "yara_revision_review", "yara_draft"
+        # A measured rule gives invariants worth pivoting on; ask Bridge for a discriminating
+        # search strategy before spending VT searches on them.
+        if not any(_consultation_type(item) == "pivot_strategy" for item in later_yara_advice):
+            return "before_vt_pivot_campaign", "pivot_strategy"
 
     if analyzed_positions:
         latest_analysis_position = analyzed_positions[-1]

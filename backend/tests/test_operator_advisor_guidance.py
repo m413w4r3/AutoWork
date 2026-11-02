@@ -249,6 +249,10 @@ async def test_complete_editorial_checkpoint_path_uses_six_bridge_turns_with_new
     assert (await checkpoint())["reason"] == "yara_revision_review"
 
     add_advice("yara_draft", 5)
+    pivot_checkpoint = await checkpoint()
+    assert pivot_checkpoint["reason"] == "before_vt_pivot_campaign"
+    assert pivot_checkpoint["suggested_consultation_type"] == "pivot_strategy"
+    assert "stratégie de pivots" in pivot_checkpoint["reminder"]
     pivot_id = uuid4()
     pivot = SimpleNamespace(id=pivot_id, observed_at=base + timedelta(seconds=6))
     assert (await checkpoint(observations=(pivot,), pivot_observation_ids=(pivot_id,)))[
