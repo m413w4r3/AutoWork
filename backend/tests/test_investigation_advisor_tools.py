@@ -4769,8 +4769,81 @@ async def test_large_invalid_advisor_output_is_archived_without_content_limit() 
     assert manifest["response_bytes"] == len(raw_output.encode())
     assert manifest["provider_usage"] == {"status": "usage_unavailable"}
     assert manifest["durations_ms"]["submission"] >= 0
+    expected_stages = {
+        "advisor_started",
+        "dossier_ready",
+        "prompt_stored",
+        "admission_complete",
+        "bridge_post_started",
+        "bridge_response_received",
+        "output_stored",
+        "manifest_persisted",
+    }
+    stage_timestamps = result.output["stage_timestamps_utc"]
+    assert set(stage_timestamps) == expected_stages
+    parsed_timestamps = [
+        datetime.fromisoformat(stage_timestamps[name].replace("Z", "+00:00"))
+        for name in (
+            "advisor_started",
+            "dossier_ready",
+            "prompt_stored",
+            "admission_complete",
+            "bridge_post_started",
+            "bridge_response_received",
+            "output_stored",
+            "manifest_persisted",
+        )
+    ]
+    assert all(timestamp.tzinfo is UTC for timestamp in parsed_timestamps)
+    assert parsed_timestamps == sorted(parsed_timestamps)
+    assert set(manifest["stage_timestamps_utc"]) == expected_stages - {"manifest_persisted"}
+    for duration in (
+        "dossier_build",
+        "prompt_store",
+        "admission",
+        "submission",
+        "post_to_response",
+        "output_store",
+        "manifest_persist",
+    ):
+        assert result.output["durations_ms"][duration] >= 0
     assert manifest["budget_reservation"]["bridge_turns"] == 1
     assert manifest["budget_consumption"]["bridge_turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_archive_failure_persists_reached_advisor_timing_stages() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticMarker", "offset": 8}],
+        },
+    )
+    tool, _ = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused")),
+        observation=observation,
+        raw=raw,
+    )
+
+    async def fail_prompt_storage(value: str, *, bucket: str) -> UUID:
+        raise OSError("synthetic prompt archive failure")
+
+    tool._artifact_store.put_text = fail_prompt_storage
+    result = await tool.execute(
+        {"consultation_type": "plan_investigation", "evidence_refs": [str(observation.id)]},
+        make_context(investigation_id, key="operator:advisor:prompt-archive-failure"),
+    )
+
+    assert result.output["advisor_status"] == "prompt_archive_failed"
+    assert set(result.output["stage_timestamps_utc"]) == {"advisor_started", "dossier_ready"}
+    assert "prompt_stored" not in result.output["stage_timestamps_utc"]
+    assert result.output["durations_ms"]["prompt_store"] >= 0
+    persisted_observation = tool._observations.observations[result.observation_refs[-1]]
+    manifest = json.loads(tool._artifact_store.values[persisted_observation.blob_id])
+    assert manifest["output"]["stage_timestamps_utc"] == result.output["stage_timestamps_utc"]
 
 
 @pytest.mark.asyncio
