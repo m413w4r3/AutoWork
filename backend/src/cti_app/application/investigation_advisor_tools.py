@@ -4412,6 +4412,7 @@ class InvestigationAdvisorTool:
         samples = await self._list_subject_samples(investigation.subject_id)
         current = self._consultation_context(investigation_id)
         sample_index = await self._ensure_sample_reference_index() if current is not None else {}
+        observation_positions = {item.id: index for index, item in enumerate(observations)}
         rows: list[dict[str, Any]] = []
         for association in associations:
             if current is not None:
@@ -4432,8 +4433,14 @@ class InvestigationAdvisorTool:
             if _sample_disclosure_restriction_sources(sample, envelope):
                 continue
             if current is not None:
-                indexed_ids = {item.id for item in sample_index.get(association.sample_sha256, ())}
-                associated_observations = [item for item in observations if item.id in indexed_ids]
+                associated_observations = sorted(
+                    (
+                        item
+                        for item in sample_index.get(association.sample_sha256, ())
+                        if item.id in observation_positions
+                    ),
+                    key=lambda item: observation_positions[item.id],
+                )
             else:
                 associated_observations = [
                     item

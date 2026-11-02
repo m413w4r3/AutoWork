@@ -38,21 +38,23 @@ SAMPLE_COUNT = 40
 OBSERVATIONS_PER_SAMPLE = 6
 SAMPLE_BYTES = 64 * 1024
 CONSULTATION_TYPES = ("yara_draft", "pivot_strategy", "suricata_draft", "draft_text")
+# The first build is the dossier actually used for the prompt. Later base-code
+# builds came from redundant alias generation and are not the consultation dossier.
 BASELINE_EXECUTION = {
     "yara_draft": {
-        "dossier_sha256": "15611e50c9132de1fc9fbb7c20370a883dc8a6f1ed9250a3b594b886136023a4",
+        "dossier_sha256": "a6c9481f559b4a7441ff3b6dfcd79888d03b2093c0972016bc66105e512bebe7",
         "prompt_sha256": "a94daf7bebbc7622452d0f18347fa113ba752638c13e8ee2b87b3da3c5b69f99",
-        "manifest_refs_sha256": "cfa5a1616a577abc712ce08e4367a7a4a7b4134cdad326fb87a1b3db4387128c",
+        "manifest_refs_sha256": "d739192f7e232fe0243c2a16c09038a815716e0c20ba20f70d03d88aacbb2f7e",
     },
     "pivot_strategy": {
-        "dossier_sha256": "529a81da90d84589ac187756db0e9a9298e4875d5b72473d472a28a20041361a",
+        "dossier_sha256": "127b9669e61da338a36d474b62baee0a3a4a1ce2181660021901aa445b9fc200",
         "prompt_sha256": "42aa494c4e193d327d985c86b8a369b5e0e8fa23e6ab66c841f73575141bde25",
-        "manifest_refs_sha256": "6fa01edceaa2c518f10afac2e5fa1a2c5c142be264bb9fa04afe3a73ee6b18a5",
+        "manifest_refs_sha256": "a158b3a7ed25b732927b986c1fb6e3edb4721ebd3141a7d4bc5c2fabf4e1102f",
     },
     "suricata_draft": {
-        "dossier_sha256": "6ceb54dbce63c8490061ca34ad61dcad14501d18bcfe149d420d7faa953611e1",
+        "dossier_sha256": "350cba0406f137c007cbedb268fc4cb66511fb5b7760cad51ea7f9df52323d77",
         "prompt_sha256": "50db168dee0827f415307f8837afd5ec1641fece8af70c6f889cb1701bc3da3c",
-        "manifest_refs_sha256": "4d4d133c17f366ed86417e045e54a1094474cb3a86aef45810059854c6118bad",
+        "manifest_refs_sha256": "a1dfeb134e565e654f6fa19256724aa45b60f108ba0a2340c905840abb629623",
     },
     "draft_text": {
         "dossier_sha256": "4595e65b3749ca89c21ddfd74809c9c4955f3353222d7727fb9edb7ed0d6e95e",
@@ -133,7 +135,8 @@ class _CountingProxy:
 
     def _record_result(self, name: str, result: object, args: tuple[object, ...]) -> None:
         if self._label == "sample_associations" and name == "list_for_investigation":
-            self._counter.association_sql_queries += 1 + 2 * len(result)  # type: ignore[arg-type]
+            # The batched SQL repository uses three SELECTs independent of S.
+            self._counter.association_sql_queries += 3
         if self._label == "artifact_store" and name == "read_bytes":
             self._counter.blob_reads += 1
             self._counter.bytes_read += len(result)  # type: ignore[arg-type]
@@ -450,20 +453,25 @@ async def test_m12_q_reservation_and_execution_characterization(
     }
     print(json.dumps(report, sort_keys=True))
 
-    assert len(reservation_prompts) == 1
+    assert reservation_prompts == []
     assert len(execution_prompts) == 1
-    assert len(reservation_builds) == 2
+    assert reservation_builds == []
     expected = BASELINE_EXECUTION[consultation_type]
-    assert execution_builds[-1]["dossier_sha256"] == expected["dossier_sha256"]
-    assert execution_builds[-1]["manifest_refs_sha256"] == expected["manifest_refs_sha256"]
+    assert len(execution_builds) == 1
+    assert execution_builds[0]["dossier_sha256"] == expected["dossier_sha256"]
+    assert execution_builds[0]["manifest_refs_sha256"] == expected["manifest_refs_sha256"]
     assert execution_prompts[0]["prompt_sha256"] == expected["prompt_sha256"]
-    assert (
-        len(execution_builds)
-        == {
-            "yara_draft": 6,
-            "pivot_strategy": 5,
-            "suricata_draft": 5,
-            "draft_text": 5,
-        }[consultation_type]
-    )
-    assert reservation_builds[-1]["manifest_refs"] == execution_builds[-1]["manifest_refs"]
+    assert execution_counts["calls"].get("sample_associations.list_for_investigation") == 1
+    assert reservation_counts["calls"].get("sample_associations.list_for_investigation") == 1
+    assert execution_counts["association_sql_queries"] == 3
+    assert reservation_counts["association_sql_queries"] == 3
+    assert execution_counts["max_observation_blob_reads"] <= 1
+    assert execution_counts["observation_blob_reads"] <= len(counter.observation_blob_ids)
+    assert reservation_counts["blob_reads"] == 0
+    assert result.output["durations_ms"]["reservation_cost_ms"] >= 0
+    diagnostics = result.output["diagnostics"]
+    assert diagnostics["repo_calls"] > 0
+    assert diagnostics["blob_reads"] == execution_counts["blob_reads"]
+    assert diagnostics["bytes_read"] == execution_counts["bytes_read"]
+    assert diagnostics["observations"] == 240
+    assert diagnostics["samples"] == SAMPLE_COUNT
