@@ -2326,7 +2326,6 @@ async def _advisor_consult_statuses(
         if getattr(invocation, "tool_name", None) != "advisor.consult":
             continue
         metadata: Mapping[str, Any] = {}
-        advisor_observation_present = False
         for observation_id in reversed(tuple(getattr(invocation, "response_refs", ()))):
             observation = observations_by_id.get(observation_id)
             if (
@@ -2335,7 +2334,6 @@ async def _advisor_consult_statuses(
                 or getattr(observation, "object_type", None) != "advisor_call"
             ):
                 continue
-            advisor_observation_present = True
             if evidence_summaries is None:
                 break
             try:
@@ -2351,6 +2349,17 @@ async def _advisor_consult_statuses(
         output = metadata.get("output")
         if not isinstance(output, Mapping):
             output = {}
+        response_observation_present = any(
+            observation is not None
+            and getattr(observation, "source", None) == "advisor.consult.response"
+            and getattr(observation, "object_type", None) == "advisor_response_received"
+            for observation_id in getattr(invocation, "response_refs", ())
+            for observation in (observations_by_id.get(observation_id),)
+        )
+        output_blob_present = any(
+            isinstance(value, str) and bool(value.strip())
+            for value in (metadata.get("output_blob_id"), output.get("output_blob_id"))
+        )
         statuses[invocation.id] = derive_advisor_consult_status(
             stage_timestamps_utc=stage_timestamps,
             invocation_stage=metadata.get("invocation_stage"),
@@ -2358,12 +2367,8 @@ async def _advisor_consult_statuses(
             submission_state=metadata.get("submission_state"),
             invocation_status=invocation.status,
             response_received=output.get("response_received") is True,
-            response_persisted=(
-                isinstance(metadata.get("response_observation_ref"), str)
-                or isinstance(metadata.get("output_blob_id"), str)
-                or output.get("response_persisted") is True
-            ),
-            advisor_observation_present=advisor_observation_present,
+            response_observation_present=response_observation_present,
+            output_blob_present=output_blob_present,
             failure_stage=metadata.get("failure_stage"),
         )
     return statuses

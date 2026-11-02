@@ -40,27 +40,35 @@ from cti_app.domain.investigation import ToolInvocationStatus
         ),
         (
             {"stage_timestamps_utc": {"response_persisted": "2026-11-02T00:00:00Z"}},
+            "response_received",
+        ),
+        (
+            {"stage_timestamps_utc": {"manifest_persisted": "2026-11-02T00:00:00Z"}},
             "response_persisted",
         ),
+        (
+            {
+                "response_observation_present": True,
+            },
+            "response_persisted",
+        ),
+        (
+            {
+                "response_received": True,
+            },
+            "response_received",
+        ),
+        ({"output_blob_present": True}, "response_received"),
         (
             {
                 "invocation_status": ToolInvocationStatus.SUCCEEDED,
-                "advisor_observation_present": True,
             },
-            "response_persisted",
-        ),
-        (
-            {
-                "invocation_status": ToolInvocationStatus.PARTIAL,
-                "advisor_observation_present": True,
-            },
-            "response_persisted",
+            "received",
         ),
         ({"response_received": True}, "response_received"),
         (
             {
                 "invocation_status": ToolInvocationStatus.NEEDS_REVIEW,
-                "advisor_observation_present": True,
             },
             "ambiguous",
         ),
@@ -69,7 +77,7 @@ from cti_app.domain.investigation import ToolInvocationStatus
         (
             {
                 "invocation_status": ToolInvocationStatus.FAILED,
-                "response_persisted": True,
+                "response_observation_present": True,
             },
             "error",
         ),
@@ -100,3 +108,90 @@ def test_compact_operator_invocation_view_includes_derived_advisor_status() -> N
     )
 
     assert view["consult_status"] == "response_received"
+
+
+@pytest.mark.asyncio
+async def test_api_consult_status_requires_response_link_or_manifest_persisted() -> None:
+    try:
+        from cti_app.api.investigation import _advisor_consult_statuses
+    except ModuleNotFoundError as exc:
+        if exc.name in {"pefile", "yara"}:
+            pytest.skip(f"API dependencies are unavailable in this sandbox: {exc.name}")
+        raise
+
+    invocation_id = uuid4()
+    advisor_call_id = uuid4()
+    response_link_id = uuid4()
+    advisor_call = SimpleNamespace(
+        id=advisor_call_id,
+        source="advisor.consult",
+        object_type="advisor_call",
+    )
+    response_link = SimpleNamespace(
+        id=response_link_id,
+        source="advisor.consult.response",
+        object_type="advisor_response_received",
+    )
+
+    class Summary:
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+        async def summary(self, _observation):
+            return self.metadata
+
+    def invocation(*response_refs):
+        return SimpleNamespace(
+            id=invocation_id,
+            tool_name="advisor.consult",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=response_refs,
+        )
+
+    linked_status = await _advisor_consult_statuses(
+        invocations=(invocation(advisor_call_id, response_link_id),),
+        observations=(advisor_call, response_link),
+        evidence_summaries=Summary(
+            {
+                "schema": "operator-advisor-call.v1",
+                "response_observation_ref": str(response_link_id),
+                "output": {"output_blob_id": str(uuid4())},
+            }
+        ),
+    )
+    blob_only_status = await _advisor_consult_statuses(
+        invocations=(invocation(advisor_call_id),),
+        observations=(advisor_call,),
+        evidence_summaries=Summary(
+            {
+                "schema": "operator-advisor-call.v1",
+                "output_blob_id": str(uuid4()),
+                "output": {"output_blob_id": str(uuid4())},
+            }
+        ),
+    )
+    manifest_status = await _advisor_consult_statuses(
+        invocations=(invocation(advisor_call_id),),
+        observations=(advisor_call,),
+        evidence_summaries=Summary(
+            {
+                "schema": "operator-advisor-call.v1",
+                "stage_timestamps_utc": {"manifest_persisted": "2026-11-02T00:00:00Z"},
+            }
+        ),
+    )
+    unlinked_status = await _advisor_consult_statuses(
+        invocations=(invocation(advisor_call_id),),
+        observations=(advisor_call,),
+        evidence_summaries=Summary(
+            {
+                "schema": "operator-advisor-call.v1",
+                "response_observation_ref": str(uuid4()),
+            }
+        ),
+    )
+
+    assert linked_status[invocation_id] == "response_persisted"
+    assert blob_only_status[invocation_id] == "response_received"
+    assert manifest_status[invocation_id] == "response_persisted"
+    assert unlinked_status[invocation_id] == "received"

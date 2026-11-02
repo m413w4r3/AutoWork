@@ -784,14 +784,7 @@ def _invocation_view(
             else None
         )
         if consult_status is None:
-            consult_status = derive_advisor_consult_status(
-                invocation_status=invocation.status,
-                advisor_observation_present=(
-                    invocation.status
-                    in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-                    and bool(invocation.response_refs)
-                ),
-            )
+            consult_status = derive_advisor_consult_status(invocation_status=invocation.status)
         view["consult_status"] = consult_status
     return view
 

@@ -6677,9 +6677,29 @@ class InvestigationAdvisorTool:
             ),
             invocation_status=result.status,
             response_received=output.get("response_received") is True,
-            response_persisted=(
-                output.get("response_persisted") is True
-                or isinstance(status_metadata.get("response_observation_ref"), str)
+            response_observation_present=(
+                isinstance(
+                    output.get(
+                        "response_observation_ref",
+                        status_metadata.get("response_observation_ref"),
+                    ),
+                    str,
+                )
+                and output.get(
+                    "response_observation_ref",
+                    status_metadata.get("response_observation_ref"),
+                )
+                in {str(item) for item in result.observation_refs}
+            ),
+            output_blob_present=(
+                (
+                    isinstance(output.get("output_blob_id"), str)
+                    and bool(output["output_blob_id"].strip())
+                )
+                or (
+                    isinstance(status_metadata.get("output_blob_id"), str)
+                    and bool(status_metadata["output_blob_id"].strip())
+                )
             ),
             failure_stage=output.get("failure_stage"),
         )

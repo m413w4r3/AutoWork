@@ -750,9 +750,13 @@ def project_advisor_call_blob_metadata(
                         isinstance(payload.get("output"), Mapping)
                         and payload["output"].get("response_received") is True
                     ),
-                    response_persisted=(
+                    response_observation_present=(
                         isinstance(payload.get("response_observation_ref"), str)
-                        or isinstance(payload.get("output_blob_id"), str)
+                        and bool(payload["response_observation_ref"].strip())
+                    ),
+                    output_blob_present=(
+                        isinstance(payload.get("output_blob_id"), str)
+                        and bool(payload["output_blob_id"].strip())
                     ),
                     failure_stage=payload.get("failure_stage"),
                 ),
