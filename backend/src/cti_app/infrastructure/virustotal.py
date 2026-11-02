@@ -341,10 +341,7 @@ class _VirusTotalPermitAwareTransport(PermitAwareTransport):
                 raise SafeExternalEffectFailure(
                     ExternalEffectFailureStage.RAW_ARCHIVE_WRITE_FAILED
                 ) from None
-            if (
-                not isinstance(reference, EvidenceReference)
-                or reference.kind != "vt.raw_response"
-            ):
+            if not isinstance(reference, EvidenceReference) or reference.kind != "vt.raw_response":
                 raise SafeExternalEffectFailure(
                     ExternalEffectFailureStage.ARCHIVE_REFERENCE_INVALID
                 )

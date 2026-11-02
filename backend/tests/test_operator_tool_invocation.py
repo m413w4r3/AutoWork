@@ -2733,7 +2733,8 @@ async def test_needs_review_offers_fresh_resubmission_only_for_trusted_passive_v
             state.sha256,
             replay=False,
         )
-        return result.output["next_action"]
+        next_action: dict[str, object] = result.output["next_action"]
+        return next_action
 
     passive_action = await response_for("vt.file_report")
     assert passive_action["code"] == "retry_with_fresh_invocation"

@@ -813,9 +813,7 @@ class ExternalEffectCoordinator:
                     )
                     return Ambiguous(
                         consume.claim_id,
-                        failure_stage=(
-                            failure_stage if record_passive_failure_stage else None
-                        ),
+                        failure_stage=(failure_stage if record_passive_failure_stage else None),
                     )
                 return await seal_zero_handoff(
                     consume.claim_id,

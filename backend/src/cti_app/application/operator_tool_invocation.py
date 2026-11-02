@@ -1887,8 +1887,7 @@ class OperatorToolInvocationService:
                     else "continue_with_current_context"
                 ),
                 "method": "POST"
-                if retryable_passive_read
-                or invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                if retryable_passive_read or invocation.status is ToolInvocationStatus.NEEDS_REVIEW
                 else "GET",
                 "path": (
                     f"/api/investigations/{self._investigation_id}/operator/tools/"

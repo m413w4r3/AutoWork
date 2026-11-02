@@ -647,9 +647,7 @@ async def test_uncertain_passive_read_records_safe_failure_diagnostics(
     assert calls == 2
     assert len(claims) == 2
     assert all(claim.state.value == "NEEDS_REVIEW" for claim in claims)
-    assert store.needs_review_reason_codes == [
-        (claim.id, failure_stage) for claim in claims
-    ]
+    assert store.needs_review_reason_codes == [(claim.id, failure_stage) for claim in claims]
     exchange_records = [
         record
         for record in caplog.records
