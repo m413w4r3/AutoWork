@@ -332,9 +332,9 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             continue
         fence = opening.group("fence")
         closing_pattern = re.compile(rf"(?m)^[ \t]*`{{{len(fence)},}}[ \t]*$")
-        closing = closing_pattern.search(text, opening.end())
-        end = closing.end() if closing is not None else len(text)
-        body_end = closing.start() if closing is not None else len(text)
+        fence_close = closing_pattern.search(text, opening.end())
+        fence_end = fence_close.end() if fence_close is not None else len(text)
+        body_end = fence_close.start() if fence_close is not None else len(text)
         body = text[opening.end() : body_end]
         language_tag = opening.group("info").strip().casefold()
         source_language = {
@@ -344,13 +344,13 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             "suricata": "suricata",
         }.get(language_tag)
         if source_language is not None:
-            blocks.append(_RawSourceBlock(source_language, body, opening.start(), end))
+            blocks.append(_RawSourceBlock(source_language, body, opening.start(), fence_end))
         elif not language_tag:
             untagged = _single_untagged_rule(body)
             if untagged is not None:
                 source_language, source = untagged
-                blocks.append(_RawSourceBlock(source_language, source, opening.start(), end))
-        wrapped_spans.append((opening.start(), end))
+                blocks.append(_RawSourceBlock(source_language, source, opening.start(), fence_end))
+        wrapped_spans.append((opening.start(), fence_end))
 
     for match in marker_pattern.finditer(text):
         if any(start <= match.start() < end for start, end in wrapped_spans):
