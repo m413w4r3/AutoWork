@@ -11,7 +11,7 @@ Ce rapport est un journal d'orchestration : les preuves restent les observations
 | attempt-002 | DeepSeek Flash 1M, thinking `max`, agent `996bd9fd` | `main@0fd7176c` (PR #21), `RULE_WORKBENCH_ENABLED=true` | idem + ligne « POST en vol » | ~1 h 40, aucune intervention | v257, avis v4 ; Bridge 7/200, VT 79/10000, downloads 4/1000, tool_seconds 9508, contexte 11,8 M/16 M tokens |
 
 « DeepSeek Max » = DeepSeek Flash 1M au niveau de réflexion `max` : seul palier exposé par le runtime. Sous-agents de correction : Luna (`gpt-6-luna`) xhigh, sessions Paseo isolées.
-Limite d'indépendance : R3 contient les 28 findings et observations d'attempt-001 ; attempt-002 est indépendant par session (aucun rapport transmis), pas par corpus. Isolation de l'opérateur : consignes textuelles seulement ; aucune lecture hors périmètre observée dans les commandes.
+Limite d'indépendance : R3 contient les 28 findings et observations d'attempt-001 ; attempt-002 est indépendant par session (aucun rapport transmis), pas par corpus. Isolation de l'opérateur : consignes textuelles seulement ; aucune lecture hors périmètre observée dans les commandes. **Écart constaté** : la session d'attempt-002 a écrit un fichier de mémoire d'agent (`mission12-qualification-final-state.md`) dans le répertoire de mémoire du projet, partagé avec les sessions d'orchestration : texte non probatoire produit par l'opérateur, susceptible d'être relu par un futur essai (contamination) ; fichier conservé et signalé, non supprimé.
 
 ## 2. Verdict indépendant par axe
 
