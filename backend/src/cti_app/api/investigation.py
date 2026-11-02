@@ -18,6 +18,7 @@ from uuid import UUID, uuid5
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.analyst_handoff import (
     AnalystHandoffPolicy,
     AnalystPostSynthesisService,
@@ -25,7 +26,6 @@ from cti_app.application.analyst_handoff import (
     current_verified_extraction_inputs,
     loop_budget_from_settings,
 )
-from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import (
     make_investigation_conversation_id,
