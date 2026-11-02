@@ -17,7 +17,9 @@ import re
 import time
 import traceback
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -139,6 +141,55 @@ logger = logging.getLogger(__name__)
 
 _REFERENCE_PAYLOAD_CACHE_ENTRIES = 48
 _REFERENCE_ANSWER_CACHE_ENTRIES = 50_000
+
+
+class _AdvisorStageTiming:
+    """Capture advisor stage times without retaining any stage input data."""
+
+    def __init__(self) -> None:
+        started_at = time.perf_counter()
+        self.stage_timestamps_utc: dict[str, str] = {"advisor_started": self._utc_timestamp()}
+        self.durations_ms: dict[str, int] = {}
+        self._started_at: dict[str, float] = {"advisor_started": started_at}
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def mark(
+        self,
+        stage: str,
+        *,
+        duration_name: str | None = None,
+        from_stage: str | None = None,
+    ) -> None:
+        if stage in self.stage_timestamps_utc:
+            return
+        now = time.perf_counter()
+        self.stage_timestamps_utc[stage] = self._utc_timestamp()
+        self._started_at[stage] = now
+        if duration_name is not None and from_stage in self._started_at:
+            self.durations_ms[duration_name] = round((now - self._started_at[from_stage]) * 1000)
+
+    def record_duration(self, name: str, started_at: float) -> None:
+        self.durations_ms[name] = round((time.perf_counter() - started_at) * 1000)
+
+    def enrich(self, output: Mapping[str, Any]) -> dict[str, Any]:
+        enriched = dict(output)
+        prior_durations = enriched.get("durations_ms")
+        durations = dict(prior_durations) if isinstance(prior_durations, Mapping) else {}
+        durations.update(self.durations_ms)
+        prior_timestamps = enriched.get("stage_timestamps_utc")
+        timestamps = dict(prior_timestamps) if isinstance(prior_timestamps, Mapping) else {}
+        timestamps.update(self.stage_timestamps_utc)
+        enriched["durations_ms"] = durations
+        enriched["stage_timestamps_utc"] = timestamps
+        return enriched
+
+
+_CURRENT_ADVISOR_TIMING: ContextVar[_AdvisorStageTiming | None] = ContextVar(
+    "current_advisor_timing", default=None
+)
 
 
 def _internal_failure_detail(exc: BaseException) -> dict[str, str | int]:
@@ -398,6 +449,35 @@ class InvestigationAdvisorTool:
         _bridge_turns_remaining: int | None = None,
         _reservation_operation_key: str | None = None,
     ) -> ToolResult:
+        timing = _AdvisorStageTiming()
+        token = _CURRENT_ADVISOR_TIMING.set(timing)
+        try:
+            result = await self._execute(
+                arguments,
+                context,
+                _editorial_batch_child=_editorial_batch_child,
+                _execution_timeout_seconds=_execution_timeout_seconds,
+                _execution_deadline_monotonic=_execution_deadline_monotonic,
+                _bridge_turns_remaining=_bridge_turns_remaining,
+                _reservation_operation_key=_reservation_operation_key,
+            )
+            return replace(result, output=timing.enrich(result.output))
+        finally:
+            _CURRENT_ADVISOR_TIMING.reset(token)
+
+    async def _execute(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolExecutionContext,
+        *,
+        _editorial_batch_child: bool = False,
+        _execution_timeout_seconds: int | None = None,
+        _execution_deadline_monotonic: float | None = None,
+        _bridge_turns_remaining: int | None = None,
+        _reservation_operation_key: str | None = None,
+    ) -> ToolResult:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        assert timing is not None
         try:
             raw_consultation_type = arguments.get("consultation_type")
             if not isinstance(raw_consultation_type, str):
@@ -995,6 +1075,12 @@ class InvestigationAdvisorTool:
             ]
             prompt = _fit_advisor_prompt(consultation_type, prompt_data)
             encoded = prompt.encode("utf-8")
+            if timing is not None:
+                timing.mark(
+                    "dossier_ready",
+                    duration_name="dossier_build",
+                    from_stage="advisor_started",
+                )
             reservation_key = _reservation_operation_key or context.idempotency_key
             reservation = _advisor_context_reservation(context, reservation_key)
             if reservation is not None and (
@@ -1400,9 +1486,12 @@ class InvestigationAdvisorTool:
         context_sha256 = hashlib.sha256(encoded).hexdigest()
         turn_index = int(hashlib.sha256(context.idempotency_key.encode()).hexdigest()[:15], 16)
         prompt_sha256 = context_sha256
+        prompt_store_started_at = time.perf_counter()
         try:
             prompt_blob_id = await self._artifact_store.put_text(prompt, bucket="advisor-prompts")
         except Exception as exc:
+            if timing is not None:
+                timing.record_duration("prompt_store", prompt_store_started_at)
             return await self._persist_preflight_failure(
                 context,
                 consultation_type=consultation_type,
@@ -1420,10 +1509,16 @@ class InvestigationAdvisorTool:
                 error_code="advisor_prompt_persistence_failed",
                 exception_class=type(exc).__name__,
             )
+        if timing is not None:
+            timing.mark("prompt_stored")
+            timing.record_duration("prompt_store", prompt_store_started_at)
+        admission_started_at = time.perf_counter()
         if context.pre_transport_check is not None:
             try:
                 admission_proof = await context.pre_transport_check(context)
             except Exception as exc:
+                if timing is not None:
+                    timing.record_duration("admission", admission_started_at)
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
@@ -1441,6 +1536,8 @@ class InvestigationAdvisorTool:
                     exception_class=type(exc).__name__,
                 )
             if admission_proof is not None:
+                if timing is not None:
+                    timing.record_duration("admission", admission_started_at)
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
@@ -1457,6 +1554,9 @@ class InvestigationAdvisorTool:
                     },
                     error_code="advisor_admission_revoked",
                 )
+        if timing is not None:
+            timing.mark("admission_complete")
+            timing.record_duration("admission", admission_started_at)
         submission_started_at = time.perf_counter()
         submission = await submit_bridge_consultation_once(
             self._transport,
@@ -1471,6 +1571,7 @@ class InvestigationAdvisorTool:
             deadline_monotonic=execution_deadline_monotonic,
             minimum_timeout_seconds=minimum_execution_seconds,
             clock=execution_clock,
+            on_submission_started=lambda: timing.mark("bridge_post_started"),
             external_effect_binding_context={
                 "authority_context": getattr(context, "external_effect_authority", None),
                 "invocation_arguments": dict(arguments),
@@ -1479,12 +1580,21 @@ class InvestigationAdvisorTool:
                 "reservation_operation_key": reservation_key,
             },
         )
+        if timing is not None:
+            if submission.output_text is not None:
+                timing.mark(
+                    "bridge_response_received",
+                    duration_name="post_to_response",
+                    from_stage="bridge_post_started",
+                )
         submission_proves_no_execution = _submission_proves_no_execution(submission)
         evidence_preflight = evaluate_advisor_evidence_preflight(
             prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)
         )
         prompt_data["evidence_preflight"] = evidence_preflight
         submission_elapsed_ms = round((time.perf_counter() - submission_started_at) * 1000)
+        if timing is not None:
+            timing.durations_ms["submission"] = submission_elapsed_ms
         # Archive every response text actually received. An ambiguous
         # submission remains unparsed and unusable until reconciled.
         raw_output = submission.output_text
@@ -1495,14 +1605,20 @@ class InvestigationAdvisorTool:
         output_blob_id: UUID | None = None
         output_archive_error: Exception | None = None
         if raw_output is not None:
+            output_store_started_at = time.perf_counter()
             try:
                 output_blob_id = await self._artifact_store.put_bytes(
                     raw_output_bytes or b"",
                     bucket="model-outputs",
                     mime_type="text/plain; charset=utf-8",
                 )
+                if timing is not None:
+                    timing.mark("output_stored")
             except Exception as exc:
                 output_archive_error = exc
+            finally:
+                if timing is not None:
+                    timing.record_duration("output_store", output_store_started_at)
         available_tool_definitions = tuple(
             item
             for item in self._available_tool_definitions(context)
@@ -1620,7 +1736,11 @@ class InvestigationAdvisorTool:
                 "submission": submission_elapsed_ms,
                 "parse": parse_elapsed_ms,
                 "elapsed_before_manifest": elapsed_before_persistence_ms,
+                **(timing.durations_ms if timing is not None else {}),
             },
+            "stage_timestamps_utc": (
+                dict(timing.stage_timestamps_utc) if timing is not None else {}
+            ),
             "redacted_secret_count": redacted_secret_count,
             "dossier_manifest": [
                 dict(item)
@@ -1769,6 +1889,10 @@ class InvestigationAdvisorTool:
                 ),
                 idempotency_key=context.idempotency_key,
             )
+            if timing is not None:
+                # This completion time is carried by the returned result persisted afterward.
+                timing.mark("manifest_persisted")
+                timing.record_duration("manifest_persist", persistence_started_at)
             result = ToolResult(
                 result.status,
                 observation_refs=tuple(dict.fromkeys((*result.observation_refs, observation.id))),
@@ -1808,10 +1932,13 @@ class InvestigationAdvisorTool:
                         "submission": submission_elapsed_ms,
                         "parse": parse_elapsed_ms,
                         "persistence": persistence_elapsed_ms,
+                        "elapsed_before_manifest": elapsed_before_persistence_ms,
                     },
                 },
             )
         except Exception as exc:
+            if timing is not None:
+                timing.record_duration("manifest_persist", persistence_started_at)
             retained_output = dict(result.output)
             if raw_output is not None:
                 retained_output.setdefault("consultation_type", consultation_type)
@@ -1879,6 +2006,9 @@ class InvestigationAdvisorTool:
                 "usable": False,
             },
         )
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        if timing is not None:
+            result = replace(result, output=timing.enrich(result.output))
         try:
             observation = await ProductionEvidenceRecorder(
                 self._artifact_store,
@@ -5306,6 +5436,7 @@ class InvestigationAdvisorTool:
             warnings = parsed.setdefault("warnings", [])
             if isinstance(warnings, list) and "secret_redacted" not in warnings:
                 warnings.append("secret_redacted")
+        _mark_rule_advisory_readability(parsed, safe_advisory_text)
         display_text = safe_advisory_text
         if evidence_links_absent and "liens de preuve absents" not in display_text.casefold():
             display_text += "\n\n[Avertissement consultatif : liens de preuve absents.]"
@@ -5358,6 +5489,9 @@ class InvestigationAdvisorTool:
     ) -> ToolResult:
         """Persist a bounded local failure with its stage before returning it."""
         safe_output = dict(output)
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        if timing is not None:
+            safe_output = timing.enrich(safe_output)
         stage = str(safe_output.get("failure_stage", "pre_transport_validation"))[:64]
         reason = str(safe_output.get("failure_reason", error_code))[:128]
         message = ""
@@ -5454,6 +5588,9 @@ class InvestigationAdvisorTool:
         return self._finish(context, result)
 
     def _finish(self, context: ToolExecutionContext, result: ToolResult) -> ToolResult:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        if timing is not None:
+            result = replace(result, output=timing.enrich(result.output))
         if (
             "response_state" not in result.output
             and result.output.get("confirmed_non_execution") is True
@@ -5890,10 +6027,15 @@ class ReparsePersistedAdvisorOutputTool:
                     "selected_parser_version": selected_parser,
                     "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
                     "raw_output": advisory_text,
+                    "raw_output_bytes": len(raw_bytes),
                     "raw_output_sha256": output_sha256,
                     "output_sha256": output_sha256,
+                    "raw_output_retained": True,
+                    "raw_output_truncated": False,
                     "warnings": warnings,
                     "usable": bool(advisory_text.strip()),
+                    "structured_usable": False,
+                    "canonicalization_eligible": False,
                     "untrusted": True,
                     "canonical_promotion": False,
                     "bridge_turns_consumed": 0,
@@ -5983,6 +6125,8 @@ class ReparsePersistedAdvisorOutputTool:
                             self._settings
                         ),
                     )
+                    if isinstance(legacy_parse, dict):
+                        _mark_rule_advisory_readability(legacy_parse, raw_text)
                 except (TypeError, ValueError, KeyError, AttributeError):
                     legacy_parse = None
             redacted_output, redacted_count = redact_explicit_operational_secrets(
@@ -6007,7 +6151,11 @@ class ReparsePersistedAdvisorOutputTool:
                 "consultation_type": consultation_type,
                 "status": "partial",
                 "untrusted": True,
-                "usable": False,
+                "usable": bool(advisory_text.strip())
+                if consultation_type in {"yara_draft", "suricata_draft"}
+                else False,
+                "structured_usable": False,
+                "canonicalization_eligible": False,
                 "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
                 "raw_output": advisory_text,
                 "raw_output_bytes": len(raw_bytes),
@@ -6026,10 +6174,17 @@ class ReparsePersistedAdvisorOutputTool:
                 and isinstance(legacy_parse, Mapping)
             ):
                 advisor_status = str(legacy_parse.get("status", "partial"))
-                usable = legacy_parse.get("usable") is True
+                canonicalization_eligible = (
+                    legacy_parse.get("canonicalization_eligible", legacy_parse.get("usable"))
+                    is True
+                )
+                usable = bool(advisory_text.strip())
                 parsed_output = {
                     **dict(legacy_parse),
                     "advisor_status": advisor_status,
+                    "structured_usable": canonicalization_eligible,
+                    "canonicalization_eligible": canonicalization_eligible,
+                    "usable": usable,
                     "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
                     "raw_output": advisory_text,
                     "raw_output_bytes": len(raw_bytes),
@@ -6095,7 +6250,9 @@ class ReparsePersistedAdvisorOutputTool:
                         exception_class=type(exc).__name__,
                     )
                 return ToolResult(
-                    ToolInvocationStatus.SUCCEEDED if usable else ToolInvocationStatus.PARTIAL,
+                    ToolInvocationStatus.SUCCEEDED
+                    if canonicalization_eligible
+                    else ToolInvocationStatus.PARTIAL,
                     observation_refs=(original.id, reparsed_observation.id),
                     output={
                         "advisor_status": advisor_status,
@@ -6105,6 +6262,8 @@ class ReparsePersistedAdvisorOutputTool:
                         "output_sha256": output_sha256,
                         "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
                         "usable": usable,
+                        "structured_usable": canonicalization_eligible,
+                        "canonicalization_eligible": canonicalization_eligible,
                         "warnings": parsed_output.get("warnings", []),
                         "consultation_type": consultation_type,
                         "output": parsed_output,
@@ -6126,7 +6285,11 @@ class ReparsePersistedAdvisorOutputTool:
                     "bridge_invocation_id": invocation_id,
                     "output_sha256": output_sha256,
                     "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
-                    "usable": False,
+                    "usable": bool(advisory_text.strip())
+                    if consultation_type in {"yara_draft", "suricata_draft"}
+                    else False,
+                    "structured_usable": False,
+                    "canonicalization_eligible": False,
                     "warnings": warnings,
                     "consultation_type": consultation_type,
                     "output": legacy_output,
@@ -6876,6 +7039,16 @@ def _advisor_invocation_stage(submission: TurnSubmission) -> str:
     if state in {"submission_attempted", "post_submission"}:
         return "submitted"
     return "submission_failed"
+
+
+def _mark_rule_advisory_readability(parsed: dict[str, Any], raw_text: str) -> None:
+    """Expose archived rule prose to operators without changing parser eligibility."""
+    if parsed.get("consultation_type") not in {"yara_draft", "suricata_draft"}:
+        return
+    canonicalization_eligible = parsed.get("usable") is True
+    parsed["structured_usable"] = canonicalization_eligible
+    parsed["canonicalization_eligible"] = canonicalization_eligible
+    parsed["usable"] = bool(raw_text.strip())
 
 
 def _advisor_response_state(result: ToolResult, submission: TurnSubmission) -> str:

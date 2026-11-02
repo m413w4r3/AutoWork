@@ -2257,6 +2257,63 @@ async def test_stale_passive_read_retry_leaves_prior_reservation_and_invocation_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "schema_version"),
+    [
+        ("advisor.consult", ADVISOR_SCHEMA_VERSION),
+        ("advisor.reparse", "advisor-reparse.v1"),
+    ],
+)
+async def test_advisor_tool_results_keep_complete_raw_reply_text(
+    tool_name: str, schema_version: str
+) -> None:
+    raw = ("Synthetic prose from Bridge.\n" * 600)[:10_424]
+    raw_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    investigation_id = uuid4()
+    invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key=f"advisor-full-text-{uuid4()}",
+        tool_name=tool_name,
+        schema_version=schema_version,
+        normalized_parameters={},
+        purpose="Read complete synthetic advisor prose.",
+        reserved_budget={},
+    )
+    invocation = invocation.transition(ToolInvocationStatus.RUNNING).transition(
+        ToolInvocationStatus.SUCCEEDED
+    )
+    tool_result = ToolResult(
+        ToolInvocationStatus.SUCCEEDED,
+        output={
+            "status": "raw_advisory_text_available",
+            "usable": True,
+            "raw_output": raw,
+            "raw_output_sha256": raw_sha256,
+            "advisory_text": "[UNTRUSTED ADVISORY]\n" + raw,
+        },
+    )
+    service = SimpleNamespace(
+        _investigation_id=investigation_id,
+        _observations=None,
+        _evidence_summaries=None,
+    )
+
+    result = await OperatorToolInvocationService._result(
+        service,
+        invocation,
+        1,
+        "a" * 64,
+        replay=False,
+        tool_result=tool_result,
+    )
+
+    data = result.output["data"]["result"]
+    assert data["raw_output"] == raw
+    assert data["raw_output_sha256"] == raw_sha256
+    assert data["advisory_text"] == "[UNTRUSTED ADVISORY]\n" + raw
+
+
+@pytest.mark.asyncio
 async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() -> None:
     fixture, state, _ = await _fixture()
     idempotency_key = "legacy-invalid-advisor-input"
@@ -2638,6 +2695,62 @@ async def test_untrusted_adapter_cannot_claim_passive_read_retryability() -> Non
 
     assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
     assert fixture.tools["vt.file_report"].calls == [arguments]
+
+
+@pytest.mark.asyncio
+async def test_needs_review_offers_fresh_resubmission_only_for_trusted_passive_vt_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=[
+            ("vt.file_report", "vt"),
+            ("vt.download_sample", "vt", ToolEffect.ACQUIRE),
+        ],
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    service = _service(fixture)
+    monkeypatch.setattr(
+        operator_tool_invocation,
+        "is_trusted_vt_passive_read_adapter",
+        lambda _name, _adapter: True,
+    )
+
+    async def response_for(tool_name: str) -> dict[str, object]:
+        invocation = ToolInvocation(
+            investigation_id=fixture.investigation_id,
+            operation_key=f"operator:{tool_name}",
+            tool_name=tool_name,
+            schema_version="1",
+            normalized_parameters={"query": "synthetic hash"},
+            purpose="Report the retry contract for an uncertain invocation.",
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            passive_read_retry_trusted=True,
+        )
+        result = await service._result(
+            invocation,
+            state.version,
+            state.sha256,
+            replay=False,
+        )
+        next_action: dict[str, object] = result.output["next_action"]
+        return next_action
+
+    passive_action = await response_for("vt.file_report")
+    assert passive_action["code"] == "retry_with_fresh_invocation"
+    assert passive_action["method"] == "POST"
+    assert passive_action["path"] == (
+        f"/api/investigations/{fixture.investigation_id}/operator/tools/vt.file_report"
+    )
+    assert passive_action["expected_version"] == state.version
+    assert passive_action["expected_sha256"] == state.sha256
+    assert passive_action["resubmission_allowed"] is True
+    assert passive_action["resubmission_reason"] == "passive_read_idempotent"
+
+    download_action = await response_for("vt.download_sample")
+    assert download_action["code"] == "reconcile_before_retry"
+    assert download_action["resubmission_allowed"] is False
+    assert download_action.get("resubmission_reason") is None
 
 
 class _IdentityProvider:

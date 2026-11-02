@@ -26,11 +26,13 @@ from cti_app.application.external_effects import (
     Completed,
     DefinitelyNotSubmitted,
     ExternalEffectCoordinator,
+    ExternalEffectFailureStage,
     HandoffGateRefused,
     PermitAwareTransport,
     PhysicalSendCapability,
     Refused,
     Reused,
+    SafeExternalEffectFailure,
     TransportResponse,
 )
 from cti_app.application.sample_acquisition import (
@@ -325,15 +327,24 @@ class _VirusTotalPermitAwareTransport(PermitAwareTransport):
                 oversized=oversized,
                 body=body,
             )
-            reference = await self.__archive.archive_external_response(
-                body,
-                status_code=status_code,
-                content_type_class=content_type_class,
-                location_host=location_host,
-                retry_after=retry_after,
-                issuer=issuer,
-                oversized=oversized,
-            )
+            try:
+                reference = await self.__archive.archive_external_response(
+                    body,
+                    status_code=status_code,
+                    content_type_class=content_type_class,
+                    location_host=location_host,
+                    retry_after=retry_after,
+                    issuer=issuer,
+                    oversized=oversized,
+                )
+            except Exception:
+                raise SafeExternalEffectFailure(
+                    ExternalEffectFailureStage.RAW_ARCHIVE_WRITE_FAILED
+                ) from None
+            if not isinstance(reference, EvidenceReference) or reference.kind != "vt.raw_response":
+                raise SafeExternalEffectFailure(
+                    ExternalEffectFailureStage.ARCHIVE_REFERENCE_INVALID
+                )
             return TransportResponse(
                 result_ref=reference.id,
                 evidence_refs=(reference,),
@@ -1817,6 +1828,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     params=request_params,
                     family=family,
                     route=route_label,
+                    correlation_id=correlation_id,
+                    capability=capability or _operation_capability(operation),
+                    transport=transport,
+                    fingerprint=fingerprint or self.acquisition_route_fingerprint,
                     max_response_bytes=max_response_bytes,
                 )
             content_type_class = _content_type_class(response.headers.get("Content-Type"))
@@ -1988,6 +2003,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         params: Mapping[str, Any] | None,
         family: str,
         route: str,
+        correlation_id: str,
+        capability: str,
+        transport: str,
+        fingerprint: str | None,
         max_response_bytes: int | None = None,
     ) -> httpx.Response:
         authority = current_virustotal_external_effect_authority()
@@ -2070,6 +2089,23 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 ) from None
 
             if isinstance(outcome, Ambiguous):
+                if outcome.failure_stage is not None:
+                    _log_vt_exchange(
+                        correlation_id=correlation_id,
+                        capability=capability,
+                        route=route,
+                        transport=transport,
+                        status_code=None,
+                        content_type_class=None,
+                        location_host=None,
+                        bytes_read=0,
+                        error_code=outcome.failure_stage,
+                        fallback_decision="none",
+                        fingerprint=fingerprint,
+                        claim_id=(str(outcome.claim_id)[:8] if outcome.claim_id else None),
+                        attempt_index=attempt_index,
+                        failure_stage=outcome.failure_stage,
+                    )
                 if (
                     outcome.retryable
                     and not final_attempt
@@ -2709,6 +2745,9 @@ def _log_vt_exchange(
     error_code: str | None,
     fallback_decision: str,
     fingerprint: str | None,
+    claim_id: str | None = None,
+    attempt_index: int | None = None,
+    failure_stage: str | None = None,
 ) -> None:
     logger.info(
         "vt_http_exchange",
@@ -2726,6 +2765,9 @@ def _log_vt_exchange(
             "error_code": error_code,
             "fallback_decision": fallback_decision,
             "fingerprint": fingerprint,
+            "claim_id": claim_id,
+            "attempt_index": attempt_index,
+            "failure_stage": failure_stage,
         },
     )
 

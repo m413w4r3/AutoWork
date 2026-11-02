@@ -286,6 +286,7 @@ async def submit_bridge_consultation_once(
     deadline_monotonic: float | None = None,
     minimum_timeout_seconds: float = 0,
     clock: Callable[[], float] | None = None,
+    on_submission_started: Callable[[], None] | None = None,
     external_effect_binding_context: Mapping[str, Any] | None = None,
 ) -> TurnSubmission:
     """Submit one non-decision consultation using Bridge's shared pacing and transport."""
@@ -428,6 +429,8 @@ async def submit_bridge_consultation_once(
                 failure_stage="external_effect_authority",
                 failure_reason=failure_reason,
             )
+        if on_submission_started is not None:
+            on_submission_started()
         if attempt == 0:
             return await transport.submit(
                 **submission_kwargs,

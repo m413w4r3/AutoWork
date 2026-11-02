@@ -73,6 +73,21 @@ class FrameworkNoSendProof:
     reason_code: str
 
 
+class ExternalEffectFailureStage(StrEnum):
+    """Safe transport failure stages that may be persisted without exception text."""
+
+    RAW_ARCHIVE_WRITE_FAILED = "raw_archive_write_failed"
+    ARCHIVE_REFERENCE_INVALID = "archive_reference_invalid"
+
+
+class SafeExternalEffectFailure(RuntimeError):
+    """A transport failure with a bounded, non-sensitive diagnostic stage."""
+
+    def __init__(self, failure_stage: ExternalEffectFailureStage) -> None:
+        self.failure_stage = failure_stage
+        super().__init__(failure_stage.value)
+
+
 @dataclass(frozen=True, slots=True)
 class ExternalEffectClaim:
     id: UUID
@@ -439,6 +454,7 @@ class Ambiguous:
     claim_id: UUID | None
     state: EffectClaimState = EffectClaimState.NEEDS_REVIEW
     retryable: bool = True
+    failure_stage: str | None = None
 
 
 ExternalEffectOutcome = Completed | Reused | Refused | DefinitelyNotSubmitted | Ambiguous
@@ -703,6 +719,7 @@ class ExternalEffectCoordinator:
             transport: PermitAwareTransport,
             *,
             mark_invocation_on_ambiguity: bool = True,
+            record_passive_failure_stage: bool = False,
         ) -> ExternalEffectOutcome:
             try:
                 validate_prepared_request(prepared)
@@ -775,36 +792,62 @@ class ExternalEffectCoordinator:
                 )
             except asyncio.CancelledError:
                 await self._seal_needs_review(consume.claim_id, "cancelled_during_transport")
-                return Ambiguous(consume.claim_id, retryable=False)
+                return Ambiguous(
+                    consume.claim_id,
+                    retryable=False,
+                    failure_stage=(
+                        "cancelled_during_transport" if record_passive_failure_stage else None
+                    ),
+                )
             except _PreHandoffGateRefused:
                 if handoff_state["entered"]:
+                    failure_stage = (
+                        "handoff_gate_failed"
+                        if record_passive_failure_stage
+                        else "transport_outcome_unknown"
+                    )
                     await self._seal_needs_review(
                         consume.claim_id,
-                        "transport_outcome_unknown",
+                        failure_stage,
                         mark_invocation=mark_invocation_on_ambiguity,
                     )
-                    return Ambiguous(consume.claim_id)
+                    return Ambiguous(
+                        consume.claim_id,
+                        failure_stage=(failure_stage if record_passive_failure_stage else None),
+                    )
                 return await seal_zero_handoff(
                     consume.claim_id,
                     reason_code="pre_handoff_gate_refused",
                     kind=NoSubmissionProofKind.BEFORE_HANDOFF,
                     mark_invocation_on_ambiguity=mark_invocation_on_ambiguity,
                 )
-            except Exception:
+            except Exception as exc:
+                failure_stage = (
+                    _passive_read_failure_stage(exc)
+                    if record_passive_failure_stage
+                    else "transport_outcome_unknown"
+                )
                 await self._seal_needs_review(
                     consume.claim_id,
-                    "transport_outcome_unknown",
+                    failure_stage,
                     mark_invocation=mark_invocation_on_ambiguity,
                 )
-                return Ambiguous(consume.claim_id)
+                return Ambiguous(
+                    consume.claim_id,
+                    failure_stage=(failure_stage if record_passive_failure_stage else None),
+                )
 
             if not isinstance(response, TransportResponse):
+                failure_stage = "invalid_transport_response"
                 await self._seal_needs_review(
                     consume.claim_id,
-                    "invalid_transport_response",
+                    failure_stage,
                     mark_invocation=mark_invocation_on_ambiguity,
                 )
-                return Ambiguous(consume.claim_id)
+                return Ambiguous(
+                    consume.claim_id,
+                    failure_stage=(failure_stage if record_passive_failure_stage else None),
+                )
             try:
                 completed = await claim_store.complete(
                     consume.claim_id,
@@ -815,12 +858,20 @@ class ExternalEffectCoordinator:
             except Exception:
                 completed = False
             if not completed:
+                failure_stage = (
+                    "claim_completion_failed"
+                    if record_passive_failure_stage
+                    else "outcome_persist_failed"
+                )
                 await self._seal_needs_review(
                     consume.claim_id,
-                    "outcome_persist_failed",
+                    failure_stage,
                     mark_invocation=mark_invocation_on_ambiguity,
                 )
-                return Ambiguous(consume.claim_id)
+                return Ambiguous(
+                    consume.claim_id,
+                    failure_stage=(failure_stage if record_passive_failure_stage else None),
+                )
             return Completed(
                 consume.claim_id,
                 response.result_ref,
@@ -852,6 +903,7 @@ class ExternalEffectCoordinator:
                 prepared,
                 transport,
                 mark_invocation_on_ambiguity=not defer_invocation_needs_review,
+                record_passive_failure_stage=True,
             )
 
         self.send_passive_read = send_passive_read
@@ -1008,6 +1060,20 @@ del _bind_capability_init
 
 def _is_safe_outcome_code(value: str) -> bool:
     return isinstance(value, str) and value in {"bridge_rate_limited", "bridge_rejected"}
+
+
+def _passive_read_failure_stage(error: Exception) -> str:
+    if isinstance(error, SafeExternalEffectFailure):
+        return error.failure_stage.value
+    exception_name = type(error).__name__
+    if (
+        not exception_name
+        or not exception_name.isascii()
+        or not exception_name[0].isalpha()
+        or not all(character.isalnum() or character == "_" for character in exception_name)
+    ):
+        exception_name = "Unknown"
+    return f"transport_exception_{exception_name[:40]}"
 
 
 _RETRYABLE_VT_READ_FAMILIES = frozenset(
