@@ -638,6 +638,157 @@ def test_advisor_timeout_budgets_allow_slow_bridge_responses() -> None:
     assert MAX_ADVISOR_TOOL_SECONDS >= 200
 
 
+async def _advisor_response_link_payloads(tool, investigation_id):
+    payloads = []
+    for observation in await tool._observations.list_for_investigation(investigation_id):
+        if (
+            observation.source != "advisor.consult"
+            or observation.object_type != "advisor_response_received"
+        ):
+            continue
+        raw = await tool._artifact_store.read_bytes(observation.blob_id, max_bytes=1_000_000)
+        payloads.append((observation, json.loads(raw)))
+    return payloads
+
+
+@pytest.mark.asyncio
+async def test_advisor_raw_response_link_survives_parse_exception(monkeypatch) -> None:
+    investigation_id = uuid4()
+    invocation_id = str(uuid4())
+    raw_output = "Bridge's original prose response."
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(
+            TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text=raw_output,
+                bridge_invocation_id=invocation_id,
+            )
+        ),
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+
+    def fail_parsing(*_args, **_kwargs):
+        raise RuntimeError("synthetic parse failure")
+
+    monkeypatch.setattr(tool, "_submission_result", fail_parsing)
+    with pytest.raises(RuntimeError, match="synthetic parse failure"):
+        await tool.execute(
+            {
+                "consultation_type": "pivot_strategy",
+                "evidence_refs": [str(evidence.id)],
+            },
+            make_context(investigation_id, key="response-link-parse-failure"),
+        )
+
+    links = await _advisor_response_link_payloads(tool, investigation_id)
+    assert len(links) == 1
+    _observation, payload = links[0]
+    assert payload["bridge_invocation_id"] == invocation_id
+    assert payload["consultation_type"] == "pivot_strategy"
+    assert payload["raw_response_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert tool._artifact_store.values[UUID(payload["raw_response_blob_id"])] == raw_output.encode()
+
+
+@pytest.mark.asyncio
+async def test_advisor_raw_response_link_survives_result_manifest_persistence_failure(
+    monkeypatch,
+) -> None:
+    from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+
+    investigation_id = uuid4()
+    raw_output = advisor_response("A measured next step.", [])
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output)),
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+    record_json = ProductionEvidenceRecorder.record_json
+
+    async def fail_call_manifest(self, **kwargs):
+        if kwargs.get("object_type") == "advisor_call":
+            raise RuntimeError("synthetic result manifest failure")
+        return await record_json(self, **kwargs)
+
+    monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_call_manifest)
+    result = await tool.execute(
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(evidence.id)],
+        },
+        make_context(investigation_id, key="response-link-manifest-failure"),
+    )
+
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    links = await _advisor_response_link_payloads(tool, investigation_id)
+    assert len(links) == 1
+    _observation, payload = links[0]
+    assert payload["raw_response_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert tool._artifact_store.values[UUID(payload["raw_response_blob_id"])] == raw_output.encode()
+
+
+@pytest.mark.asyncio
+async def test_advisor_raw_response_link_replay_does_not_duplicate(monkeypatch) -> None:
+    from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+
+    investigation_id = uuid4()
+    raw_output = advisor_response("A measured next step.", [])
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+    record_json = ProductionEvidenceRecorder.record_json
+
+    async def fail_call_manifest(self, **kwargs):
+        if kwargs.get("object_type") == "advisor_call":
+            raise RuntimeError("synthetic result manifest failure")
+        return await record_json(self, **kwargs)
+
+    monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_call_manifest)
+    context = make_context(investigation_id, key="response-link-replay")
+
+    arguments = {
+        "consultation_type": "pivot_strategy",
+        "evidence_refs": [str(evidence.id)],
+    }
+    first = await tool.execute(arguments, context)
+    assert tool.take_result(context.idempotency_key) is not None
+    replay = await tool.execute(arguments, context)
+
+    assert first.output["output_sha256"] == replay.output["output_sha256"]
+    assert len(transport.calls) == 2
+    assert len(await _advisor_response_link_payloads(tool, investigation_id)) == 1
+
+
 def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> None:
     investigation_id = uuid4()
     tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))

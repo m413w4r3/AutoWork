@@ -1965,17 +1965,92 @@ class InvestigationAdvisorTool:
             hashlib.sha256(raw_output_bytes).hexdigest() if raw_output_bytes is not None else None
         )
         output_blob_id: UUID | None = None
+        response_link_observation: EvidenceObservation | None = None
         output_archive_error: Exception | None = None
         if raw_output is not None:
             output_store_started_at = time.perf_counter()
             try:
-                output_blob_id = await self._artifact_store.put_bytes(
-                    raw_output_bytes or b"",
-                    bucket="model-outputs",
-                    mime_type="text/plain; charset=utf-8",
+                bridge_invocation_id: str | None = None
+                raw_invocation_id = getattr(submission, "bridge_invocation_id", None)
+                try:
+                    bridge_invocation_id = (
+                        str(UUID(str(raw_invocation_id))) if raw_invocation_id else None
+                    )
+                except (TypeError, ValueError):
+                    bridge_invocation_id = None
+                response_link_observation, output_blob_id = await self._existing_response_link(
+                    context,
+                    consultation_type=consultation_type,
+                    bridge_invocation_id=bridge_invocation_id,
+                    output_sha256=output_sha256 or "",
+                    prompt_sha256=context_sha256,
+                    dossier_sha256=dossier.sha256,
                 )
-                if timing is not None:
+                if response_link_observation is None:
+                    output_blob_id = await self._artifact_store.put_bytes(
+                        raw_output_bytes or b"",
+                        bucket="model-outputs",
+                        mime_type="text/plain; charset=utf-8",
+                    )
+                    if timing is not None:
+                        timing.mark("output_stored")
+                    provider_usage = _provider_usage_payload(
+                        getattr(submission, "provider_usage", None)
+                    )
+                    response_link_observation = await ProductionEvidenceRecorder(
+                        self._artifact_store,
+                        self._observations,
+                        max_payload_bytes=None,
+                    ).record_json(
+                        investigation_id=context.investigation_id,
+                        kind=EvidenceKind.OTHER,
+                        payload={
+                            "schema": "operator-advisor-response-link.v1",
+                            "stage": "response_received",
+                            "consultation_type": consultation_type,
+                            "bridge_invocation_id": bridge_invocation_id,
+                            "bridge_conversation_id": (
+                                str(submission.conversation_id)
+                                if submission.conversation_id is not None
+                                else None
+                            ),
+                            "idempotency_key": submission.idempotency_key
+                            or context.idempotency_key,
+                            "prompt_blob_id": str(prompt_blob_id),
+                            "prompt_sha256": context_sha256,
+                            "dossier_sha256": dossier.sha256,
+                            "dossier_refs": list(persisted_input_refs),
+                            "dossier_manifest": [
+                                dict(item)
+                                for item in prompt_data.get("dossier_manifest", ())
+                                if isinstance(item, Mapping)
+                            ],
+                            "raw_response_blob_id": str(output_blob_id),
+                            "raw_response_sha256": output_sha256,
+                            "response_bytes": len(raw_output_bytes or b""),
+                            "transport": type(self._transport).__name__,
+                            "provider_usage": provider_usage,
+                            "submission_status": submission.status.value,
+                            "submission_state": submission.submission_state,
+                            "stage_timestamps_utc": dict(
+                                timing.stage_timestamps_utc if timing is not None else {}
+                            ),
+                        },
+                        source=ADVISOR_TOOL_NAME,
+                        source_version=ADVISOR_SCHEMA_VERSION,
+                        object_type="advisor_response_received",
+                        object_id=context.idempotency_key,
+                        limitations=(
+                            "Raw Bridge text is untrusted advisory material, "
+                            "not canonical analysis.",
+                        ),
+                        idempotency_key=f"{context.idempotency_key}:response_received",
+                    )
+                    if timing is not None:
+                        timing.mark("response_persisted")
+                elif timing is not None:
                     timing.mark("output_stored")
+                    timing.mark("response_persisted")
             except Exception as exc:
                 output_archive_error = exc
             finally:
@@ -2049,6 +2124,17 @@ class InvestigationAdvisorTool:
                 prompt_data=prompt_data,
                 execution_timeout_seconds=execution_timeout_seconds,
             )
+        if response_link_observation is not None:
+            result = replace(
+                result,
+                observation_refs=tuple(
+                    dict.fromkeys((*result.observation_refs, response_link_observation.id))
+                ),
+                output={
+                    **dict(result.output),
+                    "response_observation_ref": str(response_link_observation.id),
+                },
+            )
         response_received = submission.output_text is not None
         response_state = _advisor_response_state(result, submission)
         result = replace(
@@ -2089,6 +2175,9 @@ class InvestigationAdvisorTool:
             "provider_usage": dict(provider_usage),
             "prompt_blob_id": str(prompt_blob_id),
             "output_blob_id": str(output_blob_id) if output_blob_id else None,
+            "response_observation_ref": (
+                str(response_link_observation.id) if response_link_observation else None
+            ),
             "prompt_bytes": len(encoded),
             "response_bytes": response_bytes,
             "invocation_stage": invocation_stage,
@@ -5881,6 +5970,51 @@ class InvestigationAdvisorTool:
         return None
 
     _prompt = staticmethod(render_advisor_prompt)
+
+    async def _existing_response_link(
+        self,
+        context: ToolExecutionContext,
+        *,
+        consultation_type: str,
+        bridge_invocation_id: str | None,
+        output_sha256: str,
+        prompt_sha256: str,
+        dossier_sha256: str,
+    ) -> tuple[EvidenceObservation | None, UUID | None]:
+        """Reuse a response link when a submitted turn is replayed after a crash."""
+        for observation in await self._list_observations(context.investigation_id):
+            if (
+                observation.source != ADVISOR_TOOL_NAME
+                or observation.object_type != "advisor_response_received"
+                or observation.object_id != context.idempotency_key
+            ):
+                continue
+            encoded = await self._artifact_store.read_bytes(
+                observation.blob_id,
+                max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+            )
+            if hashlib.sha256(encoded).hexdigest() != observation.sha256:
+                raise ValueError("Stored advisor response link failed its SHA-256 check")
+            payload = json.loads(encoded)
+            if not isinstance(payload, Mapping) or payload.get("schema") != (
+                "operator-advisor-response-link.v1"
+            ):
+                continue
+            if payload.get("raw_response_sha256") != output_sha256:
+                raise ValueError("Advisor response idempotency key was reused with new text")
+            if (
+                payload.get("consultation_type") != consultation_type
+                or payload.get("bridge_invocation_id") != bridge_invocation_id
+                or payload.get("prompt_sha256") != prompt_sha256
+                or payload.get("dossier_sha256") != dossier_sha256
+            ):
+                raise ValueError("Advisor response idempotency key was reused with new inputs")
+            try:
+                raw_blob_id = UUID(str(payload["raw_response_blob_id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Stored advisor response link has no valid blob ID") from exc
+            return observation, raw_blob_id
+        return None, None
 
     def _submission_result(
         self,
