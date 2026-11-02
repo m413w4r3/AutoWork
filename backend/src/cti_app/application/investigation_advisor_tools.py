@@ -1338,6 +1338,7 @@ class InvestigationAdvisorTool:
                 )
             reservation_key = _reservation_operation_key or context.idempotency_key
             reservation = _advisor_context_reservation(context, reservation_key)
+            reserved_amounts = dict(reservation.amounts) if reservation is not None else {}
             if reservation is not None and (
                 BudgetDimension.CONTEXT_BYTES in reservation.amounts
                 or BudgetDimension.CONTEXT_TOKENS in reservation.amounts
@@ -1383,7 +1384,11 @@ class InvestigationAdvisorTool:
                             context = adjustment
                         else:
                             context.budget.adjust_reservation(reservation_key, exact_reservation)
-                    except (BudgetExceeded, KeyError, ValueError):
+                        reservation = _advisor_context_reservation(context, reservation_key)
+                        reserved_amounts = (
+                            dict(reservation.amounts) if reservation is not None else {}
+                        )
+                    except Exception as exc:
                         return await self._persist_preflight_failure(
                             context,
                             consultation_type=consultation_type,
@@ -1406,9 +1411,8 @@ class InvestigationAdvisorTool:
                                 "usable": False,
                             },
                             error_code="advisor_context_reservation_mismatch",
+                            exception_class=type(exc).__name__,
                         )
-                    reservation = _advisor_context_reservation(context, reservation_key)
-                reserved_amounts = dict(reservation.amounts) if reservation is not None else {}
                 if reserved_amounts != exact_reservation:
                     return await self._persist_preflight_failure(
                         context,
@@ -7598,6 +7602,8 @@ def _attest_advisor_pre_submission(result: ToolResult) -> ToolResult:
             "secret_preflight",
             "sample_disclosure_restricted",
             "evidence_preflight",
+            "g2_context_reservation",
+            "advisor_context_preparation",
             "preflight",
             "bridge_transport_pre_submission",
             "pre_submission",

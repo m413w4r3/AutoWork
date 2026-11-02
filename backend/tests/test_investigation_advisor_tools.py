@@ -6704,6 +6704,49 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
 
 
 @pytest.mark.asyncio
+async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failure() -> None:
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id)
+    reserved = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 3_600,
+        BudgetDimension.CONTEXT_BYTES: 1,
+        BudgetDimension.CONTEXT_TOKENS: 1,
+    }
+    context.budget.reserve(context.idempotency_key, reserved)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+    )
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+
+    async def fail_adjustment(_context, _measured_amounts):
+        raise RuntimeError("injected reservation adjustment failure")
+
+    context = replace(context, reservation_adjuster=fail_adjustment)
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={"consultation_type": "plan_investigation", "evidence_refs": []},
+        purpose="Verify reservation adjustment failure is known to precede transport.",
+        operation_key=context.idempotency_key,
+        reservation_amounts=reserved,
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.error_code == "advisor_context_reservation_mismatch"
+    assert result.output["failure_stage"] == "g2_context_reservation"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.framework_pre_submission_proof is (
+        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_sends_prompt_above_context_accounting_limit() -> None:
     investigation_id = uuid4()
     context = make_dispatch_context(investigation_id, context_byte_limit=1)
