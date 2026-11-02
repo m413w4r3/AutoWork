@@ -293,7 +293,7 @@ def test_versioned_opinion_source_ref_is_exact() -> None:
     ]
 
 
-def test_review_reparse_recovers_unstructured_overall_without_source_aliases() -> None:
+def test_review_reparse_keeps_unassigned_overall_without_source_aliases() -> None:
     raw = "A readable review: separate the measured claim from its interpretation."
 
     result = parse_advisor_semantic_response(
@@ -303,12 +303,14 @@ def test_review_reparse_recovers_unstructured_overall_without_source_aliases() -
     )
 
     assert result["schema"] == ADVISOR_RESPONSE_SCHEMA_V4
-    assert result["status"] == "partial"
+    assert result["status"] == "partial", result.get("reason")
     assert result["usable"] is True
     assert result["unit_assignment_status"] == "unstructured_overall"
     assert result["raw_output"] == raw
-    assert {item["unit_id"] for item in result["reviews"]} == {"U1", "U2"}
-    assert all(item["assignment"] == "unstructured_overall" for item in result["reviews"])
+    assert result["overall_review"] == raw
+    assert result["reviews"] == []
+    assert result["opinions"] == []
+    assert result["candidates"] == []
 
 
 def test_review_reparse_redacts_secret_and_keeps_adjacent_advice_usable() -> None:
@@ -326,7 +328,7 @@ def test_review_reparse_redacts_secret_and_keeps_adjacent_advice_usable() -> Non
         operational_secret_values=(token,),
     )
 
-    assert result["status"] == "partial"
+    assert result["status"] == "partial", result.get("reason")
     assert result["usable"] is True
     assert "secret_redacted" in result["warnings"]
     assert token not in result["raw_output"]

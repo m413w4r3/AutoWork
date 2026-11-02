@@ -8065,7 +8065,9 @@ def _mark_rule_advisory_readability(parsed: dict[str, Any], raw_text: str) -> No
     """Expose archived rule prose to operators without changing parser eligibility."""
     if parsed.get("consultation_type") not in {"yara_draft", "suricata_draft"}:
         return
-    canonicalization_eligible = parsed.get("usable") is True
+    canonicalization_eligible = (
+        parsed.get("canonicalization_eligible", parsed.get("usable")) is True
+    )
     parsed["structured_usable"] = canonicalization_eligible
     parsed["canonicalization_eligible"] = canonicalization_eligible
     parsed["usable"] = bool(raw_text.strip())

@@ -123,7 +123,15 @@ def parse_typed_advisor_response(
                 warning in wire_result.get("warnings", ())
                 for warning in ("wire_header_missing", "type_missing", "status_missing")
             ):
-                return _classify_advisor_warnings(wire_result)
+                return _classify_advisor_warnings(
+                    _finish_draft_normalization(
+                        wire_result,
+                        raw_text=raw_text,
+                        raw_safe=raw_safe,
+                        raw_secret_count=raw_secret_count,
+                        safe_text=safe_text,
+                    )
+                )
             heuristic = _normalize_heuristic_draft(
                 raw_safe,
                 json_payload=None,
@@ -131,9 +139,15 @@ def parse_typed_advisor_response(
                 safe_text=safe_text,
             )
             heuristic = heuristic or _unusable_draft_result()
-            if raw_secret_count:
-                _append_warning(heuristic, "secret_redacted")
-            return _classify_advisor_warnings(heuristic)
+            return _classify_advisor_warnings(
+                _finish_draft_normalization(
+                    heuristic,
+                    raw_text=raw_text,
+                    raw_safe=raw_safe,
+                    raw_secret_count=raw_secret_count,
+                    safe_text=safe_text,
+                )
+            )
         return _classify_advisor_warnings(wire_result)
     parsed, secret_count = redact_explicit_operational_secrets(
         parsed, operational_secret_values=operational_secret_values
@@ -334,34 +348,39 @@ def _normalize_heuristic_review(
     grouped: dict[str, list[str]] = {}
     assignments: dict[str, str] = {}
     overall_text: str | None = None
+    assignment_status: str | None = None
     if json_payload is not None:
         grouped, assignments, overall_text = _reviews_from_json(json_payload, units)
         if not grouped and overall_text is None:
             return _unusable_review_result(raw)
-        assignment_status = "unstructured_overall" if overall_text and not grouped else "heuristic"
         if overall_text and not grouped:
-            grouped = {unit_id: [overall_text] for unit_id, _unit in units}
-            assignments = {unit_id: "unstructured_overall" for unit_id, _unit in units}
-            warning_codes = ["unstructured_overall"]
+            if len(units) == 1:
+                unit_id, _unit = units[0]
+                grouped = {unit_id: [overall_text]}
+                assignments = {unit_id: "single_requested_unit"}
+                assignment_status = "single_requested_unit"
+                warning_codes = ["unstructured_overall"]
+            else:
+                return _unassigned_review_summary(raw, overall_text)
         else:
+            assignment_status = "heuristic"
             warning_codes = ["heuristic_unit_assignment"]
     else:
         grouped, assignments, overall_text = _reviews_from_prose(raw, units)
         if not grouped and overall_text is not None:
-            grouped = {unit_id: [overall_text] for unit_id, _unit in units}
-            assignments = {unit_id: "unstructured_overall" for unit_id, _unit in units}
+            if len(units) == 1:
+                unit_id, _unit = units[0]
+                grouped = {unit_id: [overall_text]}
+                assignments = {unit_id: "single_requested_unit"}
+                assignment_status = "single_requested_unit"
+                warning_codes = ["unstructured_overall"]
+            else:
+                return _unassigned_review_summary(raw, overall_text)
         if not grouped:
             return _unusable_review_result(raw)
-        assignment_status = (
-            "unstructured_overall"
-            if all(value == "unstructured_overall" for value in assignments.values())
-            else "heuristic"
-        )
-        warning_codes = (
-            ["unstructured_overall"]
-            if assignment_status == "unstructured_overall"
-            else ["heuristic_unit_assignment"]
-        )
+    if assignment_status is None:
+        assignment_status = "heuristic"
+        warning_codes = ["heuristic_unit_assignment"]
 
     review_items = []
     for unit_id, remarks in grouped.items():
@@ -630,7 +649,7 @@ _REVIEW_TARGET_LABELS = {
 
 
 def _resolve_review_unit(
-    label: object, units: list[tuple[str, Mapping[str, Any]]], order_index: int
+    label: object, units: list[tuple[str, Mapping[str, Any]]], _order_index: int
 ) -> tuple[str | None, str]:
     if isinstance(label, int) and not isinstance(label, bool):
         index = label - 1 if label > 0 else label
@@ -660,9 +679,7 @@ def _resolve_review_unit(
         ]
         if len(matches) == 1:
             return matches[0], "named_target"
-    if 0 <= order_index < len(units):
-        return units[order_index][0], "order"
-    return None, "order"
+    return None, "unassigned"
 
 
 def _reviews_from_prose(
@@ -760,6 +777,23 @@ def _unusable_review_result(_raw: str) -> dict[str, Any]:
     }
 
 
+def _unassigned_review_summary(_raw: str, overall_text: str) -> dict[str, Any]:
+    return {
+        "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+        "consultation_type": "review_text",
+        "status": "partial",
+        "untrusted": True,
+        "language": "fr",
+        "reviews": [],
+        "limitations": [],
+        "warnings": ["unstructured_overall"],
+        "normalization_status": "partial",
+        "unit_assignment_status": "unstructured_overall",
+        "overall_review": overall_text.strip(),
+        "usable": _review_text_is_useful(overall_text),
+    }
+
+
 def _unusable_draft_result() -> dict[str, Any]:
     return {
         "schema": ADVISOR_RESPONSE_SCHEMA_V3,
@@ -795,6 +829,25 @@ def _finish_review_normalization(
         _append_warning(result, "secret_redacted")
     encoded = raw_text.encode("utf-8")
     result["raw_output"] = raw_safe
+    result["raw_output_bytes"] = len(encoded)
+    result["raw_output_sha256"] = hashlib.sha256(encoded).hexdigest()
+    result["raw_output_retained"] = True
+    result["raw_output_truncated"] = False
+    return result
+
+
+def _finish_draft_normalization(
+    result: dict[str, Any],
+    *,
+    raw_text: str,
+    raw_safe: str,
+    raw_secret_count: int,
+    safe_text: Callable[[str, int], str],
+) -> dict[str, Any]:
+    if raw_secret_count:
+        _append_warning(result, "secret_redacted")
+    encoded = raw_text.encode("utf-8")
+    result["raw_output"] = safe_text(raw_safe, len(raw_safe) + 1)
     result["raw_output_bytes"] = len(encoded)
     result["raw_output_sha256"] = hashlib.sha256(encoded).hexdigest()
     result["raw_output_retained"] = True
@@ -885,9 +938,14 @@ def _classify_advisor_warnings(result: dict[str, Any] | None) -> dict[str, Any] 
             )
             normalized.append(unit_item)
         classified[collection] = normalized
-        classified["usable"] = any(
-            isinstance(item, Mapping) and item.get("usable") is True for item in normalized
-        )
+        if normalized:
+            classified["usable"] = any(
+                isinstance(item, Mapping) and item.get("usable") is True for item in normalized
+            )
+        elif collection == "reviews" and isinstance(classified.get("overall_review"), str):
+            classified["usable"] = _review_text_is_useful(classified["overall_review"])
+        else:
+            classified["usable"] = False
     return classified
 
 
@@ -1297,13 +1355,8 @@ def _normalize_prose_yara_wire(
         normalization_errors.append("yara_strings_missing")
     warn("invariants_missing")
 
-    usable = (
-        source is not None
-        and not source_issues
-        and bool(source_names)
-        and not unmatched_names
-        and len(motifs) == len(source_names)
-    )
+    usable = source is not None and not source_issues and bool(source_names)
+    canonicalization_eligible = usable and not unmatched_names and len(motifs) == len(source_names)
     if not usable and not normalization_errors:
         normalization_errors.append("local_yara_normalization_incomplete")
     limitations = [
@@ -1313,17 +1366,18 @@ def _normalize_prose_yara_wire(
     limitations.extend(f"Wire recovery: {item}." for item in warnings)
     return {
         **common,
-        "status": "succeeded" if usable else "partial",
+        "status": "succeeded" if canonicalization_eligible else "partial",
         "rule_source": source,
         "rule_source_sha256": source_hash,
         "motifs": motifs,
         "invariants": [],
         "limitations": limitations,
-        "normalization_status": "complete" if usable else "partial",
+        "normalization_status": "complete" if canonicalization_eligible else "partial",
         "normalization_method": "local_yara_prose_v1",
         "normalization_errors": normalization_errors,
         "warnings": warnings,
         "usable": usable,
+        "canonicalization_eligible": canonicalization_eligible,
     }
 
 
@@ -1892,8 +1946,12 @@ def _parse_typed_advisor_wire(
         elif prose_recovery and not suricata_invariants:
             warn("invariants_missing")
         limits = limitations()
+        if prose_recovery and source is not None and not fact_refs:
+            limits.append(
+                "Untested candidate: no measured network facts were available for validation."
+            )
         if source is None or not fact_refs or (not suricata_invariants and not prose_recovery):
-            return _partial_typed_wire(
+            partial = _partial_typed_wire(
                 common,
                 warnings,
                 limitations=limits,
@@ -1902,6 +1960,11 @@ def _parse_typed_advisor_wire(
                 fact_refs=fact_refs,
                 invariants=suricata_invariants,
             )
+            if prose_recovery and source is not None and not fact_refs:
+                partial["usable"] = True
+                partial["canonicalization_eligible"] = False
+                partial["normalization_method"] = "local_suricata_prose_v1"
+            return partial
         limits = limits + [f"Wire recovery: {item}." for item in warnings]
         return {
             **common,

@@ -9793,9 +9793,17 @@ def test_figure_plan_accepts_only_typed_semantics_and_transmitted_refs() -> None
 
 
 @pytest.mark.asyncio
-async def test_suricata_draft_refuses_before_bridge_without_measured_network_facts() -> None:
+async def test_suricata_draft_without_capture_keeps_untested_prose_candidate() -> None:
     investigation_id = uuid4()
-    transport = Transport(None)
+    source = (
+        'alert http any any -> any any (msg:"Prose candidate"; content:"example.test"; '
+        "sid:9901001; rev:1;)\n"
+    )
+    raw_response = (
+        "This is an experimental Suricata candidate. It is untested because no capture was "
+        "available.\n\n```suricata\n" + source + "```\n"
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_response))
     tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
 
     result = await tool.execute(
@@ -9803,24 +9811,31 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.UNAVAILABLE
-    assert result.output["preflight_status"] == "INSUFFICIENT_EVIDENCE"
-    assert result.error_code == "advisor_preflight_insufficient_evidence"
-    assert result.output["missing_refs"] == (
-        {
-            "ref": "network-fact",
-            "reason": "No measured network fact was loaded for Suricata drafting.",
-        },
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["preflight_status"] == "READY"
+    assert result.output["usable"] is True
+    assert result.output["structured_usable"] is False
+    assert result.output["canonicalization_eligible"] is False
+    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["response_received"] is True
+    assert len(transport.calls) == 1
+
+    call_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.source == "advisor.consult" and item.object_type == "advisor_call"
     )
-    assert result.output["bridge_turns_consumed"] == 0
-    assert result.output["usable"] is False
-    assert result.output["response_state"] == "pre_send_failure"
-    assert result.output["response_received"] is False
-    assert (
-        result.framework_pre_submission_proof
-        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(call_observation.blob_id, max_bytes=1_000_000)
     )
-    assert transport.calls == []
+    advisor_output = persisted["output"]
+    assert advisor_output["rule_source"] == source
+    assert advisor_output["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert advisor_output["raw_output"] == raw_response
+    assert advisor_output["raw_output_sha256"] == hashlib.sha256(raw_response.encode()).hexdigest()
+    assert "fact_references_missing" in advisor_output["warnings"]
+    assert advisor_output["fact_refs"] == []
+    assert any("untested" in item.casefold() for item in advisor_output["limitations"])
 
 
 @pytest.mark.asyncio

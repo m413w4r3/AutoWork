@@ -767,26 +767,54 @@ def test_yara_prose_derives_only_exact_catalogued_measurements() -> None:
     assert "invariants_missing" in parsed["warning_classification"]["informative"]
 
 
-def test_yara_prose_without_exact_measurement_is_unusable_with_a_specific_cause() -> None:
-    source = (
-        'rule SyntheticCandidate { strings: $unmeasured = "NoCatalogMatch" '
-        "condition: $unmeasured }\n"
+def test_yara_prose_keeps_rule_candidate_when_business_measurement_linking_is_incomplete() -> None:
+    source = """rule SyntheticCandidate {
+    strings:
+        $observed = "MeasuredMarker"
+        $unmeasured = "NoCatalogMatch"
+    condition:
+        all of them
+}
+"""
+    measurement = {
+        "evidence_id": "synthetic-observation",
+        "evidence_sha256": "a" * 64,
+        "sample_sha256": "b" * 64,
+        "offset": 24,
+        "length": len(b"MeasuredMarker"),
+        "kind": "string",
+        "encoding": "ascii",
+        "value": "MeasuredMarker",
+        "measurement_id": "m001",
+    }
+    measurement_sha256 = hashlib.sha256(
+        json.dumps(measurement, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    raw = (
+        "Prose libre : cette règle candidate contient un motif observé et un motif à vérifier.\n"
+        "```yara\n" + source + "```\nAucune référence advisor-wire n'accompagne cette réponse."
     )
-    raw = "Explication consultative.\n```yara\n" + source + "```\n"
 
     parsed = parse_typed_advisor_response(
         raw,
         consultation_type="yara_draft",
-        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        prompt_data={
+            "consultation_type": "yara_draft",
+            "measurements": [measurement],
+            "transmitted_refs": [
+                {"kind": "measurement", "id": "m001", "sha256": measurement_sha256}
+            ],
+        },
         safe_text=_safe_text,
     )
 
     assert parsed is not None
-    assert parsed["usable"] is False
+    assert parsed["usable"] is True
     assert parsed["status"] == "partial"
     assert parsed["rule_source"] == source
     assert parsed["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
-    assert parsed["motifs"] == []
+    assert parsed["canonicalization_eligible"] is False
+    assert [item["name"] for item in parsed["motifs"]] == ["$observed"]
     assert "yara_measurements_unmatched" in parsed["warning_classification"]["blocking"]
     assert "$unmeasured:measurement_bytes_not_found" in parsed["normalization_errors"]
 
@@ -1166,7 +1194,7 @@ def test_suricata_wire_preserves_multiline_source_and_local_hash() -> None:
     assert parsed["status"] == "succeeded"
 
 
-def test_suricata_prose_reply_keeps_its_rule_when_it_cites_a_dossier_fact() -> None:
+def test_suricata_prose_reply_keeps_rule_with_or_without_dossier_fact_refs() -> None:
     fact = {"fact_id": "nf001", "field": "documented_endpoints", "value": "api.github.com"}
     source = (
         'alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"SNI candidate"; flow:established,'
@@ -1200,7 +1228,10 @@ def test_suricata_prose_reply_keeps_its_rule_when_it_cites_a_dossier_fact() -> N
     assert "wire_header_missing" in parsed["warnings"]
     assert not parsed["warning_classification"]["blocking"], parsed["warning_classification"]
     assert refused is not None
-    assert refused["usable"] is False
+    assert refused["usable"] is True
+    assert refused["canonicalization_eligible"] is False
+    assert refused["rule_source"] == source
+    assert refused["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
     assert "fact_references_missing" in refused["warnings"]
     assert "wire_header_missing" in refused["warning_classification"]["informative"]
     assert "fact_references_missing" in refused["warning_classification"]["blocking"]
@@ -1979,8 +2010,11 @@ def test_review_text_recovers_bridge_json_and_labelled_prose(
     assert "heuristic_unit_assignment" in parsed["warnings"]
 
 
-def test_review_text_attaches_unstructured_overall_to_each_requested_unit() -> None:
-    raw = "The review is readable, but keep the measured claim separate from interpretation."
+def test_review_text_keeps_ambiguous_overall_as_unassigned_summary_and_raw_text() -> None:
+    raw = (
+        "The review is readable, but keep the measured claim separate from interpretation.\n"
+        "\n## Additional context\nRetain the uncertainty around the sample scope."
+    )
     parsed = parse_typed_advisor_response(
         raw,
         consultation_type="review_text",
@@ -1990,13 +2024,50 @@ def test_review_text_attaches_unstructured_overall_to_each_requested_unit() -> N
 
     assert parsed is not None
     assert parsed["status"] == "partial"
-    assert parsed["usable"] is True
+    assert parsed["usable"] is True, parsed
     assert parsed["unit_assignment_status"] == "unstructured_overall"
     assert "unstructured_overall" in parsed["warning_classification"]["informative"]
-    assert {item["unit_id"] for item in parsed["reviews"]} == {"U1", "U2", "U3"}
-    assert all(item["remarks"] == [raw] for item in parsed["reviews"])
-    assert all(item["assignment"] == "unstructured_overall" for item in parsed["reviews"])
+    assert parsed["reviews"] == []
+    assert parsed["overall_review"] == raw
     assert parsed["raw_output"] == raw
+    assert parsed["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def test_review_text_assigns_exact_prose_to_a_single_explicit_target() -> None:
+    raw = "Keep this measured claim separate from interpretation, and preserve its caveat."
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data={
+            "units": [
+                {"unit_id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}
+            ]
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["unit_assignment_status"] == "single_requested_unit"
+    assert parsed["reviews"][0]["unit_id"] == "U1"
+    assert parsed["reviews"][0]["remarks"] == [raw]
+    assert parsed["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def test_review_json_without_unit_labels_is_not_assigned_by_array_order() -> None:
+    raw = '{"reviews":["First unassigned point.","Second unassigned point."]}'
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="review_text",
+        prompt_data=_tolerant_review_prompt_data(),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True, parsed
+    assert parsed["reviews"] == []
+    assert parsed["unit_assignment_status"] == "unstructured_overall"
+    assert parsed["overall_review"] == "First unassigned point.\nSecond unassigned point."
 
 
 def test_review_text_preserves_complete_prose_above_legacy_64k_cap() -> None:
@@ -2119,6 +2190,26 @@ def test_draft_text_keeps_unstructured_overall_without_per_unit_blocks() -> None
     assert parsed["summary"] == raw
     assert "blocks" not in parsed
     assert "unstructured_overall" in parsed["warning_classification"]["informative"]
+
+
+def test_draft_text_single_explicit_target_keeps_exact_prose_and_sha() -> None:
+    raw = "Keep this passage as a consultative draft with its original caveat."
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="draft_text",
+        prompt_data={
+            "units": [
+                {"unit_id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}
+            ]
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["unit_assignment_status"] == "single_requested_unit"
+    assert parsed["blocks"][0]["sentences"][0]["text"] == raw
+    assert parsed["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.parametrize("raw", ["", "   ", "{}", "...", "null"])

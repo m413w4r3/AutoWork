@@ -1945,8 +1945,8 @@ def evaluate_advisor_evidence_preflight(
             "",
             None,
             False,
-            True,
-            "No measured network fact was loaded for Suricata drafting.",
+            False,
+            "No measured network fact is available; a Suricata candidate remains untested.",
         )
     for item in network_facts:
         identifier = _as_text(item.get("fact_id"))
