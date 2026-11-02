@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import copy
 import hashlib
 import json
 import logging
@@ -32,6 +31,7 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import (
+    AdvisorDossier,
     _sample_disclosure_restriction_sources,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
@@ -1220,7 +1220,7 @@ class InvestigationAdvisorTool:
                 for item in prompt_data["transmitted_refs"]
                 if item["kind"] == "observation"
             ]
-            prompt = _fit_advisor_prompt(consultation_type, prompt_data)
+            prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
             encoded = prompt.encode("utf-8")
             if timing is not None:
                 timing.mark(
@@ -3807,17 +3807,16 @@ class InvestigationAdvisorTool:
                 if matching_sample is not None:
                     if matching_sample.get("content_status") == "verified":
                         encoded_fragment = matching_sample.get("content_base64")
-                        if isinstance(encoded_fragment, str):
-                            try:
-                                fragment = base64.b64decode(encoded_fragment, validate=True)
-                            except (ValueError, binascii.Error):
-                                fragment = b""
-                        else:
-                            fragment = b""
-                        if fragment:
-                            fragment_length = len(fragment)
+                        fragment_length = matching_sample.get("fragment_length")
+                        fragment_sha256 = matching_sample.get("fragment_sha256")
+                        if (
+                            isinstance(encoded_fragment, str)
+                            and type(fragment_length) is int
+                            and fragment_length > 0
+                            and isinstance(fragment_sha256, str)
+                            and re.fullmatch(r"[0-9a-f]{64}", fragment_sha256)
+                        ):
                             sample_sha256 = str(matching_sample["sha256"])
-                            fragment_sha256 = hashlib.sha256(fragment).hexdigest()
                             omitted_range = matching_sample.get("omitted_range")
                             provenance = [
                                 "encoding=base64",
@@ -6795,9 +6794,13 @@ def _advisor_structural_size(value: object) -> int:
 def _fit_advisor_prompt(
     consultation_type: str,
     raw_data: Mapping[str, Any],
+    *,
+    dossier: AdvisorDossier | None = None,
 ) -> str:
-    data = copy.deepcopy(dict(raw_data))
-    prompt = render_advisor_prompt(consultation_type, data)
+    data = dict(raw_data)
+    truncation = raw_data.get("truncation", {})
+    data["truncation"] = dict(truncation) if isinstance(truncation, Mapping) else {}
+    prompt = render_advisor_prompt(consultation_type, data, dossier=dossier)
     if isinstance(raw_data, dict):
         raw_data["truncation"] = dict(data.get("truncation", {}))
     return prompt

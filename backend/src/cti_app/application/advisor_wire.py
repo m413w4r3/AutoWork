@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from cti_app.application.advisor_dossier import build_advisor_dossier
+from cti_app.application.advisor_dossier import AdvisorDossier, build_advisor_dossier
 from cti_app.application.production_parsers import sanitize_bridge_output_text
 
 ADVISOR_WIRE_VERSION = "advisor-wire.v1"
@@ -91,7 +91,9 @@ def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
     )
 
 
-def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def advisor_wire_aliases(
+    prompt_data: Mapping[str, Any], *, dossier: AdvisorDossier | None = None
+) -> dict[str, dict[str, Any]]:
     """Assign stable short aliases to refs, measurements, facts and assertions."""
     refs: list[tuple[str, str, str | None]] = []
 
@@ -204,13 +206,12 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
         if isinstance(item, Mapping) and isinstance(item.get("id"), str)
     ]
     assertion_aliases = {f"A{index}": item for index, item in enumerate(assertion_rows, start=1)}
-    dossier = build_advisor_dossier(prompt_data)
     raw_manifest = prompt_data.get("dossier_manifest")
-    manifest = (
-        [dict(item) for item in raw_manifest if isinstance(item, Mapping)]
-        if isinstance(raw_manifest, (list, tuple))
-        else [dict(item) for item in dossier.manifest]
-    )
+    if isinstance(raw_manifest, (list, tuple)):
+        manifest = [dict(item) for item in raw_manifest if isinstance(item, Mapping)]
+    else:
+        resolved_dossier = dossier or build_advisor_dossier(prompt_data)
+        manifest = [dict(item) for item in resolved_dossier.manifest]
     if isinstance(raw_manifest, (list, tuple)):
         selected_measurement_ids = {
             str(item.get("measurement_id"))
