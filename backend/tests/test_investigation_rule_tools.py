@@ -37,8 +37,10 @@ from cti_app.application.investigation_rule_tools import (
     RULE_TEST_SCHEMA,
     RULE_WORKBENCH_CAPABILITY,
     QuarantineRuleCorpusBytes,
+    _motifs_from_version,
     _report_summary,
     _RuleCorpusSnapshot,
+    _version_provenance_output,
     _version_summary,
     register_rule_tools,
     rule_tool_capabilities,
@@ -59,11 +61,13 @@ from cti_app.domain.goodware import NonDiscriminantPatternRegistry
 from cti_app.domain.investigation import (
     BudgetDimension,
     DetectionCandidateStatus,
+    DetectionCandidateVersion,
     DisclosureBounds,
     EvidenceKind,
     EvidenceObservation,
     InvestigationBudget,
     InvestigationEnvelope,
+    MotifProvenance,
     QualificationActorKind,
     SampleAssociation,
     SampleOrigin,
@@ -1364,6 +1368,13 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
     assert second["signature"]["source_attribution"]["derived_from"]["source_sha256"] == (
         bridge_sha256
     )
+    assert "source_diff" not in revised.output
+    diff_summary = revised.output["source_diff_summary"]
+    assert diff_summary["parent_source_sha256"] == bridge_sha256
+    assert diff_summary["source_sha256"] == corrected_sha256
+    assert diff_summary["lines_added"] > 0
+    assert diff_summary["changed_line_numbers"]
+    assert "operator_diff" not in second["signature"]["source_attribution"]
 
     tested = await _call(
         harness,
@@ -1384,6 +1395,131 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
     )
     assert after_test.output["versions"][0]["source_author"] == "operator:analyst-42"
     assert after_test.output["versions"][0]["lifecycle"] == "tested"
+
+
+@pytest.mark.asyncio
+async def test_full_source_diff_summary_stays_bounded_with_many_strings() -> None:
+    harness = _harness(samples={})
+
+    def source_with_strings(count: int) -> str:
+        declarations = "\n".join(
+            f'        $marker_{index:03} = "LargeSourceMarker{index:03}"' for index in range(count)
+        )
+        return (
+            "rule bridge_candidate {\n"
+            "    strings:\n"
+            f"{declarations}\n"
+            "    condition:\n"
+            "        any of them\n"
+            "}\n"
+        )
+
+    parent_source = source_with_strings(40)
+    parent_observation, parent_invocation, parent_sha256 = await _bridge_yara_observation(
+        harness, source=parent_source
+    )
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(parent_observation),
+            "bridge_invocation_id": str(parent_invocation),
+            "rule_source_sha256": parent_sha256,
+        },
+    )
+    revised_source = source_with_strings(80)
+    revised_sha256 = _sha256(revised_source.encode())
+    revised = await _call(
+        harness,
+        "rule.operator_syntax_fix",
+        {
+            "candidate_id": proposed.output["candidate_id"],
+            "parent_version": 1,
+            "source": revised_source,
+            "author": "operator:analyst-42",
+            "revision_mode": "full_source",
+        },
+    )
+
+    assert revised.status is ToolInvocationStatus.SUCCEEDED
+    assert "source_diff" not in revised.output
+    summary = revised.output["source_diff_summary"]
+    assert summary["parent_source_sha256"] == parent_sha256
+    assert summary["source_sha256"] == revised_sha256
+    assert summary["lines_added"] >= 40
+    assert len(summary["changed_line_numbers"]) <= 20
+    assert summary["changed_line_numbers_truncated"] is True
+    version = await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
+    revised_version = next(item for item in version if item.version == 2)
+    serialized_motifs = [
+        json.loads(item.rationale.removeprefix("rule-workbench-motif-v1:"))
+        for item in revised_version.motif_provenance
+    ]
+    attributions = [
+        item["source_attribution"] for item in serialized_motifs if "source_attribution" in item
+    ]
+    assert len(serialized_motifs) == 80
+    assert len(attributions) == 1
+    persisted_summary = attributions[0]["operator_diff_summary"]
+    assert persisted_summary["parent_source_sha256"] == parent_sha256
+    assert persisted_summary["source_sha256"] == revised_sha256
+    assert persisted_summary["lines_added"] == summary["lines_added"]
+    assert tuple(persisted_summary["changed_line_numbers"]) == tuple(
+        summary["changed_line_numbers"]
+    )
+    assert "operator_diff" not in attributions[0]
+    assert len(json.dumps(attributions[0], separators=(",", ":"))) < 1800
+    assert revised_source not in repr(revised.output)
+
+
+def test_legacy_full_source_diff_loads_but_output_is_summarized() -> None:
+    observation_id = uuid4()
+    parent_sha256 = "a" * 64
+    source = 'rule bridge_candidate { strings: $marker = "NewMarker" condition: $marker }'
+    source_sha256 = _sha256(source.encode())
+    old_diff = (
+        f"--- {parent_sha256}\n+++ {source_sha256}\n"
+        "@@ -1 +1 @@\n"
+        '-rule bridge_candidate { strings: $marker = "OldMarker" condition: $marker }\n'
+        '+rule bridge_candidate { strings: $marker = "NewMarker" condition: $marker }\n'
+    )
+    rationale = "rule-workbench-motif-v1:" + json.dumps(
+        {
+            "kind": "string",
+            "provenance_kind": "manual",
+            "provenance_id": "operator",
+            "article_claim_refs": [],
+            "rationale": "Legacy full source revision.",
+            "source_attribution": {
+                "change_kind": "operator_source_revision",
+                "source_author": "operator",
+                "operator_parent_source_sha256": parent_sha256,
+                "operator_diff": old_diff,
+            },
+            "justification": {"status": "gap", "measurement_links": []},
+        }
+    )
+    version = DetectionCandidateVersion(
+        investigation_id=uuid4(),
+        candidate_id=uuid4(),
+        source=source,
+        source_sha256=source_sha256,
+        motif_provenance=(
+            MotifProvenance(
+                motif="$marker",
+                observation_refs=(observation_id,),
+                rationale=rationale,
+            ),
+        ),
+    )
+
+    assert _motifs_from_version(version)[0].value == "$marker"
+    output = _version_provenance_output(version)
+    attribution = output["source_attribution"]
+    assert "operator_diff" not in attribution
+    assert attribution["operator_diff_summary"]["parent_source_sha256"] == parent_sha256
+    assert attribution["operator_diff_summary"]["lines_added"] == 1
+    assert "NewMarker" not in json.dumps(output)
 
 
 @pytest.mark.asyncio

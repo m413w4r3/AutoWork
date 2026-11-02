@@ -109,6 +109,7 @@ _UUID_NAMESPACE = UUID("a24a70a5-f901-451a-8969-a0ad0ea0b267")
 _MAX_HISTORY = 64
 _PERSISTED_MOTIF_PREFIX = "rule-workbench-motif-v1:"
 MAX_RULE_REPORT_SUMMARY_BYTES = 64 * 1024
+_MAX_SOURCE_DIFF_LINE_NUMBERS = 20
 _HOLDOUT_ROLES_FOR_TEST = frozenset(
     {RuleTestCorpusRole.HOLDOUT_POSITIVE, RuleTestCorpusRole.HOLDOUT_NEGATIVE}
 )
@@ -2064,21 +2065,39 @@ class _RuleTools:
             raise _ToolFailed("operator_full_source_revision_requires_bridge_parent")
         if revision_mode == "syntax_only":
             _require_syntax_only_fix(parent.source, source)
-        diff = "".join(
-            unified_diff(
-                parent.source.splitlines(keepends=True),
-                source.splitlines(keepends=True),
-                fromfile=parent.source_sha256,
-                tofile=hashlib.sha256(source.encode("utf-8")).hexdigest(),
-            )
-        )
-        changed_lines = sum(
-            line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
-            for line in diff.splitlines()
-        )
-        if revision_mode == "syntax_only" and changed_lines > 12:
-            raise _ToolFailed("operator_syntax_fix_not_minimal")
         operator_source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        diff: str | None = None
+        diff_summary: Mapping[str, Any] | None = None
+        if revision_mode == "full_source":
+            full_diff = "".join(
+                unified_diff(
+                    parent.source.splitlines(keepends=True),
+                    source.splitlines(keepends=True),
+                    fromfile=parent.source_sha256,
+                    tofile=operator_source_sha256,
+                )
+            )
+            diff_summary = _legacy_operator_diff_summary(
+                full_diff,
+                parent_source_sha256=parent.source_sha256,
+                source_sha256=operator_source_sha256,
+            )
+            del full_diff
+        else:
+            diff = "".join(
+                unified_diff(
+                    parent.source.splitlines(keepends=True),
+                    source.splitlines(keepends=True),
+                    fromfile=parent.source_sha256,
+                    tofile=operator_source_sha256,
+                )
+            )
+            changed_lines = sum(
+                line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+                for line in diff.splitlines()
+            )
+            if changed_lines > 12:
+                raise _ToolFailed("operator_syntax_fix_not_minimal")
         compile_check = self.workbench.compile_check(source)
         if revision_mode == "syntax_only" and compile_check.status not in {
             YaraExecutionStatus.OK,
@@ -2112,9 +2131,14 @@ class _RuleTools:
                 "source_sha256": parent.source_sha256,
             },
             "operator_parent_source_sha256": parent.source_sha256,
-            "operator_diff": diff,
             "validator_findings": list(advisory_issues),
         }
+        if diff_summary is not None:
+            next_attribution.pop("operator_diff", None)
+            next_attribution["operator_diff_summary"] = dict(diff_summary)
+        else:
+            next_attribution.pop("operator_diff_summary", None)
+            next_attribution["operator_diff"] = diff or ""
         provenance = (
             _operator_source_revision_provenance(
                 parent=parent,
@@ -2153,7 +2177,11 @@ class _RuleTools:
                 "source_sha256": stored.source_sha256,
                 **_version_provenance_output(stored),
                 "source_change_kind": next_attribution["change_kind"],
-                "source_diff": diff,
+                **(
+                    {"source_diff_summary": dict(diff_summary)}
+                    if diff_summary is not None
+                    else {"source_diff": diff or ""}
+                ),
                 "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
                 "lifecycle": derive_rule_lifecycle(
                     compile_check.status,
@@ -4647,13 +4675,65 @@ def _operator_source_revision_provenance(
                 motif=name,
                 rationale=_serialize_motif_with_source(
                     rule_motif,
-                    attribution,
+                    attribution if not result else None,
                     justification=justification,
                 ),
                 observation_refs=refs,
             )
         )
     return tuple(result)
+
+
+def _legacy_operator_diff_summary(
+    diff: str,
+    *,
+    parent_source_sha256: str,
+    source_sha256: str,
+) -> dict[str, Any]:
+    added_lines = 0
+    removed_lines = 0
+    changed_line_numbers: list[int] = []
+    seen_line_numbers: set[int] = set()
+    current_line = 1
+    in_hunk = False
+    truncated = False
+
+    def remember(line_number: int) -> None:
+        nonlocal truncated
+        if line_number in seen_line_numbers:
+            return
+        if len(changed_line_numbers) == _MAX_SOURCE_DIFF_LINE_NUMBERS:
+            truncated = True
+            return
+        seen_line_numbers.add(line_number)
+        changed_line_numbers.append(line_number)
+
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)(?:,\d+)?", line)
+            current_line = int(match.group(1)) if match is not None else current_line
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("+"):
+            added_lines += 1
+            remember(current_line)
+            current_line += 1
+        elif line.startswith("-"):
+            removed_lines += 1
+            remember(current_line)
+        elif line.startswith(" "):
+            current_line += 1
+
+    return {
+        "parent_source_sha256": parent_source_sha256,
+        "source_sha256": source_sha256,
+        "lines_added": added_lines,
+        "lines_removed": removed_lines,
+        "changed_line_numbers": changed_line_numbers,
+        "changed_line_numbers_truncated": truncated,
+    }
 
 
 def _serialize_motif(
@@ -4684,12 +4764,13 @@ def _serialize_motif(
 
 def _serialize_motif_with_source(
     motif: RuleMotif,
-    attribution: Mapping[str, Any],
+    attribution: Mapping[str, Any] | None,
     *,
     justification: Mapping[str, Any] | None = None,
 ) -> str:
     payload = json.loads(_serialize_motif(motif)[len(_PERSISTED_MOTIF_PREFIX) :])
-    payload["source_attribution"] = dict(attribution)
+    if attribution is not None:
+        payload["source_attribution"] = dict(attribution)
     if justification is not None:
         payload["justification"] = dict(justification)
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
@@ -4753,6 +4834,17 @@ def _is_same_bridge_import(
 
 def _version_provenance_output(version: DetectionCandidateVersion) -> dict[str, Any]:
     attribution = _source_attribution_from_version(version) or {}
+    output_attribution = dict(attribution)
+    legacy_diff = output_attribution.get("operator_diff")
+    if output_attribution.get("change_kind") == "operator_source_revision" and isinstance(
+        legacy_diff, str
+    ):
+        output_attribution.pop("operator_diff", None)
+        output_attribution["operator_diff_summary"] = _legacy_operator_diff_summary(
+            legacy_diff,
+            parent_source_sha256=str(output_attribution.get("operator_parent_source_sha256", "")),
+            source_sha256=version.source_sha256,
+        )
     findings: set[str] = set()
     gaps: list[str] = []
     for motif in version.motif_provenance:
@@ -4786,7 +4878,7 @@ def _version_provenance_output(version: DetectionCandidateVersion) -> dict[str, 
         if invocation_id is not None or observation_id is not None
         else None,
         "derived_from": attribution.get("derived_from"),
-        "source_attribution": dict(attribution) if attribution else None,
+        "source_attribution": output_attribution if output_attribution else None,
         "source_validator_findings": sorted(findings),
         "justification_gaps": sorted(set(gaps)),
     }
