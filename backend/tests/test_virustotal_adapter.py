@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from typing import Any, cast
@@ -40,6 +41,7 @@ from cti_app.infrastructure.virustotal import (
     create_virustotal_http_client,
 )
 from tests.virustotal_external_effect_fakes import (
+    InMemoryVirusTotalArchive,
     authorized_vt_read,
     configure_test_vt_adapter,
 )
@@ -590,6 +592,78 @@ async def test_passive_read_transport_retry_uses_a_fresh_coordinator_claim() -> 
     assert {claim.invocation_id for claim in claims} == {authority.invocation_id}
     assert len({claim.effect_key for claim in claims}) == 2
     assert store.invocation_review_marks == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "failure_stage"),
+    [
+        ("transport", "transport_exception_ReadTimeout"),
+        ("archive", "raw_archive_write_failed"),
+        ("completion", "claim_completion_failed"),
+    ],
+)
+async def test_uncertain_passive_read_records_safe_failure_diagnostics(
+    caplog: pytest.LogCaptureFixture, failure_kind: str, failure_stage: str
+) -> None:
+    caplog.set_level(logging.INFO, logger="cti_app.infrastructure.virustotal")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure_kind == "transport":
+            raise httpx.ReadTimeout("must-not-be-logged secret=discard-me")
+        return httpx.Response(
+            200,
+            json={"data": {"id": SHA256.lower(), "type": "file", "attributes": {}}},
+            request=request,
+        )
+
+    value, client = adapter(handler)
+    if failure_kind == "archive":
+        archive = cast(InMemoryVirusTotalArchive, cast(Any, value)._test_vt_response_archive)
+
+        async def fail_archive(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("must-not-be-logged secret=discard-me")
+
+        archive.archive_external_response = fail_archive  # type: ignore[method-assign]
+    elif failure_kind == "completion":
+        store = cast(Any, value)._test_external_effect_store
+
+        async def fail_complete(*_args: Any, **_kwargs: Any) -> bool:
+            return False
+
+        store.complete = fail_complete
+
+    try:
+        with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
+            await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+
+    store = cast(Any, value)._test_external_effect_store
+    claims = tuple(store.claims.values())
+    assert calls == 2
+    assert len(claims) == 2
+    assert all(claim.state.value == "NEEDS_REVIEW" for claim in claims)
+    assert store.needs_review_reason_codes == [
+        (claim.id, failure_stage) for claim in claims
+    ]
+    exchange_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "vt_http_exchange"
+        and getattr(record, "failure_stage", None) is not None
+    ]
+    assert [record.attempt_index for record in exchange_records] == [0, 1]
+    assert [record.failure_stage for record in exchange_records] == [failure_stage] * 2
+    assert [record.claim_id for record in exchange_records] == [
+        str(claim.id)[:8] for claim in claims
+    ]
+    assert "must-not-be-logged" not in caplog.text
+    assert "secret=discard-me" not in caplog.text
+    assert "?x=1" not in caplog.text
 
 
 @pytest.mark.asyncio

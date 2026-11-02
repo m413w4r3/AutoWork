@@ -78,6 +78,7 @@ class InMemoryExternalEffectClaimStore:
         self.gate_nonces: set[UUID] = set()
         self.reuse_count = 0
         self.invocation_review_marks: list[bool] = []
+        self.needs_review_reason_codes: list[tuple[UUID, str]] = []
         self._proof_verifier: _NoHandoffProofVerifier | None = None
 
     def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None:
@@ -174,7 +175,7 @@ class InMemoryExternalEffectClaimStore:
         reason_code: str,
         mark_invocation: bool = True,
     ) -> bool:
-        del reason_code
+        self.needs_review_reason_codes.append((claim_id, reason_code))
         self.invocation_review_marks.append(mark_invocation)
         key, claim = self._find(claim_id)
         self.claims[key] = replace(claim, state=EffectClaimState.NEEDS_REVIEW)

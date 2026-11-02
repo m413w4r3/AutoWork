@@ -1859,6 +1859,17 @@ class OperatorToolInvocationService:
         safe_data = _sanitize_json(output_data or {})
         if invocation.tool_name not in {"advisor.consult", "advisor.reparse"}:
             safe_data = _bounded_json_value(safe_data)
+        registered =self._registry.get(invocation.tool_name, invocation.schema_version)
+        retryable_passive_read = (
+            invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+            and registered is not None
+            and self._is_trusted_passive_read(
+                invocation.tool_name,
+                registered[0],
+                registered,
+            )
+            and self._persisted_passive_read_trust(invocation)
+        )
         output: dict[str, Any] = {
             "kind": _operator_output_kind(invocation.tool_name),
             "status": invocation.status.value,
@@ -1866,24 +1877,39 @@ class OperatorToolInvocationService:
             "data": safe_data,
             "next_action": {
                 "code": (
-                    "reconcile_before_retry"
+                    "retry_with_fresh_invocation"
+                    if retryable_passive_read
+                    else "reconcile_before_retry"
                     if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
                     else "continue_with_current_context"
                 ),
                 "method": "POST"
-                if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                if retryable_passive_read
+                or invocation.status is ToolInvocationStatus.NEEDS_REVIEW
                 else "GET",
-                "path": _operator_reconciliation_path(self._investigation_id, invocation)
+                "path": (
+                    f"/api/investigations/{self._investigation_id}/operator/tools/"
+                    f"{invocation.tool_name}"
+                    if retryable_passive_read
+                    else _operator_reconciliation_path(self._investigation_id, invocation)
+                )
                 if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
                 else f"/api/investigations/{self._investigation_id}/operator/context",
                 "expected_version": invocation.version
                 if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                and not retryable_passive_read
                 else state_version,
                 "expected_sha256": None
                 if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                and not retryable_passive_read
                 else state_sha256,
-                "resubmission_allowed": False
+                "resubmission_allowed": True
+                if retryable_passive_read
+                else False
                 if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+                else None,
+                "resubmission_reason": "passive_read_idempotent"
+                if retryable_passive_read
                 else None,
                 "other_pivots_allowed": True
                 if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
