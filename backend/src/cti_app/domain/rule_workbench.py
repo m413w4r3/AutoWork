@@ -145,6 +145,56 @@ class YaraExecutionStatus(StrEnum):
     INVALID_INPUT = "invalid_input"
 
 
+class RuleDiagnosticStage(StrEnum):
+    SOURCE_VALIDATOR = "source_validator"
+    LOCAL_BUILD = "local_build"
+    YARA_COMPILE = "yara_compile"
+    ENGINE = "engine"
+    PERSISTENCE = "persistence"
+    CORPUS_TEST = "corpus_test"
+
+
+class RuleDiagnosticStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuleToolDiagnostic:
+    stage: RuleDiagnosticStage
+    status: RuleDiagnosticStatus
+    reason_code: str
+    engine_status: YaraExecutionStatus | None = None
+    line: int | None = None
+    column: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stage", RuleDiagnosticStage(self.stage))
+        object.__setattr__(self, "status", RuleDiagnosticStatus(self.status))
+        if not self.reason_code.strip():
+            raise ValueError("diagnostic reason_code is required")
+        if self.engine_status is not None:
+            object.__setattr__(self, "engine_status", YaraExecutionStatus(self.engine_status))
+        for field_name in ("line", "column"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{field_name} must be positive")
+
+    def to_payload(self) -> dict[str, str | int | None]:
+        return {
+            "stage": self.stage.value,
+            "status": self.status.value,
+            "reason_code": self.reason_code,
+            "engine_status": self.engine_status.value if self.engine_status else None,
+            "line": self.line,
+            "column": self.column,
+        }
+
+
 class RuleTestErrorCode(StrEnum):
     COMPILE_ERROR = "compile_error"
     TIMEOUT = "timeout"

@@ -1010,7 +1010,13 @@ async def test_rule_test_failure_persists_stage_reason_and_holdout_role() -> Non
     assert failed.status is ToolInvocationStatus.FAILED
     assert failed.error_code == "invalid_rule_input"
     assert failed.output["diagnostic"] == {
-        "stage": "corpus_validation",
+        "stage": "corpus_test",
+        "status": "failed",
+        "reason_code": "invalid_rule_input",
+        "engine_status": None,
+        "line": None,
+        "column": None,
+        "input_stage": "corpus_validation",
         "exception_class": "ValueError",
         "reason": "holdout cases require a persisted designation time",
         "role": "holdout",
