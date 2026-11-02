@@ -29,6 +29,18 @@ construction et la compilation du RuleWorkbench restent l’autorité pour
 refuser les motifs triviaux ou non compilables. Une proposition sans motif
 exploitable échoue localement.
 
+## Tool contract — Bridge et corrections opérateur
+
+`rule.propose_bridge` persiste la source exacte vérifiée de Bridge comme
+candidate attribuée ; une string sans lien de mesure conserve un gap de
+justification. `rule.operator_syntax_fix` accepte `revision_mode="full_source"`
+pour une source corrigée par l'opérateur : la nouvelle version est attribuée à
+l'opérateur et dérivée de sa version Bridge parente, qui reste inchangée. Les
+résultats portent un diagnostic `{stage, status, reason_code}` et un lifecycle
+dérivé (`candidate`, `compiled`, `tested`, `validated`). Après proposition ou
+révision, appeler `rule.test` sur la candidate ; compiler ne constitue pas un
+test.
+
 Les outils n’exposent aucune opération d’approbation ni de publication. Les
 versions sont enregistrées avec leurs hashes et leur parent ; les états
 produits sont `candidate`, `experimental`, `tested` ou `rejected`. Une version

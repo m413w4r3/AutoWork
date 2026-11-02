@@ -4464,24 +4464,26 @@ def _operator_source_revision_provenance(
     for motif in parent.motif_provenance:
         prior_bytes = _exact_yara_string_bytes(parent.source, motif.motif)
         justification = _motif_justification(motif)
-        links = justification.get("measurement_links")
+        measurement_links = justification.get("measurement_links")
         if (
             prior_bytes is None
             or justification.get("status") != "verified"
-            or not isinstance(links, Sequence)
-            or isinstance(links, str | bytes)
+            or not isinstance(measurement_links, Sequence)
+            or isinstance(measurement_links, str | bytes)
         ):
             continue
         verified_links_by_bytes.setdefault(prior_bytes, []).extend(
-            link for link in links if isinstance(link, Mapping)
+            link for link in measurement_links if isinstance(link, Mapping)
         )
 
     result: list[MotifProvenance] = []
     for name in yara_string_names(source):
         current_bytes = _exact_yara_string_bytes(source, name)
-        links = verified_links_by_bytes.get(current_bytes, ()) if current_bytes is not None else ()
+        matching_links: Sequence[Mapping[str, Any]] = (
+            verified_links_by_bytes.get(current_bytes, ()) if current_bytes is not None else ()
+        )
         unique_links: dict[tuple[str, str], Mapping[str, Any]] = {}
-        for link in links:
+        for link in matching_links:
             measurement_id = link.get("measurement_id")
             sha256 = link.get("sha256")
             if isinstance(measurement_id, str) and isinstance(sha256, str):
@@ -4491,7 +4493,7 @@ def _operator_source_revision_provenance(
             "status": "verified" if verified_links else "gap",
             "measurement_links": list(verified_links),
         }
-        motif = RuleMotif(
+        rule_motif = RuleMotif(
             kind=RuleMotifKind.STRING,
             value=name,
             provenance_kind=RuleMotifProvenanceKind.MANUAL,
@@ -4507,7 +4509,7 @@ def _operator_source_revision_provenance(
             MotifProvenance(
                 motif=name,
                 rationale=_serialize_motif_with_source(
-                    motif,
+                    rule_motif,
                     attribution,
                     justification=justification,
                 ),

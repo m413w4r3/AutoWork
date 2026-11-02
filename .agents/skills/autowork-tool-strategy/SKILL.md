@@ -30,6 +30,8 @@ Ce skill n'est PAS un catalogue fixe. L'autorité est available_tools, unavailab
 | Bridge | advisor.consult, advisor.reparse | Dossier ciblé, droits, effet et coût |
 | C2 / Suricata | network.capture.inspect, network.stream.reassemble, network.messages.segment, network.protocol.*, network.suricata_*, advisor.consult (suricata_draft) | Analyse statique possible sans PCAP ; replay Suricata nécessite une capture associée et le moteur disponible |
 
+Pour YARA Bridge, `rule.propose_bridge` conserve la source exacte comme candidate attribuée, avec un gap explicite pour chaque string sans mesure liée. `rule.operator_syntax_fix` permet aussi `revision_mode="full_source"` pour une source opérateur dérivée de la v1 Bridge. Les résultats incluent `{stage, status, reason_code}` et un lifecycle dérivé (`candidate`, `compiled`, `tested`, `validated`) ; après proposition ou révision, appeler `rule.test` sur la candidate.
+
 ## Réactions aux réponses
 
 - Erreur de schéma : relire la version réelle, required et enums ; corriger le champ.
