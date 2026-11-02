@@ -294,6 +294,14 @@ RULE_OPERATOR_SYNTAX_FIX_SCHEMA = _schema(
             "pattern": r"^(?!.*\x00)[\s\S]*$",
         },
         "author": {"type": "string", "minLength": 1, "maxLength": 256},
+        "revision_mode": {
+            "type": "string",
+            "enum": ["syntax_only", "full_source"],
+            "description": (
+                "Optional revision mode. syntax_only keeps the narrow syntax-fix checks; "
+                "full_source accepts a complete operator correction of a Bridge-authored rule."
+            ),
+        },
     },
     ("candidate_id", "parent_version", "source", "author"),
 )
@@ -1873,6 +1881,9 @@ class _RuleTools:
             raise _ToolFailed("operator_syntax_fix_requires_bridge_source")
         author = sanitize_evidence_text(arguments["author"], max_chars=256).strip()
         source = arguments["source"]
+        revision_mode = arguments.get("revision_mode", "syntax_only")
+        if revision_mode not in {"syntax_only", "full_source"}:
+            raise _ToolFailed("operator_syntax_fix_revision_mode_invalid")
         if not author or not isinstance(source, str) or not source.strip():
             raise _ToolFailed("operator_syntax_fix_metadata_invalid")
         source_issues = validate_single_rule_candidate(source)
@@ -1892,7 +1903,13 @@ class _RuleTools:
             )
         if source == parent.source:
             raise _ToolFailed("operator_syntax_fix_requires_source_change")
-        _require_syntax_only_fix(parent.source, source)
+        origin_author = attribution.get(
+            "origin_author", attribution.get("source_author", attribution.get("author"))
+        )
+        if revision_mode == "full_source" and origin_author != "bridge":
+            raise _ToolFailed("operator_full_source_revision_requires_bridge_parent")
+        if revision_mode == "syntax_only":
+            _require_syntax_only_fix(parent.source, source)
         diff = "".join(
             unified_diff(
                 parent.source.splitlines(keepends=True),
@@ -1905,11 +1922,11 @@ class _RuleTools:
             line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
             for line in diff.splitlines()
         )
-        if changed_lines > 12:
+        if revision_mode == "syntax_only" and changed_lines > 12:
             raise _ToolFailed("operator_syntax_fix_not_minimal")
         operator_source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         compile_check = self.workbench.compile_check(source)
-        if compile_check.status not in {
+        if revision_mode == "syntax_only" and compile_check.status not in {
             YaraExecutionStatus.OK,
             YaraExecutionStatus.ENGINE_UNAVAILABLE,
         }:
@@ -1928,18 +1945,38 @@ class _RuleTools:
         next_attribution = {
             **attribution,
             "author": author,
-            "change_kind": "operator_syntax_fix",
+            "source_author": author,
+            "origin_author": "bridge",
+            "change_kind": (
+                "operator_source_revision"
+                if revision_mode == "full_source"
+                else "operator_syntax_fix"
+            ),
+            "revision_mode": revision_mode,
+            "derived_from": {
+                "version_id": str(parent.id),
+                "source_sha256": parent.source_sha256,
+            },
             "operator_parent_source_sha256": parent.source_sha256,
             "operator_diff": diff,
             "validator_findings": list(advisory_issues),
         }
-        provenance = tuple(
-            MotifProvenance(
-                motif=item.motif,
-                rationale=_add_source_attribution(item.rationale, next_attribution),
-                observation_refs=item.observation_refs,
+        provenance = (
+            _operator_source_revision_provenance(
+                parent=parent,
+                source=source,
+                author=author,
+                attribution=next_attribution,
             )
-            for item in parent.motif_provenance
+            if revision_mode == "full_source"
+            else tuple(
+                MotifProvenance(
+                    motif=item.motif,
+                    rationale=_add_source_attribution(item.rationale, next_attribution),
+                    observation_refs=item.observation_refs,
+                )
+                for item in parent.motif_provenance
+            )
         )
         version = DetectionCandidateVersion(
             investigation_id=context.investigation_id,
@@ -1960,12 +1997,13 @@ class _RuleTools:
                 "version": stored.version_label,
                 "parent_version_id": str(parent.id),
                 "source_sha256": stored.source_sha256,
-                "source_author": author,
-                "source_change_kind": "operator_syntax_fix",
+                **_version_provenance_output(stored),
+                "source_change_kind": next_attribution["change_kind"],
                 "source_diff": diff,
                 "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
                 "validation_reasons": ["explicit_rule_test_required"],
                 "compile_status": compile_check.status.value,
+                "compile_diagnostic": _execution_diagnostic(compile_check),
                 "test_refs": [str(reference) for reference in stored.test_refs],
             },
             ToolInvocationStatus.SUCCEEDED
@@ -4353,6 +4391,75 @@ def _condition_from_source(source: str) -> RuleConditionStrategy:
     if match is None:
         raise _ToolFailed("parent_condition_unreadable")
     return RuleConditionStrategy(match.group(1))
+
+
+def _operator_source_revision_provenance(
+    *,
+    parent: DetectionCandidateVersion,
+    source: str,
+    author: str,
+    attribution: Mapping[str, Any],
+) -> tuple[MotifProvenance, ...]:
+    refs = tuple(
+        dict.fromkeys(
+            reference for motif in parent.motif_provenance for reference in motif.observation_refs
+        )
+    )
+    verified_links_by_bytes: dict[bytes, list[Mapping[str, Any]]] = {}
+    for motif in parent.motif_provenance:
+        prior_bytes = _exact_yara_string_bytes(parent.source, motif.motif)
+        justification = _motif_justification(motif)
+        links = justification.get("measurement_links")
+        if (
+            prior_bytes is None
+            or justification.get("status") != "verified"
+            or not isinstance(links, Sequence)
+            or isinstance(links, str | bytes)
+        ):
+            continue
+        verified_links_by_bytes.setdefault(prior_bytes, []).extend(
+            link for link in links if isinstance(link, Mapping)
+        )
+
+    result: list[MotifProvenance] = []
+    for name in yara_string_names(source):
+        current_bytes = _exact_yara_string_bytes(source, name)
+        links = verified_links_by_bytes.get(current_bytes, ()) if current_bytes is not None else ()
+        unique_links: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for link in links:
+            measurement_id = link.get("measurement_id")
+            sha256 = link.get("sha256")
+            if isinstance(measurement_id, str) and isinstance(sha256, str):
+                unique_links.setdefault((measurement_id, sha256), link)
+        verified_links = tuple(unique_links[key] for key in sorted(unique_links))
+        justification = {
+            "status": "verified" if verified_links else "gap",
+            "measurement_links": list(verified_links),
+        }
+        motif = RuleMotif(
+            kind=RuleMotifKind.STRING,
+            value=name,
+            provenance_kind=RuleMotifProvenanceKind.MANUAL,
+            provenance_id=author,
+            observation_refs=refs,
+            rationale=(
+                "Operator source preserves independently supported bytes."
+                if verified_links
+                else "Operator source string has no independently verified measurement link."
+            ),
+        )
+        result.append(
+            MotifProvenance(
+                motif=name,
+                rationale=_serialize_motif_with_source(
+                    motif,
+                    attribution,
+                    justification=justification,
+                ),
+                observation_refs=refs,
+            )
+        )
+    return tuple(result)
 
 
 def _serialize_motif(

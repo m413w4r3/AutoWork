@@ -80,6 +80,7 @@ from cti_app.domain.rule_workbench import (
     RuleTestError,
     RuleTestErrorCode,
     RuleTestReport,
+    RuleValidationStatus,
     YaraEngineResult,
     YaraExecutionStatus,
 )
@@ -1092,6 +1093,250 @@ async def test_bridge_yara_proposal_verifies_observation_source_and_operator_fix
     assert attribution["author"] == "operator:analyst-42"
     assert attribution["change_kind"] == "operator_syntax_fix"
     assert "operator_diff" in attribution
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_candidate_keeps_exact_source_and_per_string_justification_gaps() -> None:
+    harness = _harness(samples={})
+    measurement_id = str(uuid4())
+    measurement_sha256 = "a" * 64
+    source = """rule bridge_candidate {
+    strings:
+        $measured = "BridgeMeasuredMarker"
+        $unmeasured = "IndependentUnmeasuredMarker"
+    condition:
+        $measured or $unmeasured
+}
+"""
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness,
+        source=source,
+        measurement_catalog=(
+            {
+                "alias": "M1",
+                "measurement_id": measurement_id,
+                "sha256": measurement_sha256,
+                "sample_sha256": "1" * 64,
+                "offset": 0,
+                "length": len(b"BridgeMeasuredMarker"),
+                "kind": "string",
+                "encoding": "ascii",
+                "value": "BridgeMeasuredMarker",
+            },
+        ),
+        motifs=(
+            {
+                "name": "$measured",
+                "measurement_refs": [
+                    {
+                        "measurement_id": measurement_id,
+                        "sha256": measurement_sha256,
+                    }
+                ],
+            },
+        ),
+    )
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert proposed.output["source_author"] == "bridge"
+    assert proposed.output["source_sha256"] == source_sha256
+    assert tuple(proposed.output["source_validator_findings"]) == (
+        "or_branches_disguised_as_multiple_rules_forbidden",
+    )
+    assert any(
+        "Source validator advisory findings" in item for item in proposed.output["limitations"]
+    )
+    assert tuple(proposed.output["justification_gaps"]) == ("$unmeasured",)
+    versions = await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
+    assert versions[0].source == source
+    assert versions[0].source_sha256 == source_sha256
+    justifications = {
+        item.motif: json.loads(item.rationale.removeprefix("rule-workbench-motif-v1:"))[
+            "justification"
+        ]
+        for item in versions[0].motif_provenance
+    }
+    assert justifications["$measured"]["status"] == "verified"
+    assert len(justifications["$measured"]["measurement_links"]) == 1
+    assert justifications["$unmeasured"] == {"status": "gap", "measurement_links": []}
+    assert harness.engine.compile_count == 1
+
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"], "version": 1},
+    )
+
+    assert tested.status is ToolInvocationStatus.UNAVAILABLE
+    assert tested.output["report"]["source_sha256"] == source_sha256
+    assert tested.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert tested.output["validation_status"] != RuleValidationStatus.REAL_VALIDATED.value
+    assert tuple(tested.output["source_validator_findings"]) == (
+        "or_branches_disguised_as_multiple_rules_forbidden",
+    )
+    assert (await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"])))[
+        0
+    ].status is DetectionCandidateStatus.CANDIDATE
+
+
+@pytest.mark.asyncio
+async def test_operator_full_source_revision_preserves_bridge_parent_and_is_testable() -> None:
+    harness = _harness(samples={})
+    bridge_source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, bridge_sha256 = await _bridge_yara_observation(
+        harness,
+        source=bridge_source,
+    )
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": bridge_sha256,
+        },
+    )
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+
+    corrected_source = """rule bridge_candidate {
+    strings:
+        $marker = "BridgeMeasuredMarker"
+        $operator_added = "OperatorAddedString"
+    condition:
+        $marker and $operator_added
+}
+"""
+    corrected_sha256 = _sha256(corrected_source.encode())
+    revised = await _call(
+        harness,
+        "rule.operator_syntax_fix",
+        {
+            "candidate_id": proposed.output["candidate_id"],
+            "parent_version": 1,
+            "source": corrected_source,
+            "author": "operator:analyst-42",
+            "revision_mode": "full_source",
+        },
+    )
+
+    assert revised.status is ToolInvocationStatus.SUCCEEDED
+    assert revised.output["version"] == "v2"
+    assert revised.output["source_sha256"] == corrected_sha256
+    assert revised.output["source_author"] == "operator:analyst-42"
+    assert revised.output["source_change_kind"] == "operator_source_revision"
+    assert revised.output["derived_from"] == {
+        "version_id": proposed.output["version_id"],
+        "source_sha256": bridge_sha256,
+    }
+    assert tuple(revised.output["justification_gaps"]) == ("$operator_added",)
+
+    history = await _call(
+        harness,
+        "rule.get",
+        {"candidate_id": proposed.output["candidate_id"], "include_history": True},
+    )
+    first, second = history.output["versions"]
+    assert first["source_sha256"] == bridge_sha256
+    assert first["signature"]["source_attribution"]["source_author"] == "bridge"
+    assert second["source_sha256"] == corrected_sha256
+    assert second["signature"]["source_attribution"]["source_author"] == "operator:analyst-42"
+    assert second["signature"]["source_attribution"]["derived_from"]["source_sha256"] == (
+        bridge_sha256
+    )
+
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"], "version": 2},
+    )
+    assert tested.status is ToolInvocationStatus.UNAVAILABLE
+    assert tested.output["report"]["source_sha256"] == corrected_sha256
+    assert tested.output["origin"] == {
+        "invocation_id": str(invocation_id),
+        "observation_id": str(observation_id),
+    }
+    after_test = await _call(
+        harness,
+        "rule.get",
+        {"candidate_id": proposed.output["candidate_id"], "version": 2},
+    )
+    assert after_test.output["versions"][0]["source_author"] == "operator:analyst-42"
+
+
+@pytest.mark.asyncio
+async def test_bridge_source_refusal_and_engine_compile_failure_have_distinct_diagnostics() -> None:
+    blocked_harness = _harness(samples={})
+    two_rule_source = (
+        'rule first { strings: $a = "BridgeMeasuredMarker" condition: $a } '
+        'rule second { strings: $b = "OtherMeasuredMarker" condition: $b }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        blocked_harness,
+        source=two_rule_source,
+    )
+    blocked = await _call(
+        blocked_harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert blocked.status is ToolInvocationStatus.FAILED
+    assert blocked.output["diagnostic"]["stage"] == "source_validator"
+    assert blocked.output["diagnostic"]["status"] == "failed"
+    assert blocked.output["diagnostic"]["reason_code"] == "exactly_one_rule_required"
+
+    class CompileFailureEngine:
+        def compile(self, _source: str) -> YaraEngineResult:
+            return YaraEngineResult(
+                status=YaraExecutionStatus.COMPILE_ERROR,
+                engine_version="fixture-yara-1",
+                message="fixture syntax failure",
+                line=4,
+                column=7,
+            )
+
+        def match(self, _source: str, _samples: Sequence[YaraSampleInput]) -> YaraEngineResult:
+            raise AssertionError("matching cannot run after compilation fails")
+
+    failed_engine_harness = _harness(samples={}, engine=CompileFailureEngine())
+    valid_source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        failed_engine_harness,
+        source=valid_source,
+    )
+    failed_compile = await _call(
+        failed_engine_harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert failed_compile.status is ToolInvocationStatus.PARTIAL
+    assert failed_compile.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert failed_compile.output["compile_diagnostic"]["stage"] == "yara_compile"
+    assert failed_compile.output["compile_diagnostic"]["status"] == "failed"
+    assert failed_compile.output["compile_diagnostic"]["line"] == 4
+    assert failed_compile.output["compile_diagnostic"]["column"] == 7
 
 
 @pytest.mark.asyncio
