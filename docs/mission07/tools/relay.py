@@ -82,11 +82,24 @@ class Request:
         )[:80]
         self.payload = dict(payload)
         self.method = str(payload.get("method", "")).upper()
+        self.lane = (
+            self.method.lower() if self.method in {"GET", "POST"} else "rejected"
+        )
         self.relative_path = str(payload.get("path", ""))
         self.api_path = ""
         self.received_at = utc_now()
+        self.received_monotonic = time.monotonic()
         self.started_at: str | None = None
+        self.started_monotonic: float | None = None
+        self.completed_at: str | None = None
+        self.completed_monotonic: float | None = None
         self.state = "received"
+        self.idempotency_key = f"m07-{self.id}" if self.method == "POST" else None
+        self.idempotency_key_sha256 = (
+            hashlib.sha256(self.idempotency_key.encode()).hexdigest()
+            if self.idempotency_key
+            else None
+        )
         self.allowed = bool(
             self.id
             and GET_OK.fullmatch(self.relative_path)
@@ -97,13 +110,38 @@ class Request:
             )
         )
 
-    def status_record(self) -> dict[str, Any]:
+    def status_record(self, *, queue_position: int | None = None) -> dict[str, Any]:
+        now = time.monotonic()
+        queue_wait = (
+            max(0.0, self.started_monotonic - self.received_monotonic)
+            if self.started_monotonic is not None
+            else max(0.0, now - self.received_monotonic)
+            if self.state in {"received", "queued"}
+            else None
+        )
+        run_end = (
+            self.completed_monotonic
+            if self.completed_monotonic is not None
+            else now
+        )
+        run_seconds = (
+            max(0.0, run_end - self.started_monotonic)
+            if self.started_monotonic is not None
+            else None
+        )
         return {
             "id": self.id,
+            "request_id": self.id,
             "method": self.method,
+            "lane": self.lane,
             "path": self.api_path or self.relative_path,
             "received_at": self.received_at,
             "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "queue_wait_seconds": round(queue_wait, 3) if queue_wait is not None else None,
+            "run_seconds": round(run_seconds, 3) if run_seconds is not None else None,
+            "idempotency_key_sha256": self.idempotency_key_sha256,
+            "queue_position": queue_position,
             "status": self.state,
         }
 
@@ -138,6 +176,7 @@ class Relay:
         self.active: dict[str, tuple[Request, concurrent.futures.Future[dict[str, Any]] | None]] = {}
         self.seen_files: set[pathlib.Path] = set()
         self.last_completed_id: str | None = None
+        self.last_completed_record: dict[str, Any] | None = None
         self._last_heartbeat = 0.0
         self._get_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._post_pool: concurrent.futures.ThreadPoolExecutor | None = None
@@ -192,7 +231,17 @@ class Relay:
         return self.root / "inflight" / f"{request.id}.json"
 
     def _persist_request(self, request: Request) -> None:
-        atomic_json(self._inflight_path(request), request.status_record())
+        atomic_json(
+            self._inflight_path(request),
+            request.status_record(queue_position=self._queue_position(request)),
+        )
+
+    def _queue_position(self, request: Request) -> int | None:
+        queued = [item for item in self.pending if item.lane == request.lane]
+        try:
+            return queued.index(request) + 1
+        except ValueError:
+            return None
 
     def _status(self) -> dict[str, Any]:
         active = [
@@ -200,7 +249,10 @@ class Relay:
             for request, _future in self.active.values()
             if request.state == "running"
         ]
-        queued = [request.status_record() for request in self.pending]
+        queued = [
+            request.status_record(queue_position=self._queue_position(request))
+            for request in self.pending
+        ]
         return {
             "pid": self.pid,
             "heartbeat_ts": utc_now(),
@@ -209,6 +261,7 @@ class Relay:
             "in_flight": active,
             "queue": queued,
             "last_completed_id": self.last_completed_id,
+            "last_completed": self.last_completed_record,
         }
 
     def _write_status(self, *, heartbeat: bool = False) -> None:
@@ -232,11 +285,13 @@ class Relay:
             request = Request(path, payload)
             request.api_path = f"/api/investigations/{self.inv}{request.relative_path}"
             self.seen_files.add(path)
-            self._persist_request(request)
             if request.allowed:
+                request.state = "queued"
                 self.pending.append(request)
+                self._persist_request(request)
                 self._write_status()
             else:
+                self._persist_request(request)
                 self._write_status()
                 self._finish(request, {"http": None, "rejected": "path_or_method_not_allowed"})
 
@@ -246,13 +301,14 @@ class Relay:
             "method": request.method,
             "path": request.api_path,
             "body": request.payload.get("body"),
-            "idem": f"m07-{request.id}" if request.method == "POST" else None,
+            "idem": request.idempotency_key,
             "timeout": 7400 if request.method == "POST" else 300,
         }
 
     def _start(self, request: Request) -> None:
         request.state = "running"
         request.started_at = utc_now()
+        request.started_monotonic = time.monotonic()
         self.pending.remove(request)
         self.active[request.id] = (request, None)
         self._persist_request(request)
@@ -282,9 +338,17 @@ class Relay:
         return {
             "ts": utc_now(),
             "id": request.id,
+            "request_id": request.id,
             "agent": payload.get("agent", "CTI-ANALYST"),
             "method": request.method,
+            "lane": request.lane,
             "path": request.relative_path,
+            "received_at": request.received_at,
+            "started_at": request.started_at,
+            "completed_at": request.completed_at,
+            "queue_wait_seconds": request.status_record()["queue_wait_seconds"],
+            "run_seconds": request.status_record()["run_seconds"],
+            "idempotency_key_sha256": request.idempotency_key_sha256,
             "purpose": body.get("purpose") if request.method == "POST" else payload.get("purpose"),
             "arguments_sha256": hashlib.sha256(
                 json.dumps(body.get("arguments"), sort_keys=True).encode()
@@ -307,6 +371,10 @@ class Relay:
         if output.get("transport_error"):
             output["ambiguous"] = True
 
+        request.completed_at = utc_now()
+        request.completed_monotonic = time.monotonic()
+        request.state = "ambiguous" if output.get("ambiguous", False) else "completed"
+
         entry = self._base_log_entry(request)
         entry.update(
             {
@@ -326,8 +394,8 @@ class Relay:
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
 
-        atomic_json(self.root / "outbox" / f"{request.id}.json", output)
         self._write_journal(entry)
+        atomic_json(self.root / "outbox" / f"{request.id}.json", output)
         self._inflight_path(request).unlink(missing_ok=True)
         if request.file.exists():
             destination = self.root / "processed" / request.file.name
@@ -339,6 +407,7 @@ class Relay:
             self.pending.remove(request)
         self.seen_files.discard(request.file)
         self.last_completed_id = request.id
+        self.last_completed_record = request.status_record()
         self._write_status()
 
     def _collect_completed(self) -> None:
