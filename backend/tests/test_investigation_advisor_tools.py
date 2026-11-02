@@ -1518,13 +1518,21 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     }
     observation, raw = make_observation(investigation_id, measured)
     rule_source = 'rule Candidate { strings: $mutex = "CreateMutexW" condition: $mutex }'
-    transport = Transport(
-        lambda call: TurnSubmission(
+
+    def bridge_response(call):
+        measurements = typed_prompt_payload(call["prompt"])["measurements"]
+        mutex = next(item for item in measurements if item["value"] == "CreateMutexW")
+        return TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text=typed_yara_response(call["prompt"], rule_source=rule_source),
+            output_text=(
+                "advisor-wire.v1\nTYPE: yara_draft\nSTATUS: succeeded\n"
+                f"```yara\n{rule_source}\n```\nMOTIF: $mutex | measurements={mutex['alias']}\n"
+                "INVARIANT: The mutex marker is independently measured.\nLIMITATION: none"
+            ),
             bridge_invocation_id=str(uuid4()),
         )
-    )
+
+    transport = Transport(bridge_response)
     tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -1692,9 +1700,10 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     assert persisted["input_observation_refs"] == [str(observation.id)]
     assert persisted["output"].get("schema") == ADVISOR_RESPONSE_SCHEMA_V3, persisted
     assert persisted["output"]["rule_source"].rstrip("\n") == rule_source
+    assert persisted["output"]["motifs"][0]["name"] == "$mutex"
     assert {
         item["measurement_id"] for item in persisted["output"]["motifs"][0]["measurement_refs"]
-    } == {"m001", "m002", "m003", "m004"}
+    } == {"m001"}
     assert persisted["bridge_invocation_id_kind"] == "conversation_turn"
     assert persisted["bridge_invocation_id"]
     assert len(persisted["input_sha256"]) == 64
@@ -1722,7 +1731,9 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     assert unknown_claim.output["invalid_article_claim_ids"] == ("s9p9",)
     assert unknown_claim.output["valid_article_claim_ids"] == ("S3P2.1", "S4P1.1")
     assert "valid article claim ids: s3p2.1, s4p1.1" in unknown_claim.message.casefold()
-    assert len(transport.calls) == 1
+    # The malformed optional-measurement consult and the valid request above both reached Bridge;
+    # the unknown-claim request is rejected before transport.
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.asyncio
