@@ -584,7 +584,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
         restricted_hashes = source_hashes | provider_report_hashes
         if restricted_hashes:
             sample_hash_terms = [BlobRow.sha256.in_(sorted(restricted_hashes))]
-            if context.prepared.family in _VT_HASH_READ_FAMILIES | {"vt.intelligence_search"}:
+            if provider_report_hashes or context.prepared.family in _VT_HASH_READ_FAMILIES | {
+                "vt.intelligence_search"
+            }:
                 sample_hash_terms.extend(
                     (
                         SampleRow.expected_hash.in_(sorted(restricted_hashes)),

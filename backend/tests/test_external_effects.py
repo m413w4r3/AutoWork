@@ -3108,11 +3108,13 @@ def test_acquisition_dispatch_migration_refuses_to_drop_persisted_lineage(
 @pytest.mark.parametrize(
     ("family", "source", "expected"),
     [
-        ("advisor.consultation.v1", "vt.file_report", True),
-        ("bridge.investigation_turn.v1", "VT.behaviour", True),
-        ("advisor.consultation.v1", "sample.analyze", False),
+        ("advisor.consultation.v1", "VirusTotal", True),
+        ("bridge.investigation_turn.v1", "VirusTotal", True),
+        ("advisor.consultation.v1", "vt.file_report", False),
+        ("advisor.consultation.v1", "virustotal", False),
+        ("advisor.consultation.v1", "AutoWork local analysis", False),
         ("advisor.consultation.v1", None, False),
-        ("vt.file_report", "vt.file_report", False),
+        ("vt.file_report", "VirusTotal", False),
         ("advisor.consultation.v1", "advisor.consult", False),
     ],
 )

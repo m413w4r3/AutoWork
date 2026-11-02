@@ -4013,8 +4013,13 @@ async def _seed_bridge_report_case(
     report_hash: str,
     observation_source: str,
     sample_flags: dict[str, Any] | None,
+    lineage: str = "blob",
 ) -> EvidenceReference:
-    """Persist a sha256 observation (and optionally a subject sample) for a Bridge citation."""
+    """Persist a file observation (and optionally a subject sample) for a Bridge citation.
+
+    ``lineage`` says how the held sample is tied to the cited hash: its blob digest, or only
+    its ``expected_hash`` / ``source_object_id`` while the blob has another digest.
+    """
     observation_id = uuid4()
     observation_sha256 = "e" * 64
     async with session_factory() as session:
@@ -4022,13 +4027,14 @@ async def _seed_bridge_report_case(
             blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
             assert blob is not None
             if sample_flags is not None:
+                blob_sha256 = report_hash if lineage == "blob" else uuid4().hex + uuid4().hex
                 sample_blob = BlobRow(
                     id=uuid4(),
-                    sha256=report_hash,
+                    sha256=blob_sha256,
                     size=1,
                     mime_type="application/octet-stream",
                     logical_bucket="samples",
-                    object_key=f"samples/{report_hash}",
+                    object_key=f"samples/{blob_sha256}",
                     created_at=datetime.now(UTC),
                 )
                 session.add(sample_blob)
@@ -4048,8 +4054,8 @@ async def _seed_bridge_report_case(
                         origin_kind="manual",
                         state="quarantined",
                         source_service=None,
-                        source_object_id=report_hash,
-                        expected_hash=report_hash,
+                        source_object_id=report_hash if lineage == "source_object_id" else None,
+                        expected_hash=report_hash if lineage == "expected_hash" else None,
                         validation_actor=None,
                         validation_date=None,
                         validation_reason=None,
@@ -4072,13 +4078,13 @@ async def _seed_bridge_report_case(
                 EvidenceObservationRow(
                     id=observation_id,
                     investigation_id=investigation_id,
-                    kind="other",
+                    kind="vt_file_report",
                     blob_id=blob.id,
                     sha256=observation_sha256,
                     source=observation_source,
                     source_version="report-v1",
                     observed_at=datetime.now(UTC),
-                    object_type="sha256",
+                    object_type="file",
                     object_id=report_hash,
                     limitations=[],
                     invocation_ref=None,
@@ -4089,24 +4095,52 @@ async def _seed_bridge_report_case(
     )
 
 
+# The labels below are the ones the recorders really emit on a fresh investigation.
+_REAL_VT = "VirusTotal"
 _BRIDGE_REPORT_CASES = [
-    # (observation source, existing subject sample, expected: Bridge may cite it)
-    pytest.param("vt.file_report", None, True, id="vt-report-of-unacquired-hash"),
-    pytest.param("sample.analyze", None, False, id="local-analysis-needs-an-associated-sample"),
+    # (observation source, existing subject sample, how it is tied to the hash, Bridge may cite)
+    pytest.param(_REAL_VT, None, "blob", True, id="vt-report-of-unacquired-hash"),
     pytest.param(
-        "vt.file_report",
+        "AutoWork local analysis",
+        None,
+        "blob",
+        False,
+        id="local-analysis-needs-an-associated-sample",
+    ),
+    pytest.param(
+        "vt.file_report", None, "blob", False, id="a-tool-name-is-not-a-provider-provenance"
+    ),
+    pytest.param(
+        _REAL_VT,
         {"external_llm_allowed": False},
+        "blob",
         False,
         id="vt-report-keeps-the-external-llm-veto-of-a-held-sample",
     ),
     pytest.param(
-        "vt.file_report",
+        _REAL_VT,
         {"license_restriction": "restricted"},
+        "blob",
         False,
         id="vt-report-keeps-the-licence-of-a-held-sample",
     ),
+    pytest.param(_REAL_VT, {"tlp": "RED"}, "blob", False, id="vt-report-keeps-tlp-red"),
     pytest.param(
-        "vt.file_report", {"tlp": "RED"}, False, id="vt-report-keeps-tlp-red-of-a-held-sample"
+        _REAL_VT,
+        {"external_llm_allowed": False},
+        "expected_hash",
+        False,
+        id="restricted-sample-tied-only-by-expected-hash",
+    ),
+    pytest.param(
+        _REAL_VT,
+        {"external_llm_allowed": False},
+        "source_object_id",
+        False,
+        id="restricted-sample-tied-only-by-source-object-id",
+    ),
+    pytest.param(
+        _REAL_VT, {"external_llm_allowed": True}, "expected_hash", True, id="permitted-held-sample"
     ),
 ]
 
@@ -4129,12 +4163,15 @@ def _bridge_prepared(reference: EvidenceReference) -> PreparedExternalRequest:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("observation_source", "sample_flags", "allowed"), _BRIDGE_REPORT_CASES)
+@pytest.mark.parametrize(
+    ("observation_source", "sample_flags", "lineage", "allowed"), _BRIDGE_REPORT_CASES
+)
 async def test_osint_guard_bridge_may_cite_provider_report_of_unacquired_hash(
     migrated_postgres_url: str,
     tmp_path: Path,
     observation_source: str,
     sample_flags: dict[str, Any] | None,
+    lineage: str,
     allowed: bool,
 ) -> None:
     # A fresh investigation only holds VT reports: its first Bridge consultation cites them.
@@ -4150,6 +4187,7 @@ async def test_osint_guard_bridge_may_cite_provider_report_of_unacquired_hash(
             report_hash=uuid4().hex + uuid4().hex,
             observation_source=observation_source,
             sample_flags=sample_flags,
+            lineage=lineage,
         )
         prepared = _bridge_prepared(reference)
         async with session_factory() as session:
@@ -4169,12 +4207,15 @@ async def test_osint_guard_bridge_may_cite_provider_report_of_unacquired_hash(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("observation_source", "sample_flags", "allowed"), _BRIDGE_REPORT_CASES)
+@pytest.mark.parametrize(
+    ("observation_source", "sample_flags", "lineage", "allowed"), _BRIDGE_REPORT_CASES
+)
 async def test_bridge_source_restrictions_accept_provider_report_of_unacquired_hash(
     migrated_postgres_url: str,
     tmp_path: Path,
     observation_source: str,
     sample_flags: dict[str, Any] | None,
+    lineage: str,
     allowed: bool,
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
@@ -4189,6 +4230,7 @@ async def test_bridge_source_restrictions_accept_provider_report_of_unacquired_h
             report_hash=uuid4().hex + uuid4().hex,
             observation_source=observation_source,
             sample_flags=sample_flags,
+            lineage=lineage,
         )
         prepared = _bridge_prepared(reference)
         binding = ExternalEffectFamilyBinding(

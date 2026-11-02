@@ -1745,7 +1745,11 @@ class SqlAlchemyExternalEffectClaimStore:
                     .join(BlobRow, BlobRow.id == SampleRow.blob_id)
                     .where(
                         SampleRow.subject_id == subject_id,
-                        BlobRow.sha256.in_(sorted(provider_report_hashes)),
+                        or_(
+                            BlobRow.sha256.in_(sorted(provider_report_hashes)),
+                            SampleRow.expected_hash.in_(sorted(provider_report_hashes)),
+                            SampleRow.source_object_id.in_(sorted(provider_report_hashes)),
+                        ),
                     )
                     .order_by(SampleRow.id)
                     .with_for_update()
