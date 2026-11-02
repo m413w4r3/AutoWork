@@ -25,7 +25,10 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
+from cti_app.application.advisor_checkpoint import (
+    derive_advisor_consult_status,
+    split_advisor_trace_purpose,
+)
 from cti_app.domain.advisor_completeness import AdvisorEvidenceStatus, AdvisorPreflightStatus
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
@@ -923,6 +926,44 @@ def _budget_amounts(value: Any) -> dict[str, int]:
     return dict(sorted(output.items()))
 
 
+def _operator_trace(invocation: Any) -> dict[str, Any]:
+    """Project the validated Bridge checkpoint and recommendation decision of an invocation.
+
+    Only the bounded, structured trace fields are exported. Free-form reasons stay
+    behind their SHA-256, like the purpose they were written with.
+    """
+    purpose = _get(invocation, "purpose")
+    if not isinstance(purpose, str):
+        return {"state": "absent"}
+    try:
+        trace, _human_purpose = split_advisor_trace_purpose(
+            purpose, tool_name=_text(_get(invocation, "tool_name")), allow_server_denied=True
+        )
+    except ValueError:
+        return {"state": "invalid"}
+    if trace is None:
+        return {"state": "absent"}
+    projected: dict[str, Any] = {"state": "recorded"}
+    checkpoint = trace.get("checkpoint")
+    if checkpoint is not None:
+        projected["checkpoint"] = {
+            "id": checkpoint["id"],
+            "status": checkpoint["status"],
+            "reason_sha256": _sha256_value(checkpoint.get("reason")),
+            "reason_included": False,
+        }
+    recommendation = trace.get("recommendation")
+    if recommendation is not None:
+        projected["recommendation"] = {
+            "advisor_invocation_id": recommendation["invocation_id"],
+            "index": recommendation["index"],
+            "decision": recommendation["decision"],
+            "reason_sha256": _sha256_value(recommendation.get("reason")),
+            "reason_included": False,
+        }
+    return projected
+
+
 def _invocation_event(
     investigation_id: str,
     invocation: Any,
@@ -953,6 +994,7 @@ def _invocation_event(
             "schema_version_sha256": _sha256_value(_get(invocation, "schema_version")),
             "purpose_sha256": _sha256_value(_get(invocation, "purpose")),
             "purpose_included": False,
+            "operator_trace": _operator_trace(invocation),
             "status_at_snapshot": _enum_token(status, ToolInvocationStatus) or "UNKNOWN",
             "admission": {
                 "requested": _unknown("requested budget amount is not stored on the invocation"),

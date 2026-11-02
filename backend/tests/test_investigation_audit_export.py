@@ -944,3 +944,51 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
     assert (output_dir / "RUN_TRACE.md").read_bytes() == bundle.trace
     assert (output_dir / "RUN_INDEX.json").read_bytes() == bundle.index
     assert (output_dir / "RUN_MANIFEST.json").read_bytes() == bundle.manifest
+
+
+def test_invocation_event_projects_bridge_checkpoint_and_recommendation_decision() -> None:
+    from cti_app.application.advisor_checkpoint import format_advisor_trace_purpose
+    from cti_app.application.investigation_audit_export import _operator_trace
+
+    advisor_invocation = _id("advisor-invocation")
+    reason = "PRIVATE_SYNTHETIC_RECOMMENDATION_REASON"
+    purpose = format_advisor_trace_purpose(
+        "Test the pivot Bridge proposed on the shared resource name.",
+        checkpoint={"id": "no_advisor_consultation@3", "status": "skipped", "reason": reason},
+        recommendation={
+            "invocation_id": advisor_invocation,
+            "index": 1,
+            "decision": "refused",
+            "reason": reason,
+        },
+    )
+    trace = _operator_trace(SimpleNamespace(purpose=purpose, tool_name="vt.relationships"))
+
+    assert trace == {
+        "state": "recorded",
+        "checkpoint": {
+            "id": "no_advisor_consultation@3",
+            "status": "skipped",
+            "reason_sha256": hashlib.sha256(reason.encode()).hexdigest(),
+            "reason_included": False,
+        },
+        "recommendation": {
+            "advisor_invocation_id": advisor_invocation,
+            "index": 1,
+            "decision": "refused",
+            "reason_sha256": hashlib.sha256(reason.encode()).hexdigest(),
+            "reason_included": False,
+        },
+    }
+    assert reason not in json.dumps(trace)
+
+
+def test_invocation_event_trace_distinguishes_absent_from_invalid() -> None:
+    from cti_app.application.investigation_audit_export import _operator_trace
+
+    assert _operator_trace(
+        SimpleNamespace(purpose="plain purpose", tool_name="sample.analyze")
+    ) == {"state": "absent"}
+    assert _operator_trace(
+        SimpleNamespace(purpose="[[advisor-trace.v1]]{broken\nwhy", tool_name="sample.analyze")
+    ) == {"state": "invalid"}
