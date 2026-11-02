@@ -1571,7 +1571,13 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         raw = artifacts.values.get(blob_id)
         if observation is None or raw is None:
             return None
-        return SimpleNamespace(descriptor=SimpleNamespace(sha256=observation.sha256, size=len(raw)))
+        return SimpleNamespace(
+            descriptor=SimpleNamespace(
+                sha256=observation.sha256,
+                size=len(raw),
+                logical_bucket="evidence",
+            )
+        )
 
     summaries = CanonicalEvidenceSummaryPort(artifacts)
 
