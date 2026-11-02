@@ -24,6 +24,8 @@ Le bac à sable ne voit pas nécessairement les processus de l’hôte. Lis `rel
 
 Envoie une seule demande à la fois. Pour une consultation longue, attends au moins 60 secondes avant une vérification; ne crée pas de POST identique et n’empile pas des GET de statut toutes les quelques secondes. Si la vérification est encore en attente derrière le POST, attends plusieurs minutes avant une seule nouvelle vérification de l’identifiant exact. Une demande `pending`, `needs_review` ou ambiguë reste à réconcilier : ne la rejoue pas à l’aveugle.
 
+Ne termine pas ton tour tant qu'un POST est en vol : rien ne te réveillera à l'arrivée de la réponse. Attends dans un shell (boucle `sleep` bornée sur `outbox/<id>.json`, ou lecture espacée de `relay-status.json`), puis exploite la réponse. Un POST Bridge peut durer plus de 40 minutes ; pendant ce temps, poursuis les analyses locales indépendantes plutôt que de rendre la main.
+
 Pour une **expérience formelle ou une hypothèse contestée**, consigne brièvement la question, le résultat attendu et le critère permettant de la départager **avant le test**. Une simple inspection de fichier, de méthode, de ressource ou un pivot VT passif autorisé ne demande ni hypothèse formelle préalable ni minimum de tests alternatifs. Après une action informative, conserve les références et limites utiles sans imposer experiment.record ou finding.propose à chaque appel. Une erreur déjà observée n’est retentée qu’avec un paramètre ou une preuve corrigés ; si le même garde revient, passe à une autre piste et signale la friction.
 
 ## Versions, CAS et idempotence
