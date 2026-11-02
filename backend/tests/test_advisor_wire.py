@@ -759,8 +759,12 @@ def test_yara_prose_derives_only_exact_catalogued_measurements() -> None:
         "m001",
         "m002",
     ]
+    assert not parsed["warning_classification"]["blocking"]
     assert "wire_header_missing" in parsed["warning_classification"]["informative"]
+    assert "wire_prose_ignored" in parsed["warning_classification"]["informative"]
+    assert "type_missing" in parsed["warning_classification"]["informative"]
     assert "status_missing" in parsed["warning_classification"]["informative"]
+    assert "invariants_missing" in parsed["warning_classification"]["informative"]
 
 
 def test_yara_prose_without_exact_measurement_is_unusable_with_a_specific_cause() -> None:
@@ -1198,6 +1202,8 @@ def test_suricata_prose_reply_keeps_its_rule_when_it_cites_a_dossier_fact() -> N
     assert refused is not None
     assert refused["usable"] is False
     assert "fact_references_missing" in refused["warnings"]
+    assert "wire_header_missing" in refused["warning_classification"]["informative"]
+    assert "fact_references_missing" in refused["warning_classification"]["blocking"]
 
 
 def test_draft_wire_rejects_unknown_assertion_alias_as_a_unit_blocker() -> None:

@@ -2257,6 +2257,63 @@ async def test_stale_passive_read_retry_leaves_prior_reservation_and_invocation_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "schema_version"),
+    [
+        ("advisor.consult", ADVISOR_SCHEMA_VERSION),
+        ("advisor.reparse", "advisor-reparse.v1"),
+    ],
+)
+async def test_advisor_tool_results_keep_complete_raw_reply_text(
+    tool_name: str, schema_version: str
+) -> None:
+    raw = ("Synthetic prose from Bridge.\n" * 600)[:10_424]
+    raw_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    investigation_id = uuid4()
+    invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key=f"advisor-full-text-{uuid4()}",
+        tool_name=tool_name,
+        schema_version=schema_version,
+        normalized_parameters={},
+        purpose="Read complete synthetic advisor prose.",
+        reserved_budget={},
+    )
+    invocation = invocation.transition(ToolInvocationStatus.RUNNING).transition(
+        ToolInvocationStatus.SUCCEEDED
+    )
+    tool_result = ToolResult(
+        ToolInvocationStatus.SUCCEEDED,
+        output={
+            "status": "raw_advisory_text_available",
+            "usable": True,
+            "raw_output": raw,
+            "raw_output_sha256": raw_sha256,
+            "advisory_text": "[UNTRUSTED ADVISORY]\n" + raw,
+        },
+    )
+    service = SimpleNamespace(
+        _investigation_id=investigation_id,
+        _observations=None,
+        _evidence_summaries=None,
+    )
+
+    result = await OperatorToolInvocationService._result(
+        service,
+        invocation,
+        1,
+        "a" * 64,
+        replay=False,
+        tool_result=tool_result,
+    )
+
+    data = result.output["data"]["result"]
+    assert data["raw_output"] == raw
+    assert data["raw_output_sha256"] == raw_sha256
+    assert data["advisory_text"] == "[UNTRUSTED ADVISORY]\n" + raw
+
+
+@pytest.mark.asyncio
 async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() -> None:
     fixture, state, _ = await _fixture()
     idempotency_key = "legacy-invalid-advisor-input"

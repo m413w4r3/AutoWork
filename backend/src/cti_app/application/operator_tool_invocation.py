@@ -1633,7 +1633,7 @@ class OperatorToolInvocationService:
         output = stored_output["output"]
         if (
             output.get("untrusted") is not True
-            or output.get("usable", True) is False
+            or output.get("canonicalization_eligible", output.get("usable", True)) is False
             or output.get("advisor_status") == "refused"
         ):
             raise ValueError("advisor_recommendation_unavailable")
@@ -1857,7 +1857,8 @@ class OperatorToolInvocationService:
             output_data = {}
         output_data["omitted_observation_refs"] = omitted_observation_refs
         safe_data = _sanitize_json(output_data or {})
-        safe_data = _bounded_json_value(safe_data)
+        if invocation.tool_name not in {"advisor.consult", "advisor.reparse"}:
+            safe_data = _bounded_json_value(safe_data)
         output: dict[str, Any] = {
             "kind": _operator_output_kind(invocation.tool_name),
             "status": invocation.status.value,
