@@ -746,6 +746,70 @@ async def test_advisor_raw_response_link_survives_result_manifest_persistence_fa
 
 
 @pytest.mark.asyncio
+async def test_response_link_write_failure_keeps_raw_text_and_replay_does_not_post_again(
+    monkeypatch,
+) -> None:
+    from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+
+    investigation_id = uuid4()
+    raw_output = "Bridge returned text before its response link write failed."
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "e" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+    record_json = ProductionEvidenceRecorder.record_json
+
+    async def fail_response_link(self, **kwargs):
+        if kwargs.get("object_type") == "advisor_response_received":
+            raise RuntimeError("synthetic response-link write failure")
+        return await record_json(self, **kwargs)
+
+    monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_response_link)
+    context = make_context(investigation_id, key="response-link-write-failure-replay")
+    arguments = {
+        "consultation_type": "pivot_strategy",
+        "evidence_refs": [str(evidence.id)],
+    }
+
+    first = await tool.execute(arguments, context)
+
+    assert first.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert first.output["failure_stage"] == "response_archival"
+    assert first.output["raw_output_retained"] is True
+    assert first.output["raw_output"] == raw_output
+    assert first.output["response_received"] is True
+    assert first.output["confirmed_non_execution"] is False
+    assert await _advisor_response_link_payloads(tool, investigation_id) == []
+    manifest_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.object_type == "advisor_call" and item.source == "advisor.consult"
+    )
+    manifest = json.loads(
+        await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
+    )
+    assert manifest["output"]["raw_output"] == raw_output
+
+    assert tool.take_result(context.idempotency_key) is not None
+    replay = await tool.execute(arguments, context)
+
+    assert replay.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert replay.output["raw_output"] == raw_output
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_advisor_raw_response_link_replay_does_not_duplicate(monkeypatch) -> None:
     from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 
@@ -775,18 +839,31 @@ async def test_advisor_raw_response_link_replay_does_not_duplicate(monkeypatch) 
 
     monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_call_manifest)
     context = make_context(investigation_id, key="response-link-replay")
+    response_link_appends: list[UUID] = []
+    append_if_absent = tool._observations.append_if_absent
+
+    async def record_response_link_append(observation):
+        if observation.source == "advisor.consult.response":
+            response_link_appends.append(observation.id)
+        return await append_if_absent(observation)
+
+    monkeypatch.setattr(tool._observations, "append_if_absent", record_response_link_append)
 
     arguments = {
         "consultation_type": "pivot_strategy",
         "evidence_refs": [str(evidence.id)],
     }
     first = await tool.execute(arguments, context)
+    first_response_ref = first.output["response_observation_ref"]
     assert tool.take_result(context.idempotency_key) is not None
     replay = await tool.execute(arguments, context)
 
     assert first.output["output_sha256"] == replay.output["output_sha256"]
-    assert len(transport.calls) == 2
-    assert len(await _advisor_response_link_payloads(tool, investigation_id)) == 1
+    assert len(transport.calls) == 1
+    links = await _advisor_response_link_payloads(tool, investigation_id)
+    assert len(links) == 1
+    assert replay.output["response_observation_ref"] == first_response_ref
+    assert response_link_appends == [UUID(first_response_ref)]
 
 
 @pytest.mark.asyncio
