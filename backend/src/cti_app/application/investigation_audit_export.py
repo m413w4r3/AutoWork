@@ -750,7 +750,10 @@ def project_advisor_call_blob_metadata(
                         isinstance(payload.get("output"), Mapping)
                         and payload["output"].get("response_received") is True
                     ),
-                    response_persisted=isinstance(payload.get("response_observation_ref"), str),
+                    response_persisted=(
+                        isinstance(payload.get("response_observation_ref"), str)
+                        or isinstance(payload.get("output_blob_id"), str)
+                    ),
                     failure_stage=payload.get("failure_stage"),
                 ),
                 "preflight_status": _enum_token(

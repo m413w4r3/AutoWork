@@ -3150,18 +3150,27 @@ class InvestigationAdvisorTool:
                 for raw_unit in units:
                     if not isinstance(raw_unit, Mapping) or not isinstance(raw_unit.get("id"), str):
                         continue
-                    unit_refs = _unit_assertion_references(
+                    raw_unit_refs = _unit_assertion_references(
                         (raw_unit,), warnings=input_warnings, field="units.assertions"
                     )
+                    # Article and measurement links have their own validators below. Observation,
+                    # finding, and experiment links are retained only after assertion validation.
+                    unit_refs = [
+                        item for item in raw_unit_refs if item["kind"] in {"article", "measurement"}
+                    ]
                     assertion_refs_by_unit[raw_unit["id"]] = unit_refs
                     unit_assertion_refs.extend(unit_refs)
             elif "units" not in arguments and "assertions" in arguments:
-                unit_assertion_refs = _unit_assertion_references(
-                    ({"assertions": arguments.get("assertions")},),
-                    warnings=input_warnings,
-                    field="assertions",
-                    require_target_fields=True,
-                )
+                unit_assertion_refs = [
+                    item
+                    for item in _unit_assertion_references(
+                        ({"assertions": arguments.get("assertions")},),
+                        warnings=input_warnings,
+                        field="assertions",
+                        require_target_fields=True,
+                    )
+                    if item["kind"] in {"article", "measurement"}
+                ]
         explicit_observation_ids = (
             {
                 str(reference)
@@ -3170,9 +3179,6 @@ class InvestigationAdvisorTool:
             }
             if isinstance(raw_observation_refs, (list, tuple))
             else set()
-        )
-        explicit_observation_ids.update(
-            item["id"] for item in unit_assertion_refs if item["kind"] == "observation"
         )
         article_passages = _consultation_article_passages(snapshot, question)
         base: dict[str, Any] = {
@@ -3219,9 +3225,13 @@ class InvestigationAdvisorTool:
                     else identifier
                 )
                 if canonical_id != article_sha256:
-                    raise _AdvisorInputValidationError(
-                        "editorial_reference_unavailable", reference=identifier
+                    warn_input(
+                        "units.assertions" if "units" in arguments else "assertions",
+                        "optional_draft_assertion_ignored",
+                        "An assertion with an unverifiable article reference was omitted.",
                     )
+                    ignored_assertion_ref_keys.add(("article", identifier))
+                    continue
                 declared_sha256 = reference.get("sha256")
                 if declared_sha256 is not None and declared_sha256 != article_sha256:
                     warn_input(
@@ -3569,7 +3579,6 @@ class InvestigationAdvisorTool:
                                 for reference in raw_assertion_refs
                             ]
                             normalized_assertions.append(normalized_assertion)
-                    validation_failed = False
                     try:
                         validated = (
                             await self._validated_assertions(
@@ -3581,7 +3590,6 @@ class InvestigationAdvisorTool:
                     except ValueError:
                         # Optional draft annotations do not gate consultive text generation.
                         validated = []
-                        validation_failed = True
                         warn_input(
                             "units.assertions",
                             "optional_draft_assertion_ignored",
@@ -3624,20 +3632,26 @@ class InvestigationAdvisorTool:
                         seen_assertion_ids.add(assertion["id"])
                         accepted_assertions.append(assertion)
                         draft_assertions.append({**assertion, "unit_id": unit_id})
-                    if not validation_failed:
-                        assertion_refs_by_unit[unit_id] = [
-                            {
-                                "kind": reference["kind"],
-                                "id": reference["id"],
-                                "sha256": reference["sha256"],
-                            }
-                            for assertion in accepted_assertions
-                            for reference in assertion["refs"]
-                        ] + [
-                            reference
-                            for reference in assertion_refs_by_unit.get(unit_id, ())
-                            if reference["kind"] in {"article", "measurement"}
-                        ]
+                    accepted_refs = [
+                        {
+                            "kind": reference["kind"],
+                            "id": reference["id"],
+                            "sha256": reference["sha256"],
+                        }
+                        for assertion in accepted_assertions
+                        for reference in assertion["refs"]
+                    ]
+                    special_refs = [
+                        reference
+                        for reference in assertion_refs_by_unit.get(unit_id, ())
+                        if reference["kind"] in {"article", "measurement"}
+                    ]
+                    assertion_refs_by_unit[unit_id] = [*accepted_refs, *special_refs]
+                    explicit_observation_ids.update(
+                        reference["id"]
+                        for reference in accepted_refs
+                        if reference["kind"] == "observation"
+                    )
                     unit_refs = [
                         ref for assertion in accepted_assertions for ref in assertion["refs"]
                     ]
@@ -3669,6 +3683,18 @@ class InvestigationAdvisorTool:
                         "An unverifiable optional assertion was omitted.",
                     )
                 base["assertions"] = draft_assertions
+                validated_refs = [
+                    dict(reference)
+                    for assertion in draft_assertions
+                    for reference in assertion["refs"]
+                ]
+                unit_assertion_refs.extend(validated_refs)
+                base["_explicit_assertion_refs"] = [dict(item) for item in unit_assertion_refs]
+                explicit_observation_ids.update(
+                    reference["id"]
+                    for reference in validated_refs
+                    if reference["kind"] == "observation"
+                )
             else:
                 base["assertions"] = []
                 if "assertions" in arguments and arguments.get("assertions") not in (None, (), []):
@@ -4082,25 +4108,33 @@ class InvestigationAdvisorTool:
                         measurement_by_id
                     )
                     if missing_measurement_ids:
-                        missing_measurement_id = sorted(missing_measurement_ids)[0]
-                        raise _AdvisorInputValidationError(
-                            "editorial_reference_unavailable",
-                            reference=missing_measurement_id,
+                        warn_input(
+                            "units.assertions" if "units" in arguments else "assertions",
+                            "optional_draft_assertion_ignored",
+                            "An assertion with an unverifiable measurement reference was omitted.",
+                        )
+                        ignored_assertion_ref_keys.update(
+                            ("measurement", item) for item in missing_measurement_ids
                         )
                     measurement_rows = [
                         measurement_by_id[reference["id"]]
                         for reference in base.get("_explicit_assertion_refs", ())
                         if reference["kind"] == "measurement"
+                        and reference["id"] in measurement_by_id
                     ]
                 base["measurements"] = measurement_rows
-                for reference in base.get("_explicit_assertion_refs", ()):
+                for reference in list(base.get("_explicit_assertion_refs", ())):
                     if reference["kind"] != "measurement":
                         continue
                     measurement_row = measurement_by_id.get(reference["id"])
                     if measurement_row is None:
-                        raise _AdvisorInputValidationError(
-                            "editorial_reference_unavailable", reference=reference["id"]
+                        warn_input(
+                            "units.assertions" if "units" in arguments else "assertions",
+                            "optional_draft_assertion_ignored",
+                            "An assertion with an unverifiable measurement reference was omitted.",
                         )
+                        ignored_assertion_ref_keys.add(("measurement", reference["id"]))
+                        continue
                     actual_sha256 = hashlib.sha256(
                         json.dumps(
                             measurement_row,
@@ -4117,13 +4151,14 @@ class InvestigationAdvisorTool:
                             "An assertion with an unverifiable measurement hash was omitted.",
                         )
                         ignored_assertion_ref_keys.add(("measurement", reference["id"]))
-                        base["_explicit_assertion_refs"] = [
-                            item
-                            for item in base.get("_explicit_assertion_refs", ())
-                            if (item["kind"], item["id"]) not in ignored_assertion_ref_keys
-                        ]
                         continue
                     reference["sha256"] = actual_sha256
+                if ignored_assertion_ref_keys:
+                    base["_explicit_assertion_refs"] = [
+                        item
+                        for item in base.get("_explicit_assertion_refs", ())
+                        if (item["kind"], item["id"]) not in ignored_assertion_ref_keys
+                    ]
         elif consultation_type == "yara_draft":
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")

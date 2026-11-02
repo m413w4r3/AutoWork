@@ -137,9 +137,22 @@ def derive_advisor_consult_status(
     invocation_status: Any = None,
     response_received: Any = False,
     response_persisted: Any = False,
+    advisor_observation_present: Any = False,
     failure_stage: Any = None,
 ) -> str:
-    """Derive a compact Bridge consultation status from persisted stage facts."""
+    """Map consultation facts using this precedence table:
+
+    - needs-review or ambiguous submission -> ``ambiguous``
+    - failed, denied, unavailable, or another failure -> ``error``
+    - persisted response -> ``response_persisted``
+    - received response without persistence -> ``response_received``
+    - prompt stored or Bridge post started -> ``sent_to_bridge``
+    - advisor started or invocation running -> ``dossier_preparing``
+    - no timestamps and not running -> ``received``
+
+    A succeeded/partial invocation with its advisor observation is persisted even if
+    legacy metadata has no timestamps.
+    """
     stages = (
         {key for key, value in stage_timestamps_utc.items() if isinstance(key, str) and value}
         if isinstance(stage_timestamps_utc, Mapping)
@@ -155,20 +168,15 @@ def derive_advisor_consult_status(
     submission_state = submission_state if isinstance(submission_state, str) else None
     invocation_status = invocation_status if isinstance(invocation_status, str) else None
     failure_stage = failure_stage if isinstance(failure_stage, str) else None
+    ambiguous_states = {"ambiguous", "submission_ambiguous", "external_state_unknown"}
     if (
         invocation_status == ToolInvocationStatus.NEEDS_REVIEW.value
-        or submission_state == "external_state_unknown"
-        or invocation_stage == "timeout_ambiguous"
+        or submission_state in ambiguous_states
+        or submission_status in ambiguous_states
+        or invocation_stage in {"timeout_ambiguous", "submission_ambiguous"}
+        or failure_stage in {"provider_submission_ambiguous", "submission_ambiguous"}
     ):
         return "ambiguous"
-    if response_persisted is True or stages.intersection(
-        {"response_persisted", "manifest_persisted"}
-    ):
-        return "response_persisted"
-    if response_received is True or stages.intersection(
-        {"bridge_response_received", "output_stored"}
-    ):
-        return "response_received"
     if (
         failure_stage
         or submission_status in {"failed", "blocked", "invalid_output", "unavailable"}
@@ -182,7 +190,21 @@ def derive_advisor_consult_status(
     ):
         return "error"
     if (
-        "bridge_post_started" in stages
+        response_persisted is True
+        or stages.intersection({"response_persisted", "manifest_persisted"})
+        or (
+            advisor_observation_present is True
+            and invocation_status
+            in {ToolInvocationStatus.SUCCEEDED.value, ToolInvocationStatus.PARTIAL.value}
+        )
+    ):
+        return "response_persisted"
+    if response_received is True or stages.intersection(
+        {"bridge_response_received", "output_stored"}
+    ):
+        return "response_received"
+    if (
+        stages.intersection({"prompt_stored", "bridge_post_started"})
         or invocation_stage in {"submitted", "run_confirmed"}
         or submission_state in {"submission_attempted", "post_submission", "result_obtained"}
     ):

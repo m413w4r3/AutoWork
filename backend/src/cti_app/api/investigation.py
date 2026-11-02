@@ -2326,39 +2326,44 @@ async def _advisor_consult_statuses(
         if getattr(invocation, "tool_name", None) != "advisor.consult":
             continue
         metadata: Mapping[str, Any] = {}
-        if evidence_summaries is not None:
-            for observation_id in reversed(tuple(getattr(invocation, "response_refs", ()))):
-                observation = observations_by_id.get(observation_id)
-                if (
-                    observation is None
-                    or getattr(observation, "source", None) != "advisor.consult"
-                    or getattr(observation, "object_type", None) != "advisor_call"
-                ):
-                    continue
-                try:
-                    payload = await evidence_summaries.summary(observation)
-                except Exception:
-                    continue
-                if (
-                    isinstance(payload, Mapping)
-                    and payload.get("schema") == "operator-advisor-call.v1"
-                ):
-                    metadata = payload
-                    break
+        advisor_observation_present = False
+        for observation_id in reversed(tuple(getattr(invocation, "response_refs", ()))):
+            observation = observations_by_id.get(observation_id)
+            if (
+                observation is None
+                or getattr(observation, "source", None) != "advisor.consult"
+                or getattr(observation, "object_type", None) != "advisor_call"
+            ):
+                continue
+            advisor_observation_present = True
+            if evidence_summaries is None:
+                break
+            try:
+                payload = await evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if isinstance(payload, Mapping) and payload.get("schema") == "operator-advisor-call.v1":
+                metadata = payload
+                break
         stage_timestamps = metadata.get("stage_timestamps_utc")
         if not isinstance(stage_timestamps, Mapping):
             stage_timestamps = {}
+        output = metadata.get("output")
+        if not isinstance(output, Mapping):
+            output = {}
         statuses[invocation.id] = derive_advisor_consult_status(
             stage_timestamps_utc=stage_timestamps,
             invocation_stage=metadata.get("invocation_stage"),
             submission_status=metadata.get("submission_status"),
             submission_state=metadata.get("submission_state"),
             invocation_status=invocation.status,
-            response_received=(
-                isinstance(metadata.get("output"), Mapping)
-                and metadata["output"].get("response_received") is True
+            response_received=output.get("response_received") is True,
+            response_persisted=(
+                isinstance(metadata.get("response_observation_ref"), str)
+                or isinstance(metadata.get("output_blob_id"), str)
+                or output.get("response_persisted") is True
             ),
-            response_persisted=isinstance(metadata.get("response_observation_ref"), str),
+            advisor_observation_present=advisor_observation_present,
             failure_stage=metadata.get("failure_stage"),
         )
     return statuses

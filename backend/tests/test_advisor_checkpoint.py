@@ -20,6 +20,17 @@ from cti_app.domain.investigation import ToolInvocationStatus
             "dossier_preparing",
         ),
         (
+            {
+                "stage_timestamps_utc": {"advisor_started": "2026-11-02T00:00:00Z"},
+                "invocation_status": ToolInvocationStatus.RUNNING,
+            },
+            "dossier_preparing",
+        ),
+        (
+            {"stage_timestamps_utc": {"prompt_stored": "2026-11-02T00:00:00Z"}},
+            "sent_to_bridge",
+        ),
+        (
             {"stage_timestamps_utc": {"bridge_post_started": "2026-11-02T00:00:00Z"}},
             "sent_to_bridge",
         ),
@@ -31,7 +42,39 @@ from cti_app.domain.investigation import ToolInvocationStatus
             {"stage_timestamps_utc": {"response_persisted": "2026-11-02T00:00:00Z"}},
             "response_persisted",
         ),
+        (
+            {
+                "invocation_status": ToolInvocationStatus.SUCCEEDED,
+                "advisor_observation_present": True,
+            },
+            "response_persisted",
+        ),
+        (
+            {
+                "invocation_status": ToolInvocationStatus.PARTIAL,
+                "advisor_observation_present": True,
+            },
+            "response_persisted",
+        ),
+        ({"response_received": True}, "response_received"),
+        (
+            {
+                "invocation_status": ToolInvocationStatus.NEEDS_REVIEW,
+                "advisor_observation_present": True,
+            },
+            "ambiguous",
+        ),
+        ({"submission_state": "submission_ambiguous"}, "ambiguous"),
         ({"invocation_stage": "pretransport_failure"}, "error"),
+        (
+            {
+                "invocation_status": ToolInvocationStatus.FAILED,
+                "response_persisted": True,
+            },
+            "error",
+        ),
+        ({"invocation_status": ToolInvocationStatus.POLICY_DENIED}, "error"),
+        ({"invocation_status": ToolInvocationStatus.UNAVAILABLE}, "error"),
         ({"invocation_status": ToolInvocationStatus.NEEDS_REVIEW}, "ambiguous"),
     ],
 )

@@ -6378,7 +6378,7 @@ async def test_draft_text_unit_assertion_refs_load_article_and_measurement_bodie
 
 @pytest.mark.parametrize("bad_reference", ["sha_mismatch", "foreign_observation"])
 @pytest.mark.asyncio
-async def test_draft_text_unit_assertion_reference_failure_is_visible_in_batch(
+async def test_draft_text_unit_assertion_reference_failures_are_omitted_in_batch(
     bad_reference: str,
 ) -> None:
     investigation_id = uuid4()
@@ -6453,23 +6453,13 @@ async def test_draft_text_unit_assertion_reference_failure_is_visible_in_batch(
             key=f"operator:advisor:unit-assertion-{bad_reference}",
         ),
     )
-    if bad_reference == "sha_mismatch":
-        assert len(transport.calls) == 1
-        input_warnings = result.output.get("input_warnings", ())
-        assert any(
-            item["field"] == "units.assertions"
-            and item["code"] == "optional_draft_assertion_ignored"
-            for item in input_warnings
-        ), result.output
-    else:
-        assert transport.calls == []
-        assert result.output["preflight_cause"]["ref"] == str(reference_id)
-        statuses = result.output["batch_statuses"]
-        assert statuses[0]["preflight_cause"]["ref"] == str(reference_id)
-        assert statuses[0]["additional_missing_ref_count"] == 0
-        assert statuses[0]["refusal_guidance"]
-        assert result.output["additional_missing_ref_count"] == 0
-        assert result.output["refusal_guidance"]
+    assert len(transport.calls) == 1, result.output
+    assert result.error_code is None, result.output
+    input_warnings = result.output.get("input_warnings", ())
+    assert any(
+        item["field"] == "units.assertions" and item["code"] == "optional_draft_assertion_ignored"
+        for item in input_warnings
+    ), result.output
 
 
 @pytest.mark.asyncio
