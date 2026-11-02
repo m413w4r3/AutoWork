@@ -15,6 +15,7 @@ from pathlib import Path
 
 SKILL_NAMES = (
     "autowork-cti-investigation-loop",
+    "autowork-bridge-collaboration",
     "autowork-tool-strategy",
     "autowork-artifact-triage",
     "autowork-cti-pivot-strategy",

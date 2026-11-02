@@ -38,6 +38,8 @@ Ne déduire ni le format ni le comportement d'une simple extension, d'un nom VT 
 
 Pour une donnée opaque .NET, utiliser d'abord field.data.read si offert (FieldRVA → octets bornés) ; xxd reste une voie complémentaire si un offset fichier fiable est connu. Chercher ensuite chaînes/structures exploitables, invariants et pistes de pivot sans exécuter le malware.
 
+Quand l'inventaire initial est établi (échantillons acquis, signalés, associés, mesurables), c'est le moment de demander un plan à Bridge (`autowork-bridge-collaboration`), avant d'approfondir un seul échantillon.
+
 ## Sortie de triage
 
 Noter l'objet, le format étayé, la piste à forte valeur et le prochain outil. Dès qu'un motif, un indice de C2 ou un nouvel enfant est découvert, passer à la détection ou au pivot ; ne pas attendre un triage exhaustif.

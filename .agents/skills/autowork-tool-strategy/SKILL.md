@@ -7,6 +7,10 @@ description: Choisir rapidement les outils CTI utiles à l'analyse, aux règles 
 
 Ce skill n'est PAS un catalogue fixe. L'autorité est available_tools, unavailable_tools, blocked_capabilities, status et le schéma effectif de CETTE enquête. Un outil historique ne vaut pas permission actuelle.
 
+## Un appel auditable
+
+Le `purpose` de chaque appel est le journal de décision : objectif, motif synthétique du choix, ce que le résultat doit apprendre, et si l'appel donne suite à un conseil Bridge (voir `autowork-bridge-collaboration`). Une phrase factuelle suffit ; ne pas y mettre de raisonnement privé ni de secret.
+
 ## Découverte proportionnée
 
 1. Au début de la session, lire l'inventaire réel available_tools et les capacités importantes. Ensuite, consulter **seulement** le schéma de l'outil choisi lorsqu'il est inconnu, a changé ou refuse un argument ; éviter les relectures systématiques.

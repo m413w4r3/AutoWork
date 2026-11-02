@@ -6,8 +6,9 @@
 
 Favoriser **invariants techniques, règles YARA/Suricata candidates, description du protocole C2 et nouveaux échantillons**. Supprimer les obligations méthodologiques ajoutées sans nécessité : nombre minimal d'hypothèses/tests/pivots ; expérience ou finding à chaque lecture ; goodware et holdout préalables à la première candidate. L'inventaire available_tools, les schémas et les droits courants restent l'autorité.
 
-Les neuf guides vivent dans .agents/skills et sont indexés dans .agents/skills/OPERATOR-CTI.md :
+Les dix guides vivent dans .agents/skills et sont indexés dans .agents/skills/OPERATOR-CTI.md :
 - autowork-cti-investigation-loop
+- autowork-bridge-collaboration
 - autowork-tool-strategy
 - autowork-artifact-triage
 - autowork-cti-pivot-strategy
@@ -33,7 +34,7 @@ Sur l'hôte d'orchestration autorisé, **avant de démarrer** l'opérateur :
 python3 scripts/ops/stage_operator_cti_skills.py --workspace /chemin/vers/session-autorisée
 ~~~
 
-Le script refuse d'écraser un bundle déjà présent. Il copie exclusivement les neuf SKILL.md et crée un manifeste local contenant leurs SHA-256. Il ne lit pas les dossiers secrets, ne contacte aucun fournisseur et ne lit aucune trace d'investigation.
+Le script refuse d'écraser un bundle déjà présent. Il copie exclusivement les dix SKILL.md et crée un manifeste local contenant leurs SHA-256. Il ne lit pas les dossiers secrets, ne contacte aucun fournisseur et ne lit aucune trace d'investigation.
 
 Pour une nouvelle session Claude Code, si son répertoire de travail est bien ce workspace, il est possible d'ajouter l'option --claude afin de créer des symlinks .claude/skills vers ce bundle. Pour Codex, vérifier la découverte .agents/skills sur la version installée ; un runtime CTI utilisant un autre mécanisme doit recevoir un pointeur explicite dans son prompt.
 
@@ -55,7 +56,7 @@ Tester avec fixtures ou replay hors ligne, sans appel de fournisseur live ni mal
 8. **C2 / Suricata :** sans capture, description statique du protocole et candidate non testée ; avec capture, validation/replay offline lorsque disponibles.
 9. **Isolation :** un opérateur neuf découvre les guides sans données d'une autre enquête et conserve G2/TLP et l'API comme autorité.
 
-Mesures utiles : invariants nouveaux, candidates YARA/Suricata produites, protocole C2 documenté, nouveaux candidats pertinents, règle améliorée grâce aux variantes et limites connues. Les scénarios de replay ci-dessus servent à mesurer la qualité des skills ; **ils ne constituent pas neuf formalités par investigation**.
+Mesures utiles : invariants nouveaux, candidates YARA/Suricata produites, protocole C2 documenté, nouveaux candidats pertinents, règle améliorée grâce aux variantes et limites connues. Les scénarios de replay ci-dessus servent à mesurer la qualité des skills ; **ils ne constituent pas des formalités obligatoires par investigation**.
 
 ## Validation automatique du paquet
 
@@ -63,7 +64,7 @@ Mesures utiles : invariants nouveaux, candidates YARA/Suricata produites, protoc
 python3 scripts/ops/test_stage_operator_cti_skills.py
 ~~~
 
-Ce test contrôle la présence des neuf guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
+Ce test contrôle la présence des dix guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
 
 La sélection des consultations Bridge, les formes de mesures valides, les règles YARA candidates et la rédaction `draft_text` sont décrites dans [l'audit anti-friction Bridge](bridge-friction-audit-2026-11-01.md). Les opportunités de consultation ne sont pas des étapes obligatoires ni des quotas.
 

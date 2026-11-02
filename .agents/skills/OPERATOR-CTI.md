@@ -5,6 +5,7 @@ Ce registre est destiné à l'orchestrateur qui prépare une session CTI. Les sk
 | Déclencheur précis | Skill |
 | --- | --- |
 | Nouvelle question / expérience / arrêt | autowork-cti-investigation-loop |
+| Démarrage, résultat significatif, YARA, avant pivots VT, contradiction, rédaction : consulter/utiliser Bridge | autowork-bridge-collaboration |
 | Choisir un outil, budget, refus, CAS, besoin de bytes | autowork-tool-strategy |
 | Nouvel artefact, type inconnu, archive, script | autowork-artifact-triage |
 | Nouvelle relation/hash/IOC/similarité ; quel prochain test ? | autowork-cti-pivot-strategy |
@@ -14,7 +15,7 @@ Ce registre est destiné à l'orchestrateur qui prépare une session CTI. Les sk
 | Proposition, test, comparaison, révision YARA avec Bridge | autowork-yara-bridge-workflow |
 | Protocole C2, champs réseau, signature Suricata candidate | autowork-network-protocol-detection |
 
-**Ne pas précharger les neuf SKILL.md intégralement.** L'opérateur lit uniquement les guides utiles. Une inspection simple n'exige pas de charger systématiquement la boucle, le guide d'outils et plusieurs spécialistes.
+**Ne pas précharger tous les SKILL.md intégralement** (lire la boucle et la collaboration Bridge au démarrage, les autres à la demande). L'opérateur lit uniquement les guides utiles. Une inspection simple n'exige pas de charger systématiquement la boucle, le guide d'outils et plusieurs spécialistes.
 
 **Priorité métier : invariants → YARA/Suricata candidates → description C2 → pivots VT → nouveaux échantillons → révision des règles.** Ni nombre minimal d'hypothèses/tests/pivots, ni goodware/holdout obligatoire pour la première candidate, ni PCAP indispensable au modèle statique du protocole. Les garde-fous du backend et les autorisations courantes demeurent l'autorité.
 
@@ -22,7 +23,7 @@ Les compétences YARA/Bridge et les analyses PE ne sont pas des motifs de collec
 
 ## Isolation de l'enquête
 
-Le code AutoWork et les consignes des **agents de développement Paseo** ne sont pas automatiquement accessibles à l'opérateur CTI isolé. L'orchestrateur peut copier uniquement les neuf guides génériques dans le répertoire autorisé de la nouvelle session via scripts/ops/stage_operator_cti_skills.py, avant le démarrage. Aucun journal, mémoire, hash d'enquête, finding ou compte rendu antérieur n'est copié. Dans le brief de session, autoriser explicitement la lecture du répertoire de skills déposé ; ne pas autoriser l'accès au dépôt général, aux secrets ou aux autres runs.
+Le code AutoWork et les consignes des **agents de développement Paseo** ne sont pas automatiquement accessibles à l'opérateur CTI isolé. L'orchestrateur peut copier uniquement les guides génériques dans le répertoire autorisé de la nouvelle session via scripts/ops/stage_operator_cti_skills.py, avant le démarrage. Aucun journal, mémoire, hash d'enquête, finding ou compte rendu antérieur n'est copié. Dans le brief de session, autoriser explicitement la lecture du répertoire de skills déposé ; ne pas autoriser l'accès au dépôt général, aux secrets ou aux autres runs.
 
 Pour Claude Code, les nouveaux dossiers sont également référencés par symlinks de dépôt dans .claude/skills ; cela ne prouve PAS que Paseo ou le runtime CTI les ont chargés. Vérifier réellement l'inventaire et la lecture dans une session propre. Voir docs/operations/operator-skills.md.
 

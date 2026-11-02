@@ -17,6 +17,10 @@ Un finding n'est ni une hypothèse ni une réponse Bridge. Proposer un finding *
 6. Conserver les IDs/SHA des observations, la version et l'invocation qui soutiennent **exactement** l'assertion. Si la même constatation existe déjà, ne pas la dupliquer.
 7. Après persistance, relire finding et provenance ; vérifier qu'aucun champ ne dépasse la couverture des observations.
 
+## Audit et prose livrée
+
+La provenance (observations, versions, auteurs, hashes) vit dans la couche canonique. Le texte destiné au lecteur n'imprime aucun marqueur interne (`SUPPORTED`, `PARTIAL`, `bridge_authored`, `observation_ref`, `confidence=`) ; les affirmations techniques importantes doivent rester retrouvables dans l'état canonique par un auditeur externe.
+
 ## Comparaison de portée
 
 | Mesure | Fait pouvant être supported | Extrapolation interdite |

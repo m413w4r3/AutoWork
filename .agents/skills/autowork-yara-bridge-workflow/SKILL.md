@@ -30,6 +30,10 @@ Demander à Bridge de critiquer spécificité, fragilité, faux positifs, condit
 
 Le Bridge peut produire une règle réellement utile : `rule.propose_bridge` conserve sa source exacte persistée comme candidate attribuée, sans exiger un lien de mesure pour chaque string ; les strings non mesurées gardent un `justification.status=gap`. En cas de `measurements_invalid`, regarder `measurement_errors` (forme acceptée : `content_pattern_id` OU quartet `blob_id, kind, offset, value`). Ne répéter aucune soumission ambiguë ; si le texte a été persisté mais mal parsé, envisager `advisor.reparse` sans nouvel envoi.
 
+## 3 bis. Boucle de révision
+
+Bridge → candidate → compilation → test → lecture des résultats par hash → retour à Bridge avec ces résultats → nouvelle version. Transmettre à chaque retour ce qui a été **mesuré** (matches, non-matches, non mesurables, contre-exemples), pas une impression. Sur faux négatif, chercher les motifs absents, la condition et l'appartenance réelle du sample au groupe ; sur faux positif, la sous-expression trop générique et l'origine du contre-exemple. Ne pas modifier sans mesure ; consigner dans le `purpose` suivant la disposition du conseil (voir `autowork-bridge-collaboration`).
+
 ## 4. Enregistrer et tester
 
 - Voie Bridge : rule.propose_bridge exige les champs réels bridge_observation_id, bridge_invocation_id et rule_source_sha256 du **rule_source complet persisté** ; ne pas les inventer à partir d'un résumé. Vérifier la version du schéma avant l'appel.
@@ -52,6 +56,7 @@ Ne pas optimiser au hasard jusqu'à faire matcher l'échantillon test. Le status
 - Bridge invocation et observation si utilisées ; conseil accepté/rejeté avec raison.
 - Résultats réellement disponibles : corpus exact par rôle, moteur s'il a exécuté, matches/non_matches/non_measurable et limites ; ne pas inventer les tests absents.
 - Détection candidate, statut de validation réel, risques de faux positifs et condition de reprise.
+- Rédaction : faire expliquer la règle par Bridge (`draft_text` : motifs retenus, caractéristiques représentées, condition, échantillons testés, couverture, limites) puis vérifier le texte contre les tests ; la source YARA exacte reste un fichier d'annexe distinct, identifié par son SHA-256.
 - Approbation/publication : exclusivement humains, hors de ce skill.
 
 **Oracle :** dès qu'un invariant discriminant est mesuré, l'agent produit une candidate YARA et la teste si possible, puis utilise ses résultats pour découvrir de nouveaux échantillons. Il ne confond pas candidate/experimental/tested, et l'absence de goodware/holdout ne bloque pas la première version.

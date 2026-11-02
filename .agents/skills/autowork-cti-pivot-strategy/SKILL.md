@@ -23,6 +23,10 @@ Pour une simple recherche de hash ou de relation passive VT autorisée, ne pas i
 - Détection : motifs YARA traçables, positifs qualifiés et goodware ; correspondance ≠ attribution.
 - Texte de renseignement : revendication source, contradiction et observation indépendante.
 
+## Stratégie avant la campagne
+
+Avant de lancer des recherches VT, demander à Bridge (`pivot_strategy`) des pivots exécutables et discriminants à partir des invariants **vérifiés** (distingués des hypothèses), des résultats YARA, des relations déjà consultées et des outils VT réellement exposés ; Bridge ne doit proposer ni commande ni filtre absents du registre. Choisir ensuite soi-même les pivots dont le résultat peut le plus modifier l'évaluation du corpus : un seul peut suffire, mais un résultat vide n'arrête pas la recherche tant qu'une alternative discriminante reste plausible. Le `purpose` de chaque appel VT dit le critère, son origine, pourquoi il pourrait trouver des variantes et sa limite : c'est ce qui rend la campagne auditable.
+
 ## Boucle découverte ↔ détection
 
 - Choisir **un** pivot prometteur quand il suffit. Comparer plusieurs options seulement s'il y a une vraie hésitation coût/valeur ; aucun minimum de deux ou trois tests.
@@ -31,6 +35,8 @@ Pour une simple recherche de hash ou de relation passive VT autorisée, ne pas i
 - Lorsqu'un nouvel échantillon est associé/acquis, comparer des invariants (ressources, constantes, fonctions, protocoles) et tester la YARA existante si possible. Les matches et non-matches mesurables guident la révision ; les octets absents ne sont pas un non-match.
 - Un motif YARA ou un champ C2 peut devenir pivot vers de nouveaux objets ; une variante nouvellement trouvée peut améliorer YARA/Suricata et la description du protocole.
 - Enregistrer une expérience ou un finding lorsque le résultat le justifie ; ne pas imposer une mutation canonique après chaque lecture passive.
+
+Un candidat qui ne correspond pas peut servir de contre-exemple pour la YARA ; ne pas le promouvoir en positif de famille par défaut. Un match YARA ou une relation VT ne prouve pas à lui seul la parenté. Après un candidat qualifié, retourner vers Bridge (`yara_draft`) avec les différences et les matches mesurés.
 
 Ne pas fabriquer de corroboration avec une circularité entre rapports. Une relation fournisseur, un import générique ou un imphash ne prouvent pas à eux seuls une chaîne commune ; ils peuvent néanmoins constituer une piste raisonnable.
 

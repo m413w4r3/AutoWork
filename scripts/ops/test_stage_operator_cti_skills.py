@@ -17,11 +17,11 @@ SPEC.loader.exec_module(module)
 
 
 class StageSkillsTests(unittest.TestCase):
-    def test_stage_all_nine_with_exact_hash_manifest(self) -> None:
+    def test_stage_all_skills_with_exact_hash_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)
             hashes = module.stage(workspace)
-            self.assertEqual(len(hashes), 10)  # Nine SKILL.md + index.
+            self.assertEqual(len(hashes), len(module.SKILL_NAMES) + 1)  # SKILL.md files + index.
             bundle = workspace / ".agents" / "skills"
             manifest = json.loads((bundle / "manifest.json").read_text())
             self.assertEqual(manifest["sha256_by_skill"], hashes)

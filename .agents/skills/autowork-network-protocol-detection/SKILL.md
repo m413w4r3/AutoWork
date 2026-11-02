@@ -7,6 +7,10 @@ description: Reconstruire le protocole C2 depuis code statique et captures dispo
 
 **But :** obtenir un modèle partiel utile du C2, identifier les invariants de messages et, si possible, proposer une règle Suricata. Ce n'est pas une étape de validation imposée avant YARA ou les pivots. Aucune interaction live avec un C2 et aucune exécution de sample.
 
+## Avant la rétro-ingénierie
+
+Si l'article décrit mal les échanges et que le code est exploitable, c'est une branche prioritaire. Demander d'abord à Bridge (`plan_investigation`, avec les méthodes, données et octets déjà acquis) quelles méthodes cibler, où chercher les messages et leur sérialisation, quelles fonctions cryptographiques comprendre, quels champs serviraient une signature réseau et quels tests passifs départageraient les hypothèses. Après l'analyse, faire rédiger par Bridge (`draft_text`, `figure_plan`) la section protocole : le schéma ne contient que les étapes établies et rend les inconnues visibles, sans message ni transaction inventés. Les secrets embarqués utiles à l'analyse vont dans des annexes à accès contrôlé.
+
 ## Sans capture : la voie statique est utile
 
 À partir de code PE/.NET/ELF, strings décodées et ressources, inspecter sélectivement :
