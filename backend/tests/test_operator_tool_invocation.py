@@ -1784,6 +1784,57 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     assert "refused" in _trace(refused.invocation)
     assert "Le pivot VT ne discrimine pas assez" in _trace(refused.invocation)
 
+    # A whole-consultation disposition needs no structured recommendation index.
+    latest_state = await fixture.states.get(fixture.investigation_id)
+    adapted = await service.invoke(
+        tool_name="sample.analyze",
+        schema_version="1",
+        arguments={"query": "adapted"},
+        purpose=format_advisor_trace_purpose(
+            "Adapter le conseil Bridge à la mesure disponible.",
+            recommendation={
+                "invocation_id": str(advice.invocation.id),
+                "decision": "adapted",
+                "reason": "Je mesure d'abord la fonction avant le pivot VT proposé.",
+            },
+        ),
+        expected_version=latest_state.version,
+        idempotency_key="advisor-recommendation-adapted",
+    )
+    assert "adapted" in _trace(adapted.invocation)
+    assert "Je mesure d'abord la fonction" in _trace(adapted.invocation)
+
+    latest_state = await fixture.states.get(fixture.investigation_id)
+    with pytest.raises(OperatorToolInvocationError) as unknown_consultation:
+        await service.invoke(
+            tool_name="sample.analyze",
+            schema_version="1",
+            arguments={"query": "unknown-consultation"},
+            purpose=format_advisor_trace_purpose(
+                "Suivre un conseil inexistant.",
+                recommendation={"invocation_id": str(uuid4()), "decision": "accepted"},
+            ),
+            expected_version=latest_state.version,
+            idempotency_key="advisor-recommendation-unknown",
+        )
+    assert unknown_consultation.value.code == "advisor_recommendation_unavailable"
+    with pytest.raises(OperatorToolInvocationError) as missing_reason:
+        await service.invoke(
+            tool_name="sample.analyze",
+            schema_version="1",
+            arguments={"query": "missing-reason"},
+            purpose=format_advisor_trace_purpose(
+                "Écarter sans motif.",
+                recommendation={
+                    "invocation_id": str(advice.invocation.id),
+                    "decision": "refused",
+                },
+            ),
+            expected_version=latest_state.version,
+            idempotency_key="advisor-recommendation-no-reason",
+        )
+    assert missing_reason.value.code == "operator_payload_invalid_or_sensitive"
+
     current_state = await fixture.states.get(fixture.investigation_id)
     app = FastAPI()
     app.include_router(router)

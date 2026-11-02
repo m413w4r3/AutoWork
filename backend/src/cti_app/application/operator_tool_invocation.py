@@ -1599,12 +1599,16 @@ class OperatorToolInvocationService:
             or advisor_invocation.tool_name != "advisor.consult"
             or advisor_invocation.status
             not in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-            or self._observations is None
-            or self._evidence_summaries is None
         ):
             raise ValueError("advisor_recommendation_unavailable")
 
         recommendation_index = recommendation.get("index")
+        if recommendation_index is None:
+            # Disposition of a whole prose consultation: Bridge advice is a working
+            # hypothesis, so only the consultation itself must be canonical.
+            return
+        if self._observations is None or self._evidence_summaries is None:
+            raise ValueError("advisor_recommendation_unavailable")
         stored_output: Mapping[str, Any] | None = None
         for observation_id in advisor_invocation.response_refs:
             observation = await self._observations.get(observation_id)

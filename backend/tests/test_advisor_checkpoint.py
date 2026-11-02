@@ -6,7 +6,11 @@ from uuid import uuid4
 
 import pytest
 
-from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
+from cti_app.application.advisor_checkpoint import (
+    derive_advisor_consult_status,
+    format_advisor_trace_purpose,
+    split_advisor_trace_purpose,
+)
 from cti_app.application.investigation_operator_view import _invocation_view
 from cti_app.domain.investigation import ToolInvocationStatus
 
@@ -190,3 +194,35 @@ async def test_api_consult_status_requires_response_link_or_manifest_persisted()
     assert blob_only_status[invocation_id] == "response_received"
     assert manifest_status[invocation_id] == "response_persisted"
     assert unlinked_status[invocation_id] == "received"
+
+
+def test_prose_disposition_of_a_consultation_needs_no_recommendation_index() -> None:
+    advisor = str(uuid4())
+    purpose = format_advisor_trace_purpose(
+        "Mesurer la fonction avant le pivot.",
+        recommendation={"invocation_id": advisor, "decision": "deferred", "reason": "Pas encore"},
+    )
+    trace, human = split_advisor_trace_purpose(purpose)
+    assert human == "Mesurer la fonction avant le pivot."
+    assert trace == {
+        "recommendation": {"invocation_id": advisor, "decision": "deferred", "reason": "Pas encore"}
+    }
+
+
+@pytest.mark.parametrize(
+    "recommendation",
+    [
+        {"decision": "adapted"},
+        {"decision": "refused", "reason": " "},
+        {"decision": "maybe", "reason": "x"},
+        {"index": 1, "decision": "adapted", "reason": "x"},
+        {"index": 5, "decision": "accepted"},
+        {"index": True, "decision": "accepted"},
+    ],
+)
+def test_recommendation_trace_keeps_its_bounded_contract(recommendation: dict[str, object]) -> None:
+    purpose = format_advisor_trace_purpose(
+        "Action choisie.", recommendation={"invocation_id": str(uuid4()), **recommendation}
+    )
+    with pytest.raises(ValueError, match="advisor_trace_invalid"):
+        split_advisor_trace_purpose(purpose)

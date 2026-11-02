@@ -956,7 +956,7 @@ def _operator_trace(invocation: Any) -> dict[str, Any]:
     if recommendation is not None:
         projected["recommendation"] = {
             "advisor_invocation_id": recommendation["invocation_id"],
-            "index": recommendation["index"],
+            "index": recommendation.get("index"),
             "decision": recommendation["decision"],
             "reason_sha256": _sha256_value(recommendation.get("reason")),
             "reason_included": False,

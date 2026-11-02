@@ -12,6 +12,9 @@ from cti_app.domain.investigation import BudgetDimension, ToolInvocationStatus, 
 PURPOSE_MARKER = "[[advisor-trace.v1]]"
 MAX_CHECKPOINT_ID_CHARS = 128
 MAX_CHECKPOINT_REASON_CHARS = 256
+# A disposition without ``index`` covers a whole prose consultation; with an ``index`` it
+# targets one structured recommendation and keeps the stricter accepted/refused contract.
+PROSE_DISPOSITION_DECISIONS = frozenset({"accepted", "adapted", "refused", "deferred"})
 
 
 def split_advisor_trace_purpose(
@@ -88,18 +91,22 @@ def split_advisor_trace_purpose(
         index = recommendation.get("index")
         decision = recommendation.get("decision")
         reason = recommendation.get("reason")
+        if index is None:
+            allowed_decisions: frozenset[str] = PROSE_DISPOSITION_DECISIONS
+            index_valid = True
+        else:
+            allowed_decisions = frozenset({"accepted", "refused"})
+            index_valid = not isinstance(index, bool) and isinstance(index, int) and 0 <= index <= 4
         if (
-            isinstance(index, bool)
-            or not isinstance(index, int)
-            or not 0 <= index <= 4
-            or decision not in {"accepted", "refused"}
-            or (decision == "refused" and not _bounded_reason(reason))
+            not index_valid
+            or decision not in allowed_decisions
+            or (decision != "accepted" and not _bounded_reason(reason))
             or (reason is not None and not _bounded_reason(reason))
         ):
             raise ValueError("advisor_trace_invalid")
         normalized["recommendation"] = {
             "invocation_id": str(advisor_invocation_id),
-            "index": index,
+            **({"index": index} if index is not None else {}),
             "decision": decision,
             **({"reason": reason.strip()} if isinstance(reason, str) else {}),
         }
