@@ -16,7 +16,7 @@ import re
 import time
 import traceback
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -151,6 +151,7 @@ class _AdvisorStageTiming:
         started_at = time.perf_counter()
         self.stage_timestamps_utc: dict[str, str] = {"advisor_started": self._utc_timestamp()}
         self.durations_ms: dict[str, int] = {}
+        self.counters: Counter[str] = Counter()
         self._started_at: dict[str, float] = {"advisor_started": started_at}
 
     @staticmethod
@@ -175,6 +176,17 @@ class _AdvisorStageTiming:
     def record_duration(self, name: str, started_at: float) -> None:
         self.durations_ms[name] = round((time.perf_counter() - started_at) * 1000)
 
+    def record_elapsed(self, name: str, elapsed_seconds: float) -> None:
+        self.durations_ms[name] = self.durations_ms.get(name, 0) + round(elapsed_seconds * 1000)
+
+    def record_stage_duration(self, stage: str, duration_name: str) -> None:
+        started_at = self._started_at.get(stage)
+        if started_at is not None:
+            self.durations_ms[duration_name] = round((time.perf_counter() - started_at) * 1000)
+
+    def increment_counter(self, name: str, amount: int = 1) -> None:
+        self.counters[name] += amount
+
     def enrich(self, output: Mapping[str, Any]) -> dict[str, Any]:
         enriched = dict(output)
         prior_durations = enriched.get("durations_ms")
@@ -185,6 +197,10 @@ class _AdvisorStageTiming:
         timestamps.update(self.stage_timestamps_utc)
         enriched["durations_ms"] = durations
         enriched["stage_timestamps_utc"] = timestamps
+        prior_diagnostics = enriched.get("diagnostics")
+        diagnostics = dict(prior_diagnostics) if isinstance(prior_diagnostics, Mapping) else {}
+        diagnostics.update(self.counters)
+        enriched["diagnostics"] = diagnostics
         return enriched
 
 
@@ -325,6 +341,27 @@ class InvestigationAdvisorTool:
             return None
         return current
 
+    @staticmethod
+    def _record_repo_call() -> None:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        if timing is not None:
+            timing.increment_counter("repo_calls")
+
+    async def _read_consultation_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        started_at = time.perf_counter()
+        if timing is not None:
+            timing.mark("blob_reads")
+            timing.increment_counter("blob_reads")
+        try:
+            raw = await self._artifact_store.read_bytes(blob_id, max_bytes=max_bytes)
+            if timing is not None and isinstance(raw, bytes):
+                timing.increment_counter("bytes_read", len(raw))
+            return raw
+        finally:
+            if timing is not None:
+                timing.record_elapsed("blob_reads_ms", time.perf_counter() - started_at)
+
     async def _make_consultation_context(
         self,
         investigation_id: UUID,
@@ -334,27 +371,43 @@ class InvestigationAdvisorTool:
         observations: tuple[EvidenceObservation, ...] | None = None,
         findings: tuple[Any, ...] | None = None,
     ) -> _AdvisorConsultationContext:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        if timing is not None:
+            timing.mark("evidence_listing")
         if observations is None:
             observation_list = getattr(self._observations, "list_for_investigation", None)
-            observations = (
-                tuple(await observation_list(investigation_id))
-                if callable(observation_list)
-                else ()
-            )
+            if callable(observation_list):
+                self._record_repo_call()
+                observations = tuple(await observation_list(investigation_id))
+            else:
+                observations = ()
         if findings is None:
             finding_list = getattr(self._findings, "list_for_investigation", None)
-            findings = tuple(await finding_list(investigation_id)) if callable(finding_list) else ()
+            if callable(finding_list):
+                self._record_repo_call()
+                findings = tuple(await finding_list(investigation_id))
+            else:
+                findings = ()
+        if timing is not None:
+            timing.record_stage_duration("evidence_listing", "evidence_listing_ms")
+            timing.mark("association_resolution")
         association_list = getattr(self._sample_associations, "list_for_investigation", None)
-        associations = (
-            tuple(await association_list(investigation_id)) if callable(association_list) else ()
-        )
+        if callable(association_list):
+            self._record_repo_call()
+            associations = tuple(await association_list(investigation_id))
+        else:
+            associations = ()
         sample_list = getattr(self._samples, "list_for_subject", None)
         subject_id = getattr(investigation, "subject_id", None)
-        samples = (
-            tuple(await sample_list(subject_id))
-            if subject_id is not None and callable(sample_list)
-            else ()
-        )
+        if subject_id is not None and callable(sample_list):
+            self._record_repo_call()
+            samples = tuple(await sample_list(subject_id))
+        else:
+            samples = ()
+        if timing is not None:
+            timing.record_stage_duration("association_resolution", "association_resolution_ms")
+            timing.increment_counter("observations", len(observations))
+            timing.increment_counter("samples", len(samples))
         associations_by_hash: dict[str, list[Any]] = {}
         for association in associations:
             sample_hash = getattr(association, "sample_sha256", None)
@@ -381,13 +434,13 @@ class InvestigationAdvisorTool:
             samples_by_hash={key: tuple(value) for key, value in samples_by_hash.items()},
         )
 
-    async def _list_observations(
-        self, investigation_id: UUID
-    ) -> tuple[EvidenceObservation, ...]:
+    async def _list_observations(self, investigation_id: UUID) -> tuple[EvidenceObservation, ...]:
         current = self._consultation_context(investigation_id)
         if current is not None:
             return current.observations
         listing = getattr(self._observations, "list_for_investigation", None)
+        if callable(listing):
+            self._record_repo_call()
         return tuple(await listing(investigation_id)) if callable(listing) else ()
 
     async def _list_findings(self, investigation_id: UUID) -> tuple[Any, ...]:
@@ -395,6 +448,8 @@ class InvestigationAdvisorTool:
         if current is not None:
             return current.findings
         listing = getattr(self._findings, "list_for_investigation", None)
+        if callable(listing):
+            self._record_repo_call()
         return tuple(await listing(investigation_id)) if callable(listing) else ()
 
     async def _list_sample_associations(self, investigation_id: UUID) -> tuple[Any, ...]:
@@ -402,6 +457,8 @@ class InvestigationAdvisorTool:
         if current is not None:
             return current.associations
         listing = getattr(self._sample_associations, "list_for_investigation", None)
+        if callable(listing):
+            self._record_repo_call()
         return tuple(await listing(investigation_id)) if callable(listing) else ()
 
     async def _list_subject_samples(self, subject_id: UUID | None) -> tuple[Any, ...]:
@@ -409,13 +466,19 @@ class InvestigationAdvisorTool:
         if current is not None and getattr(current.investigation, "subject_id", None) == subject_id:
             return current.samples
         listing = getattr(self._samples, "list_for_subject", None)
-        return tuple(await listing(subject_id)) if subject_id is not None and callable(listing) else ()
+        if subject_id is not None and callable(listing):
+            self._record_repo_call()
+        return (
+            tuple(await listing(subject_id)) if subject_id is not None and callable(listing) else ()
+        )
 
     async def _get_investigation(self, investigation_id: UUID) -> Any | None:
         current = self._consultation_context(investigation_id)
         if current is not None:
             return current.investigation
         getter = getattr(self._investigations, "get", None)
+        if callable(getter):
+            self._record_repo_call()
         return await getter(investigation_id) if callable(getter) else None
 
     async def _get_blob_descriptor(self, blob_id: UUID) -> Any | None:
@@ -423,6 +486,8 @@ class InvestigationAdvisorTool:
         if current is not None and blob_id in current.blob_descriptors:
             return current.blob_descriptors[blob_id]
         getter = getattr(self._blobs, "get", None)
+        if callable(getter):
+            self._record_repo_call()
         descriptor = await getter(blob_id) if callable(getter) else None
         if current is not None:
             current.blob_descriptors[blob_id] = descriptor
@@ -527,14 +592,16 @@ class InvestigationAdvisorTool:
             )
             sample_list = getattr(self._samples, "list_for_subject", None)
             samples = (
-                tuple(await sample_list(investigation.subject_id))
-                if callable(sample_list)
-                else ()
+                tuple(await sample_list(investigation.subject_id)) if callable(sample_list) else ()
             )
             findings: tuple[Any, ...] = ()
             if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
                 finding_list = getattr(self._findings, "list_for_investigation", None)
-                findings = tuple(await finding_list(context.investigation_id)) if callable(finding_list) else ()
+                findings = (
+                    tuple(await finding_list(context.investigation_id))
+                    if callable(finding_list)
+                    else ()
+                )
 
             descriptor_reader = getattr(self._blobs, "get", None)
             source_bytes = 0
@@ -734,7 +801,7 @@ class InvestigationAdvisorTool:
                     execution_deadline_monotonic=execution_deadline_monotonic,
                     bridge_turns_remaining=bridge_turns_remaining,
                 )
-            investigation = await self._investigations.get(context.investigation_id)
+            investigation = await self._get_investigation(context.investigation_id)
             if investigation is None:
                 return self._finish(
                     context,
@@ -746,6 +813,7 @@ class InvestigationAdvisorTool:
                         )
                     ),
                 )
+            self._record_repo_call()
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
             consultation_context = await self._make_consultation_context(
                 context.investigation_id,
@@ -1207,6 +1275,8 @@ class InvestigationAdvisorTool:
                     redacted_secret_count=redacted_secret_count,
                     secret_findings=secret_findings,
                 )
+            dossier_started_at = time.perf_counter()
+            timing.mark("dossier_rendering")
             dossier = build_advisor_dossier(prompt_data, envelope=context.envelope)
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
             prompt_data["dossier_text"] = dossier.text
@@ -1222,6 +1292,7 @@ class InvestigationAdvisorTool:
             ]
             prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
             encoded = prompt.encode("utf-8")
+            timing.record_elapsed("dossier_rendering_ms", time.perf_counter() - dossier_started_at)
             if timing is not None:
                 timing.mark(
                     "dossier_ready",
@@ -1237,8 +1308,7 @@ class InvestigationAdvisorTool:
                 measured_tokens = max(1, (len(encoded) + 3) // 4)
                 if (
                     reservation.amounts.get(BudgetDimension.CONTEXT_BYTES, 0) < len(encoded)
-                    or reservation.amounts.get(BudgetDimension.CONTEXT_TOKENS, 0)
-                    < measured_tokens
+                    or reservation.amounts.get(BudgetDimension.CONTEXT_TOKENS, 0) < measured_tokens
                 ):
                     return await self._persist_preflight_failure(
                         context,
@@ -1428,6 +1498,7 @@ class InvestigationAdvisorTool:
                 snapshot=snapshot,
                 source_document_repository=self._source_documents,
                 blob_repository=self._blobs,
+                record_repo_call=self._record_repo_call,
             )
             advisor_observation_refs = tuple(
                 UUID(item["id"]) for item in transmitted_refs if item["kind"] == "observation"
@@ -1538,6 +1609,7 @@ class InvestigationAdvisorTool:
             else:
                 persisted_input_refs = []
                 for ref in advisor_observation_refs:
+                    self._record_repo_call()
                     observation = await self._observations.get(ref)
                     if (
                         observation is None
@@ -1889,6 +1961,7 @@ class InvestigationAdvisorTool:
             "stage_timestamps_utc": (
                 dict(timing.stage_timestamps_utc) if timing is not None else {}
             ),
+            "diagnostics": dict(timing.counters) if timing is not None else {},
             "redacted_secret_count": redacted_secret_count,
             "dossier_manifest": [
                 dict(item)
@@ -2673,6 +2746,7 @@ class InvestigationAdvisorTool:
         for ref in unique_refs:
             item = current.observations_by_id.get(ref) if current is not None else None
             if item is None:
+                self._record_repo_call()
                 item = await self._observations.get(ref)
             if item is None or item.investigation_id != context.investigation_id:
                 raise _AdvisorInputValidationError(
@@ -2694,6 +2768,7 @@ class InvestigationAdvisorTool:
         for ref in refs:
             item = current.observations_by_id.get(ref) if current is not None else None
             if item is None:
+                self._record_repo_call()
                 item = await self._observations.get(ref)
             if item is None or item.investigation_id != investigation_id:
                 raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
@@ -2717,6 +2792,7 @@ class InvestigationAdvisorTool:
         }
         experiments = {}
         if self._experiments is not None:
+            self._record_repo_call()
             experiments = {
                 item.id: item
                 for item in await self._experiments.list_for_investigation(investigation_id)
@@ -2901,6 +2977,7 @@ class InvestigationAdvisorTool:
             if raw_version is not None and (type(raw_version) is not int or raw_version < 1):
                 raise _AdvisorInputValidationError("opinion_version_invalid")
             opinion_version = raw_version
+            self._record_repo_call()
             opinion = await self._opinions.get(opinion_id, version=opinion_version)
             if opinion is None or opinion.investigation_id != investigation_id:
                 raise _AdvisorInputValidationError("opinion_not_found")
@@ -3133,11 +3210,11 @@ class InvestigationAdvisorTool:
                 )
             base["opinion_sections"] = opinion_sections
         if consultation_type in {"plan_investigation", "pivot_strategy"}:
-            state = (
-                await self._investigation_states.get(investigation_id)
-                if self._investigation_states is not None
-                else None
-            )
+            if self._investigation_states is not None:
+                self._record_repo_call()
+                state = await self._investigation_states.get(investigation_id)
+            else:
+                state = None
             if state is not None and state.investigation_id == investigation_id:
                 base["working_state_ref"] = (
                     f"investigation-state:{investigation_id}:v{state.version}:{state.sha256}"
@@ -3537,9 +3614,7 @@ class InvestigationAdvisorTool:
             base["candidate_rules"] = candidate_rules
         if consultation_type in {"plan_investigation", "pivot_strategy"}:
             available_observation_ids = {item.id for item in evidence}
-            findings = self._latest_findings(
-                await self._list_findings(investigation_id)
-            )
+            findings = self._latest_findings(await self._list_findings(investigation_id))
             findings = tuple(
                 item
                 for item in findings
@@ -3719,9 +3794,7 @@ class InvestigationAdvisorTool:
             "review_text",
         }:
             available_observation_ids = {item.id for item in evidence}
-            current_findings = self._latest_findings(
-                await self._list_findings(investigation_id)
-            )
+            current_findings = self._latest_findings(await self._list_findings(investigation_id))
             base["findings"] = [
                 {
                     "finding_id": str(item.id),
@@ -4305,6 +4378,29 @@ class InvestigationAdvisorTool:
         *,
         include_content: bool = True,
     ) -> list[dict[str, Any]]:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        started_at = time.perf_counter()
+        if timing is not None:
+            timing.mark("sample_selection")
+        try:
+            return await self._sample_inventory_from_context(
+                investigation_id,
+                observations,
+                envelope,
+                include_content=include_content,
+            )
+        finally:
+            if timing is not None:
+                timing.record_elapsed("sample_selection_ms", time.perf_counter() - started_at)
+
+    async def _sample_inventory_from_context(
+        self,
+        investigation_id: UUID,
+        observations: tuple[EvidenceObservation, ...],
+        envelope: InvestigationEnvelope | None,
+        *,
+        include_content: bool = True,
+    ) -> list[dict[str, Any]]:
         investigation = await self._get_investigation(investigation_id)
         if investigation is None:
             return []
@@ -4336,9 +4432,7 @@ class InvestigationAdvisorTool:
             if _sample_disclosure_restriction_sources(sample, envelope):
                 continue
             if current is not None:
-                indexed_ids = {
-                    item.id for item in sample_index.get(association.sample_sha256, ())
-                }
+                indexed_ids = {item.id for item in sample_index.get(association.sample_sha256, ())}
                 associated_observations = [item for item in observations if item.id in indexed_ids]
             else:
                 associated_observations = [
@@ -4421,23 +4515,20 @@ class InvestigationAdvisorTool:
             content_status = "not_requested_for_consultation"
             if include_content:
                 cached_sample = (
-                    current.verified_sample_bytes.get(blob_id)
-                    if current is not None
-                    else None
+                    current.verified_sample_bytes.get(blob_id) if current is not None else None
                 )
                 if cached_sample is not None:
                     blob_content, content_status = cached_sample
                 else:
                     content_status = "verified"
                     try:
-                        blob_content = await self._artifact_store.read_bytes(
+                        blob_content = await self._read_consultation_blob(
                             blob_id, max_bytes=descriptor.size
                         )
                         if (
                             not isinstance(blob_content, bytes)
                             or len(blob_content) != descriptor.size
-                            or hashlib.sha256(blob_content).hexdigest()
-                            != association.sample_sha256
+                            or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
                         ):
                             blob_content = None
                             content_status = "sample_content_hash_mismatch"
@@ -4536,7 +4627,7 @@ class InvestigationAdvisorTool:
             return []
         if not isinstance(model_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", model_sha256) is None:
             return []
-        raw = await self._artifact_store.read_bytes(
+        raw = await self._read_consultation_blob(
             model_blob_id,
             max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
         )
@@ -4595,7 +4686,7 @@ class InvestigationAdvisorTool:
             else None
         )
         if not isinstance(payload, Mapping):
-            raw = await self._artifact_store.read_bytes(
+            raw = await self._read_consultation_blob(
                 observation.blob_id,
                 max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
             )
@@ -4642,9 +4733,11 @@ class InvestigationAdvisorTool:
                 else None
             )
             if not isinstance(payload, Mapping):
-                raw = await self._artifact_store.read_bytes(
+                raw = await self._read_consultation_blob(
                     observation.blob_id,
-                    max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+                    max_bytes=int(
+                        getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)
+                    ),
                 )
                 if hashlib.sha256(raw).hexdigest() != observation.sha256:
                     return facts
@@ -4855,6 +4948,19 @@ class InvestigationAdvisorTool:
         return selected
 
     async def _measurement_rows(self, observation: EvidenceObservation) -> list[dict[str, Any]]:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        started_at = time.perf_counter()
+        if timing is not None:
+            timing.mark("measurement_extraction")
+        try:
+            return await self._extract_measurement_rows(observation)
+        finally:
+            if timing is not None:
+                timing.record_elapsed("measurement_extraction_ms", time.perf_counter() - started_at)
+
+    async def _extract_measurement_rows(
+        self, observation: EvidenceObservation
+    ) -> list[dict[str, Any]]:
         current = self._consultation_context(observation.investigation_id)
         if current is not None and observation.id in current.measurement_rows_by_observation:
             return [dict(item) for item in current.measurement_rows_by_observation[observation.id]]
@@ -4980,7 +5086,7 @@ class InvestigationAdvisorTool:
             )
         else:
             try:
-                raw = await self._artifact_store.read_bytes(observation.blob_id, max_bytes=size)
+                raw = await self._read_consultation_blob(observation.blob_id, max_bytes=size)
                 if len(raw) != size:
                     failure_reason = (
                         "Canonical observation blob is unreadable because its stored size does not "
@@ -4989,7 +5095,8 @@ class InvestigationAdvisorTool:
                 elif hashlib.sha256(raw).hexdigest() != observation.sha256:
                     failure_reason = (
                         "Canonical observation SHA-256 mismatch: blob bytes do not match the cited "
-                        "observation; restore the canonical blob or repair the observation reference."
+                        "observation; restore the canonical blob or repair the observation "
+                        "reference."
                     )
                 else:
                     payload = json.loads(raw)
@@ -5177,7 +5284,6 @@ class InvestigationAdvisorTool:
         same investigation do not block the consultation.
         """
         sample_list = getattr(self._samples, "list_for_subject", None)
-        association_list = getattr(self._sample_associations, "list_for_investigation", None)
         if not callable(sample_list):
             return set()
         associations = await self._list_sample_associations(investigation_id)
@@ -5301,9 +5407,7 @@ class InvestigationAdvisorTool:
         current = self._consultation_context(observation.investigation_id)
         if current is not None:
             indexed = await self._ensure_sample_reference_index()
-            return any(
-                item.id == observation.id for item in indexed.get(sample_hash, ())
-            )
+            return any(item.id == observation.id for item in indexed.get(sample_hash, ()))
         # Observation blobs are immutable and content-addressed (sha256), so both the parsed
         # payload and the per-sample answer can be memoized; recomputing them read and parsed
         # every blob once per (observation, sample) pair and stalled large consultations.
@@ -5376,9 +5480,7 @@ class InvestigationAdvisorTool:
             return None
         samples = await self._list_subject_samples(investigation.subject_id)
         candidates = (
-            current.samples_by_hash.get(measured_hash, ())
-            if current is not None
-            else samples
+            current.samples_by_hash.get(measured_hash, ()) if current is not None else samples
         )
         for sample in candidates:
             if sample.expected_hash != measured_hash and sample.source_object_id != measured_hash:
@@ -8042,6 +8144,7 @@ async def _advisor_external_effect_evidence_refs(
     snapshot: Any,
     source_document_repository: Any | None,
     blob_repository: Any,
+    record_repo_call: Callable[[], None] | None = None,
 ) -> tuple[EvidenceReference, ...]:
     """Resolve transmitted observations and source documents canonically."""
     observations = {str(item.id): item for item in evidence}
@@ -8058,9 +8161,13 @@ async def _advisor_external_effect_evidence_refs(
                 document_id = UUID(reference["id"])
             except ValueError as exc:
                 raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            if record_repo_call is not None:
+                record_repo_call()
             document = await source_document_repository.get(document_id)
             if document is None or document.subject_id != getattr(snapshot, "subject_id", None):
                 raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            if record_repo_call is not None:
+                record_repo_call()
             blob = await blob_repository.get(document.blob_id)
             blob_descriptor = getattr(blob, "descriptor", None)
             blob_sha256 = getattr(blob_descriptor, "sha256", None)
@@ -8085,6 +8192,8 @@ async def _advisor_external_effect_evidence_refs(
                 observation_id = UUID(reference["id"])
             except ValueError as exc:
                 raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            if record_repo_call is not None:
+                record_repo_call()
             observation = await observation_repository.get(observation_id)
         if (
             observation is None
@@ -8751,9 +8860,9 @@ def _parse_advisor_wire_legacy(
 
     risks = [item for value in fields.get("risk", ()) if (item := safe(value, 0, "risk_invalid"))]
     questions = [item for value in fields.get("gap", ()) if (item := safe(value, 0, "gap_invalid"))]
-    for field, values in (("risks", fields.get("risk", ())), ("gaps", fields.get("gap", ()))):
+    for field_name, values in (("risks", fields.get("risk", ())), ("gaps", fields.get("gap", ()))):
         if not values:
-            warn(f"{field}_missing")
+            warn(f"{field_name}_missing")
 
     if status_match is not None and status_match.group(1).casefold() == "refused":
         reason = safe(
@@ -9443,11 +9552,7 @@ def _payload_sample_hashes(value: object) -> set[str]:
             hashes.update(_payload_sample_hashes(item))
         return hashes
     if isinstance(value, list | tuple):
-        return {
-            sample_hash
-            for item in value
-            for sample_hash in _payload_sample_hashes(item)
-        }
+        return {sample_hash for item in value for sample_hash in _payload_sample_hashes(item)}
     return set()
 
 

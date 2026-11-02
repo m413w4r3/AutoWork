@@ -30,7 +30,6 @@ from tests.test_investigation_advisor_tools import (
     make_tool,
 )
 
-
 INVESTIGATION_ID = uuid5(NAMESPACE_URL, "autowork:advisor-context:m12-q")
 SUBJECT_ID = uuid5(NAMESPACE_URL, "autowork:advisor-context:subject")
 SYNTHESIS_ID = uuid5(NAMESPACE_URL, "autowork:advisor-context:synthesis")
@@ -114,7 +113,7 @@ class _CountingProxy:
             self._record_result(name, result, args)
             return result
 
-        if hasattr(value, "__call__") and getattr(value, "__code__", None) is not None:
+        if callable(value) and getattr(value, "__code__", None) is not None:
             if value.__code__.co_flags & 0x80:
                 return async_call
 
@@ -368,7 +367,10 @@ async def test_m12_q_reservation_and_execution_characterization(
     def capture_render(*args: object, **kwargs: object) -> str:
         prompt = original_render(*args, **kwargs)
         capture["prompts"].append(
-            {"prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "bytes": len(prompt.encode("utf-8"))}
+            {
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "bytes": len(prompt.encode("utf-8")),
+            }
         )
         return prompt
 
@@ -455,10 +457,13 @@ async def test_m12_q_reservation_and_execution_characterization(
     assert execution_builds[-1]["dossier_sha256"] == expected["dossier_sha256"]
     assert execution_builds[-1]["manifest_refs_sha256"] == expected["manifest_refs_sha256"]
     assert execution_prompts[0]["prompt_sha256"] == expected["prompt_sha256"]
-    assert len(execution_builds) == {
-        "yara_draft": 6,
-        "pivot_strategy": 5,
-        "suricata_draft": 5,
-        "draft_text": 5,
-    }[consultation_type]
+    assert (
+        len(execution_builds)
+        == {
+            "yara_draft": 6,
+            "pivot_strategy": 5,
+            "suricata_draft": 5,
+            "draft_text": 5,
+        }[consultation_type]
+    )
     assert reservation_builds[-1]["manifest_refs"] == execution_builds[-1]["manifest_refs"]

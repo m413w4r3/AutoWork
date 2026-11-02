@@ -909,8 +909,7 @@ class SqlAlchemySampleAssociationRepository:
             .subquery()
         )
         version_rows = await self._session.scalars(
-            select(SampleAssociationVersionRow)
-            .join(
+            select(SampleAssociationVersionRow).join(
                 latest_versions,
                 and_(
                     SampleAssociationVersionRow.association_id == latest_versions.c.association_id,
