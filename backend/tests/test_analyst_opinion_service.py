@@ -660,6 +660,19 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
                 "schema": "advisor-response.v3",
                 "usable": False,
                 "output_sha256": draft_output_sha,
+                "warnings": [
+                    "unstructured_draft",
+                    "heuristic_unit_assignment",
+                    "evidence_links_absent",
+                ],
+                "warning_classification": {
+                    "blocking": [],
+                    "informative": [
+                        "unstructured_draft",
+                        "heuristic_unit_assignment",
+                        "evidence_links_absent",
+                    ],
+                },
                 "blocks": [
                     {
                         "block_type": "key_findings",
@@ -1034,6 +1047,19 @@ async def test_compose_and_revise_accept_per_unit_refs_from_batched_advisor_call
                 "schema": "advisor-response.v3",
                 "usable": False,
                 "output_sha256": draft_output_sha,
+                "warnings": [
+                    "unstructured_draft",
+                    "heuristic_unit_assignment",
+                    "evidence_links_absent",
+                ],
+                "warning_classification": {
+                    "blocking": [],
+                    "informative": [
+                        "unstructured_draft",
+                        "heuristic_unit_assignment",
+                        "evidence_links_absent",
+                    ],
+                },
                 "blocks": [
                     {
                         "unit_id": "U1",
@@ -1162,6 +1188,9 @@ async def test_compose_and_revise_accept_per_unit_refs_from_batched_advisor_call
         OpinionCompositionSelection(),
         draft_blocks=(body,),
     )
+    assert composed.blocks[0].text == body_text
+    assert composed.blocks[0].bridge_draft_ref is not None
+    assert composed.blocks[0].bridge_draft_ref.text_sha256 == body_sha
     revised = await harness.service.revise(
         composed.id,
         composed.version,

@@ -32,6 +32,7 @@ _REFERENCE_ALIAS_IN_PROSE = re.compile(r"(?<![A-Za-z0-9_])[ER][1-9][0-9]*(?![A-Z
 _INFORMATIVE_ADVISOR_WARNINGS = {
     "block_target_defaulted",
     "bridge_reported_partial",
+    "evidence_links_absent",
     "invariants_missing",
     "limitations_missing",
     "source_alias_in_prose",

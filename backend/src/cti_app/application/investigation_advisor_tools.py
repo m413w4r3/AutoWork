@@ -6605,10 +6605,23 @@ class InvestigationAdvisorTool:
             parsed["normalization_status"] = "partial"
         if evidence_links_absent:
             parsed["status"] = "partial"
-            parsed["usable"] = False
             warnings = parsed.setdefault("warnings", [])
             if isinstance(warnings, list) and "evidence_links_absent" not in warnings:
                 warnings.append("evidence_links_absent")
+            classification = parsed.get("warning_classification")
+            if isinstance(classification, Mapping):
+                blocking = [
+                    item
+                    for item in classification.get("blocking", ())
+                    if item != "evidence_links_absent"
+                ]
+                informative = list(classification.get("informative", ()))
+                if "evidence_links_absent" not in informative:
+                    informative.append("evidence_links_absent")
+                parsed["warning_classification"] = {
+                    "blocking": blocking,
+                    "informative": informative,
+                }
             parsed["normalization_status"] = "partial"
         parsed["raw_output"] = safe_advisory_text
         parsed["raw_output_bytes"] = len(raw_bytes)

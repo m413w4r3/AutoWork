@@ -31,6 +31,7 @@ from cti_app.application.investigation_advisor_tools import (
     MAX_ADVISOR_TOOL_SECONDS,
     InvestigationAdvisorTool,
     _advisor_dossier_opinion_source_refs,
+    _combine_editorial_batch_results,
     _contains_encoded_operational_secrets,
     _marked_secret_field_survives,
     _parse_advisor_output,
@@ -2353,6 +2354,111 @@ def test_unlinked_draft_prose_includes_explicit_consultative_warning() -> None:
     assert "evidence_links_absent" in result.output["warnings"]
     assert result.output["raw_output"] == raw_output
     assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert result.output["usable"] is True
+    assert result.output["response_state"] == "partial_response_usable"
+
+
+def test_missing_draft_evidence_links_warn_without_downgrading_readable_units() -> None:
+    investigation_id = uuid4()
+    tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    block_types = [
+        item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+    ]
+    units = [
+        {
+            "id": f"U{index}",
+            "block_type": block_type.value,
+            "form": "body",
+            "anchor": None,
+        }
+        for index, block_type in enumerate(block_types, start=1)
+    ]
+    raw_output = "\n".join(
+        f"U{index}: Proposition de rédaction synthétique pour l'unité U{index}."
+        for index in range(1, len(units) + 1)
+    )
+    submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=raw_output,
+        bridge_invocation_id=str(uuid4()),
+    )
+
+    result = tool._submission_result(
+        submission,
+        prompt="Synthetic multi-unit opinion draft prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=128,
+        consultation_type="draft_text",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={"units": units, "assertions": []},
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["usable"] is True
+    assert [block["unit_id"] for block in result.output["blocks"]] == [
+        f"U{index}" for index in range(1, len(units) + 1)
+    ]
+    assert all(block["usable"] is True for block in result.output["blocks"])
+    assert not result.output["warning_classification"]["blocking"]
+    assert "unstructured_draft" in result.output["warning_classification"]["informative"]
+    assert "heuristic_unit_assignment" in result.output["warning_classification"]["informative"]
+    assert "evidence_links_absent" in result.output["warning_classification"]["informative"]
+    assert "evidence_links_absent" in result.output["warnings"]
+    assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+
+    combined = _combine_editorial_batch_results([result])
+    assert combined.status is ToolInvocationStatus.PARTIAL
+    assert combined.output["usable"] is True
+    assert [block["unit_id"] for block in combined.output["blocks"]] == [
+        f"U{index}" for index in range(1, len(units) + 1)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batched_unlinked_draft_keeps_usable_blocks_with_partial_status() -> None:
+    investigation_id = uuid4()
+    block_types = [
+        item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+    ]
+    units = [
+        {
+            "id": f"U{index}",
+            "block_type": block_type.value,
+            "form": "body",
+            "anchor": None,
+        }
+        for index, block_type in enumerate(block_types, start=1)
+    ]
+    raw_output = "\n".join(
+        f"U{index}: Proposition de rédaction synthétique pour l'unité U{index}."
+        for index in range(1, len(units) + 1)
+    )
+    submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=raw_output,
+        bridge_invocation_id=str(uuid4()),
+    )
+    tool, _ = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(lambda _call: submission),
+    )
+
+    result = await tool.execute(
+        {"consultation_type": "draft_text", "units": units},
+        make_context(investigation_id, key="operator:advisor:unlinked-draft-batch"),
+    )
+
+    expected_unit_ids = [f"U{index}" for index in range(1, len(units) + 1)]
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["usable"] is True
+    assert [block["unit_id"] for block in result.output["blocks"]] == expected_unit_ids
+    assert all(block["usable"] is True for block in result.output["blocks"])
+    assert "evidence_links_absent" in result.output["warnings"]
+    assert result.output["batch_statuses"][0]["status"] == "partial"
+    assert result.output["unprocessed_unit_ids"] == tuple(expected_unit_ids)
 
 
 @pytest.mark.asyncio
