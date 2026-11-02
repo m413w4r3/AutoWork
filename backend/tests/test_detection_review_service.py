@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace, TracebackType
 from typing import Any
@@ -434,3 +435,43 @@ async def test_rejected_test_version_cannot_be_approved() -> None:
         )
 
     assert error.value.code is DetectionReviewErrorCode.VERSION_REJECTED_BY_TEST
+
+
+@pytest.mark.asyncio
+async def test_approval_keeps_source_validator_advisories_blocking() -> None:
+    fixture = _Fixture()
+    source = 'rule Sample { strings: $a = "first-marker" $b = "second-marker" condition: $a or $b }'
+    source_sha256 = hashlib.sha256(source.encode()).hexdigest()
+    fixture.version = DetectionCandidateVersion(
+        id=fixture.version.id,
+        investigation_id=fixture.version.investigation_id,
+        candidate_id=fixture.version.candidate_id,
+        source=source,
+        source_sha256=source_sha256,
+        motif_provenance=(),
+        status=DetectionCandidateStatus.TESTED,
+    )
+    fixture.uow.detection_candidates.version = fixture.version
+    report_observation = fixture.observations[0]
+    payload = fixture.blobs.payloads[report_observation.blob_id]
+    payload["proposal_source_sha256"] = source_sha256
+    payload["source_sha256"] = source_sha256
+    report_observation = replace(
+        report_observation,
+        sha256=hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest(),
+    )
+    fixture.observations = (report_observation,)
+    fixture.uow.evidence_observations.items = [report_observation]
+
+    with pytest.raises(DetectionReviewError) as error:
+        await fixture.service.approve(
+            fixture.version.id,
+            source_sha256,
+            ACTOR,
+            "Reviewed source and corpus",
+            "Known limitations reviewed.",
+            "approve-validator-advisory",
+        )
+
+    assert error.value.code is DetectionReviewErrorCode.SOURCE_VALIDATION_FAILED
+    assert fixture.uow.commits == 0

@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.rule_workbench import validate_single_rule_candidate
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -42,6 +43,7 @@ class DetectionReviewErrorCode(StrEnum):
     TEST_REPORT_NOT_FOUND = "detection_test_report_not_found"
     ARTICLE_BASE_UNAVAILABLE = "detection_article_base_unavailable"
     VERSION_REJECTED_BY_TEST = "detection_version_rejected_by_test"
+    SOURCE_VALIDATION_FAILED = "detection_source_validation_failed"
     INVALID_ACTOR = "detection_review_actor_required"
     INVALID_REASON = "detection_review_reason_required"
     LIMITATIONS_REQUIRED = "detection_known_limitations_required"
@@ -324,6 +326,11 @@ class DetectionReviewService:
             reports = await self._read_test_reports(version, observations)
             if not reports:
                 raise DetectionReviewError(DetectionReviewErrorCode.TEST_REPORT_NOT_FOUND)
+            if (
+                decision_type is AnalystDecisionType.DETECTION_APPROVE
+                and validate_single_rule_candidate(version.source)
+            ):
+                raise DetectionReviewError(DetectionReviewErrorCode.SOURCE_VALIDATION_FAILED)
             report = reports[-1]
             false_positives = report.known_false_positives
             if (

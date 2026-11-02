@@ -890,17 +890,18 @@ async def test_bridge_yara_provenance_failures_have_distinct_actionable_codes(
             "rule_source_sha256": source_sha256,
         },
     )
-
-    assert rejected.status is ToolInvocationStatus.FAILED
-    assert rejected.error_code == expected_code
     if failure == "not_canonicalizable":
-        assert tuple(rejected.output["diagnostic"]["blocking_warnings"]) == (
-            "yara_measurements_unmatched",
-        )
+        assert rejected.status is ToolInvocationStatus.SUCCEEDED
+        assert rejected.output["source_author"] == "bridge"
+        assert "yara_measurements_unmatched" in rejected.output["bridge_warning_findings"]
+        assert rejected.output["limitations"]
+    else:
+        assert rejected.status is ToolInvocationStatus.FAILED
+        assert rejected.error_code == expected_code
 
 
 @pytest.mark.asyncio
-async def test_bridge_yara_proposal_rejects_motif_bytes_that_differ_from_measurement() -> None:
+async def test_bridge_yara_proposal_records_gap_when_motif_bytes_differ_from_measurement() -> None:
     harness = _harness(samples={})
     source = 'rule bridge_candidate { strings: $marker = "BridgeWrongMarker" condition: $marker }'
     observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
@@ -917,11 +918,12 @@ async def test_bridge_yara_proposal_rejects_motif_bytes_that_differ_from_measure
         },
     )
 
-    assert rejected.status is ToolInvocationStatus.FAILED
-    assert rejected.error_code == "motif_bytes_mismatch"
-    assert rejected.output["diagnostic"]["motif"] == "$marker"
-    assert rejected.output["diagnostic"]["measurement_alias"] == "M1"
-    assert rejected.output["diagnostic"]["reason"] == "pattern_bytes_differ"
+    assert rejected.status is ToolInvocationStatus.SUCCEEDED
+    assert tuple(rejected.output["justification_gaps"]) == ("$marker",)
+    assert rejected.output["source_sha256"] == source_sha256
+    versions = await harness.candidates.list_for_candidate(UUID(rejected.output["candidate_id"]))
+    assert versions[0].motif_provenance[0].motif == "$marker"
+    assert '"status":"gap"' in versions[0].motif_provenance[0].rationale
 
 
 @pytest.mark.asyncio
@@ -1198,10 +1200,11 @@ async def test_bridge_yara_proposal_rejects_truncated_source_and_two_rule_source
     )
     assert two_rules.status is ToolInvocationStatus.FAILED
     assert "exactly_one_rule_required" in two_rules.error_code
+    assert two_rules.output["diagnostic"]["stage"] == "source_validator"
 
 
 @pytest.mark.asyncio
-async def test_bridge_yara_proposal_requires_motif_measurement_ref_in_transmitted_inputs() -> None:
+async def test_bridge_yara_proposal_gaps_untransmitted_motif_measurement_ref() -> None:
     harness = _harness(samples={})
     source = (
         'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
@@ -1223,8 +1226,8 @@ async def test_bridge_yara_proposal_requires_motif_measurement_ref_in_transmitte
             "rule_source_sha256": source_sha256,
         },
     )
-    assert rejected.status is ToolInvocationStatus.FAILED
-    assert rejected.error_code == "bridge_yara_measurement_ref_not_transmitted"
+    assert rejected.status is ToolInvocationStatus.SUCCEEDED
+    assert tuple(rejected.output["justification_gaps"]) == ("$marker",)
 
 
 @pytest.mark.asyncio

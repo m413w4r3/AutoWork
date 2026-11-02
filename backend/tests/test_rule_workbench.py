@@ -20,6 +20,7 @@ from cti_app.application.rule_workbench import (
     RuleValidationReason,
     RuleWorkbench,
     YaraSampleInput,
+    classify_rule_validation_issues,
     rule_validation_reason,
     validate_single_rule_candidate,
 )
@@ -248,6 +249,35 @@ rule bridge_candidate {
 }
 """
     assert validate_single_rule_candidate(source) == ()
+
+
+@pytest.mark.asyncio
+async def test_disguised_or_finding_is_advisory_for_testing_and_blocks_validation() -> None:
+    data = b"measured-marker"
+    source = (
+        'rule bridge_candidate { strings: $a = "measured-marker" $b = "other-marker" '
+        "condition: $a or $b }"
+    )
+    issues = validate_single_rule_candidate(source)
+    blocking, advisory = classify_rule_validation_issues(issues)
+    assert blocking == ()
+    assert advisory == ("or_branches_disguised_as_multiple_rules_forbidden",)
+
+    workbench = _workbench(
+        {_sha256(data): data},
+        engine=UnavailableYaraEngine(),
+    )
+    assert workbench.compile_check(source).status is YaraExecutionStatus.ENGINE_UNAVAILABLE
+    report = await workbench.compile_and_test(
+        source,
+        (_case(data, RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),),
+        selection_bias="One selected synthetic candidate sample.",
+        coverage_statement="One synthetic candidate sample was measured.",
+    )
+
+    assert report.execution_status is YaraExecutionStatus.ENGINE_UNAVAILABLE
+    assert report.source_validator_findings == advisory
+    assert report.validation_status is not RuleValidationStatus.REAL_VALIDATED
 
 
 @pytest.mark.parametrize(

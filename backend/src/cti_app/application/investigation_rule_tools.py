@@ -47,6 +47,7 @@ from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
     RuleValidationReason,
     RuleWorkbench,
+    classify_rule_validation_issues,
     is_generic_dotnet_import,
     rule_validation_reason,
     validate_single_rule_candidate,
@@ -1362,6 +1363,12 @@ class _RuleTools:
             build = self.workbench.build_rule(generated, condition, meta)
             if not build.valid or build.source is None:
                 raise _ToolFailed("rule_build_failed")
+            proposal_source_issues = validate_single_rule_candidate(build.source)
+            blocking_issues, advisory_issues = classify_rule_validation_issues(
+                proposal_source_issues
+            )
+            if blocking_issues:
+                raise _ToolFailed("rule_source_rejected:" + ",".join(blocking_issues))
             latest = max(existing_versions, key=lambda item: item.version)
             requested_sha256 = hashlib.sha256(build.source.encode("utf-8")).hexdigest()
             expected_provenance = tuple(
@@ -1370,6 +1377,7 @@ class _RuleTools:
                     rationale=_serialize_motif(
                         motif,
                         source_bytes_verified=motif in verified_source_motifs,
+                        source_validator_findings=advisory_issues,
                     ),
                     observation_refs=motif.observation_refs,
                 )
@@ -1595,35 +1603,6 @@ class _RuleTools:
                 "bridge_yara_consultation_type_mismatch",
                 agent_message="Provide a persisted yara_draft advisor consultation.",
             )
-        if output.get("canonicalization_eligible", output.get("usable")) is not True:
-            raw_classification = output.get("warning_classification")
-            raw_blocking = (
-                raw_classification.get("blocking")
-                if isinstance(raw_classification, Mapping)
-                else None
-            )
-            raw_warnings = output.get("warnings")
-            blocking_warnings = (
-                [item for item in raw_blocking if isinstance(item, str)]
-                if isinstance(raw_blocking, Sequence) and not isinstance(raw_blocking, str | bytes)
-                else [item for item in raw_warnings if isinstance(item, str)]
-                if isinstance(raw_warnings, Sequence) and not isinstance(raw_warnings, str | bytes)
-                else []
-            )
-            raise _ToolFailed(
-                "bridge_yara_output_unusable",
-                agent_message=(
-                    "The local advisor normalization marked this YARA output unusable. Inspect "
-                    "its blocking warnings and ensure every rule string matches a transmitted "
-                    "measurement exactly; reparse after correcting the stored parse context."
-                ),
-                diagnostic=_rule_diagnostic(
-                    stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
-                    status=RuleDiagnosticStatus.FAILED,
-                    reason_code="bridge_yara_output_unusable",
-                    details={"blocking_warnings": blocking_warnings},
-                ),
-            )
         if not parse_status_allowed:
             raise _ToolFailed(
                 "bridge_yara_advisor_status_not_succeeded",
@@ -1692,35 +1671,29 @@ class _RuleTools:
                 ),
             )
         source_issues = validate_single_rule_candidate(source)
-        if source_issues:
+        blocking_issues, advisory_issues = classify_rule_validation_issues(source_issues)
+        if blocking_issues:
             raise _ToolFailed(
-                "bridge_yara_source_rejected:" + ",".join(source_issues),
+                "bridge_yara_source_rejected:" + ",".join(blocking_issues),
                 diagnostic=_rule_diagnostic(
                     stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
                     status=RuleDiagnosticStatus.FAILED,
-                    reason_code=source_issues[0],
-                    details={"validator_findings": list(source_issues)},
+                    reason_code=blocking_issues[0],
+                    details={
+                        "validator_findings": list(blocking_issues),
+                        "advisory_findings": list(advisory_issues),
+                    },
                 ),
             )
         raw_measurement_catalog = bridge_provenance.get("measurement_catalog")
         measurement_catalog = _bridge_measurement_catalog(raw_measurement_catalog)
-        if measurement_catalog is None:
-            raise _ToolFailed(
-                "bridge_yara_measurement_catalog_missing",
-                diagnostic=_rule_diagnostic(
-                    stage=RuleDiagnosticStage.LOCAL_BUILD,
-                    status=RuleDiagnosticStatus.FAILED,
-                    reason_code="bridge_yara_measurement_catalog_missing",
-                ),
-            )
 
         raw_motifs = output.get("motifs")
-        if (
-            not isinstance(raw_motifs, Sequence)
-            or isinstance(raw_motifs, str | bytes)
-            or not raw_motifs
-        ):
-            raise _ToolFailed("bridge_yara_motif_refs_missing")
+        motif_refs = (
+            raw_motifs
+            if isinstance(raw_motifs, Sequence) and not isinstance(raw_motifs, str | bytes)
+            else ()
+        )
         input_refs = persisted.get("input_refs", ())
         if not isinstance(input_refs, Sequence) or isinstance(input_refs, str | bytes):
             raise _ToolFailed("bridge_yara_input_refs_invalid")
@@ -1738,7 +1711,7 @@ class _RuleTools:
                     or not isinstance(measurement_sha256, str)
                     or re.fullmatch(_SHA256_PATTERN, measurement_sha256) is None
                 ):
-                    raise _ToolFailed("bridge_yara_input_ref_invalid")
+                    continue
                 transmitted_measurements.add((measurement_id, measurement_sha256))
                 continue
             if reference.get("kind") != "observation":
@@ -1755,106 +1728,67 @@ class _RuleTools:
             ):
                 raise _ToolFailed("bridge_yara_input_ref_not_verified")
             source_observation_refs.append(source_ref)
-        if not source_observation_refs:
-            raise _ToolFailed("bridge_yara_measurement_observation_missing")
 
-        declared_names: set[str] = set()
         motif_provenance: list[MotifProvenance] = []
         observation_refs = tuple(dict.fromkeys((*source_observation_refs, observation.id)))
         source_attribution = {
             "author": "bridge",
+            "source_author": "bridge",
+            "origin_author": "bridge",
             "change_kind": "bridge_yara_draft",
             "bridge_invocation_id": str(requested_invocation_id),
             "bridge_observation_id": str(observation.id),
             "bridge_rule_source_sha256": observed_sha256,
+            "validator_findings": list(advisory_issues),
+            "bridge_warning_findings": _bridge_warning_codes(output),
         }
-        for raw_motif in raw_motifs:
-            if not isinstance(raw_motif, Mapping):
-                raise _ToolFailed("bridge_yara_motif_ref_invalid")
-            name = raw_motif.get("name")
-            measurement_refs = raw_motif.get("measurement_refs")
-            if (
-                not isinstance(name, str)
-                or re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", name) is None
-                or name in declared_names
-                or not isinstance(measurement_refs, Sequence)
-                or isinstance(measurement_refs, str | bytes)
-                or not measurement_refs
-            ):
-                raise _ToolFailed("bridge_yara_motif_ref_invalid")
-            declared_names.add(name)
-            for reference in measurement_refs:
-                if (
-                    not isinstance(reference, Mapping)
-                    or not isinstance(reference.get("measurement_id"), str)
-                    or not isinstance(reference.get("sha256"), str)
-                    or re.fullmatch(_SHA256_PATTERN, reference["sha256"]) is None
-                ):
-                    raise _ToolFailed("bridge_yara_motif_ref_invalid")
-                if (
-                    reference["measurement_id"],
-                    reference["sha256"],
-                ) not in transmitted_measurements:
-                    raise _ToolFailed("bridge_yara_measurement_ref_not_transmitted")
-                measured = measurement_catalog.get(
-                    (reference["measurement_id"], reference["sha256"])
-                )
-                expected_bytes = _bridge_measurement_bytes(measured) if measured else None
-                actual_bytes = _exact_yara_string_bytes(source, name)
-                if expected_bytes is None or actual_bytes != expected_bytes:
-                    measurement = measured or {}
-                    raise _ToolFailed(
-                        "motif_bytes_mismatch",
-                        agent_message=(
-                            f"Bridge motif {name} does not exactly match its cited measurement."
-                        ),
-                        diagnostic={
-                            "motif": name,
-                            "measurement_id": reference["measurement_id"],
-                            "measurement_alias": measurement.get("alias"),
-                            "sample_sha256": measurement.get("sample_sha256"),
-                            "offset": measurement.get("offset"),
-                            "length": measurement.get("length"),
-                            "encoding": measurement.get("encoding"),
-                            "reason": (
-                                "measurement_bytes_unavailable"
-                                if expected_bytes is None
-                                else "pattern_bytes_differ"
-                            ),
-                        },
-                    )
+        verified_links_by_name = _verified_bridge_measurement_links(
+            source=source,
+            motif_refs=motif_refs,
+            catalog=measurement_catalog,
+            transmitted_measurements=transmitted_measurements,
+        )
+        for name in yara_string_names(source):
+            measurement_links = verified_links_by_name.get(name, ())
+            justification_status = "verified" if measurement_links else "gap"
             motif = RuleMotif(
                 kind=RuleMotifKind.STRING,
                 value=name,
                 provenance_kind=RuleMotifProvenanceKind.BRIDGE,
                 provenance_id=str(requested_invocation_id),
                 observation_refs=observation_refs,
-                rationale="Bridge v3 motif refs: "
-                + json.dumps(measurement_refs, sort_keys=True, separators=(",", ":")),
+                rationale=(
+                    "Bridge string has an independently verified measurement link."
+                    if measurement_links
+                    else "Bridge string has no independently verified measurement link."
+                ),
             )
             motif_provenance.append(
                 MotifProvenance(
                     motif=name,
-                    rationale=_serialize_motif_with_source(motif, source_attribution),
+                    rationale=_serialize_motif_with_source(
+                        motif,
+                        source_attribution,
+                        justification={
+                            "status": justification_status,
+                            "measurement_links": list(measurement_links),
+                        },
+                    ),
                     observation_refs=observation_refs,
                 )
             )
-        source_names = set(yara_string_names(source))
-        condition_match = re.search(r"(?is)\bcondition\s*:\s*(.*?)(?:\}\s*)?$", source)
-        condition_text = condition_match.group(1) if condition_match else ""
-        condition_names = set(re.findall(r"\$[A-Za-z_][A-Za-z0-9_]*", condition_text))
-        all_patterns_referenced = (
-            re.search(r"(?i)\b(?:any|all|\d+)\s+of\s+them\b", condition_text) is not None
-        )
-        if declared_names != source_names or not (
-            all_patterns_referenced or declared_names.issubset(condition_names)
-        ):
-            raise _ToolFailed("bridge_yara_motifs_do_not_cover_rule_source")
 
         candidate_value = _empty_optional_value(arguments.get("candidate_id"))
         candidate_id = UUID(candidate_value) if candidate_value is not None else uuid4()
         if await self.candidates.list_for_candidate(candidate_id):
-            raise _ToolFailed("candidate_id_already_exists")
+            raise _ToolFailed(
+                "candidate_id_already_exists",
+                diagnostic=_rule_diagnostic(
+                    stage=RuleDiagnosticStage.PERSISTENCE,
+                    status=RuleDiagnosticStatus.FAILED,
+                    reason_code="candidate_id_already_exists",
+                ),
+            )
         corpus = await self._build_corpus(context.investigation_id)
         compile_check = self.workbench.compile_check(source)
         version = DetectionCandidateVersion(
@@ -1886,8 +1820,14 @@ class _RuleTools:
             "parent_version_id": None,
             "source_sha256": stored.source_sha256,
             "candidate_status": stored.status.value,
-            "source_author": "bridge",
             "source_change_kind": "bridge_yara_draft",
+            **_version_provenance_output(stored),
+            "bridge_warning_findings": list(source_attribution["bridge_warning_findings"]),
+            "limitations": _bridge_candidate_limitations(
+                stored.motif_provenance,
+                advisory_issues,
+                source_attribution["bridge_warning_findings"],
+            ),
             "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
             "validation_reasons": ["explicit_rule_test_required"],
             "bridge_invocation_id": str(requested_invocation_id),
@@ -1936,14 +1876,18 @@ class _RuleTools:
         if not author or not isinstance(source, str) or not source.strip():
             raise _ToolFailed("operator_syntax_fix_metadata_invalid")
         source_issues = validate_single_rule_candidate(source)
-        if source_issues:
+        blocking_issues, advisory_issues = classify_rule_validation_issues(source_issues)
+        if blocking_issues:
             raise _ToolFailed(
-                "operator_syntax_fix_source_rejected:" + ",".join(source_issues),
+                "operator_syntax_fix_source_rejected:" + ",".join(blocking_issues),
                 diagnostic=_rule_diagnostic(
                     stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
                     status=RuleDiagnosticStatus.FAILED,
-                    reason_code=source_issues[0],
-                    details={"validator_findings": list(source_issues)},
+                    reason_code=blocking_issues[0],
+                    details={
+                        "validator_findings": list(blocking_issues),
+                        "advisory_findings": list(advisory_issues),
+                    },
                 ),
             )
         if source == parent.source:
@@ -1987,6 +1931,7 @@ class _RuleTools:
             "change_kind": "operator_syntax_fix",
             "operator_parent_source_sha256": parent.source_sha256,
             "operator_diff": diff,
+            "validator_findings": list(advisory_issues),
         }
         provenance = tuple(
             MotifProvenance(
@@ -2249,6 +2194,7 @@ class _RuleTools:
                 "version": selected.version_label,
                 "source_sha256": selected.source_sha256,
                 "candidate_status": candidate_status.value,
+                **_version_provenance_output(selected),
                 "validation_status": validation_status.value,
                 "validation_reason": validation_reason.value,
                 "final_status": final_status.value,
@@ -2435,6 +2381,18 @@ class _RuleTools:
                 ),
             )
         reconstructed_source_sha256 = hashlib.sha256(build.source.encode("utf-8")).hexdigest()
+        source_issues = validate_single_rule_candidate(build.source)
+        blocking_issues, advisory_issues = classify_rule_validation_issues(source_issues)
+        if blocking_issues:
+            raise _ToolFailed(
+                "rule_source_rejected:" + ",".join(blocking_issues),
+                diagnostic=_rule_diagnostic(
+                    stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
+                    status=RuleDiagnosticStatus.FAILED,
+                    reason_code=blocking_issues[0],
+                    details={"validator_findings": list(blocking_issues)},
+                ),
+            )
         source_hash_details = (
             {
                 "exact_source_sha256": parent.source_sha256,
@@ -2490,6 +2448,7 @@ class _RuleTools:
                     rationale=_serialize_motif(
                         motif,
                         source_bytes_verified=motif in verified_source_motifs,
+                        source_validator_findings=advisory_issues,
                     ),
                     observation_refs=motif.observation_refs,
                 )
@@ -2535,6 +2494,7 @@ class _RuleTools:
             ),
             "source_sha256": version.source_sha256,
             "candidate_status": version.status.value,
+            **_version_provenance_output(version),
             "validation_status": RuleValidationStatus.UNTESTED.value,
             "validation_reason": RuleValidationReason.EXPLICIT_TEST_REQUIRED.value,
             "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
@@ -3231,6 +3191,7 @@ def _report_payload(
     return {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
+        "source_validator_findings": list(report.source_validator_findings),
         "validation_status": report.validation_status.value,
         "validation_reason": rule_validation_reason(report).value,
         "engine_version": report.engine_version[:200],
@@ -3369,6 +3330,8 @@ def _one_rule_final_status(
         reasons.append("engine_or_corpus_errors")
     if any(role.non_measurable for role in report.roles):
         reasons.append("unmeasurable_files_present")
+    if report.source_validator_findings:
+        reasons.append("source_validator_advisory_findings_present")
     if any(case.role is RuleTestCorpusRole.BYTES_MISSING for case in corpus.cases):
         reasons.append("bytes_missing_present")
     if corpus.holdout_overlap_sha256s:
@@ -3630,6 +3593,7 @@ def _report_summary(
         "rule_version": version.version_label if version is not None else None,
         "test_refs": [str(case.id) for role in report.roles for case in role.test_cases],
         "execution_status": report.execution_status.value,
+        "source_validator_findings": list(report.source_validator_findings),
         "validation_status": effective_status.value,
         "validation_reason": effective_reason.value,
         "final_status": final_status.value,
@@ -3794,6 +3758,8 @@ def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, 
         }
     meta = _meta_from_source(version.source)
     motifs: list[dict[str, Any]] = []
+    source_validator_findings: set[str] = set()
+    justification_gaps: list[str] = []
     for item in version.motif_provenance:
         provenance: dict[str, Any] = {}
         if item.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
@@ -3803,6 +3769,28 @@ def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, 
                     provenance = dict(parsed)
             except (TypeError, ValueError, json.JSONDecodeError):
                 provenance = {}
+        raw_findings = provenance.get("source_validator_findings")
+        if isinstance(raw_findings, list):
+            source_validator_findings.update(
+                value for value in raw_findings if isinstance(value, str)
+            )
+        justification = provenance.get("justification")
+        justification_status = (
+            justification.get("status") if isinstance(justification, Mapping) else None
+        )
+        measurement_links = (
+            justification.get("measurement_links", []) if isinstance(justification, Mapping) else []
+        )
+        if justification_status == "gap":
+            justification_gaps.append(item.motif)
+        attribution = provenance.get("source_attribution")
+        attribution_findings = (
+            attribution.get("validator_findings") if isinstance(attribution, Mapping) else None
+        )
+        if isinstance(attribution_findings, list):
+            source_validator_findings.update(
+                value for value in attribution_findings if isinstance(value, str)
+            )
         source_sha256 = provenance.get("sample_sha256")
         offsets = provenance.get("offsets")
         source_method = provenance.get("provenance_kind")
@@ -3831,6 +3819,10 @@ def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, 
                     article_claim_refs if isinstance(article_claim_refs, list) else []
                 ),
                 "rationale": provenance.get("rationale", ""),
+                "justification_status": justification_status,
+                "measurement_links": measurement_links
+                if isinstance(measurement_links, list)
+                else [],
                 "source_bytes_verified": provenance.get("source_bytes_verified") is True,
                 "generic_dotnet_import": is_generic_dotnet_import(item.motif),
                 "exact_source_available": exact_source,
@@ -3862,6 +3854,8 @@ def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, 
         "version": version.version,
         "source_sha256": version.source_sha256,
         "source_attribution": _source_attribution_from_version(version),
+        "source_validator_findings": sorted(source_validator_findings),
+        "justification_gaps": sorted(justification_gaps),
         "family": meta.get("family"),
         "hypothesis": meta.get("hypothesis"),
         "dotnet_imports_discussion": meta.get("dotnet_imports_discussion"),
@@ -3909,6 +3903,22 @@ def _signature_limitations(signature: Mapping[str, Any]) -> tuple[str, ...]:
         limitations.append(
             "Common .NET motifs lack an ALL condition with a source-byte-verified specific motif, "
             "hypothesis, and import discussion; this signature remains a candidate."
+        )
+    validator_findings = signature.get("source_validator_findings")
+    if (
+        isinstance(validator_findings, Sequence)
+        and not isinstance(validator_findings, str | bytes)
+        and validator_findings
+    ):
+        limitations.append(
+            "Source validator advisory findings remain on this candidate: "
+            + ", ".join(str(item) for item in validator_findings)
+            + "."
+        )
+    if signature.get("justification_gaps"):
+        limitations.append(
+            "Some Bridge strings have no independently verified measurement link; review the "
+            "per-string justification gaps before using this candidate."
         )
     return tuple(limitations)
 
@@ -4345,7 +4355,12 @@ def _condition_from_source(source: str) -> RuleConditionStrategy:
     return RuleConditionStrategy(match.group(1))
 
 
-def _serialize_motif(motif: RuleMotif, *, source_bytes_verified: bool = False) -> str:
+def _serialize_motif(
+    motif: RuleMotif,
+    *,
+    source_bytes_verified: bool = False,
+    source_validator_findings: Sequence[str] = (),
+) -> str:
     payload = {
         "kind": motif.kind.value,
         "provenance_kind": motif.provenance_kind.value,
@@ -4359,14 +4374,23 @@ def _serialize_motif(motif: RuleMotif, *, source_bytes_verified: bool = False) -
         "goodware_occurrence_count": motif.goodware_occurrence_count,
         "source_bytes_verified": source_bytes_verified,
     }
+    if source_validator_findings:
+        payload["source_validator_findings"] = list(source_validator_findings)
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
 
 
-def _serialize_motif_with_source(motif: RuleMotif, attribution: Mapping[str, Any]) -> str:
+def _serialize_motif_with_source(
+    motif: RuleMotif,
+    attribution: Mapping[str, Any],
+    *,
+    justification: Mapping[str, Any] | None = None,
+) -> str:
     payload = json.loads(_serialize_motif(motif)[len(_PERSISTED_MOTIF_PREFIX) :])
     payload["source_attribution"] = dict(attribution)
+    if justification is not None:
+        payload["justification"] = dict(justification)
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
@@ -4402,6 +4426,47 @@ def _source_attribution_from_version(
         if isinstance(attribution, Mapping):
             return attribution
     return None
+
+
+def _version_provenance_output(version: DetectionCandidateVersion) -> dict[str, Any]:
+    attribution = _source_attribution_from_version(version) or {}
+    findings: set[str] = set()
+    gaps: list[str] = []
+    for motif in version.motif_provenance:
+        if _motif_justification(motif).get("status") == "gap":
+            gaps.append(motif.motif)
+        if not motif.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
+            continue
+        try:
+            payload = json.loads(motif.rationale[len(_PERSISTED_MOTIF_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        raw_findings = (
+            payload.get("source_validator_findings") if isinstance(payload, Mapping) else None
+        )
+        if isinstance(raw_findings, Sequence) and not isinstance(raw_findings, str | bytes):
+            findings.update(item for item in raw_findings if isinstance(item, str))
+    attribution_findings = attribution.get("validator_findings")
+    if isinstance(attribution_findings, Sequence) and not isinstance(
+        attribution_findings, str | bytes
+    ):
+        findings.update(item for item in attribution_findings if isinstance(item, str))
+    invocation_id = attribution.get("bridge_invocation_id")
+    observation_id = attribution.get("bridge_observation_id")
+    return {
+        "source_author": attribution.get("source_author", attribution.get("author")),
+        "source_sha256": version.source_sha256,
+        "origin": {
+            "invocation_id": invocation_id,
+            "observation_id": observation_id,
+        }
+        if invocation_id is not None or observation_id is not None
+        else None,
+        "derived_from": attribution.get("derived_from"),
+        "source_attribution": dict(attribution) if attribution else None,
+        "source_validator_findings": sorted(findings),
+        "justification_gaps": sorted(set(gaps)),
+    }
 
 
 def _require_syntax_only_fix(parent_source: str, next_source: str) -> None:
@@ -4525,13 +4590,14 @@ def _unique_valid_hashes(values: Sequence[str]) -> tuple[str, ...]:
 
 def _bridge_measurement_catalog(
     value: object,
-) -> dict[tuple[str, str], Mapping[str, Any]] | None:
-    if not isinstance(value, Sequence) or isinstance(value, str | bytes) or not value:
-        return None
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return {}
     result: dict[tuple[str, str], Mapping[str, Any]] = {}
+    duplicates: set[tuple[str, str]] = set()
     for row in value:
         if not isinstance(row, Mapping):
-            return None
+            continue
         measurement_id = row.get("measurement_id")
         sha256 = row.get("sha256")
         sample_sha256 = row.get("sample_sha256")
@@ -4556,12 +4622,127 @@ def _bridge_measurement_catalog(
             or not isinstance(row.get("kind"), str)
             or not isinstance(row.get("value"), str)
         ):
-            return None
+            continue
         identity = (measurement_id, sha256)
+        if identity in duplicates:
+            continue
         if identity in result:
-            return None
+            result.pop(identity)
+            duplicates.add(identity)
+            continue
         result[identity] = row
-    return result or None
+    return result
+
+
+def _verified_bridge_measurement_links(
+    *,
+    source: str,
+    motif_refs: Sequence[Any],
+    catalog: Mapping[tuple[str, str], Mapping[str, Any]],
+    transmitted_measurements: set[tuple[str, str]],
+) -> dict[str, tuple[Mapping[str, Any], ...]]:
+    source_names = set(yara_string_names(source))
+    links_by_name: dict[str, list[Mapping[str, Any]]] = {}
+    seen_links: set[tuple[str, str, str]] = set()
+    for motif_ref in motif_refs:
+        if not isinstance(motif_ref, Mapping):
+            continue
+        name = motif_ref.get("name")
+        references = motif_ref.get("measurement_refs")
+        if (
+            not isinstance(name, str)
+            or name not in source_names
+            or not isinstance(references, Sequence)
+            or isinstance(references, str | bytes)
+        ):
+            continue
+        actual_bytes = _exact_yara_string_bytes(source, name)
+        if actual_bytes is None:
+            continue
+        for reference in references:
+            if not isinstance(reference, Mapping):
+                continue
+            measurement_id = reference.get("measurement_id")
+            measurement_sha256 = reference.get("sha256")
+            if (
+                not isinstance(measurement_id, str)
+                or not measurement_id.strip()
+                or not isinstance(measurement_sha256, str)
+                or re.fullmatch(_SHA256_PATTERN, measurement_sha256) is None
+            ):
+                continue
+            identity = (measurement_id, measurement_sha256)
+            if identity not in transmitted_measurements:
+                continue
+            measurement = catalog.get(identity)
+            if measurement is None or _bridge_measurement_bytes(measurement) != actual_bytes:
+                continue
+            link_identity = (name, measurement_id, measurement_sha256)
+            if link_identity in seen_links:
+                continue
+            seen_links.add(link_identity)
+            links_by_name.setdefault(name, []).append(
+                {
+                    "measurement_id": measurement_id,
+                    "sha256": measurement_sha256,
+                    "alias": measurement.get("alias"),
+                    "sample_sha256": measurement.get("sample_sha256"),
+                    "offset": measurement.get("offset"),
+                    "length": measurement.get("length"),
+                    "encoding": measurement.get("encoding"),
+                    "kind": measurement.get("kind"),
+                }
+            )
+    return {
+        name: tuple(sorted(links, key=lambda item: str(item["measurement_id"])))
+        for name, links in links_by_name.items()
+    }
+
+
+def _bridge_warning_codes(output: Mapping[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    warnings = output.get("warnings")
+    if isinstance(warnings, Sequence) and not isinstance(warnings, str | bytes):
+        values.extend(item for item in warnings if isinstance(item, str))
+    classification = output.get("warning_classification")
+    if isinstance(classification, Mapping):
+        for category in ("blocking", "informative"):
+            items = classification.get(category)
+            if isinstance(items, Sequence) and not isinstance(items, str | bytes):
+                values.extend(item for item in items if isinstance(item, str))
+    return tuple(
+        sorted({item for item in values if re.fullmatch(r"[a-z][a-z0-9_]{0,99}", item) is not None})
+    )
+
+
+def _motif_justification(motif: MotifProvenance) -> Mapping[str, Any]:
+    if not motif.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
+        return {}
+    try:
+        payload = json.loads(motif.rationale[len(_PERSISTED_MOTIF_PREFIX) :])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    justification = payload.get("justification") if isinstance(payload, Mapping) else None
+    return justification if isinstance(justification, Mapping) else {}
+
+
+def _bridge_candidate_limitations(
+    motif_provenance: Sequence[MotifProvenance],
+    validator_findings: Sequence[str],
+    bridge_warnings: Sequence[str],
+) -> list[str]:
+    limitations = [
+        f"YARA string {item.motif} has no independently verified measurement link."
+        for item in motif_provenance
+        if _motif_justification(item).get("status") == "gap"
+    ]
+    if validator_findings:
+        limitations.append(
+            "Source validator advisory findings: " + ", ".join(validator_findings) + "."
+        )
+    if bridge_warnings:
+        limitations.append("Bridge normalization warnings: " + ", ".join(bridge_warnings) + ".")
+    return list(dict.fromkeys(limitations))
 
 
 def _safe_rule_test_diagnostic_reason(value: str) -> str:

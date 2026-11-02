@@ -517,6 +517,7 @@ class RuleTestReport:
     roles: tuple[RuleRoleTestReport, ...]
     selection_bias: str
     coverage_statement: str
+    source_validator_findings: tuple[str, ...] = ()
     measurement_method: RuleTestMeasurementMethod = RuleTestMeasurementMethod.ISOLATED_YARA_WORKER
     id: UUID = field(default_factory=uuid4)
 
@@ -534,6 +535,10 @@ class RuleTestReport:
         object.__setattr__(
             self, "roles", tuple(sorted(roles, key=lambda result: result.role.value))
         )
+        findings = tuple(self.source_validator_findings)
+        if any(not isinstance(finding, str) or not finding.strip() for finding in findings):
+            raise ValueError("source validator findings must be non-empty reason codes")
+        object.__setattr__(self, "source_validator_findings", tuple(dict.fromkeys(findings)))
         if not self.engine_version.strip():
             raise ValueError("engine_version must be declared")
         if not self.selection_bias.strip() or not self.coverage_statement.strip():
@@ -663,6 +668,7 @@ class RuleTestReport:
                 for case in goodware.test_cases
                 if case.sample_sha256 in goodware.non_measurable
             )
+            and not self.source_validator_findings
         ):
             return RuleValidationStatus.REAL_VALIDATED
         return RuleValidationStatus.REAL_PARTIAL
