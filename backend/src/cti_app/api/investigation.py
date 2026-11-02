@@ -18,6 +18,7 @@ from uuid import UUID, uuid5
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.analyst_handoff import (
     AnalystHandoffPolicy,
     AnalystPostSynthesisService,
@@ -2182,6 +2183,11 @@ async def get_investigation_operator_status(
         evidence_summaries = (
             CanonicalEvidenceSummaryPort(artifact_store) if artifact_store is not None else None
         )
+        advisor_consult_statuses = await _advisor_consult_statuses(
+            invocations=invocations,
+            observations=observations,
+            evidence_summaries=evidence_summaries,
+        )
         advisor_guidance = await build_advisor_guidance(
             invocations=invocations,
             observations=observations,
@@ -2255,6 +2261,7 @@ async def get_investigation_operator_status(
                 pending_bridge_turn.idempotency_key if pending_bridge_turn else None
             ),
             provider_response_ids=provider_response_ids,
+            advisor_consult_statuses=advisor_consult_statuses,
             operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
         )
         invocation_costs = await _operator_bridge_invocation_costs(
@@ -2304,6 +2311,62 @@ async def get_investigation_operator_status(
             }
             return InvestigationOperatorStatusCompactResponse.model_validate(compact_payload)
         return InvestigationOperatorStatusResponse.model_validate(operator_view.payload)
+
+
+async def _advisor_consult_statuses(
+    *,
+    invocations: Sequence[Any],
+    observations: Sequence[Any],
+    evidence_summaries: CanonicalEvidenceSummaryPort | None,
+) -> dict[UUID, str]:
+    """Project compact consultation states from verified advisor-call metadata."""
+    observations_by_id = {getattr(item, "id", None): item for item in observations}
+    statuses: dict[UUID, str] = {}
+    for invocation in invocations:
+        if getattr(invocation, "tool_name", None) != "advisor.consult":
+            continue
+        metadata: Mapping[str, Any] = {}
+        advisor_observation_present = False
+        for observation_id in reversed(tuple(getattr(invocation, "response_refs", ()))):
+            observation = observations_by_id.get(observation_id)
+            if (
+                observation is None
+                or getattr(observation, "source", None) != "advisor.consult"
+                or getattr(observation, "object_type", None) != "advisor_call"
+            ):
+                continue
+            advisor_observation_present = True
+            if evidence_summaries is None:
+                break
+            try:
+                payload = await evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if isinstance(payload, Mapping) and payload.get("schema") == "operator-advisor-call.v1":
+                metadata = payload
+                break
+        stage_timestamps = metadata.get("stage_timestamps_utc")
+        if not isinstance(stage_timestamps, Mapping):
+            stage_timestamps = {}
+        output = metadata.get("output")
+        if not isinstance(output, Mapping):
+            output = {}
+        statuses[invocation.id] = derive_advisor_consult_status(
+            stage_timestamps_utc=stage_timestamps,
+            invocation_stage=metadata.get("invocation_stage"),
+            submission_status=metadata.get("submission_status"),
+            submission_state=metadata.get("submission_state"),
+            invocation_status=invocation.status,
+            response_received=output.get("response_received") is True,
+            response_persisted=(
+                isinstance(metadata.get("response_observation_ref"), str)
+                or isinstance(metadata.get("output_blob_id"), str)
+                or output.get("response_persisted") is True
+            ),
+            advisor_observation_present=advisor_observation_present,
+            failure_stage=metadata.get("failure_stage"),
+        )
+    return statuses
 
 
 @router.get("/investigations/{investigation_id}/envelope", response_model=EnvelopeView)

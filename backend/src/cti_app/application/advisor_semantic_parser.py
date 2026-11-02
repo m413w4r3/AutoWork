@@ -249,7 +249,14 @@ def parse_advisor_semantic_response(
     if not isinstance(opinions_raw, list):
         return terminal("invalid", reason="opinions_invalid")
     if len(opinions_raw) == 0 and status == "succeeded":
-        return terminal("invalid", reason="opinions_missing")
+        if (
+            consultation_type == "review_text"
+            and heuristic_review is not None
+            and heuristic_review.get("unit_assignment_status") == "unstructured_overall"
+        ):
+            status = "partial"
+        else:
+            return terminal("invalid", reason="opinions_missing")
 
     opinions: list[dict[str, Any]] = []
     incomplete_units: list[str] = list(response.get("incomplete_units", []))
@@ -386,6 +393,11 @@ def parse_advisor_semantic_response(
         if redacted_secret_count and "secret_redacted" not in heuristic_review_warnings:
             heuristic_review_warnings.append("secret_redacted")
     warnings = list(dict.fromkeys(heuristic_review_warnings))
+    overall_review = (
+        heuristic_review.get("overall_review")
+        if heuristic_review is not None and isinstance(heuristic_review.get("overall_review"), str)
+        else None
+    )
     result = {
         "schema": ADVISOR_RESPONSE_SCHEMA_V4,
         "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
@@ -393,8 +405,10 @@ def parse_advisor_semantic_response(
         "status": status,
         "untrusted": True,
         "usable": (
-            bool(normalized_reviews)
-            and any(item.get("usable") is True for item in normalized_reviews)
+            (
+                any(item.get("usable") is True for item in normalized_reviews)
+                or bool(overall_review and overall_review.strip())
+            )
             and status in {"succeeded", "partial"}
             if consultation_type == "review_text"
             else bool(candidates) and status == "succeeded"
@@ -410,6 +424,8 @@ def parse_advisor_semantic_response(
     }
     if consultation_type == "review_text":
         result["reviews"] = normalized_reviews
+        if overall_review is not None:
+            result["overall_review"] = overall_review
         result["unit_assignment_status"] = (
             heuristic_review.get("unit_assignment_status", "heuristic")
             if heuristic_review is not None

@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.bridge_investigator import (
     make_investigation_conversation_id,
     make_investigation_turn_idempotency_key,
@@ -174,6 +175,7 @@ def build_investigation_operator_view(
     pending_bridge_turn_error_code: str | None = None,
     pending_bridge_turn_key: str | None = None,
     provider_response_ids: Mapping[UUID, str] | None = None,
+    advisor_consult_statuses: Mapping[UUID, str] | None = None,
     operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> InvestigationOperatorView:
     (
@@ -290,6 +292,7 @@ def build_investigation_operator_view(
             working_state_version=state.version,
             available_tools=projected_available_tools,
             retryable_vt_tool_versions=retryable_vt_tool_versions,
+            advisor_consult_statuses=advisor_consult_statuses,
         )
     else:
         last_operation = None
@@ -472,6 +475,7 @@ def build_investigation_operator_view(
                     working_state_version=state.version,
                     available_tools=projected_available_tools,
                     retryable_vt_tool_versions=retryable_vt_tool_versions,
+                    advisor_consult_statuses=advisor_consult_statuses,
                     operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
                 )
                 for item in ordered_invocations
@@ -484,6 +488,7 @@ def build_investigation_operator_view(
                     working_state_version=state.version,
                     available_tools=projected_available_tools,
                     retryable_vt_tool_versions=retryable_vt_tool_versions,
+                    advisor_consult_statuses=advisor_consult_statuses,
                     operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
                 )
                 for item in ambiguous
@@ -496,6 +501,7 @@ def build_investigation_operator_view(
                     working_state_version=state.version,
                     available_tools=projected_available_tools,
                     retryable_vt_tool_versions=retryable_vt_tool_versions,
+                    advisor_consult_statuses=advisor_consult_statuses,
                     operator_reconciliation_vt_tool_versions=operator_reconciliation_vt_tool_versions,
                 )
                 for item in unresolved
@@ -719,6 +725,7 @@ def _invocation_view(
     working_state_version: int | None = None,
     available_tools: tuple[str, ...] = (),
     retryable_vt_tool_versions: frozenset[tuple[str, str]] = frozenset(),
+    advisor_consult_statuses: Mapping[UUID, str] | None = None,
     operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     needs_reconciliation = invocation.status is ToolInvocationStatus.NEEDS_REVIEW
@@ -742,7 +749,7 @@ def _invocation_view(
         if investigation_id is not None and working_state_version is not None
         else None
     )
-    return {
+    view = {
         "id": invocation.id,
         "operation_key": invocation.operation_key,
         "tool_name": invocation.tool_name,
@@ -770,6 +777,23 @@ def _invocation_view(
         "retry_action": retry_action,
         "updated_at": invocation.updated_at,
     }
+    if invocation.tool_name == "advisor.consult":
+        consult_status = (
+            advisor_consult_statuses.get(invocation.id)
+            if advisor_consult_statuses is not None
+            else None
+        )
+        if consult_status is None:
+            consult_status = derive_advisor_consult_status(
+                invocation_status=invocation.status,
+                advisor_observation_present=(
+                    invocation.status
+                    in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+                    and bool(invocation.response_refs)
+                ),
+            )
+        view["consult_status"] = consult_status
+    return view
 
 
 def _reconciliation_task(

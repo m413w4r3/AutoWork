@@ -638,6 +638,365 @@ def test_advisor_timeout_budgets_allow_slow_bridge_responses() -> None:
     assert MAX_ADVISOR_TOOL_SECONDS >= 200
 
 
+async def _advisor_response_link_payloads(tool, investigation_id):
+    payloads = []
+    for observation in await tool._observations.list_for_investigation(investigation_id):
+        if (
+            observation.source != "advisor.consult.response"
+            or observation.object_type != "advisor_response_received"
+        ):
+            continue
+        raw = await tool._artifact_store.read_bytes(observation.blob_id, max_bytes=1_000_000)
+        payloads.append((observation, json.loads(raw)))
+    return payloads
+
+
+@pytest.mark.asyncio
+async def test_advisor_raw_response_link_survives_parse_exception(monkeypatch) -> None:
+    investigation_id = uuid4()
+    invocation_id = str(uuid4())
+    raw_output = "Bridge's original prose response."
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(
+            TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text=raw_output,
+                bridge_invocation_id=invocation_id,
+            )
+        ),
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+
+    def fail_parsing(*_args, **_kwargs):
+        raise RuntimeError("synthetic parse failure")
+
+    monkeypatch.setattr(tool, "_submission_result", fail_parsing)
+    with pytest.raises(RuntimeError, match="synthetic parse failure"):
+        await tool.execute(
+            {
+                "consultation_type": "pivot_strategy",
+                "evidence_refs": [str(evidence.id)],
+            },
+            make_context(investigation_id, key="response-link-parse-failure"),
+        )
+
+    links = await _advisor_response_link_payloads(tool, investigation_id)
+    assert len(links) == 1
+    _observation, payload = links[0]
+    assert payload["bridge_invocation_id"] == invocation_id
+    assert payload["consultation_type"] == "pivot_strategy"
+    assert payload["raw_response_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert tool._artifact_store.values[UUID(payload["raw_response_blob_id"])] == raw_output.encode()
+
+
+@pytest.mark.asyncio
+async def test_advisor_raw_response_link_survives_result_manifest_persistence_failure(
+    monkeypatch,
+) -> None:
+    from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+
+    investigation_id = uuid4()
+    raw_output = advisor_response("A measured next step.", [])
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output)),
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+    record_json = ProductionEvidenceRecorder.record_json
+
+    async def fail_call_manifest(self, **kwargs):
+        if kwargs.get("object_type") == "advisor_call":
+            raise RuntimeError("synthetic result manifest failure")
+        return await record_json(self, **kwargs)
+
+    monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_call_manifest)
+    result = await tool.execute(
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(evidence.id)],
+        },
+        make_context(investigation_id, key="response-link-manifest-failure"),
+    )
+
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    links = await _advisor_response_link_payloads(tool, investigation_id)
+    assert len(links) == 1
+    _observation, payload = links[0]
+    assert payload["raw_response_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert tool._artifact_store.values[UUID(payload["raw_response_blob_id"])] == raw_output.encode()
+
+
+@pytest.mark.asyncio
+async def test_advisor_raw_response_link_replay_does_not_duplicate(monkeypatch) -> None:
+    from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+
+    investigation_id = uuid4()
+    raw_output = advisor_response("A measured next step.", [])
+    evidence, evidence_bytes = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=evidence,
+        raw=evidence_bytes,
+    )
+    record_json = ProductionEvidenceRecorder.record_json
+
+    async def fail_call_manifest(self, **kwargs):
+        if kwargs.get("object_type") == "advisor_call":
+            raise RuntimeError("synthetic result manifest failure")
+        return await record_json(self, **kwargs)
+
+    monkeypatch.setattr(ProductionEvidenceRecorder, "record_json", fail_call_manifest)
+    context = make_context(investigation_id, key="response-link-replay")
+
+    arguments = {
+        "consultation_type": "pivot_strategy",
+        "evidence_refs": [str(evidence.id)],
+    }
+    first = await tool.execute(arguments, context)
+    assert tool.take_result(context.idempotency_key) is not None
+    replay = await tool.execute(arguments, context)
+
+    assert first.output["output_sha256"] == replay.output["output_sha256"]
+    assert len(transport.calls) == 2
+    assert len(await _advisor_response_link_payloads(tool, investigation_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_optional_draft_inputs_degrade_with_warnings_and_canonical_measurements() -> None:
+    investigation_id = uuid4()
+    sample_hash = "c" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "CanonicalMeasurementMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Draft prose with an optional annotation omitted.",
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "string",
+                    "offset": 128,
+                    "value": "UnverifiedInputMarker",
+                }
+            ],
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "broken-annotation",
+                            "text": "",
+                            "nature": "unknown",
+                            "refs": "not-a-reference-list",
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="optional-draft-input-degradation"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert "CanonicalMeasurementMarker" in prompt
+    assert "UnverifiedInputMarker" not in prompt
+    warnings = [dict(item) for item in result.output["input_warnings"]]
+    assert {item["field"] for item in warnings} == {"measurements", "units.assertions"}
+    assert all(
+        item["code"] == "optional_draft_assertion_ignored"
+        for item in warnings
+        if item["field"] == "units.assertions"
+    )
+    assert all(
+        item["code"] == "optional_measurements_ignored"
+        for item in warnings
+        if item["field"] == "measurements"
+    )
+
+    manifest_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.object_type == "advisor_call" and item.source == "advisor.consult"
+    )
+    manifest = json.loads(
+        await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
+    )
+    assert manifest["input_warnings"] == warnings
+    assert manifest["output"]["input_warnings"] == warnings
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected_error"),
+    [
+        pytest.param("evidence_refs", "evidence_reference_not_found", id="evidence-ref"),
+        pytest.param("sample_sha256", "sample_hash_not_associated", id="sample-hash"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_optional_measurement_fallback_does_not_widen_explicit_scope(
+    selector: str, expected_error: str
+) -> None:
+    investigation_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    arguments: dict[str, Any] = {
+        "consultation_type": "pivot_strategy",
+        "measurements": [{"blob_id": "unknown", "kind": "string"}],
+    }
+    if selector == "evidence_refs":
+        arguments[selector] = [str(uuid4())]
+    else:
+        arguments[selector] = "d" * 64
+
+    result = await tool.execute(
+        arguments,
+        make_context(investigation_id, key=f"scope-selector-{selector}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["input_error_code"] == expected_error
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "consultation_type",
+    [
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "review_text",
+        "draft_text",
+        "suricata_draft",
+        "figure_plan",
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_optional_measurements_warn_for_every_consultation_type(
+    consultation_type: str,
+) -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "e" * 64,
+            "strings": [{"value": "IndependentCanonicalMeasurement", "offset": 256}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The optional measurement selector could not be used.",
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, "e" * 64)
+
+    result = await tool.execute(
+        {
+            "consultation_type": consultation_type,
+            "evidence_refs": [str(observation.id)],
+            "measurements": [{"blob_id": "unverified", "kind": "string"}],
+        },
+        make_context(investigation_id, key=f"optional-measurements-{consultation_type}"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    warnings = [dict(item) for item in result.output["input_warnings"]]
+    assert any(
+        item["field"] == "measurements" and item["code"] == "optional_measurements_ignored"
+        for item in warnings
+    )
+    manifest_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.object_type == "advisor_call" and item.source == "advisor.consult"
+    )
+    manifest = json.loads(
+        await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
+    )
+    assert manifest["input_warnings"] == warnings
+
+
+@pytest.mark.asyncio
+async def test_malformed_top_level_draft_assertions_are_ignored_with_warning() -> None:
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Draft prose remains available without optional assertions.",
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+
+    result = await tool.execute(
+        {"consultation_type": "draft_text", "assertions": [{"malformed": True}]},
+        make_context(investigation_id, key="optional-top-level-assertion"),
+    )
+
+    assert len(transport.calls) == 1
+    assert any(
+        item["field"] == "assertions" and item["code"] == "optional_draft_assertion_ignored"
+        for item in result.output["input_warnings"]
+    )
+
+
 def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> None:
     investigation_id = uuid4()
     tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
@@ -705,8 +1064,9 @@ def test_advisor_registered_schema_accepts_canonical_editorial_assertion_refs() 
     validate_json_schema(arguments, schema)
 
     arguments["units"][0]["assertions"][0]["refs"][0]["id"] = "not-a-uuid"
-    with pytest.raises(ValueError):
-        validate_json_schema(arguments, schema)
+    # Assertion annotations are optional, so their canonical shape is checked
+    # by the adapter, which can omit a defective annotation with a warning.
+    validate_json_schema(arguments, schema)
 
 
 def test_verified_advisor_measurements_accept_more_than_sixty_four_items() -> None:
@@ -1158,13 +1518,21 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     }
     observation, raw = make_observation(investigation_id, measured)
     rule_source = 'rule Candidate { strings: $mutex = "CreateMutexW" condition: $mutex }'
-    transport = Transport(
-        lambda call: TurnSubmission(
+
+    def bridge_response(call):
+        measurements = typed_prompt_payload(call["prompt"])["measurements"]
+        mutex = next(item for item in measurements if item["value"] == "CreateMutexW")
+        return TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text=typed_yara_response(call["prompt"], rule_source=rule_source),
+            output_text=(
+                "advisor-wire.v1\nTYPE: yara_draft\nSTATUS: succeeded\n"
+                f"```yara\n{rule_source}\n```\nMOTIF: $mutex | measurements={mutex['alias']}\n"
+                "INVARIANT: The mutex marker is independently measured.\nLIMITATION: none"
+            ),
             bridge_invocation_id=str(uuid4()),
         )
-    )
+
+    transport = Transport(bridge_response)
     tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -1332,9 +1700,10 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     assert persisted["input_observation_refs"] == [str(observation.id)]
     assert persisted["output"].get("schema") == ADVISOR_RESPONSE_SCHEMA_V3, persisted
     assert persisted["output"]["rule_source"].rstrip("\n") == rule_source
+    assert persisted["output"]["motifs"][0]["name"] == "$mutex"
     assert {
         item["measurement_id"] for item in persisted["output"]["motifs"][0]["measurement_refs"]
-    } == {"m001", "m002", "m003", "m004"}
+    } == {"m001"}
     assert persisted["bridge_invocation_id_kind"] == "conversation_turn"
     assert persisted["bridge_invocation_id"]
     assert len(persisted["input_sha256"]) == 64
@@ -1362,7 +1731,9 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     assert unknown_claim.output["invalid_article_claim_ids"] == ("s9p9",)
     assert unknown_claim.output["valid_article_claim_ids"] == ("S3P2.1", "S4P1.1")
     assert "valid article claim ids: s3p2.1, s4p1.1" in unknown_claim.message.casefold()
-    assert len(transport.calls) == 1
+    # The malformed optional-measurement consult and the valid request above both reached Bridge;
+    # the unknown-claim request is rejected before transport.
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -4792,6 +5163,7 @@ async def test_large_invalid_advisor_output_is_archived_without_content_limit() 
         "bridge_post_started",
         "bridge_response_received",
         "output_stored",
+        "response_persisted",
         "manifest_persisted",
     }
     stage_timestamps = result.output["stage_timestamps_utc"]
@@ -6006,7 +6378,7 @@ async def test_draft_text_unit_assertion_refs_load_article_and_measurement_bodie
 
 @pytest.mark.parametrize("bad_reference", ["sha_mismatch", "foreign_observation"])
 @pytest.mark.asyncio
-async def test_draft_text_unit_assertion_reference_failure_is_visible_in_batch(
+async def test_draft_text_unit_assertion_reference_failures_are_omitted_in_batch(
     bad_reference: str,
 ) -> None:
     investigation_id = uuid4()
@@ -6025,7 +6397,12 @@ async def test_draft_text_unit_assertion_reference_failure_is_visible_in_batch(
             {"schema": "article-claim-capture.v1", "summary": "Synthetic foreign evidence."},
         )
         reference_id = foreign_observation.id
-    transport = Transport(None)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Draft prose with the unverifiable optional annotation omitted.",
+        )
+    )
     tool, _sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -6076,15 +6453,13 @@ async def test_draft_text_unit_assertion_reference_failure_is_visible_in_batch(
             key=f"operator:advisor:unit-assertion-{bad_reference}",
         ),
     )
-
-    assert transport.calls == []
-    assert result.output["preflight_cause"]["ref"] == str(reference_id)
-    statuses = result.output["batch_statuses"]
-    assert statuses[0]["preflight_cause"]["ref"] == str(reference_id)
-    assert statuses[0]["additional_missing_ref_count"] == 0
-    assert statuses[0]["refusal_guidance"]
-    assert result.output["additional_missing_ref_count"] == 0
-    assert result.output["refusal_guidance"]
+    assert len(transport.calls) == 1, result.output
+    assert result.error_code is None, result.output
+    input_warnings = result.output.get("input_warnings", ())
+    assert any(
+        item["field"] == "units.assertions" and item["code"] == "optional_draft_assertion_ignored"
+        for item in input_warnings
+    ), result.output
 
 
 @pytest.mark.asyncio
@@ -9419,9 +9794,17 @@ def test_figure_plan_accepts_only_typed_semantics_and_transmitted_refs() -> None
 
 
 @pytest.mark.asyncio
-async def test_suricata_draft_refuses_before_bridge_without_measured_network_facts() -> None:
+async def test_suricata_draft_without_capture_keeps_untested_prose_candidate() -> None:
     investigation_id = uuid4()
-    transport = Transport(None)
+    source = (
+        'alert http any any -> any any (msg:"Prose candidate"; content:"example.test"; '
+        "sid:9901001; rev:1;)\n"
+    )
+    raw_response = (
+        "This is an experimental Suricata candidate. It is untested because no capture was "
+        "available.\n\n```suricata\n" + source + "```\n"
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_response))
     tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
 
     result = await tool.execute(
@@ -9429,24 +9812,31 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.UNAVAILABLE
-    assert result.output["preflight_status"] == "INSUFFICIENT_EVIDENCE"
-    assert result.error_code == "advisor_preflight_insufficient_evidence"
-    assert result.output["missing_refs"] == (
-        {
-            "ref": "network-fact",
-            "reason": "No measured network fact was loaded for Suricata drafting.",
-        },
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["preflight_status"] == "READY"
+    assert result.output["usable"] is True
+    assert result.output["structured_usable"] is False
+    assert result.output["canonicalization_eligible"] is False
+    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["response_received"] is True
+    assert len(transport.calls) == 1
+
+    call_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.source == "advisor.consult" and item.object_type == "advisor_call"
     )
-    assert result.output["bridge_turns_consumed"] == 0
-    assert result.output["usable"] is False
-    assert result.output["response_state"] == "pre_send_failure"
-    assert result.output["response_received"] is False
-    assert (
-        result.framework_pre_submission_proof
-        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(call_observation.blob_id, max_bytes=1_000_000)
     )
-    assert transport.calls == []
+    advisor_output = persisted["output"]
+    assert advisor_output["rule_source"] == source
+    assert advisor_output["rule_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert advisor_output["raw_output"] == raw_response
+    assert advisor_output["raw_output_sha256"] == hashlib.sha256(raw_response.encode()).hexdigest()
+    assert "fact_references_missing" in advisor_output["warnings"]
+    assert advisor_output["fact_refs"] == []
+    assert any("untested" in item.casefold() for item in advisor_output["limitations"])
 
 
 @pytest.mark.asyncio
