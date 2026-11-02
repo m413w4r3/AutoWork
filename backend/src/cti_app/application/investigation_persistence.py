@@ -155,6 +155,27 @@ class DetectionCandidateRepository(Protocol):
         self, version: DetectionCandidateVersion, *, expected_previous_id: UUID | None
     ) -> DetectionCandidateVersion: ...
 
+    async def append_version_idempotently(
+        self, version: DetectionCandidateVersion
+    ) -> tuple[DetectionCandidateVersion, bool]: ...
+
+
+def _same_detection_candidate_version(
+    left: DetectionCandidateVersion, right: DetectionCandidateVersion
+) -> bool:
+    """Compare persisted version content while ignoring its creation timestamp."""
+    return (
+        left.id == right.id
+        and left.candidate_id == right.candidate_id
+        and left.investigation_id == right.investigation_id
+        and left.source == right.source
+        and left.source_sha256 == right.source_sha256
+        and left.motif_provenance == right.motif_provenance
+        and left.status is right.status
+        and left.version == right.version
+        and left.parent_version_id == right.parent_version_id
+    )
+
 
 class AnalystOpinionRepository(Protocol):
     async def get(
@@ -571,6 +592,29 @@ class InMemoryDetectionCandidateRepository:
                     raise VersionConflictError("Detection candidate already has a newer version")
             self._items[version.id] = version
             return version
+
+    async def append_version_idempotently(
+        self, version: DetectionCandidateVersion
+    ) -> tuple[DetectionCandidateVersion, bool]:
+        if version.version != 1 or version.parent_version_id is not None:
+            raise ValueError("Idempotent candidate imports must create a first version")
+        async with self._lock:
+            existing = self._items.get(version.id)
+            if existing is None:
+                existing = next(
+                    (
+                        item
+                        for item in self._items.values()
+                        if item.candidate_id == version.candidate_id and item.version == 1
+                    ),
+                    None,
+                )
+            if existing is not None:
+                if _same_detection_candidate_version(existing, version):
+                    return existing, True
+                raise VersionConflictError("Detection candidate import identity already exists")
+            self._items[version.id] = version
+            return version, False
 
 
 class InMemoryAnalystOpinionRepository:

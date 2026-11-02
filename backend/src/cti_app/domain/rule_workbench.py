@@ -145,6 +145,85 @@ class YaraExecutionStatus(StrEnum):
     INVALID_INPUT = "invalid_input"
 
 
+class RuleLifecycle(StrEnum):
+    CANDIDATE = "candidate"
+    COMPILED = "compiled"
+    TESTED = "tested"
+    VALIDATED = "validated"
+
+
+def derive_rule_lifecycle(
+    compile_status: YaraExecutionStatus,
+    *,
+    has_test_report: bool,
+    validation_status: RuleValidationStatus,
+) -> RuleLifecycle:
+    """Derive user-facing lifecycle from current compilation and persisted test evidence."""
+    status = YaraExecutionStatus(compile_status)
+    validation = RuleValidationStatus(validation_status)
+    if (
+        has_test_report
+        and status is YaraExecutionStatus.OK
+        and validation is RuleValidationStatus.REAL_VALIDATED
+    ):
+        return RuleLifecycle.VALIDATED
+    if has_test_report:
+        return RuleLifecycle.TESTED
+    if status is YaraExecutionStatus.OK:
+        return RuleLifecycle.COMPILED
+    return RuleLifecycle.CANDIDATE
+
+
+class RuleDiagnosticStage(StrEnum):
+    SOURCE_VALIDATOR = "source_validator"
+    LOCAL_BUILD = "local_build"
+    YARA_COMPILE = "yara_compile"
+    ENGINE = "engine"
+    PERSISTENCE = "persistence"
+    CORPUS_TEST = "corpus_test"
+
+
+class RuleDiagnosticStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuleToolDiagnostic:
+    stage: RuleDiagnosticStage
+    status: RuleDiagnosticStatus
+    reason_code: str
+    engine_status: YaraExecutionStatus | None = None
+    line: int | None = None
+    column: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stage", RuleDiagnosticStage(self.stage))
+        object.__setattr__(self, "status", RuleDiagnosticStatus(self.status))
+        if not self.reason_code.strip():
+            raise ValueError("diagnostic reason_code is required")
+        if self.engine_status is not None:
+            object.__setattr__(self, "engine_status", YaraExecutionStatus(self.engine_status))
+        for field_name in ("line", "column"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{field_name} must be positive")
+
+    def to_payload(self) -> dict[str, str | int | None]:
+        return {
+            "stage": self.stage.value,
+            "status": self.status.value,
+            "reason_code": self.reason_code,
+            "engine_status": self.engine_status.value if self.engine_status else None,
+            "line": self.line,
+            "column": self.column,
+        }
+
+
 class RuleTestErrorCode(StrEnum):
     COMPILE_ERROR = "compile_error"
     TIMEOUT = "timeout"
@@ -467,6 +546,7 @@ class RuleTestReport:
     roles: tuple[RuleRoleTestReport, ...]
     selection_bias: str
     coverage_statement: str
+    source_validator_findings: tuple[str, ...] = ()
     measurement_method: RuleTestMeasurementMethod = RuleTestMeasurementMethod.ISOLATED_YARA_WORKER
     id: UUID = field(default_factory=uuid4)
 
@@ -484,6 +564,10 @@ class RuleTestReport:
         object.__setattr__(
             self, "roles", tuple(sorted(roles, key=lambda result: result.role.value))
         )
+        findings = tuple(self.source_validator_findings)
+        if any(not isinstance(finding, str) or not finding.strip() for finding in findings):
+            raise ValueError("source validator findings must be non-empty reason codes")
+        object.__setattr__(self, "source_validator_findings", tuple(dict.fromkeys(findings)))
         if not self.engine_version.strip():
             raise ValueError("engine_version must be declared")
         if not self.selection_bias.strip() or not self.coverage_statement.strip():
@@ -613,6 +697,7 @@ class RuleTestReport:
                 for case in goodware.test_cases
                 if case.sample_sha256 in goodware.non_measurable
             )
+            and not self.source_validator_findings
         ):
             return RuleValidationStatus.REAL_VALIDATED
         return RuleValidationStatus.REAL_PARTIAL

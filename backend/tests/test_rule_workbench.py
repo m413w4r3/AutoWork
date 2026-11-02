@@ -20,6 +20,7 @@ from cti_app.application.rule_workbench import (
     RuleValidationReason,
     RuleWorkbench,
     YaraSampleInput,
+    classify_rule_validation_issues,
     rule_validation_reason,
     validate_single_rule_candidate,
 )
@@ -48,6 +49,7 @@ from cti_app.domain.legitimate_services import (
 from cti_app.domain.reference_corpus import ReferenceCorpusVerdict
 from cti_app.domain.rule_workbench import (
     RuleConditionStrategy,
+    RuleLifecycle,
     RuleMotif,
     RuleMotifIssueCode,
     RuleMotifKind,
@@ -59,6 +61,7 @@ from cti_app.domain.rule_workbench import (
     RuleValidationStatus,
     YaraEngineResult,
     YaraExecutionStatus,
+    derive_rule_lifecycle,
     detect_file_format_magic,
     wilson_rate,
 )
@@ -228,6 +231,49 @@ def test_single_rule_source_guard_accepts_one_measured_rule_using_all_of_them() 
     assert validate_single_rule_candidate(source) == ()
 
 
+def test_rule_lifecycle_is_derived_from_compile_test_and_strict_validation() -> None:
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.OK,
+            has_test_report=False,
+            validation_status=RuleValidationStatus.UNTESTED,
+        )
+        is RuleLifecycle.COMPILED
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.COMPILE_ERROR,
+            has_test_report=False,
+            validation_status=RuleValidationStatus.UNTESTED,
+        )
+        is RuleLifecycle.CANDIDATE
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.ENGINE_UNAVAILABLE,
+            has_test_report=True,
+            validation_status=RuleValidationStatus.REAL_PARTIAL,
+        )
+        is RuleLifecycle.TESTED
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.OK,
+            has_test_report=True,
+            validation_status=RuleValidationStatus.REAL_VALIDATED,
+        )
+        is RuleLifecycle.VALIDATED
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.COMPILE_ERROR,
+            has_test_report=True,
+            validation_status=RuleValidationStatus.REAL_VALIDATED,
+        )
+        is RuleLifecycle.TESTED
+    )
+
+
 def test_single_rule_source_guard_accepts_grouped_or_in_conjunctive_condition() -> None:
     source = """
 rule bridge_candidate {
@@ -248,6 +294,35 @@ rule bridge_candidate {
 }
 """
     assert validate_single_rule_candidate(source) == ()
+
+
+@pytest.mark.asyncio
+async def test_disguised_or_finding_is_advisory_for_testing_and_blocks_validation() -> None:
+    data = b"measured-marker"
+    source = (
+        'rule bridge_candidate { strings: $a = "measured-marker" $b = "other-marker" '
+        "condition: $a or $b }"
+    )
+    issues = validate_single_rule_candidate(source)
+    blocking, advisory = classify_rule_validation_issues(issues)
+    assert blocking == ()
+    assert advisory == ("or_branches_disguised_as_multiple_rules_forbidden",)
+
+    workbench = _workbench(
+        {_sha256(data): data},
+        engine=UnavailableYaraEngine(),
+    )
+    assert workbench.compile_check(source).status is YaraExecutionStatus.ENGINE_UNAVAILABLE
+    report = await workbench.compile_and_test(
+        source,
+        (_case(data, RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),),
+        selection_bias="One selected synthetic candidate sample.",
+        coverage_statement="One synthetic candidate sample was measured.",
+    )
+
+    assert report.execution_status is YaraExecutionStatus.ENGINE_UNAVAILABLE
+    assert report.source_validator_findings == advisory
+    assert report.validation_status is not RuleValidationStatus.REAL_VALIDATED
 
 
 @pytest.mark.parametrize(

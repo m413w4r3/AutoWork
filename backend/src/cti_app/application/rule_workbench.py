@@ -7,7 +7,7 @@ import math
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol, TypedDict
 from uuid import UUID, uuid4
@@ -96,11 +96,25 @@ class RuleValidationReason(StrEnum):
     EXPLICIT_TEST_REQUIRED = "explicit_rule_test_required"
 
 
+_ADVISORY_RULE_VALIDATION_ISSUES = frozenset({"or_branches_disguised_as_multiple_rules_forbidden"})
+
+
+def classify_rule_validation_issues(
+    issues: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Separate hard source refusals from advisory discrimination heuristics."""
+    blocking = tuple(issue for issue in issues if issue not in _ADVISORY_RULE_VALIDATION_ISSUES)
+    advisory = tuple(issue for issue in issues if issue in _ADVISORY_RULE_VALIDATION_ISSUES)
+    return blocking, advisory
+
+
 def rule_validation_reason(report: RuleTestReport) -> RuleValidationReason:
     if report.validation_status is RuleValidationStatus.REAL_VALIDATED:
         return RuleValidationReason.VALIDATED
     if not any(role.test_cases for role in report.roles):
         return RuleValidationReason.CORPUS_EMPTY
+    if report.source_validator_findings:
+        return RuleValidationReason.EXECUTION_INCOMPLETE
     positives = next(
         role for role in report.roles if role.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
     )
@@ -420,11 +434,12 @@ class RuleWorkbench:
     def compile_check(self, rule_source: str) -> YaraEngineResult:
         """Compile generated rule source without evaluating it against a corpus."""
         source_issues = validate_single_rule_candidate(rule_source)
-        if source_issues:
+        blocking_issues, _advisory_issues = classify_rule_validation_issues(source_issues)
+        if blocking_issues:
             return YaraEngineResult(
                 status=YaraExecutionStatus.INVALID_INPUT,
                 engine_version="unavailable",
-                message="single-rule source guard: " + ",".join(source_issues),
+                message="single-rule source guard: " + ",".join(blocking_issues),
             )
         if len(rule_source.encode("utf-8")) > self._policy.maximum_source_bytes:
             return YaraEngineResult(
@@ -994,13 +1009,14 @@ class RuleWorkbench:
             for role in RuleTestCorpusRole
         }
         source_issues = validate_single_rule_candidate(rule_source)
-        if source_issues:
+        blocking_issues, advisory_issues = classify_rule_validation_issues(source_issues)
+        if blocking_issues:
             for role, role_cases in by_role.items():
                 for case in role_cases:
                     results[role]["errors"].append(
                         RuleTestError(
                             code=RuleTestErrorCode.INVALID_SAMPLE,
-                            message="single-rule source guard: " + ",".join(source_issues),
+                            message="single-rule source guard: " + ",".join(blocking_issues),
                             sample_sha256=case.sample_sha256,
                         )
                     )
@@ -1010,7 +1026,7 @@ class RuleWorkbench:
                         matched=None,
                         format_magic=case.format_magic,
                         details_complete=False,
-                        unavailable_strings=source_issues,
+                        unavailable_strings=blocking_issues,
                     )
             return self._report(
                 source_sha256,
@@ -1020,15 +1036,17 @@ class RuleWorkbench:
                 results,
                 selection_bias,
                 coverage_statement,
+                source_validator_findings=source_issues,
             )
         if self._confined_analysis is not None:
-            return await self._compile_and_test_confined(
+            report = await self._compile_and_test_confined(
                 rule_source,
                 cases,
                 selection_bias=selection_bias,
                 coverage_statement=coverage_statement,
                 investigation_id=investigation_id,
             )
+            return replace(report, source_validator_findings=advisory_issues)
         if self._yara_engine is None:
             raise RuntimeError("no YARA execution port is configured")
         try:
@@ -1069,6 +1087,7 @@ class RuleWorkbench:
                 results,
                 selection_bias,
                 coverage_statement,
+                source_validator_findings=advisory_issues,
             )
 
         if len(cases) > self._policy.maximum_corpus_cases:
@@ -1080,6 +1099,7 @@ class RuleWorkbench:
                 selection_bias,
                 coverage_statement,
                 "corpus exceeds the configured case count",
+                source_validator_findings=advisory_issues,
             )
 
         sample_bytes: dict[str, bytes] = {}
@@ -1127,6 +1147,7 @@ class RuleWorkbench:
                     selection_bias,
                     coverage_statement,
                     "corpus exceeds the configured sample byte limit",
+                    source_validator_findings=advisory_issues,
                 )
             sample_bytes[case.sample_sha256] = payload
             total_sample_bytes += len(payload)
@@ -1223,6 +1244,7 @@ class RuleWorkbench:
             results,
             selection_bias,
             coverage_statement,
+            source_validator_findings=advisory_issues,
         )
 
     async def _compile_and_test_confined(
@@ -1743,6 +1765,8 @@ class RuleWorkbench:
         results: Mapping[RuleTestCorpusRole, _MutableRoleResult],
         selection_bias: str,
         coverage_statement: str,
+        *,
+        source_validator_findings: Sequence[str] = (),
     ) -> RuleTestReport:
         role_reports: list[RuleRoleTestReport] = []
         for role in RuleTestCorpusRole:
@@ -1790,6 +1814,7 @@ class RuleWorkbench:
             roles=tuple(role_reports),
             selection_bias=selection_bias,
             coverage_statement=coverage_statement,
+            source_validator_findings=tuple(source_validator_findings),
             measurement_method=(
                 RuleTestMeasurementMethod.CONFINED_ANALYSIS_WORKER
                 if self._confined_analysis is not None
@@ -1806,6 +1831,8 @@ class RuleWorkbench:
         selection_bias: str,
         coverage_statement: str,
         message: str,
+        *,
+        source_validator_findings: Sequence[str] = (),
     ) -> RuleTestReport:
         for role, cases in by_role.items():
             result = results[role]
@@ -1830,6 +1857,7 @@ class RuleWorkbench:
             results,
             selection_bias,
             coverage_statement,
+            source_validator_findings=source_validator_findings,
         )
 
     def _motif_kind(

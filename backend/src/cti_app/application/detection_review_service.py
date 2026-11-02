@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.rule_workbench import validate_single_rule_candidate
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -33,6 +35,7 @@ from cti_app.domain.publication_document import parse_publication_document
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DETECTION_REVIEW_NAMESPACE = UUID("3bdc0363-2ff8-4c0f-a842-98f9359f8e2c")
 DETECTION_REVIEW_DETAILS_SCHEMA = "detection-review.v1"
+_PERSISTED_MOTIF_PREFIX = "rule-workbench-motif-v1:"
 
 
 class DetectionReviewErrorCode(StrEnum):
@@ -42,6 +45,7 @@ class DetectionReviewErrorCode(StrEnum):
     TEST_REPORT_NOT_FOUND = "detection_test_report_not_found"
     ARTICLE_BASE_UNAVAILABLE = "detection_article_base_unavailable"
     VERSION_REJECTED_BY_TEST = "detection_version_rejected_by_test"
+    SOURCE_VALIDATION_FAILED = "detection_source_validation_failed"
     INVALID_ACTOR = "detection_review_actor_required"
     INVALID_REASON = "detection_review_reason_required"
     LIMITATIONS_REQUIRED = "detection_known_limitations_required"
@@ -280,6 +284,11 @@ class DetectionReviewService:
                 != expected_source_sha256
             ):
                 raise DetectionReviewError(DetectionReviewErrorCode.SOURCE_SHA256_MISMATCH)
+            decision_limitations = (
+                _append_justification_gap_limitation(known_limitations, version)
+                if decision_type is AnalystDecisionType.DETECTION_APPROVE
+                else known_limitations
+            )
 
             existing_decisions = tuple(
                 await uow.analyst_decisions.list_for_investigation(version.investigation_id)
@@ -301,7 +310,7 @@ class DetectionReviewService:
                     actor=actor,
                     reason=reason,
                     source_sha256=expected_source_sha256,
-                    known_limitations=known_limitations,
+                    known_limitations=decision_limitations,
                     retrohunt_authorization=retrohunt_authorization,
                 ):
                     return prior
@@ -324,6 +333,11 @@ class DetectionReviewService:
             reports = await self._read_test_reports(version, observations)
             if not reports:
                 raise DetectionReviewError(DetectionReviewErrorCode.TEST_REPORT_NOT_FOUND)
+            if (
+                decision_type is AnalystDecisionType.DETECTION_APPROVE
+                and validate_single_rule_candidate(version.source)
+            ):
+                raise DetectionReviewError(DetectionReviewErrorCode.SOURCE_VALIDATION_FAILED)
             report = reports[-1]
             false_positives = report.known_false_positives
             if (
@@ -352,7 +366,7 @@ class DetectionReviewService:
                 details={
                     "schema": DETECTION_REVIEW_DETAILS_SCHEMA,
                     "source_sha256": expected_source_sha256,
-                    "known_limitations": known_limitations,
+                    "known_limitations": decision_limitations,
                     "known_false_positives": list(false_positives),
                     "test_report": {
                         "observation_id": str(report.observation.id),
@@ -395,7 +409,7 @@ class DetectionReviewService:
                     actor=actor,
                     reason=reason,
                     source_sha256=expected_source_sha256,
-                    known_limitations=known_limitations,
+                    known_limitations=decision_limitations,
                     retrohunt_authorization=retrohunt_authorization,
                 ):
                     raise DetectionReviewError(
@@ -567,6 +581,27 @@ def _limitations_acknowledge_false_positives(
     return (
         "faux positif" in normalized or "goodware" in normalized or "false positive" in normalized
     )
+
+
+def _append_justification_gap_limitation(
+    known_limitations: str, version: DetectionCandidateVersion
+) -> str:
+    gaps: set[str] = set()
+    for motif in version.motif_provenance:
+        if not motif.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
+            continue
+        try:
+            payload = json.loads(motif.rationale[len(_PERSISTED_MOTIF_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        justification = payload.get("justification") if isinstance(payload, Mapping) else None
+        if isinstance(justification, Mapping) and justification.get("status") == "gap":
+            gaps.add(motif.motif)
+    if not gaps:
+        return known_limitations
+    identifiers = ", ".join(sorted(gaps))
+    limitation = f"Machine-recorded unresolved justification gaps ({len(gaps)}): {identifiers}."
+    return f"{known_limitations}\n{limitation}"
 
 
 def _same_idempotent_decision(

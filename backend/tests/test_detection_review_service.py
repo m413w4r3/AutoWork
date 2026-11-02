@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace, TracebackType
 from typing import Any
@@ -20,6 +22,7 @@ from cti_app.domain.investigation import (
     DetectionCandidateVersion,
     EvidenceKind,
     EvidenceObservation,
+    MotifProvenance,
 )
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -408,6 +411,45 @@ async def test_approval_is_append_only_audited_and_idempotent_by_correlation_id(
 
 
 @pytest.mark.asyncio
+async def test_approval_persists_machine_generated_justification_gap_limitations() -> None:
+    fixture = _Fixture()
+    report_observation = fixture.observations[0]
+    gap = MotifProvenance(
+        motif="$unmeasured",
+        observation_refs=(report_observation.id,),
+        rationale="rule-workbench-motif-v1:" + json.dumps({"justification": {"status": "gap"}}),
+    )
+    fixture.version = DetectionCandidateVersion(
+        id=fixture.version.id,
+        investigation_id=fixture.version.investigation_id,
+        candidate_id=fixture.version.candidate_id,
+        source=fixture.version.source,
+        source_sha256=fixture.version.source_sha256,
+        motif_provenance=(gap,),
+        status=fixture.version.status,
+        version=fixture.version.version,
+        parent_version_id=fixture.version.parent_version_id,
+        test_refs=fixture.version.test_refs,
+        created_at=fixture.version.created_at,
+    )
+    fixture.uow.detection_candidates.version = fixture.version
+
+    decision = await fixture.service.approve(
+        fixture.version.id,
+        SOURCE_SHA256,
+        ACTOR,
+        "Reviewed the source and available tests.",
+        "The local corpus is limited.",
+        "approve-with-gap",
+    )
+
+    persisted_limitations = decision.details["known_limitations"]
+    assert persisted_limitations.startswith("The local corpus is limited.\n")
+    assert "unresolved justification gaps (1): $unmeasured" in persisted_limitations
+    assert "safe-marker" not in persisted_limitations
+
+
+@pytest.mark.asyncio
 async def test_rejected_test_version_cannot_be_approved() -> None:
     fixture = _Fixture()
     fixture.version = DetectionCandidateVersion(
@@ -434,3 +476,43 @@ async def test_rejected_test_version_cannot_be_approved() -> None:
         )
 
     assert error.value.code is DetectionReviewErrorCode.VERSION_REJECTED_BY_TEST
+
+
+@pytest.mark.asyncio
+async def test_approval_keeps_source_validator_advisories_blocking() -> None:
+    fixture = _Fixture()
+    source = 'rule Sample { strings: $a = "first-marker" $b = "second-marker" condition: $a or $b }'
+    source_sha256 = hashlib.sha256(source.encode()).hexdigest()
+    fixture.version = DetectionCandidateVersion(
+        id=fixture.version.id,
+        investigation_id=fixture.version.investigation_id,
+        candidate_id=fixture.version.candidate_id,
+        source=source,
+        source_sha256=source_sha256,
+        motif_provenance=(),
+        status=DetectionCandidateStatus.TESTED,
+    )
+    fixture.uow.detection_candidates.version = fixture.version
+    report_observation = fixture.observations[0]
+    payload = fixture.blobs.payloads[report_observation.blob_id]
+    payload["proposal_source_sha256"] = source_sha256
+    payload["source_sha256"] = source_sha256
+    report_observation = replace(
+        report_observation,
+        sha256=hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest(),
+    )
+    fixture.observations = (report_observation,)
+    fixture.uow.evidence_observations.items = [report_observation]
+
+    with pytest.raises(DetectionReviewError) as error:
+        await fixture.service.approve(
+            fixture.version.id,
+            source_sha256,
+            ACTOR,
+            "Reviewed source and corpus",
+            "Known limitations reviewed.",
+            "approve-validator-advisory",
+        )
+
+    assert error.value.code is DetectionReviewErrorCode.SOURCE_VALIDATION_FAILED
+    assert fixture.uow.commits == 0
