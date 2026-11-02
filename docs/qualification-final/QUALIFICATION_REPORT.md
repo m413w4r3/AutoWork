@@ -8,7 +8,7 @@ Ce rapport est un journal d'orchestration : les preuves restent les observations
 | Essai | Opérateur (modèle réel) | Code déployé | Skills / playbook | Durée | État R3 en fin d'essai |
 |---|---|---|---|---|---|
 | attempt-001 | DeepSeek Flash 1M, thinking `max` (`deepseek-claude`), agent `83b66d59` | `main@7d5cb350` (PR #20), déployé le 2026-11-01 avec `RULE_WORKBENCH_ENABLED=false` hérité de `.env` | 9 skills génériques lus (trace vérifiée), playbook sans la ligne « POST en vol » | ~2 h 30 (dont 1 reprise neutre après fin de tour pendant un POST Bridge) | v224, 618 obs., 551 inv., avis v2 ; Bridge 6/200, VT 74/10000 |
-| attempt-002 | DeepSeek Flash 1M, thinking `max`, agent `996bd9fd` | `main@0fd7176c` (PR #21), `RULE_WORKBENCH_ENABLED=true` | idem + ligne « POST en vol » | ~2 h 20, aucune intervention | v257, avis v4 ; Bridge 7/200, VT 79/10000, downloads 4/1000, tool_seconds 9508, contexte 11,8 M/16 M tokens |
+| attempt-002 | DeepSeek Flash 1M, thinking `max`, agent `996bd9fd` | `main@0fd7176c` (PR #21), `RULE_WORKBENCH_ENABLED=true` | idem + ligne « POST en vol » | ~1 h 40, aucune intervention | v257, avis v4 ; Bridge 7/200, VT 79/10000, downloads 4/1000, tool_seconds 9508, contexte 11,8 M/16 M tokens |
 
 « DeepSeek Max » = DeepSeek Flash 1M au niveau de réflexion `max` : seul palier exposé par le runtime. Sous-agents de correction : Luna (`gpt-6-luna`) xhigh, sessions Paseo isolées.
 Limite d'indépendance : R3 contient les 28 findings et observations d'attempt-001 ; attempt-002 est indépendant par session (aucun rapport transmis), pas par corpus. Isolation de l'opérateur : consignes textuelles seulement ; aucune lecture hors périmètre observée dans les commandes.
@@ -65,7 +65,7 @@ Aucune régression observée sur les fichiers testés. Non exécutés : tests ad
 2. **Latence Bridge** : réduire le délai de prise en charge du job (24 min) et la construction du dossier (27 min) avant tout usage interactif de Bridge.
 3. **Suricata** : aucune PCAP ; règles non testées, bruit non mesuré (catégorie C, pas un défaut d'AutoWork).
 4. **YARA** : candidates de spécimen ; aucun goodware/holdout dans le corpus ; aucune règle de famille validée ; `rule.propose` provenance `bridge` à diagnostiquer (§4 #7).
-5. **Budgets R3** : contexte 11,8 M/16 M tokens et 47,3 M/67,1 M octets consommés ; un troisième essai sur R3 serait limité. 7 000 unités de VT et 996 téléchargements restent disponibles.
+5. **Budgets R3** : contexte 11,8 M/16 M tokens et 47,3 M/67,1 M octets consommés ; un troisième essai sur R3 serait limité. 9 921 unités VT et 996 téléchargements restent disponibles.
 6. **Relais** : le relais attempt-002 est resté actif sur R3 à la fin de l'essai ; aucune remise à zéro ni suppression n'a été effectuée (`make clean` non lancé).
 
 ## 7. Références
