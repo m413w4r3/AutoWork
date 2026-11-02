@@ -21,6 +21,10 @@ Un finding n'est ni une hypothèse ni une réponse Bridge. Proposer un finding *
 
 La provenance (observations, versions, auteurs, hashes) vit dans la couche canonique. Le texte destiné au lecteur n'imprime aucun marqueur interne (`SUPPORTED`, `PARTIAL`, `bridge_authored`, `observation_ref`, `confidence=`) ; les affirmations techniques importantes doivent rester retrouvables dans l'état canonique par un auditeur externe.
 
+## Une valeur dérivée doit exister comme observation
+
+Un décodage, un déchiffrement, un recalcul de hash ou un comptage fait dans ton répertoire de travail (script local, calcul mental) n'est **pas** une observation de l'enquête : un auditeur ne peut pas le retrouver. Produis-le avec un outil de l'enquête (`local.run_command` ou l'outil d'extraction adapté) pour que sa sortie soit enregistrée, puis cite cette observation. Sans cela, le finding reste `qualified` et dit que la valeur est dérivée hors enquête. Recopie les nombres (capacités, tailles, comptes) depuis l'observation citée au lieu de les retaper : si le finding dit 32 et l'observation 37, c'est l'observation qui a raison. Une classification fournisseur (« 0/62 », « signé ») se cite avec l'observation du rapport fournisseur, pas avec une lecture de fichier.
+
 ## Comparaison de portée
 
 | Mesure | Fait pouvant être supported | Extrapolation interdite |
