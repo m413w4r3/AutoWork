@@ -49,6 +49,7 @@ from cti_app.domain.legitimate_services import (
 from cti_app.domain.reference_corpus import ReferenceCorpusVerdict
 from cti_app.domain.rule_workbench import (
     RuleConditionStrategy,
+    RuleLifecycle,
     RuleMotif,
     RuleMotifIssueCode,
     RuleMotifKind,
@@ -60,6 +61,7 @@ from cti_app.domain.rule_workbench import (
     RuleValidationStatus,
     YaraEngineResult,
     YaraExecutionStatus,
+    derive_rule_lifecycle,
     detect_file_format_magic,
     wilson_rate,
 )
@@ -227,6 +229,49 @@ def test_single_rule_source_guard_rejects_cheating_shapes(
 def test_single_rule_source_guard_accepts_one_measured_rule_using_all_of_them() -> None:
     source = 'rule measured { strings: $a = "marker" condition: 1 of them }'
     assert validate_single_rule_candidate(source) == ()
+
+
+def test_rule_lifecycle_is_derived_from_compile_test_and_strict_validation() -> None:
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.OK,
+            has_test_report=False,
+            validation_status=RuleValidationStatus.UNTESTED,
+        )
+        is RuleLifecycle.COMPILED
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.COMPILE_ERROR,
+            has_test_report=False,
+            validation_status=RuleValidationStatus.UNTESTED,
+        )
+        is RuleLifecycle.CANDIDATE
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.ENGINE_UNAVAILABLE,
+            has_test_report=True,
+            validation_status=RuleValidationStatus.REAL_PARTIAL,
+        )
+        is RuleLifecycle.TESTED
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.OK,
+            has_test_report=True,
+            validation_status=RuleValidationStatus.REAL_VALIDATED,
+        )
+        is RuleLifecycle.VALIDATED
+    )
+    assert (
+        derive_rule_lifecycle(
+            YaraExecutionStatus.COMPILE_ERROR,
+            has_test_report=True,
+            validation_status=RuleValidationStatus.REAL_VALIDATED,
+        )
+        is RuleLifecycle.TESTED
+    )
 
 
 def test_single_rule_source_guard_accepts_grouped_or_in_conjunctive_condition() -> None:

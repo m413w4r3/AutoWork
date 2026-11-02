@@ -1149,6 +1149,7 @@ async def test_bridge_yara_candidate_keeps_exact_source_and_per_string_justifica
 
     assert proposed.status is ToolInvocationStatus.SUCCEEDED
     assert proposed.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert proposed.output["lifecycle"] == "compiled"
     assert proposed.output["source_author"] == "bridge"
     assert proposed.output["source_sha256"] == source_sha256
     assert tuple(proposed.output["source_validator_findings"]) == (
@@ -1182,6 +1183,7 @@ async def test_bridge_yara_candidate_keeps_exact_source_and_per_string_justifica
     assert tested.output["report"]["source_sha256"] == source_sha256
     assert tested.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
     assert tested.output["validation_status"] != RuleValidationStatus.REAL_VALIDATED.value
+    assert tested.output["lifecycle"] == "tested"
     assert tuple(tested.output["source_validator_findings"]) == (
         "or_branches_disguised_as_multiple_rules_forbidden",
     )
@@ -1237,6 +1239,7 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
     assert revised.output["source_sha256"] == corrected_sha256
     assert revised.output["source_author"] == "operator:analyst-42"
     assert revised.output["source_change_kind"] == "operator_source_revision"
+    assert revised.output["lifecycle"] == "compiled"
     assert revised.output["derived_from"] == {
         "version_id": proposed.output["version_id"],
         "source_sha256": bridge_sha256,
@@ -1264,6 +1267,7 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
     )
     assert tested.status is ToolInvocationStatus.UNAVAILABLE
     assert tested.output["report"]["source_sha256"] == corrected_sha256
+    assert tested.output["lifecycle"] == "tested"
     assert tested.output["origin"] == {
         "invocation_id": str(invocation_id),
         "observation_id": str(observation_id),
@@ -1274,6 +1278,7 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
         {"candidate_id": proposed.output["candidate_id"], "version": 2},
     )
     assert after_test.output["versions"][0]["source_author"] == "operator:analyst-42"
+    assert after_test.output["versions"][0]["lifecycle"] == "tested"
 
 
 @pytest.mark.asyncio
@@ -1333,6 +1338,7 @@ async def test_bridge_source_refusal_and_engine_compile_failure_have_distinct_di
     )
     assert failed_compile.status is ToolInvocationStatus.PARTIAL
     assert failed_compile.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert failed_compile.output["lifecycle"] == "candidate"
     assert failed_compile.output["compile_diagnostic"]["stage"] == "yara_compile"
     assert failed_compile.output["compile_diagnostic"]["status"] == "failed"
     assert failed_compile.output["compile_diagnostic"]["line"] == 4

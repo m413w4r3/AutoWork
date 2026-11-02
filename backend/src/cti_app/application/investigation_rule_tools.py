@@ -93,6 +93,7 @@ from cti_app.domain.rule_workbench import (
     RuleVersionComparison,
     YaraEngineResult,
     YaraExecutionStatus,
+    derive_rule_lifecycle,
     rule_corpus_sha256,
 )
 
@@ -1411,6 +1412,12 @@ class _RuleTools:
                     ),
                 )
             latest_test = await self._latest_explicit_test_report(context, latest)
+            compile_check = self.workbench.compile_check(latest.source)
+            validation_status = (
+                _rule_validation_status(latest_test)
+                if latest_test is not None
+                else RuleValidationStatus.UNTESTED
+            )
             return (
                 {
                     "candidate_id": str(latest.candidate_id),
@@ -1421,16 +1428,19 @@ class _RuleTools:
                     ),
                     "source_sha256": latest.source_sha256,
                     "candidate_status": latest.status.value,
-                    "validation_status": (
-                        _rule_validation_status(latest_test)
-                        if latest_test is not None
-                        else RuleValidationStatus.UNTESTED.value
-                    ),
+                    **_version_provenance_output(latest),
+                    "validation_status": validation_status.value,
                     "validation_reason": (
                         latest_test.get("validation_reason")
                         if latest_test is not None
                         else RuleValidationReason.EXPLICIT_TEST_REQUIRED.value
                     ),
+                    "compile_status": compile_check.status.value,
+                    "lifecycle": derive_rule_lifecycle(
+                        compile_check.status,
+                        has_test_report=latest_test is not None,
+                        validation_status=validation_status,
+                    ).value,
                     "evaluation_status": ToolInvocationStatus.SUCCEEDED.value,
                     "observation_refs": [],
                     "replayed": True,
@@ -1837,6 +1847,13 @@ class _RuleTools:
                 source_attribution["bridge_warning_findings"],
             ),
             "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
+            "lifecycle": derive_rule_lifecycle(
+                compile_check.status,
+                has_test_report=False,
+                validation_status=RuleValidationStatus.UNTESTED,
+            ).value,
+            "validation_status": RuleValidationStatus.UNTESTED.value,
+            "validation_reason": RuleValidationReason.EXPLICIT_TEST_REQUIRED.value,
             "validation_reasons": ["explicit_rule_test_required"],
             "bridge_invocation_id": str(requested_invocation_id),
             "bridge_observation_id": str(observation.id),
@@ -2001,6 +2018,11 @@ class _RuleTools:
                 "source_change_kind": next_attribution["change_kind"],
                 "source_diff": diff,
                 "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
+                "lifecycle": derive_rule_lifecycle(
+                    compile_check.status,
+                    has_test_report=False,
+                    validation_status=RuleValidationStatus.UNTESTED,
+                ).value,
                 "validation_reasons": ["explicit_rule_test_required"],
                 "compile_status": compile_check.status.value,
                 "compile_diagnostic": _execution_diagnostic(compile_check),
@@ -2236,6 +2258,12 @@ class _RuleTools:
                 "validation_status": validation_status.value,
                 "validation_reason": validation_reason.value,
                 "final_status": final_status.value,
+                "compile_status": report.execution_status.value,
+                "lifecycle": derive_rule_lifecycle(
+                    report.execution_status,
+                    has_test_report=bool(re.fullmatch(_SHA256_PATTERN, report.corpus_sha256)),
+                    validation_status=validation_status,
+                ).value,
                 "validation_reasons": list(validation_reasons),
                 "diagnostic": _test_report_diagnostic(
                     report,
@@ -2338,8 +2366,15 @@ class _RuleTools:
                 comparisons.append(await self.evidence_payloads.read_json(observation.blob_id))
             except Exception:
                 continue
+        if self.workbench is None:
+            raise _ToolUnavailable("rule_history_unavailable")
         history = [
-            _version_summary(version, reports.get(str(version.id), ())) for version in visible
+            _version_summary(
+                version,
+                reports.get(str(version.id), ()),
+                compile_status=self.workbench.compile_check(version.source).status,
+            )
+            for version in visible
         ]
         return (
             {
@@ -2536,6 +2571,11 @@ class _RuleTools:
             "validation_status": RuleValidationStatus.UNTESTED.value,
             "validation_reason": RuleValidationReason.EXPLICIT_TEST_REQUIRED.value,
             "final_status": OneRuleTestStatus.NOT_VALIDATED.value,
+            "lifecycle": derive_rule_lifecycle(
+                result.compile_check.status,
+                has_test_report=False,
+                validation_status=RuleValidationStatus.UNTESTED,
+            ).value,
             "validation_reasons": ["explicit_rule_test_required"],
             "evaluation_status": (
                 ToolInvocationStatus.SUCCEEDED.value
@@ -4192,7 +4232,10 @@ def _comparison_summary(
 
 
 def _version_summary(
-    version: DetectionCandidateVersion, reports: Sequence[Mapping[str, Any]]
+    version: DetectionCandidateVersion,
+    reports: Sequence[Mapping[str, Any]],
+    *,
+    compile_status: YaraExecutionStatus = YaraExecutionStatus.ENGINE_UNAVAILABLE,
 ) -> dict[str, Any]:
     """Expose stable validation status/reason fields for rule.get and publication consumers."""
     matching_reports = tuple(
@@ -4204,6 +4247,11 @@ def _version_summary(
         and report.get("rule_version_id", str(version.id)) == str(version.id)
     )
     latest_report = matching_reports[-1] if matching_reports else None
+    has_identified_test_report = bool(
+        latest_report is not None
+        and isinstance(latest_report.get("corpus_sha256"), str)
+        and re.fullmatch(_SHA256_PATTERN, str(latest_report.get("corpus_sha256"))) is not None
+    )
     try:
         validation_status = RuleValidationStatus(
             latest_report.get("validation_status", "untested") if latest_report else "untested"
@@ -4234,6 +4282,13 @@ def _version_summary(
         "parent_version_id": str(version.parent_version_id) if version.parent_version_id else None,
         "source_sha256": version.source_sha256,
         "status": version.status.value,
+        **_version_provenance_output(version),
+        "compile_status": compile_status.value,
+        "lifecycle": derive_rule_lifecycle(
+            compile_status,
+            has_test_report=has_identified_test_report,
+            validation_status=RuleValidationStatus(validation_status),
+        ).value,
         "validation_status": validation_status,
         "validation_reason": validation_reason,
         "final_status": (

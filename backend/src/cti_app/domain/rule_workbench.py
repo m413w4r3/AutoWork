@@ -145,6 +145,35 @@ class YaraExecutionStatus(StrEnum):
     INVALID_INPUT = "invalid_input"
 
 
+class RuleLifecycle(StrEnum):
+    CANDIDATE = "candidate"
+    COMPILED = "compiled"
+    TESTED = "tested"
+    VALIDATED = "validated"
+
+
+def derive_rule_lifecycle(
+    compile_status: YaraExecutionStatus,
+    *,
+    has_test_report: bool,
+    validation_status: RuleValidationStatus,
+) -> RuleLifecycle:
+    """Derive user-facing lifecycle from current compilation and persisted test evidence."""
+    status = YaraExecutionStatus(compile_status)
+    validation = RuleValidationStatus(validation_status)
+    if (
+        has_test_report
+        and status is YaraExecutionStatus.OK
+        and validation is RuleValidationStatus.REAL_VALIDATED
+    ):
+        return RuleLifecycle.VALIDATED
+    if has_test_report:
+        return RuleLifecycle.TESTED
+    if status is YaraExecutionStatus.OK:
+        return RuleLifecycle.COMPILED
+    return RuleLifecycle.CANDIDATE
+
+
 class RuleDiagnosticStage(StrEnum):
     SOURCE_VALIDATOR = "source_validator"
     LOCAL_BUILD = "local_build"
