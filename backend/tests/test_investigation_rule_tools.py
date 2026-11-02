@@ -32,6 +32,7 @@ from cti_app.application.investigation_rule_tools import (
     JSON_SCHEMA_2020_12,
     RULE_COMPARE_SCHEMA,
     RULE_GET_SCHEMA,
+    RULE_OPERATOR_SYNTAX_FIX_SCHEMA,
     RULE_PROPOSE_SCHEMA,
     RULE_REVISE_SCHEMA,
     RULE_TEST_SCHEMA,
@@ -623,6 +624,18 @@ async def test_tool_schemas_capabilities_and_approval_are_closed() -> None:
     test_candidate_description = RULE_TEST_SCHEMA["properties"]["candidate_id"]["description"]
     assert "candidate_id returned by rule.propose" in test_candidate_description
     assert "rule_deltas" in RULE_REVISE_SCHEMA["properties"]["candidate_id"]["description"]
+    assert (
+        "server-side"
+        in RULE_OPERATOR_SYNTAX_FIX_SCHEMA["properties"]["parent_version"]["description"]
+    )
+    assert (
+        "never inherits approval"
+        in RULE_OPERATOR_SYNTAX_FIX_SCHEMA["properties"]["revision_mode"]["description"]
+    )
+    assert (
+        "literal 'operator'"
+        in RULE_OPERATOR_SYNTAX_FIX_SCHEMA["properties"]["author"]["description"]
+    )
     assert RULE_PROPOSE_SCHEMA["properties"]["meta"]["default"] == {}
     assert "Optional JSON object" in RULE_PROPOSE_SCHEMA["properties"]["meta"]["description"]
     assert "ARG meta:" in RULE_REVISE_SCHEMA["properties"]["meta"]["description"]
@@ -1331,7 +1344,7 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
 }
 """
     corrected_sha256 = _sha256(corrected_source.encode())
-    revised = await _call(
+    spoofed = await _call(
         harness,
         "rule.operator_syntax_fix",
         {
@@ -1342,11 +1355,28 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
             "revision_mode": "full_source",
         },
     )
+    assert spoofed.status is ToolInvocationStatus.FAILED
+    assert spoofed.error_code == "operator_full_source_author_must_be_operator"
+    assert (
+        len(await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))) == 1
+    )
+
+    revised = await _call(
+        harness,
+        "rule.operator_syntax_fix",
+        {
+            "candidate_id": proposed.output["candidate_id"],
+            "parent_version": 1,
+            "source": corrected_source,
+            "author": "operator",
+            "revision_mode": "full_source",
+        },
+    )
 
     assert revised.status is ToolInvocationStatus.SUCCEEDED
     assert revised.output["version"] == "v2"
     assert revised.output["source_sha256"] == corrected_sha256
-    assert revised.output["source_author"] == "operator:analyst-42"
+    assert revised.output["source_author"] == "operator"
     assert revised.output["source_change_kind"] == "operator_source_revision"
     assert revised.output["lifecycle"] == "compiled"
     assert revised.output["derived_from"] == {
@@ -1364,7 +1394,7 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
     assert first["source_sha256"] == bridge_sha256
     assert first["signature"]["source_attribution"]["source_author"] == "bridge"
     assert second["source_sha256"] == corrected_sha256
-    assert second["signature"]["source_attribution"]["source_author"] == "operator:analyst-42"
+    assert second["signature"]["source_attribution"]["source_author"] == "operator"
     assert second["signature"]["source_attribution"]["derived_from"]["source_sha256"] == (
         bridge_sha256
     )
@@ -1393,7 +1423,7 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
         "rule.get",
         {"candidate_id": proposed.output["candidate_id"], "version": 2},
     )
-    assert after_test.output["versions"][0]["source_author"] == "operator:analyst-42"
+    assert after_test.output["versions"][0]["source_author"] == "operator"
     assert after_test.output["versions"][0]["lifecycle"] == "tested"
 
 
@@ -1436,7 +1466,7 @@ async def test_full_source_diff_summary_stays_bounded_with_many_strings() -> Non
             "candidate_id": proposed.output["candidate_id"],
             "parent_version": 1,
             "source": revised_source,
-            "author": "operator:analyst-42",
+            "author": "operator",
             "revision_mode": "full_source",
         },
     )

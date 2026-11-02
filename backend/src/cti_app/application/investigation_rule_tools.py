@@ -289,19 +289,32 @@ RULE_PROPOSE_BRIDGE_SCHEMA = _schema(
 RULE_OPERATOR_SYNTAX_FIX_SCHEMA = _schema(
     {
         "candidate_id": {"type": "string", "pattern": _UUID_PATTERN},
-        "parent_version": {"type": "integer", "minimum": 1},
+        "parent_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "Select the parent by version number. The parent version ID and derived_from "
+                "record are built server-side; a new version never inherits parent approval."
+            ),
+        },
         "source": {
             "type": "string",
             "minLength": 1,
             "pattern": r"^(?!.*\x00)[\s\S]*$",
         },
-        "author": {"type": "string", "minLength": 1, "maxLength": 256},
+        "author": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": ("For revision_mode=full_source, this must be the literal 'operator'."),
+        },
         "revision_mode": {
             "type": "string",
             "enum": ["syntax_only", "full_source"],
             "description": (
                 "Optional revision mode. syntax_only keeps the narrow syntax-fix checks; "
-                "full_source accepts a complete operator correction of a Bridge-authored rule."
+                "full_source accepts a complete operator correction of a Bridge-authored rule. "
+                "The parent lineage is server-built, and a new version never inherits approval."
             ),
         },
     },
@@ -2041,6 +2054,16 @@ class _RuleTools:
             raise _ToolFailed("operator_syntax_fix_revision_mode_invalid")
         if not author or not isinstance(source, str) or not source.strip():
             raise _ToolFailed("operator_syntax_fix_metadata_invalid")
+        if revision_mode == "full_source" and author != "operator":
+            raise _ToolFailed(
+                "operator_full_source_author_must_be_operator",
+                diagnostic=_rule_diagnostic(
+                    stage=RuleDiagnosticStage.PERSISTENCE,
+                    status=RuleDiagnosticStatus.FAILED,
+                    reason_code="operator_full_source_author_must_be_operator",
+                    details={"expected_author": "operator"},
+                ),
+            )
         source_issues = validate_single_rule_candidate(source)
         blocking_issues, advisory_issues = classify_rule_validation_issues(source_issues)
         if blocking_issues:
@@ -2156,6 +2179,8 @@ class _RuleTools:
                 for item in parent.motif_provenance
             )
         )
+        # Approval is bound to an immutable version ID and SHA.
+        # Revisions always start as candidates.
         version = DetectionCandidateVersion(
             investigation_id=context.investigation_id,
             candidate_id=candidate_id,
