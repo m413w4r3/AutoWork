@@ -845,7 +845,7 @@ async def test_prose_yara_local_normalization_produces_acceptable_bridge_provena
     ("failure", "expected_code"),
     [
         ("response_schema", "bridge_yara_response_schema_mismatch"),
-        ("unusable", "bridge_yara_output_unusable"),
+        ("not_canonicalizable", "bridge_yara_output_unusable"),
         ("invocation_id", "bridge_yara_invocation_id_mismatch"),
         ("measurement_catalog", "bridge_yara_measurement_catalog_mismatch"),
     ],
@@ -867,8 +867,10 @@ async def test_bridge_yara_provenance_failures_have_distinct_actionable_codes(
     requested_invocation_id = invocation_id
     if failure == "response_schema":
         payload["advisor_response_schema"] = "advisor-response.v4"
-    elif failure == "unusable":
-        output["usable"] = False
+    elif failure == "not_canonicalizable":
+        output["usable"] = True
+        output["structured_usable"] = False
+        output["canonicalization_eligible"] = False
         output["warnings"] = ["yara_measurements_unmatched"]
         output["warning_classification"] = {
             "blocking": ["yara_measurements_unmatched"],
@@ -891,7 +893,7 @@ async def test_bridge_yara_provenance_failures_have_distinct_actionable_codes(
 
     assert rejected.status is ToolInvocationStatus.FAILED
     assert rejected.error_code == expected_code
-    if failure == "unusable":
+    if failure == "not_canonicalizable":
         assert tuple(rejected.output["diagnostic"]["blocking_warnings"]) == (
             "yara_measurements_unmatched",
         )

@@ -384,9 +384,13 @@ async def test_v3_yara_reparse_rejects_measurement_catalog_hash_drift() -> None:
     )
 
     assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["usable"] is False
+    assert result.output["usable"] is True
+    assert result.output["structured_usable"] is False
+    assert result.output["canonicalization_eligible"] is False
     assert result.output["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
     assert result.output["output"]["rule_source"] == source
+    assert result.output["output"]["usable"] is True
+    assert result.output["output"]["canonicalization_eligible"] is False
     assert result.output["output"]["motifs"] == ()
     assert (
         "$marker:measurement_reference_not_transmitted"
@@ -397,7 +401,8 @@ async def test_v3_yara_reparse_rejects_measurement_catalog_hash_drift() -> None:
 
 @pytest.mark.asyncio
 async def test_parser_version_mismatch_still_returns_archived_advisory_text() -> None:
-    raw = "Ancien conseil Bridge en prose, à vérifier par l'analyste.\n"
+    raw = ("Synthetic Bridge prose.\n" * 600)[:10_424]
+    assert len(raw.encode("utf-8")) == 10_424
     tool, recorder, original, context, output_sha256, _store, _raw_blob_id = _harness(raw)
 
     result = await tool.execute(
@@ -412,7 +417,11 @@ async def test_parser_version_mismatch_still_returns_archived_advisory_text() ->
     assert result.error_code is None
     assert result.output["status"] == "raw_advisory_text_available"
     assert result.output["advisory_text"].endswith(raw)
+    assert result.output["raw_output"] == raw
+    assert result.output["raw_output_bytes"] == 10_424
     assert result.output["raw_output_sha256"] == output_sha256
+    assert result.output["raw_output_retained"] is True
+    assert result.output["raw_output_truncated"] is False
     assert result.output["usable"] is True
     assert result.output["canonical_promotion"] is False
     assert result.output["new_observation_written"] is False

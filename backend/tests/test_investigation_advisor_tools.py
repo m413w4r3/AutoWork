@@ -4222,7 +4222,12 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
 
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["advisor_status"] == "partial"
-    assert result.output["usable"] is False
+    if consultation_type == "suricata_draft":
+        assert result.output["usable"] is True
+        assert result.output["structured_usable"] is False
+        assert result.output["canonicalization_eligible"] is False
+    else:
+        assert result.output["usable"] is False
     assert len(transport.calls) == 1
     prompt_data = typed_prompt_payload(transport.calls[0]["prompt"])
     assert prompt_data["measurements"][0]["value"] == "CreateMutexW"
@@ -9286,7 +9291,25 @@ async def test_suricata_draft_accepts_documented_protocol_model_with_its_status(
     }
     observation, raw = make_observation(investigation_id, summary)
     observation = replace(observation, object_type="protocol_model")
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Draft."))
+    raw_reply = (
+        "## Proposition provisoire\n\n"
+        "Les deux règles ci-dessous restent des propositions à vérifier.\n\n"
+        "```yara\n"
+        'rule SyntheticMarker { strings: $marker = "SyntheticMarker" condition: $marker }\n'
+        "```\n\n"
+        "```suricata\n"
+        'alert tls any any -> any any (msg:"Synthetic SNI"; tls.sni; '
+        'content:"updates.example.test"; sid:9900001; rev:1;)\n'
+        "```\n"
+    )
+    bridge_invocation_id = str(uuid4())
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=raw_reply,
+            bridge_invocation_id=bridge_invocation_id,
+        )
+    )
     tool, _sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -9305,6 +9328,28 @@ async def test_suricata_draft_accepts_documented_protocol_model_with_its_status(
     prompt = transport.calls[0]["prompt"]
     assert "api.github.com" in prompt
     assert "documented_not_observed" in prompt
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["advisor_status"] == "partial"
+    assert result.output["usable"] is True
+    assert result.output["structured_usable"] is False
+    assert result.output["canonicalization_eligible"] is False
+    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["raw_output"] == raw_reply
+    assert result.output["raw_output_sha256"] == hashlib.sha256(raw_reply.encode()).hexdigest()
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult" and item.object_id == "suricata_draft"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=1_000_000)
+    )
+    assert persisted["bridge_invocation_id"] == bridge_invocation_id
+    assert persisted["output"]["raw_output"] == raw_reply
+    assert (
+        persisted["output"]["raw_output_sha256"] == hashlib.sha256(raw_reply.encode()).hexdigest()
+    )
+    assert persisted["output"]["bridge_provenance"]["input_refs"] == persisted["input_refs"]
 
 
 @pytest.mark.asyncio

@@ -5306,6 +5306,7 @@ class InvestigationAdvisorTool:
             warnings = parsed.setdefault("warnings", [])
             if isinstance(warnings, list) and "secret_redacted" not in warnings:
                 warnings.append("secret_redacted")
+        _mark_rule_advisory_readability(parsed, safe_advisory_text)
         display_text = safe_advisory_text
         if evidence_links_absent and "liens de preuve absents" not in display_text.casefold():
             display_text += "\n\n[Avertissement consultatif : liens de preuve absents.]"
@@ -5890,10 +5891,15 @@ class ReparsePersistedAdvisorOutputTool:
                     "selected_parser_version": selected_parser,
                     "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
                     "raw_output": advisory_text,
+                    "raw_output_bytes": len(raw_bytes),
                     "raw_output_sha256": output_sha256,
                     "output_sha256": output_sha256,
+                    "raw_output_retained": True,
+                    "raw_output_truncated": False,
                     "warnings": warnings,
                     "usable": bool(advisory_text.strip()),
+                    "structured_usable": False,
+                    "canonicalization_eligible": False,
                     "untrusted": True,
                     "canonical_promotion": False,
                     "bridge_turns_consumed": 0,
@@ -5983,6 +5989,8 @@ class ReparsePersistedAdvisorOutputTool:
                             self._settings
                         ),
                     )
+                    if isinstance(legacy_parse, dict):
+                        _mark_rule_advisory_readability(legacy_parse, raw_text)
                 except (TypeError, ValueError, KeyError, AttributeError):
                     legacy_parse = None
             redacted_output, redacted_count = redact_explicit_operational_secrets(
@@ -6007,7 +6015,11 @@ class ReparsePersistedAdvisorOutputTool:
                 "consultation_type": consultation_type,
                 "status": "partial",
                 "untrusted": True,
-                "usable": False,
+                "usable": bool(advisory_text.strip())
+                if consultation_type in {"yara_draft", "suricata_draft"}
+                else False,
+                "structured_usable": False,
+                "canonicalization_eligible": False,
                 "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
                 "raw_output": advisory_text,
                 "raw_output_bytes": len(raw_bytes),
@@ -6026,10 +6038,17 @@ class ReparsePersistedAdvisorOutputTool:
                 and isinstance(legacy_parse, Mapping)
             ):
                 advisor_status = str(legacy_parse.get("status", "partial"))
-                usable = legacy_parse.get("usable") is True
+                canonicalization_eligible = (
+                    legacy_parse.get("canonicalization_eligible", legacy_parse.get("usable"))
+                    is True
+                )
+                usable = bool(advisory_text.strip())
                 parsed_output = {
                     **dict(legacy_parse),
                     "advisor_status": advisor_status,
+                    "structured_usable": canonicalization_eligible,
+                    "canonicalization_eligible": canonicalization_eligible,
+                    "usable": usable,
                     "advisory_text": "[UNTRUSTED ADVISORY]\n" + advisory_text,
                     "raw_output": advisory_text,
                     "raw_output_bytes": len(raw_bytes),
@@ -6095,7 +6114,9 @@ class ReparsePersistedAdvisorOutputTool:
                         exception_class=type(exc).__name__,
                     )
                 return ToolResult(
-                    ToolInvocationStatus.SUCCEEDED if usable else ToolInvocationStatus.PARTIAL,
+                    ToolInvocationStatus.SUCCEEDED
+                    if canonicalization_eligible
+                    else ToolInvocationStatus.PARTIAL,
                     observation_refs=(original.id, reparsed_observation.id),
                     output={
                         "advisor_status": advisor_status,
@@ -6105,6 +6126,8 @@ class ReparsePersistedAdvisorOutputTool:
                         "output_sha256": output_sha256,
                         "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
                         "usable": usable,
+                        "structured_usable": canonicalization_eligible,
+                        "canonicalization_eligible": canonicalization_eligible,
                         "warnings": parsed_output.get("warnings", []),
                         "consultation_type": consultation_type,
                         "output": parsed_output,
@@ -6126,7 +6149,11 @@ class ReparsePersistedAdvisorOutputTool:
                     "bridge_invocation_id": invocation_id,
                     "output_sha256": output_sha256,
                     "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
-                    "usable": False,
+                    "usable": bool(advisory_text.strip())
+                    if consultation_type in {"yara_draft", "suricata_draft"}
+                    else False,
+                    "structured_usable": False,
+                    "canonicalization_eligible": False,
                     "warnings": warnings,
                     "consultation_type": consultation_type,
                     "output": legacy_output,
@@ -6876,6 +6903,16 @@ def _advisor_invocation_stage(submission: TurnSubmission) -> str:
     if state in {"submission_attempted", "post_submission"}:
         return "submitted"
     return "submission_failed"
+
+
+def _mark_rule_advisory_readability(parsed: dict[str, Any], raw_text: str) -> None:
+    """Expose archived rule prose to operators without changing parser eligibility."""
+    if parsed.get("consultation_type") not in {"yara_draft", "suricata_draft"}:
+        return
+    canonicalization_eligible = parsed.get("usable") is True
+    parsed["structured_usable"] = canonicalization_eligible
+    parsed["canonicalization_eligible"] = canonicalization_eligible
+    parsed["usable"] = bool(raw_text.strip())
 
 
 def _advisor_response_state(result: ToolResult, submission: TurnSubmission) -> str:

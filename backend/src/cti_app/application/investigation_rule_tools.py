@@ -1342,7 +1342,7 @@ class _RuleTools:
                 "bridge_yara_consultation_type_mismatch",
                 agent_message="Provide a persisted yara_draft advisor consultation.",
             )
-        if output.get("usable") is not True:
+        if output.get("canonicalization_eligible", output.get("usable")) is not True:
             raw_classification = output.get("warning_classification")
             raw_blocking = (
                 raw_classification.get("blocking")
