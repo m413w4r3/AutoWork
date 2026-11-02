@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
@@ -358,7 +359,7 @@ async def test_m12_q_reservation_and_execution_characterization(
     import cti_app.application.investigation_advisor_tools as advisor_tools_module
 
     tool, transport, counter = _m12_q_fixture()
-    capture: dict[str, object] = {"builds": [], "prompts": []}
+    capture: dict[str, list[dict[str, Any]]] = {"builds": [], "prompts": []}
     original_build = advisor_tools_module.build_advisor_dossier
     original_render = advisor_tools_module.render_advisor_prompt
 

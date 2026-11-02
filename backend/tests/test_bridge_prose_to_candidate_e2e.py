@@ -124,6 +124,7 @@ async def test_bridge_yara_prose_reaches_an_untested_rule_candidate() -> None:
 
     rules = _harness(samples={sample_sha256: sample_bytes})
     rules.investigation_id = investigation_id
+    assert rules.context.envelope is not None
     rules.context = replace(
         rules.context,
         investigation_id=investigation_id,

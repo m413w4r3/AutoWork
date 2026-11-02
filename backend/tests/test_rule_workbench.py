@@ -126,6 +126,23 @@ class MemoryDetectionCandidates(DetectionCandidateRepository):
         versions.append(version)
         return version
 
+    async def append_version_idempotently(
+        self, version: DetectionCandidateVersion
+    ) -> tuple[DetectionCandidateVersion, bool]:
+        existing = next(
+            (
+                item
+                for item in self.versions.get(version.candidate_id, ())
+                if item.id == version.id or item.version == 1
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.id != version.id or existing.source_sha256 != version.source_sha256:
+                raise ValueError("candidate import identity already exists")
+            return existing, True
+        return await self.append_version(version, expected_previous_id=None), False
+
 
 class UnavailableYaraEngine:
     def compile(self, source: str) -> YaraEngineResult:
