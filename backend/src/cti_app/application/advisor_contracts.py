@@ -1231,6 +1231,30 @@ def _unique_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def _dossier_candidate_rule_sources(prompt_data: Mapping[str, Any]) -> tuple[str, ...]:
+    manifest = prompt_data.get("dossier_manifest")
+    candidates = prompt_data.get("candidate_rules")
+    if not isinstance(manifest, (list, tuple)) or not isinstance(candidates, (list, tuple)):
+        return ()
+    selected = {
+        (str(item.get("id")), str(item.get("sha256")))
+        for item in manifest
+        if isinstance(item, Mapping)
+        and item.get("kind") == "rule"
+        and item.get("origin") == "candidate_rule_summary"
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("sha256"), str)
+    }
+    return tuple(
+        source
+        for item in candidates
+        if isinstance(item, Mapping)
+        and isinstance(item.get("source"), str)
+        and (item.get("evidence_id"), item.get("sha256")) in selected
+        for source in (item["source"],)
+    )
+
+
 def _normalize_prose_yara_wire(
     *,
     common: Mapping[str, Any],
@@ -1243,6 +1267,7 @@ def _normalize_prose_yara_wire(
     safe_text: Callable[[str, int], str],
     warnings: list[str],
     measurement_sha256_overrides: Mapping[str, str] | None,
+    source_extraction_notes: Sequence[str],
 ) -> dict[str, Any]:
     """Derive YARA motif links from source bytes and transmitted measurements only."""
 
@@ -1251,6 +1276,9 @@ def _normalize_prose_yara_wire(
             warnings.append(code)
 
     normalization_errors: list[str] = []
+    for note in source_extraction_notes:
+        warn(note)
+        normalization_errors.append(note)
     if source_count > 1:
         warn("raw_source_multiple_blocks")
         normalization_errors.append("exactly_one_yara_block_required")
@@ -1378,6 +1406,7 @@ def _normalize_prose_yara_wire(
         "normalization_method": "local_yara_prose_v1",
         "normalization_errors": normalization_errors,
         "warnings": warnings,
+        "extraction_notes": list(source_extraction_notes),
         "usable": usable,
         "canonicalization_eligible": canonicalization_eligible,
     }
@@ -1391,7 +1420,9 @@ def _parse_typed_advisor_wire(
     safe_text: Callable[[str, int], str],
     measurement_sha256_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    document = parse_advisor_wire(raw)
+    document = parse_advisor_wire(
+        raw, sent_rule_sources=_dossier_candidate_rule_sources(prompt_data)
+    )
     aliases = advisor_wire_aliases(prompt_data)
     warnings: list[str] = []
     fields = document.fields
@@ -1402,6 +1433,9 @@ def _parse_typed_advisor_wire(
     def warn(code: str) -> None:
         if code not in warnings:
             warnings.append(code)
+
+    for note in document.extraction_notes:
+        warn(note)
 
     def text(value: str, maximum: int, code: str) -> str | None:
         del maximum
@@ -1542,6 +1576,8 @@ def _parse_typed_advisor_wire(
         "consultation_type": consultation_type,
         "untrusted": True,
     }
+    if document.extraction_notes:
+        common["extraction_notes"] = list(document.extraction_notes)
 
     if consultation_type == "yara_draft" and not document.has_header:
         return _normalize_prose_yara_wire(
@@ -1555,6 +1591,7 @@ def _parse_typed_advisor_wire(
             safe_text=safe_text,
             warnings=warnings,
             measurement_sha256_overrides=measurement_sha256_overrides,
+            source_extraction_notes=document.extraction_notes,
         )
 
     if consultation_type == "review_text":

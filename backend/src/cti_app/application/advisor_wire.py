@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +32,7 @@ class AdvisorWireDocument:
     source_count: int
     ignored_prose: bool = False
     source_error: str | None = None
+    extraction_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +44,7 @@ class _RawSourceBlock:
     error: str | None = None
 
 
-def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
+def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> AdvisorWireDocument:
     """Read wire fields and one complete, unambiguous raw source block."""
     text = _sanitize_wire_text(raw if isinstance(raw, str) else "")
     header = _HEADER.search(text)
@@ -51,6 +52,16 @@ def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
     source_blocks = _raw_source_blocks(region)
     source, language, source_count = _source_result(source_blocks)
     source_error = source_blocks[0].error if len(source_blocks) == 1 else None
+    extraction_notes: list[str] = []
+    if source_count > 1:
+        extraction_notes.append("multiple_sources_unassigned_ambiguous")
+    sent_sources = {
+        _normalize_source_whitespace(item) for item in sent_rule_sources if isinstance(item, str)
+    }
+    if source is not None and _normalize_source_whitespace(source) in sent_sources:
+        source = None
+        source_error = "echoed_from_dossier"
+        extraction_notes.append("echoed_from_dossier")
     fields: dict[str, list[str]] = defaultdict(list)
     records: list[tuple[str, str]] = []
     ignored_prose = False
@@ -88,6 +99,7 @@ def parse_advisor_wire(raw: str) -> AdvisorWireDocument:
         source_count=source_count,
         ignored_prose=ignored_prose,
         source_error=source_error,
+        extraction_notes=tuple(extraction_notes),
     )
 
 
@@ -292,6 +304,10 @@ def _source_result(
     return block.source, block.language, 1
 
 
+def _normalize_source_whitespace(source: str) -> str:
+    return " ".join(source.split())
+
+
 def _sanitize_wire_text(text: str) -> str:
     cleaned = sanitize_bridge_output_text(text).replace("\r\n", "\n").replace("\r", "\n")
     return "\n".join(
@@ -303,10 +319,7 @@ def _sanitize_wire_text(text: str) -> str:
 
 def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
     blocks: list[_RawSourceBlock] = []
-    fenced_pattern = re.compile(
-        r"(?im)^[ \t]*```[ \t]*(yara|suricata)[ \t]*\n(.*?)^[ \t]*```[ \t]*$",
-        re.S,
-    )
+    fence_open = re.compile(r"(?im)^[ \t]*(?P<fence>`{3,})[ \t]*(?P<info>[^\n]*)\n")
     marker_pattern = re.compile(
         r"(?im)^[ \t]*BEGIN_SOURCE(?:[ \t]+(yara|suricata))?[ \t]*\n(.*?)"
         r"^[ \t]*END_SOURCE[ \t]*$",
@@ -314,12 +327,34 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
     )
     wrapped_spans: list[tuple[int, int]] = []
 
-    for match in fenced_pattern.finditer(text):
-        blocks.append(
-            _RawSourceBlock(match.group(1).casefold(), match.group(2), match.start(), match.end())
-        )
-        wrapped_spans.append((match.start(), match.end()))
+    for opening in fence_open.finditer(text):
+        if any(start <= opening.start() < end for start, end in wrapped_spans):
+            continue
+        fence = opening.group("fence")
+        closing_pattern = re.compile(rf"(?m)^[ \t]*`{{{len(fence)},}}[ \t]*$")
+        closing = closing_pattern.search(text, opening.end())
+        end = closing.end() if closing is not None else len(text)
+        body_end = closing.start() if closing is not None else len(text)
+        body = text[opening.end() : body_end]
+        language_tag = opening.group("info").strip().casefold()
+        source_language = {
+            "yara": "yara",
+            "yar": "yara",
+            "yara-rule": "yara",
+            "suricata": "suricata",
+        }.get(language_tag)
+        if source_language is not None:
+            blocks.append(_RawSourceBlock(source_language, body, opening.start(), end))
+        elif not language_tag:
+            untagged = _single_untagged_rule(body)
+            if untagged is not None:
+                source_language, source = untagged
+                blocks.append(_RawSourceBlock(source_language, source, opening.start(), end))
+        wrapped_spans.append((opening.start(), end))
+
     for match in marker_pattern.finditer(text):
+        if any(start <= match.start() < end for start, end in wrapped_spans):
+            continue
         blocks.append(
             _RawSourceBlock(
                 (match.group(1) or "").casefold() or None,
@@ -331,13 +366,15 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
         wrapped_spans.append((match.start(), match.end()))
 
     for pattern, language_group in (
-        (re.compile(r"(?im)^[ \t]*```[ \t]*(yara|suricata)[ \t]*$"), 1),
+        (re.compile(r"(?im)^[ \t]*```[ \t]*(yara|yar|yara-rule|suricata)[ \t]*$"), 1),
         (re.compile(r"(?im)^[ \t]*BEGIN_SOURCE(?:[ \t]+(yara|suricata))?[ \t]*$"), 1),
     ):
         for match in pattern.finditer(text):
             if any(start <= match.start() < end for start, end in wrapped_spans):
                 continue
             language_value = match.group(language_group) or ""
+            if language_value.casefold() in {"yar", "yara-rule"}:
+                language_value = "yara"
             block = _RawSourceBlock(
                 language_value.casefold() or None, None, match.start(), len(text)
             )
@@ -474,6 +511,63 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             blocks.append(_RawSourceBlock("suricata", text[start:end].rstrip("\n"), start, end))
 
     return sorted(blocks, key=lambda block: (block.start, block.end))
+
+
+def _single_untagged_rule(text: str) -> tuple[str, str] | None:
+    """Accept untagged fenced code only when it consists of one complete rule."""
+    candidate = text.strip()
+    if not candidate:
+        return None
+    yara_declaration = re.compile(
+        r"(?im)^[ \t]*(?P<decl>(?:(?:private|global)[ \t]+)*rule[ \t]+"
+        r"[A-Za-z_][A-Za-z0-9_]*"
+        r"[ \t]*(?::[ \t]*[A-Za-z_][A-Za-z0-9_]*"
+        r"(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)?[ \t]*(?:\n[ \t]*)?\{)"
+    )
+    declarations = list(yara_declaration.finditer(_mask_yara_comments(candidate)))
+    if len(declarations) == 1:
+        declaration = declarations[0]
+        start = declaration.start("decl")
+        end = _balanced_yara_rule_end(candidate, declaration.end() - 1)
+        if end is not None and not candidate[:start].strip() and not candidate[end:].strip():
+            return "yara", candidate[start:end]
+    suricata = _single_complete_suricata_rule(candidate)
+    if suricata is not None:
+        return "suricata", suricata
+    return None
+
+
+def _single_complete_suricata_rule(source: str) -> str | None:
+    action = re.match(r"(?is)^[ \t]*(?:alert|drop|pass)\b", source)
+    if action is None:
+        return None
+    opening = source.find("(", action.end())
+    if opening < 0:
+        return None
+    depth = 0
+    quoted = False
+    escaped = False
+    for index in range(opening, len(source)):
+        character = source[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                if source[index + 1 :].strip(" ;\t\r\n"):
+                    return None
+                return source[: index + 1].strip()
+    return None
 
 
 def _mask_yara_comments(text: str) -> str:

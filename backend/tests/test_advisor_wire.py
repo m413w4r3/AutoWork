@@ -1132,7 +1132,7 @@ def test_yara_prose_with_rule_word_but_no_declaration_keeps_missing_source_cause
     assert "raw_source_block_missing" in parsed["warnings"]
 
 
-@pytest.mark.parametrize("fence_language", ["yara", "yar", ""])
+@pytest.mark.parametrize("fence_language", ["yara", "yar", "yara-rule", ""])
 def test_yara_fence_aliases_keep_one_complete_source(fence_language: str) -> None:
     source = 'rule FencedCandidate { strings: $marker = "fenced-value" condition: $marker }'
     opening_fence = "```" + fence_language
@@ -1143,6 +1143,155 @@ def test_yara_fence_aliases_keep_one_complete_source(fence_language: str) -> Non
     assert document.source.strip() == source
     assert document.source_language == "yara"
     assert document.source_count == 1
+
+
+@pytest.mark.parametrize("fence_language", ["python", "json", "text"])
+def test_yara_rule_inside_foreign_fence_is_not_extracted(fence_language: str) -> None:
+    source = 'rule PythonExample { strings: $marker = "foreign" condition: $marker }'
+
+    document = parse_advisor_wire(f"```{fence_language}\n" + source + "\n```\n")
+
+    assert document.source is None
+    assert document.source_count == 0
+
+
+def _candidate_dossier_prompt_data(
+    *, consultation_type: str, candidate_id: str, candidate_sha: str, source: str
+) -> dict[str, object]:
+    prompt_data: dict[str, object] = {
+        "consultation_type": consultation_type,
+        "question": "Review the candidate detection rule against the dossier.",
+        "candidate_rules": [
+            {"evidence_id": candidate_id, "sha256": candidate_sha, "source": source}
+        ],
+    }
+    dossier = build_advisor_dossier(prompt_data)
+    prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+    assert any(
+        item.get("origin") == "candidate_rule_summary"
+        and item.get("id") == candidate_id
+        and item.get("sha256") == candidate_sha
+        for item in dossier.manifest
+    )
+    return prompt_data
+
+
+def test_yara_exact_dossier_candidate_echo_is_not_a_bridge_source() -> None:
+    candidate = 'rule Candidate { strings: $marker = "sent" condition: $marker }'
+    echoed = 'rule Candidate {\n strings: $marker = "sent"\n condition: $marker\n}'
+    candidate_sha = "a" * 64
+    prompt_data = _candidate_dossier_prompt_data(
+        consultation_type="yara_draft",
+        candidate_id="candidate-1",
+        candidate_sha=candidate_sha,
+        source=candidate,
+    )
+    prompt_data["measurements"] = []
+    prompt_data["transmitted_refs"] = []
+
+    parsed = parse_typed_advisor_response(
+        "Bridge review:\n" + echoed,
+        consultation_type="yara_draft",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] is None
+    assert "echoed_from_dossier" in parsed["extraction_notes"]
+    assert "echoed_from_dossier" in parsed["warnings"]
+
+
+def test_modified_dossier_candidate_is_authored_by_bridge() -> None:
+    candidate = 'rule Candidate { strings: $marker = "sent" condition: $marker }'
+    modified = 'rule Candidate { strings: $marker = "modified" condition: $marker }'
+    candidate_sha = "b" * 64
+    prompt_data = _candidate_dossier_prompt_data(
+        consultation_type="yara_draft",
+        candidate_id="candidate-2",
+        candidate_sha=candidate_sha,
+        source=candidate,
+    )
+    prompt_data["measurements"] = []
+    prompt_data["transmitted_refs"] = []
+
+    parsed = parse_typed_advisor_response(
+        "Bridge proposal:\n" + modified,
+        consultation_type="yara_draft",
+        prompt_data=prompt_data,
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] == modified
+    assert "echoed_from_dossier" not in parsed.get("extraction_notes", ())
+
+
+def test_two_yara_rules_remain_unassigned_ambiguous() -> None:
+    raw = (
+        'rule First { strings: $first = "one" condition: $first }\n'
+        'rule Second { strings: $second = "two" condition: $second }\n'
+    )
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source is None
+    assert document.source_count == 2
+    assert "multiple_sources_unassigned_ambiguous" in document.extraction_notes
+
+
+def test_dossier_rule_not_echoed_does_not_hide_bridge_authored_rule() -> None:
+    dossier_rule = 'rule DossierOnly { strings: $marker = "sent" condition: $marker }'
+    bridge_rule = 'rule BridgeAuthored { strings: $marker = "new" condition: $marker }'
+    candidate_sha = "c" * 64
+    parsed = parse_typed_advisor_response(
+        "Bridge proposal:\n" + bridge_rule,
+        consultation_type="yara_draft",
+        prompt_data=_candidate_dossier_prompt_data(
+            consultation_type="yara_draft",
+            candidate_id="candidate-3",
+            candidate_sha=candidate_sha,
+            source=dossier_rule,
+        ),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] == bridge_rule
+    assert "echoed_from_dossier" not in parsed.get("extraction_notes", ())
+
+
+def test_suricata_exact_dossier_echo_is_not_a_bridge_source() -> None:
+    candidate = 'drop tcp any any -> any any (msg:"sent"; sid:1; rev:1;)'
+    candidate_sha = "d" * 64
+    parsed = parse_typed_advisor_response(
+        "Bridge review:\n```suricata\n" + candidate + "\n```",
+        consultation_type="suricata_draft",
+        prompt_data=_candidate_dossier_prompt_data(
+            consultation_type="suricata_draft",
+            candidate_id="candidate-4",
+            candidate_sha=candidate_sha,
+            source=candidate,
+        ),
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] is None
+    assert "echoed_from_dossier" in parsed["extraction_notes"]
+
+
+def test_suricata_rule_inside_foreign_fence_is_not_extracted() -> None:
+    source = 'drop tcp any any -> any any (msg:"foreign"; sid:2; rev:1;)'
+    parsed = parse_typed_advisor_response(
+        "```text\n" + source + "\n```",
+        consultation_type="suricata_draft",
+        prompt_data={"consultation_type": "suricata_draft", "network_facts": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["rule_source"] is None
 
 
 def test_many_unclosed_yara_declarations_are_scanned_once(monkeypatch) -> None:
