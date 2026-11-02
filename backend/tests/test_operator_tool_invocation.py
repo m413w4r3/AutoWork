@@ -1719,6 +1719,8 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     )
     assert guidance["last_advice"] is not None
     assert guidance["last_advice"]["invocation_id"] == advice.invocation.id
+
+
     assert guidance["last_advice"]["consultation_type"] == "pivot_strategy"
     assert isinstance(guidance["last_advice"]["date"], datetime)
     assert isinstance(guidance["last_advice"]["key_points"], tuple)
@@ -1840,6 +1842,125 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     assert "cost=" in continued_trace
     assert "provenance=" in continued_trace
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reservation_adjustment_exception_is_not_recorded_as_ambiguous(monkeypatch) -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(("vt.file_report", "vt"),),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    fixture.envelope = replace(
+        fixture.envelope,
+        allowed_providers=("bridge", "vt"),
+    )
+    fixture.envelopes._items[fixture.investigation_id] = fixture.envelope
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "bridge.advisor"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+
+    class ArtifactStore:
+        def __init__(self):
+            self.values = {}
+
+        async def put_canonical_json(self, payload, *, bucket):
+            raw = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+            blob_id = uuid4()
+            self.values[blob_id] = raw
+            return blob_id, hashlib.sha256(raw).hexdigest()
+
+        async def put_bytes(self, value, *, bucket, mime_type):
+            blob_id = uuid4()
+            self.values[blob_id] = bytes(value)
+            return blob_id
+
+        async def read_bytes(self, blob_id, *, max_bytes):
+            raw = self.values[blob_id]
+            assert len(raw) <= max_bytes
+            return raw
+
+    class CountingTransport:
+        def __init__(self):
+            self.calls = []
+
+        async def submit(self, **kwargs):
+            self.calls.append(kwargs)
+            return TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text='{"schema":"unused"}',
+            )
+
+    async def empty_associations(_investigation_id):
+        return ()
+
+    async def empty_samples(_subject_id):
+        return ()
+
+    async def no_blob(_blob_id):
+        return None
+
+    artifacts = ArtifactStore()
+    transport = CountingTransport()
+    advisor = InvestigationAdvisorTool(
+        transport=transport,
+        settings=Settings(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        investigations=fixture.investigations,
+        investigation_states=fixture.states,
+        observations=fixture.observations,
+        findings=fixture.findings,
+        opinions=fixture.opinions,
+        sample_associations=SimpleNamespace(list_for_investigation=empty_associations),
+        samples=SimpleNamespace(list_for_subject=empty_samples),
+        blobs=SimpleNamespace(get=no_blob),
+        article_snapshots=fixture.context_builder.article_snapshots,
+        artifact_store=artifacts,
+        registry=fixture.registry,
+    )
+
+    async def small_reservation(_arguments, _context):
+        return {
+            BudgetDimension.CONTEXT_BYTES: 1,
+            BudgetDimension.CONTEXT_TOKENS: 1,
+        }
+
+    advisor.reservation_cost = small_reservation
+    register_investigation_advisor_tool(fixture.registry, adapter=advisor)
+    original_adjustment = InvestigationBudget.adjust_reservation
+
+    def fail_adjustment(self, operation_key, amounts):
+        if BudgetDimension.CONTEXT_BYTES in amounts:
+            raise RuntimeError("injected durable reservation adjustment failure")
+        return original_adjustment(self, operation_key, amounts)
+
+    monkeypatch.setattr(InvestigationBudget, "adjust_reservation", fail_adjustment)
+    service = _service(fixture)
+    result = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={
+            "consultation_type": "plan_investigation",
+            "question": "Which loader behavior should be checked next?",
+        },
+        purpose="Verify reservation adjustment exceptions are safely retryable.",
+        expected_version=state.version,
+        idempotency_key="advisor-reservation-adjustment-exception",
+    )
+
+    assert result.invocation.status is not ToolInvocationStatus.NEEDS_REVIEW, result.output
+    assert result.invocation.consumed_budget.get(BudgetDimension.BRIDGE_TURNS, 0) == 0
+    assert transport.calls == []
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item
+        for item in latest_envelope.budget.reservations
+        if item.operation_key == result.invocation.operation_key
+    )
+    assert reservation.status.value == "released"
 
 
 @pytest.mark.asyncio
