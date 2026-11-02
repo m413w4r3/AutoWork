@@ -112,12 +112,7 @@ def test_compact_operator_invocation_view_includes_derived_advisor_status() -> N
 
 @pytest.mark.asyncio
 async def test_api_consult_status_requires_response_link_or_manifest_persisted() -> None:
-    try:
-        from cti_app.api.investigation import _advisor_consult_statuses
-    except ModuleNotFoundError as exc:
-        if exc.name in {"pefile", "yara"}:
-            pytest.skip(f"API dependencies are unavailable in this sandbox: {exc.name}")
-        raise
+    from cti_app.api.investigation import _advisor_consult_statuses
 
     invocation_id = uuid4()
     advisor_call_id = uuid4()

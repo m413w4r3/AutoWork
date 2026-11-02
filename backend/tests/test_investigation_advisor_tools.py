@@ -7435,12 +7435,8 @@ async def test_revocation_during_prompt_preparation_stops_before_fake_transport(
 
 @pytest.mark.asyncio
 async def test_service_current_envelope_recheck_preserves_needs_review_recovery() -> None:
-    try:
-        from tests.test_investigation_service import _Fixture
-    except ImportError as exc:
-        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
-
     from cti_app.domain.investigation_state import Hypothesis
+    from tests.test_investigation_service import _Fixture
 
     fixture = _Fixture(responses=[], tools=())
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
@@ -8348,10 +8344,7 @@ async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> No
 
 @pytest.mark.asyncio
 async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> None:
-    try:
-        from tests.test_investigation_service import _Fixture
-    except ImportError as exc:
-        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+    from tests.test_investigation_service import _Fixture
 
     fixture = _Fixture(responses=[], tools=())
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
@@ -8706,10 +8699,7 @@ async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -
 
 @pytest.mark.asyncio
 async def test_service_commits_aggregate_measured_reservation_for_editorial_children() -> None:
-    try:
-        from tests.test_investigation_service import _Fixture
-    except ImportError as exc:
-        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+    from tests.test_investigation_service import _Fixture
 
     fixture = _Fixture(responses=[], tools=())
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
@@ -8863,10 +8853,7 @@ async def test_service_commits_aggregate_measured_reservation_for_editorial_chil
 
 @pytest.mark.asyncio
 async def test_service_reservation_persistence_failure_is_pre_send_and_retryable() -> None:
-    try:
-        from tests.test_investigation_service import _Fixture
-    except ImportError as exc:
-        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+    from tests.test_investigation_service import _Fixture
 
     fixture = _Fixture(responses=[], tools=())
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
