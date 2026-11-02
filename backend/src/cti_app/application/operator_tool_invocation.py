@@ -1859,10 +1859,13 @@ class OperatorToolInvocationService:
         safe_data = _sanitize_json(output_data or {})
         if invocation.tool_name not in {"advisor.consult", "advisor.reparse"}:
             safe_data = _bounded_json_value(safe_data)
-        registered =self._registry.get(invocation.tool_name, invocation.schema_version)
+        registered = (
+            self._registry.get(invocation.tool_name, invocation.schema_version)
+            if invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+            else None
+        )
         retryable_passive_read = (
-            invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-            and registered is not None
+            registered is not None
             and self._is_trusted_passive_read(
                 invocation.tool_name,
                 registered[0],
