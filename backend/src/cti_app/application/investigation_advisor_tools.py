@@ -148,9 +148,7 @@ class _AdvisorStageTiming:
 
     def __init__(self) -> None:
         started_at = time.perf_counter()
-        self.stage_timestamps_utc: dict[str, str] = {
-            "advisor_started": self._utc_timestamp()
-        }
+        self.stage_timestamps_utc: dict[str, str] = {"advisor_started": self._utc_timestamp()}
         self.durations_ms: dict[str, int] = {}
         self._started_at: dict[str, float] = {"advisor_started": started_at}
 
