@@ -71,7 +71,7 @@ G2 / TLP / divulgation / `external_llm_allowed` / révocations contrôlés avant
 
 | Contrôle | Résultat |
 |---|---|
-| Suite unitaire complète (hors `integration` et `workflow_emulator`), mono-processus | 5 763 réussis, 36 échecs, 4 skips. Les 36 échecs sont **tous** dans la liste de `main` (37 échecs : 34 Typst, `test_publication_detection_band`, `test_ioc_table`, `test_editorial_figures`, golden de prompt) ; un échec de `main` (`test_yara_draft_preserves_claims_and_sends_only_verified_offsets`) est corrigé ; **aucune nouvelle régression**. |
+| Suite unitaire complète (hors `integration` et `workflow_emulator`), mono-processus | 5 764 réussis, 36 échecs, 3 skips. Les 36 échecs sont **tous** dans la liste de `main` (37 échecs : 34 Typst, `test_publication_detection_band`, `test_ioc_table`, `test_editorial_figures`, golden de prompt) ; un échec de `main` (`test_yara_draft_preserves_claims_and_sends_only_verified_offsets`) est corrigé ; **aucune nouvelle régression**. |
 | `ruff check`, `ruff format --check` sur les fichiers modifiés | OK |
 | `mypy src` (429 fichiers) | OK |
 | Tests du relais (`unittest`) | 6 OK |
