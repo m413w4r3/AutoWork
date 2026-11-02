@@ -886,16 +886,60 @@ class SqlAlchemySampleAssociationRepository:
         return await self._association_from_identity(identity) if identity is not None else None
 
     async def list_for_investigation(self, investigation_id: UUID) -> tuple[SampleAssociation, ...]:
-        identities = await self._session.scalars(
-            select(SampleAssociationIdentityRow)
-            .where(SampleAssociationIdentityRow.investigation_id == investigation_id)
-            .order_by(SampleAssociationIdentityRow.sample_sha256, SampleAssociationIdentityRow.id)
+        identities = tuple(
+            await self._session.scalars(
+                select(SampleAssociationIdentityRow)
+                .where(SampleAssociationIdentityRow.investigation_id == investigation_id)
+                .order_by(
+                    SampleAssociationIdentityRow.sample_sha256, SampleAssociationIdentityRow.id
+                )
+            )
         )
+        if not identities:
+            return ()
+
+        association_ids = tuple(identity.id for identity in identities)
+        latest_versions = (
+            select(
+                SampleAssociationVersionRow.association_id.label("association_id"),
+                func.max(SampleAssociationVersionRow.version).label("version"),
+            )
+            .where(SampleAssociationVersionRow.association_id.in_(association_ids))
+            .group_by(SampleAssociationVersionRow.association_id)
+            .subquery()
+        )
+        version_rows = await self._session.scalars(
+            select(SampleAssociationVersionRow)
+            .join(
+                latest_versions,
+                and_(
+                    SampleAssociationVersionRow.association_id == latest_versions.c.association_id,
+                    SampleAssociationVersionRow.version == latest_versions.c.version,
+                ),
+            )
+        )
+        changes_rows = await self._session.scalars(
+            select(QualificationChangeRow)
+            .where(QualificationChangeRow.association_id.in_(association_ids))
+            .order_by(QualificationChangeRow.association_id, QualificationChangeRow.version)
+        )
+        versions_by_association = {row.association_id: row for row in version_rows}
+        changes_by_association: dict[UUID, list[QualificationChangeRow]] = {}
+        for row in changes_rows:
+            changes_by_association.setdefault(row.association_id, []).append(row)
+
         associations: list[SampleAssociation] = []
         for identity in identities:
-            association = await self._association_from_identity(identity)
-            if association is not None:
-                associations.append(association)
+            version_row = versions_by_association.get(identity.id)
+            if version_row is None:
+                continue
+            associations.append(
+                self._association_from_rows(
+                    identity,
+                    version_row,
+                    changes_by_association.get(identity.id, ()),
+                )
+            )
         return tuple(associations)
 
     async def append_version(
@@ -1041,6 +1085,14 @@ class SqlAlchemySampleAssociationRepository:
             .where(QualificationChangeRow.association_id == identity.id)
             .order_by(QualificationChangeRow.version)
         )
+        return self._association_from_rows(identity, version_row, changes_rows)
+
+    @staticmethod
+    def _association_from_rows(
+        identity: SampleAssociationIdentityRow,
+        version_row: SampleAssociationVersionRow,
+        changes_rows: Any,
+    ) -> SampleAssociation:
         changes = tuple(
             QualificationChange(
                 from_qualification=SampleQualification(row.from_qualification),
