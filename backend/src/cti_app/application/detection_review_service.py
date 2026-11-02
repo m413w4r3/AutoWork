@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from cti_app.domain.publication_document import parse_publication_document
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DETECTION_REVIEW_NAMESPACE = UUID("3bdc0363-2ff8-4c0f-a842-98f9359f8e2c")
 DETECTION_REVIEW_DETAILS_SCHEMA = "detection-review.v1"
+_PERSISTED_MOTIF_PREFIX = "rule-workbench-motif-v1:"
 
 
 class DetectionReviewErrorCode(StrEnum):
@@ -282,6 +284,11 @@ class DetectionReviewService:
                 != expected_source_sha256
             ):
                 raise DetectionReviewError(DetectionReviewErrorCode.SOURCE_SHA256_MISMATCH)
+            decision_limitations = (
+                _append_justification_gap_limitation(known_limitations, version)
+                if decision_type is AnalystDecisionType.DETECTION_APPROVE
+                else known_limitations
+            )
 
             existing_decisions = tuple(
                 await uow.analyst_decisions.list_for_investigation(version.investigation_id)
@@ -303,7 +310,7 @@ class DetectionReviewService:
                     actor=actor,
                     reason=reason,
                     source_sha256=expected_source_sha256,
-                    known_limitations=known_limitations,
+                    known_limitations=decision_limitations,
                     retrohunt_authorization=retrohunt_authorization,
                 ):
                     return prior
@@ -359,7 +366,7 @@ class DetectionReviewService:
                 details={
                     "schema": DETECTION_REVIEW_DETAILS_SCHEMA,
                     "source_sha256": expected_source_sha256,
-                    "known_limitations": known_limitations,
+                    "known_limitations": decision_limitations,
                     "known_false_positives": list(false_positives),
                     "test_report": {
                         "observation_id": str(report.observation.id),
@@ -402,7 +409,7 @@ class DetectionReviewService:
                     actor=actor,
                     reason=reason,
                     source_sha256=expected_source_sha256,
-                    known_limitations=known_limitations,
+                    known_limitations=decision_limitations,
                     retrohunt_authorization=retrohunt_authorization,
                 ):
                     raise DetectionReviewError(
@@ -574,6 +581,27 @@ def _limitations_acknowledge_false_positives(
     return (
         "faux positif" in normalized or "goodware" in normalized or "false positive" in normalized
     )
+
+
+def _append_justification_gap_limitation(
+    known_limitations: str, version: DetectionCandidateVersion
+) -> str:
+    gaps: set[str] = set()
+    for motif in version.motif_provenance:
+        if not motif.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
+            continue
+        try:
+            payload = json.loads(motif.rationale[len(_PERSISTED_MOTIF_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        justification = payload.get("justification") if isinstance(payload, Mapping) else None
+        if isinstance(justification, Mapping) and justification.get("status") == "gap":
+            gaps.add(motif.motif)
+    if not gaps:
+        return known_limitations
+    identifiers = ", ".join(sorted(gaps))
+    limitation = f"Machine-recorded unresolved justification gaps ({len(gaps)}): {identifiers}."
+    return f"{known_limitations}\n{limitation}"
 
 
 def _same_idempotent_decision(
