@@ -27,7 +27,7 @@ from tests.test_investigation_rule_tools import (
 
 
 @pytest.mark.asyncio
-async def test_bridge_yara_prose_reaches_an_untested_rule_candidate() -> None:
+async def test_bridge_yara_multi_rule_prose_reaches_independent_candidates() -> None:
     investigation_id = uuid4()
     sample_bytes = b"\x00" * 0x80 + b"CreateMutexW" + b"\x00"
     sample_sha256 = hashlib.sha256(sample_bytes).hexdigest()
@@ -54,11 +54,21 @@ async def test_bridge_yara_prose_reaches_an_untested_rule_candidate() -> None:
         $unmeasured = "NoMeasurementForThisMarker" ascii
     condition:
         $mutex and $unmeasured
-}
-"""
+}"""
+    rule_sources = (
+        source,
+        (
+            'rule BridgeSecondCandidate { strings: $second = "SecondUnmeasuredMarker" '
+            "condition: $second }"
+        ),
+        (
+            'rule BridgeThirdCandidate { strings: $third = "ThirdUnmeasuredMarker" '
+            "condition: $third }"
+        ),
+    )
     raw_response = (
         "The first literal is measured in the sample. The second literal still needs evidence.\n\n"
-        "```yara\n" + source + "```\n"
+        "```yara\n" + "\n\n".join(rule_sources) + "\n```\n"
         "This is a consultative candidate and has not been tested."
     )
     invocation_id = str(uuid4())
@@ -89,13 +99,29 @@ async def test_bridge_yara_prose_reaches_an_untested_rule_candidate() -> None:
         make_context(investigation_id, key="bridge-prose-yara-e2e"),
     )
 
+    assert consulted.status.value == "succeeded"
+    assert consulted.output["advisor_status"] == "succeeded"
     assert consulted.output["usable"] is True
     assert consulted.output["structured_usable"] is False
     assert consulted.output["canonicalization_eligible"] is False
     assert consulted.output["consult_status"] == "response_persisted"
-    assert consulted.output["rule_source"] == source
-    source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    assert consulted.output["rule_source_sha256"] == source_sha256
+    expected_rules = [
+        {
+            "rule_source": rule_source,
+            "rule_source_sha256": hashlib.sha256(rule_source.encode("utf-8")).hexdigest(),
+            "name": name,
+        }
+        for name, rule_source in zip(
+            ("BridgeProseCandidate", "BridgeSecondCandidate", "BridgeThirdCandidate"),
+            rule_sources,
+            strict=True,
+        )
+    ]
+    assert [
+        {key: rule[key] for key in ("rule_source", "rule_source_sha256", "name")}
+        for rule in consulted.output["rules"]
+    ] == expected_rules
+    source_sha256 = expected_rules[0]["rule_source_sha256"]
 
     response_links = await _advisor_response_link_payloads(advisor, investigation_id)
     assert len(response_links) == 1
@@ -119,8 +145,11 @@ async def test_bridge_yara_prose_reaches_an_untested_rule_candidate() -> None:
     )
     assert persisted_call["output"]["raw_output"] == raw_response
     assert persisted_call["output"]["raw_output_sha256"] == response_link["raw_response_sha256"]
-    assert persisted_call["output"]["rule_source"] == source
-    assert persisted_call["output"]["rule_source_sha256"] == source_sha256
+    assert persisted_call["output"]["rule_source"] is None
+    assert [
+        {key: rule[key] for key in ("rule_source", "rule_source_sha256", "name")}
+        for rule in persisted_call["output"]["rules"]
+    ] == expected_rules
 
     rules = _harness(samples={sample_sha256: sample_bytes})
     rules.investigation_id = investigation_id
@@ -135,24 +164,31 @@ async def test_bridge_yara_prose_reaches_an_untested_rule_candidate() -> None:
         await rules.evidence.repository.append_if_absent(observation)
     rules.evidence.payloads[advisor_call.blob_id] = persisted_call
 
-    proposed = await _call(
-        rules,
-        "rule.propose_bridge",
-        {
-            "bridge_observation_id": str(advisor_call.id),
-            "bridge_invocation_id": invocation_id,
-            "rule_source_sha256": source_sha256,
-        },
-    )
+    proposals = []
+    for expected_rule in expected_rules:
+        proposed = await _call(
+            rules,
+            "rule.propose_bridge",
+            {
+                "bridge_observation_id": str(advisor_call.id),
+                "bridge_invocation_id": invocation_id,
+                "rule_source_sha256": expected_rule["rule_source_sha256"],
+            },
+        )
 
-    assert proposed.status.value == "succeeded", dict(proposed.output)
-    assert proposed.output["source_author"] == "bridge"
-    assert proposed.output["compile_status"] == "ok"
+        assert proposed.status.value == "succeeded", dict(proposed.output)
+        assert proposed.output["source_author"] == "bridge"
+        assert proposed.output["bridge_invocation_id"] == invocation_id
+        assert proposed.output["compile_status"] == "ok"
+        versions = await rules.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
+        assert versions[0].status is DetectionCandidateStatus.CANDIDATE
+        assert versions[0].source == expected_rule["rule_source"]
+        assert versions[0].source_sha256 == expected_rule["rule_source_sha256"]
+        proposals.append((proposed, versions))
+
+    assert len({versions[0].candidate_id for _proposed, versions in proposals}) == 3
+    proposed, versions = proposals[0]
     assert tuple(proposed.output["justification_gaps"]) == ("$unmeasured",)
-    versions = await rules.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
-    assert versions[0].status is DetectionCandidateStatus.CANDIDATE
-    assert versions[0].source == source
-    assert versions[0].source_sha256 == source_sha256
 
     tested = await _call(
         rules,

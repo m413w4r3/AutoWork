@@ -881,7 +881,7 @@ def test_yara_prose_ignores_comment_only_string_declarations() -> None:
     assert parsed["motifs"][0]["measurement_refs"][0]["measurement_id"] == "m002"
 
 
-def test_yara_prose_rejects_multiple_rules_and_missing_rule_blocks() -> None:
+def test_yara_prose_assigns_multiple_rules_and_reports_missing_rule_blocks() -> None:
     two_rules = (
         'rule First { strings: $first = "first-marker" condition: $first }\n'
         'rule Second { strings: $second = "second-marker" condition: $second }\n'
@@ -900,12 +900,72 @@ def test_yara_prose_rejects_multiple_rules_and_missing_rule_blocks() -> None:
     )
 
     assert invalid is not None
-    assert invalid["usable"] is False
-    assert "rule_validation:exactly_one_rule_required" in invalid["normalization_errors"]
+    assert invalid["usable"] is True
+    assert [item["name"] for item in invalid["rules"]] == ["First", "Second"]
+    assert [item["rule_source"] for item in invalid["rules"]] == [
+        'rule First { strings: $first = "first-marker" condition: $first }',
+        'rule Second { strings: $second = "second-marker" condition: $second }',
+    ]
     assert prose_only is not None
     assert prose_only["usable"] is False
     assert "raw_source_block_missing" in prose_only["warnings"]
     assert "yara_block_missing" in prose_only["normalization_errors"]
+
+
+def test_yara_prose_exposes_each_exact_rule_with_its_own_sha256() -> None:
+    """The prose contract exposes ordered rules with exact source, SHA, name, and motifs."""
+    sources = (
+        'rule First { strings: $a = "first-marker" condition: $a }',
+        'rule Second { strings: $b = "second-marker" condition: $b }',
+        'rule Third { strings: $c = "third-marker" condition: $c }',
+    )
+    raw = "Bridge proposes these independent rules:\n\n" + "\n\n".join(sources)
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is True
+    assert parsed["normalization_method"] == "local_yara_prose_v1"
+    assert parsed["rules"] == [
+        {
+            "rule_source": source,
+            "rule_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "name": name,
+            "motifs": [],
+        }
+        for name, source in zip(("First", "Second", "Third"), sources, strict=True)
+    ]
+    assert parsed["rule_source"] is None
+    assert parsed["rule_source_sha256"] is None
+    assert parsed["canonicalization_eligible"] is False
+
+
+def test_yara_prose_keeps_ambiguous_multi_rule_boundaries_noncanonicalizable() -> None:
+    raw = (
+        "```yara\n"
+        'rule First { strings: $a = "first" condition: $a }\n'
+        "// Bridge omitted a clean rule boundary.\n"
+        'rule Second { strings: $b = "second" condition: $b }\n'
+        "```\n"
+    )
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["usable"] is False
+    assert parsed["canonicalization_eligible"] is False
+    assert "multiple_yara_rules_split_ambiguous" in parsed["warnings"]
+    assert parsed.get("rules", []) == []
 
 
 def test_yara_unfenced_bridge_shape_extracts_and_links_both_measured_strings() -> None:
@@ -1063,7 +1123,7 @@ def test_unfenced_yara_ignores_rule_like_text_inside_a_comment() -> None:
     assert document.source_count == 1
 
 
-def test_unfenced_yara_rejects_multiple_rule_declarations_with_specific_cause() -> None:
+def test_unfenced_yara_assigns_multiple_complete_rule_declarations() -> None:
     raw = (
         'rule First { strings: $first = "first-marker" condition: $first }\n'
         'rule Second { strings: $second = "second-marker" condition: $second }\n'
@@ -1077,10 +1137,10 @@ def test_unfenced_yara_rejects_multiple_rule_declarations_with_specific_cause() 
     )
 
     assert parsed is not None
-    assert parsed["usable"] is False
+    assert parsed["usable"] is True
     assert parsed["rule_source"] is None
-    assert "raw_source_multiple_blocks" in parsed["warnings"]
-    assert "multiple_yara_rules_detected" in parsed["normalization_errors"]
+    assert [item["name"] for item in parsed["rules"]] == ["First", "Second"]
+    assert all("exactly_one_rule_required" not in error for error in parsed["normalization_errors"])
 
 
 def test_unfenced_yara_complete_invalid_rule_keeps_validation_cause() -> None:
@@ -1227,7 +1287,7 @@ def test_modified_dossier_candidate_is_authored_by_bridge() -> None:
     assert "echoed_from_dossier" not in parsed.get("extraction_notes", ())
 
 
-def test_two_yara_rules_remain_unassigned_ambiguous() -> None:
+def test_two_yara_rules_are_exposed_as_individually_assigned_sources() -> None:
     raw = (
         'rule First { strings: $first = "one" condition: $first }\n'
         'rule Second { strings: $second = "two" condition: $second }\n'
@@ -1237,7 +1297,11 @@ def test_two_yara_rules_remain_unassigned_ambiguous() -> None:
 
     assert document.source is None
     assert document.source_count == 2
-    assert "multiple_sources_unassigned_ambiguous" in document.extraction_notes
+    assert document.yara_rules == (
+        ('rule First { strings: $first = "one" condition: $first }', "First"),
+        ('rule Second { strings: $second = "two" condition: $second }', "Second"),
+    )
+    assert "multiple_sources_unassigned_ambiguous" not in document.extraction_notes
 
 
 def test_dossier_rule_not_echoed_does_not_hide_bridge_authored_rule() -> None:

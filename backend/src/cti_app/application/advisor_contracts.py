@@ -1269,12 +1269,30 @@ def _normalize_prose_yara_wire(
     warnings: list[str],
     measurement_sha256_overrides: Mapping[str, str] | None,
     source_extraction_notes: Sequence[str],
+    yara_rules: Sequence[tuple[str, str]] = (),
 ) -> dict[str, Any]:
     """Derive YARA motif links from source bytes and transmitted measurements only."""
 
     def warn(code: str) -> None:
         if code not in warnings:
             warnings.append(code)
+
+    if len(yara_rules) > 1:
+        return _normalize_multiple_prose_yara_rules(
+            common=common,
+            yara_rules=yara_rules,
+            aliases=aliases,
+            prompt_data=prompt_data,
+            safe_text=safe_text,
+            warnings=warnings,
+            measurement_sha256_overrides=measurement_sha256_overrides,
+            source_extraction_notes=source_extraction_notes,
+        )
+    if len(yara_rules) == 1 and source is None:
+        source = yara_rules[0][0]
+        source_language = "yara"
+        source_count = 1
+        source_error = None
 
     normalization_errors: list[str] = []
     for note in source_extraction_notes:
@@ -1406,6 +1424,92 @@ def _normalize_prose_yara_wire(
         "normalization_status": "complete" if canonicalization_eligible else "partial",
         "normalization_method": "local_yara_prose_v1",
         "normalization_errors": normalization_errors,
+        "warnings": warnings,
+        "extraction_notes": list(source_extraction_notes),
+        "usable": usable,
+        "canonicalization_eligible": canonicalization_eligible,
+    }
+
+
+def _normalize_multiple_prose_yara_rules(
+    *,
+    common: Mapping[str, Any],
+    yara_rules: Sequence[tuple[str, str]],
+    aliases: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    prompt_data: Mapping[str, Any],
+    safe_text: Callable[[str, int], str],
+    warnings: list[str],
+    measurement_sha256_overrides: Mapping[str, str] | None,
+    source_extraction_notes: Sequence[str],
+) -> dict[str, Any]:
+    """Normalize complete rules independently while retaining exact source slices."""
+    normalization_errors = list(dict.fromkeys(source_extraction_notes))
+    for note in source_extraction_notes:
+        if note not in warnings:
+            warnings.append(note)
+
+    normalized_rules: list[dict[str, Any]] = []
+    unit_results: list[dict[str, Any]] = []
+    for rule_source, name in yara_rules:
+        unit_warnings: list[str] = []
+        unit = _normalize_prose_yara_wire(
+            common=common,
+            source=rule_source,
+            source_count=1,
+            source_language="yara",
+            source_error=None,
+            aliases=aliases,
+            prompt_data=prompt_data,
+            safe_text=safe_text,
+            warnings=unit_warnings,
+            measurement_sha256_overrides=measurement_sha256_overrides,
+            source_extraction_notes=(),
+        )
+        unit_results.append(unit)
+        source_value = unit.get("rule_source")
+        source_sha256 = unit.get("rule_source_sha256")
+        if isinstance(source_value, str) and isinstance(source_sha256, str):
+            normalized_rules.append(
+                {
+                    "rule_source": source_value,
+                    "rule_source_sha256": source_sha256,
+                    "name": name,
+                    "motifs": unit.get("motifs", []),
+                }
+            )
+        for warning in unit_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+        for error in unit.get("normalization_errors", []):
+            if isinstance(error, str):
+                normalization_errors.append(f"{name}:{error}")
+
+    usable = any(unit.get("usable") is True for unit in unit_results)
+    canonicalization_eligible = (
+        bool(normalized_rules)
+        and len(normalized_rules) == len(yara_rules)
+        and all(unit.get("canonicalization_eligible") is True for unit in unit_results)
+    )
+    limitations = [
+        "Chaque règle extraite reste consultative; compilation, tests et revue humaine sont requis."
+    ]
+    for unit in unit_results:
+        for limitation in unit.get("limitations", []):
+            if isinstance(limitation, str) and limitation not in limitations:
+                limitations.append(limitation)
+    limitations.extend(f"Wire recovery: {item}." for item in warnings)
+    return {
+        **common,
+        "status": "succeeded" if usable else "partial",
+        "rule_source": None,
+        "rule_source_sha256": None,
+        "rules": normalized_rules,
+        "motifs": [],
+        "invariants": [],
+        "limitations": limitations,
+        "normalization_status": "complete" if canonicalization_eligible else "partial",
+        "normalization_method": "local_yara_prose_v1",
+        "normalization_errors": list(dict.fromkeys(normalization_errors)),
         "warnings": warnings,
         "extraction_notes": list(source_extraction_notes),
         "usable": usable,
@@ -1593,6 +1697,7 @@ def _parse_typed_advisor_wire(
             warnings=warnings,
             measurement_sha256_overrides=measurement_sha256_overrides,
             source_extraction_notes=document.extraction_notes,
+            yara_rules=document.yara_rules,
         )
 
     if consultation_type == "review_text":

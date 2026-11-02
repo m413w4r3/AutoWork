@@ -276,7 +276,10 @@ RULE_PROPOSE_BRIDGE_SCHEMA = _schema(
         "rule_source_sha256": {
             "type": "string",
             "pattern": _SHA256_PATTERN,
-            "description": "SHA-256 from the complete persisted yara_draft rule_source.",
+            "description": (
+                "SHA-256 of the exact persisted YARA rule source to import; selects one entry "
+                "from output.rules when the advisor returned multiple rules."
+            ),
         },
         "candidate_id": _allow_empty_optional(
             {"type": "string", "pattern": _UUID_PATTERN},
@@ -1678,6 +1681,37 @@ class _RuleTools:
             )
         source = output.get("rule_source")
         observed_sha256 = output.get("rule_source_sha256")
+        selected_rule: Mapping[str, Any] | None = None
+        raw_rules = output.get("rules")
+        if isinstance(raw_rules, Sequence) and not isinstance(raw_rules, str | bytes):
+            matching_rules = [
+                item
+                for item in raw_rules
+                if isinstance(item, Mapping) and item.get("rule_source_sha256") == requested_sha256
+            ]
+            if len(matching_rules) > 1:
+                raise _ToolFailed(
+                    "bridge_yara_rule_source_sha256_ambiguous",
+                    diagnostic=_rule_diagnostic(
+                        stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
+                        status=RuleDiagnosticStatus.FAILED,
+                        reason_code="bridge_yara_rule_source_sha256_ambiguous",
+                    ),
+                )
+            if raw_rules and not matching_rules:
+                raise _ToolFailed(
+                    "bridge_yara_source_sha256_mismatch",
+                    diagnostic=_rule_diagnostic(
+                        stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
+                        status=RuleDiagnosticStatus.FAILED,
+                        reason_code="source_sha256_mismatch",
+                        details={"supplied_source_sha256": requested_sha256},
+                    ),
+                )
+            if len(matching_rules) == 1:
+                selected_rule = matching_rules[0]
+                source = selected_rule.get("rule_source")
+                observed_sha256 = selected_rule.get("rule_source_sha256")
         if not isinstance(source, str) or not source.strip():
             raise _ToolFailed(
                 "bridge_yara_source_missing_or_truncated",
@@ -1769,7 +1803,9 @@ class _RuleTools:
         raw_measurement_catalog = bridge_provenance.get("measurement_catalog")
         measurement_catalog = _bridge_measurement_catalog(raw_measurement_catalog)
 
-        raw_motifs = output.get("motifs")
+        raw_motifs = (
+            selected_rule.get("motifs") if selected_rule is not None else output.get("motifs")
+        )
         motif_refs = (
             raw_motifs
             if isinstance(raw_motifs, Sequence) and not isinstance(raw_motifs, str | bytes)

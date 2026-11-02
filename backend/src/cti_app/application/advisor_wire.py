@@ -33,6 +33,7 @@ class AdvisorWireDocument:
     ignored_prose: bool = False
     source_error: str | None = None
     extraction_notes: tuple[str, ...] = ()
+    yara_rules: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +46,7 @@ class _RawSourceBlock:
 
 
 def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> AdvisorWireDocument:
-    """Read wire fields and one complete, unambiguous raw source block."""
+    """Read wire fields and complete, unambiguous YARA rule sources."""
     text = _sanitize_wire_text(raw if isinstance(raw, str) else "")
     header = _HEADER.search(text)
     region = text[header.end() :] if header else text
@@ -53,7 +54,25 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
     source, language, source_count = _source_result(source_blocks)
     source_error = source_blocks[0].error if len(source_blocks) == 1 else None
     extraction_notes: list[str] = []
-    if source_count > 1:
+    yara_rules: tuple[tuple[str, str], ...] = ()
+    if source_blocks and all(
+        block.language == "yara" and block.source is not None and block.error is None
+        for block in source_blocks
+    ):
+        extracted: list[tuple[str, str]] = []
+        unambiguous = True
+        for block in source_blocks:
+            assert block.source is not None
+            block_rules = split_yara_rule_sources(block.source)
+            if block_rules is None:
+                unambiguous = False
+                break
+            extracted.extend(block_rules)
+        if unambiguous:
+            yara_rules = tuple(extracted)
+        elif any(len(_yara_declarations(block.source or "")) > 1 for block in source_blocks):
+            extraction_notes.append("multiple_yara_rules_split_ambiguous")
+    if source_count > 1 and not yara_rules:
         extraction_notes.append("multiple_sources_unassigned_ambiguous")
     sent_sources = {
         _normalize_source_whitespace(item) for item in sent_rule_sources if isinstance(item, str)
@@ -62,6 +81,20 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
         source = None
         source_error = "echoed_from_dossier"
         extraction_notes.append("echoed_from_dossier")
+        yara_rules = ()
+    elif yara_rules:
+        retained_rules = tuple(
+            (rule_source, name)
+            for rule_source, name in yara_rules
+            if _normalize_source_whitespace(rule_source) not in sent_sources
+        )
+        if len(retained_rules) != len(yara_rules):
+            extraction_notes.append("echoed_from_dossier")
+            yara_rules = retained_rules
+            source = None
+            source_error = "echoed_from_dossier"
+        elif len(yara_rules) > 1:
+            source = None
     fields: dict[str, list[str]] = defaultdict(list)
     records: list[tuple[str, str]] = []
     ignored_prose = False
@@ -100,6 +133,7 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
         ignored_prose=ignored_prose,
         source_error=source_error,
         extraction_notes=tuple(extraction_notes),
+        yara_rules=yara_rules,
     )
 
 
@@ -535,6 +569,41 @@ def _single_untagged_rule(text: str) -> tuple[str, str] | None:
     if suricata is not None:
         return "suricata", suricata
     return None
+
+
+_YARA_DECLARATION = re.compile(
+    r"(?im)^[ \t]*(?P<decl>(?:(?:private|global)[ \t]+)*rule[ \t]+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"[ \t]*(?::[ \t]*[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)?[ \t]*(?:\n[ \t]*)?\{)"
+)
+
+
+def _yara_declarations(text: str) -> list[re.Match[str]]:
+    return list(_YARA_DECLARATION.finditer(_mask_yara_comments(text)))
+
+
+def split_yara_rule_sources(source: str) -> tuple[tuple[str, str], ...] | None:
+    """Split complete rules only when every multi-rule boundary is whitespace."""
+    declarations = _yara_declarations(source)
+    if not declarations:
+        return None
+    spans: list[tuple[int, int, str]] = []
+    previous_end = 0
+    for declaration in declarations:
+        start = declaration.start("decl")
+        end = _balanced_yara_rule_end(source, declaration.end("decl") - 1)
+        if end is None or start < previous_end:
+            return None
+        if len(declarations) > 1 and source[previous_end:start].strip():
+            return None
+        spans.append((start, end, declaration.group("name")))
+        previous_end = end
+    if len(spans) > 1 and source[previous_end:].strip():
+        return None
+    if len(spans) == 1:
+        return ((source, spans[0][2]),)
+    return tuple((source[start:end], name) for start, end, name in spans)
 
 
 def _single_complete_suricata_rule(source: str) -> str | None:

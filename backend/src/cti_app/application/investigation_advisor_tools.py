@@ -9203,12 +9203,23 @@ def _advisor_output_result_status(
 ) -> tuple[str, ToolInvocationStatus]:
     """Map parser outcomes without treating explicit v4 failures as success."""
     status = parsed.get("status")
+    rule_source = parsed.get("rule_source")
+    singular_yara_source_usable = isinstance(rule_source, str) and bool(rule_source.strip())
+    raw_rules = parsed.get("rules")
+    multiple_yara_sources_usable = isinstance(raw_rules, list) and any(
+        isinstance(rule, Mapping)
+        and isinstance(rule.get("rule_source"), str)
+        and bool(rule["rule_source"].strip())
+        and isinstance(rule.get("rule_source_sha256"), str)
+        and hashlib.sha256(rule["rule_source"].encode("utf-8")).hexdigest()
+        == rule["rule_source_sha256"]
+        for rule in raw_rules
+    )
     if (
         parsed.get("normalization_method") == "local_yara_prose_v1"
         and status == "succeeded"
         and parsed.get("usable") is True
-        and isinstance(parsed.get("rule_source"), str)
-        and bool(parsed["rule_source"].strip())
+        and (singular_yara_source_usable or multiple_yara_sources_usable)
     ):
         return "succeeded", ToolInvocationStatus.SUCCEEDED
     if parsed.get("parser_version") == ADVISOR_SOURCE_PARSER_VERSION_V4:

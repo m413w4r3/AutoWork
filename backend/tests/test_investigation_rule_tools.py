@@ -860,6 +860,72 @@ async def test_prose_yara_local_normalization_produces_acceptable_bridge_provena
 
 
 @pytest.mark.asyncio
+async def test_bridge_yara_proposal_selects_each_persisted_rule_by_its_exact_sha256() -> None:
+    harness = _harness(samples={})
+    sources = (
+        'rule First { strings: $a = "first-marker" condition: $a }',
+        'rule Second { strings: $b = "second-marker" condition: $b }',
+        'rule Third { strings: $c = "third-marker" condition: $c }',
+    )
+    observation_id, invocation_id, _ = await _bridge_yara_observation(
+        harness, source=sources[0], motifs=[]
+    )
+    observation = await harness.evidence.repository.get(observation_id)
+    assert observation is not None
+    output = harness.evidence.payloads[observation.blob_id]["output"]
+    output["rule_source"] = None
+    output["rule_source_sha256"] = None
+    output["rules"] = [
+        {
+            "rule_source": source,
+            "rule_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "name": name,
+            "motifs": [],
+        }
+        for name, source in zip(("First", "Second", "Third"), sources, strict=True)
+    ]
+    output["canonicalization_eligible"] = False
+    output["structured_usable"] = False
+
+    candidate_ids: list[str] = []
+    for source in sources:
+        source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        proposed = await _call(
+            harness,
+            "rule.propose_bridge",
+            {
+                "bridge_observation_id": str(observation_id),
+                "bridge_invocation_id": str(invocation_id),
+                "rule_source_sha256": source_sha256,
+            },
+        )
+
+        assert proposed.status is ToolInvocationStatus.SUCCEEDED
+        assert proposed.output["source_author"] == "bridge"
+        assert proposed.output["bridge_invocation_id"] == str(invocation_id)
+        assert proposed.output["source_sha256"] == source_sha256
+        candidate_id = str(proposed.output["candidate_id"])
+        candidate_ids.append(candidate_id)
+        versions = await harness.candidates.list_for_candidate(UUID(candidate_id))
+        assert len(versions) == 1
+        assert versions[0].source == source
+        assert versions[0].source_sha256 == source_sha256
+
+    assert len(set(candidate_ids)) == 3
+    unmatched = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": "f" * 64,
+        },
+    )
+    assert unmatched.status is ToolInvocationStatus.FAILED
+    assert unmatched.error_code == "bridge_yara_source_sha256_mismatch"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure", "expected_code"),
     [
