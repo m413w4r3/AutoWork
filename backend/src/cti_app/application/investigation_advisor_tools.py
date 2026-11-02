@@ -93,7 +93,6 @@ from cti_app.domain.analyst_opinion import (
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
-    BudgetExceeded,
     BudgetReservation,
     BudgetReservationStatus,
     EvidenceKind,
@@ -1358,7 +1357,7 @@ class InvestigationAdvisorTool:
                     try:
                         if context.reservation_adjuster is not None:
                             adjustment = await context.reservation_adjuster(
-                                context, measured_amounts
+                                context, reservation_key, measured_amounts
                             )
                             if isinstance(adjustment, FrameworkPreSubmissionProof):
                                 return await self._persist_preflight_failure(
@@ -1402,11 +1401,11 @@ class InvestigationAdvisorTool:
                                 "preflight_status": "BUDGET_BLOCKED",
                                 "failure_stage": "g2_context_reservation",
                                 "failure_reason": "measured_prompt_reservation_failed",
-                                "reserved_context_bytes": reservation.amounts.get(
+                                "reserved_context_bytes": reserved_amounts.get(
                                     BudgetDimension.CONTEXT_BYTES, 0
                                 ),
                                 "measured_context_bytes": len(encoded),
-                                "reserved_context_tokens": reservation.amounts.get(
+                                "reserved_context_tokens": reserved_amounts.get(
                                     BudgetDimension.CONTEXT_TOKENS, 0
                                 ),
                                 "measured_context_tokens": measured_tokens,
@@ -1417,7 +1416,13 @@ class InvestigationAdvisorTool:
                             error_code="advisor_context_reservation_mismatch",
                             exception_class=type(exc).__name__,
                         )
-                if reserved_amounts != exact_reservation:
+                reservation_covers_prompt = (
+                    reserved_amounts.get(BudgetDimension.CONTEXT_BYTES, 0) >= len(encoded)
+                    and reserved_amounts.get(BudgetDimension.CONTEXT_TOKENS, 0) >= measured_tokens
+                    if context.reservation_adjuster is not None
+                    else reserved_amounts == exact_reservation
+                )
+                if not reservation_covers_prompt:
                     return await self._persist_preflight_failure(
                         context,
                         consultation_type=consultation_type,

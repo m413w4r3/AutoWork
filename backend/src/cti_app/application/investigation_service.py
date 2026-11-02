@@ -1885,21 +1885,40 @@ class InvestigationService:
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
 
+        measured_context_amounts_by_child: dict[str, dict[BudgetDimension, int]] = {}
+
         async def adjust_measured_reservation(
             _context: ToolExecutionContext,
+            reservation_operation_key: str,
             measured_amounts: Mapping[BudgetDimension, int],
         ) -> ToolExecutionContext | FrameworkPreSubmissionProof:
             nonlocal budget, cost, envelope, external_effect_authority, invocation
             nonlocal reservation_persisted, tool_envelope
-            if tool_name != "advisor.consult" or _context.idempotency_key != operation_key:
+            if (
+                tool_name != "advisor.consult"
+                or reservation_operation_key != operation_key
+                or _context.investigation_id != investigation.id
+            ):
                 return FrameworkPreSubmissionProof.BUDGET_REJECTED
             if set(measured_amounts) != {
                 BudgetDimension.CONTEXT_BYTES,
                 BudgetDimension.CONTEXT_TOKENS,
             }:
                 return FrameworkPreSubmissionProof.BUDGET_REJECTED
+
+            # Batched editorial children have their own replay keys but consume
+            # one parent reservation. Replacing the amount for a repeated child
+            # key keeps this aggregation idempotent.
+            measured_context_amounts_by_child[_context.idempotency_key] = dict(measured_amounts)
             requested = dict(cost)
-            requested.update(measured_amounts)
+            for dimension in (
+                BudgetDimension.CONTEXT_BYTES,
+                BudgetDimension.CONTEXT_TOKENS,
+            ):
+                requested[dimension] = sum(
+                    child_amounts[dimension]
+                    for child_amounts in measured_context_amounts_by_child.values()
+                )
             if requested == dict(cost):
                 return _context
 

@@ -279,7 +279,7 @@ class ToolExecutionContext:
     purpose: str | None = None
     reservation_adjuster: (
         Callable[
-            [ToolExecutionContext, Mapping[BudgetDimension, int]],
+            [ToolExecutionContext, str, Mapping[BudgetDimension, int]],
             Awaitable[ToolExecutionContext | FrameworkPreSubmissionProof],
         ]
         | None

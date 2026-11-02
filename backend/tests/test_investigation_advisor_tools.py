@@ -6722,7 +6722,7 @@ async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failu
     registry = InMemoryToolRegistry()
     register_investigation_advisor_tool(registry, adapter=tool)
 
-    async def fail_adjustment(_context, _measured_amounts):
+    async def fail_adjustment(_context, _reservation_operation_key, _measured_amounts):
         raise RuntimeError("injected reservation adjustment failure")
 
     context = replace(context, reservation_adjuster=fail_adjustment)
@@ -8129,6 +8129,269 @@ async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -
         "bbe1503c546ae78c9d2922da5f1dea2ed59129b2708b1258c0396151b9c7472f"
     )
     assert base64.b64encode(sample_bytes).decode("ascii") in prompt
+
+
+@pytest.mark.asyncio
+async def test_service_commits_aggregate_measured_reservation_for_editorial_children() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    from cti_app.domain.investigation_state import Hypothesis
+
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="editorial-reservation", statement="A measured assertion."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    operation_key = "operator:advisor:multi-unit-reservation"
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Synthetic editorial evidence."},
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    def response_for_call(call):
+        payload = typed_prompt_payload(call["prompt"])
+        lines = ["advisor-wire.v1", "TYPE: draft_text", "STATUS: succeeded"]
+        for unit in payload["units"]:
+            assertion = next(
+                item for item in payload["assertions"] if item["unit_id"] == unit["id"]
+            )
+            lines.extend(
+                [
+                    f"UNIT: {unit['id']}",
+                    f"S: Section {unit['id']} is supported. [{assertion['id']}]",
+                ]
+            )
+        lines.append("LIMITATION: none")
+        return TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="\n".join(lines),
+            bridge_invocation_id=str(uuid4()),
+        )
+
+    transport = Transport(response_for_call)
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+    execute_editorial_batches = tool._execute_editorial_batches
+
+    async def one_unit_per_child(
+        arguments,
+        context,
+        units,
+        *,
+        maximum_units,
+        execution_timeout_seconds=MAX_ADVISOR_TOOL_SECONDS,
+        execution_deadline_monotonic=None,
+        bridge_turns_remaining=None,
+    ):
+        return await execute_editorial_batches(
+            arguments,
+            context,
+            units,
+            maximum_units=1,
+            execution_timeout_seconds=execution_timeout_seconds,
+            execution_deadline_monotonic=execution_deadline_monotonic,
+            bridge_turns_remaining=bridge_turns_remaining,
+        )
+
+    tool._execute_editorial_batches = one_unit_per_child
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    definition, _adapter = fixture.registry.get("advisor.consult", "advisor-consult.v1")
+    object.__setattr__(
+        definition,
+        "cost_model",
+        {
+            **dict(definition.cost_model),
+            BudgetDimension.BRIDGE_TURNS: 2,
+        },
+    )
+    block_types = [
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    ][:2]
+    units = [
+        {
+            "id": f"U{index}",
+            "block_type": block_type.value,
+            "form": "body",
+            "anchor": None,
+            "assertions": [
+                {
+                    "id": f"a{index}",
+                    "text": f"Unit {index} assertion is grounded in the fixture.",
+                    "nature": "analyse",
+                    "refs": [{"kind": "observation", "id": str(observation.id)}],
+                    "block_type": block_type.value,
+                    "form": "body",
+                    "anchor": None,
+                }
+            ],
+        }
+        for index, block_type in enumerate(block_types, start=1)
+    ]
+    arguments = {
+        "consultation_type": "draft_text",
+        "evidence_refs": [str(observation.id)],
+        "units": units,
+    }
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments=arguments,
+        purpose="Measure each editorial child and account for their aggregate prompts.",
+        operation_key=operation_key,
+    )
+
+    measured_bytes = sum(len(call["prompt"].encode("utf-8")) for call in transport.calls)
+    measured_tokens = sum(
+        (len(call["prompt"].encode("utf-8")) + 3) // 4 for call in transport.calls
+    )
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output.get("batch_statuses")
+    assert invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert uncertain is False
+    assert result.output["advisor_status"] == "succeeded"
+    assert len(transport.calls) == len(units)
+    latest_envelope = await fixture.envelopes.get(investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status.value == "committed"
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == measured_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == measured_tokens
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == measured_bytes
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == measured_tokens
+
+
+@pytest.mark.asyncio
+async def test_service_reservation_persistence_failure_is_pre_send_and_retryable() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    from cti_app.domain.investigation_state import Hypothesis
+
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="reservation-retry", statement="A measured assertion."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Synthetic retry evidence."},
+    )
+    await fixture.observations.append_if_absent(observation)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The evidence is available.", [str(observation.id)]),
+        )
+    )
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    original_save_envelope = fixture.service._save_envelope_version
+    save_calls = 0
+
+    async def fail_measured_adjustment_once(envelope):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise RuntimeError("injected reservation adjustment persistence failure")
+        return await original_save_envelope(envelope)
+
+    fixture.service._save_envelope_version = fail_measured_adjustment_once
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "evidence_refs": [str(observation.id)],
+    }
+    operation_key = "operator:advisor:reservation-persistence-failure"
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments=arguments,
+        purpose="Verify a failed measured reservation cannot reach Bridge.",
+        operation_key=operation_key,
+    )
+
+    assert save_calls >= 2
+    assert transport.calls == []
+    assert invocation.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_context_reservation_mismatch"
+    assert result.output["confirmed_non_execution"] is True
+    assert uncertain is False
+    assert (
+        result.framework_pre_submission_proof
+        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+
+    fixture.service._save_envelope_version = original_save_envelope
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    retry_state = await fixture.states.get(investigation_id)
+    retried, retry_result, _retry_refs, retry_uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=retry_state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments=arguments,
+        purpose="Retry after the confirmed pre-send persistence failure.",
+        operation_key=f"{operation_key}:retry",
+    )
+    assert retried.status is ToolInvocationStatus.SUCCEEDED
+    assert retry_result.status is ToolInvocationStatus.SUCCEEDED
+    assert retry_uncertain is False
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.asyncio
