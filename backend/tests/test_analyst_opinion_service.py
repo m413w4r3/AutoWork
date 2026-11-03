@@ -504,6 +504,7 @@ async def test_approval_requires_exact_draft_hash_and_respects_tlp() -> None:
         "Evidence and reservations reviewed",
         correlation_id="corr-approval",
         idempotency_key="approve-once",
+        bridge_drafting_gap_acknowledged=True,
     )
     replay = await harness.service.approve(
         opinion.id,
@@ -550,6 +551,110 @@ async def test_approval_requires_exact_draft_hash_and_respects_tlp() -> None:
             "Reviewed",
         )
     assert no_submit_error.value.code is OpinionErrorCode.DO_NOT_SUBMIT
+
+
+@pytest.mark.asyncio
+async def test_opinion_approval_refuses_internal_workflow_markers() -> None:
+    harness = make_opinion_harness()
+    draft = await harness.service.compose_from_findings(harness.investigation.id)
+    changed_blocks = tuple(
+        replace(block, text="SUPPORTED observation_ref=internal confidence=0.9")
+        if index == 0
+        else block
+        for index, block in enumerate(draft.renderable_blocks)
+    )
+    revised = await harness.service.revise(
+        draft.id,
+        draft.version,
+        OpinionRevisionEdits(changed_blocks, draft.unresolved_points),
+        "editor:one",
+        expected_sha256=draft.content_sha256,
+    )
+
+    with pytest.raises(OpinionError) as caught:
+        await harness.service.approve(
+            revised.id,
+            revised.version,
+            revised.content_sha256,
+            "editor:one",
+            "Reviewed",
+            bridge_drafting_gap_acknowledged=True,
+        )
+
+    assert caught.value.code is OpinionErrorCode.OPINION_TEXT_MARKERS_FOUND
+    assert {item["marker"] for item in caught.value.publication_text_markers} >= {
+        "SUPPORTED",
+        "observation_ref",
+        "confidence=",
+    }
+
+
+@pytest.mark.asyncio
+async def test_approval_retry_cannot_silently_add_bridge_gap_acknowledgement() -> None:
+    harness = make_opinion_harness()
+    draft = await harness.service.compose_from_findings(harness.investigation.id)
+    legacy_approved = AnalystOpinionV1(
+        id=draft.id,
+        version=draft.version + 1,
+        investigation_id=draft.investigation_id,
+        synthesis_artifact_id=draft.synthesis_artifact_id,
+        synthesis_sha256=draft.synthesis_sha256,
+        base_publication_artifact_id=draft.base_publication_artifact_id,
+        base_publication_sha256=draft.base_publication_sha256,
+        blocks=draft.blocks,
+        unresolved_points=draft.unresolved_points,
+        protocol_figures=draft.protocol_figures,
+        author_id=draft.author_id,
+        reviewer_id="editor:one",
+        status=AnalystOpinionStatus.APPROVED,
+    )
+    harness.uow.analyst_opinions.items[draft.id] = [draft, legacy_approved]
+
+    with pytest.raises(OpinionError) as error:
+        await harness.service.approve(
+            draft.id,
+            draft.version,
+            draft.content_sha256,
+            "editor:one",
+            "Retry with a Bridge drafting gap acknowledgement",
+            bridge_drafting_gap_acknowledged=True,
+        )
+
+    assert error.value.code is OpinionErrorCode.INVALID_STATE
+    assert await harness.uow.analyst_opinions.get(draft.id) == legacy_approved
+
+
+@pytest.mark.asyncio
+async def test_concurrent_approval_recovery_checks_bridge_gap_acknowledgement() -> None:
+    harness = make_opinion_harness()
+    draft = await harness.service.compose_from_findings(harness.investigation.id)
+    repository = harness.uow.analyst_opinions
+
+    async def append_legacy_approval(
+        approved: AnalystOpinionV1, *, expected_version: int
+    ) -> AnalystOpinionV1:
+        assert expected_version == draft.version
+        legacy_approved = replace(
+            approved,
+            bridge_drafting_gap_acknowledged=False,
+            content_sha256="",
+        )
+        repository.items[approved.id].append(legacy_approved)
+        raise VersionConflictError("Concurrent legacy approval won the version race")
+
+    repository.append_version = append_legacy_approval  # type: ignore[method-assign]
+    with pytest.raises(OpinionError) as error:
+        await harness.service.approve(
+            draft.id,
+            draft.version,
+            draft.content_sha256,
+            "editor:one",
+            "Reviewed with a Bridge drafting gap acknowledgement",
+            bridge_drafting_gap_acknowledged=True,
+        )
+
+    assert error.value.code is OpinionErrorCode.STALE_VERSION
+    assert (await repository.get(draft.id)).bridge_drafting_gap_acknowledged is False
 
 
 @pytest.mark.asyncio
@@ -602,8 +707,10 @@ async def test_claim_verification_uses_the_local_knowledge_provider_protocol() -
 @pytest.mark.asyncio
 async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_refs() -> None:
     harness = make_opinion_harness()
+    source_text = "Bridge : le comportement mesuré correspond au finding cité."
     text = "Le comportement mesuré correspond au finding cité."
     text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    source_text_sha256 = hashlib.sha256(source_text.encode()).hexdigest()
     attacker_token = "ghp_" + "a" * 36
     material_text = (
         f"Configuration implant : RC4 00112233445566778899aabbccddeeff; C2 {attacker_token}."
@@ -613,7 +720,7 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
     review_invocation_id = str(uuid4())
     review_output_sha256 = "d" * 64
 
-    def persist_call(payload: dict[str, object]) -> None:
+    def persist_call(payload: dict[str, object]) -> EvidenceObservation:
         input_refs = payload.setdefault("input_refs", [])
         raw_output = payload["output"]
         assert isinstance(raw_output, dict)
@@ -646,9 +753,10 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
             object_id=str(payload["consultation_type"]),
         )
         harness.observations.items = (*harness.observations.items, call)
+        return call
 
     draft_output_sha = "c" * 64
-    persist_call(
+    draft_observation = persist_call(
         {
             "schema": "operator-advisor-call.v1",
             "consultation_type": "draft_text",
@@ -679,7 +787,7 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
                         "form": "body",
                         "anchor": None,
                         "usable": True,
-                        "sentences": [{"text": text, "assertion_ids": ["a1"]}],
+                        "sentences": [{"text": source_text, "assertion_ids": ["a1"]}],
                     },
                     {
                         "block_type": "implant_materials",
@@ -771,9 +879,11 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
         qualification=OpinionClaimQualification.FACT,
         certainty=0.8,
         bridge_authored=True,
-        bridge_draft_ref=BridgeDraftReferenceV1(draft_invocation_id, text_sha256),
-        bridge_review_ref=BridgeReviewReferenceV1(
-            review_invocation_id, review_output_sha256, text_sha256
+        bridge_draft_ref=BridgeDraftReferenceV1(
+            draft_invocation_id,
+            text_sha256,
+            source_text_sha256,
+            draft_observation.id,
         ),
     )
 
@@ -783,7 +893,8 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
         draft_blocks=(block,),
     )
     assert composed_with_bridge.blocks[0].bridge_draft_ref == block.bridge_draft_ref
-    assert composed_with_bridge.blocks[0].bridge_review_ref == block.bridge_review_ref
+    assert composed_with_bridge.blocks[0].bridge_draft_ref.operator_modified is True
+    assert composed_with_bridge.blocks[0].bridge_review_ref is None
 
     material_section = OpinionBlock(
         block_type=OpinionBlockType.IMPLANT_MATERIALS,
@@ -814,7 +925,7 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
     )
     assert revised.blocks[0].bridge_authored is True
     assert revised.blocks[0].bridge_draft_ref == block.bridge_draft_ref
-    assert revised.blocks[0].bridge_review_ref == block.bridge_review_ref
+    assert revised.blocks[0].bridge_review_ref is None
     assert revised.implant_materials == (material,)
     assert revised.implant_materials[0].value == attacker_token
     assert revised.implant_materials_section is not None

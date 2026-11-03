@@ -957,6 +957,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 "editor:m05c-reviewer",
                 "The persisted finding and sample-linked observation support this statement.",
                 idempotency_key=f"m05c-opinion-approve:{investigation_id}",
+                bridge_drafting_gap_acknowledged=True,
             )
             assert approved_opinion.reviewer_id == "editor:m05c-reviewer"
             augmentation = PublicationAugmentationArtifactService(

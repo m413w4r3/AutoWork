@@ -210,6 +210,7 @@ async def test_artifact_service_appends_a_linked_version_without_changing_the_v5
     opinion = replace(
         opinion,
         synthesis_sha256=hashlib.sha256(synthesis_bytes).hexdigest(),
+        bridge_drafting_gap_acknowledged=True,
         content_sha256="",
     )
     run_id = UUID(int=911)
@@ -261,6 +262,24 @@ async def test_artifact_service_appends_a_linked_version_without_changing_the_v5
     assert publication.stage is ProductionArtifactStage.PUBLICATION
     assert publication.version == 5
     assert publication.status is ProductionArtifactStatus.VERIFIED
+    assert (
+        publication.metadata["publication_augmentation"]["bridge_drafting_gap_acknowledged"] is True
+    )
+
+    legacy_metadata = dict(publication.metadata)
+    legacy_augmentation = dict(legacy_metadata["publication_augmentation"])
+    del legacy_augmentation["bridge_drafting_gap_acknowledged"]
+    legacy_metadata["publication_augmentation"] = legacy_augmentation
+    legacy_publication = replace(publication, metadata=legacy_metadata)
+    repository.items[-1] = legacy_publication
+    replay = await service.publish(
+        base_publication_artifact_id=base_artifact.id,
+        opinion=opinion,
+        citation_context=context,
+    )
+
+    assert replay is legacy_publication
+    assert "bridge_drafting_gap_acknowledged" not in replay.metadata["publication_augmentation"]
     assert publication.metadata["previous_publication_artifact_id"] == str(base_artifact.id)
     assert publication.canonical_blob_id != base_blob_id
     assert blobs[base_blob_id] == base_bytes

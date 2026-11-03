@@ -769,6 +769,7 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
             "editor:integration",
             "The finding and its reservation are supported.",
             idempotency_key=f"approve-{suffix}",
+            bridge_drafting_gap_acknowledged=True,
         )
         augmentation = PublicationAugmentationArtifactService(
             uow_factory=uow_factory,
@@ -796,6 +797,9 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
                 if item is not None:
                     history_items.append(item)
             opinion_history = tuple(history_items)
+            persisted_approved_opinion = await uow.analyst_opinions.get(
+                approved.id, version=approved.version
+            )
         assert persisted_base == base_artifact
         assert persisted_augmented == augmented
         assert persisted_augmented is not None
@@ -810,6 +814,14 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
         assert len(publication_versions) == 2
         assert blobs[base_blob_id] == base_bytes
         assert len(opinion_history) == approved.version
+        assert persisted_approved_opinion is not None
+        assert persisted_approved_opinion.bridge_drafting_gap_acknowledged is True
+        assert (
+            persisted_augmented.metadata["publication_augmentation"][
+                "bridge_drafting_gap_acknowledged"
+            ]
+            is True
+        )
         v6_bytes = await store.read_bytes(persisted_augmented.canonical_blob_id)
         parsed = publication_document_from_json(json.loads(v6_bytes))
         assert isinstance(parsed, PublicationDocumentV6)

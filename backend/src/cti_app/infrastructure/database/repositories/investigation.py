@@ -1425,6 +1425,7 @@ def _opinion_from_row(row: AnalystOpinionVersionRow) -> AnalystOpinionV1:
         status=AnalystOpinionStatus(row.status),
         created_at=datetime.fromisoformat(str(content["created_at"])),
         content_sha256=row.content_sha256,
+        bridge_drafting_gap_acknowledged=content.get("bridge_drafting_gap_acknowledged", False),
     )
 
 
