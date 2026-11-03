@@ -2297,3 +2297,16 @@ async def test_chatgpt_textual_draft_keeps_textual_drafting_adapter() -> None:
     assert execution.structured_output is None
     assert execution.run.requested_model == "drafting-model"
     assert "contrat" not in transport.payloads[0]["input"][0]["content"]
+
+
+def test_external_effect_refusal_reason_keeps_key_value_diagnostics_but_not_free_text() -> None:
+    from cti_app.integrations.models import _safe_external_effect_reason
+
+    named = (
+        "unresolvable_evidence_observation_source:id=08f6816fe5945e02bf969d934f5e8731"
+        ":t=file:s=VirusTotal:h=64:a=drop_ref_or_cite_sha256"
+    )
+    assert _safe_external_effect_reason(named) == named
+    assert _safe_external_effect_reason("free text with spaces and a secret") == (
+        "unclassified_refusal"
+    )
