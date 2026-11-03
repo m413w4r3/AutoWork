@@ -51,6 +51,9 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
     OpinionProtocolFigureV1,
+    missing_opinion_annex_references,
+    opinion_bridge_drafting_summary,
+    opinion_internal_text_markers,
 )
 from cti_app.domain.protocol_model import ProtocolDiagramKind, ProtocolModelV1
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
@@ -82,6 +85,8 @@ class BridgeDraftReferencePayload(BaseModel):
 
     invocation_id: str = Field(min_length=1, max_length=128)
     text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_text_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_observation_id: UUID | None = None
 
 
 class BridgeReviewReferencePayload(BaseModel):
@@ -104,6 +109,7 @@ class OpinionBlockEdit(BaseModel):
     bridge_authored: bool = False
     bridge_draft_ref: BridgeDraftReferencePayload | None = None
     bridge_review_ref: BridgeReviewReferencePayload | None = None
+    bridge_modified_by_operator: bool | None = None
 
     @field_validator("block_type")
     @classmethod
@@ -119,6 +125,16 @@ class OpinionBlockEdit(BaseModel):
             raise ValueError("Bridge draft reference does not match opinion text")
         if self.bridge_authored and self.bridge_draft_ref is None:
             raise ValueError("Bridge-authored opinion blocks require a draft reference")
+        modified = bool(
+            self.bridge_draft_ref is not None
+            and self.bridge_draft_ref.source_text_sha256 is not None
+            and self.bridge_draft_ref.source_text_sha256 != self.bridge_draft_ref.text_sha256
+        )
+        if (
+            self.bridge_modified_by_operator is not None
+            and self.bridge_modified_by_operator != modified
+        ):
+            raise ValueError("Bridge operator-modification marker does not match its text hashes")
         if self.bridge_review_ref is not None:
             if self.bridge_draft_ref is None:
                 raise ValueError("Bridge review reference requires a Bridge draft reference")
@@ -158,6 +174,37 @@ class OpinionObservationEdit(BaseModel):
     relation: AnalystObservationRelation
     finding_refs: tuple[UUID, ...] = ()
     evidence_refs: tuple[UUID, ...] = ()
+    bridge_authored: bool = False
+    bridge_block_type: OpinionBlockType | None = None
+    bridge_draft_ref: BridgeDraftReferencePayload | None = None
+    bridge_review_ref: BridgeReviewReferencePayload | None = None
+    bridge_modified_by_operator: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_bridge_refs(self) -> OpinionObservationEdit:
+        text_sha256 = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+        if self.bridge_draft_ref is not None and self.bridge_draft_ref.text_sha256 != text_sha256:
+            raise ValueError("Bridge draft reference does not match analyst note")
+        if self.bridge_authored and self.bridge_draft_ref is None:
+            raise ValueError("Bridge-authored analyst notes require a draft reference")
+        if self.bridge_draft_ref is not None and self.bridge_block_type is None:
+            raise ValueError("Bridge analyst notes require a target block type")
+        modified = bool(
+            self.bridge_draft_ref is not None
+            and self.bridge_draft_ref.source_text_sha256 is not None
+            and self.bridge_draft_ref.source_text_sha256 != self.bridge_draft_ref.text_sha256
+        )
+        if (
+            self.bridge_modified_by_operator is not None
+            and self.bridge_modified_by_operator != modified
+        ):
+            raise ValueError("Bridge operator-modification marker does not match its text hashes")
+        if self.bridge_review_ref is not None:
+            if self.bridge_draft_ref is None:
+                raise ValueError("Bridge review reference requires a Bridge draft reference")
+            if self.bridge_review_ref.reviewed_text_sha256 != text_sha256:
+                raise PydanticCustomError("review_text_stale", "review_text_stale")
+        return self
 
     def to_domain(self) -> AnalystObservationV1:
         return AnalystObservationV1(
@@ -168,6 +215,18 @@ class OpinionObservationEdit(BaseModel):
             relation=self.relation,
             finding_refs=self.finding_refs,
             evidence_refs=self.evidence_refs,
+            bridge_authored=self.bridge_authored,
+            bridge_block_type=self.bridge_block_type,
+            bridge_draft_ref=(
+                BridgeDraftReferenceV1(**self.bridge_draft_ref.model_dump())
+                if self.bridge_draft_ref is not None
+                else None
+            ),
+            bridge_review_ref=(
+                BridgeReviewReferenceV1(**self.bridge_review_ref.model_dump())
+                if self.bridge_review_ref is not None
+                else None
+            ),
         )
 
 
@@ -192,11 +251,16 @@ class OpinionReviewPayload(BaseModel):
     reason: str = Field(min_length=1, max_length=4000)
 
 
+class OpinionApprovalPayload(OpinionReviewPayload):
+    bridge_drafting_gap_acknowledged: bool = False
+
+
 class OpinionPublishPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int = Field(ge=1)
     expected_base_publication_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bridge_drafting_gap_acknowledged: bool = False
 
 
 def _opinion_preview_service(request: Request) -> AnalystOpinionPreviewService:
@@ -283,6 +347,8 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.CITATIONS_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.OPINION_NOT_DRAFT: status.HTTP_409_CONFLICT,
         OpinionErrorCode.INVALID_STATE: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.OPINION_TEXT_MARKERS_FOUND: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.OPINION_NOT_APPROVED: status.HTTP_409_CONFLICT,
         OpinionErrorCode.STALE_VERSION: status.HTTP_409_CONFLICT,
         OpinionErrorCode.VERSION_HASH_MISMATCH: status.HTTP_409_CONFLICT,
@@ -305,6 +371,8 @@ def _raise_opinion_error(exc: OpinionError) -> None:
             }
             for item in exc.citation_violations
         ]
+    if exc.publication_text_markers:
+        detail["publication_text_markers"] = list(exc.publication_text_markers)
     raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
@@ -332,6 +400,18 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
             "evidence_refs": [str(ref) for ref in block.evidence_refs],
             "qualification": block.qualification.value,
             "certainty": block.certainty,
+            "bridge_authored": block.bridge_authored,
+            "bridge_draft_ref": _api_bridge_draft_ref_payload(block.bridge_draft_ref),
+            "bridge_review_ref": (
+                block.bridge_review_ref.to_payload()
+                if block.bridge_review_ref is not None
+                else None
+            ),
+            "bridge_modified_by_operator": (
+                block.bridge_draft_ref.operator_modified
+                if block.bridge_draft_ref is not None
+                else False
+            ),
         }
         for block in item.blocks
         if block.block_type
@@ -347,6 +427,18 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
                 "evidence_refs": [str(ref) for ref in block.evidence_refs],
                 "qualification": block.qualification.value,
                 "certainty": block.certainty,
+                "bridge_authored": block.bridge_authored,
+                "bridge_draft_ref": _api_bridge_draft_ref_payload(block.bridge_draft_ref),
+                "bridge_review_ref": (
+                    block.bridge_review_ref.to_payload()
+                    if block.bridge_review_ref is not None
+                    else None
+                ),
+                "bridge_modified_by_operator": (
+                    block.bridge_draft_ref.operator_modified
+                    if block.bridge_draft_ref is not None
+                    else False
+                ),
             }
             for block in item.renderable_blocks
         ],
@@ -359,6 +451,23 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
                 "relation": observation.relation.value,
                 "finding_refs": [str(ref) for ref in observation.finding_refs],
                 "evidence_refs": [str(ref) for ref in observation.evidence_refs],
+                "bridge_authored": observation.bridge_authored,
+                "bridge_block_type": (
+                    observation.bridge_block_type.value
+                    if observation.bridge_block_type is not None
+                    else None
+                ),
+                "bridge_draft_ref": _api_bridge_draft_ref_payload(observation.bridge_draft_ref),
+                "bridge_review_ref": (
+                    observation.bridge_review_ref.to_payload()
+                    if observation.bridge_review_ref is not None
+                    else None
+                ),
+                "bridge_modified_by_operator": (
+                    observation.bridge_draft_ref.operator_modified
+                    if observation.bridge_draft_ref is not None
+                    else False
+                ),
             }
             for observation in item.observations
         ],
@@ -368,15 +477,18 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
                 "type": OpinionBlockType.IMPLANT_MATERIALS.value,
                 "text": implant_materials_section.text,
                 "bridge_authored": implant_materials_section.bridge_authored,
-                "bridge_draft_ref": (
-                    implant_materials_section.bridge_draft_ref.to_payload()
-                    if implant_materials_section.bridge_draft_ref is not None
-                    else None
+                "bridge_draft_ref": _api_bridge_draft_ref_payload(
+                    implant_materials_section.bridge_draft_ref
                 ),
                 "bridge_review_ref": (
                     implant_materials_section.bridge_review_ref.to_payload()
                     if implant_materials_section.bridge_review_ref is not None
                     else None
+                ),
+                "bridge_modified_by_operator": (
+                    implant_materials_section.bridge_draft_ref.operator_modified
+                    if implant_materials_section.bridge_draft_ref is not None
+                    else False
                 ),
             }
             if implant_materials_section is not None
@@ -389,6 +501,35 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
             "base_publication_artifact_id": str(item.base_publication_artifact_id),
             "base_publication_sha256": item.base_publication_sha256,
         },
+        "editorial_review": _opinion_editorial_review_payload(item),
+    }
+
+
+def _api_bridge_draft_ref_payload(
+    reference: BridgeDraftReferenceV1 | None,
+) -> dict[str, str] | None:
+    if reference is None:
+        return None
+    payload = reference.to_payload()
+    payload["source_text_sha256"] = reference.original_text_sha256
+    return payload
+
+
+def _opinion_editorial_review_payload(opinion: AnalystOpinionV1) -> dict[str, Any]:
+    bridge_drafting = opinion_bridge_drafting_summary(opinion)
+    text_markers = list(opinion_internal_text_markers(opinion))
+    missing_annexes = list(missing_opinion_annex_references(opinion))
+    warnings = list(bridge_drafting["warnings"])
+    if text_markers:
+        warnings.append("Le texte publiable contient des marqueurs internes.")
+    if missing_annexes:
+        warnings.append("Certaines annexes citées sont absentes du dossier d'annexes.")
+    return {
+        "status": "blocked" if text_markers else "warning" if warnings else "clear",
+        "bridge_drafting": bridge_drafting,
+        "publication_text_markers": text_markers,
+        "missing_annex_references": missing_annexes,
+        "warnings": warnings,
     }
 
 
@@ -408,6 +549,7 @@ def _draft_view_payload(view: AnalystOpinionDraftView) -> dict[str, Any]:
         ],
         "renderable_blocks": opinion_payload["renderable_blocks"] if opinion_payload else [],
         "provenance": opinion_payload["provenance"] if opinion_payload else None,
+        "editorial_review": opinion_payload["editorial_review"] if opinion_payload else None,
     }
 
 
@@ -636,7 +778,7 @@ async def _compile_opinion_protocol_figures(
 async def approve_opinion(
     opinion_id: UUID,
     request: Request,
-    payload: OpinionReviewPayload,
+    payload: OpinionApprovalPayload,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     key = _require_idempotency_key(idempotency_key)
@@ -649,6 +791,7 @@ async def approve_opinion(
             payload.reason,
             correlation_id=get_correlation_id(),
             idempotency_key=key,
+            bridge_drafting_gap_acknowledged=payload.bridge_drafting_gap_acknowledged,
         )
     except OpinionError as exc:
         _raise_opinion_error(exc)
@@ -696,6 +839,7 @@ async def publish_opinion(
             payload.version,
             await _actor_id(request),
             payload.expected_base_publication_sha256,
+            bridge_drafting_gap_acknowledged=payload.bridge_drafting_gap_acknowledged,
         )
     except OpinionError as exc:
         _raise_opinion_error(exc)

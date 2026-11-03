@@ -25,6 +25,7 @@ from cti_app.application.typst_rendering import (
 )
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
+    BridgeDraftReferenceV1,
     ImplantMaterialEditorialV1,
     ImplantMaterialType,
     OpinionBlock,
@@ -413,7 +414,57 @@ def test_opinion_github_tokens_and_typed_rc4_material_reach_publication_render_d
     assert material_items[0]["sample_location"] == "0x120-0x12f"
     assert material_items[0]["sample_sha256"] == sample_sha256
     assert material_items[0]["evidence_ref"]["label"] == "[E1]"
-    assert sections["technical_annex"]["implant_identifier_rows"][0]["value"] == fine_grained_token
+    assert sections["technical_annex"]["implant_identifier_rows"][0]["value"] == (
+        fine_grained_token
+    )
+
+
+def test_typst_opinion_text_keeps_reservations_and_excludes_bridge_audit_metadata(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    publication, *_ = _frontmatter_v6_case()
+    text = "Réserves : attribution non déterminée; protocole non testé."
+    invocation_id = str(uuid4())
+    opinion = AnalystOpinionV1(
+        investigation_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=(
+            OpinionBlock(
+                block_type=OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
+                text=text,
+                bridge_authored=True,
+                bridge_draft_ref=BridgeDraftReferenceV1(
+                    invocation_id,
+                    hashlib.sha256(text.encode()).hexdigest(),
+                    source_text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+                    source_observation_id=UUID(int=707),
+                ),
+            ),
+        ),
+        author_id="fixture-analyst",
+    )
+
+    rendered = _render(
+        renderer,
+        TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion),
+        bundle,
+    )
+    data_text = rendered.render_data_bytes.decode("utf-8")
+    data = json.loads(data_text)
+    opinion_section = next(
+        item for item in data["content_sections"] if item["type"] == "analyst_opinion"
+    )
+    opinion_text = opinion_section["blocks"][0]["text"]
+
+    assert "non déterminée" in opinion_text
+    assert "non testé" in opinion_text
+    assert "bridge_authored" not in data_text
+    assert invocation_id not in data_text
+    assert str(UUID(int=707)) not in data_text
 
 
 def test_publication_document_label_is_required_and_kept_verbatim(tmp_path: Path) -> None:

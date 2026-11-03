@@ -18,8 +18,10 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    missing_opinion_annex_references,
     normalize_opinion_text,
     opinion_blocks_with_observations,
+    opinion_internal_text_markers,
     verify_opinion_citations,
 )
 from cti_app.domain.investigation import (
@@ -335,6 +337,71 @@ def test_bridge_block_provenance_roundtrips_through_existing_projection_payload(
     assert reconstructed.blocks[0].bridge_draft_ref == draft_ref
     assert reconstructed.blocks[0].bridge_review_ref == review_ref
     assert reconstructed.content_sha256 == opinion.content_sha256
+
+
+def test_bridge_draft_reference_preserves_original_text_when_operator_adapts_it() -> None:
+    bridge_text = "Bridge : le protocole C2 n'a pas été testé sur cet échantillon."
+    final_text = "Le protocole C2 n'a pas été testé sur cet échantillon."
+    reference = BridgeDraftReferenceV1(
+        invocation_id=str(uuid4()),
+        text_sha256=hashlib.sha256(final_text.encode()).hexdigest(),
+        source_text_sha256=hashlib.sha256(bridge_text.encode()).hexdigest(),
+        source_observation_id=UUID(int=704),
+    )
+    opinion = _opinion(
+        (
+            OpinionBlock(
+                block_type=OpinionBlockType.NETWORK_AND_INFRASTRUCTURE,
+                text=final_text,
+                bridge_authored=True,
+                bridge_draft_ref=reference,
+            ),
+        )
+    )
+
+    assert reference.operator_modified is True
+    assert reference.original_text_sha256 == hashlib.sha256(bridge_text.encode()).hexdigest()
+    assert reference.final_text_sha256 == hashlib.sha256(final_text.encode()).hexdigest()
+    assert reference.to_payload()["source_observation_id"] == str(UUID(int=704))
+    assert opinion_internal_text_markers(opinion) == ()
+
+
+def test_publication_text_linter_detects_internal_markers_and_missing_annexes() -> None:
+    opinion = _opinion(
+        (
+            OpinionBlock(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text=(
+                    "SUPPORTED PARTIAL bridge_authored (observation_ref=123); "
+                    "confidence=0.9; status=draft; bridge_draft_ref=abc; "
+                    "bridge_invocation_id=abc; source_observation_id=abc; "
+                    "source_text_sha256=abc; usable=false. Voir annexe A."
+                ),
+            ),
+        )
+    )
+
+    markers = opinion_internal_text_markers(opinion)
+    assert {item["marker"] for item in markers} >= {
+        "SUPPORTED",
+        "PARTIAL",
+        "bridge_authored",
+        "observation_ref",
+        "confidence=",
+        "workflow_status",
+        "provenance_identifier",
+    }
+    assert missing_opinion_annex_references(opinion) == ("A",)
+    assert missing_opinion_annex_references(opinion, available_annex_ids=("A",)) == ()
+
+
+def test_opinion_text_cleanup_preserves_uncertainty_reservations() -> None:
+    text = "Réserves : attribution non déterminée; protocole non testé."
+
+    normalized = normalize_opinion_text(OpinionBlockType.KEY_FINDINGS, text)
+
+    assert "non déterminée" in normalized
+    assert "non testé" in normalized
 
 
 def test_bridge_authorship_marker_requires_reference_and_note_target_type() -> None:

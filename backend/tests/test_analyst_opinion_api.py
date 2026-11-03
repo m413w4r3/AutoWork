@@ -25,6 +25,7 @@ from cti_app.application.identity import Identity
 from cti_app.application.production_artifact_store import ProductionReuseStorageUnavailableError
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
 from cti_app.application.typst_compilation import CompiledTypstDocument
+from cti_app.domain.production import ProductionArtifactStage
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from tests.test_analyst_opinion_service import make_opinion_harness
 
@@ -289,6 +290,14 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         assert restarted.json()["draft"]["observations"][0]["text"] == (
             "La seconde retouche conserve la réserve sur l'attribution."
         )
+        assert restarted.json()["editorial_review"]["bridge_drafting"]["status"] == ("incomplete")
+        assert (
+            restarted.json()["editorial_review"]["bridge_drafting"]["requires_acknowledgement"]
+            is True
+        )
+        assert "n'est pas indiqué comme rédigé avec Bridge" in " ".join(
+            restarted.json()["editorial_review"]["bridge_drafting"]["warnings"]
+        )
 
         opinion_id = UUID(draft["id"])
         versions_before_preview = tuple(harness.uow.analyst_opinions.items[opinion_id])
@@ -311,6 +320,16 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == versions_before_preview
         assert tuple(harness.artifacts.items) == artifacts_before_preview
         assert tuple(harness.decisions.items) == decisions_before_preview
+        assert harness.uow.analyst_opinions.items[opinion_id][-1].status.value == "draft"
+        assert tuple(
+            item.id
+            for item in harness.artifacts.items
+            if item.stage is ProductionArtifactStage.PUBLICATION
+        ) == tuple(
+            item.id
+            for item in artifacts_before_preview
+            if item.stage is ProductionArtifactStage.PUBLICATION
+        )
 
         stale_version_preview = await client.get(
             f"/api/opinions/{draft['id']}/preview.pdf",
@@ -352,11 +371,25 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
             },
             headers={"Idempotency-Key": "approve-1"},
         )
+        assert approve.status_code == 422
+        assert approve.json()["detail"]["code"] == "bridge_drafting_ack_required"
+
+        approve = await client.post(
+            f"/api/opinions/{draft['id']}/approve",
+            json={
+                "version": revised["version"],
+                "expected_sha256": revised["content_sha256"],
+                "reason": "Reviewed the missing Bridge drafting and accept responsibility",
+                "bridge_drafting_gap_acknowledged": True,
+            },
+            headers={"Idempotency-Key": "approve-2"},
+        )
         assert approve.status_code == 200
         approved = approve.json()
         assert approved["reviewed_version"] == revised["version"]
         assert approved["approved_version"] == revised["version"] + 1
         assert approved["approved"]["status"] == "approved"
+        assert approved["approved"]["bridge_drafting_gap_acknowledged"] is True
 
         publish = await client.post(
             f"/api/opinions/{draft['id']}/publish",
@@ -370,6 +403,17 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         published = publish.json()
         assert published["publication"]["previous_publication_artifact_id"] == str(
             harness.base_artifact.id
+        )
+        published_artifact = next(
+            item
+            for item in harness.artifacts.items
+            if str(item.id) == published["publication"]["artifact_id"]
+        )
+        assert (
+            published_artifact.metadata["publication_augmentation"][
+                "bridge_drafting_gap_acknowledged"
+            ]
+            is True
         )
         assert published["composition_repin_required"] is True
         assert "réépinglage" in published["message"]
@@ -402,6 +446,75 @@ async def test_opinion_mutation_routes_require_idempotency_key() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prepublication_view_and_preview_flag_internal_opinion_markers() -> None:
+    harness = make_opinion_harness()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.analyst_opinion_service = harness.service
+    app.state.analyst_opinion_preview_service = AnalystOpinionPreviewService(
+        uow_factory=harness.uow_factory,  # type: ignore[arg-type]
+        artifact_store=harness.store,  # type: ignore[arg-type]
+        renderer=_PreviewRenderer(),
+    )
+    app.state.identity_provider = _IdentityProvider()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        compose = await client.post(
+            f"/api/investigations/{harness.investigation.id}/opinion/compose",
+            json={"selection": {}},
+            headers={"Idempotency-Key": "marker-compose"},
+        )
+        draft = compose.json()["draft"]
+        blocks = [
+            {
+                "block_type": block["type"],
+                "text": (
+                    "SUPPORTED observation_ref=internal confidence=0.7; voir annexe A."
+                    if index == 0
+                    else block["text"]
+                ),
+                "finding_refs": block["finding_refs"],
+                "evidence_refs": block["evidence_refs"],
+                "qualification": block["qualification"],
+                "certainty": block["certainty"],
+            }
+            for index, block in enumerate(draft["blocks"])
+        ]
+        revised_response = await client.post(
+            f"/api/opinions/{draft['id']}/revise",
+            json={
+                "expected_version": draft["version"],
+                "expected_sha256": draft["content_sha256"],
+                "blocks": blocks,
+            },
+            headers={"Idempotency-Key": "marker-revise"},
+        )
+        assert revised_response.status_code == 200, revised_response.text
+        revised = revised_response.json()["draft"]
+
+        review = await client.get(f"/api/investigations/{harness.investigation.id}/opinion")
+        assert review.status_code == 200
+        assert review.json()["editorial_review"]["status"] == "blocked"
+        assert review.json()["editorial_review"]["publication_text_markers"]
+        assert review.json()["editorial_review"]["missing_annex_references"] == ["A"]
+
+        preview = await client.get(
+            f"/api/opinions/{draft['id']}/preview.pdf",
+            params={
+                "version": revised["version"],
+                "opinion_sha256": revised["content_sha256"],
+                "base_publication_sha256": revised["provenance"]["base_publication_sha256"],
+            },
+        )
+
+    assert preview.status_code == 422
+    assert preview.json()["detail"]["code"] == "opinion_text_markers_found"
+    assert preview.json()["detail"]["publication_text_markers"]
+
+
+@pytest.mark.asyncio
 async def test_opinion_api_revise_accepts_implant_material_bridge_references(monkeypatch) -> None:
     harness = make_opinion_harness()
 
@@ -413,11 +526,17 @@ async def test_opinion_api_revise_accepts_implant_material_bridge_references(mon
     app.include_router(router)
     app.state.analyst_opinion_service = harness.service
     app.state.identity_provider = _IdentityProvider()
+    source_text = "Bridge : RC4 00112233445566778899aabbccddeeff; C2 ghp_" + "b" * 36
     implant_text = "RC4 00112233445566778899aabbccddeeff; C2 ghp_" + "b" * 36
     text_sha256 = hashlib.sha256(implant_text.encode()).hexdigest()
+    source_text_sha256 = hashlib.sha256(source_text.encode()).hexdigest()
     draft_invocation_id = str(UUID(int=701))
-    review_invocation_id = str(UUID(int=702))
-    review_output_sha256 = "d" * 64
+    draft_observation_id = str(UUID(int=705))
+    note_source_text = "Bridge : le protocole n'a pas été testé."
+    note_text = "Le protocole n'a pas été testé."
+    note_invocation_id = str(UUID(int=703))
+    note_source_text_sha256 = hashlib.sha256(note_source_text.encode()).hexdigest()
+    note_text_sha256 = hashlib.sha256(note_text.encode()).hexdigest()
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -453,11 +572,8 @@ async def test_opinion_api_revise_accepts_implant_material_bridge_references(mon
                         "bridge_draft_ref": {
                             "invocation_id": draft_invocation_id,
                             "text_sha256": text_sha256,
-                        },
-                        "bridge_review_ref": {
-                            "invocation_id": review_invocation_id,
-                            "output_sha256": review_output_sha256,
-                            "reviewed_text_sha256": text_sha256,
+                            "source_text_sha256": source_text_sha256,
+                            "source_observation_id": draft_observation_id,
                         },
                     },
                 ],
@@ -471,6 +587,23 @@ async def test_opinion_api_revise_accepts_implant_material_bridge_references(mon
                         "evidence_observation_id": str(harness.observation.id),
                     }
                 ],
+                "observations": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000704",
+                        "anchor": "lead:0001",
+                        "text": note_text,
+                        "state": "unresolved",
+                        "relation": "unresolved",
+                        "bridge_authored": True,
+                        "bridge_block_type": "uncertainties_and_next_leads",
+                        "bridge_draft_ref": {
+                            "invocation_id": note_invocation_id,
+                            "text_sha256": note_text_sha256,
+                            "source_text_sha256": note_source_text_sha256,
+                            "source_observation_id": str(UUID(int=706)),
+                        },
+                    }
+                ],
             },
             headers={"Idempotency-Key": "implant-revise"},
         )
@@ -480,13 +613,68 @@ async def test_opinion_api_revise_accepts_implant_material_bridge_references(mon
     section = revised["implant_materials_section"]
     assert section["text"] == implant_text
     assert section["bridge_authored"] is True
+    assert section["bridge_modified_by_operator"] is True
     assert section["bridge_draft_ref"] == {
         "invocation_id": draft_invocation_id,
         "text_sha256": text_sha256,
+        "source_text_sha256": source_text_sha256,
+        "source_observation_id": draft_observation_id,
     }
-    assert section["bridge_review_ref"] == {
-        "invocation_id": review_invocation_id,
-        "output_sha256": review_output_sha256,
-        "reviewed_text_sha256": text_sha256,
-    }
+    note = revised["observations"][0]
+    assert note["text"] == note_text
+    assert note["bridge_modified_by_operator"] is True
+    assert note["bridge_draft_ref"]["invocation_id"] == note_invocation_id
+    assert note["bridge_draft_ref"]["source_text_sha256"] == note_source_text_sha256
+    assert note["bridge_draft_ref"]["source_observation_id"] == str(UUID(int=706))
+
+    edited_implant_text = implant_text + "; formulation relue par l'opérateur."
+    edited_sha256 = hashlib.sha256(edited_implant_text.encode()).hexdigest()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        revise_again = await client.post(
+            f"/api/opinions/{draft['id']}/revise",
+            json={
+                "expected_version": revised["version"],
+                "expected_sha256": revised["content_sha256"],
+                "blocks": [
+                    *[
+                        {
+                            "block_type": block["type"],
+                            "text": block["text"],
+                            "finding_refs": block["finding_refs"],
+                            "evidence_refs": block["evidence_refs"],
+                            "qualification": block["qualification"],
+                            "certainty": block["certainty"],
+                        }
+                        for block in revised["blocks"]
+                    ],
+                    {
+                        "block_type": "implant_materials",
+                        "text": edited_implant_text,
+                        "bridge_authored": True,
+                        "bridge_draft_ref": {
+                            "invocation_id": draft_invocation_id,
+                            "text_sha256": edited_sha256,
+                            "source_text_sha256": source_text_sha256,
+                            "source_observation_id": draft_observation_id,
+                        },
+                    },
+                ],
+                "observations": revised["observations"],
+                "implant_materials": revised["implant_materials"],
+            },
+            headers={"Idempotency-Key": "implant-revise-again"},
+        )
+    assert revise_again.status_code == 200, revise_again.text
+    revised_again = revise_again.json()["draft"]
+    section_again = revised_again["implant_materials_section"]
+    assert section_again["text"] == edited_implant_text
+    assert section_again["bridge_modified_by_operator"] is True
+    assert section_again["bridge_draft_ref"]["source_text_sha256"] == source_text_sha256
+    assert section_again["bridge_draft_ref"]["text_sha256"] == edited_sha256
+    assert revised_again["observations"][0]["bridge_draft_ref"]["invocation_id"] == (
+        note_invocation_id
+    )
+    assert section["bridge_review_ref"] is None
     assert revised["implant_materials"][0]["value"] == "ghp_" + "b" * 36

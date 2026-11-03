@@ -49,6 +49,8 @@ from cti_app.domain.analyst_opinion import (
     OpinionProtocolFigureV1,
     opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
+    opinion_bridge_drafting_summary,
+    opinion_internal_text_markers,
     verify_opinion_citations,
 )
 from cti_app.domain.editorial import (
@@ -107,6 +109,8 @@ class OpinionErrorCode(StrEnum):
     SYNTHESIS_IDENTITY_MISMATCH = "synthesis_identity_mismatch"
     OPINION_NOT_APPROVED = "opinion_not_approved"
     OPINION_NOT_DRAFT = "opinion_not_draft"
+    BRIDGE_DRAFTING_ACK_REQUIRED = "bridge_drafting_ack_required"
+    OPINION_TEXT_MARKERS_FOUND = "opinion_text_markers_found"
     INVALID_SELECTION = "invalid_selection"
     REVIEW_TEXT_STALE = "review_text_stale"
     INVALID_OBSERVATION_ANCHOR = "invalid_observation_anchor"
@@ -125,11 +129,13 @@ class OpinionError(ValueError):
         code: OpinionErrorCode,
         *,
         citation_violations: tuple[CitationViolation, ...] = (),
+        publication_text_markers: tuple[dict[str, str], ...] = (),
         field_path: str | None = None,
         message: str | None = None,
     ) -> None:
         self.code = code
         self.citation_violations = citation_violations
+        self.publication_text_markers = publication_text_markers
         self.field_path = field_path
         super().__init__(message or code.value)
 
@@ -526,6 +532,7 @@ class AnalystOpinionService:
         *,
         correlation_id: str = "",
         idempotency_key: str = "",
+        bridge_drafting_gap_acknowledged: bool = False,
     ) -> AnalystOpinionV1:
         actor_id = self._require_actor(actor)
         self._require_reason(reason)
@@ -533,17 +540,37 @@ class AnalystOpinionService:
             reviewed = await self._require_version(uow, opinion_id, version)
             self._require_expected_sha(reviewed, expected_sha256)
             current = await self._require_current(uow, opinion_id)
+            drafting = opinion_bridge_drafting_summary(reviewed)
+            gap_acknowledged = (
+                current.bridge_drafting_gap_acknowledged or bridge_drafting_gap_acknowledged
+            )
             if current.status is AnalystOpinionStatus.APPROVED:
+                if drafting["requires_acknowledgement"] and not gap_acknowledged:
+                    raise OpinionError(OpinionErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED)
                 if (
                     current.version == version + 1
                     and current.reviewer_id == actor_id
                     and self._same_opinion_text(current, reviewed)
                 ):
+                    expected_gap_acknowledgement = (
+                        bool(drafting["requires_acknowledgement"]) and gap_acknowledged
+                    )
+                    if current.bridge_drafting_gap_acknowledged != expected_gap_acknowledgement:
+                        raise OpinionError(
+                            OpinionErrorCode.INVALID_STATE,
+                            message=(
+                                "An existing approval cannot be amended by retry; "
+                                "acknowledge the drafting gap with the separate "
+                                "publication decision"
+                            ),
+                        )
                     return current
                 raise OpinionError(OpinionErrorCode.STALE_VERSION)
             if current.version != version or current.status is not AnalystOpinionStatus.DRAFT:
                 raise OpinionError(OpinionErrorCode.STALE_VERSION)
             await self._validate_review_preconditions(uow, reviewed)
+            if drafting["requires_acknowledgement"] and not gap_acknowledged:
+                raise OpinionError(OpinionErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED)
             approved = AnalystOpinionV1(
                 id=reviewed.id,
                 version=reviewed.version + 1,
@@ -558,6 +585,9 @@ class AnalystOpinionService:
                 author_id=reviewed.author_id,
                 reviewer_id=actor_id,
                 status=AnalystOpinionStatus.APPROVED,
+                bridge_drafting_gap_acknowledged=(
+                    bool(drafting["requires_acknowledgement"]) and gap_acknowledged
+                ),
             )
             await self._validate_citations(uow, approved)
             try:
@@ -571,6 +601,8 @@ class AnalystOpinionService:
                     and concurrent.version == approved.version
                     and concurrent.status is AnalystOpinionStatus.APPROVED
                     and concurrent.reviewer_id == actor_id
+                    and concurrent.bridge_drafting_gap_acknowledged
+                    == approved.bridge_drafting_gap_acknowledged
                     and self._same_opinion_text(concurrent, reviewed)
                 ):
                     return concurrent
@@ -867,6 +899,13 @@ class AnalystOpinionService:
     async def _validate_review_preconditions(
         self, uow: UnitOfWork, opinion: AnalystOpinionV1
     ) -> None:
+        markers = opinion_internal_text_markers(opinion)
+        if markers:
+            raise OpinionError(
+                OpinionErrorCode.OPINION_TEXT_MARKERS_FOUND,
+                publication_text_markers=markers,
+                message="Reader-facing opinion text contains internal markers.",
+            )
         await self._validate_citations(uow, opinion)
         investigation = await uow.analyst_investigations.get(opinion.investigation_id)
         if investigation is None:
@@ -1038,6 +1077,7 @@ class AnalystOpinionService:
 
         persisted = await uow.evidence_observations.list_for_investigation(opinion.investigation_id)
         advisor_calls: dict[str, Mapping[str, Any]] = {}
+        advisor_observation_ids: dict[str, UUID] = {}
         referenced_invocations: dict[str, set[str]] = {"draft_text": set(), "review_text": set()}
         observation_failures: dict[str, list[tuple[UUID, str, str | None]]] = {
             "draft_text": [],
@@ -1131,6 +1171,7 @@ class AnalystOpinionService:
             invocation_id = payload.get("bridge_invocation_id")
             if isinstance(invocation_id, str):
                 advisor_calls[invocation_id] = payload
+                advisor_observation_ids[invocation_id] = observation.id
 
         for consultation_type, invocation_ids in referenced_invocations.items():
             for invocation_id in invocation_ids - advisor_calls.keys():
@@ -1188,10 +1229,29 @@ class AnalystOpinionService:
             if draft_ref is None or draft_ref.text_sha256 != text_sha256:
                 raise OpinionError(OpinionErrorCode.INVALID_SELECTION)
             draft_call = advisor_calls.get(draft_ref.invocation_id)
+            source_observation_id = draft_ref.source_observation_id
+            if draft_ref.operator_modified and source_observation_id is None:
+                raise OpinionError(
+                    OpinionErrorCode.INVALID_SELECTION,
+                    message=(
+                        f"Bridge invocation {draft_ref.invocation_id}: an operator-adapted "
+                        "section must retain its source observation reference"
+                    ),
+                )
+            if (
+                source_observation_id is not None
+                and advisor_observation_ids.get(draft_ref.invocation_id) != source_observation_id
+            ):
+                raise OpinionError(
+                    OpinionErrorCode.INVALID_SELECTION,
+                    message=(
+                        f"Bridge invocation {draft_ref.invocation_id}: source observation "
+                        "reference does not match the persisted consultation"
+                    ),
+                )
             if not self._bridge_call_contains_draft(
                 draft_call,
-                text_value=text_value,
-                text_sha256=text_sha256,
+                source_text_sha256=draft_ref.original_text_sha256,
                 block_type=block_type,
                 anchor=anchor,
             ):
@@ -1211,8 +1271,7 @@ class AnalystOpinionService:
     def _bridge_call_contains_draft(
         call: Mapping[str, Any] | None,
         *,
-        text_value: str,
-        text_sha256: str,
+        source_text_sha256: str,
         block_type: str,
         anchor: str | None,
     ) -> bool:
@@ -1254,9 +1313,8 @@ class AnalystOpinionService:
                         and call.get("advisor_status") == "succeeded"
                     )
                 )
-                and " ".join(sentence_texts) == text_value
                 and hashlib.sha256(" ".join(sentence_texts).encode("utf-8")).hexdigest()
-                == text_sha256
+                == source_text_sha256
             ):
                 return True
         return False
@@ -1895,6 +1953,8 @@ def register_operator_opinion_tools(
         "properties": {
             "invocation_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "text_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+            "source_text_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+            "source_observation_id": uuid_schema,
         },
         "required": ["invocation_id", "text_sha256"],
         "additionalProperties": False,
@@ -2204,11 +2264,38 @@ def _operator_implant_materials(
 def _operator_bridge_draft_ref(value: object) -> BridgeDraftReferenceV1 | None:
     if value is None:
         return None
-    if not isinstance(value, Mapping) or set(value) != {"invocation_id", "text_sha256"}:
+    expected_fields = {"invocation_id", "text_sha256"}
+    optional_fields = {"source_text_sha256", "source_observation_id"}
+    if (
+        not isinstance(value, Mapping)
+        or not expected_fields.issubset(value)
+        or set(value) - (expected_fields | optional_fields)
+    ):
         raise ValueError("Bridge draft reference is invalid")
-    if not isinstance(value["invocation_id"], str) or not isinstance(value["text_sha256"], str):
+    if (
+        not isinstance(value["invocation_id"], str)
+        or not isinstance(value["text_sha256"], str)
+        or ("source_text_sha256" in value and not isinstance(value["source_text_sha256"], str))
+        or (
+            "source_observation_id" in value
+            and not isinstance(value["source_observation_id"], (str, UUID))
+        )
+    ):
         raise ValueError("Bridge draft reference is invalid")
-    return BridgeDraftReferenceV1(value["invocation_id"], value["text_sha256"])
+    try:
+        source_observation_id = (
+            UUID(str(value["source_observation_id"]))
+            if value.get("source_observation_id") is not None
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bridge source observation identity is invalid") from exc
+    return BridgeDraftReferenceV1(
+        value["invocation_id"],
+        value["text_sha256"],
+        value.get("source_text_sha256"),
+        source_observation_id,
+    )
 
 
 def _operator_bridge_review_ref(value: object) -> BridgeReviewReferenceV1 | None:
