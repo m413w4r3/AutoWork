@@ -27,6 +27,17 @@ class ToolInvocationStatus(StrEnum):
     PARTIAL = "partial"
 
 
+class InvocationReconciliationOutcome(StrEnum):
+    EXECUTED_WITH_RESULT = "executed_with_result"
+    EXECUTED_EMPTY_RESPONSE = "executed_empty_response"
+    TRANSPORT_ERROR = "transport_error"
+    EXTERNAL_RESULT_UNKNOWN = "external_result_unknown"
+    RESULT_UNAVAILABLE = "result_unavailable"
+    RECONCILED_WITHOUT_RESULT = "reconciled_without_result"
+    NOT_EXECUTED = "not_executed"
+    ABANDON = "abandon"
+
+
 class FrameworkPreSubmissionProof(StrEnum):
     """Framework-attested outcomes proving no external submit or handoff occurred."""
 

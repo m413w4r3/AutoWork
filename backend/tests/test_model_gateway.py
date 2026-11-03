@@ -124,6 +124,7 @@ class TerminalFailureThenSuccessTransport:
         verified_no_answer: bool = False,
         code: str = "bridge_server_error",
         submission_state: str = "post_submission",
+        phase: str = "generation",
     ) -> None:
         self.failures = failures
         self.retryable = retryable
@@ -131,6 +132,7 @@ class TerminalFailureThenSuccessTransport:
         self.verified_no_answer = verified_no_answer
         self.code = code
         self.submission_state = submission_state
+        self.phase = phase
         self.idempotency_keys: list[str | None] = []
 
     async def create(
@@ -143,7 +145,7 @@ class TerminalFailureThenSuccessTransport:
                 self.code,
                 "contrat DOM de la réponse non résolu",
                 retryable=self.retryable,
-                phase="generation",
+                phase=self.phase,
                 submission_state=self.submission_state,
                 bridge_run_id=f"resp_failed_{len(self.idempotency_keys)}",
                 bridge_status=self.bridge_status,
@@ -355,6 +357,92 @@ async def test_typed_bridge_error_details_are_persisted_safely() -> None:
         "retryable": False,
         "attempts": 1,
     }
+
+
+async def test_bridge_rejects_locally_invalid_request_before_emission() -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        return httpx.Response(200, json={})
+
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": object()}, idempotency_key="synthetic-invalid-request")
+
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.code == "bridge_request_invalid"
+    assert emitted == []
+
+
+async def test_bridge_unsupported_protocol_is_proven_pre_submission() -> None:
+    client = ChatGPTBridgeClient("ftp://bridge.invalid")
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": "synthetic"}, idempotency_key="synthetic-unsupported-url")
+
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.code == "bridge_unsupported_protocol"
+
+
+async def test_bridge_transport_error_after_mock_request_emission_is_ambiguous() -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        if request.method == "GET":
+            return httpx.Response(404, json={"detail": "not found"}, request=request)
+        raise httpx.ReadTimeout("synthetic response timeout", request=request)
+
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": "synthetic"}, idempotency_key="synthetic-timeout")
+
+    assert [request.method for request in emitted] == ["POST", "GET"]
+    assert caught.value.submission_state == "external_state_unknown"
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+async def test_submission_phase_pre_submission_claim_is_read_only_reconciled(
+    status_code: int,
+) -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                status_code,
+                json={
+                    "detail": {
+                        "code": "bridge_server_error",
+                        "phase": "submission",
+                        "submission_state": "pre_submission",
+                    }
+                },
+                request=request,
+            )
+        return httpx.Response(404, json={"detail": "not found"}, request=request)
+
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": "synthetic"}, idempotency_key="synthetic-server-error")
+
+    assert [request.method for request in emitted] == ["POST", "GET"]
+    assert caught.value.code == "bridge_server_error"
+    assert caught.value.submission_state == "external_state_unknown"
 
 
 async def test_first_submission_uses_attempt_one_bridge_identity() -> None:
@@ -621,6 +709,27 @@ async def test_failed_without_verified_no_answer_reconciles_without_retry() -> N
     assert run.status is ModelRunStatus.NEEDS_REVIEW
     assert run.submission_state.value == "external_state_unknown"
     assert run.error_details["diagnostic_code"] == "bridge_server_error"
+
+
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+async def test_bridge_pre_submission_server_error_from_submission_is_ambiguous() -> None:
+    transport = TerminalFailureThenSuccessTransport(
+        failures=1,
+        bridge_status="failed",
+        verified_no_answer=False,
+        submission_state="pre_submission",
+        phase="submission",
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert len(transport.idempotency_keys) == 1
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.submission_state.value == "external_state_unknown"
 
 
 @pytest.mark.usefixtures("no_bridge_retry_delay")

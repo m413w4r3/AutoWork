@@ -135,6 +135,7 @@ from cti_app.domain.investigation import (
     FindingAssessment,
     InvestigationBudget,
     InvestigationExecutionMode,
+    InvocationReconciliationOutcome,
     QualificationActorKind,
     SampleQualification,
     TLPLevel,
@@ -4616,9 +4617,7 @@ class InvocationReconciliationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
-    outcome: str = Field(
-        pattern=r"^(executed_with_result|not_executed|abandon)$",
-    )
+    outcome: InvocationReconciliationOutcome
     reason: str = Field(min_length=1, max_length=4_000)
     response_refs: tuple[UUID, ...] = Field(default=(), max_length=128)
 
@@ -4627,6 +4626,7 @@ class InvocationReconciliationResponse(BaseModel):
     invocation_id: UUID
     status: ToolInvocationStatus
     version: int
+    outcome: InvocationReconciliationOutcome
     response_refs: tuple[UUID, ...]
 
 
@@ -4634,7 +4634,7 @@ class OperatorInvocationReconciliationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
-    outcome: Literal["executed_with_result", "not_executed", "abandon"] | None = None
+    outcome: InvocationReconciliationOutcome | None = None
     reason: str | None = Field(default=None, min_length=1, max_length=4_000)
     response_refs: tuple[UUID, ...] = Field(default=(), max_length=128)
 
@@ -4727,8 +4727,6 @@ async def reconcile_operator_advisor_invocation(
                     "Passive VT reconciliation requires the Idempotency-Key header.",
                 )
 
-            from cti_app.application.investigation_service import InvocationReconciliationOutcome
-
             try:
                 invocation = await composition.service.reconcile_invocation(
                     investigation_id,
@@ -4757,11 +4755,19 @@ async def reconcile_operator_advisor_invocation(
                 invocation_id=invocation.id,
                 status=invocation.status,
                 version=invocation.version,
+                outcome=payload.outcome,
                 response_refs=invocation.response_refs,
             )
 
         if invocation.tool_name != "advisor.consult":
             raise _operator_reconciliation_not_permitted(invocation.tool_name)
+        if payload.outcome not in {
+            None,
+            InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+            InvocationReconciliationOutcome.NOT_EXECUTED,
+            InvocationReconciliationOutcome.ABANDON,
+        }:
+            raise _http_error(422, "operator_reconciliation_outcome_not_supported")
         if invocation.version != payload.expected_version:
             raise _http_error(409, "stale_invocation_version")
         if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
@@ -5187,8 +5193,6 @@ async def reconcile_investigation_invocation(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> InvocationReconciliationResponse:
-    from cti_app.application.investigation_service import InvocationReconciliationOutcome
-
     identity = await _require_verified_human_operator(request)
     async with _uow_factory(request)() as uow:
         try:
@@ -5222,5 +5226,6 @@ async def reconcile_investigation_invocation(
         invocation_id=invocation.id,
         status=invocation.status,
         version=invocation.version,
+        outcome=payload.outcome,
         response_refs=invocation.response_refs,
     )
