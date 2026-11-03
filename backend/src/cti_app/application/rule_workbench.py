@@ -909,10 +909,6 @@ class RuleWorkbench:
                 rendered_meta[f"motif_{index}_positive_support"] = motif.positive_support
             if motif.benign_prevalence is not None:
                 rendered_meta[f"motif_{index}_benign_prevalence"] = motif.benign_prevalence
-            if motif.goodware_occurrence_count is not None:
-                rendered_meta[f"motif_{index}_goodware_occurrences"] = (
-                    motif.goodware_occurrence_count
-                )
 
         lines = [f"rule {rule_identifier} {{", "    meta:"]
         for key, value in sorted(rendered_meta.items()):
