@@ -11,7 +11,6 @@ from uuid import UUID
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -1164,30 +1163,43 @@ class SqlAlchemyDetectionCandidateRepository:
                 return existing, True
             raise VersionConflictError("Detection candidate import identity already exists")
 
-        try:
-            # The savepoint keeps a uniqueness race from poisoning the caller's UoW.
-            # uq_detection_candidate_version is the cross-process CAS for candidate v1.
-            async with self._session.begin_nested():
-                stored = await self.append_version(version, expected_previous_id=None)
-        except (IntegrityError, ValueError, VersionConflictError) as exc:
-            existing_by_id = await self.get(version.id)
-            if existing_by_id is not None and _same_detection_candidate_version(
-                existing_by_id, version
-            ):
-                return existing_by_id, True
-            existing_versions = await self.list_for_candidate(version.candidate_id)
-            if any(_same_detection_candidate_version(item, version) for item in existing_versions):
-                return next(
-                    item
-                    for item in existing_versions
-                    if _same_detection_candidate_version(item, version)
-                ), True
-            if existing_versions:
-                raise VersionConflictError(
-                    "Detection candidate import identity already exists"
-                ) from exc
-            raise
-        return stored, False
+        # The unique v1 constraint arbitrates imports in separate processes.
+        # DO NOTHING is important here: append_version may find an identical row
+        # after this method's preflight read and cannot tell a replay from an insert.
+        async with self._session.begin_nested():
+            inserted_id = await self._session.scalar(
+                insert(DetectionCandidateVersionRow)
+                .values(**_candidate_values(version))
+                .on_conflict_do_nothing()
+                .returning(DetectionCandidateVersionRow.id)
+            )
+            if inserted_id is not None:
+                await self._append_candidate_details(version)
+
+        if inserted_id is not None:
+            return version, False
+
+        # Under READ COMMITTED, this new statement sees the transaction that won
+        # the unique insert after PostgreSQL made DO NOTHING wait for its commit.
+        existing_by_id = await self.get(version.id)
+        if existing_by_id is not None and _same_detection_candidate_version(
+            existing_by_id, version
+        ):
+            return existing_by_id, True
+        existing_versions = await self.list_for_candidate(version.candidate_id)
+        matching = next(
+            (
+                item
+                for item in existing_versions
+                if _same_detection_candidate_version(item, version)
+            ),
+            None,
+        )
+        if matching is not None:
+            return matching, True
+        if existing_by_id is not None or existing_versions:
+            raise VersionConflictError("Detection candidate import identity already exists")
+        raise VersionConflictError("Detection candidate import conflicted without a visible row")
 
     async def append_version(
         self, version: DetectionCandidateVersion, *, expected_previous_id: UUID | None
@@ -1234,6 +1246,10 @@ class SqlAlchemyDetectionCandidateRepository:
 
         self._session.add(DetectionCandidateVersionRow(**_candidate_values(version)))
         await self._session.flush()
+        await self._append_candidate_details(version)
+        return version
+
+    async def _append_candidate_details(self, version: DetectionCandidateVersion) -> None:
         motif_rows = [
             DetectionCandidateMotifRow(
                 version_id=version.id,
@@ -1266,7 +1282,6 @@ class SqlAlchemyDetectionCandidateRepository:
             ]
         )
         await self._session.flush()
-        return version
 
     async def _candidate_from_row(
         self, row: DetectionCandidateVersionRow
