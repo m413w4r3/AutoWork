@@ -1431,10 +1431,9 @@ class _RuleTools:
                     key=lambda item: (item.kind.value, item.value.casefold(), item.provenance_id),
                 )
             )
-            if (
-                latest.source_sha256 != requested_sha256
-                or latest.motif_provenance != expected_provenance
-            ):
+            if latest.source_sha256 != requested_sha256 or _proposal_identity_motif_provenance(
+                latest.motif_provenance
+            ) != _proposal_identity_motif_provenance(expected_provenance):
                 raise _ToolFailed(
                     "candidate_id_already_exists_with_different_proposal",
                     diagnostic=_rule_diagnostic(
@@ -1465,6 +1464,7 @@ class _RuleTools:
                     "source_sha256": latest.source_sha256,
                     "candidate_status": latest.status.value,
                     **_version_provenance_output(latest),
+                    "signature": _signature_manifest(latest),
                     "validation_status": validation_status.value,
                     "validation_reason": (
                         latest_test.get("validation_reason")
@@ -5231,6 +5231,47 @@ def _serialize_motif(
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
+
+
+def _proposal_identity_motif_provenance(
+    provenance: Sequence[MotifProvenance],
+) -> tuple[MotifProvenance, ...]:
+    measurement_fields = (
+        "goodware_occurrence_count",
+        "goodware_measurement_status",
+        "goodware_measurement_reason",
+        "goodware_banality",
+    )
+    normalized: list[MotifProvenance] = []
+    for item in provenance:
+        if not item.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
+            normalized.append(item)
+            continue
+        try:
+            payload = json.loads(item.rationale[len(_PERSISTED_MOTIF_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            normalized.append(item)
+            continue
+        if not isinstance(payload, dict):
+            normalized.append(item)
+            continue
+        for field_name in measurement_fields:
+            payload.pop(field_name, None)
+        normalized.append(
+            replace(
+                item,
+                rationale=(
+                    _PERSISTED_MOTIF_PREFIX
+                    + json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                ),
+            )
+        )
+    return tuple(normalized)
 
 
 def _serialize_motif_with_source(

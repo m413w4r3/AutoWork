@@ -3430,6 +3430,68 @@ async def test_goodware_feature_baseline_is_not_reported_as_tested_goodware_byte
 
 
 @pytest.mark.asyncio
+async def test_rule_propose_replay_reads_original_unmeasured_goodware_after_baseline_is_bound() -> (
+    None
+):
+    harness = _harness(samples={})
+    observation_ref = await _source_observation(harness, "Qz9Vn5Hs")
+    candidate_id = uuid4()
+    provenance_id = "fixture:goodware-stable"
+    arguments = {
+        "candidate_id": str(candidate_id),
+        "condition": "any",
+        "motifs": [_motif("Qz9Vn5Hs", observation_ref, provenance_id=provenance_id)],
+    }
+
+    first = await _call(harness, "rule.propose", arguments)
+
+    assert first.status is ToolInvocationStatus.SUCCEEDED
+    assert first.output["signature"]["motifs"][0]["goodware_measurement_status"] == "unmeasured"
+    assert (
+        first.output["signature"]["motifs"][0]["goodware_measurement_reason"]
+        == "investigation_goodware_baseline_unbound"
+    )
+
+    baseline_id = uuid4()
+
+    async def bound_baseline(_investigation_id: UUID) -> UUID:
+        return baseline_id
+
+    class PreparedIndex:
+        async def lookup_batch(self, features):
+            assert tuple(features) == (("string", "qz9vn5hs"),)
+            return {("string", "qz9vn5hs"): 12}
+
+    class Measurement:
+        async def prepare(self, requested_baseline_id):
+            assert requested_baseline_id == baseline_id
+            return PreparedIndex()
+
+    harness.bytes_port.goodware_baseline_id = bound_baseline
+    harness.rule_tools.goodware_measurement = Measurement()
+    replay = await _call(harness, "rule.propose", arguments)
+
+    assert replay.status is ToolInvocationStatus.SUCCEEDED
+    assert replay.output["replayed"] is True
+    assert replay.output["candidate_id"] == str(candidate_id)
+    assert replay.output["version_id"] == first.output["version_id"]
+    assert replay.output["source_sha256"] == first.output["source_sha256"]
+    assert replay.output["signature"] == first.output["signature"]
+    assert len(await harness.candidates.list_for_candidate(candidate_id)) == 1
+
+    changed_proposal = await _call(
+        harness,
+        "rule.propose",
+        {
+            **arguments,
+            "motifs": [_motif("DifferentMarker", observation_ref, provenance_id=provenance_id)],
+        },
+    )
+    assert changed_proposal.status is ToolInvocationStatus.FAILED
+    assert changed_proposal.error_code == "candidate_id_already_exists_with_different_proposal"
+
+
+@pytest.mark.asyncio
 async def test_rule_propose_measures_baseline_banality_and_rule_test_rejects_goodware_match() -> (
     None
 ):
@@ -3480,7 +3542,11 @@ async def test_rule_propose_measures_baseline_banality_and_rule_test_rejects_goo
     goodware_role = next(role for role in persisted["roles"] if role["role"] == "goodware")
     assert goodware_role["matches"] == [goodware_sha256]
     assert persisted["goodware_measurement"]["status"] == "measured"
+    assert persisted["goodware_measurement"]["baseline_id"] == str(baseline_id)
     assert persisted["goodware_measurement"]["matches"] == [goodware_sha256]
+    stored = await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
+    assert len(stored) == 1
+    assert "goodware_occurrences" not in stored[0].source
 
 
 @pytest.mark.asyncio
