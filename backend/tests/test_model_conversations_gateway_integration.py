@@ -18,23 +18,30 @@ never mocking `gateway.execute` itself.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.bridge_investigator import ModelConversationTurnTransport
+from cti_app.application.bridge_investigator import (
+    ModelConversationTurnTransport,
+    TurnSubmissionStatus,
+    submit_bridge_consultation_once,
+)
 from cti_app.application.external_effects import (
     ExternalEffectCoordinator,
     FrameworkNoSendProof,
     Refused,
 )
+from cti_app.application.investigation_advisor_tools import _bridge_turns_consumed
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
@@ -68,6 +75,7 @@ from cti_app.domain.model_runs import (
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import (
     BlobModelOutputStore,
+    ChatGPTBridgeClient,
     FakeModelAdapter,
     HttpResponsesTransport,
     OpenAIResearchAdapter,
@@ -121,7 +129,10 @@ class _ScriptedBridgeAdapter:
 
 
 def _build_service(
-    adapter: _ScriptedBridgeAdapter, tmp_path: Path
+    adapter: _ScriptedBridgeAdapter,
+    tmp_path: Path,
+    *,
+    known_subject_ids: set[UUID] | None = None,
 ) -> tuple[ModelConversationService, InMemoryConversationUnitOfWorkFactory]:
     router = ModelRouter(
         openai_research=adapter,
@@ -129,7 +140,7 @@ def _build_service(
         qwen=FakeModelAdapter(),
         fake=FakeModelAdapter(),
     )
-    conversation_uow = InMemoryConversationUnitOfWorkFactory()
+    conversation_uow = InMemoryConversationUnitOfWorkFactory(known_subject_ids=known_subject_ids)
     blob_store = FilesystemBlobStore(tmp_path)
     # Production wires the gateway's output store through the blob catalog
     # (`blob://...` references) rather than the plain in-memory store used
@@ -174,6 +185,7 @@ async def test_q1_fresh_conversation_reaches_the_adapter_exactly_once(tmp_path: 
 
     assert turn.status is ConversationTurnStatus.SUCCEEDED
     assert len(adapter.calls) == 1
+
     assert adapter.calls[0].web_search is True
 
     updated = await service.get(conversation.id)
@@ -198,6 +210,122 @@ async def test_q1_fresh_conversation_reaches_the_adapter_exactly_once(tmp_path: 
     assert replay.id == turn.id
     assert replay.status is ConversationTurnStatus.SUCCEEDED
     assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_local_deadline_during_gateway_preflight_is_durable_pre_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class SlowPreflightAdapter(_ScriptedBridgeAdapter):
+        async def preflight(self) -> None:
+            await asyncio.sleep(1)
+
+    class NoWaitPacer:
+        async def wait_for_next_submission(self, **_kwargs: Any) -> bool:
+            return True
+
+    import cti_app.application.bridge_investigator as bridge_module
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    adapter = SlowPreflightAdapter("unused")
+    subject_id = uuid4()
+    service, conversation_uow = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+    callback_calls: list[bool] = []
+
+    result = await submit_bridge_consultation_once(
+        ModelConversationTurnTransport(service),
+        investigation_id=uuid4(),
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=hashlib.sha256(b"local preflight timeout").hexdigest(),
+        prompt="Synthetic local preparation timeout.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        timeout_seconds=0.01,
+        on_submission_started=lambda: callback_calls.append(True),
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.submission_state.value == "pre_submission"
+    assert result.prior_submission_made is False
+    assert _bridge_turns_consumed(result) == 0
+    assert callback_calls == []
+    assert adapter.calls == []
+    persisted_run = next(iter(conversation_uow.model_runs.values()))
+    assert persisted_run.submission_state.value == "not_submitted"
+
+
+@pytest.mark.asyncio
+async def test_typed_bridge_pre_submission_502_consumes_no_turn_or_get(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            502,
+            request=request,
+            json={
+                "detail": {
+                    "id": "typed-pre-submission-run",
+                    "status": "failed",
+                    "error": {
+                        "code": "bridge_server_error",
+                        "submission_state": "pre_submission",
+                    },
+                }
+            },
+        )
+
+    class NoWaitPacer:
+        async def wait_for_next_submission(self, **_kwargs: Any) -> bool:
+            return True
+
+    import cti_app.application.bridge_investigator as bridge_module
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    bridge_transport = ChatGPTBridgeClient(
+        "https://bridge.test/v1",
+        http_transport=httpx.MockTransport(handler),
+    )
+    bridge_transport._last_capabilities_check = time.monotonic()
+    adapter = OpenAIResearchAdapter(bridge_transport, model="test-model")
+    subject_id = uuid4()
+    service, _conversation_uow = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+
+    result = await submit_bridge_consultation_once(
+        ModelConversationTurnTransport(service),
+        investigation_id=uuid4(),
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=hashlib.sha256(b"typed pre-submission").hexdigest(),
+        prompt="Synthetic pre-submission error.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.submission_state.value == "pre_submission"
+    assert result.prior_submission_made is False
+    assert _bridge_turns_consumed(result) == 0
+    assert [request.method for request in requests] == ["POST"]
 
 
 async def test_general_conversation_turn_uses_plain_bridge_gateway(tmp_path: Path) -> None:

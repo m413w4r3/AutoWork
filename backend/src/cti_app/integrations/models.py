@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from typing import Any, Protocol
+from urllib.parse import quote
 from uuid import UUID, uuid5
 
 import httpx
@@ -35,6 +36,7 @@ from cti_app.application.model_gateway import (
     ModelCapabilityError,
     ModelGatewayError,
     SafeModelRequest,
+    mark_bridge_submission_started,
     validate_structured_output,
 )
 from cti_app.domain.external_effects import (
@@ -121,29 +123,91 @@ class HttpResponsesTransport:
         timeout_seconds: float | None = None,
         bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> dict[str, Any]:
-        if self._external_effect_coordinator is not None:
-            if bridge_external_effect_binding is None:
-                raise _bridge_external_effect_refusal(
-                    failure_stage="binding_missing",
-                    failure_reason="bridge_external_effect_binding_missing",
+        try:
+            if self._external_effect_coordinator is not None:
+                if bridge_external_effect_binding is None:
+                    raise _bridge_external_effect_refusal(
+                        failure_stage="binding_missing",
+                        failure_reason="bridge_external_effect_binding_missing",
+                    )
+                return await self._coordinated_create(
+                    payload,
+                    idempotency_key=idempotency_key,
+                    timeout_seconds=timeout_seconds,
+                    binding=bridge_external_effect_binding,
                 )
-            return await self._coordinated_create(
-                payload,
+            if bridge_external_effect_binding is not None:
+                raise _bridge_external_effect_refusal(
+                    failure_stage="binding_invalid",
+                    failure_reason="coordinator_unavailable_for_binding",
+                )
+            return await self._request(
+                "POST",
+                "/responses",
+                json_body=payload,
                 idempotency_key=idempotency_key,
                 timeout_seconds=timeout_seconds,
-                binding=bridge_external_effect_binding,
             )
-        if bridge_external_effect_binding is not None:
-            raise _bridge_external_effect_refusal(
-                failure_stage="binding_invalid",
-                failure_reason="coordinator_unavailable_for_binding",
+        except BridgeTransportError as exc:
+            if idempotency_key:
+                exc.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
+            if not idempotency_key or not _should_reconcile_bridge_submission(exc):
+                raise
+            return await self._reconcile_ambiguous_submission(
+                exc,
+                idempotency_key=idempotency_key,
             )
-        return await self._request(
-            "POST",
-            "/responses",
-            json_body=payload,
+
+    async def _reconcile_ambiguous_submission(
+        self,
+        submit_error: BridgeTransportError,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Read Bridge's durable run snapshot by the exact caller key after POST ambiguity."""
+        try:
+            snapshot = await self.reconcile_bridge_submission(idempotency_key)
+        except BridgeTransportError as reconcile_error:
+            reconcile_error.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
+            if (
+                reconcile_error.bridge_status == "failed"
+                and reconcile_error.verified_no_answer
+                and reconcile_error.bridge_run_id
+            ):
+                raise reconcile_error
+            raise _ambiguous_bridge_submission_error(
+                submit_error,
+                idempotency_key=idempotency_key,
+                bridge_run_id=(reconcile_error.bridge_run_id or submit_error.bridge_run_id),
+                bridge_status=reconcile_error.bridge_status,
+            ) from None
+
+        status = snapshot.get("status")
+        bridge_run_id = snapshot.get("id")
+        if status in {"completed", "failed", "needs_review"}:
+            return snapshot
+        if status in {"queued", "running", "in_progress"}:
+            raise _ambiguous_bridge_submission_error(
+                submit_error,
+                idempotency_key=idempotency_key,
+                bridge_run_id=bridge_run_id if isinstance(bridge_run_id, str) else None,
+                bridge_status=status,
+                confirmed_received=True,
+            ) from None
+        raise _ambiguous_bridge_submission_error(
+            submit_error,
             idempotency_key=idempotency_key,
-            timeout_seconds=timeout_seconds,
+            bridge_run_id=bridge_run_id if isinstance(bridge_run_id, str) else None,
+            bridge_status=status if isinstance(status, str) else None,
+        ) from None
+
+    async def reconcile_bridge_submission(self, idempotency_key: str) -> dict[str, Any]:
+        """Read a Bridge run by its exact key without creating another run."""
+        return await self._request(
+            "GET",
+            f"/bridge/runs/{quote(idempotency_key, safe='')}",
+            phase="bridge_run_reconciliation",
+            timeout_seconds=self._capabilities_timeout,
         )
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
@@ -177,29 +241,64 @@ class HttpResponsesTransport:
 
         try:
             if self._client is not None:
-                response = await self._client.request(
-                    method,
-                    f"{self._base_url}{path}",
-                    json=json_body,
-                    headers=headers,
-                    timeout=timeout,
-                )
+                build_request = getattr(self._client, "build_request", None)
+                send = getattr(self._client, "send", None)
+                if callable(build_request) and callable(send):
+                    request = build_request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    if is_responses_submission:
+                        mark_bridge_submission_started()
+                    response = await send(request, follow_redirects=False)
+                else:
+                    if is_responses_submission:
+                        mark_bridge_submission_started()
+                    response = await self._client.request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
+                    )
             else:
                 async with httpx.AsyncClient(
                     timeout=timeout,
                     follow_redirects=False,
                     transport=self._http_transport,
                 ) as client:
-                    response = await client.request(
-                        method, f"{self._base_url}{path}", json=json_body, headers=headers
+                    request = client.build_request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
                     )
+                    if is_responses_submission:
+                        mark_bridge_submission_started()
+                    response = await client.send(request, follow_redirects=False)
+        except httpx.PoolTimeout as exc:
+            raise BridgeTransportError(
+                "bridge_pool_timeout",
+                "Le transport Bridge n'a pas obtenu de connexion avant l'envoi.",
+                retryable=True,
+                phase=phase,
+                submission_state=(
+                    "pre_submission" if phase == "preflight" or is_responses_submission else None
+                ),
+            ) from exc
         except httpx.ConnectError as exc:
             raise BridgeTransportError(
                 "bridge_unreachable",
                 "Le bridge ChatGPT est inaccessible.",
                 retryable=True,
                 phase=phase,
-                submission_state=("pre_submission" if phase == "preflight" else None),
+                submission_state=(
+                    "pre_submission" if phase == "preflight" or is_responses_submission else None
+                ),
             ) from exc
         except httpx.ReadTimeout as exc:
             timed_out_generation = phase == "generation"
@@ -222,10 +321,30 @@ class HttpResponsesTransport:
                 "Le bridge ChatGPT n'a pas répondu à temps.",
                 retryable=True,
                 phase=phase,
-                submission_state=("pre_submission" if phase == "preflight" else None),
+                submission_state=(
+                    "pre_submission" if phase == "preflight" or is_responses_submission else None
+                ),
+            ) from exc
+        except httpx.RequestError as exc:
+            raise BridgeTransportError(
+                "bridge_transport_error",
+                "Le transport Bridge a échoué après le début de la requête; "
+                "son résultat est inconnu.",
+                retryable=False,
+                phase=phase,
+                submission_state=(
+                    "submission_attempted"
+                    if is_responses_submission
+                    else ("pre_submission" if phase == "preflight" else None)
+                ),
             ) from exc
         if response.is_error:
-            raise _bridge_http_error(response, 1, default_phase=phase)
+            raise _bridge_http_error(
+                response,
+                1,
+                default_phase=phase,
+                submission_request=is_responses_submission,
+            )
         try:
             value = response.json()
         except (ValueError, json.JSONDecodeError) as exc:
@@ -489,6 +608,7 @@ class BridgeTransportError(ModelGatewayError):
         phase: str = "generation",
         status_code: int | None = None,
         bridge_run_id: str | None = None,
+        bridge_request_id: str | None = None,
         bridge_status: str | None = None,
         submission_state: str | None = None,
         diagnostics: dict[str, Any] | None = None,
@@ -507,6 +627,7 @@ class BridgeTransportError(ModelGatewayError):
         self.phase = phase
         self.status_code = status_code
         self.bridge_run_id = bridge_run_id
+        self.bridge_request_id = bridge_request_id
         self.bridge_status = bridge_status
         self.submission_state = submission_state
         self.diagnostics = diagnostics or {}
@@ -537,6 +658,7 @@ class _CoordinatedResponsesPoster:
         if _freeze_httpx_request(self.__request) != request:
             raise RuntimeError("Bridge request changed after it was prepared")
         capability(request)
+        mark_bridge_submission_started()
         response = await self.__client.send(self.__request, follow_redirects=False)
         if response.is_error:
             if response.status_code == 429:
@@ -793,7 +915,11 @@ _BRIDGE_DIAGNOSTIC_CODE_ALIASES = {
 
 
 def _bridge_http_error(
-    response: httpx.Response, attempts: int, *, default_phase: str = "generation"
+    response: httpx.Response,
+    attempts: int,
+    *,
+    default_phase: str = "generation",
+    submission_request: bool = True,
 ) -> BridgeTransportError:
     status = response.status_code
     server_code: str | None = None
@@ -881,19 +1007,13 @@ def _bridge_http_error(
         pass
     if default_phase == "preflight" and submission_state is None:
         submission_state = "pre_submission"
-    elif status == 429 and submission_state is None:
+    elif status in {401, 403} and submission_request and submission_state is None:
+        # Authentication rejection is a terminal Bridge refusal before a run
+        # can be created; generic server failures do not prove that boundary.
+        submission_state = "pre_submission"
+    elif status == 429 and submission_request and submission_state is None:
         # An HTTP 429 is a completed provider rejection. The request did not
         # start a generation, so retrying after Retry-After is safe.
-        submission_state = "pre_submission"
-    elif (
-        submission_state is None
-        and server_code == "bridge_server_error"
-        and _explicit_non_submission_message(server_message)
-    ):
-        # Older Bridge server responses can predate the structured
-        # `submission_state` field. Treat only clear declarations that nothing
-        # was submitted as pre-submission; generic 5xx/UI timeouts remain
-        # ambiguous and continue to require reconciliation.
         submission_state = "pre_submission"
     if conflicting_submission_state:
         # A malformed or contradictory contract cannot establish a send
@@ -1005,23 +1125,84 @@ def _bridge_http_error(
     )
 
 
-def _explicit_non_submission_message(message: str | None) -> bool:
-    if not message:
+def _should_reconcile_bridge_submission(error: BridgeTransportError) -> bool:
+    """Return true when a create error is not proof that Bridge did not receive it."""
+    if error.completed_response or (
+        error.bridge_status == "failed" and error.verified_no_answer and error.bridge_run_id
+    ):
         return False
-    normalized = " ".join(message.casefold().replace("\u2019", "'").split())
-    return any(
-        phrase in normalized
-        for phrase in (
-            "not submitted",
-            "nothing was submitted",
-            "before submission",
-            "prior to submission",
-            "avant soumission",
-            "avant la soumission",
-            "rien n'a été soumis",
-            "aucune soumission",
+    if error.submission_state == "pre_submission" and error.bridge_status not in {
+        "queued",
+        "running",
+        "in_progress",
+        "completed",
+        "succeeded",
+    }:
+        return False
+    # Generic server failures and UI/wait timeouts can follow a created run.
+    # A prose message from an older server is not terminal non-execution proof.
+    if error.status_code is not None and error.status_code >= 500:
+        return (
+            error.code
+            not in {
+                "bridge_auth_failed",
+                "bridge_extension_disconnected",
+                "conversation_unavailable",
+            }
+            or error.submission_state != "pre_submission"
         )
+    return error.submission_state != "pre_submission"
+
+
+def _ambiguous_bridge_submission_error(
+    submit_error: BridgeTransportError,
+    *,
+    idempotency_key: str,
+    bridge_run_id: str | None = None,
+    bridge_status: str | None = None,
+    confirmed_received: bool = False,
+) -> BridgeTransportError:
+    run_id = bridge_run_id or submit_error.bridge_run_id
+    received = confirmed_received or run_id is not None
+    request_fingerprint = _bridge_idempotency_fingerprint(idempotency_key)
+    if received:
+        message = (
+            f"Bridge a reçu la soumission (run {run_id or 'identifiant indisponible'}), "
+            "mais son résultat reste inconnu. Réconciliez le tour avec "
+            f"reconcile_orphaned_turn et l'empreinte {request_fingerprint} avant tout rejeu."
+        )
+        state = "submission_attempted"
+    else:
+        message = (
+            "La soumission a pu atteindre Bridge, mais son résultat reste inconnu. "
+            "Réconciliez le tour avec "
+            f"reconcile_orphaned_turn et l'empreinte {request_fingerprint} avant tout rejeu."
+        )
+        state = "external_state_unknown"
+    diagnostics = dict(submit_error.diagnostics)
+    diagnostics["bridge_request_id"] = request_fingerprint
+    if run_id is not None:
+        diagnostics["bridge_run_id"] = run_id[:128]
+    return BridgeTransportError(
+        submit_error.code,
+        message,
+        retryable=False,
+        attempts=submit_error.attempts,
+        retry_after=submit_error.retry_after,
+        phase="bridge_run_reconciliation",
+        status_code=submit_error.status_code,
+        bridge_run_id=run_id,
+        bridge_request_id=request_fingerprint,
+        bridge_status=bridge_status or submit_error.bridge_status,
+        submission_state=state,
+        diagnostics=diagnostics,
+        conversation_id=submit_error.conversation_id,
+        reason=submit_error.reason,
     )
+
+
+def _bridge_idempotency_fingerprint(idempotency_key: str) -> str:
+    return f"sha256:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _safe_bridge_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
@@ -1483,6 +1664,12 @@ class OpenAIResearchAdapter:
     ) -> AdapterResult:
         del role, output_schema
         return _responses_result(await self._transport.retrieve(response_id), self.provider)
+
+    async def reconcile_bridge_submission(self, idempotency_key: str) -> AdapterResult:
+        reconcile = getattr(self._transport, "reconcile_bridge_submission", None)
+        if not callable(reconcile):
+            raise ModelGatewayError("Bridge transport does not support read-only reconciliation")
+        return _responses_result(await reconcile(idempotency_key), self.provider)
 
 
 class OpenAIStructuredAdapter:

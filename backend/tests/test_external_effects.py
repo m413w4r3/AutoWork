@@ -914,7 +914,9 @@ async def test_bridge_500_after_handoff_needs_review_and_never_resends() -> None
             await transport.create(**kwargs)
         assert caught.value.code == "model_submission_reconciliation_required"
         assert caught.value.submission_state == "external_state_unknown"
-    assert len(calls) == 1
+        assert "bridge-request-server-error" not in str(caught.value)
+    assert [request.method for request in calls] == ["POST", "GET", "GET"]
+    assert sum(request.method == "POST" for request in calls) == 1
     assert store.sealed == [("needs_review", "transport_outcome_unknown")]
 
 
@@ -944,7 +946,43 @@ async def test_timeout_after_bridge_handoff_is_needs_review_and_never_resends() 
         assert caught.value.code == "model_submission_reconciliation_required"
         assert caught.value.submission_state == "external_state_unknown"
         assert "authorization-probe-do-not-persist" not in str(caught.value)
-    assert len(calls) == 1
+        assert "bridge-request-timeout" not in str(caught.value)
+    assert [request.method for request in calls] == ["POST", "GET", "GET"]
+    assert sum(request.method == "POST" for request in calls) == 1
+    assert store.sealed == [("needs_review", "transport_outcome_unknown")]
+
+
+@pytest.mark.asyncio
+async def test_unknown_bridge_run_after_ambiguous_submission_stays_needs_review() -> None:
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(500, json={"error": "synthetic server failure"})
+        return httpx.Response(404, json={"error": "unknown run"})
+
+    store = FakeStore()
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key="authorization-probe-do-not-persist",
+        coordinator=_coordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    kwargs = {
+        "payload": {"input": "safe test prompt"},
+        "idempotency_key": "bridge-request-not-found",
+        "bridge_external_effect_binding": _bridge_external_effect_binding(),
+    }
+    for _ in range(2):
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create(**kwargs)
+        assert caught.value.code == "model_submission_reconciliation_required"
+        assert caught.value.submission_state == "external_state_unknown"
+        assert "bridge-request-not-found" not in str(caught.value)
+
+    assert [request.method for request in calls] == ["POST", "GET", "GET"]
+    assert sum(request.method == "POST" for request in calls) == 1
     assert store.sealed == [("needs_review", "transport_outcome_unknown")]
 
 
