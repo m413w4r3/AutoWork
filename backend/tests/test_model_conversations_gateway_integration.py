@@ -264,7 +264,7 @@ async def test_local_deadline_during_gateway_preflight_is_durable_pre_submission
 
 
 @pytest.mark.asyncio
-async def test_typed_bridge_pre_submission_502_consumes_no_turn_or_get(
+async def test_typed_bridge_pre_submission_502_is_reconciled_without_second_post(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -272,6 +272,12 @@ async def test_typed_bridge_pre_submission_502_consumes_no_turn_or_get(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                request=request,
+                json={"id": "typed-pre-submission-run", "status": "running"},
+            )
         return httpx.Response(
             502,
             request=request,
@@ -321,11 +327,11 @@ async def test_typed_bridge_pre_submission_502_consumes_no_turn_or_get(
         ),
     )
 
-    assert result.status is TurnSubmissionStatus.UNAVAILABLE
-    assert result.submission_state.value == "pre_submission"
-    assert result.prior_submission_made is False
-    assert _bridge_turns_consumed(result) == 0
-    assert [request.method for request in requests] == ["POST"]
+    assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert result.submission_state.value == "external_state_unknown"
+    assert result.prior_submission_made is True
+    assert _bridge_turns_consumed(result) == 1
+    assert [request.method for request in requests] == ["POST", "GET"]
 
 
 async def test_general_conversation_turn_uses_plain_bridge_gateway(tmp_path: Path) -> None:

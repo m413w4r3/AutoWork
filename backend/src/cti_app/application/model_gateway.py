@@ -1731,13 +1731,22 @@ def _public_error(exc: Exception) -> str:
 def _is_certain_pre_submission_failure(exc: Exception) -> bool:
     submission_state = getattr(exc, "submission_state", None)
     if submission_state == "pre_submission":
-        # This specific Bridge server error can carry a stale pre_submission
-        # label even after the run entered submission. Other typed pre-send
-        # failures retain their proof and must not trigger reconciliation.
-        if getattr(exc, "code", None) == "bridge_server_error" and getattr(exc, "phase", None) in {
-            "submission",
-            "submission_confirmation",
-        }:
+        # A Bridge 5xx can carry a stale pre_submission label after the POST
+        # reached the server, even when the response omits its phase. Other
+        # typed pre-send failures retain their proof and skip reconciliation.
+        phase = getattr(exc, "phase", None)
+        status_code = getattr(exc, "status_code", None) or 0
+        submission_request = getattr(exc, "submission_request", None)
+        if getattr(exc, "code", None) == "bridge_server_error" and (
+            (phase in {"submission", "submission_confirmation"} and submission_request is not False)
+            or (
+                status_code >= 500
+                and (
+                    submission_request is True
+                    or (submission_request is None and phase != "preflight")
+                )
+            )
+        ):
             return False
         if getattr(exc, "verified_no_answer", False) is True:
             return True
