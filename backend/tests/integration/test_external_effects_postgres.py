@@ -4367,14 +4367,15 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
     authority, _base = authorities[0]
     blob_store = _MemoryBlobStore()
     observation_id = uuid4()
-    canonical_sample_sha256 = "d" * 64
+    report_hash = uuid4().hex
+    canonical_sample_sha256 = uuid4().hex + uuid4().hex
     try:
         # These are the values emitted by the VT file-report recorder.
         reference = await _seed_bridge_report_case(
             session_factory,
             investigation_id=investigation_id,
             subject_id=subject_id,
-            report_hash="c" * 32,
+            report_hash=report_hash,
             observation_source="VirusTotal",
             sample_flags=sample_flags,
             lineage=lineage,
@@ -4416,7 +4417,7 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
             assert "s=VirusTotal" in refused.detail
             assert "h=32" in refused.detail
             assert "drop_ref_or_cite_sha256" in refused.detail
-            assert "c" * 32 not in refused.detail
+            assert report_hash not in refused.detail
     finally:
         await engine.dispose()
 
@@ -4431,13 +4432,14 @@ async def test_bridge_md5_policy_reloads_sample_tlp_between_consume_checks_and_r
     )
     authority, _base = authorities[0]
     blob_store = _MemoryBlobStore()
-    canonical_sample_sha256 = "d" * 64
+    report_hash = uuid4().hex
+    canonical_sample_sha256 = uuid4().hex + uuid4().hex
     try:
         reference = await _seed_bridge_report_case(
             session_factory,
             investigation_id=investigation_id,
             subject_id=subject_id,
-            report_hash="c" * 32,
+            report_hash=report_hash,
             observation_source="VirusTotal",
             sample_flags={"external_llm_allowed": True},
             lineage="expected_hash",
@@ -4456,13 +4458,19 @@ async def test_bridge_md5_policy_reloads_sample_tlp_between_consume_checks_and_r
         report_blob_contents = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
         async with session_factory() as session:
             sample_id = await session.scalar(
-                select(SampleRow.id).where(SampleRow.expected_hash == canonical_sample_sha256)
+                select(SampleRow.id).where(
+                    SampleRow.subject_id == subject_id,
+                    SampleRow.expected_hash == canonical_sample_sha256,
+                )
             )
         assert sample_id is not None
 
-        # Keep the first sample ORM instance in the identity map across commits.
+        # Retain the ORM instance so this checks reloading across commits, not garbage collection.
         async with session_factory() as session:
             async with session.begin():
+                held_sample = await session.get(SampleRow, sample_id)
+                assert held_sample is not None
+                assert held_sample.tlp == "CLEAR"
                 await store._check_source_restrictions(
                     session,
                     authority,
@@ -4477,6 +4485,8 @@ async def test_bridge_md5_policy_reloads_sample_tlp_between_consume_checks_and_r
                         update(SampleRow).where(SampleRow.id == sample_id).values(tlp="RED")
                     )
 
+            # expire_on_commit=False leaves this strongly held instance stale until refreshed.
+            assert held_sample.tlp == "CLEAR"
             for _attempt in range(2):
                 async with session.begin():
                     with pytest.raises(_ConsumeDenied) as denied:
