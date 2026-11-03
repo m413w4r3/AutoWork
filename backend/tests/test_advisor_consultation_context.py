@@ -461,22 +461,32 @@ async def test_m12_q_reservation_and_execution_characterization(
     }
     print(json.dumps(report, sort_keys=True))
 
-    assert reservation_prompts == []
+    assert len(reservation_prompts) == 1
     assert len(execution_prompts) == 1
-    assert reservation_builds == []
-    expected = BASELINE_EXECUTION[consultation_type]
+    assert reservation_prompts == execution_prompts
+    assert len(reservation_builds) == 1
     assert len(execution_builds) == 1
-    assert execution_builds[0]["dossier_sha256"] == expected["dossier_sha256"]
-    assert execution_builds[0]["manifest_refs_sha256"] == expected["manifest_refs_sha256"]
-    assert execution_prompts[0]["prompt_sha256"] == expected["prompt_sha256"]
-    assert execution_counts["calls"].get("sample_associations.list_for_investigation") == 2
-    assert execution_counts["calls"].get("samples.list_for_subject") == 2
+    assert reservation_builds == execution_builds
+    assert "content_base64:" not in transport.calls[0]["prompt"]
+    assert (
+        "content_omission_reason=whole_sample_not_needed_for_consultation"
+        in (transport.calls[0]["prompt"])
+    )
+    # The final pre-send sample-policy recheck reloads associations after
+    # preparation, response lookup, and pacing.
+    expected_association_reads = 3
+    assert (
+        execution_counts["calls"].get("sample_associations.list_for_investigation")
+        == expected_association_reads
+    )
+    assert execution_counts["calls"].get("samples.list_for_subject") == expected_association_reads
     assert reservation_counts["calls"].get("sample_associations.list_for_investigation") == 1
-    assert execution_counts["association_sql_queries"] == 6
+    assert execution_counts["association_sql_queries"] == 3 * expected_association_reads
     assert reservation_counts["association_sql_queries"] == 3
     assert execution_counts["max_observation_blob_reads"] <= 1
     assert execution_counts["observation_blob_reads"] <= len(counter.observation_blob_ids)
-    assert reservation_counts["blob_reads"] == 0
+    assert reservation_counts["blob_reads"] == len(counter.observation_blob_ids)
+    assert reservation_counts["bytes_read"] == execution_counts["bytes_read"]
     assert result.output["durations_ms"]["reservation_cost_ms"] >= 0
     diagnostics = result.output["diagnostics"]
     assert diagnostics["repo_calls"] > 0
@@ -525,24 +535,26 @@ async def test_reservation_estimate_covers_measured_prompt(
         budget=budget,
         envelope=replace(estimate_context.envelope, budget=budget),
     )
-    await tool.execute(arguments, context)
+    result = await tool.execute(arguments, context)
 
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 1, result.output
     prompt_bytes = len(transport.calls[0]["prompt"].encode("utf-8"))
     actual_tokens = (prompt_bytes + 3) // 4
     reserved_bytes = reserved[BudgetDimension.CONTEXT_BYTES]
     reserved_tokens = reserved[BudgetDimension.CONTEXT_TOKENS]
-    ratio = reserved_bytes / prompt_bytes
     print(
-        f"reservation_ratio type={consultation_type} sample_content={include_sample_content} "
-        f"ratio={ratio:.4f} reserved_bytes={reserved_bytes} actual_bytes={prompt_bytes}"
+        f"reservation_selection type={consultation_type} sample_content={include_sample_content} "
+        f"estimated_bytes={reserved_bytes} actual_bytes={prompt_bytes}"
     )
-    assert reserved_bytes >= prompt_bytes
-    assert reserved_tokens >= actual_tokens
-    if include_sample_content and consultation_type in {
-        "yara_draft",
-        "pivot_strategy",
-        "plan_investigation",
-    }:
-        assert "content_status=verified" in transport.calls[0]["prompt"]
-        assert ratio <= 1.35
+    prompt = transport.calls[0]["prompt"]
+    assert "content_base64:" not in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert reserved_bytes < SAMPLE_BYTES * 2
+    assert reserved_tokens < SAMPLE_BYTES // 2
+    reservation = next(
+        item for item in context.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == actual_tokens
+    assert result.budget_consumed[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert result.budget_consumed[BudgetDimension.CONTEXT_TOKENS] == actual_tokens

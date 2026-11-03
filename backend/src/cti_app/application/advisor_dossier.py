@@ -710,7 +710,9 @@ def build_advisor_dossier(
         blob_id = _as_text(sample.get("blob_id"))
         byte_length = sample.get("byte_length")
         mime_type = _as_text(sample.get("mime_type"))
-        content = _as_text(sample.get("content_base64"))
+        content = (
+            _as_text(sample.get("content_base64")) if sample.get("range_verified") is True else ""
+        )
         fragment_length = sample.get("fragment_length", byte_length)
         omitted_range = _as_text(sample.get("omitted_range"))
         lines = [
@@ -720,10 +722,10 @@ def build_advisor_dossier(
             f"blob_id={blob_id}",
             f"blob_sha256={_as_text(sample.get('blob_sha256'))}",
             f"sha256={sample_sha256}",
+            f"sample_sha256={sample_sha256}",
             f"expected_hash={_as_text(sample.get('expected_hash'))}",
             f"source_object_id={_as_text(sample.get('source_object_id'))}",
-            f"encoding=base64; byte_length={byte_length}; offset=0; "
-            f"length={fragment_length}; mime_type={mime_type}",
+            f"byte_length={byte_length}; mime_type={mime_type}",
             f"association_status={_as_text(sample.get('association_status'))}",
             f"content_status={_as_text(sample.get('content_status'))}",
             f"state={_as_text(sample.get('state'))}",
@@ -733,6 +735,8 @@ def build_advisor_dossier(
             f"tlp={_as_text(sample.get('tlp'))}",
             f"external_llm_allowed={str(sample.get('external_llm_allowed')).lower()}",
         ]
+        if sample.get("covers_whole_sample") is True:
+            lines.append("covers_whole_sample=true")
         evidence_ids = sample.get("evidence_ids")
         if isinstance(evidence_ids, (list, tuple)):
             lines.append("evidence_ids=" + ",".join(_as_text(item) for item in evidence_ids))
@@ -761,12 +765,21 @@ def build_advisor_dossier(
                 )
             )
         if content:
-            lines.extend(["encoding=base64", "content_base64:", content])
+            lines.extend(
+                [
+                    f"encoding=base64; offset={sample.get('offset', 0)}; length={fragment_length}",
+                    "content_base64:",
+                    content,
+                ]
+            )
         if omitted_range:
             lines.append(f"omitted_range={omitted_range}")
         omission_reason = sample.get("content_omission_reason")
         if isinstance(omission_reason, str) and omission_reason:
             lines.append(f"content_omission_reason={omission_reason}")
+        request_hint = sample.get("content_request_hint")
+        if isinstance(request_hint, str) and request_hint:
+            lines.append(f"content_request_hint={request_hint}")
         body = "\n".join(lines)
         candidates.append(
             _candidate(
@@ -790,9 +803,15 @@ def build_advisor_dossier(
                     "mime_type": mime_type,
                     "encoding": "base64",
                     "fragment_sha256": _as_text(sample.get("fragment_sha256")),
+                    **(
+                        {"covers_whole_sample": True}
+                        if sample.get("covers_whole_sample") is True
+                        else {}
+                    ),
                     "omitted_range": omitted_range,
                     "content_status": _as_text(sample.get("content_status")),
                     "content_omission_reason": _as_text(omission_reason),
+                    "content_request_hint": _as_text(request_hint),
                 },
                 body_occurrences=_body_occurrences_for_content(
                     body, content, sample_id or association_id
@@ -907,6 +926,11 @@ def build_advisor_dossier(
             )
 
     evidence_rows = [item for item in prompt_data.get("evidence", ()) if isinstance(item, Mapping)]
+    sample_backed_evidence_ids = {
+        _as_text(item.get("evidence_id"))
+        for item in evidence_rows
+        if _as_text(item.get("evidence_id")) and _observation_is_sample_backed(item)
+    }
     for item in evidence_rows:
         identifier = _as_text(item.get("evidence_id"))
         excerpts = [row for row in item.get("content_excerpts", ()) if isinstance(row, Mapping)]
@@ -923,24 +947,39 @@ def build_advisor_dossier(
         pieces: list[str] = []
         piece_contents: list[tuple[int, str, str, str]] = []
         explicitly_referenced_observation = ("observation", identifier) in explicitly_referenced
+        sample_backed = _observation_is_sample_backed(item)
         label = _human_evidence_label(item, excerpts)
-        row_score = _relevance_score(task_terms, label)
-        if _as_text(item.get("source")).casefold().startswith(("virustotal.", "vt.")):
-            # Include current VT reports in the consultation dossier even when the
-            # question says only "VT" and the provider name does not tokenize as
-            # a lexical match.
-            row_score = max(row_score, 1)
+        source = _as_text(item.get("source")).casefold()
+        requested_source_families = (
+            ("virustotal", r"(?i)\b(?:vt|virustotal)\b", ("virustotal.", "vt.")),
+            ("floss", r"(?i)\bfloss\b", ("autowork.floss", "floss.")),
+            ("capa", r"(?i)\bcapa\b", ("capa.",)),
+            ("ilspy", r"(?i)\bilspy\b", ("dotnet.ilspycmd", "ilspy.")),
+            ("network", r"(?i)\b(?:network|dns|tls|capture)\b", ("network.",)),
+        )
+        provider_relevant = any(
+            re.search(request_pattern, relevance_text) is not None
+            and source.startswith(source_prefixes)
+            for _, request_pattern, source_prefixes in requested_source_families
+        )
+        row_score = max(_relevance_score(task_terms, label), 1 if provider_relevant else 0)
+        omitted_sample_measurement = False
         for excerpt in excerpts:
+            if sample_backed and _is_byte_excerpt(excerpt):
+                continue
             body = _as_text(excerpt.get("text"))
             title = _as_text(excerpt.get("title")) or "Extrait"
             score = _relevance_score(task_terms, _excerpt_relevance_text(excerpt))
-            if score > 0 or explicitly_referenced_observation:
+            if body and (score > 0 or explicitly_referenced_observation or provider_relevant):
                 quoted_body = _quote(body)
                 pieces.append(f"{title}:\n{quoted_body}")
-                if body:
-                    piece_contents.append((len(pieces) - 1, quoted_body, body, identifier))
+                piece_contents.append((len(pieces) - 1, quoted_body, body, identifier))
                 row_score = max(row_score, score, 1 if explicitly_referenced_observation else 0)
         for fact in (*measurement_rows, *typed_measurements):
+            if fact.get("sample_sha256"):
+                if fact.get("range_verified") is not True:
+                    omitted_sample_measurement = True
+                continue
             raw_value = fact.get("sample_material", fact.get("value"))
             value = _as_text(raw_value)
             if not value or value in {"…", "..."}:
@@ -984,6 +1023,9 @@ def build_advisor_dossier(
             is_byte_fragment = byte_encoding in {"hex", "hexdump", "base64", "bytes"} or (
                 kind.casefold() in {"hex", "hexdump", "base64", "bytes"}
             )
+            if sample_backed and is_byte_fragment and fact.get("range_verified") is not True:
+                omitted_sample_measurement = True
+                continue
             provenance = []
             if is_byte_fragment and byte_encoding:
                 provenance.append(f"encoding={byte_encoding}")
@@ -1012,19 +1054,23 @@ def build_advisor_dossier(
             score = _relevance_score(task_terms, fact_text)
             if _numeric_targets_conflict(relevance_text, fact_text):
                 score = 0
-            if score > 0 or explicitly_referenced_observation:
+            if score > 0:
                 pieces.append(f"Mesure observée: {fact_text}")
                 piece_contents.append((len(pieces) - 1, value, value, identifier))
                 row_score = max(row_score, score, 1)
-        if (explicitly_referenced_observation or row_score > 0) and not pieces and excerpts:
-            best = max(
-                excerpts, key=lambda row: _relevance_score(task_terms, _as_text(row.get("text")))
+        if omitted_sample_measurement:
+            pieces.append(
+                "Contenu omis: sample_range_not_verified_against_canonical_blob\n"
+                "Sélectionner une mesure vérifiée avec blob_id, type, offset et longueur; "
+                "la plage doit correspondre aux octets canoniques."
             )
-            best_body = _as_text(best.get("text"))
-            quoted_body = _quote(best_body)
-            pieces.append(f"{_as_text(best.get('title')) or 'Extrait'}:\n{quoted_body}")
-            if best_body:
-                piece_contents.append((len(pieces) - 1, quoted_body, best_body, identifier))
+        omission_reason = _as_text(item.get("content_omission_reason"))
+        request_hint = _as_text(item.get("content_request_hint"))
+        if pieces and omission_reason:
+            omission_note = f"Contenu omis: {omission_reason}"
+            if request_hint:
+                omission_note += f"\n{request_hint}"
+            pieces.append(omission_note)
         if pieces:
             candidates.append(
                 _candidate(
@@ -1043,12 +1089,59 @@ def build_advisor_dossier(
                             "id": identifier,
                             "sha256": _as_text(item.get("sha256")),
                         },
+                        **({"content_omission_reason": omission_reason} if omission_reason else {}),
                     },
                     body_occurrences=_joined_body_occurrences(pieces, piece_contents),
                 )
             )
-        elif ("observation", identifier) in explicitly_referenced:
-            unavailable_observations.add(identifier)
+        else:
+            omission_reason = _as_text(item.get("content_omission_reason")) or (
+                "sample_bytes_not_included_without_targeted_range"
+                if _observation_is_sample_backed(item)
+                else (
+                    "Canonical content was omitted by task relevance selection; this does not "
+                    "establish semantic irrelevance because relevance to the question was not "
+                    "verified."
+                )
+            )
+            request_hint = _as_text(item.get("content_request_hint")) or (
+                "Select a verified measurement by blob_id, kind, offset, and value; its canonical "
+                "length must match the sample bytes."
+                if _observation_is_sample_backed(item)
+                else ""
+            )
+            body = "\n".join(
+                part
+                for part in (
+                    f"evidence_id={identifier}",
+                    f"sha256={_as_text(item.get('sha256'))}",
+                    f"source={_as_text(item.get('source'))}",
+                    f"object_type={_as_text(item.get('object_type'))}",
+                    f"content_omission_reason={omission_reason}",
+                    f"content_request_hint={request_hint}" if request_hint else "",
+                )
+                if part
+            )
+            candidates.append(
+                _candidate(
+                    kind="observation",
+                    identifier=identifier,
+                    sha256=_as_text(item.get("sha256")),
+                    label="Référence d'observation — contenu omis",
+                    body=body,
+                    score=1 if explicitly_referenced_observation else 0,
+                    origin="observation_reference_only",
+                    extra={
+                        "source_ref": {
+                            "kind": "observation",
+                            "id": identifier,
+                            "sha256": _as_text(item.get("sha256")),
+                        },
+                        "content_omission_reason": omission_reason,
+                        **({"content_request_hint": request_hint} if request_hint else {}),
+                    },
+                )
+            )
 
     for item in prompt_data.get("findings", ()):
         if not isinstance(item, Mapping):
@@ -1129,6 +1222,61 @@ def build_advisor_dossier(
     for item in prompt_data.get("measurements", ()):
         if not isinstance(item, Mapping):
             continue
+        evidence_id = _as_text(item.get("evidence_id"))
+        is_sample_backed_measurement = bool(item.get("sample_sha256")) or (
+            evidence_id in sample_backed_evidence_ids
+        )
+        if is_sample_backed_measurement and item.get("range_verified") is not True:
+            measurement_id = _as_text(item.get("measurement_id"))
+            if measurement_id:
+                digest = hashlib.sha256(
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                omission_reason = _as_text(item.get("content_omission_reason")) or (
+                    "sample_range_not_verified_against_canonical_blob"
+                )
+                candidates.append(
+                    _candidate(
+                        kind="measurement",
+                        identifier=measurement_id,
+                        sha256=digest,
+                        label="Référence de mesure — plage omise",
+                        body="\n".join(
+                            part
+                            for part in (
+                                f"measurement_id={measurement_id}",
+                                f"evidence_id={evidence_id}",
+                                f"evidence_sha256={_as_text(item.get('evidence_sha256'))}",
+                                f"blob_id={_as_text(item.get('blob_id'))}",
+                                f"sample_sha256={_as_text(item.get('sample_sha256'))}",
+                                f"offset={item.get('offset')}",
+                                f"length={item.get('length')}",
+                                f"fragment_sha256={_as_text(item.get('fragment_sha256'))}",
+                                f"content_omission_reason={omission_reason}",
+                            )
+                            if part
+                        ),
+                        score=1 if prompt_data.get("explicit_measurement_selection") is True else 0,
+                        origin="measurement_reference_only",
+                        extra={
+                            "measurement_id": measurement_id,
+                            "evidence_id": _as_text(item.get("evidence_id")),
+                            "sample_sha256": _as_text(item.get("sample_sha256")),
+                            "offset": item.get("offset"),
+                            "length": item.get("length"),
+                            "fragment_sha256": _as_text(item.get("fragment_sha256")),
+                            "encoding": _as_text(item.get("encoding")),
+                            "range_verified": item.get("range_verified"),
+                            "content_omission_reason": omission_reason,
+                        },
+                    )
+                )
+            continue
         measurement_id = _as_text(item.get("measurement_id"))
         evidence_id = _as_text(item.get("evidence_id"))
         raw_value = item.get("value")
@@ -1154,7 +1302,8 @@ def build_advisor_dossier(
             "base64"
             if rendered_as_base64
             else declared_encoding
-            if declared_encoding in {"hex", "hexdump", "base64", "bytes"}
+            if declared_encoding
+            in {"ascii", "utf8", "utf16le", "hex", "hexdump", "base64", "bytes"}
             else kind.casefold()
             if kind.casefold() in {"hex", "base64", "bytes"}
             else ""
@@ -1174,6 +1323,8 @@ def build_advisor_dossier(
             byte_metadata.append(f"encoding={byte_encoding}")
             if type(byte_length) is int and byte_length >= 0:
                 byte_metadata.append(f"byte_length={byte_length}; length={byte_length}")
+            if item.get("covers_whole_sample") is True:
+                byte_metadata.append("covers_whole_sample=true")
             declared_fragment_sha256 = _as_text(item.get("fragment_sha256"))
             full_digest = (
                 hashlib.sha256(fragment_bytes).hexdigest()
@@ -1206,7 +1357,6 @@ def build_advisor_dossier(
         ) is True or _measurement_explicitly_targeted(item, relevance_text)
         if (
             score > 0
-            or ("observation", evidence_id) in explicitly_referenced
             or ("measurement", measurement_id) in explicitly_referenced
             or explicitly_selected_measurement
             or (
@@ -1236,10 +1386,7 @@ def build_advisor_dossier(
                     body=body,
                     score=max(
                         score,
-                        1
-                        if ("observation", evidence_id) in explicitly_referenced
-                        or ("measurement", measurement_id) in explicitly_referenced
-                        else 0,
+                        1 if ("measurement", measurement_id) in explicitly_referenced else 0,
                     ),
                     origin="typed_measurement",
                     extra={
@@ -1251,6 +1398,18 @@ def build_advisor_dossier(
                         "length": byte_length,
                         "byte_length": byte_length,
                         "encoding": byte_encoding,
+                        "fragment_sha256": _as_text(item.get("fragment_sha256"))
+                        or (
+                            hashlib.sha256(fragment_bytes).hexdigest()
+                            if fragment_bytes is not None
+                            else ""
+                        ),
+                        "range_verified": item.get("range_verified"),
+                        **(
+                            {"covers_whole_sample": True}
+                            if item.get("covers_whole_sample") is True
+                            else {}
+                        ),
                         "blob_id": item.get("blob_id"),
                         "association_id": item.get("association_id"),
                         "mime_type": item.get("mime_type", item.get("mime")),
@@ -1730,33 +1889,59 @@ def evaluate_advisor_evidence_preflight(
         for item in rows:
             identifier = _as_text(item.get(id_key))
             sha = _as_text(item.get("sha256"))
+            sample_provenance_present = False
             if kind == "observation":
                 excerpts = item.get("content_excerpts", ())
-                has_body = bool(
-                    isinstance(excerpts, (list, tuple))
-                    and any(
-                        isinstance(row, Mapping) and _as_text(row.get("text")) for row in excerpts
+                eligible_excerpts = (
+                    [
+                        row
+                        for row in excerpts
+                        if isinstance(row, Mapping)
+                        and (not _observation_is_sample_backed(item) or not _is_byte_excerpt(row))
+                    ]
+                    if isinstance(excerpts, (list, tuple))
+                    else []
+                )
+                sample_provenance_present = any(
+                    isinstance(sample, Mapping)
+                    and sample.get("verified") is True
+                    and item.get("blob_read_verified") is not False
+                    and isinstance(sample.get("evidence_ids"), (list, tuple))
+                    and identifier in {str(value) for value in sample.get("evidence_ids", ())}
+                    for sample in prompt_data.get("samples", ())
+                )
+                has_body = (
+                    bool(any(_as_text(row.get("text")) for row in eligible_excerpts))
+                    or any(
+                        isinstance(row, Mapping)
+                        and _as_text(row.get("evidence_id")) == identifier
+                        and _as_text(row.get("sample_material", row.get("value")))
+                        for row in prompt_data.get("measured_facts", ())
                     )
-                ) or any(
-                    isinstance(row, Mapping)
-                    and _as_text(row.get("evidence_id")) == identifier
-                    and _as_text(row.get("sample_material", row.get("value")))
-                    for row in prompt_data.get("measured_facts", ())
+                    or sample_provenance_present
                 )
             else:
                 has_body = bool(_as_text(item.get("line", item.get("statement"))))
             explicitly_referenced = (kind, identifier) in references
-            canonical_text = _as_text(item.get("line", item.get("statement")))
-            if kind == "observation":
-                canonical_text += " " + " ".join(
-                    _as_text(row.get("text"))
-                    for row in item.get("content_excerpts", ())
-                    if isinstance(row, Mapping)
-                )
-            dossier_selected = any(
-                row.get("kind") == kind and row.get("id") == identifier for row in dossier.manifest
+            dossier_content_selected = any(
+                row.get("kind") == kind
+                and row.get("id") == identifier
+                and row.get("origin") != "observation_reference_only"
+                for row in dossier.manifest
             )
-            relevant = _relevance_score(_terms(task), canonical_text) > 0
+            content_omission_reason = _as_text(item.get("content_omission_reason"))
+            reference_only_reason = next(
+                (
+                    _as_text(row.get("content_omission_reason"))
+                    for row in dossier.manifest
+                    if row.get("kind") == kind
+                    and row.get("id") == identifier
+                    and row.get("origin") == "observation_reference_only"
+                ),
+                "",
+            )
+            omission_reason = content_omission_reason or reference_only_reason
+            sample_content_omitted = omission_reason.startswith(("sample_", "subject_sample_"))
             selected_for_type = (
                 consultation_type
                 in {
@@ -1766,13 +1951,20 @@ def evaluate_advisor_evidence_preflight(
                     "figure_plan",
                 }
                 and has_body
-                and (dossier_selected or relevant)
+                and dossier_content_selected
             )
             is_contradiction = item.get(
                 "assessment"
             ) == "refuted" and _finding_matches_requested_claims(item, claim_ids)
             required = (
-                explicitly_referenced
+                (
+                    explicitly_referenced
+                    and (
+                        not omission_reason
+                        or item.get("blob_read_verified") is False
+                        or not sample_content_omitted
+                    )
+                )
                 or selected_for_type
                 or (contradiction_required and kind == "finding" and is_contradiction)
             )
@@ -1784,7 +1976,9 @@ def evaluate_advisor_evidence_preflight(
                 has_body,
                 required,
                 "Explicitly referenced by the question or target."
-                if explicitly_referenced
+                if explicitly_referenced and not omission_reason
+                else omission_reason
+                if content_omission_reason
                 else "Canonical proof selected for this consultation type."
                 if selected_for_type
                 else "Refuted finding is required to represent the requested contradiction."
@@ -1803,6 +1997,7 @@ def evaluate_advisor_evidence_preflight(
                     and bool(re.fullmatch(r"[0-9a-f]{64}", sha))
                     and item.get("blob_read_verified") is True
                 ),
+                content_omission_reason=content_omission_reason or reference_only_reason,
             )
 
     for item in prompt_data.get("_disclosure_omissions", ()):
@@ -1889,12 +2084,18 @@ def evaluate_advisor_evidence_preflight(
             "explicit_measurement_selection"
         ) is True or _measurement_explicitly_targeted(item, task)
         selected_in_dossier = any(
-            row.get("kind") == "measurement" and row.get("id") == identifier
+            row.get("kind") == "measurement"
+            and row.get("id") == identifier
+            and row.get("origin") != "measurement_reference_only"
             for row in dossier.manifest
         )
         type_requires_measurements = consultation_type in {"yara_draft", "pivot_strategy"}
-        required = ("measurement", identifier) in references or (
-            type_requires_measurements and (explicitly_selected or selected_in_dossier)
+        sample_range_verified = (
+            not _as_text(item.get("sample_sha256")) or item.get("range_verified") is True
+        )
+        required = sample_range_verified and (
+            ("measurement", identifier) in references
+            or (type_requires_measurements and (explicitly_selected or selected_in_dossier))
         )
         digest = hashlib.sha256(
             json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
@@ -1913,9 +2114,11 @@ def evaluate_advisor_evidence_preflight(
             identifier,
             digest,
             {"kind": "measurement", "id": identifier, "sha256": digest},
-            bool(_as_text(item.get("value"))),
+            bool(_as_text(item.get("value"))) and sample_range_verified,
             required,
-            "Measurement is explicitly selected by the invocation or named in the question."
+            _as_text(item.get("content_omission_reason"))
+            if item.get("range_verified") is False
+            else "Measurement is explicitly selected by the invocation or named in the question."
             if explicitly_selected
             else "Measurement was selected for this consultation."
             if required
@@ -2218,7 +2421,20 @@ def evaluate_advisor_evidence_preflight(
                 or (item["kind"] == "fact" and row.get("fact_id") == item["id"])
             )
             and (not item.get("claim_id") or row.get("claim_id") == item.get("claim_id"))
+            and not (
+                item["kind"] == "observation" and row.get("origin") == "observation_reference_only"
+            )
         ]
+        if item["kind"] == "observation":
+            matches.extend(
+                row
+                for row in dossier_rows
+                if row.get("kind") == "sample"
+                and item.get("blob_read_verified") is not False
+                and isinstance(row.get("evidence_ids"), (list, tuple))
+                and item["id"] in {str(value) for value in row.get("evidence_ids", ())}
+                and row not in matches
+            )
         statuses: list[dict[str, str]] = []
 
         def mark(
@@ -2236,6 +2452,11 @@ def evaluate_advisor_evidence_preflight(
             mark(AdvisorEvidenceStatus.REQUIRED, item["reason"])
         elif item.get("informational"):
             mark(AdvisorEvidenceStatus.INFORMATIONAL, item["reason"])
+        if item.get("content_omission_reason"):
+            mark(
+                AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
+                _as_text(item.get("content_omission_reason")),
+            )
         verified = item.get("verified", True)
         if policy_omission:
             pass
@@ -2746,7 +2967,6 @@ def _explicit_reference_ids(data: Mapping[str, Any]) -> list[tuple[str, str]]:
                     result.append(row)
     for key, kind in (
         ("evidence_refs", "observation"),
-        ("observation_refs", "observation"),
         ("finding_refs", "finding"),
     ):
         for raw_id in data.get(key, ()):
@@ -2874,6 +3094,32 @@ def _excerpt_relevance_text(excerpt: Mapping[str, Any]) -> str:
     return f"{title} {body}"
 
 
+def _is_byte_excerpt(excerpt: Mapping[str, Any]) -> bool:
+    return _as_text(excerpt.get("kind")).casefold() in {"hex", "hexdump", "base64", "bytes"}
+
+
+def _observation_is_sample_backed(item: Mapping[str, Any]) -> bool:
+    if (
+        _as_text(item.get("source")).casefold() in {"virustotal", "vt"}
+        and _as_text(item.get("object_type")).casefold() == "file"
+    ):
+        return True
+    if _as_text(item.get("sample_sha256")):
+        return True
+    omission_reason = _as_text(item.get("content_omission_reason"))
+    if omission_reason.startswith(("sample_", "subject_sample_")):
+        return True
+    excerpts = item.get("content_excerpts", ())
+    if not isinstance(excerpts, (list, tuple)):
+        return False
+    return any(
+        isinstance(excerpt, Mapping)
+        and excerpt.get("kind") == "metadata"
+        and _as_text(excerpt.get("text")).casefold().startswith("sample_sha256=")
+        for excerpt in excerpts
+    )
+
+
 def _numeric_targets_conflict(task: str, candidate: str) -> bool:
     requested = set(re.findall(r"\b\d{3,}\b", task))
     actual = set(re.findall(r"\b\d{3,}\b", candidate))
@@ -2881,6 +3127,16 @@ def _numeric_targets_conflict(task: str, candidate: str) -> bool:
 
 
 def _measurement_explicitly_targeted(measurement: Mapping[str, Any], task: str) -> bool:
+    if re.search(
+        r"\b(?:all|every|each|tous?|toutes|chaque)\b.{0,64}\b(?:verified|measured|measurements?|mesures?)\b",
+        task,
+        re.IGNORECASE,
+    ) or re.search(
+        r"\b(?:verified|measured|measurements?|mesures?)\b.{0,64}\b(?:all|every|each|tous?|toutes|chaque)\b",
+        task,
+        re.IGNORECASE,
+    ):
+        return True
     measurement_id = _as_text(measurement.get("measurement_id"))
     if measurement_id and re.search(
         rf"(?<![\w]){re.escape(measurement_id)}(?![\w])", task, re.IGNORECASE

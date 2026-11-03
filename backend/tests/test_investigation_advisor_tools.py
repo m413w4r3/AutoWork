@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import re
+import tracemalloc
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -21,6 +23,7 @@ from cti_app.application.advisor_contracts import (
     extract_json_object,
     parse_typed_advisor_response,
 )
+from cti_app.application.advisor_dossier import build_advisor_dossier
 from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
@@ -53,7 +56,9 @@ from cti_app.domain.analyst_opinion import (
     ImplantMaterialType,
     OpinionBlockType,
 )
+from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.classification import TLP
+from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -72,6 +77,7 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     thaw_json,
 )
+from cti_app.infrastructure.blob_storage.common import CHUNK_SIZE, read_verified_range
 
 
 class Transport:
@@ -126,6 +132,10 @@ class ArtifactStore:
         assert len(value) <= max_bytes
         return value
 
+    async def read_verified_range(self, blob_id, *, offset, length):
+        value = self.values[blob_id]
+        return value[offset : offset + length]
+
     async def put_canonical_json(self, payload, *, bucket):
         raw = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -143,6 +153,30 @@ class ArtifactStore:
         blob_id = uuid4()
         self.values[blob_id] = bytes(value)
         return blob_id
+
+
+class _GeneratedBlobReader:
+    def __init__(self, size: int, fill: bytes = b"G") -> None:
+        self.remaining = size
+        self.fill = fill
+        self.max_chunk_size = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk_size = min(size, self.remaining)
+        self.max_chunk_size = max(self.max_chunk_size, chunk_size)
+        self.remaining -= chunk_size
+        return self.fill * chunk_size
+
+
+def _generated_blob_sha256(size: int, fill: bytes = b"G") -> str:
+    digest = hashlib.sha256()
+    chunk = fill * CHUNK_SIZE
+    remaining = size
+    while remaining:
+        part_size = min(remaining, CHUNK_SIZE)
+        digest.update(chunk[:part_size])
+        remaining -= part_size
+    return digest.hexdigest()
 
 
 class BlobRepository:
@@ -1703,7 +1737,17 @@ async def test_args_hint_is_normalized_against_recommended_tool_schema(
 @pytest.mark.asyncio
 async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> None:
     investigation_id = uuid4()
-    sample_sha256 = "b" * 64
+    sample_content = bytearray(0xC0)
+    fragments = (
+        (0x80, b"CreateMutexW"),
+        (0x90, bytes.fromhex("41424344")),
+        (0x98, "WideMarker".encode("utf-16le")),
+        (0xB0, base64.b64decode("QmFzZTY0TWVhc3VyZQ==")),
+    )
+    for offset, fragment in fragments:
+        sample_content[offset : offset + len(fragment)] = fragment
+    sample_content = bytes(sample_content)
+    sample_sha256 = hashlib.sha256(sample_content).hexdigest()
     measured = {
         "schema": "sample-obfuscated-strings.v1",
         "sample_sha256": sample_sha256,
@@ -1713,7 +1757,7 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
         ],
         "hex": [{"value": "41424344", "offset": 0x90}],
         "wide": [{"value": "WideMarker", "offset": 0x98}],
-        "base64": [{"value": "QmFzZTY0TWVhc3VyZQ==", "offset": 0xA0}],
+        "base64": [{"value": "QmFzZTY0TWVhc3VyZQ==", "offset": 0xB0}],
     }
     observation, raw = make_observation(investigation_id, measured)
     rule_source = 'rule Candidate { strings: $mutex = "CreateMutexW" condition: $mutex }'
@@ -1798,7 +1842,13 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
             ),
         )
     )
-    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
     valid_measurements = [
         {
             "blob_id": str(sample_blob_id),
@@ -1821,7 +1871,7 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
         {
             "blob_id": str(sample_blob_id),
             "kind": "base64",
-            "offset": 0xA0,
+            "offset": 0xB0,
             "value": "QmFzZTY0TWVhc3VyZQ==",
         },
     ]
@@ -1829,6 +1879,7 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
     invalid = await tool.execute(
         {
             "consultation_type": "yara_draft",
+            "question": "Use CreateMutexW at offset 128 in the candidate.",
             "evidence_refs": [str(observation.id)],
             "measurements": [
                 {
@@ -1841,7 +1892,7 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
         },
         make_context(investigation_id, key="operator:advisor:invalid-measurement"),
     )
-    assert invalid.status is ToolInvocationStatus.SUCCEEDED
+    assert invalid.status is ToolInvocationStatus.SUCCEEDED, dict(invalid.output)
     assert len(transport.calls) == 1
     assert "sélection facultative ignorée" in transport.calls[0]["prompt"]
     assert all(
@@ -1861,7 +1912,12 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.SUCCEEDED, dict(result.output)
+    assert result.status is ToolInvocationStatus.SUCCEEDED, (
+        dict(result.output),
+        typed_prompt_payload(transport.calls[-1]["prompt"])["measurements"]
+        if transport.calls
+        else (),
+    )
     prompt = transport.calls[-1]["prompt"]
     assert "The first canonical passage describes the measured mutex marker." in prompt
     assert "The second canonical passage records the associated loader behavior." in prompt
@@ -2239,7 +2295,7 @@ async def test_pivot_strategy_persists_only_observation_validated_recommendation
         if item.source == "advisor.consult"
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=32 * 1024)
     )
     assert persisted["input_observation_refs"] == [str(observation.id)]
     persisted_suggestion = persisted["output"]["recommended_next_tools"][0]
@@ -2915,7 +2971,7 @@ async def _submit_preservation_observation(payload, *, question: str, key: str):
 
     # Transport is the in-process fake above; no real network transport is configured.
     assert transport.real_network_calls == 0
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 1, dict(result.output)
     assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
     provenance = result.output["bridge_provenance"]
     assert provenance["preflight_status"] == "READY"
@@ -3045,7 +3101,7 @@ async def test_two_independent_300_byte_base64_values_reach_fake_transport() -> 
 
 
 @pytest.mark.asyncio
-async def test_large_legacy_hex_and_base64_measurements_reach_fake_transport() -> None:
+async def test_large_legacy_sample_measurements_are_provenance_only() -> None:
     investigation_id = uuid4()
     sample_sha256 = "a" * 64
     hex_value = "41" * 600
@@ -3095,12 +3151,12 @@ async def test_large_legacy_hex_and_base64_measurements_reach_fake_transport() -
     assert len(transport.calls) == 1
     assert transport.real_network_calls == 0
     assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-    measurements = typed_prompt_payload(transport.calls[0]["prompt"])["measurements"]
-    by_kind = {item["kind"]: item for item in measurements}
-    assert by_kind["hex"]["value"] == hex_value
-    assert by_kind["hex"]["offset"] == 128
-    assert by_kind["base64"]["value"] == base64_value
-    assert by_kind["base64"]["offset"] == 256
+    prompt = transport.calls[0]["prompt"]
+    assert hex_value not in prompt
+    assert base64_value not in prompt
+    assert f"sha256={sample_sha256}" in prompt
+    assert "sample_range_not_explicitly_selected_or_task_targeted" in prompt
+    assert "Select a verified measurement by blob_id, kind, offset, and value" in prompt
 
 
 @pytest.mark.asyncio
@@ -3485,7 +3541,7 @@ async def test_nested_sample_hash_with_license_restriction_refuses_before_bridge
 
 
 @pytest.mark.asyncio
-async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
+async def test_unrestricted_sample_measurement_is_omitted_without_targeted_range() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     value = "41" * 600
@@ -3523,7 +3579,18 @@ async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
     )
 
     assert len(transport.calls) == 1
-    assert value in transport.calls[0]["prompt"]
+    assert value not in transport.calls[0]["prompt"]
+    assert any(
+        reason in transport.calls[0]["prompt"]
+        for reason in (
+            "whole_sample_not_needed_for_consultation",
+            "sample_range_not_explicitly_selected_or_task_targeted",
+        )
+    )
+    assert (
+        "Select a verified measurement by blob_id, kind, offset, and value"
+        in transport.calls[0]["prompt"]
+    )
     assert result.output["bridge_provenance"]["preflight_status"] == "READY"
 
 
@@ -3635,13 +3702,6 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
     prompt = transport.calls[0]["prompt"]
     expected_bytes_label = f"encoding=base64; byte_length={len(raw_sample)}; sha256={sample_sha256}"
     for required in (
-        base64_content,
-        raw_sample.hex(),
-        expected_bytes_label,
-        "offset 37",
-        "offset 38",
-        "offset 91",
-        f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}",
         "status=clean",
         "analysis_status=malicious",
         "EngineAlpha",
@@ -3662,26 +3722,31 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         "external_llm_allowed=true",
     ):
         assert required in prompt
-    assert attacker_token in base64.b64decode(base64_content).decode("latin-1")
-    assert result.output["bridge_provenance"]["redacted_secret_count"] == 0
+    for omitted in (base64_content, raw_sample.hex(), expected_bytes_label, attacker_token):
+        assert omitted not in prompt
     assert any(
-        all(
-            value in line
-            for value in (
-                f"evidence_id={observation.id}",
-                f"blob_id={observation.blob_id}",
-                f"association_id={association_id}",
-            )
+        reason in prompt
+        for reason in (
+            "sample_bytes_not_included_without_targeted_range",
+            "sample_range_not_explicitly_selected_or_task_targeted",
         )
-        for line in prompt.splitlines()
-        if "Octets observés" in line
     )
-    fragment_line = next(
-        line for line in prompt.splitlines() if "Octets observés" in line and "offset 91" in line
-    )
-    assert f"mime_type={mime_type}" in fragment_line
-    assert f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}" in fragment_line
-    assert f"; sha256={sample_sha256}" not in fragment_line
+    assert "Select a verified measurement by blob_id, kind, offset, and value" in prompt
+    assert result.output["bridge_provenance"]["redacted_secret_count"] == 0
+    for provenance in (
+        f"sample_id={sample_id}",
+        f"association_id={association_id}",
+        f"blob_id={sample_blob_id}",
+        f"sha256={sample_sha256}",
+        f"blob_sha256={sample_sha256}",
+        f"evidence_ids={observation.id}",
+        f"evidence_blob_ids={observation.blob_id}",
+        f"evidence_sha256s={observation.sha256}",
+        f"related_sample_sha256={contradictory_source_hash}",
+        f"source_object_id={contradictory_source_hash}",
+        f"length={len(raw_sample)}",
+    ):
+        assert provenance in prompt
 
 
 @pytest.mark.asyncio
@@ -3781,20 +3846,28 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
         make_context(investigation_id, key=f"operator:advisor:encoded-veto:{representation}"),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "refused"
-    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
-    assert result.output["redacted_secret_count"] == len(result.output["secret_findings"])
-    assert result.output["secret_findings"]
-    assert all(item["type"] == "encoded_credential" for item in result.output["secret_findings"])
-    assert all(item["location"].startswith("$") for item in result.output["secret_findings"])
+    if representation == "sample_blob":
+        assert len(transport.calls) == 1
+        assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+        assert material not in transport.calls[0]["prompt"]
+        assert "whole_sample_not_needed_for_consultation" in transport.calls[0]["prompt"]
+    else:
+        assert transport.calls == []
+        assert result.output["advisor_status"] == "refused"
+        assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+        assert result.output["redacted_secret_count"] == len(result.output["secret_findings"])
+        assert result.output["secret_findings"]
+        assert all(
+            item["type"] == "encoded_credential" for item in result.output["secret_findings"]
+        )
+        assert all(item["location"].startswith("$") for item in result.output["secret_findings"])
     safe_output = repr(result.output)
     assert operator_secret not in safe_output
     assert "synthetic-signed-sample-url" not in safe_output
 
 
 @pytest.mark.asyncio
-async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest_status() -> None:
+async def test_cited_downloaded_sample_bytes_keep_provenance_and_omit_whole_content() -> None:
     investigation_id = uuid4()
     sample_content = bytes(range(256)) * 40
     (
@@ -3827,12 +3900,11 @@ async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "mime_type=application/x-synthetic-sample" in prompt
-    assert "encoding=base64" in prompt
-    assert "offset=0" in prompt
-    assert "length=10240" in prompt
     assert "byte_length=10240" in prompt
-    assert "omitted_range" not in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert "content_request_hint=" in prompt
+    assert "content_base64:" not in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
     advisor_observation = next(
         item
         for item in tool._observations.observations.values()
@@ -3848,6 +3920,900 @@ async def test_cited_downloaded_sample_bytes_are_verified_and_sent_with_manifest
     )
     statuses = {row["status"] for row in item["statuses"]}
     assert {"PRESENT_IN_CANONICAL", "IN_DOSSIER", "SENT_TO_BRIDGE"} <= statuses
+
+
+@pytest.mark.asyncio
+async def test_plan_dossier_keeps_five_sample_provenances_without_sample_bytes_or_reads() -> None:
+    investigation_id = uuid4()
+    samples: list[SimpleNamespace] = []
+    associations: list[SimpleNamespace] = []
+    observations: list[EvidenceObservation] = []
+    evidence_payloads: dict[UUID, bytes] = {}
+    sample_blob_ids: set[UUID] = set()
+    sample_contents: list[bytes] = []
+
+    for index in range(5):
+        content = (
+            f"CITED_SAMPLE_SENTINEL_{index}".encode()
+            if index < 2
+            else f"INHERITED_SAMPLE_SENTINEL_{index}".encode() + bytes(range(251)) * 8_000
+        )
+        sample_hash = hashlib.sha256(content).hexdigest()
+        sample_blob_id = uuid4()
+        sample_id = uuid4()
+        association_id = uuid4()
+        sample_contents.append(content)
+        sample_blob_ids.add(sample_blob_id)
+        associations.append(
+            SimpleNamespace(
+                id=association_id,
+                sample_sha256=sample_hash,
+                qualification="confirmed",
+            )
+        )
+        samples.append(
+            SimpleNamespace(
+                id=sample_id,
+                expected_hash=sample_hash,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=sample_blob_id,
+                origin_kind="subject_seed" if index >= 2 else "source_seed",
+                original_name=f"synthetic-{index}.bin",
+                source_service="fixture",
+                tlp=TLP.GREEN,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                license_restriction=None,
+            )
+        )
+        if index < 2:
+            observation, raw = make_observation(
+                investigation_id,
+                {
+                    "schema": "virustotal-file-report.v1",
+                    "analysis_summary": (
+                        f"Cited observation {index} reports a distinct compiled marker "
+                        "for the requested investigation plan."
+                    ),
+                },
+            )
+            observation = replace(
+                observation,
+                source="VirusTotal",
+                object_type="file",
+                object_id=sample_hash,
+            )
+            observations.append(observation)
+            evidence_payloads[observation.blob_id] = raw
+        else:
+            observations.append(
+                EvidenceObservation(
+                    investigation_id=investigation_id,
+                    kind=EvidenceKind.OTHER,
+                    blob_id=sample_blob_id,
+                    sha256=sample_hash,
+                    source="investigation.subject_sample_reuse",
+                    source_version="sample-subject-reuse.v1",
+                    observed_at=datetime.now(UTC),
+                    object_type="sample",
+                    object_id=sample_hash,
+                    limitations=("The sample is quarantined and untrusted.",),
+                )
+            )
+
+    cited_refs = [str(item.id) for item in observations[:2]]
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The cited report observations support these next checks.", cited_refs
+            ),
+        )
+    )
+    tool, _unused_sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+    )
+    tool._observations = ObservationRepository(observations)
+    tool._sample_associations = _SampleAssociations([item.sample_sha256 for item in associations])
+    tool._samples = _Samples(samples)
+    for observation in observations:
+        if observation.blob_id in evidence_payloads:
+            raw = evidence_payloads[observation.blob_id]
+            tool._blobs.add(
+                observation.blob_id,
+                sha256=observation.sha256,
+                size=len(raw),
+                logical_bucket="evidence",
+            )
+            tool._artifact_store.values[observation.blob_id] = raw
+    for sample, content in zip(samples, sample_contents, strict=True):
+        tool._blobs.add(
+            sample.blob_id,
+            sha256=sample.expected_hash,
+            size=len(content),
+            logical_bucket="samples-quarantine",
+        )
+        tool._artifact_store.values[sample.blob_id] = content
+    sample_reads: list[UUID] = []
+    original_read = tool._artifact_store.read_bytes
+
+    async def track_sample_reads(blob_id, *, max_bytes):
+        if blob_id in sample_blob_ids:
+            sample_reads.append(blob_id)
+        return await original_read(blob_id, max_bytes=max_bytes)
+
+    tool._artifact_store.read_bytes = track_sample_reads
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": "Compare the cited compiled markers and propose the next verification.",
+        "evidence_refs": cited_refs,
+    }
+    operation_key = "operator:advisor:five-provenance-only-samples"
+    context = make_context(investigation_id, key=operation_key)
+    estimate = await tool.reservation_cost(arguments, context)
+    context.budget.adjust_reservation(
+        operation_key,
+        {
+            BudgetDimension.BRIDGE_TURNS: 1,
+            BudgetDimension.TOOL_SECONDS: 3_600,
+            **estimate,
+        },
+    )
+
+    result = await tool.execute(arguments, context)
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert sample_reads == []
+    for content in sample_contents:
+        assert content not in prompt.encode()
+        assert base64.b64encode(content).decode("ascii") not in prompt
+    manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    sample_rows = [item for item in manifest if item["kind"] == "sample"]
+    assert len(sample_rows) == 5
+    assert all(
+        item["content_omission_reason"] == "whole_sample_not_needed_for_consultation"
+        for item in sample_rows
+    )
+    assert all(item["sha256"] for item in sample_rows)
+    reservation = next(
+        item for item in context.budget.reservations if item.operation_key == operation_key
+    )
+    prompt_bytes = len(prompt.encode("utf-8"))
+    assert estimate[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert estimate[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+
+
+@pytest.mark.asyncio
+async def test_explicit_measurement_sends_only_blob_verified_targeted_range() -> None:
+    investigation_id = uuid4()
+    marker = b"TARGETED_RANGE_MARKER"
+    prefix = b"UNSENT_PREFIX_SENTINEL_" + b"x" * (128 - len(b"UNSENT_PREFIX_SENTINEL_"))
+    offset = len(prefix)
+    suffix = b"_UNSENT_SUFFIX_SENTINEL_"
+    sample_content = prefix + marker + suffix + b"Z" * (256 * 1024)
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [
+                {
+                    "value": marker.decode("ascii"),
+                    "offset": offset,
+                    "encoding": "ascii",
+                }
+            ],
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The selected range was verified.", [str(observation.id)]),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=sample_blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-range.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    sample_reads: list[UUID] = []
+    original_read_range = tool._artifact_store.read_verified_range
+
+    async def track_sample_reads(blob_id, *, offset, length):
+        if blob_id == sample_blob_id:
+            sample_reads.append(blob_id)
+        return await original_read_range(blob_id, offset=offset, length=length)
+
+    tool._artifact_store.read_verified_range = track_sample_reads
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": f"Review the verified measurement at offset {offset}.",
+        "evidence_refs": [str(observation.id)],
+        "measurements": [
+            {
+                "blob_id": str(sample_blob_id),
+                "kind": "string",
+                "offset": offset,
+                "value": marker.decode("ascii"),
+            }
+        ],
+    }
+    context = make_context(investigation_id, key="operator:advisor:verified-targeted-range")
+    estimate = await tool.reservation_cost(arguments, make_dispatch_context(investigation_id))
+    result = await tool.execute(arguments, context)
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert marker.decode("ascii") in prompt
+    assert "UNSENT_PREFIX_SENTINEL" not in prompt
+    assert "UNSENT_SUFFIX_SENTINEL" not in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert sample_reads == [sample_blob_id, sample_blob_id]
+    measurement = next(
+        item
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+        if item["kind"] == "measurement"
+    )
+    assert measurement["range_verified"] is True
+    assert measurement["offset"] == offset
+    assert measurement["length"] == len(marker)
+    assert "covers_whole_sample" not in measurement
+    assert measurement["fragment_sha256"] == hashlib.sha256(marker).hexdigest()
+    assert f"fragment_sha256={hashlib.sha256(marker).hexdigest()}" in prompt
+    assert "covers_whole_sample=true" not in prompt
+    prompt_bytes = len(prompt.encode("utf-8"))
+    assert estimate[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert estimate[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+
+
+@pytest.mark.asyncio
+async def test_explicit_whole_sample_measurement_is_sent_and_marked_for_audit() -> None:
+    investigation_id = uuid4()
+    sample_content = b"cfg=small"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": [{"value": sample_content.hex(), "offset": 0}],
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The requested configuration was verified.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=sample_blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-config.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": "Review the complete verified hex configuration at offset 0.",
+        "evidence_refs": [str(observation.id)],
+        "measurements": [
+            {
+                "blob_id": str(sample_blob_id),
+                "kind": "hex",
+                "encoding": "hex",
+                "offset": 0,
+                "length": len(sample_content),
+                "value": sample_content.hex(),
+            }
+        ],
+    }
+
+    result = await tool.execute(
+        arguments,
+        make_context(investigation_id, key="operator:advisor:whole-sample-range"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert sample_content.hex() in prompt
+    assert f"byte_length={len(sample_content)}" in prompt
+    assert "covers_whole_sample=true" in prompt
+    measurement = next(
+        item
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+        if item["kind"] == "measurement"
+    )
+    assert measurement["range_verified"] is True
+    assert measurement["offset"] == 0
+    assert measurement["length"] == len(sample_content)
+    assert measurement["byte_length"] == len(sample_content)
+    assert measurement["covers_whole_sample"] is True
+
+
+@pytest.mark.asyncio
+async def test_whole_sample_coverage_uses_union_and_is_order_independent() -> None:
+    investigation_id = uuid4()
+    sample_content = b"coverage"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    split = 3
+    measurement_rows = [
+        {"value": sample_content[:-1].hex(), "offset": 0},
+        {"value": sample_content[-1:].hex(), "offset": len(sample_content) - 1},
+        {"value": sample_content[:split].hex(), "offset": 0},
+        {"value": sample_content[split:].hex(), "offset": split},
+    ]
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": measurement_rows,
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    candidates = {
+        "prefix": [sample_content[:-1].hex()],
+        "last_byte": [sample_content[-1:].hex()],
+        "split": [sample_content[:split].hex(), sample_content[split:].hex()],
+    }
+
+    async def invoke(values: list[str], *, key: str):
+        transport = Transport(
+            TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text=advisor_response(
+                    "The explicitly selected ranges were verified.", [str(observation.id)]
+                ),
+            )
+        )
+        tool, _unused_blob_id = make_tool(
+            investigation_id=investigation_id,
+            transport=transport,
+            observation=observation,
+            raw=observation_raw,
+        )
+        tool._blobs.add(
+            sample_blob_id,
+            sha256=sample_hash,
+            size=len(sample_content),
+            logical_bucket="samples-quarantine",
+        )
+        tool._artifact_store.values[sample_blob_id] = sample_content
+        tool._sample_associations = SimpleNamespace(
+            list_for_investigation=async_get(
+                (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+            )
+        )
+        tool._samples = SimpleNamespace(
+            list_for_subject=async_get(
+                (
+                    SimpleNamespace(
+                        id=sample_id,
+                        expected_hash=sample_hash,
+                        source_object_id=None,
+                        state="quarantined",
+                        blob_id=sample_blob_id,
+                        origin_kind="source_seed",
+                        original_name="synthetic-coverage.bin",
+                        source_service="fixture",
+                        tlp=TLP.GREEN,
+                        do_not_submit=False,
+                        external_llm_allowed=True,
+                        license_restriction=None,
+                    ),
+                )
+            )
+        )
+        offsets = {
+            sample_content[:-1].hex(): 0,
+            sample_content[-1:].hex(): len(sample_content) - 1,
+            sample_content[:split].hex(): 0,
+            sample_content[split:].hex(): split,
+        }
+        arguments = {
+            "consultation_type": "plan_investigation",
+            "question": "Review the explicitly selected verified hex measurements.",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "hex",
+                    "offset": offsets[value],
+                    "value": value,
+                }
+                for value in values
+            ],
+        }
+        result = await tool.execute(arguments, make_context(investigation_id, key=key))
+        assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+        assert len(transport.calls) == 1
+        return transport.calls[0]["prompt"], result.output["bridge_provenance"]
+
+    prefix_prompt, prefix_provenance = await invoke(
+        candidates["prefix"], key="operator:advisor:sample-prefix-only"
+    )
+    prefix_manifest = prefix_provenance["dossier_manifest"]
+    assert "covers_whole_sample=true" not in prefix_prompt
+    assert all("covers_whole_sample" not in item for item in prefix_manifest)
+
+    last_prompt, last_provenance = await invoke(
+        candidates["last_byte"], key="operator:advisor:sample-last-byte-only"
+    )
+    last_manifest = last_provenance["dossier_manifest"]
+    assert "covers_whole_sample=true" not in last_prompt
+    assert all("covers_whole_sample" not in item for item in last_manifest)
+
+    split_prompt, split_provenance = await invoke(
+        candidates["split"], key="operator:advisor:sample-split-forward"
+    )
+    _reverse_prompt, reverse_provenance = await invoke(
+        list(reversed(candidates["split"])), key="operator:advisor:sample-split-reverse"
+    )
+    assert sample_content[:split].hex() in split_prompt
+    assert sample_content[split:].hex() in split_prompt
+    assert "covers_whole_sample=true" in split_prompt
+    assert split_provenance["dossier_sha256"] == reverse_provenance["dossier_sha256"]
+    for provenance in (split_provenance, reverse_provenance):
+        manifest = provenance["dossier_manifest"]
+        sample_manifest = next(item for item in manifest if item["kind"] == "sample")
+        assert sample_manifest["covers_whole_sample"] is True
+        assert sample_manifest["byte_length"] == len(sample_content)
+        measurements = [
+            item
+            for item in manifest
+            if item["kind"] == "measurement" and item.get("range_verified") is True
+        ]
+        assert len(measurements) == 2
+        assert all(item["covers_whole_sample"] is True for item in measurements)
+        assert sorted(item["byte_length"] for item in measurements) == sorted(
+            (split, len(sample_content) - split)
+        )
+
+
+@pytest.mark.asyncio
+async def test_empty_blob_range_omission_has_observable_reason() -> None:
+    investigation_id = uuid4()
+    sample_hash = hashlib.sha256(b"").hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": sample_hash},
+    )
+    sample_blob_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("No empty range bytes were transmitted.", []),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=0,
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = b""
+    verified = await tool._verify_targeted_measurement_ranges(
+        [
+            {
+                "measurement_id": "m-empty",
+                "evidence_id": str(observation.id),
+                "evidence_sha256": observation.sha256,
+                "sample_sha256": sample_hash,
+                "blob_id": str(sample_blob_id),
+                "kind": "hex",
+                "encoding": "hex",
+                "offset": 0,
+                "length": 0,
+                "byte_length": 0,
+                "value": "",
+            }
+        ]
+    )
+    assert verified[0]["range_verified"] is False
+    assert verified[0]["content_omission_reason"] == "empty_blob_range"
+
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the explicitly selected empty range.",
+            "evidence_refs": [str(observation.id)],
+            "explicit_measurement_selection": True,
+            "evidence": [
+                {
+                    "evidence_id": str(observation.id),
+                    "sha256": observation.sha256,
+                    "sample_sha256": sample_hash,
+                    "source": "autowork.floss",
+                    "object_type": "sample",
+                    "object_id": sample_hash,
+                    "content_excerpts": [],
+                }
+            ],
+            "measurements": verified,
+            "samples": [],
+        }
+    )
+    manifest_measurement = next(item for item in dossier.manifest if item["kind"] == "measurement")
+    assert manifest_measurement["content_omission_reason"] == "empty_blob_range"
+    assert "content_omission_reason=empty_blob_range" in dossier.text
+
+
+@pytest.mark.asyncio
+async def test_corruption_outside_requested_range_fails_integrity_without_sending_range() -> None:
+    investigation_id = uuid4()
+    prefix = b"CORRUPT_OUTSIDE_RANGE_"
+    marker = b"INTEGRITY_GATED_RANGE"
+    sample_content = prefix + marker + b"_suffix"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": [{"value": marker.hex(), "offset": len(prefix)}],
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Unverified bytes were omitted.", []),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    descriptor = BlobDescriptor(
+        sha256=sample_hash,
+        size=len(sample_content),
+        mime_type="application/octet-stream",
+        logical_bucket="samples-quarantine",
+    )
+    corrupt_content = bytearray(sample_content)
+    corrupt_content[0] ^= 1
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = bytes(corrupt_content)
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=sample_blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-corrupt.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    integrity_errors: list[BlobIntegrityError] = []
+    original_read_range = tool._artifact_store.read_verified_range
+
+    async def read_corrupt_range(blob_id, *, offset, length):
+        if blob_id != sample_blob_id:
+            return await original_read_range(blob_id, offset=offset, length=length)
+        try:
+            return read_verified_range(
+                io.BytesIO(bytes(corrupt_content)),
+                descriptor,
+                offset=offset,
+                length=length,
+            )
+        except BlobIntegrityError as exc:
+            integrity_errors.append(exc)
+            raise
+
+    tool._artifact_store.read_verified_range = read_corrupt_range
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Review the verified range at offset {len(prefix)}.",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "hex",
+                    "offset": len(prefix),
+                    "value": marker.hex(),
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:corrupt-outside-range"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert marker.decode("ascii") not in prompt
+    assert marker.hex() not in prompt
+    assert "content_omission_reason=sample_content_hash_mismatch" in prompt
+    assert integrity_errors and isinstance(integrity_errors[0], BlobIntegrityError)
+    manifest_measurement = next(
+        item
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+        if item["kind"] == "measurement"
+    )
+    assert manifest_measurement["range_verified"] is False
+    assert manifest_measurement["content_omission_reason"] == "sample_content_hash_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_restricted_sample_target_range_is_omitted_with_reason() -> None:
+    investigation_id = uuid4()
+    marker = b"RESTRICTED_TARGET_RANGE_SENTINEL"
+    sample_content = b"prefix:" + marker + b":suffix"
+    (
+        tool,
+        transport,
+        _download_observation,
+        _sample_id,
+        _association_id,
+        sample_blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(investigation_id, sample_content)
+    offset = len(b"prefix:")
+    measurement_observation, measurement_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [
+                {
+                    "value": marker.decode("ascii"),
+                    "offset": offset,
+                    "encoding": "ascii",
+                }
+            ],
+        },
+    )
+    measurement_observation = replace(
+        measurement_observation,
+        source="autowork.floss",
+        object_id=sample_hash,
+    )
+    tool._observations = ObservationRepository((measurement_observation,))
+    tool._blobs.add(
+        measurement_observation.blob_id,
+        sha256=measurement_observation.sha256,
+        size=len(measurement_raw),
+        logical_bucket="evidence",
+    )
+    tool._artifact_store.values[measurement_observation.blob_id] = measurement_raw
+    sample = tool._samples.samples[0]
+    original_measurement_payload = tool._measurement_payload
+
+    async def restrict_sample_after_selection(observation, **kwargs):
+        payload = await original_measurement_payload(observation, **kwargs)
+        if observation.id == measurement_observation.id:
+            sample.tlp = TLP.RED
+        return payload
+
+    tool._measurement_payload = restrict_sample_after_selection
+    transport.submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=advisor_response("The restricted range was omitted.", []),
+    )
+    context = make_context(investigation_id, key="operator:advisor:restricted-target-range")
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Review the targeted sample range at offset {offset}.",
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "sample_sha256": sample_hash,
+                    "kind": "string",
+                    "offset": offset,
+                    "length": len(marker),
+                    "value": marker.decode("ascii"),
+                }
+            ],
+        },
+        context,
+    )
+
+    prompt_candidates = [
+        value.decode("utf-8")
+        for value in tool._artifact_store.values.values()
+        if isinstance(value, bytes) and b"TYPE: plan_investigation" in value
+    ]
+    assert len(prompt_candidates) == 1
+    prepared_prompt = prompt_candidates[0]
+    assert sample_hash not in prepared_prompt
+    assert len(transport.calls) == 1, {
+        "advisor_status": result.output.get("advisor_status"),
+        "failure_stage": result.output.get("failure_stage"),
+        "failure_reason": result.output.get("failure_reason"),
+        "sample_hash_in_prompt": sample_hash in prepared_prompt,
+    }
+    prompt = transport.calls[0]["prompt"]
+    assert marker.decode("ascii") not in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert "content_omission_reason=sample_disclosure_restricted" in prompt
+    assert result.output["advisor_status"] in {"succeeded", "partial", "untrusted_response"}
+
+
+@pytest.mark.asyncio
+async def test_subject_sample_reuse_observation_content_is_not_joined() -> None:
+    investigation_id = uuid4()
+    sample_content = b'{"content":"SUBJECT_SAMPLE_REUSE_SECRET_SENTINEL"}'
+    tool, transport, observation, _sample_id, _association_id, blob_id, _sample_hash = (
+        _make_downloaded_sample_fixture(investigation_id, sample_content)
+    )
+    file_observation = replace(
+        observation,
+        source="VirusTotal",
+        object_type="file",
+        object_id=_sample_hash,
+    )
+    reuse_observation = replace(
+        observation,
+        source="investigation.subject_sample_reuse",
+        object_type="sample",
+        blob_id=blob_id,
+    )
+    tool._observations = ObservationRepository((file_observation, reuse_observation))
+    transport.submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=advisor_response("Only sample provenance was included.", []),
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Summarize the associated sample provenance.",
+            "evidence_refs": [str(file_observation.id), str(reuse_observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:subject-sample-reuse"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert "SUBJECT_SAMPLE_REUSE_SECRET_SENTINEL" not in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    assert any(item.get("kind") == "observation" for item in manifest)
+
+
+def test_verified_range_memory_is_independent_of_blob_size() -> None:
+    def read_range_and_peak(size: int) -> tuple[bytes, int, int]:
+        reader = _GeneratedBlobReader(size)
+        descriptor = BlobDescriptor(
+            sha256=_generated_blob_sha256(size),
+            size=size,
+            mime_type="application/octet-stream",
+            logical_bucket="samples-quarantine",
+        )
+        offset = size // 2
+        tracemalloc.start()
+        try:
+            fragment = read_verified_range(reader, descriptor, offset=offset, length=37)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        return fragment, peak_bytes, reader.max_chunk_size
+
+    small_fragment, small_peak, _small_max_chunk = read_range_and_peak(4 * CHUNK_SIZE)
+    large_fragment, large_peak, large_max_chunk = read_range_and_peak(96 * CHUNK_SIZE)
+
+    assert small_fragment == large_fragment == b"G" * 37
+    assert large_max_chunk <= CHUNK_SIZE
+    assert large_peak <= small_peak + 2 * CHUNK_SIZE
 
 
 @pytest.mark.asyncio
@@ -3897,8 +4863,8 @@ async def test_osint_policy_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "do_not_submit" not in prompt
-    assert "length=10240" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
     advisor_observation = next(
         item
         for item in tool._observations.observations.values()
@@ -3995,9 +4961,8 @@ async def test_human_g2_allows_cited_do_not_submit_sample_bytes() -> None:
     assert f"blob_id={blob_id}" in prompt
     assert f"sample_sha256={sample_hash}" in prompt
     assert "do_not_submit" not in prompt
-    assert "length=10240" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
 
 
 @pytest.mark.asyncio
@@ -4043,8 +5008,8 @@ async def test_human_g2_envelope_do_not_submit_allows_cited_sample_bytes() -> No
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
     assert "do_not_submit" not in prompt
-    assert "length=256" in prompt
-    assert base64.b64encode(bytes(range(256))).decode("ascii") in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert base64.b64encode(bytes(range(256))).decode("ascii") not in prompt
 
 
 @pytest.mark.asyncio
@@ -4141,16 +5106,18 @@ async def test_downloaded_sample_blob_read_failures_refuse_with_precise_reason(
         blob_id,
         _sample_hash,
     ) = _make_downloaded_sample_fixture(investigation_id, sample_content)
-    if failure == "unreadable":
-        original_read_bytes = tool._artifact_store.read_bytes
+    sample_reads: list[UUID] = []
+    original_read_bytes = tool._artifact_store.read_bytes
 
-        async def fail_sample_read(requested_blob_id, *, max_bytes):
-            if requested_blob_id == blob_id:
+    async def track_sample_read(requested_blob_id, *, max_bytes):
+        if requested_blob_id == blob_id:
+            sample_reads.append(requested_blob_id)
+            if failure == "unreadable":
                 raise OSError("synthetic quarantined blob read failure")
-            return await original_read_bytes(requested_blob_id, max_bytes=max_bytes)
+        return await original_read_bytes(requested_blob_id, max_bytes=max_bytes)
 
-        tool._artifact_store.read_bytes = fail_sample_read
-    else:
+    tool._artifact_store.read_bytes = track_sample_read
+    if failure == "mismatched_bytes":
         tool._artifact_store.values[blob_id] = bytes(reversed(sample_content))
 
     result = await tool.execute(
@@ -4162,15 +5129,14 @@ async def test_downloaded_sample_blob_read_failures_refuse_with_precise_reason(
         make_context(investigation_id, key=f"operator:advisor:raw-sample-{failure}"),
     )
 
-    assert result.status is ToolInvocationStatus.UNAVAILABLE
-    assert result.output["advisor_status"] == "technical_blocked"
-    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
-    assert result.output["failure_reason"] == "required_canonical_evidence_not_in_payload"
-    assert len(result.output["missing_refs"]) == 1
-    missing = result.output["missing_refs"][0]
-    assert str(observation.id) in missing["ref"]
-    assert missing["reason"] == expected_reason
-    assert transport.calls == []
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert sample_content.hex() not in prompt
+    assert expected_reason not in prompt
+    assert "whole_sample_not_needed_for_consultation" in prompt
+    assert "Select a verified measurement by blob_id, kind, offset, and value" in prompt
+    assert sample_reads == []
 
 
 @pytest.mark.asyncio
@@ -4219,7 +5185,7 @@ async def test_disclosure_restricted_downloaded_sample_bytes_refuse_before_bridg
 
 
 @pytest.mark.asyncio
-async def test_sample_blob_bytes_are_included_when_they_fit_the_fragment_bound() -> None:
+async def test_sample_blob_content_is_not_read_or_included_without_targeted_range() -> None:
     investigation_id = uuid4()
     sample_content = b"synthetic sample content above the configured test bound"
     sample_hash = hashlib.sha256(sample_content).hexdigest()
@@ -4300,12 +5266,13 @@ async def test_sample_blob_bytes_are_included_when_they_fit_the_fragment_bound()
 
     assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert len(transport.calls) == 1
-    assert sample_reads == [sample_blob_id]
+    assert sample_reads == []
     prompt = transport.calls[0]["prompt"]
     assert f"sample_id={sample_id}" in prompt
     assert f"association_id={association_id}" in prompt
-    assert "content_status=verified" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
+    assert "content_status=not_requested_for_consultation" in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
 
 
 @pytest.mark.asyncio
@@ -4489,10 +5456,18 @@ async def test_do_not_submit_sample_inventory_allows_linked_finding_for_bridge()
         make_context(investigation_id, key="operator:advisor:restricted-finding"),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL, result.output
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert len(transport.calls) == 1
     assert result.output["preflight_status"] == "READY"
     assert "RESTRICTED_FINDING_MARKER" in transport.calls[0]["prompt"]
+    assert "RestrictedSampleMarker" not in transport.calls[0]["prompt"]
+    assert any(
+        reason in transport.calls[0]["prompt"]
+        for reason in (
+            "sample_bytes_not_included_without_targeted_range",
+            "whole_sample_not_needed_for_consultation",
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -4565,7 +5540,11 @@ async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
 @pytest.mark.asyncio
 async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() -> None:
     investigation_id = uuid4()
-    sample_sha256 = "d" * 64
+    sample_content = bytearray(512)
+    sample_content[128 : 128 + len(b"CreateMutexW")] = b"CreateMutexW"
+    sample_content[384 : 384 + len(b"ReflectiveLoader")] = b"ReflectiveLoader"
+    sample_content = bytes(sample_content)
+    sample_sha256 = hashlib.sha256(sample_content).hexdigest()
     observation, raw = make_observation(
         investigation_id,
         {
@@ -4620,10 +5599,21 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
             ),
         )
     )
-    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
 
     result = await tool.execute(
-        {"consultation_type": "yara_draft"},
+        {
+            "consultation_type": "yara_draft",
+            "question": (
+                "Draft a rule using CreateMutexW at offset 128 and ReflectiveLoader at offset 384."
+            ),
+        },
         make_context(investigation_id, key="operator:advisor:minimal-yara"),
     )
 
@@ -4655,10 +5645,16 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
 @pytest.mark.asyncio
 async def test_yara_draft_includes_every_required_measurement_from_cited_observation() -> None:
     investigation_id = uuid4()
-    sample_sha256 = "e" * 64
-    strings = [
-        {"value": f"SyntheticMarker{index:03d}", "offset": 10_000 + index} for index in range(220)
-    ]
+    strings = []
+    sample_content = bytearray(20_000)
+    for index in range(220):
+        value = f"SyntheticMarker{index:03d}"
+        offset = 10_000 + index * 32
+        encoded_value = value.encode("ascii")
+        sample_content[offset : offset + len(encoded_value)] = encoded_value
+        strings.append({"value": value, "offset": offset})
+    sample_content = bytes(sample_content)
+    sample_sha256 = hashlib.sha256(sample_content).hexdigest()
     observation, raw = make_observation(
         investigation_id,
         {
@@ -4694,12 +5690,18 @@ async def test_yara_draft_includes_every_required_measurement_from_cited_observa
             ),
         )
     )
-    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
 
     result = await tool.execute(
         {
             "consultation_type": "yara_draft",
-            "question": "Draft a rule for offset 128 using the cited observation.",
+            "question": "Draft a rule using every verified measurement from the cited observation.",
             "evidence_refs": [str(observation.id)],
         },
         make_context(investigation_id, key="operator:advisor:all-required-measurements"),
@@ -4709,7 +5711,9 @@ async def test_yara_draft_includes_every_required_measurement_from_cited_observa
     assert result.output["bridge_provenance"]["preflight_status"] == "READY"
     dossier_manifest = result.output["bridge_provenance"]["dossier_manifest"]
     measurement_ids = {item["id"] for item in dossier_manifest if item["kind"] == "measurement"}
-    assert measurement_ids == {f"m{index:03d}" for index in range(1, 221)}
+    assert measurement_ids == {f"m{index:03d}" for index in range(1, 221)}, [
+        item for item in dossier_manifest if item["kind"] == "measurement"
+    ]
     assert result.output["bridge_provenance"]["completeness_counts"]["missing"] == 0
 
 
@@ -4756,8 +5760,10 @@ async def test_yara_measurement_source_sha_mismatch_has_precise_refusal() -> Non
         make_context(investigation_id, key="operator:advisor:yara-source-sha-mismatch"),
     )
 
-    assert transport.calls == []
-    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
+    assert transport.calls == [], dict(result.output)
+    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED", result.output.get(
+        "missing_refs"
+    )
     assert str(observation.id) in result.output["preflight_cause"]["ref"]
     assert "SHA-256 mismatch" in result.output["preflight_cause"]["reason"]
     assert "restore the canonical blob" in result.output["preflight_cause"]["reason"]
@@ -4816,7 +5822,11 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
     consultation_type,
 ) -> None:
     investigation_id = uuid4()
-    sample_sha256 = "e" * 64
+    sample_content = bytearray(512)
+    sample_content[128 : 128 + len(b"CreateMutexW")] = b"CreateMutexW"
+    sample_content[384 : 384 + len(b"ReflectiveLoader")] = b"ReflectiveLoader"
+    sample_content = bytes(sample_content)
+    sample_sha256 = hashlib.sha256(sample_content).hexdigest()
     payload: dict[str, object] = {
         "schema": "sample-obfuscated-strings.v1",
         "sample_sha256": sample_sha256,
@@ -4857,7 +5867,13 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
             ),
         )
     )
-    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
     if consultation_type == "figure_plan":
         finding = InvestigationFinding(
             investigation_id=investigation_id,
@@ -5024,7 +6040,18 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
     source, payload, consultation_type, expected_kind, expected_value, offset
 ) -> None:
     investigation_id = uuid4()
-    sample_sha256 = "e" * 64
+    sample_bytes = (
+        bytes.fromhex(expected_value) if expected_kind == "hex" else expected_value.encode("ascii")
+    )
+    sample_content = bytearray(256)
+    sample_content[offset : offset + len(sample_bytes)] = sample_bytes
+    sample_content = bytes(sample_content)
+    sample_sha256 = hashlib.sha256(sample_content).hexdigest()
+    if isinstance(payload.get("sample_sha256"), str):
+        payload["sample_sha256"] = sample_sha256
+    nested_result = payload.get("result")
+    if isinstance(nested_result, dict) and isinstance(nested_result.get("sample_sha256"), str):
+        nested_result["sample_sha256"] = sample_sha256
     observation, raw = make_observation(investigation_id, payload)
     is_local = source == "AutoWork local analysis"
     is_dotnet = source.startswith("dotnet.")
@@ -5077,7 +6104,13 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
             ),
         )
     )
-    tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
     tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = sample_mime_type
     if consultation_type == "figure_plan":
         finding = InvestigationFinding(
@@ -5154,7 +6187,9 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
 @pytest.mark.asyncio
 async def test_yara_advisor_verifies_pivot_candidate_outside_selected_evidence_refs() -> None:
     investigation_id = uuid4()
-    sample_sha256 = "e" * 64
+    measured = bytes.fromhex("ed c7 c7 cb cf c3 f0 cc 94 96 c2 93 91 92 c1 88")
+    sample_content = b"\0" * 256 + measured + b"\0" * 64
+    sample_sha256 = hashlib.sha256(sample_content).hexdigest()
     selected, selected_raw = make_observation(
         investigation_id,
         {
@@ -5163,7 +6198,6 @@ async def test_yara_advisor_verifies_pivot_candidate_outside_selected_evidence_r
             "strings": [{"value": "SyntheticSelectedEvidence", "offset": 32}],
         },
     )
-    measured = bytes.fromhex("ed c7 c7 cb cf c3 f0 cc 94 96 c2 93 91 92 c1 88")
     ascii_column = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in measured)
     dump = f"00000100: {' '.join(f'{byte:02x}' for byte in measured):<47}  {ascii_column}".encode()
     source_payload = {
@@ -5199,7 +6233,7 @@ async def test_yara_advisor_verifies_pivot_candidate_outside_selected_evidence_r
             ),
         )
     )
-    tool, _sample_blob_id = make_tool(
+    tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
         observation=selected,
@@ -5213,6 +6247,36 @@ async def test_yara_advisor_verifies_pivot_candidate_outside_selected_evidence_r
         size=len(source_raw),
         logical_bucket="evidence",
     )
+    association_id = uuid4()
+    sample_id = uuid4()
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_sha256),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_sha256,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=sample_blob_id,
+                    tlp=TLP.GREEN,
+                    external_llm_allowed=True,
+                    do_not_submit=False,
+                ),
+            )
+        )
+    )
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
     pattern_id = verify_content_pattern_candidates((source,), {str(source.id): source_payload})[
         0
     ].id
@@ -5712,9 +6776,10 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
 ) -> None:
     investigation_id = uuid4()
     observations: list[EvidenceObservation] = []
+    observation_payloads: dict[UUID, bytes] = {}
     for index in range(17):
         sample_sha256 = f"{index + 1:x}" * 64
-        observation, _raw = make_observation(
+        observation, raw = make_observation(
             investigation_id,
             {
                 "schema": "sample-obfuscated-strings.v1",
@@ -5723,6 +6788,7 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
             },
         )
         observations.append(observation)
+        observation_payloads[observation.id] = raw
     findings = tuple(
         InvestigationFinding(
             investigation_id=investigation_id,
@@ -5763,6 +6829,41 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
         raw=b"{}",
     )
     tool._observations = ObservationRepository(observations)
+    sample_rows = []
+    for item in observations:
+        raw = observation_payloads[item.id]
+        tool._artifact_store.values[item.blob_id] = raw
+        if item.blob_id not in tool._blobs.descriptors:
+            tool._blobs.add(
+                item.blob_id,
+                sha256=item.sha256,
+                size=len(raw),
+                logical_bucket="investigation-evidence",
+            )
+        else:
+            tool._blobs.descriptors[item.blob_id].descriptor.size = len(raw)
+            tool._blobs.descriptors[item.blob_id].descriptor.sha256 = item.sha256
+        sample_hash = item.object_id
+        sample_blob_id = uuid4()
+        tool._blobs.add(
+            sample_blob_id,
+            sha256=sample_hash,
+            size=1,
+            logical_bucket="samples-quarantine",
+        )
+        sample_rows.append(
+            SimpleNamespace(
+                id=uuid4(),
+                expected_hash=sample_hash,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=sample_blob_id,
+                tlp=TLP.GREEN,
+                external_llm_allowed=True,
+                do_not_submit=False,
+            )
+        )
+    tool._samples = _Samples(sample_rows)
     tool._sample_associations = _SampleAssociations(
         [f"{index + 1:x}" * 64 for index in range(len(observations))]
     )
@@ -5824,12 +6925,36 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
     )
 
     assert requested_versions == [None]
-    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    diagnostic = None
+    if result.status is not ToolInvocationStatus.SUCCEEDED:
+        missing_ref = json.loads(result.output["missing_refs"][0]["ref"])
+        diagnostic_row = next(
+            row for row in result.output["completeness_manifest"] if row["id"] == missing_ref["id"]
+        )
+        diagnostic = {
+            key: diagnostic_row.get(key)
+            for key in (
+                "id",
+                "required",
+                "body_present",
+                "content_omission_reason",
+                "blob_read_verified",
+                "reason",
+                "statuses",
+            )
+        }
+    assert result.status is ToolInvocationStatus.SUCCEEDED, diagnostic
     prompt = transport.calls[0]["prompt"]
     prompt_data = typed_prompt_payload(prompt)
-    assert len(prompt_data["evidence"]) == 17
+    assert len(prompt_data["evidence"]) == 34
+    assert (
+        sum(item.get("source") == "Échantillon CTI vérifié" for item in prompt_data["evidence"])
+        == 17
+    )
     assert len(prompt_data["findings"]) == 4
-    assert len(prompt_data["measured_facts"]) == 17
+    assert "RC4_KEY_EXAMPLE" not in prompt
+    assert "ghp_" + "a" * 36 not in prompt
+    assert not any(f"decoded implant value {index}" in prompt for index in range(1, 17))
     assert not any(item["kind"] == "opinion" for item in prompt_data["wire_ref_catalog"])
     assert all(
         re.fullmatch(r"E[1-9][0-9]*", item["ref"]) for item in prompt_data["wire_ref_catalog"]
@@ -5841,9 +6966,7 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
     assert "gaps" not in prompt_data
     assert "budget_remaining" not in prompt_data
     assert len(prompt.encode("utf-8")) == result.output["bridge_provenance"]["prompt_bytes"]
-    assert "RC4_KEY_EXAMPLE" in prompt
-    assert "RC4_KEY_EXAMPLE=0x1234" in prompt
-    assert "ghp_" + "a" * 36 in prompt
+    assert "sample_bytes_not_included_without_targeted_range" in prompt
 
     duplicate_unit = {
         "evidence_refs": [str(item.id) for item in observations],
@@ -6611,7 +7734,12 @@ async def test_draft_text_unit_assertion_refs_load_article_and_measurement_bodie
     )
     observation = None
     if reference_kind == "measurement":
-        sample_hash = "b" * 64
+        sample_content = bytearray(256)
+        sample_content[128 : 128 + len(b"SyntheticUnitMeasurementMarker")] = (
+            b"SyntheticUnitMeasurementMarker"
+        )
+        sample_content = bytes(sample_content)
+        sample_hash = hashlib.sha256(sample_content).hexdigest()
         observation, raw = make_observation(
             investigation_id,
             {
@@ -6627,6 +7755,8 @@ async def test_draft_text_unit_assertion_refs_load_article_and_measurement_bodie
             raw=raw,
         )
         _attach_sample_policy(tool, sample_blob_id, sample_hash)
+        tool._blobs.descriptors[sample_blob_id].descriptor.size = len(sample_content)
+        tool._artifact_store.values[sample_blob_id] = sample_content
         reference = {"kind": "measurement", "id": "m001"}
         expected_body = "SyntheticUnitMeasurementMarker"
     else:
@@ -6673,7 +7803,10 @@ async def test_draft_text_unit_assertion_refs_load_article_and_measurement_bodie
         ),
     )
 
-    assert len(transport.calls) == 1, result.output
+    assert len(transport.calls) == 1, (
+        result.output.get("batch_statuses"),
+        result.output.get("exception_class"),
+    )
     assert expected_body in transport.calls[0]["prompt"]
     assert result.output["batch_statuses"][0]["preflight_status"] == "READY"
     manifest = result.output["bridge_provenance"]["batches"][0]["dossier_manifest"]
@@ -7042,7 +8175,7 @@ async def test_draft_text_unrelated_finding_remains_eligible() -> None:
 
 
 @pytest.mark.asyncio
-async def test_editorial_measurements_keep_fragment_provenance_for_byte_representations(
+async def test_editorial_measurements_omit_sample_bytes_without_targeted_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cti_app.application.advisor_dossier import build_advisor_dossier
@@ -7125,19 +8258,11 @@ async def test_editorial_measurements_keep_fragment_provenance_for_byte_represen
         },
     )
 
-    assert len(measured_rows) == 4
-    for row, offset, encoding in zip(
-        measured_rows, (11, 22, 33, 44), ("hex", "base64", "base64", "base64"), strict=True
-    ):
-        assert row["offset"] == offset
-        assert row["encoding"] == encoding
-        assert row["byte_length"] == 2
-        assert row["length"] == 2
-        assert row["fragment_sha256"] == expected_digest
-        assert row["evidence_id"] == str(observation.id)
-        assert row["blob_id"] == str(sample_blob_id)
-        assert row["association_id"] == str(association_id)
-        assert row["mime_type"] == "application/x-editorial-fragment; version=2"
+    assert measured_rows == []
+    assert evidence_rows[0]["content_omission_reason"] == (
+        "sample_bytes_not_included_without_targeted_range"
+    )
+    assert "blob_id" not in evidence_rows[0]
 
     dossier = build_advisor_dossier(
         {
@@ -7146,18 +8271,13 @@ async def test_editorial_measurements_keep_fragment_provenance_for_byte_represen
             "assertions": [{"refs": [{"kind": "observation", "id": str(observation.id)}]}],
         }
     )
-    for offset, encoding in zip(
-        (11, 22, 33, 44), ("hex", "base64", "base64", "base64"), strict=True
-    ):
-        assert f"offset {offset}" in dossier.text
-        assert f"encoding={encoding}" in dossier.text
-    assert f"fragment_sha256={expected_digest}" in dossier.text
-    assert f"association_id={association_id}" in dossier.text
-    assert f"evidence_id={observation.id}" in dossier.text
-    assert f"blob_id={sample_blob_id}" in dossier.text
-    assert "byte_length=2" in dossier.text
-    assert "length=2" in dossier.text
-    assert "mime_type=application/x-editorial-fragment; version=2" in dossier.text
+    assert "offset 11" not in dossier.text
+    assert "encoding=hex" not in dossier.text
+    assert f"fragment_sha256={expected_digest}" not in dossier.text
+    assert f"association_id={association_id}" not in dossier.text
+    assert any(row["id"] == str(observation.id) for row in dossier.manifest)
+    assert "sample_bytes_not_included_without_targeted_range" in dossier.text
+    assert "Select a verified measurement by blob_id, kind, offset, and value" in dossier.text
 
 
 def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> None:
@@ -7383,8 +8503,15 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
 
 
 @pytest.mark.asyncio
-async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failure() -> None:
+async def test_reservation_refusal_lists_heaviest_dossier_items_and_exclusion_guidance() -> None:
     investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "reservation-diagnostic-fixture.v1",
+            "analysis": "Synthetic relevant observation. " * 800,
+        },
+    )
     context = make_dispatch_context(investigation_id)
     reserved = {
         BudgetDimension.BRIDGE_TURNS: 1,
@@ -7397,6 +8524,8 @@ async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failu
     tool, _sample_blob = make_tool(
         investigation_id=investigation_id,
         transport=transport,
+        observation=observation,
+        raw=raw,
     )
     registry = InMemoryToolRegistry()
     register_investigation_advisor_tool(registry, adapter=tool)
@@ -7409,8 +8538,12 @@ async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failu
         context,
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
-        arguments={"consultation_type": "plan_investigation", "evidence_refs": []},
-        purpose="Verify reservation adjustment failure is known to precede transport.",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "question": "Review the synthetic relevant observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        purpose="Verify reservation refusal lists the selected prompt's heaviest items.",
         operation_key=context.idempotency_key,
         reservation_amounts=reserved,
     )
@@ -7419,6 +8552,14 @@ async def test_reservation_adjustment_exception_is_confirmed_pre_transport_failu
     assert result.error_code == "advisor_context_reservation_mismatch"
     assert result.output["failure_stage"] == "g2_context_reservation"
     assert result.output["confirmed_non_execution"] is True
+    assert result.output["heaviest_items"]
+    heaviest = result.output["heaviest_items"][0]
+    assert heaviest["id"] == str(observation.id)
+    assert heaviest["size_bytes"] > 0
+    assert heaviest["origin"] == "observation_content"
+    assert "evidence_refs" in result.output["exclusion_guidance"]
+    assert str(observation.id) in result.message
+    assert "bytes" in result.message
     assert result.framework_pre_submission_proof is (
         FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
     )
@@ -8449,7 +9590,7 @@ async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> No
 
 
 @pytest.mark.asyncio
-async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> None:
+async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> None:
     from tests.test_investigation_service import _Fixture
 
     fixture = _Fixture(responses=[], tools=())
@@ -8571,14 +9712,19 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     estimated_tokens = estimated_cost[BudgetDimension.CONTEXT_TOKENS]
     current_envelope = await fixture.envelopes.get(investigation_id)
     assert current_envelope is not None
+    existing_context_tokens = (
+        current_envelope.budget.consumed[BudgetDimension.CONTEXT_TOKENS]
+        + current_envelope.budget.reserved[BudgetDimension.CONTEXT_TOKENS]
+    )
     limited_budget = InvestigationBudget(
         limits={
             **dict(current_envelope.budget.limits),
-            BudgetDimension.CONTEXT_TOKENS: estimated_tokens - 1,
+            BudgetDimension.CONTEXT_TOKENS: estimated_tokens + existing_context_tokens,
         }
     )
     for prior_reservation in current_envelope.budget.reservations:
         limited_budget.restore_reservation(prior_reservation)
+    assert limited_budget.remaining[BudgetDimension.CONTEXT_TOKENS] == estimated_tokens
     limited_envelope = replace(
         current_envelope,
         version=current_envelope.version + 1,
@@ -8602,12 +9748,16 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
         operation_key=operation_key,
     )
 
-    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output.get("missing_refs")
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert uncertain is False
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
-    assert len(prompt.encode("utf-8")) > 4_000_000
-    assert base64.b64encode(sample_bytes).decode("ascii") in prompt
+    assert base64.b64encode(sample_bytes).decode("ascii") not in prompt
+    assert f"sample_id={sample_id}" in prompt
+    assert f"association_id={association_id}" in prompt
+    assert f"blob_id={blob_id}" in prompt
+    assert f"sha256={sample_sha256}" in prompt
+    assert "whole_sample_not_needed_for_consultation" in prompt
     assert "omitted_range" not in prompt
     assert "length=3200000" in prompt
     assert "byte_length=3200000" in prompt
@@ -8619,8 +9769,8 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert "length=3200000" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
-    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] >= prompt_bytes
-    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] / prompt_bytes <= 1.35
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert estimated_tokens == prompt_tokens
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert invocation.consumed_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -8633,8 +9783,6 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
-    assert estimated_tokens > limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
-    assert prompt_tokens <= limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
 
 
 @pytest.mark.asyncio
@@ -8660,6 +9808,18 @@ async def test_prompt_sample_policy_is_refreshed_before_transport(
         _make_downloaded_sample_fixture(investigation_id, sample_bytes)
     )
     sample = tool._samples.samples[0]
+    analysis, analysis_raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "A local static analysis marker."},
+    )
+    tool._observations.observations[analysis.id] = analysis
+    tool._blobs.add(
+        analysis.blob_id,
+        sha256=analysis.sha256,
+        size=len(analysis_raw),
+        logical_bucket="evidence",
+    )
+    tool._artifact_store.values[analysis.blob_id] = analysis_raw
 
     class MutableAssociations:
         def __init__(self) -> None:
@@ -8704,7 +9864,7 @@ async def test_prompt_sample_policy_is_refreshed_before_transport(
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
-            "evidence_refs": [str(observation.id)],
+            "evidence_refs": [str(observation.id), str(analysis.id)],
         },
         make_context(investigation_id, key=f"operator:advisor:sample-policy:{change}"),
     )
@@ -8724,7 +9884,7 @@ async def test_prompt_sample_policy_is_refreshed_before_transport(
 
 
 @pytest.mark.asyncio
-async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -> None:
+async def test_prompt_sample_policy_unchanged_keeps_provenance_without_sample_bytes() -> None:
     investigation_id = UUID("00000000-0000-0000-0000-000000000001")
     sample_bytes = b"Synthetic sample whose policy remains unchanged."
     sample_hash = hashlib.sha256(sample_bytes).hexdigest()
@@ -8786,10 +9946,22 @@ async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -
             )
         )
     )
+    analysis, analysis_raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "A local static analysis marker."},
+    )
+    tool._observations.observations[analysis.id] = analysis
+    tool._blobs.add(
+        analysis.blob_id,
+        sha256=analysis.sha256,
+        size=len(analysis_raw),
+        logical_bucket="evidence",
+    )
+    tool._artifact_store.values[analysis.blob_id] = analysis_raw
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
-            "evidence_refs": [str(observation.id)],
+            "evidence_refs": [str(observation.id), str(analysis.id)],
         },
         make_context(investigation_id, key="operator:advisor:sample-policy-unchanged"),
     )
@@ -8797,10 +9969,9 @@ async def test_prompt_sample_policy_unchanged_keeps_characterized_prompt_sha() -
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert len(transport.calls) == 1
     prompt = transport.calls[0]["prompt"]
-    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == (
-        "bbe1503c546ae78c9d2922da5f1dea2ed59129b2708b1258c0396151b9c7472f"
-    )
-    assert base64.b64encode(sample_bytes).decode("ascii") in prompt
+    assert base64.b64encode(sample_bytes).decode("ascii") not in prompt
+    assert "whole_sample_not_needed_for_consultation" in prompt
+    assert f"sample_sha256={sample_hash}" in prompt
 
 
 @pytest.mark.asyncio
@@ -8941,7 +10112,7 @@ async def test_service_commits_aggregate_measured_reservation_for_editorial_chil
     measured_tokens = sum(
         (len(call["prompt"].encode("utf-8")) + 3) // 4 for call in transport.calls
     )
-    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output.get("batch_statuses")
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert invocation.status is ToolInvocationStatus.SUCCEEDED
     assert uncertain is False
     assert result.output["advisor_status"] == "succeeded"
@@ -8998,13 +10169,25 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
     )
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    original_reservation_cost = tool.reservation_cost
+
+    async def overestimate_prompt_by_one_byte(arguments, context):
+        estimated = dict(await original_reservation_cost(arguments, context))
+        estimated[BudgetDimension.CONTEXT_BYTES] += 1
+        return estimated
+
+    # Force the measured-reservation persistence path. Exact estimates normally
+    # skip this adjustment because the estimate and rendered prompt are equal.
+    tool.reservation_cost = overestimate_prompt_by_one_byte
     original_save_envelope = fixture.service._save_envelope_version
     save_calls = 0
+    adjustment_failure_injected = False
 
     async def fail_measured_adjustment_once(envelope):
-        nonlocal save_calls
+        nonlocal adjustment_failure_injected, save_calls
         save_calls += 1
         if save_calls == 2:
+            adjustment_failure_injected = True
             raise RuntimeError("injected reservation adjustment persistence failure")
         return await original_save_envelope(envelope)
 
@@ -9028,7 +10211,7 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
         operation_key=operation_key,
     )
 
-    assert save_calls >= 2
+    assert adjustment_failure_injected
     assert transport.calls == []
     assert invocation.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_context_reservation_mismatch"
@@ -9040,6 +10223,7 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
     )
 
     fixture.service._save_envelope_version = original_save_envelope
+    tool.reservation_cost = original_reservation_cost
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     retry_state = await fixture.states.get(investigation_id)

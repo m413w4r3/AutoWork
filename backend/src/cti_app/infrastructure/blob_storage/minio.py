@@ -16,6 +16,7 @@ from cti_app.application.blob_storage import (
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.errors import BlobIntegrityError
 from cti_app.infrastructure.blob_storage.common import (
+    read_verified_range,
     spool_and_describe,
     verify_file,
 )
@@ -61,6 +62,21 @@ class MinioBlobStore:
             raise BlobReadLimitExceededError(size_bytes=descriptor.size, max_bytes=max_bytes)
         try:
             return await asyncio.to_thread(self._read_sync, descriptor)
+        except (BlobIntegrityError, FileNotFoundError, ValueError):
+            raise
+        except Exception as exc:
+            raise BlobStorageUnavailableError("MinIO is temporarily unavailable") from exc
+
+    async def read_verified_range(
+        self, descriptor: BlobDescriptor, *, offset: int, length: int
+    ) -> bytes:
+        try:
+            return await asyncio.to_thread(
+                self._read_verified_range_sync,
+                descriptor,
+                offset=offset,
+                length=length,
+            )
         except (BlobIntegrityError, FileNotFoundError, ValueError):
             raise
         except Exception as exc:
@@ -139,3 +155,15 @@ class MinioBlobStore:
         if hashlib.sha256(content).hexdigest() != descriptor.sha256:
             raise BlobIntegrityError("Downloaded object digest does not match its descriptor")
         return content
+
+    def _read_verified_range_sync(
+        self, descriptor: BlobDescriptor, *, offset: int, length: int
+    ) -> bytes:
+        if not self._exists_sync(descriptor):
+            raise FileNotFoundError(descriptor.object_key)
+        response = self._client.get_object(self._physical_bucket, descriptor.object_key)
+        try:
+            return read_verified_range(response, descriptor, offset=offset, length=length)
+        finally:
+            response.close()
+            response.release_conn()

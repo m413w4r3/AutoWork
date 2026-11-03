@@ -7,6 +7,7 @@ from uuid import uuid4
 from cti_app.application.blob_storage import BlobReadLimitExceededError, MaterializationMethod
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.infrastructure.blob_storage.common import (
+    read_verified_range,
     spool_and_describe,
     verify_file,
 )
@@ -40,6 +41,13 @@ class FilesystemBlobStore:
         if descriptor.size > max_bytes:
             raise BlobReadLimitExceededError(size_bytes=descriptor.size, max_bytes=max_bytes)
         return path.read_bytes()
+
+    async def read_verified_range(
+        self, descriptor: BlobDescriptor, *, offset: int, length: int
+    ) -> bytes:
+        path = self._path_for(descriptor)
+        with path.open("rb") as source:
+            return read_verified_range(source, descriptor, offset=offset, length=length)
 
     def _put_sync(self, source: BinaryIO, *, logical_bucket: str, mime_type: str) -> BlobDescriptor:
         temporary, descriptor = spool_and_describe(
