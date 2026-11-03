@@ -2436,6 +2436,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             self.resolved_aliases_were_queried = False
             self.report_sample_populate_existing = False
             self.sample_catalog_locked = False
+            self.subject_locked = False
 
         async def execute(self, statement):
             self.sample_catalog_locked = str(statement) == "LOCK TABLE samples IN SHARE MODE"
@@ -2457,7 +2458,8 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             return []
 
         async def scalar(self, _statement):
-            raise AssertionError("The matching expected_hash already names the report sample")
+            self.subject_locked = True
+            return SimpleNamespace(id=subject_id)
 
     store = SqlAlchemyExternalEffectClaimStore(lambda: None)  # type: ignore[arg-type]
     authority = _authority()
@@ -2492,7 +2494,8 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
     assert session.resolved_sha256_was_queried
     assert session.resolved_aliases_were_queried
     assert session.report_sample_populate_existing
-    assert session.sample_catalog_locked
+    assert session.subject_locked
+    assert not session.sample_catalog_locked
 
 
 @pytest.mark.asyncio
@@ -3324,7 +3327,36 @@ def test_only_bridge_may_cite_a_provider_report_without_an_acquired_sample(
 ) -> None:
     assert (
         bridge_may_cite_provider_report_hash_without_sample(
-            family=family, observation=SimpleNamespace(source=source)
+            family=family,
+            observation=SimpleNamespace(
+                source=source,
+                object_type="file",
+                kind="vt_file_report",
+            ),
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "object_type", "kind", "expected"),
+    [
+        pytest.param("VirusTotal", "file", "vt_file_report", True, id="file-report"),
+        pytest.param("VirusTotal", "file", "negative_result", False, id="negative-result"),
+        pytest.param("VirusTotal", "sample", "vt_file_report", False, id="wrong-object"),
+        pytest.param("AutoWork local analysis", "file", "vt_file_report", False, id="wrong-source"),
+    ],
+)
+def test_bridge_provider_report_without_sample_requires_exact_file_report_observation(
+    source: str,
+    object_type: str,
+    kind: str,
+    expected: bool,
+) -> None:
+    assert (
+        bridge_may_cite_provider_report_hash_without_sample(
+            family="advisor.consultation.v1",
+            observation=SimpleNamespace(source=source, object_type=object_type, kind=kind),
         )
         is expected
     )
@@ -3363,6 +3395,15 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
     )
     assert resolved is not None
     assert resolved.identifiers == frozenset({md5, sha1, sha256})
+    sha256_resolution = resolve_bridge_vt_file_report_hashes(
+        family="advisor.consultation.v1",
+        source="VirusTotal",
+        object_type="file",
+        object_id=sha256,
+        report_content=report,
+    )
+    assert sha256_resolution is not None
+    assert sha256_resolution.sha256 == sha256
     id_only_payload = json.loads(report)
     del id_only_payload["data"]["attributes"]["sha256"]
     id_only_resolution = resolve_bridge_vt_file_report_hashes(
@@ -3445,6 +3486,35 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
             object_type="file",
             object_id=md5,
             report_content=b"not-json",
+        )
+        is None
+    )
+
+
+def test_bridge_vt_report_rejects_requested_hash_as_data_id_instead_of_canonical_sha256() -> None:
+    md5 = "a" * 32
+    report_sha256 = "c" * 64
+    report = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": md5,
+                "attributes": {
+                    "md5": md5,
+                    "sha1": "b" * 40,
+                    "sha256": report_sha256,
+                },
+            }
+        }
+    ).encode()
+
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=report,
         )
         is None
     )
