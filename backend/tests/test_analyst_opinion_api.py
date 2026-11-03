@@ -362,6 +362,9 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         assert stale_base_hash_preview.status_code == 409
         assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == versions_before_preview
 
+        versions_before_unacknowledged_approval = tuple(
+            harness.uow.analyst_opinions.items[opinion_id]
+        )
         approve = await client.post(
             f"/api/opinions/{draft['id']}/approve",
             json={
@@ -373,6 +376,9 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         )
         assert approve.status_code == 422
         assert approve.json()["detail"]["code"] == "bridge_drafting_ack_required"
+        assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == (
+            versions_before_unacknowledged_approval
+        )
 
         approve = await client.post(
             f"/api/opinions/{draft['id']}/approve",

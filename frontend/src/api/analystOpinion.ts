@@ -40,7 +40,31 @@ export interface AnalystOpinionVersion {
   implant_materials: ImplantMaterialEdit[];
   implant_materials_section: ImplantMaterialsSection | null;
   provenance: OpinionProvenance;
+  editorial_review?: OpinionEditorialReview;
 }
+
+export interface OpinionBridgeDraftingSummary {
+  status: "complete" | "partial" | "incomplete";
+  section_count: number;
+  bridge_authored_section_count: number;
+  unlinked_sections: string[];
+  requires_acknowledgement: boolean;
+  acknowledged: boolean;
+  resume_available: boolean;
+  diagnosis: string | null;
+}
+
+export interface OpinionEditorialReview {
+  status: "clear" | "warning" | "blocked";
+  bridge_drafting: OpinionBridgeDraftingSummary;
+  publication_text_markers: string[];
+  missing_annex_references: string[];
+  warnings: string[];
+}
+
+export type AnalystOpinionErrorCode = "bridge_drafting_ack_required";
+export const BRIDGE_DRAFTING_ACK_REQUIRED: AnalystOpinionErrorCode =
+  "bridge_drafting_ack_required";
 
 export interface BridgeDraftReference {
   invocation_id: string;
@@ -133,11 +157,13 @@ export interface ReviewOpinionInput {
   version: number;
   expected_sha256: string;
   reason: string;
+  bridge_drafting_gap_acknowledged?: boolean;
 }
 
 export interface PublishOpinionInput {
   version: number;
   expected_base_publication_sha256: string;
+  bridge_drafting_gap_acknowledged?: boolean;
 }
 
 export interface OpinionDraftMutationResponse {
@@ -309,6 +335,8 @@ export function useApproveAnalystOpinion(investigationId: string) {
         version: input.version,
         expected_sha256: input.expected_sha256,
         reason: input.reason,
+        bridge_drafting_gap_acknowledged:
+          input.bridge_drafting_gap_acknowledged,
       }),
     investigationId,
   );
@@ -333,6 +361,8 @@ export function usePublishAnalystOpinion(investigationId: string) {
         version: input.version,
         expected_base_publication_sha256:
           input.expected_base_publication_sha256,
+        bridge_drafting_gap_acknowledged:
+          input.bridge_drafting_gap_acknowledged,
       }),
     investigationId,
   );
