@@ -3923,7 +3923,7 @@ async def test_cited_downloaded_sample_bytes_keep_provenance_and_omit_whole_cont
 
 
 @pytest.mark.asyncio
-async def test_plan_dossier_keeps_five_sample_provenances_without_sample_bytes_or_reads() -> None:
+async def test_plan_dossier_omits_inherited_samples_without_sample_bytes_or_reads() -> None:
     investigation_id = uuid4()
     samples: list[SimpleNamespace] = []
     associations: list[SimpleNamespace] = []
@@ -4073,12 +4073,14 @@ async def test_plan_dossier_keeps_five_sample_provenances_without_sample_bytes_o
         assert base64.b64encode(content).decode("ascii") not in prompt
     manifest = result.output["bridge_provenance"]["dossier_manifest"]
     sample_rows = [item for item in manifest if item["kind"] == "sample"]
-    assert len(sample_rows) == 5
+    assert len(sample_rows) == 2
     assert all(
         item["content_omission_reason"] == "whole_sample_not_needed_for_consultation"
         for item in sample_rows
     )
     assert all(item["sha256"] for item in sample_rows)
+    assert "omitted_historical_sample_count=3" in prompt
+    assert "historical_subject_samples_not_selected_by_default" in prompt
     reservation = next(
         item for item in context.budget.reservations if item.operation_key == operation_key
     )
@@ -11913,3 +11915,117 @@ async def test_editorial_sample_inventory_avoids_unrequested_whole_binary_bytes(
     )
     assert full_rows[0]["content_status"] == "verified"
     assert full_rows[0]["content_base64"] == base64.b64encode(sample_content).decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_plan_dossier_metrics_do_not_grow_with_historical_subject_samples() -> None:
+    async def run_with_historical_samples(
+        count: int,
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        investigation_id = uuid4()
+        transport = Transport(
+            TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text=advisor_response(
+                    "Use the article's open questions to choose the next local analysis.", ["A1"]
+                ),
+            )
+        )
+        tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+        observations = []
+        samples = []
+        associations = []
+        for index in range(1, count + 1):
+            sample_hash = f"{index:064x}"
+            blob_id = uuid4()
+            observation = EvidenceObservation(
+                investigation_id=investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=uuid4(),
+                sha256=hashlib.sha256(f"historical-observation-{index}".encode()).hexdigest(),
+                source="investigation.subject_sample_reuse",
+                source_version="1",
+                observed_at=datetime.now(UTC),
+                object_type="sample",
+                object_id=sample_hash,
+            )
+            observations.append(observation)
+            associations.append(SimpleNamespace(id=uuid4(), sample_sha256=sample_hash))
+            samples.append(
+                SimpleNamespace(
+                    id=uuid4(),
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=blob_id,
+                    origin_kind="subject_seed",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                )
+            )
+            tool._blobs.add(
+                blob_id,
+                sha256=sample_hash,
+                size=4096,
+                logical_bucket="samples-quarantine",
+            )
+        tool._observations = ObservationRepository(observations)
+        tool._sample_associations = SimpleNamespace(
+            list_for_investigation=async_get(tuple(associations))
+        )
+        tool._samples = SimpleNamespace(list_for_subject=async_get(tuple(samples)))
+
+        result = await tool.execute(
+            {
+                "consultation_type": "plan_investigation",
+                "question": "Plan next investigation steps using the article and open questions.",
+            },
+            make_context(investigation_id, key=f"operator:advisor:history-{count}"),
+        )
+        assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}, (
+            result.output
+        )
+        assert len(transport.calls) == 1
+        call_observation = next(
+            item
+            for item in tool._observations.observations.values()
+            if item.source == "advisor.consult"
+        )
+        persisted = json.loads(tool._artifact_store.values[call_observation.blob_id])
+        return result.output, transport.calls[0]["prompt"], persisted["output"]["bridge_provenance"]
+
+    baseline, baseline_prompt, _ = await run_with_historical_samples(0)
+    historical, historical_prompt, persisted_provenance = await run_with_historical_samples(250)
+    provenance = historical["bridge_provenance"]
+    diagnostics = provenance["diagnostics"]
+
+    assert historical["dossier_bytes"] < 10_000
+    assert historical["prompt_bytes"] < 20_000
+    assert historical["dossier_bytes"] == provenance["dossier_bytes"]
+    assert historical["dossier_sha256"] == provenance["dossier_sha256"]
+    assert historical["prompt_sha256"] == provenance["input_sha256"]
+    assert historical["prompt_bytes"] == provenance["prompt_bytes"]
+    assert diagnostics.get("blob_reads", 0) == baseline["bridge_provenance"]["diagnostics"].get(
+        "blob_reads", 0
+    )
+    assert diagnostics.get("bytes_read", 0) == baseline["bridge_provenance"]["diagnostics"].get(
+        "bytes_read", 0
+    )
+    assert diagnostics.get("blob_reads", 0) == 0
+    assert diagnostics.get("bytes_read", 0) == 0
+    assert provenance["durations_ms"]["dossier_build"] >= 0
+    assert "omitted_sample_count=250" in historical_prompt
+    assert "sample_id" not in historical_prompt
+    assert f"{1:064x}" not in historical_prompt
+    assert len(historical_prompt) - len(baseline_prompt) < 2_000
+    assert any(item["kind"] == "article" for item in provenance["dossier_manifest"])
+    assert any(item["kind"] == "omission" for item in provenance["dossier_manifest"])
+    assert not any(item["kind"] == "sample" for item in provenance["dossier_manifest"])
+    assert persisted_provenance["dossier_sha256"] == historical["dossier_sha256"]
+    assert persisted_provenance["input_sha256"] == historical["prompt_sha256"]
+    assert persisted_provenance["durations_ms"]["dossier_build"] >= 0
+    assert persisted_provenance["diagnostics"].get("blob_reads", 0) == diagnostics.get(
+        "blob_reads", 0
+    )
+    assert persisted_provenance["dossier_manifest"] == list(provenance["dossier_manifest"])
