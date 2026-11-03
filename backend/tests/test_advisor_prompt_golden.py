@@ -247,8 +247,8 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
             1266,
         ),
         "pivot_strategy": (
-            "aa9b10637ac96222dc80369901ec64d3dccb9df63985953665006f09f2004fec",
-            1241,
+            "898b095a07aca885b0eb07300f571599ffabd017beb001da9326a53a0d2a72b1",
+            1182,
         ),
         "yara_draft_base64_hex": (
             "7ccf4d806cf7b0686ab7293aa0e5167eb102bbecc8ff50caca95d66edacbdce2",

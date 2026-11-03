@@ -349,6 +349,13 @@ def _manifest_reference_digest(rows: list[dict[str, object]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _assert_sample_inventory_omission(prompt: str, *, sample_count: int, reason: str) -> None:
+    assert f"omitted_sample_count={sample_count}" in prompt
+    assert f"omission_reason={reason}" in prompt
+    assert "resource=sample inventory and canonical sample associations" in prompt
+    assert "consultation ciblée complémentaire possible si un sample précis devient utile" in prompt
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("consultation_type", CONSULTATION_TYPES)
 async def test_m12_q_reservation_and_execution_characterization(
@@ -467,14 +474,20 @@ async def test_m12_q_reservation_and_execution_characterization(
     assert len(reservation_builds) == 1
     assert len(execution_builds) == 1
     assert reservation_builds == execution_builds
-    assert "content_base64:" not in transport.calls[0]["prompt"]
-    assert (
-        "content_omission_reason=whole_sample_not_needed_for_consultation"
-        in (transport.calls[0]["prompt"])
+    prompt = transport.calls[0]["prompt"]
+    assert "content_base64:" not in prompt
+    _assert_sample_inventory_omission(
+        prompt,
+        sample_count=SAMPLE_COUNT,
+        reason=(
+            "editorial_section_does_not_need_sample_inventory"
+            if consultation_type == "draft_text"
+            else "sample_inventory_not_selected_for_consultation"
+        ),
     )
-    # The final pre-send sample-policy recheck reloads associations after
-    # preparation, response lookup, and pacing.
-    expected_association_reads = 3
+    # The final pre-send sample-policy recheck runs when sample material is
+    # present in the prompt. Editorial drafts omit the inventory entirely.
+    expected_association_reads = 1 if consultation_type == "draft_text" else 3
     assert (
         execution_counts["calls"].get("sample_associations.list_for_investigation")
         == expected_association_reads
@@ -548,9 +561,22 @@ async def test_reservation_estimate_covers_measured_prompt(
     )
     prompt = transport.calls[0]["prompt"]
     assert "content_base64:" not in prompt
-    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    if consultation_type == "plan_investigation":
+        assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    else:
+        _assert_sample_inventory_omission(
+            prompt,
+            sample_count=1,
+            reason=(
+                "editorial_section_does_not_need_sample_inventory"
+                if consultation_type == "draft_text"
+                else "sample_inventory_not_selected_for_consultation"
+            ),
+        )
     assert reserved_bytes < SAMPLE_BYTES * 2
     assert reserved_tokens < SAMPLE_BYTES // 2
+    assert reserved_bytes >= prompt_bytes
+    assert reserved_tokens >= actual_tokens
     reservation = next(
         item for item in context.budget.reservations if item.operation_key == operation_key
     )
