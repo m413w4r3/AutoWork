@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import re
 import tracemalloc
@@ -56,6 +57,7 @@ from cti_app.domain.analyst_opinion import (
 )
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.classification import TLP
+from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -4199,11 +4201,236 @@ async def test_explicit_measurement_sends_only_blob_verified_targeted_range() ->
     assert measurement["range_verified"] is True
     assert measurement["offset"] == offset
     assert measurement["length"] == len(marker)
+    assert "covers_whole_sample" not in measurement
     assert measurement["fragment_sha256"] == hashlib.sha256(marker).hexdigest()
     assert f"fragment_sha256={hashlib.sha256(marker).hexdigest()}" in prompt
+    assert "covers_whole_sample=true" not in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     assert estimate[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert estimate[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+
+
+@pytest.mark.asyncio
+async def test_explicit_whole_sample_measurement_is_sent_and_marked_for_audit() -> None:
+    investigation_id = uuid4()
+    sample_content = b"cfg=small"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": [{"value": sample_content.hex(), "offset": 0}],
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The requested configuration was verified.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = sample_content
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=sample_blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-config.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": "Review the complete verified hex configuration at offset 0.",
+        "evidence_refs": [str(observation.id)],
+        "measurements": [
+            {
+                "blob_id": str(sample_blob_id),
+                "kind": "hex",
+                "encoding": "hex",
+                "offset": 0,
+                "length": len(sample_content),
+                "value": sample_content.hex(),
+            }
+        ],
+    }
+
+    result = await tool.execute(
+        arguments,
+        make_context(investigation_id, key="operator:advisor:whole-sample-range"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert sample_content.hex() in prompt
+    assert f"byte_length={len(sample_content)}" in prompt
+    assert "covers_whole_sample=true" in prompt
+    measurement = next(
+        item
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+        if item["kind"] == "measurement"
+    )
+    assert measurement["range_verified"] is True
+    assert measurement["offset"] == 0
+    assert measurement["length"] == len(sample_content)
+    assert measurement["byte_length"] == len(sample_content)
+    assert measurement["covers_whole_sample"] is True
+
+
+@pytest.mark.asyncio
+async def test_corruption_outside_requested_range_fails_integrity_without_sending_range() -> None:
+    investigation_id = uuid4()
+    prefix = b"CORRUPT_OUTSIDE_RANGE_"
+    marker = b"INTEGRITY_GATED_RANGE"
+    sample_content = prefix + marker + b"_suffix"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": [{"value": marker.hex(), "offset": len(prefix)}],
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Unverified bytes were omitted.", []),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    descriptor = BlobDescriptor(
+        sha256=sample_hash,
+        size=len(sample_content),
+        mime_type="application/octet-stream",
+        logical_bucket="samples-quarantine",
+    )
+    corrupt_content = bytearray(sample_content)
+    corrupt_content[0] ^= 1
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = bytes(corrupt_content)
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._samples = SimpleNamespace(
+        list_for_subject=async_get(
+            (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=sample_blob_id,
+                    origin_kind="source_seed",
+                    original_name="synthetic-corrupt.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+        )
+    )
+    integrity_errors: list[BlobIntegrityError] = []
+    original_read_range = tool._artifact_store.read_verified_range
+
+    async def read_corrupt_range(blob_id, *, offset, length):
+        if blob_id != sample_blob_id:
+            return await original_read_range(blob_id, offset=offset, length=length)
+        try:
+            return read_verified_range(
+                io.BytesIO(bytes(corrupt_content)),
+                descriptor,
+                offset=offset,
+                length=length,
+            )
+        except BlobIntegrityError as exc:
+            integrity_errors.append(exc)
+            raise
+
+    tool._artifact_store.read_verified_range = read_corrupt_range
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Review the verified range at offset {len(prefix)}.",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "hex",
+                    "offset": len(prefix),
+                    "value": marker.hex(),
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:corrupt-outside-range"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    prompt = transport.calls[0]["prompt"]
+    assert marker.decode("ascii") not in prompt
+    assert marker.hex() not in prompt
+    assert "content_omission_reason=sample_content_hash_mismatch" in prompt
+    assert integrity_errors and isinstance(integrity_errors[0], BlobIntegrityError)
+    manifest_measurement = next(
+        item
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+        if item["kind"] == "measurement"
+    )
+    assert manifest_measurement["range_verified"] is False
+    assert manifest_measurement["content_omission_reason"] == "sample_content_hash_mismatch"
 
 
 @pytest.mark.asyncio

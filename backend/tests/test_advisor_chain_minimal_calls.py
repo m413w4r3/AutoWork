@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
@@ -485,17 +486,38 @@ async def test_unselected_restricted_sample_is_excluded_without_blocking_other_e
 
 
 @pytest.mark.asyncio
-async def test_sample_restricted_during_pacing_is_refused_before_transport(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("source", "object_type"),
+    (
+        ("virustotal.sample_download", "binary_or_non_json"),
+        ("VirusTotal", "file"),
+        ("investigation.subject_sample_reuse", "sample"),
+    ),
+)
+@pytest.mark.parametrize("change", ("tlp_red", "external_llm_disallowed", "association_revoked"))
+async def test_sample_restricted_during_pacing_is_refused_before_transport(
+    monkeypatch, source: str, object_type: str, change: str
+) -> None:
     investigation_id = uuid4()
     sample_content = b"sample bytes remain local"
     tool, transport, observation, *_fixture = _make_downloaded_sample_fixture(
         investigation_id, sample_content
     )
     sample = tool._samples.samples[0]
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation = replace(
+        observation, source=source, object_type=object_type, object_id=sample_hash
+    )
+    tool._observations = ObservationRepository((observation,))
 
     class RestrictingPacer:
         async def wait_for_next_submission(self, *, deadline_monotonic=None):
-            sample.external_llm_allowed = False
+            if change == "tlp_red":
+                sample.tlp = TLP.RED
+            elif change == "external_llm_disallowed":
+                sample.external_llm_allowed = False
+            elif change == "association_revoked":
+                tool._sample_associations = _SampleAssociations(())
             return True
 
     monkeypatch.setattr(
@@ -516,9 +538,13 @@ async def test_sample_restricted_during_pacing_is_refused_before_transport(monke
     )
 
     assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted", result.output
-    assert result.output["failure_stage"] == "sample_disclosure_restricted"
+    if change == "association_revoked":
+        assert result.output["input_error_code"] == "sample_hash_not_associated", result.output
+    else:
+        assert result.output["advisor_status"] == "disclosure_restricted", result.output
+        assert result.output["failure_stage"] == "sample_disclosure_restricted"
     assert result.output["confirmed_non_execution"] is True
+    assert result.output["bridge_turns_consumed"] == 0
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 0
     assert context.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
     assert context.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 0

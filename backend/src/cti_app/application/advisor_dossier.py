@@ -1316,6 +1316,8 @@ def build_advisor_dossier(
             byte_metadata.append(f"encoding={byte_encoding}")
             if type(byte_length) is int and byte_length >= 0:
                 byte_metadata.append(f"byte_length={byte_length}; length={byte_length}")
+            if item.get("covers_whole_sample") is True:
+                byte_metadata.append("covers_whole_sample=true")
             declared_fragment_sha256 = _as_text(item.get("fragment_sha256"))
             full_digest = (
                 hashlib.sha256(fragment_bytes).hexdigest()
@@ -1396,6 +1398,11 @@ def build_advisor_dossier(
                             else ""
                         ),
                         "range_verified": item.get("range_verified"),
+                        **(
+                            {"covers_whole_sample": True}
+                            if item.get("covers_whole_sample") is True
+                            else {}
+                        ),
                         "blob_id": item.get("blob_id"),
                         "association_id": item.get("association_id"),
                         "mime_type": item.get("mime_type", item.get("mime")),

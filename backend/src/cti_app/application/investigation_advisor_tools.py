@@ -5570,11 +5570,16 @@ class InvestigationAdvisorTool:
                 and fragment == fragment_bytes
                 and (not declared_fragment_sha256 or declared_fragment_sha256 == fragment_sha256)
             ):
+                # A fully covered explicit range remains requested evidence; mark it for audit.
+                covers_whole_sample = offset == 0 and length == descriptor.size
                 row.update(
                     range_verified=True,
                     range_length=length,
+                    byte_length=length,
                     fragment_sha256=fragment_sha256,
                 )
+                if covers_whole_sample:
+                    row["covers_whole_sample"] = True
             else:
                 row.update(
                     range_verified=False,
