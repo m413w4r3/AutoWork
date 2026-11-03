@@ -2886,6 +2886,30 @@ def _reconciliation_run(
     return run
 
 
+def test_production_reconciliation_api_fingerprints_bridge_request_id() -> None:
+    request_id = "internal-bridge-idempotency-key"
+    reconciliation = ProductionSubmissionReconciliation(
+        production_run_id=uuid4(),
+        model_run_id=uuid4(),
+        stage=ProductionStage.EXTRACTION,
+        bridge_response_id=None,
+        bridge_request_id=request_id,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        phase="reconciliation",
+    )
+
+    view = production_api.reconciliation_view(
+        reconciliation.production_run_id,
+        reconciliation,
+        pipeline_generation=1,
+    )
+
+    assert view is not None
+    expected = f"sha256:{hashlib.sha256(request_id.encode()).hexdigest()[:16]}"
+    assert view.bridge_request_id == expected
+    assert request_id not in json.dumps(view.model_dump())
+
+
 @pytest.mark.parametrize("stage", ("extraction", "references"))
 async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
     api: AsyncClient,
