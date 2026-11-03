@@ -9072,14 +9072,19 @@ async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> N
     estimated_tokens = estimated_cost[BudgetDimension.CONTEXT_TOKENS]
     current_envelope = await fixture.envelopes.get(investigation_id)
     assert current_envelope is not None
+    existing_context_tokens = (
+        current_envelope.budget.consumed[BudgetDimension.CONTEXT_TOKENS]
+        + current_envelope.budget.reserved[BudgetDimension.CONTEXT_TOKENS]
+    )
     limited_budget = InvestigationBudget(
         limits={
             **dict(current_envelope.budget.limits),
-            BudgetDimension.CONTEXT_TOKENS: estimated_tokens - 1,
+            BudgetDimension.CONTEXT_TOKENS: estimated_tokens + existing_context_tokens,
         }
     )
     for prior_reservation in current_envelope.budget.reservations:
         limited_budget.restore_reservation(prior_reservation)
+    assert limited_budget.remaining[BudgetDimension.CONTEXT_TOKENS] == estimated_tokens
     limited_envelope = replace(
         current_envelope,
         version=current_envelope.version + 1,
@@ -9125,8 +9130,8 @@ async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> N
     assert "length=3200000" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
-    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] >= prompt_bytes
-    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] / prompt_bytes <= 1.35
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert estimated_tokens == prompt_tokens
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert invocation.consumed_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -9139,8 +9144,6 @@ async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> N
     assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
-    assert estimated_tokens > limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
-    assert prompt_tokens <= limited_budget.limits[BudgetDimension.CONTEXT_TOKENS]
 
 
 @pytest.mark.asyncio
@@ -9527,13 +9530,25 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
     )
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    original_reservation_cost = tool.reservation_cost
+
+    async def overestimate_prompt_by_one_byte(arguments, context):
+        estimated = dict(await original_reservation_cost(arguments, context))
+        estimated[BudgetDimension.CONTEXT_BYTES] += 1
+        return estimated
+
+    # Force the measured-reservation persistence path. Exact estimates normally
+    # skip this adjustment because the estimate and rendered prompt are equal.
+    tool.reservation_cost = overestimate_prompt_by_one_byte
     original_save_envelope = fixture.service._save_envelope_version
     save_calls = 0
+    adjustment_failure_injected = False
 
     async def fail_measured_adjustment_once(envelope):
-        nonlocal save_calls
+        nonlocal adjustment_failure_injected, save_calls
         save_calls += 1
         if save_calls == 2:
+            adjustment_failure_injected = True
             raise RuntimeError("injected reservation adjustment persistence failure")
         return await original_save_envelope(envelope)
 
@@ -9557,7 +9572,7 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
         operation_key=operation_key,
     )
 
-    assert save_calls >= 2
+    assert adjustment_failure_injected
     assert transport.calls == []
     assert invocation.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_context_reservation_mismatch"
@@ -9569,6 +9584,7 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
     )
 
     fixture.service._save_envelope_version = original_save_envelope
+    tool.reservation_cost = original_reservation_cost
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     retry_state = await fixture.states.get(investigation_id)
