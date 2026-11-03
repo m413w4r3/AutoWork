@@ -2324,6 +2324,8 @@ def _analyst_opinion_from_json(raw: Any) -> AnalystOpinionV1:
     )
     if isinstance(raw, Mapping) and "protocol_figures" in raw:
         fields = fields | {"protocol_figures"}
+    if isinstance(raw, Mapping) and "bridge_drafting_gap_acknowledged" in raw:
+        fields = fields | {"bridge_drafting_gap_acknowledged"}
     item = json_object(raw, fields, "AnalystOpinionV1")
     if item["schema"] != "analyst-opinion.v1":
         raise ValueError("AnalystOpinionV1 schema is unsupported")
@@ -2393,6 +2395,7 @@ def _analyst_opinion_from_json(raw: Any) -> AnalystOpinionV1:
             if item["reviewer_id"] is not None
             else None,
             status=json_enum(AnalystOpinionStatus, item["status"], "Opinion status"),
+            bridge_drafting_gap_acknowledged=item.get("bridge_drafting_gap_acknowledged") is True,
             created_at=datetime.fromisoformat(json_text(item["created_at"], "Opinion created_at")),
             content_sha256=json_sha256(item["content_sha256"], "Opinion content SHA-256"),
         )

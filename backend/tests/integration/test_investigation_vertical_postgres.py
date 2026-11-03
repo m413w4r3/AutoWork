@@ -564,6 +564,9 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                 "version": draft["version"],
                 "expected_sha256": draft["content_sha256"],
                 "reason": "Approve the cited article-relative update.",
+                # This synthetic run has no Bridge drafting consultation: the human approver
+                # acknowledges the gap explicitly instead of the opinion claiming Bridge wording.
+                "bridge_drafting_gap_acknowledged": True,
             },
             headers={"Idempotency-Key": f"opinion-approve-{draft['id']}-{draft['version']}"},
         )
