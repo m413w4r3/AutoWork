@@ -160,20 +160,20 @@ export function AnalystOpinionEditor({
   const canEdit = draft !== null && draft.status !== "approved";
   const canReview = Boolean(
     draft &&
-      draft.status === "draft" &&
-      hashMatchesCurrent &&
-      citationViolations.length === 0 &&
-      !dirty &&
-      ((!hasBridgeDraftingGap && !acknowledgementRequiredError) ||
-        bridgeDraftingGapAcknowledged),
+    draft.status === "draft" &&
+    hashMatchesCurrent &&
+    citationViolations.length === 0 &&
+    !dirty &&
+    ((!hasBridgeDraftingGap && !acknowledgementRequiredError) ||
+      bridgeDraftingGapAcknowledged),
   );
   const canPublish = Boolean(
     draft &&
-      draft.status === "approved" &&
-      hashMatchesCurrent &&
-      !dirty &&
-      ((!hasBridgeDraftingGap && !acknowledgementRequiredError) ||
-        bridgeDraftingGapAcknowledged),
+    draft.status === "approved" &&
+    hashMatchesCurrent &&
+    !dirty &&
+    ((!hasBridgeDraftingGap && !acknowledgementRequiredError) ||
+      bridgeDraftingGapAcknowledged),
   );
   const selectedProtocolBlobId =
     protocolBlobId || protocolModelsQuery.data?.models[0]?.blob_id || "";
@@ -274,7 +274,8 @@ export function AnalystOpinionEditor({
                 setBridgeDraftingGapAcknowledged(event.currentTarget.checked)
               }
             />{" "}
-            Je confirme avoir pris connaissance de l’absence de rédaction Bridge liée.
+            Je confirme avoir pris connaissance de l’absence de rédaction Bridge
+            liée.
           </label>
         </div>
       ) : null}

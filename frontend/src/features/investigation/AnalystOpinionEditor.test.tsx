@@ -391,7 +391,7 @@ describe("AnalystOpinionEditor", () => {
     const user = userEvent.setup();
 
     await user.type(
-      screen.getByLabelText("Raison de la décision"),
+      await screen.findByLabelText("Raison de la décision"),
       "Revue humaine terminée.",
     );
     expect(
@@ -415,7 +415,9 @@ describe("AnalystOpinionEditor", () => {
     await user.click(approveButton);
     await waitFor(() =>
       expect(
-        calls.some((call) => call.url === `/api/opinions/${OPINION_ID}/approve`),
+        calls.some(
+          (call) => call.url === `/api/opinions/${OPINION_ID}/approve`,
+        ),
       ).toBe(true),
     );
     const call = calls.find(
@@ -431,7 +433,7 @@ describe("AnalystOpinionEditor", () => {
     const { calls } = renderEditor(opinion, draftSummary(opinion), [], true);
     const user = userEvent.setup();
     await user.type(
-      screen.getByLabelText("Raison de la décision"),
+      await screen.findByLabelText("Raison de la décision"),
       "Revue humaine terminée.",
     );
     await user.click(
@@ -453,7 +455,9 @@ describe("AnalystOpinionEditor", () => {
     );
     await waitFor(() =>
       expect(
-        calls.filter((call) => call.url === `/api/opinions/${OPINION_ID}/approve`),
+        calls.filter(
+          (call) => call.url === `/api/opinions/${OPINION_ID}/approve`,
+        ),
       ).toHaveLength(2),
     );
     const retry = calls
@@ -498,7 +502,9 @@ describe("AnalystOpinionEditor", () => {
     await user.click(publishButton);
     await waitFor(() =>
       expect(
-        calls.some((call) => call.url === `/api/opinions/${OPINION_ID}/publish`),
+        calls.some(
+          (call) => call.url === `/api/opinions/${OPINION_ID}/publish`,
+        ),
       ).toBe(true),
     );
     const call = calls.find(
