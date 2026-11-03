@@ -4719,8 +4719,9 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
         )
         prepared = replace(base_prepared, evidence_refs=(reference,))
         transport = _CountingTransport()
+        coordinator = ExternalEffectCoordinator(store)
 
-        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        outcome = await coordinator.send_one(authority, prepared, transport)
 
         if allowed:
             assert isinstance(outcome, Completed), outcome
@@ -4736,9 +4737,7 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
             assert "c" * 32 not in outcome.reason
             assert len(outcome.reason) <= 128
             assert transport.calls == 0
-            replayed = await ExternalEffectCoordinator(store).send_one(
-                authority, prepared, transport
-            )
+            replayed = await coordinator.send_one(authority, prepared, transport)
             assert isinstance(replayed, Refused), replayed
             assert replayed.reason == outcome.reason
             assert transport.calls == 0
