@@ -2130,6 +2130,9 @@ def _serialize_motif(motif: RuleMotif, *, source_bytes_verified: bool = False) -
         "positive_support": motif.positive_support,
         "benign_prevalence": motif.benign_prevalence,
         "goodware_occurrence_count": motif.goodware_occurrence_count,
+        "goodware_measurement_status": motif.goodware_measurement_status.value,
+        "goodware_measurement_reason": motif.goodware_measurement_reason,
+        "goodware_banality": motif.goodware_banality.value if motif.goodware_banality else None,
         "source_bytes_verified": source_bytes_verified,
     }
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
@@ -2157,6 +2160,13 @@ def _motifs_from_version(version: DetectionCandidateVersion) -> tuple[RuleMotif,
                 positive_support=payload.get("positive_support"),
                 benign_prevalence=payload.get("benign_prevalence"),
                 goodware_occurrence_count=payload.get("goodware_occurrence_count"),
+                goodware_measurement_status=payload.get(
+                    "goodware_measurement_status", "unmeasured"
+                ),
+                goodware_measurement_reason=payload.get(
+                    "goodware_measurement_reason", "not_measured"
+                ),
+                goodware_banality=payload.get("goodware_banality"),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuleRevisionError("parent motif provenance is invalid") from exc

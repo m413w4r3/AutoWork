@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
+from cti_app.domain.goodware import Banality
+
 
 class RuleMotifKind(StrEnum):
     STRING = "string"
@@ -21,6 +23,11 @@ class RuleMotifProvenanceKind(StrEnum):
     P10_PROPOSAL = "p10_proposal"
     BRIDGE = "bridge"
     MANUAL = "manual"
+
+
+class GoodwareMotifMeasurementStatus(StrEnum):
+    MEASURED = "measured"
+    UNMEASURED = "unmeasured"
 
 
 class RuleTestCorpusRole(StrEnum):
@@ -257,10 +264,26 @@ class RuleMotif:
     positive_support: int | None = None
     benign_prevalence: int | None = None
     goodware_occurrence_count: int | None = None
+    goodware_measurement_status: GoodwareMotifMeasurementStatus = (
+        GoodwareMotifMeasurementStatus.UNMEASURED
+    )
+    goodware_measurement_reason: str | None = "not_measured"
+    goodware_banality: Banality | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", RuleMotifKind(self.kind))
         object.__setattr__(self, "provenance_kind", RuleMotifProvenanceKind(self.provenance_kind))
+        measurement_status = GoodwareMotifMeasurementStatus(self.goodware_measurement_status)
+        if (
+            self.goodware_occurrence_count is not None
+            and measurement_status is GoodwareMotifMeasurementStatus.UNMEASURED
+            and self.goodware_measurement_reason == "not_measured"
+        ):
+            measurement_status = GoodwareMotifMeasurementStatus.MEASURED
+            object.__setattr__(self, "goodware_measurement_reason", None)
+        object.__setattr__(self, "goodware_measurement_status", measurement_status)
+        if self.goodware_banality is not None:
+            object.__setattr__(self, "goodware_banality", Banality(self.goodware_banality))
         if not isinstance(self.value, str) or not self.value.strip():
             raise ValueError("motif value cannot be empty")
         if not isinstance(self.provenance_id, str) or not self.provenance_id.strip():
@@ -296,6 +319,17 @@ class RuleMotif:
         ):
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if measurement_status is GoodwareMotifMeasurementStatus.MEASURED:
+            if self.goodware_measurement_reason is not None:
+                raise ValueError("measured goodware motifs cannot have an unmeasured reason")
+        elif self.goodware_occurrence_count is not None or self.goodware_banality is not None:
+            raise ValueError("unmeasured goodware motifs cannot have measured values")
+        if self.goodware_measurement_reason is not None and (
+            not isinstance(self.goodware_measurement_reason, str)
+            or not self.goodware_measurement_reason.strip()
+            or len(self.goodware_measurement_reason) > 128
+        ):
+            raise ValueError("goodware_measurement_reason must be bounded text")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -246,6 +246,8 @@ class EditionRenderRepository(Protocol):
 
 
 class GoodwareBaselineRepository(Protocol):
+    async def list_all(self) -> Sequence[GoodwareBaseline]: ...
+
     async def get_by_baseline_fingerprint_sha256(
         self, baseline_fingerprint_sha256: str
     ) -> GoodwareBaseline | None: ...

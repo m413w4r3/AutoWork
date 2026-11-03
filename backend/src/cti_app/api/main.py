@@ -72,6 +72,7 @@ from cti_app.application.edition_workspace import (
     EditionWorkspaceMaterializer,
 )
 from cti_app.application.editions import EditionService
+from cti_app.application.goodware import GoodwareService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
@@ -380,6 +381,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     blob_catalog = BlobCatalogService(blob_store, uow_factory)
+    goodware_service = GoodwareService(blob_catalog, uow_factory)
+    await goodware_service.check_startup()
     production_artifact_store = ProductionArtifactStore(blob_catalog)
     network_capture_import_service = NetworkCaptureImportService(
         uow_factory=uow_factory,
@@ -511,6 +514,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
+    app.state.goodware_service = goodware_service
     app.state.production_artifact_store = production_artifact_store
     app.state.pdf_inspection_service = pdf_inspection_service
     app.state.render_input_inspection_service = render_input_inspection_service

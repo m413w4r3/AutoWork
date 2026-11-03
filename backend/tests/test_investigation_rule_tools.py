@@ -3170,6 +3170,91 @@ async def test_goodware_feature_baseline_is_not_reported_as_tested_goodware_byte
 
 
 @pytest.mark.asyncio
+async def test_rule_propose_measures_baseline_banality_and_rule_test_rejects_goodware_match() -> (
+    None
+):
+    goodware = b"synthetic benign application marker Qz9Vn5Hs"
+    goodware_sha256 = _sha256(goodware)
+    harness = _harness(samples={goodware_sha256: goodware}, goodware=(goodware_sha256,))
+    baseline_id = uuid4()
+
+    async def bound_baseline(_investigation_id: UUID) -> UUID:
+        return baseline_id
+
+    class PreparedIndex:
+        async def lookup_batch(self, features):
+            assert tuple(features) == (("string", "qz9vn5hs"),)
+            return {("string", "qz9vn5hs"): 12}
+
+    class Measurement:
+        async def prepare(self, requested_baseline_id):
+            assert requested_baseline_id == baseline_id
+            return PreparedIndex()
+
+    harness.bytes_port.goodware_baseline_id = bound_baseline
+    harness.rule_tools.goodware_measurement = Measurement()
+    observation_ref = await _source_observation(harness, "Qz9Vn5Hs")
+
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {"condition": "any", "motifs": [_motif("Qz9Vn5Hs", observation_ref)]},
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    measured_motif = proposed.output["signature"]["motifs"][0]
+    assert measured_motif["goodware_measurement_status"] == "measured"
+    assert measured_motif["goodware_occurrence_count"] == 12
+    assert measured_motif["goodware_banality"] == "BANAL"
+    assert measured_motif["goodware_non_discriminant"] is True
+
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+    assert tested.output["candidate_status"] == "rejected"
+    observation = await harness.evidence.repository.get(tested.observation_refs[0])
+    assert observation is not None
+    persisted = await harness.evidence.read_json(observation.blob_id)
+    goodware_role = next(role for role in persisted["roles"] if role["role"] == "goodware")
+    assert goodware_role["matches"] == [goodware_sha256]
+    assert persisted["goodware_measurement"]["status"] == "measured"
+    assert persisted["goodware_measurement"]["matches"] == [goodware_sha256]
+
+
+@pytest.mark.asyncio
+async def test_rule_propose_and_test_expose_unmeasured_goodware_without_a_baseline() -> None:
+    harness = _harness(samples={})
+    observation_ref = await _source_observation(harness, "Qz9Vn5Hs")
+
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {"condition": "any", "motifs": [_motif("Qz9Vn5Hs", observation_ref)]},
+    )
+
+    motif = proposed.output["signature"]["motifs"][0]
+    assert motif["goodware_measurement_status"] == "unmeasured"
+    assert motif["goodware_measurement_reason"] == "investigation_goodware_baseline_unbound"
+
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+    observation = await harness.evidence.repository.get(tested.observation_refs[0])
+    assert observation is not None
+    persisted = await harness.evidence.read_json(observation.blob_id)
+    assert persisted["goodware_measurement"]["status"] == "unmeasured"
+    assert (
+        persisted["goodware_measurement"]["reason"]
+        == "goodware_baseline_unbound_and_binary_corpus_empty"
+    )
+    assert any("Goodware non mesuré" in item for item in persisted["limitations"])
+
+
+@pytest.mark.asyncio
 async def test_conflicting_corpus_roles_and_unreadable_goodware_baseline_are_blocking() -> None:
     from cti_app.domain.rule_workbench import (
         RuleCorpusInventoryItem,

@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -24,6 +25,7 @@ from cti_app.application.blob_storage import (
 )
 from cti_app.application.confined_analysis import confined_analysis_operation_cache_identity
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
+from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.investigation_persistence import (
     DetectionCandidateRepository,
     EvidenceObservationRepository,
@@ -62,7 +64,7 @@ from cti_app.application.yara_measurements import (
 from cti_app.application.yara_measurements import yara_string_names
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.code_features import CodeFeatureSet
-from cti_app.domain.goodware import GoodwareFeature
+from cti_app.domain.goodware import Banality, BanalityScorer, BanalityThresholds, GoodwareFeature
 from cti_app.domain.invariants import CandidateInvariant
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -76,6 +78,7 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
 )
 from cti_app.domain.rule_workbench import (
+    GoodwareMotifMeasurementStatus,
     OneRuleTestStatus,
     RuleConditionStrategy,
     RuleCorpusInventoryItem,
@@ -898,6 +901,9 @@ def register_rule_tools(
     evidence_payloads: EvidencePayloadReader | None = None,
     corpus_inventory: RuleCorpusInventoryPort | None = None,
     feature_provider: RuleFeatureProvider | None = None,
+    goodware_measurement: GoodwareMeasurementService | None = None,
+    goodware_suspicious_count: int = 3,
+    goodware_banal_count: int = 10,
     article_claims: RuleArticleClaimPort | None = None,
     max_tool_seconds: int = 30,
 ) -> _RuleTools:
@@ -920,6 +926,9 @@ def register_rule_tools(
         evidence_payloads=evidence_payloads,
         corpus_inventory=inventory,
         feature_provider=feature_provider,
+        goodware_measurement=goodware_measurement,
+        goodware_suspicious_count=goodware_suspicious_count,
+        goodware_banal_count=goodware_banal_count,
         article_claims=article_claims,
         max_tool_seconds=max_tool_seconds,
     )
@@ -1142,6 +1151,9 @@ class _RuleTools:
         evidence_payloads: EvidencePayloadReader | None,
         corpus_inventory: RuleCorpusInventoryPort,
         feature_provider: RuleFeatureProvider | None,
+        goodware_measurement: GoodwareMeasurementService | None = None,
+        goodware_suspicious_count: int = 3,
+        goodware_banal_count: int = 10,
         article_claims: RuleArticleClaimPort | None = None,
         max_tool_seconds: int = 30,
     ) -> None:
@@ -1155,6 +1167,13 @@ class _RuleTools:
         self.evidence_payloads = evidence_payloads
         self.corpus_inventory = corpus_inventory
         self.feature_provider = feature_provider
+        self.goodware_measurement = goodware_measurement
+        self.goodware_scorer = BanalityScorer(
+            BanalityThresholds(
+                suspicious_count=goodware_suspicious_count,
+                banal_count=goodware_banal_count,
+            )
+        )
         self.article_claims = article_claims
         self.max_tool_seconds = max_tool_seconds
 
@@ -2624,6 +2643,7 @@ class _RuleTools:
         meta: Mapping[str, str | int | bool] | None,
     ) -> _CreatedRuleCandidate:
         assert self.workbench is not None and self.candidates is not None
+        motifs = await self._measure_goodware_motifs(context.investigation_id, motifs)
         validation = self.workbench.validate_motifs(motifs, meta=meta, condition=condition)
         if not validation.valid:
             raise _ToolFailed(
@@ -2778,6 +2798,70 @@ class _RuleTools:
                 ),
             ) from exc
         return _CreatedRuleCandidate(version=stored, compile_check=compile_check)
+
+    async def _measure_goodware_motifs(
+        self, investigation_id: UUID, motifs: Sequence[RuleMotif]
+    ) -> tuple[RuleMotif, ...]:
+        def unmeasured(reason: str) -> tuple[RuleMotif, ...]:
+            return tuple(
+                replace(
+                    motif,
+                    goodware_occurrence_count=None,
+                    goodware_measurement_status=GoodwareMotifMeasurementStatus.UNMEASURED,
+                    goodware_measurement_reason=reason,
+                    goodware_banality=None,
+                )
+                for motif in motifs
+            )
+
+        baseline_reader = getattr(self.corpus_inventory, "goodware_baseline_id", None)
+        if not callable(baseline_reader):
+            return unmeasured("investigation_goodware_baseline_unbound")
+        try:
+            baseline_id = await baseline_reader(investigation_id)
+        except Exception:
+            return unmeasured("goodware_baseline_lookup_failed")
+        if baseline_id is None:
+            return unmeasured("investigation_goodware_baseline_unbound")
+        if self.goodware_measurement is None:
+            return unmeasured("goodware_measurement_service_unavailable")
+
+        descriptors = tuple(_goodware_motif_descriptor(motif) for motif in motifs)
+        lookup_descriptors = tuple(item for item in descriptors if item is not None)
+        try:
+            prepared = await self.goodware_measurement.prepare(baseline_id)
+            occurrence_counts = await prepared.lookup_batch(lookup_descriptors)
+        except Exception:
+            return unmeasured("goodware_index_unavailable")
+
+        measured: list[RuleMotif] = []
+        for motif, descriptor in zip(motifs, descriptors, strict=True):
+            if descriptor is None:
+                measured.append(
+                    replace(
+                        motif,
+                        goodware_occurrence_count=None,
+                        goodware_measurement_status=GoodwareMotifMeasurementStatus.UNMEASURED,
+                        goodware_measurement_reason="unsupported_motif_kind_or_pattern",
+                        goodware_banality=None,
+                    )
+                )
+                continue
+            occurrence_count = occurrence_counts.get(descriptor, 0)
+            measured.append(
+                replace(
+                    motif,
+                    goodware_occurrence_count=occurrence_count,
+                    goodware_measurement_status=GoodwareMotifMeasurementStatus.MEASURED,
+                    goodware_measurement_reason=None,
+                    goodware_banality=(
+                        self.goodware_scorer.score(occurrence_count)
+                        if occurrence_count > 0
+                        else None
+                    ),
+                )
+            )
+        return tuple(measured)
 
     def _version_output(
         self,
@@ -3086,14 +3170,23 @@ class _RuleTools:
             item.role is RuleTestCorpusRole.GOODWARE for item in all_manual_imports
         )
         if not manual_goodware_present and not manual_import_read_failed:
-            add_limitation(
-                "Aucun fichier binaire goodware n'est présent dans le corpus de règles.",
-                blocking=False,
-            )
+            if goodware_baseline_id is None:
+                add_limitation(
+                    "Goodware non mesuré: aucune baseline n'est liée à cette investigation. "
+                    "Aucun fichier binaire goodware n'est présent dans le corpus de règles.",
+                    blocking=False,
+                )
+            else:
+                add_limitation(
+                    "Aucun fichier binaire goodware n'est présent dans le corpus de règles; "
+                    "la baseline contient des fréquences de motifs, pas les octets nécessaires "
+                    "pour mesurer les faux positifs de la règle.",
+                    blocking=False,
+                )
         if goodware_baseline_id is None and not goodware_baseline_read_failed:
             add_limitation(
-                "Aucune goodware_baseline n'est liée à cette investigation; les tests goodware "
-                "restent limités aux imports par SHA.",
+                "Aucune goodware_baseline n'est liée à cette investigation; la banalité des "
+                "motifs ne peut pas être mesurée depuis l'index goodware.",
                 blocking=False,
             )
         ordered_cases = tuple(
@@ -3542,6 +3635,7 @@ def _report_payload(
         "goodware_baseline_id": (
             str(corpus.goodware_baseline_id) if corpus.goodware_baseline_id else None
         ),
+        "goodware_measurement": _goodware_test_measurement(report, corpus),
         "holdout_overlap_sha256s": list(corpus.holdout_overlap_sha256s),
         "conflicting_role_sha256s": list(corpus.conflicting_role_sha256s),
         "provenance_counts_by_role": report.provenance_counts_by_role,
@@ -3731,6 +3825,19 @@ def _bounded_report_payload_summary(payload: Mapping[str, Any]) -> dict[str, Any
             )
     raw_reasons = payload.get("validation_reasons")
     raw_limitations = payload.get("limitations")
+    goodware_measurement = payload.get("goodware_measurement")
+    goodware_summary = (
+        {
+            "status": goodware_measurement.get("status"),
+            "reason": goodware_measurement.get("reason"),
+            "baseline_id": goodware_measurement.get("baseline_id"),
+            "match_count": len(goodware_measurement.get("matches", ())),
+            "non_match_count": len(goodware_measurement.get("non_matches", ())),
+            "non_measurable_count": len(goodware_measurement.get("non_measurable", ())),
+        }
+        if isinstance(goodware_measurement, Mapping)
+        else None
+    )
     return {
         "schema": "investigation-yara-test-summary.v1",
         "source_sha256": payload.get("source_sha256"),
@@ -3745,6 +3852,7 @@ def _bounded_report_payload_summary(payload: Mapping[str, Any]) -> dict[str, Any
         "false_positive_count": payload.get("false_positive_count", 0),
         "false_negative_count": payload.get("false_negative_count", 0),
         "non_measurable_count": payload.get("non_measurable_count", 0),
+        "goodware_measurement": goodware_summary,
         "test_case_count": test_case_count,
         "roles": role_summary,
         "limitations": [str(item)[:400] for item in raw_limitations[:12]]
@@ -4034,6 +4142,7 @@ def _report_summary(
         result["goodware_baseline_id"] = (
             str(corpus.goodware_baseline_id) if corpus.goodware_baseline_id else None
         )
+        result["goodware_measurement"] = _goodware_test_measurement(report, corpus)
         result["holdout_overlap_sha256s"] = list(corpus.holdout_overlap_sha256s)
         result["conflicting_role_sha256s"] = list(corpus.conflicting_role_sha256s)
         result["limitations"] = list(
@@ -4115,6 +4224,16 @@ def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, 
             {
                 "motif_sha256": hashlib.sha256(item.motif.encode("utf-8")).hexdigest(),
                 "kind": provenance.get("kind", "unknown"),
+                "goodware_occurrence_count": provenance.get("goodware_occurrence_count"),
+                "goodware_measurement_status": provenance.get(
+                    "goodware_measurement_status", "unmeasured"
+                ),
+                "goodware_measurement_reason": provenance.get(
+                    "goodware_measurement_reason", "not_measured"
+                ),
+                "goodware_banality": provenance.get("goodware_banality"),
+                "goodware_non_discriminant": provenance.get("goodware_banality")
+                == Banality.BANAL.value,
                 "source_method": source_method if isinstance(source_method, str) else "unknown",
                 "source_sha256": source_sha256 if isinstance(source_sha256, str) else None,
                 "offsets": offsets if isinstance(offsets, list) else None,
@@ -4611,6 +4730,25 @@ def _motifs_from_json(raw_motifs: Sequence[Mapping[str, Any]]) -> tuple[RuleMoti
     return tuple(result)
 
 
+def _goodware_motif_descriptor(motif: RuleMotif) -> tuple[str, str] | None:
+    if motif.kind in {
+        RuleMotifKind.STRING,
+        RuleMotifKind.WIDE,
+        RuleMotifKind.BASE64,
+    }:
+        normalized = unicodedata.normalize("NFC", motif.value).lower()
+        return ("string", normalized) if normalized else None
+    if motif.kind in {RuleMotifKind.HEX, RuleMotifKind.CODE_SEQUENCE}:
+        normalized = re.sub(r"\s+", "", motif.value).lower()
+        if (
+            16 <= len(normalized) <= 32
+            and len(normalized) % 2 == 0
+            and re.fullmatch(r"[0-9a-f]+", normalized)
+        ):
+            return "opcode_fragment16", normalized
+    return None
+
+
 def _motif_payload(motif: RuleMotif) -> dict[str, Any]:
     """Serialize one typed motif for the existing rule tool contract."""
     payload: dict[str, Any] = {
@@ -4658,6 +4796,13 @@ def _motifs_from_version(version: DetectionCandidateVersion) -> tuple[RuleMotif,
                     positive_support=metadata.get("positive_support"),
                     benign_prevalence=metadata.get("benign_prevalence"),
                     goodware_occurrence_count=metadata.get("goodware_occurrence_count"),
+                    goodware_measurement_status=metadata.get(
+                        "goodware_measurement_status", "unmeasured"
+                    ),
+                    goodware_measurement_reason=metadata.get(
+                        "goodware_measurement_reason", "not_measured"
+                    ),
+                    goodware_banality=metadata.get("goodware_banality"),
                 )
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -4814,6 +4959,9 @@ def _serialize_motif(
         "positive_support": motif.positive_support,
         "benign_prevalence": motif.benign_prevalence,
         "goodware_occurrence_count": motif.goodware_occurrence_count,
+        "goodware_measurement_status": motif.goodware_measurement_status.value,
+        "goodware_measurement_reason": motif.goodware_measurement_reason,
+        "goodware_banality": motif.goodware_banality.value if motif.goodware_banality else None,
         "source_bytes_verified": source_bytes_verified,
     }
     if source_validator_findings:
@@ -5011,6 +5159,49 @@ def _meta_from_source(source: str) -> dict[str, str | int | bool]:
 
 def _role_for(report: RuleTestReport, role: RuleTestCorpusRole) -> RuleRoleTestReport:
     return next(item for item in report.roles if item.role is role)
+
+
+def _goodware_test_measurement(
+    report: RuleTestReport, corpus: _RuleCorpusSnapshot
+) -> dict[str, Any]:
+    role = _role_for(report, RuleTestCorpusRole.GOODWARE)
+    if report.execution_status is not YaraExecutionStatus.OK:
+        state = "unmeasured"
+        reason = "rule_execution_not_completed"
+        message = "Goodware non mesuré: le moteur YARA n'a pas terminé le test."
+    elif not role.test_cases:
+        state = "unmeasured"
+        if corpus.goodware_baseline_id is None:
+            reason = "goodware_baseline_unbound_and_binary_corpus_empty"
+            message = (
+                "Goodware non mesuré: aucune baseline n'est liée et aucun fichier binaire "
+                "goodware n'est importé dans le corpus de règles."
+            )
+        else:
+            reason = "goodware_binary_corpus_empty"
+            message = (
+                "Goodware non mesuré: la baseline contient des fréquences de motifs, pas les "
+                "octets binaires nécessaires au test; aucun fichier goodware n'est importé."
+            )
+    elif role.non_measurable or role.errors:
+        state = "partial"
+        reason = "goodware_cases_not_fully_measured"
+        message = (
+            "La mesure goodware est partielle; certains octets ou résultats sont indisponibles."
+        )
+    else:
+        state = "measured"
+        reason = None
+        message = "Les faux positifs goodware ont été mesurés sur les fichiers importés."
+    return {
+        "status": state,
+        "reason": reason,
+        "message": message,
+        "baseline_id": str(corpus.goodware_baseline_id) if corpus.goodware_baseline_id else None,
+        "matches": list(role.matches),
+        "non_matches": list(role.non_matches),
+        "non_measurable": list(role.non_measurable),
+    }
 
 
 def _rule_case(

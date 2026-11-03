@@ -40,6 +40,18 @@ Les versions persistées requièrent des références vers des observations de
 preuve pour chaque motif, conformément à `MotifProvenance` d'A1. Les offsets
 peuvent être absents lorsque la source ne les mesure pas.
 
+## Chargement et mesures goodware
+
+`make goodware-build` construit l'index v2 hors dépôt depuis `GOODWARE_SOURCE_DIR` (défaut : `$HOME/tools/yarGen/dbs`) vers `GOODWARE_ARTIFACT_DIR` (défaut : `$HOME/.local/share/autowork/goodware/v2`). Un artefact existant est vérifié et réutilisé; `GOODWARE_REBUILD=1` demande explicitement sa reconstruction.
+
+`make goodware-load` passe par `GoodwareService.import_index`, stocke les blobs avec leurs empreintes, puis prépare le cache configuré par `GOODWARE_CACHE_ROOT`. L'import et le lien optionnel `GOODWARE_INVESTIGATION_ID=<uuid>` sont idempotents. `make goodware-status` affiche les versions, empreintes et nombres de la base sans la modifier. Ces commandes utilisent la configuration backend courante pour PostgreSQL et MinIO.
+
+Quand l'investigation a une baseline liée, `rule.propose` mesure les motifs chaîne et hexadécimaux pris en charge dans l'index. La version et sa signature exposent le nombre d'occurrences, le statut et la banalité; une fréquence au seuil `GOODWARE_BANAL_COUNT` est marquée `BANAL` et non discriminante. Sans baseline, le motif porte le statut `unmeasured` avec sa raison.
+
+L'index de fréquences ne contient pas les octets des fichiers goodware. `rule.test` mesure les faux positifs sur les fichiers importés dans le corpus d'enquête avec le rôle `goodware`; son observation déclare les hashes qui matchent et le statut de mesure. Si aucun fichier goodware n'est importé, l'observation indique explicitement pourquoi la mesure n'a pas eu lieu. `rule.propose_bridge` ne fait qu'importer et compiler le brouillon Bridge; appeler `rule.test` pour mesurer son résultat.
+
+Au démarrage, l'application journalise un WARNING si aucune baseline n'est enregistrée. `/api/health/ready` expose le statut et les métadonnées des baselines sans les inclure dans le calcul de disponibilité de l'application.
+
 ## Rapport et portée du corpus
 
 Chaque `RuleTestReport` déclare, pour les rôles confirmed positive,

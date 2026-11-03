@@ -112,6 +112,12 @@ WORKFLOW_RESULTS_DIR ?= $(CURDIR)/var/workflow-results
 # WORKFLOW_PYTEST_TIME_CMD="/usr/bin/time -v -o /tmp/pytest-time.txt").
 WORKFLOW_PYTEST_TIME_CMD ?=
 
+# Goodware sources remain outside the repository; derived artifacts do too.
+GOODWARE_SOURCE_DIR ?= $$HOME/tools/yarGen/dbs
+GOODWARE_ARTIFACT_DIR ?= $$HOME/.local/share/autowork/goodware/v2
+GOODWARE_INVESTIGATION_ID ?=
+GOODWARE_REBUILD ?= 0
+
 
 # ==============================================================================
 # Application data
@@ -172,6 +178,9 @@ CLEAN_PATHS := \
 	typecheck-frontend \
 	format \
 	model-run-diagnostics \
+	goodware-build \
+	goodware-load \
+	goodware-status \
 	diagnostics \
 	ctx \
 	ctx-dense \
@@ -670,6 +679,24 @@ model-run-diagnostics: ## Diagnostic d'un model run: RUN_ID=<uuid>
 	)
 	$(STACK_COMPOSE) exec -T backend \
 		python -m cti_app.model_run_diagnostics "$(RUN_ID)"
+
+goodware-build: ## Construit ou vérifie l'index goodware v2 hors dépôt
+	@set -eu; \
+	source_dir="$(GOODWARE_SOURCE_DIR)"; \
+	artifact_dir="$(GOODWARE_ARTIFACT_DIR)"; \
+	if [ "$(GOODWARE_REBUILD)" = "1" ]; then \
+		python3 scripts/import_goodware.py build-index "$$source_dir" "$$artifact_dir" --overwrite; \
+	elif [ -f "$$artifact_dir/manifest.json" ]; then \
+		python3 scripts/import_goodware.py verify-index "$$artifact_dir" --source-dir "$$source_dir"; \
+	else \
+		python3 scripts/import_goodware.py build-index "$$source_dir" "$$artifact_dir"; \
+	fi
+
+goodware-load: goodware-build ## Importe via GoodwareService et prépare le cache local
+	cd $(BACKEND_DIR) && PYTHONPATH=src $(UV_RUN) python ../scripts/goodware_admin.py load --artifact-dir "$(GOODWARE_ARTIFACT_DIR)" --source-dir "$(GOODWARE_SOURCE_DIR)" $(if $(GOODWARE_INVESTIGATION_ID),--investigation-id "$(GOODWARE_INVESTIGATION_ID)")
+
+goodware-status: ## Affiche les baselines goodware sans modifier l'état
+	cd $(BACKEND_DIR) && PYTHONPATH=src $(UV_RUN) python ../scripts/goodware_admin.py status
 
 # Timeline of var/diagnostics/events.jsonl.
 #

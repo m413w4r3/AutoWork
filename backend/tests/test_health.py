@@ -2,8 +2,10 @@ import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
 
+from cti_app.application.goodware import GoodwareServiceStatus
 from cti_app.application.health import DependencyStatus
 from cti_app.config import Settings
+from cti_app.domain.goodware import GoodwareServiceState
 
 
 class FakeReadinessChecker:
@@ -23,6 +25,11 @@ class FakeModelGatewayStatus:
             "forced_backend": None,
             "configured_backends": {"chatgpt_bridge": True, "qwen": True},
         }
+
+
+class FakeGoodwareService:
+    async def status(self) -> GoodwareServiceStatus:
+        return GoodwareServiceStatus(state=GoodwareServiceState.ABSENT)
 
 
 @pytest.mark.asyncio
@@ -52,6 +59,30 @@ async def test_ready_reports_all_dependencies(client: AsyncClient, app: FastAPI)
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert set(response.json()["dependencies"]) == {"postgresql", "redis", "object_storage"}
+
+
+@pytest.mark.asyncio
+async def test_ready_exposes_absent_goodware_without_blocking_readiness(
+    client: AsyncClient, app: FastAPI
+) -> None:
+    app.state.readiness = FakeReadinessChecker(
+        {
+            "postgresql": DependencyStatus(status="ok"),
+            "redis": DependencyStatus(status="ok"),
+            "object_storage": DependencyStatus(status="ok"),
+        }
+    )
+    app.state.goodware_service = FakeGoodwareService()
+
+    response = await client.get("/api/health/ready")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["goodware"] == {
+        "status": "absent",
+        "reason": None,
+        "baselines": [],
+    }
 
 
 @pytest.mark.asyncio
