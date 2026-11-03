@@ -261,10 +261,7 @@ def resolve_bridge_vt_file_report_hashes(
         and data_id.isascii()
         and re.fullmatch(r"[0-9a-f]{64}", data_id.casefold()) is not None
     )
-    if sha256 is None and data_id_is_sha256:
-        assert isinstance(data_id, str)
-        resolved_sha256 = data_id.casefold()
-    elif (
+    if (
         isinstance(sha256, str)
         and sha256.isascii()
         and re.fullmatch(r"[0-9a-f]{64}", sha256.casefold())

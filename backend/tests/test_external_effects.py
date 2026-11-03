@@ -69,6 +69,7 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     SqlAlchemyExternalEffectClaimStore,
     _ConsumeDenied,
     _family_credentials_match,
+    _observation_refusal_detail,
 )
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
     SqlAlchemyVirusTotalPolicyGuard,
@@ -3413,8 +3414,31 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
         object_id=md5,
         report_content=json.dumps(id_only_payload).encode(),
     )
-    assert id_only_resolution is not None
-    assert id_only_resolution.sha256 == sha256
+    assert id_only_resolution is None
+    missing_md5_payload = json.loads(report)
+    del missing_md5_payload["data"]["attributes"]["md5"]
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=json.dumps(missing_md5_payload).encode(),
+        )
+        is None
+    )
+    missing_sha1_payload = json.loads(report)
+    del missing_sha1_payload["data"]["attributes"]["sha1"]
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha1,
+            report_content=json.dumps(missing_sha1_payload).encode(),
+        )
+        is None
+    )
     conflicting_id_payload = json.loads(report)
     conflicting_id_payload["data"]["id"] = "d" * 64
     assert (
@@ -3488,6 +3512,54 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
             report_content=b"not-json",
         )
         is None
+    )
+
+
+def test_bridge_vt_sha256_report_rejects_incomplete_osint_fixture_shape() -> None:
+    sha256 = "c" * 64
+    report_payload = {
+        "data": {
+            "id": sha256,
+            "type": "file",
+            "attributes": {"sha256": sha256},
+        }
+    }
+    incomplete_report = json.dumps(report_payload).encode()
+
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha256,
+            report_content=incomplete_report,
+        )
+        is None
+    )
+    observation_id = uuid4()
+    refusal_detail = _observation_refusal_detail(
+        SimpleNamespace(
+            id=observation_id,
+            object_type="file",
+            source="VirusTotal",
+            object_id=sha256,
+        )
+    )
+    assert f"id={observation_id.hex}" in refusal_detail
+
+    report_payload["data"]["attributes"].update(
+        {"md5": "a" * 32, "sha1": "b" * 40}
+    )
+    complete_report = json.dumps(report_payload).encode()
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha256,
+            report_content=complete_report,
+        )
+        == sha256
     )
 
 
