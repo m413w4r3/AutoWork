@@ -141,6 +141,7 @@ class ExistingClaim:
 @dataclass(frozen=True, slots=True)
 class ConsumeRefused:
     reason: str
+    detail: str | None = None
 
 
 ConsumeResult = ConsumeCommitted | ExistingClaim | ConsumeRefused
@@ -454,6 +455,7 @@ class Reused:
 class Refused:
     reason: str
     framework_no_send_proof: FrameworkNoSendProof
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,9 +781,13 @@ class ExternalEffectCoordinator:
                 )
 
             if isinstance(consume, ConsumeRefused):
+                refusal_reason = consume.reason
+                if consume.detail is not None:
+                    refusal_reason = f"{refusal_reason}:{consume.detail}"
                 return Refused(
-                    reason=consume.reason,
+                    reason=refusal_reason,
                     framework_no_send_proof=FrameworkNoSendProof("PRE_CONSUME", consume.reason),
+                    detail=consume.detail,
                 )
             if isinstance(consume, ExistingClaim):
                 return await self._handle_existing(consume.claim, authority, prepared)

@@ -4253,3 +4253,201 @@ async def test_bridge_source_restrictions_accept_provider_report_of_unacquired_h
         assert (refused is None) is allowed, refused
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sample_flags", "lineage", "allowed"),
+    [
+        pytest.param({"external_llm_allowed": True}, "expected_hash", True, id="owned-md5-allowed"),
+        pytest.param(
+            {"external_llm_allowed": False}, "expected_hash", False, id="owned-md5-external-denied"
+        ),
+        pytest.param({"tlp": "RED"}, "expected_hash", False, id="owned-md5-tlp-red"),
+        pytest.param(
+            {"license_restriction": "restricted"},
+            "expected_hash",
+            False,
+            id="owned-md5-license-denied",
+        ),
+        pytest.param(
+            {"external_llm_allowed": False},
+            "source_object_id",
+            False,
+            id="owned-md5-source-id-denied",
+        ),
+        pytest.param(None, "blob", True, id="unacquired-md5-provider-report"),
+    ],
+)
+async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_report(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    sample_flags: dict[str, Any] | None,
+    lineage: str,
+    allowed: bool,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    observation_id = uuid4()
+    try:
+        # These are the values emitted by the VT file-report recorder.
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash="c" * 32,
+            observation_source="VirusTotal",
+            sample_flags=sample_flags,
+            lineage=lineage,
+        )
+        observation_id = UUID(reference.id)
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True)
+        async with session_factory() as session:
+            async with session.begin():
+                try:
+                    await store._check_source_restrictions(
+                        session, authority, prepared, subject_id, binding
+                    )
+                    refused: _ConsumeDenied | None = None
+                except _ConsumeDenied as exc:
+                    refused = exc
+        assert (refused is None) is allowed, refused
+        if not allowed:
+            assert refused is not None
+            assert refused.reason == "sample_source_restricted"
+            assert refused.detail is not None
+            assert observation_id.hex in refused.detail
+            assert "t=file" in refused.detail
+            assert "s=VirusTotal" in refused.detail
+            assert "h=32" in refused.detail
+            assert "drop_ref_or_cite_sha256" in refused.detail
+            assert "c" * 32 not in refused.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "report_hash",
+    [
+        pytest.param("c" * 31, id="short-31-hex"),
+        pytest.param("C" * 32, id="uppercase-md5"),
+        pytest.param("g" * 32, id="non-hex-md5"),
+    ],
+)
+async def test_bridge_rejects_malformed_vt_short_file_hash_with_safe_observation_detail(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    report_hash: str,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=report_hash,
+            observation_source="VirusTotal",
+            sample_flags=None,
+            lineage="blob",
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True)
+        async with session_factory() as session:
+            async with session.begin():
+                with pytest.raises(_ConsumeDenied) as denied:
+                    await store._check_source_restrictions(
+                        session, authority, prepared, subject_id, binding
+                    )
+        assert denied.value.reason == "unresolvable_evidence_observation_source"
+        assert denied.value.detail is not None
+        assert UUID(reference.id).hex in denied.value.detail
+        assert "t=file" in denied.value.detail
+        assert "s=VirusTotal" in denied.value.detail
+        assert f"h={len(report_hash)}" in denied.value.detail
+        assert report_hash not in denied.value.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sample_flags", "allowed"),
+    [
+        pytest.param({"external_llm_allowed": True}, True, id="owned-md5-bridge-consult-allowed"),
+        pytest.param(
+            {"external_llm_allowed": False}, False, id="owned-md5-bridge-consult-denied-with-ref"
+        ),
+    ],
+)
+async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_details(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    sample_flags: dict[str, Any],
+    allowed: bool,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        authority,
+        base_prepared,
+        store,
+        _run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    try:
+        async with session_factory() as session:
+            investigation = await session.get(AnalystInvestigationRow, investigation_id)
+        assert investigation is not None
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=investigation.subject_id,
+            report_hash="c" * 32,
+            observation_source="VirusTotal",
+            sample_flags=sample_flags,
+            lineage="expected_hash",
+        )
+        prepared = replace(base_prepared, evidence_refs=(reference,))
+        transport = _CountingTransport()
+
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+
+        if allowed:
+            assert isinstance(outcome, Completed), outcome
+            assert transport.calls == 1
+        else:
+            assert isinstance(outcome, Refused), outcome
+            assert outcome.reason.startswith("sample_source_restricted:")
+            assert UUID(reference.id).hex in outcome.reason
+            assert "t=file" in outcome.reason
+            assert "s=VirusTotal" in outcome.reason
+            assert "h=32" in outcome.reason
+            assert "drop_ref_or_cite_sha256" in outcome.reason
+            assert "c" * 32 not in outcome.reason
+            assert len(outcome.reason) <= 128
+            assert transport.calls == 0
+    finally:
+        await engine.dispose()

@@ -85,9 +85,40 @@ from cti_app.infrastructure.database.repositories.investigation import (
 
 
 class _ConsumeDenied(Exception):
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, detail: str | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail
+
+
+def _observation_refusal_detail(observation: EvidenceObservationRow) -> str:
+    """Return a bounded, hash-content-free Bridge refusal detail code."""
+    observation_id = observation.id.hex if isinstance(observation.id, UUID) else "unknown"
+    object_type = observation.object_type
+    source = observation.source
+    object_id = observation.object_id
+    safe_type = (
+        re.sub(r"[^A-Za-z0-9_.-]", "_", object_type)[:16]
+        if isinstance(object_type, str) and object_type
+        else "unknown"
+    )
+    safe_source = (
+        re.sub(r"[^A-Za-z0-9_.-]", "_", source)[:11]
+        if isinstance(source, str) and source
+        else "unknown"
+    )
+    object_id_length = len(object_id) if isinstance(object_id, str) else 0
+    safe_length = str(object_id_length) if object_id_length <= 999 else "large"
+    action = (
+        "drop_ref_or_cite_sha256"
+        if isinstance(object_type, str)
+        and object_type.casefold()
+        in {"file", "sample", "sample_observation", "md5", "sha1", "sha256"}
+        else "drop_ref"
+    )
+    # UUID.hex is the same identifier without hyphens. The compact fields keep
+    # the combined code within Bridge's 128-character refusal limit.
+    return f"id={observation_id}:t={safe_type}:s={safe_source}:h={safe_length}:a={action}"
 
 
 SourceReferenceResolver = Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]
@@ -547,7 +578,7 @@ class SqlAlchemyExternalEffectClaimStore:
                             result = ConsumeCommitted(row_id)
             return result
         except _ConsumeDenied as denied:
-            return ConsumeRefused(denied.reason)
+            return ConsumeRefused(denied.reason, detail=denied.detail)
 
     async def enter_handoff(
         self,
@@ -1518,6 +1549,7 @@ class SqlAlchemyExternalEffectClaimStore:
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
         provider_report_hashes: set[str] = set()
+        provider_report_observations: dict[str, EvidenceObservationRow] = {}
         observation_file_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
@@ -1612,6 +1644,13 @@ class SqlAlchemyExternalEffectClaimStore:
                     "vt.file_report",
                     "vt.relationships",
                 }
+                is_bridge_provider_file_report = (
+                    is_bridge_submission
+                    and object_type == "file"
+                    and bridge_may_cite_provider_report_hash_without_sample(
+                        family=prepared.family, observation=observation
+                    )
+                )
                 if supports_short_file_hash:
                     file_object_types.update({"sha256", "md5", "sha1"})
                 elif vt_file_hash_read:
@@ -1619,30 +1658,46 @@ class SqlAlchemyExternalEffectClaimStore:
                 elif is_bridge_submission:
                     file_object_types.add("sha256")
                 if object_type in file_object_types:
-                    normalized_observation_hash = observation.object_id.casefold()
+                    raw_observation_hash = observation.object_id
+                    normalized_observation_hash = (
+                        raw_observation_hash
+                        if is_bridge_provider_file_report
+                        and isinstance(raw_observation_hash, str)
+                        and len(raw_observation_hash) in {32, 40}
+                        else raw_observation_hash.casefold()
+                    )
                     hash_pattern = (
                         r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})"
-                        if supports_short_file_hash
+                        if supports_short_file_hash or is_bridge_provider_file_report
                         else r"[0-9a-f]{64}"
                     )
                     if not re.fullmatch(hash_pattern, normalized_observation_hash):
-                        raise _ConsumeDenied("unresolvable_evidence_observation_source")
+                        raise _ConsumeDenied(
+                            "unresolvable_evidence_observation_source",
+                            detail=_observation_refusal_detail(observation),
+                        )
                     if vt_file_hash_read:
                         observation_file_hashes.add(normalized_observation_hash)
-                    if len(normalized_observation_hash) == 64:
-                        if bridge_may_cite_provider_report_hash_without_sample(
-                            family=prepared.family, observation=observation
-                        ):
-                            provider_report_hashes.add(normalized_observation_hash)
-                        else:
-                            observation_hashes.add(normalized_observation_hash)
+                    if bridge_may_cite_provider_report_hash_without_sample(
+                        family=prepared.family, observation=observation
+                    ):
+                        provider_report_hashes.add(normalized_observation_hash)
+                        provider_report_observations[normalized_observation_hash] = observation
+                    elif len(normalized_observation_hash) == 64:
+                        observation_hashes.add(normalized_observation_hash)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
                     except ValueError as exc:
-                        raise _ConsumeDenied("unresolvable_evidence_observation_source") from exc
+                        raise _ConsumeDenied(
+                            "unresolvable_evidence_observation_source",
+                            detail=_observation_refusal_detail(observation),
+                        ) from exc
                 elif is_model_submission and not is_bridge_submission:
-                    raise _ConsumeDenied("unresolvable_evidence_observation_source")
+                    raise _ConsumeDenied(
+                        "unresolvable_evidence_observation_source",
+                        detail=_observation_refusal_detail(observation),
+                    )
 
         if vt_file_hash_read and sample_hashes and not observation_hashes.issubset(sample_hashes):
             raise _ConsumeDenied("vt_source_observation_hash_mismatch")
@@ -1753,6 +1808,7 @@ class SqlAlchemyExternalEffectClaimStore:
                     )
                     .order_by(SampleRow.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             )
         if (vt_file_hash_read or prepared.family == "vt.intelligence_search") and source_hashes:
@@ -1788,6 +1844,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 .execution_options(populate_existing=True)
             )
         )
+        report_hash_sample_ids = {item.id for item in report_hash_samples}
         for sample in [*samples, *report_hash_samples]:
             if (
                 sample.subject_id != subject_id
@@ -1798,7 +1855,26 @@ class SqlAlchemyExternalEffectClaimStore:
                 )
                 or bool((sample.license_restriction or "").strip())
             ):
-                raise _ConsumeDenied("sample_source_restricted")
+                detail = None
+                if sample.id in report_hash_sample_ids:
+                    matching_report_hashes = {
+                        report_hash
+                        for report_hash in provider_report_hashes
+                        if sample.expected_hash == report_hash
+                        or sample.source_object_id == report_hash
+                    }
+                    if not matching_report_hashes:
+                        blob_hash = await session.scalar(
+                            select(BlobRow.sha256).where(BlobRow.id == sample.blob_id)
+                        )
+                        if blob_hash in provider_report_hashes:
+                            matching_report_hashes.add(blob_hash)
+                    if matching_report_hashes:
+                        report_observation = provider_report_observations[
+                            sorted(matching_report_hashes)[0]
+                        ]
+                        detail = _observation_refusal_detail(report_observation)
+                raise _ConsumeDenied("sample_source_restricted", detail=detail)
         if sample_ids and {sample.id for sample in samples} != sample_ids:
             raise _ConsumeDenied("sample_source_missing")
 

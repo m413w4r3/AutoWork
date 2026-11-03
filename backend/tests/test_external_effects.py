@@ -1375,6 +1375,25 @@ async def test_refusal_mints_no_permit_and_never_sends() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refusal_detail_is_additive_and_reaches_coordinator_reason() -> None:
+    detail = (
+        "id=89c70553451140a18f3014f9e3fc4ea8:t=file:s=VirusTotal:h=32:a=drop_ref_or_cite_sha256"
+    )
+    store = FakeStore(ConsumeRefused("unresolvable_evidence_observation_source", detail=detail))
+    transport = FakeTransport()
+
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+
+    assert isinstance(outcome, Refused)
+    assert outcome.reason == f"unresolvable_evidence_observation_source:{detail}"
+    assert outcome.reason.startswith("unresolvable_evidence_observation_source:")
+    assert len(outcome.reason) <= 128
+    assert outcome.detail == detail
+    assert outcome.framework_no_send_proof.reason_code == "unresolvable_evidence_observation_source"
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_committed_consume_mints_one_permit_and_calls_transport_once() -> None:
     store = FakeStore()
     transport = FakeTransport(store.events)
