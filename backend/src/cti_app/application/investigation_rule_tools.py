@@ -277,8 +277,8 @@ RULE_PROPOSE_BRIDGE_SCHEMA = _schema(
             "type": "string",
             "pattern": _SHA256_PATTERN,
             "description": (
-                "SHA-256 of the exact persisted YARA rule source to import; selects one entry "
-                "from output.rules when the advisor returned multiple rules."
+                "Optional SHA-256 of the exact persisted YARA rule source to import. It selects "
+                "one entry from output.rules; omit it to import every returned rule."
             ),
         },
         "candidate_id": _allow_empty_optional(
@@ -286,7 +286,7 @@ RULE_PROPOSE_BRIDGE_SCHEMA = _schema(
             "Optional UUID; omit or leave empty to create a new candidate.",
         ),
     },
-    ("bridge_observation_id", "bridge_invocation_id", "rule_source_sha256"),
+    ("bridge_observation_id", "bridge_invocation_id"),
 )
 
 RULE_OPERATOR_SYNTAX_FIX_SCHEMA = _schema(
@@ -1483,25 +1483,137 @@ class _RuleTools:
         )
         return output, status, ()
 
+    async def _resolve_bridge_yara_observation(
+        self,
+        received_id: UUID,
+        *,
+        requested_invocation_id: UUID,
+        context: ToolExecutionContext,
+    ) -> tuple[EvidenceObservation, EvidenceObservation]:
+        assert self.evidence_observations is not None and self.evidence_payloads is not None
+        payload_store = self.evidence_payloads
+        received = await self.evidence_observations.get(received_id)
+        received_type = received.object_type if received is not None else "unknown"
+        received_source = received.source if received is not None else "unknown"
+
+        def rejection(detail: str) -> _ToolFailed:
+            return _ToolFailed(
+                "bridge_yara_observation_not_found",
+                agent_message=(
+                    f"Received observation {received_id} (type {received_type!r}, "
+                    f"source {received_source!r}); {detail} Expected an advisor_call for "
+                    "yara_draft in this investigation, or an advisor response-link / related "
+                    "observation from the same invocation. Pass its observation ID and the "
+                    "matching bridge_invocation_id."
+                ),
+            )
+
+        if received is None:
+            raise rejection("the ID is unknown.")
+        if received.investigation_id != context.investigation_id:
+            raise rejection("it belongs to a different investigation.")
+        if received.kind is not EvidenceKind.OTHER:
+            raise rejection("it is not an advisor evidence observation.")
+
+        async def read_payload(
+            item: EvidenceObservation, *, verify_sha256: bool = False
+        ) -> Mapping[str, Any] | None:
+            try:
+                payload = await payload_store.read_json(item.blob_id)
+            except Exception:
+                return None
+            if not isinstance(payload, Mapping):
+                return None
+            digest = hashlib.sha256(
+                ProductionArtifactStore.canonical_json_bytes(dict(payload))
+            ).hexdigest()
+            if verify_sha256 and digest != item.sha256:
+                return None
+            return payload
+
+        async def is_yara_call(item: EvidenceObservation) -> bool:
+            if (
+                item.investigation_id != context.investigation_id
+                or item.kind is not EvidenceKind.OTHER
+                or item.source != "advisor.consult"
+                or item.object_type != "advisor_call"
+            ):
+                return False
+            payload = await read_payload(item)
+            if payload is None or payload.get("schema") != "operator-advisor-call.v1":
+                return False
+            if payload.get("consultation_type") != "yara_draft":
+                return False
+            output = payload.get("output")
+            provenance = output.get("bridge_provenance") if isinstance(output, Mapping) else None
+            persisted_invocation = payload.get("bridge_invocation_id")
+            output_invocation = (
+                provenance.get("bridge_invocation_id") if isinstance(provenance, Mapping) else None
+            )
+            return (
+                isinstance(persisted_invocation, str)
+                and bool(persisted_invocation)
+                and output_invocation == persisted_invocation
+            )
+
+        if await is_yara_call(received):
+            return received, received
+
+        if (
+            received.source == "advisor.consult.response"
+            and received.object_type == "advisor_response_received"
+        ):
+            payload = await read_payload(received, verify_sha256=True)
+            if (
+                payload is None
+                or payload.get("schema") != "operator-advisor-response-link.v1"
+                or payload.get("consultation_type") != "yara_draft"
+                or payload.get("stage") != "response_received"
+                or not isinstance(payload.get("bridge_invocation_id"), str)
+            ):
+                raise rejection(
+                    "the response link does not identify the requested YARA invocation."
+                )
+            linked_invocation_id = payload["bridge_invocation_id"]
+            if self.evidence_observations is not None:
+                for candidate in await self.evidence_observations.list_for_investigation(
+                    context.investigation_id
+                ):
+                    if (
+                        candidate.source == "advisor.consult"
+                        and candidate.object_type == "advisor_call"
+                        and await is_yara_call(candidate)
+                        and (await read_payload(candidate) or {}).get("bridge_invocation_id")
+                        == linked_invocation_id
+                    ):
+                        return candidate, received
+            raise rejection("no parent yara_draft advisor call matches its invocation ID.")
+
+        if received.invocation_ref is not None:
+            parent = await self.evidence_observations.get(received.invocation_ref)
+            if parent is not None and await is_yara_call(parent):
+                return parent, received
+
+        raise rejection("it does not resolve to a yara_draft advisor call.")
+
     async def propose_from_bridge(
-        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolExecutionContext,
+        *,
+        received_observation_id: UUID | None = None,
     ) -> tuple[Mapping[str, Any], ToolInvocationStatus, tuple[UUID, ...]]:
         assert self.workbench is not None and self.candidates is not None
         if self.evidence_observations is None or self.evidence_payloads is None:
             raise _ToolUnavailable("bridge_rule_provenance_unavailable")
-        observation_id = UUID(arguments["bridge_observation_id"])
+        supplied_observation_id = UUID(arguments["bridge_observation_id"])
         requested_invocation_id = UUID(arguments["bridge_invocation_id"])
-        requested_sha256 = arguments["rule_source_sha256"]
-        observation = await self.evidence_observations.get(observation_id)
-        if (
-            observation is None
-            or observation.investigation_id != context.investigation_id
-            or observation.kind is not EvidenceKind.OTHER
-            or observation.source != "advisor.consult"
-            or observation.object_type != "advisor_call"
-            or observation.object_id != "yara_draft"
-        ):
-            raise _ToolFailed("bridge_yara_observation_not_found")
+        requested_sha256 = _empty_optional_value(arguments.get("rule_source_sha256"))
+        observation, received_observation = await self._resolve_bridge_yara_observation(
+            received_observation_id or supplied_observation_id,
+            requested_invocation_id=requested_invocation_id,
+            context=context,
+        )
         try:
             persisted = await self.evidence_payloads.read_json(observation.blob_id)
         except Exception as exc:
@@ -1520,10 +1632,10 @@ class _RuleTools:
             and isinstance(reparsed_from, str)
         )
         parse_status_allowed = (
-            persisted.get("advisor_status") == "succeeded"
+            persisted.get("advisor_status") in {"partial", "succeeded"}
             and isinstance(output, Mapping)
-            and output.get("status") == "succeeded"
-            and output.get("advisor_status") == "succeeded"
+            and output.get("status") in {"partial", "succeeded"}
+            and output.get("advisor_status") in {"partial", "succeeded"}
         )
         if reparsed:
             try:
@@ -1654,8 +1766,9 @@ class _RuleTools:
             raise _ToolFailed(
                 "bridge_yara_invocation_id_mismatch",
                 agent_message=(
-                    "The requested invocation ID does not match this advisor call. Use the "
-                    "bridge_invocation_id persisted on the selected observation."
+                    f"Observation {received_observation.id} (type "
+                    f"{received_observation.object_type!r}) does not resolve to the requested "
+                    "invocation. Use the bridge_invocation_id persisted on that observation."
                 ),
             )
         if bridge_provenance.get("measurement_catalog") != persisted.get("measurement_catalog"):
@@ -1683,6 +1796,129 @@ class _RuleTools:
         observed_sha256 = output.get("rule_source_sha256")
         selected_rule: Mapping[str, Any] | None = None
         raw_rules = output.get("rules")
+        if requested_sha256 is None:
+            raw_rule_items = (
+                list(raw_rules)
+                if isinstance(raw_rules, Sequence) and not isinstance(raw_rules, str | bytes)
+                else []
+            )
+            rule_sources: list[tuple[str, Mapping[str, Any] | None]] = []
+            skipped_rules: list[dict[str, str]] = []
+            if raw_rule_items:
+                for index, item in enumerate(raw_rule_items):
+                    if not isinstance(item, Mapping):
+                        skipped_rules.append({"index": str(index), "reason": "rule_entry_invalid"})
+                        continue
+                    candidate_source = item.get("rule_source")
+                    candidate_sha256 = item.get("rule_source_sha256")
+                    if not isinstance(candidate_source, str) or not candidate_source.strip():
+                        skipped_rules.append({"index": str(index), "reason": "rule_source_missing"})
+                        continue
+                    computed_sha256 = hashlib.sha256(candidate_source.encode("utf-8")).hexdigest()
+                    if candidate_sha256 != computed_sha256:
+                        skipped_rules.append(
+                            {
+                                "index": str(index),
+                                "reason": "rule_source_sha256_mismatch",
+                            }
+                        )
+                        continue
+                    rule_sources.append((computed_sha256, item))
+            elif isinstance(source, str) and source.strip():
+                computed_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                if observed_sha256 not in {None, computed_sha256}:
+                    skipped_rules.append({"index": "0", "reason": "rule_source_sha256_mismatch"})
+                else:
+                    rule_sources.append((computed_sha256, None))
+
+            if not rule_sources:
+                raise _ToolFailed(
+                    "bridge_yara_source_missing_or_sha256_invalid",
+                    agent_message=(
+                        f"Observation {received_observation.id} (type "
+                        f"{received_observation.object_type!r}) contains no YARA rule with a "
+                        "matching source SHA-256. Reparse the saved response or select a rule "
+                        "whose persisted source and rule_source_sha256 agree."
+                    ),
+                )
+
+            if len(rule_sources) == 1 and not skipped_rules:
+                child_arguments = dict(arguments)
+                child_arguments["bridge_observation_id"] = str(observation.id)
+                child_arguments["rule_source_sha256"] = rule_sources[0][0]
+                return await self.propose_from_bridge(
+                    child_arguments,
+                    context,
+                    received_observation_id=received_observation.id,
+                )
+
+            explicit_candidate_id = _empty_optional_value(arguments.get("candidate_id"))
+            candidate_seed = explicit_candidate_id or (
+                f"{context.investigation_id}:{observation.id}:{requested_invocation_id}"
+            )
+            imported_candidates: list[dict[str, Any]] = []
+            candidate_refs: list[UUID] = []
+            import_statuses: list[ToolInvocationStatus] = []
+            for index, (rule_sha256, _rule_item) in enumerate(rule_sources):
+                child_candidate_id = uuid5(
+                    _UUID_NAMESPACE,
+                    f"bridge-rule-import-all:{candidate_seed}:{index}:{rule_sha256}",
+                )
+                child_arguments = dict(arguments)
+                child_arguments.update(
+                    bridge_observation_id=str(observation.id),
+                    rule_source_sha256=rule_sha256,
+                    candidate_id=str(child_candidate_id),
+                )
+                try:
+                    child_output, child_status, child_refs = await self.propose_from_bridge(
+                        child_arguments,
+                        context,
+                        received_observation_id=received_observation.id,
+                    )
+                except _ToolFailed as exc:
+                    skipped_rules.append(
+                        {
+                            "rule_source_sha256": rule_sha256,
+                            "reason": str(exc),
+                        }
+                    )
+                    continue
+                imported_candidates.append(dict(child_output))
+                import_statuses.append(child_status)
+                candidate_refs.extend(child_refs)
+            if not imported_candidates:
+                raise _ToolFailed(
+                    "bridge_yara_no_rules_imported",
+                    agent_message=(
+                        f"Observation {received_observation.id} (type "
+                        f"{received_observation.object_type!r}) had no importable YARA rules. "
+                        "Use a complete rule block with a matching SHA-256."
+                    ),
+                )
+            warnings = ["multiple_rules_imported_without_selection"]
+            if skipped_rules:
+                warnings.append("some_rules_skipped; inspect skipped_rules for details")
+            aggregate_status = (
+                ToolInvocationStatus.PARTIAL
+                if skipped_rules
+                or any(status is ToolInvocationStatus.PARTIAL for status in import_statuses)
+                else ToolInvocationStatus.SUCCEEDED
+            )
+            return (
+                {
+                    "bridge_observation_id": str(observation.id),
+                    "bridge_received_observation_id": str(received_observation.id),
+                    "bridge_invocation_id": str(requested_invocation_id),
+                    "candidate_count": len(imported_candidates),
+                    "candidate_ids": [item["candidate_id"] for item in imported_candidates],
+                    "candidates": imported_candidates,
+                    "skipped_rules": skipped_rules,
+                    "warnings": warnings,
+                },
+                aggregate_status,
+                tuple(dict.fromkeys(candidate_refs)),
+            )
         if isinstance(raw_rules, Sequence) and not isinstance(raw_rules, str | bytes):
             matching_rules = [
                 item
@@ -1701,6 +1937,12 @@ class _RuleTools:
             if raw_rules and not matching_rules:
                 raise _ToolFailed(
                     "bridge_yara_source_sha256_mismatch",
+                    agent_message=(
+                        f"Observation {received_observation.id} (type "
+                        f"{received_observation.object_type!r}) has no rule with the requested "
+                        "SHA-256. Use the exact rule_source_sha256 stored with a rule in this "
+                        "advisor response."
+                    ),
                     diagnostic=_rule_diagnostic(
                         stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
                         status=RuleDiagnosticStatus.FAILED,
@@ -1725,6 +1967,11 @@ class _RuleTools:
         if observed_sha256 != requested_sha256 or computed_source_sha256 != observed_sha256:
             raise _ToolFailed(
                 "bridge_yara_source_sha256_mismatch",
+                agent_message=(
+                    f"Observation {received_observation.id} (type "
+                    f"{received_observation.object_type!r}) failed rule-source SHA-256 "
+                    "verification. Use the SHA-256 for the exact persisted rule text."
+                ),
                 diagnostic=_rule_diagnostic(
                     stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
                     status=RuleDiagnosticStatus.FAILED,
@@ -1787,9 +2034,15 @@ class _RuleTools:
                 status,
                 tuple(
                     dict.fromkeys(
-                        reference
-                        for motif in matching_import.motif_provenance
-                        for reference in motif.observation_refs
+                        (
+                            *(
+                                reference
+                                for motif in matching_import.motif_provenance
+                                for reference in motif.observation_refs
+                            ),
+                            observation.id,
+                            received_observation.id,
+                        )
                     )
                 ),
             )
@@ -1847,7 +2100,9 @@ class _RuleTools:
             source_observation_refs.append(source_ref)
 
         motif_provenance: list[MotifProvenance] = []
-        observation_refs = tuple(dict.fromkeys((*source_observation_refs, observation.id)))
+        observation_refs = tuple(
+            dict.fromkeys((*source_observation_refs, observation.id, received_observation.id))
+        )
         source_attribution = {
             "author": "bridge",
             "source_author": "bridge",
@@ -1855,6 +2110,7 @@ class _RuleTools:
             "change_kind": "bridge_yara_draft",
             "bridge_invocation_id": str(requested_invocation_id),
             "bridge_observation_id": str(observation.id),
+            "bridge_received_observation_id": str(received_observation.id),
             "bridge_rule_source_sha256": observed_sha256,
             "validator_findings": list(advisory_issues),
             "bridge_warning_findings": _bridge_warning_codes(output),
@@ -1954,7 +2210,9 @@ class _RuleTools:
         return (
             output_value,
             status,
-            (observation.id, *source_observation_refs),
+            tuple(
+                dict.fromkeys((observation.id, received_observation.id, *source_observation_refs))
+            ),
         )
 
     def _bridge_import_output(
@@ -2015,7 +2273,11 @@ class _RuleTools:
             "validation_reasons": ["explicit_rule_test_required"],
             "bridge_invocation_id": invocation_id,
             "bridge_observation_id": observation_id,
+            "bridge_received_observation_id": attribution.get(
+                "bridge_received_observation_id", observation_id
+            ),
             "bridge_rule_source_sha256": attribution.get("bridge_rule_source_sha256"),
+            "validator_findings": list(validator_findings),
             "compile_status": compile_status.value,
             "compile_diagnostic": compile_diagnostic,
             "test_refs": [str(reference) for reference in version.test_refs],

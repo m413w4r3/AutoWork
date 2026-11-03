@@ -923,6 +923,266 @@ async def test_bridge_yara_proposal_selects_each_persisted_rule_by_its_exact_sha
     )
     assert unmatched.status is ToolInvocationStatus.FAILED
     assert unmatched.error_code == "bridge_yara_source_sha256_mismatch"
+    assert str(observation_id) in (unmatched.message or "")
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_imports_every_rule_when_no_sha_is_selected() -> None:
+    harness = _harness(samples={})
+    sources = (
+        'rule First { strings: $a = "first-marker" condition: $a }',
+        'rule Second { strings: $b = "second-marker" condition: $b }',
+    )
+    observation_id, invocation_id, _ = await _bridge_yara_observation(
+        harness, source=sources[0], motifs=[]
+    )
+    observation = await harness.evidence.repository.get(observation_id)
+    assert observation is not None
+    output = harness.evidence.payloads[observation.blob_id]["output"]
+    output["rule_source"] = None
+    output["rule_source_sha256"] = None
+    output["rules"] = [
+        {
+            "rule_source": source,
+            "rule_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "name": name,
+            "motifs": [],
+        }
+        for name, source in zip(("First", "Second"), sources, strict=True)
+    ]
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED, dict(proposed.output)
+    imported = proposed.output["candidates"]
+    assert len(imported) == 2
+    assert len({item["candidate_id"] for item in imported}) == 2
+    assert [item["bridge_rule_source_sha256"] for item in imported] == [
+        hashlib.sha256(source.encode("utf-8")).hexdigest() for source in sources
+    ]
+    for item, source in zip(imported, sources, strict=True):
+        versions = await harness.candidates.list_for_candidate(UUID(item["candidate_id"]))
+        assert len(versions) == 1
+        assert versions[0].source == source
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_response_link_resolves_parent_and_records_both_observations() -> None:
+    harness = _harness(samples={})
+    source = 'rule Linked { strings: $a = "linked-marker" condition: $a }'
+    parent_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source, motifs=[]
+    )
+    link = await harness.evidence.record_json(
+        investigation_id=harness.investigation_id,
+        kind=EvidenceKind.OTHER,
+        payload={
+            "schema": "operator-advisor-response-link.v1",
+            "stage": "response_received",
+            "consultation_type": "yara_draft",
+            "bridge_invocation_id": str(invocation_id),
+        },
+        source="advisor.consult.response",
+        source_version="advisor-consult.v1",
+        object_type="advisor_response_received",
+        object_id=str(invocation_id),
+        idempotency_key=f"advisor-response-link:{invocation_id}",
+    )
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(link.id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED, dict(proposed.output)
+    assert proposed.output["bridge_observation_id"] == str(parent_id)
+    assert proposed.output["bridge_received_observation_id"] == str(link.id)
+    assert parent_id in proposed.observation_refs
+    assert link.id in proposed.observation_refs
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_neighbor_observation_resolves_through_invocation_ref() -> None:
+    harness = _harness(samples={})
+    source = 'rule Neighbor { strings: $a = "neighbor-marker" condition: $a }'
+    parent_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source, motifs=[]
+    )
+    neighbor = await harness.evidence.record_json(
+        investigation_id=harness.investigation_id,
+        kind=EvidenceKind.OTHER,
+        payload={"schema": "advisor-neighbor.v1", "bridge_invocation_id": str(invocation_id)},
+        source="advisor.consult.metadata",
+        source_version="advisor-consult.v1",
+        object_type="advisor_call_metadata",
+        object_id=str(invocation_id),
+        invocation_ref=parent_id,
+        idempotency_key=f"advisor-neighbor:{invocation_id}",
+    )
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(neighbor.id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED, dict(proposed.output)
+    assert proposed.output["bridge_observation_id"] == str(parent_id)
+    assert proposed.output["bridge_received_observation_id"] == str(neighbor.id)
+    assert parent_id in proposed.observation_refs
+    assert neighbor.id in proposed.observation_refs
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_partial_status_imports_exploitable_rule() -> None:
+    harness = _harness(samples={})
+    source = 'rule Partial { strings: $a = "partial-marker" condition: $a }'
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source, motifs=[]
+    )
+    observation = await harness.evidence.repository.get(observation_id)
+    assert observation is not None
+    payload = harness.evidence.payloads[observation.blob_id]
+    payload["advisor_status"] = "partial"
+    payload["output"]["status"] = "partial"
+    payload["output"]["advisor_status"] = "partial"
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED, dict(proposed.output)
+    assert proposed.output["source_author"] == "bridge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "expected_finding"),
+    (
+        (
+            'import "hash"\nrule HashOnly { strings: $a = "hash-marker" '
+            'condition: hash.sha256(0, filesize) == "' + ("a" * 64) + '" }',
+            "hash_equality_condition_forbidden",
+        ),
+        (
+            'rule SizeOnly { strings: $a = "size-marker" condition: filesize == 1234 }',
+            "filesize_only_condition_forbidden",
+        ),
+    ),
+)
+async def test_bridge_yara_hash_or_size_only_rule_imports_with_warning(
+    source: str, expected_finding: str
+) -> None:
+    harness = _harness(samples={})
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source, motifs=[]
+    )
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert proposed.output["source_author"] == "bridge"
+    assert expected_finding in proposed.output["validator_findings"]
+    versions = await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
+    assert len(versions) == 1
+    assert versions[0].source == source
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_rejection_message_names_unknown_and_wrong_investigation_ids() -> None:
+    harness = _harness(samples={})
+    source = 'rule Scope { strings: $a = "scope-marker" condition: $a }'
+    parent_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source, motifs=[]
+    )
+    unknown_id = uuid4()
+    unknown = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(unknown_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert unknown.status is ToolInvocationStatus.FAILED
+    assert str(unknown_id) in (unknown.message or "")
+    assert "unknown" in (unknown.message or "").casefold()
+
+    other_investigation_id = uuid4()
+    other = await harness.evidence.record_json(
+        investigation_id=other_investigation_id,
+        kind=EvidenceKind.OTHER,
+        payload={
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "yara_draft",
+            "advisor_response_schema": "advisor-response.v3",
+            "advisor_status": "succeeded",
+            "bridge_invocation_id": str(invocation_id),
+            "input_refs": [],
+            "measurement_catalog": [],
+            "output": {
+                "schema": "advisor-response.v3",
+                "consultation_type": "yara_draft",
+                "status": "succeeded",
+                "advisor_status": "succeeded",
+                "bridge_provenance": {
+                    "bridge_invocation_id": str(invocation_id),
+                    "measurement_catalog": [],
+                },
+                "rule_source": source,
+                "rule_source_sha256": source_sha256,
+                "motifs": [],
+            },
+        },
+        source="advisor.consult",
+        source_version="advisor-response.v3",
+        object_type="advisor_call",
+        object_id="yara_draft",
+        idempotency_key=f"other-investigation:{invocation_id}",
+    )
+    wrong_investigation = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(other.id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert wrong_investigation.status is ToolInvocationStatus.FAILED
+    assert str(other.id) in (wrong_investigation.message or "")
+    assert str(parent_id) not in (wrong_investigation.message or "")
 
 
 @pytest.mark.asyncio

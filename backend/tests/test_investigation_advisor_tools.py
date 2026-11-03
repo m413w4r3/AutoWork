@@ -6432,7 +6432,7 @@ async def test_literal_json_advisor_reply_is_partial_and_not_retried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_schema_excerpt_omits_response_values() -> None:
+async def test_mismatched_json_schema_is_retained_with_a_warning() -> None:
     investigation_id = uuid4()
     raw_output = json.dumps(
         {
@@ -6458,10 +6458,11 @@ async def test_invalid_json_schema_excerpt_omits_response_values() -> None:
         make_context(investigation_id, key="operator:advisor:schema-diagnostic"),
     )
 
-    assert result.output.get("validation_rejection") == {
-        "code": "schema_mismatch",
-        "path": "$.schema",
-    }
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["advisor_status"] == "succeeded"
+    assert result.output["usable"] is True
+    assert "schema_missing_or_mismatched" in result.output["warnings"]
+    assert result.output.get("validation_rejection") is None
     assert "response_excerpt" not in result.output
     assert "PRIVATE-RESPONSE-MARKER" in result.output["advisory_text"]
     assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()

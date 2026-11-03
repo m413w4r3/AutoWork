@@ -243,6 +243,29 @@ def test_single_rule_source_guard_rejects_cheating_shapes(
     assert expected_reason in validate_single_rule_candidate(source)
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_warning"),
+    (
+        (
+            'rule hash_gate { strings: $a = "marker" '
+            'condition: hash.sha256(0, filesize) == "' + ("a" * 64) + '" }',
+            "hash_equality_condition_forbidden",
+        ),
+        (
+            'rule size_gate { strings: $a = "marker" condition: filesize == 1234 }',
+            "filesize_only_condition_forbidden",
+        ),
+    ),
+)
+def test_hash_or_size_only_conditions_are_advisory_for_candidates(
+    source: str, expected_warning: str
+) -> None:
+    blocking, advisory = classify_rule_validation_issues(validate_single_rule_candidate(source))
+
+    assert blocking == ()
+    assert expected_warning in advisory
+
+
 def test_single_rule_source_guard_accepts_one_measured_rule_using_all_of_them() -> None:
     source = 'rule measured { strings: $a = "marker" condition: 1 of them }'
     assert validate_single_rule_candidate(source) == ()
