@@ -23,6 +23,7 @@ from cti_app.application.advisor_contracts import (
     extract_json_object,
     parse_typed_advisor_response,
 )
+from cti_app.application.advisor_dossier import build_advisor_dossier
 from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
@@ -4310,6 +4311,223 @@ async def test_explicit_whole_sample_measurement_is_sent_and_marked_for_audit() 
     assert measurement["length"] == len(sample_content)
     assert measurement["byte_length"] == len(sample_content)
     assert measurement["covers_whole_sample"] is True
+
+
+@pytest.mark.asyncio
+async def test_whole_sample_coverage_uses_union_and_is_order_independent() -> None:
+    investigation_id = uuid4()
+    sample_content = b"coverage"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    split = 3
+    measurement_rows = [
+        {"value": sample_content[:-1].hex(), "offset": 0},
+        {"value": sample_content[-1:].hex(), "offset": len(sample_content) - 1},
+        {"value": sample_content[:split].hex(), "offset": 0},
+        {"value": sample_content[split:].hex(), "offset": split},
+    ]
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": measurement_rows,
+        },
+    )
+    observation = replace(observation, source="autowork.floss", object_id=sample_hash)
+    sample_blob_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    candidates = {
+        "prefix": [sample_content[:-1].hex()],
+        "last_byte": [sample_content[-1:].hex()],
+        "split": [sample_content[:split].hex(), sample_content[split:].hex()],
+    }
+
+    async def invoke(values: list[str], *, key: str):
+        transport = Transport(
+            TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text=advisor_response(
+                    "The explicitly selected ranges were verified.", [str(observation.id)]
+                ),
+            )
+        )
+        tool, _unused_blob_id = make_tool(
+            investigation_id=investigation_id,
+            transport=transport,
+            observation=observation,
+            raw=observation_raw,
+        )
+        tool._blobs.add(
+            sample_blob_id,
+            sha256=sample_hash,
+            size=len(sample_content),
+            logical_bucket="samples-quarantine",
+        )
+        tool._artifact_store.values[sample_blob_id] = sample_content
+        tool._sample_associations = SimpleNamespace(
+            list_for_investigation=async_get(
+                (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+            )
+        )
+        tool._samples = SimpleNamespace(
+            list_for_subject=async_get(
+                (
+                    SimpleNamespace(
+                        id=sample_id,
+                        expected_hash=sample_hash,
+                        source_object_id=None,
+                        state="quarantined",
+                        blob_id=sample_blob_id,
+                        origin_kind="source_seed",
+                        original_name="synthetic-coverage.bin",
+                        source_service="fixture",
+                        tlp=TLP.GREEN,
+                        do_not_submit=False,
+                        external_llm_allowed=True,
+                        license_restriction=None,
+                    ),
+                )
+            )
+        )
+        offsets = {
+            sample_content[:-1].hex(): 0,
+            sample_content[-1:].hex(): len(sample_content) - 1,
+            sample_content[:split].hex(): 0,
+            sample_content[split:].hex(): split,
+        }
+        arguments = {
+            "consultation_type": "plan_investigation",
+            "question": "Review the explicitly selected verified hex measurements.",
+            "evidence_refs": [str(observation.id)],
+            "measurements": [
+                {
+                    "blob_id": str(sample_blob_id),
+                    "kind": "hex",
+                    "offset": offsets[value],
+                    "value": value,
+                }
+                for value in values
+            ],
+        }
+        result = await tool.execute(arguments, make_context(investigation_id, key=key))
+        assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+        assert len(transport.calls) == 1
+        return transport.calls[0]["prompt"], result.output["bridge_provenance"]
+
+    prefix_prompt, prefix_provenance = await invoke(
+        candidates["prefix"], key="operator:advisor:sample-prefix-only"
+    )
+    prefix_manifest = prefix_provenance["dossier_manifest"]
+    assert "covers_whole_sample=true" not in prefix_prompt
+    assert all("covers_whole_sample" not in item for item in prefix_manifest)
+
+    last_prompt, last_provenance = await invoke(
+        candidates["last_byte"], key="operator:advisor:sample-last-byte-only"
+    )
+    last_manifest = last_provenance["dossier_manifest"]
+    assert "covers_whole_sample=true" not in last_prompt
+    assert all("covers_whole_sample" not in item for item in last_manifest)
+
+    split_prompt, split_provenance = await invoke(
+        candidates["split"], key="operator:advisor:sample-split-forward"
+    )
+    _reverse_prompt, reverse_provenance = await invoke(
+        list(reversed(candidates["split"])), key="operator:advisor:sample-split-reverse"
+    )
+    assert sample_content[:split].hex() in split_prompt
+    assert sample_content[split:].hex() in split_prompt
+    assert "covers_whole_sample=true" in split_prompt
+    assert split_provenance["dossier_sha256"] == reverse_provenance["dossier_sha256"]
+    for provenance in (split_provenance, reverse_provenance):
+        manifest = provenance["dossier_manifest"]
+        sample_manifest = next(item for item in manifest if item["kind"] == "sample")
+        assert sample_manifest["covers_whole_sample"] is True
+        assert sample_manifest["byte_length"] == len(sample_content)
+        measurements = [
+            item
+            for item in manifest
+            if item["kind"] == "measurement" and item.get("range_verified") is True
+        ]
+        assert len(measurements) == 2
+        assert all(item["covers_whole_sample"] is True for item in measurements)
+        assert sorted(item["byte_length"] for item in measurements) == sorted(
+            (split, len(sample_content) - split)
+        )
+
+
+@pytest.mark.asyncio
+async def test_empty_blob_range_omission_has_observable_reason() -> None:
+    investigation_id = uuid4()
+    sample_hash = hashlib.sha256(b"").hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": sample_hash},
+    )
+    sample_blob_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("No empty range bytes were transmitted.", []),
+        )
+    )
+    tool, _unused_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=0,
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[sample_blob_id] = b""
+    verified = await tool._verify_targeted_measurement_ranges(
+        [
+            {
+                "measurement_id": "m-empty",
+                "evidence_id": str(observation.id),
+                "evidence_sha256": observation.sha256,
+                "sample_sha256": sample_hash,
+                "blob_id": str(sample_blob_id),
+                "kind": "hex",
+                "encoding": "hex",
+                "offset": 0,
+                "length": 0,
+                "byte_length": 0,
+                "value": "",
+            }
+        ]
+    )
+    assert verified[0]["range_verified"] is False
+    assert verified[0]["content_omission_reason"] == "empty_blob_range"
+
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the explicitly selected empty range.",
+            "evidence_refs": [str(observation.id)],
+            "explicit_measurement_selection": True,
+            "evidence": [
+                {
+                    "evidence_id": str(observation.id),
+                    "sha256": observation.sha256,
+                    "sample_sha256": sample_hash,
+                    "source": "autowork.floss",
+                    "object_type": "sample",
+                    "object_id": sample_hash,
+                    "content_excerpts": [],
+                }
+            ],
+            "measurements": verified,
+            "samples": [],
+        }
+    )
+    manifest_measurement = next(item for item in dossier.manifest if item["kind"] == "measurement")
+    assert manifest_measurement["content_omission_reason"] == "empty_blob_range"
+    assert "content_omission_reason=empty_blob_range" in dossier.text
 
 
 @pytest.mark.asyncio

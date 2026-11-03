@@ -735,6 +735,8 @@ def build_advisor_dossier(
             f"tlp={_as_text(sample.get('tlp'))}",
             f"external_llm_allowed={str(sample.get('external_llm_allowed')).lower()}",
         ]
+        if sample.get("covers_whole_sample") is True:
+            lines.append("covers_whole_sample=true")
         evidence_ids = sample.get("evidence_ids")
         if isinstance(evidence_ids, (list, tuple)):
             lines.append("evidence_ids=" + ",".join(_as_text(item) for item in evidence_ids))
@@ -801,6 +803,11 @@ def build_advisor_dossier(
                     "mime_type": mime_type,
                     "encoding": "base64",
                     "fragment_sha256": _as_text(sample.get("fragment_sha256")),
+                    **(
+                        {"covers_whole_sample": True}
+                        if sample.get("covers_whole_sample") is True
+                        else {}
+                    ),
                     "omitted_range": omitted_range,
                     "content_status": _as_text(sample.get("content_status")),
                     "content_omission_reason": _as_text(omission_reason),

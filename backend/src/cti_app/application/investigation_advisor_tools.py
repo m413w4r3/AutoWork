@@ -4666,6 +4666,16 @@ class InvestigationAdvisorTool:
             context.envelope,
             include_content=False,
         )
+        covered_sample_blob_ids = {
+            _safe_text(item.get("blob_id"), 64)
+            for item in base.get("measurements", ())
+            if isinstance(item, Mapping)
+            and item.get("range_verified") is True
+            and item.get("covers_whole_sample") is True
+        }
+        for sample_row in sample_rows:
+            if _safe_text(sample_row.get("blob_id"), 64) in covered_sample_blob_ids:
+                sample_row["covers_whole_sample"] = True
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
         mime_types_by_evidence: dict[str, list[str]] = {}
@@ -5496,9 +5506,12 @@ class InvestigationAdvisorTool:
     ) -> list[dict[str, Any]]:
         """Verify explicitly selected byte ranges against their canonical sample blobs."""
         verified_sample_ranges: dict[tuple[UUID, int, int], tuple[bytes | None, str]] = {}
+        verified_intervals_by_blob: dict[UUID, list[tuple[int, int, int]]] = {}
+        sample_sizes_by_blob: dict[UUID, int] = {}
         results: list[dict[str, Any]] = []
         for measurement in measurements:
             row = dict(measurement)
+            row.pop("covers_whole_sample", None)
             reason = "sample_range_verification_failed"
             try:
                 blob_id = UUID(str(row.get("blob_id")))
@@ -5518,6 +5531,22 @@ class InvestigationAdvisorTool:
                 row["length"] = length
             descriptor_blob = await self._get_blob_descriptor(blob_id)
             descriptor = getattr(descriptor_blob, "descriptor", None)
+            if (
+                type(offset) is int
+                and offset == 0
+                and type(length) is int
+                and length == 0
+                and fragment_bytes == b""
+                and re.fullmatch(r"[0-9a-f]{64}", sample_sha256)
+                and descriptor is not None
+                and descriptor.logical_bucket == "samples-quarantine"
+                and descriptor.sha256 == sample_sha256
+                and type(descriptor.size) is int
+                and descriptor.size == 0
+            ):
+                row.update(range_verified=False, content_omission_reason="empty_blob_range")
+                results.append(row)
+                continue
             if (
                 type(offset) is not int
                 or offset < 0
@@ -5570,16 +5599,17 @@ class InvestigationAdvisorTool:
                 and fragment == fragment_bytes
                 and (not declared_fragment_sha256 or declared_fragment_sha256 == fragment_sha256)
             ):
-                # A fully covered explicit range remains requested evidence; mark it for audit.
-                covers_whole_sample = offset == 0 and length == descriptor.size
                 row.update(
                     range_verified=True,
                     range_length=length,
                     byte_length=length,
                     fragment_sha256=fragment_sha256,
                 )
-                if covers_whole_sample:
-                    row["covers_whole_sample"] = True
+                result_index = len(results)
+                verified_intervals_by_blob.setdefault(blob_id, []).append(
+                    (offset, offset + length, result_index)
+                )
+                sample_sizes_by_blob[blob_id] = descriptor.size
             else:
                 row.update(
                     range_verified=False,
@@ -5590,6 +5620,18 @@ class InvestigationAdvisorTool:
                     ),
                 )
             results.append(row)
+
+        for blob_id, intervals in verified_intervals_by_blob.items():
+            sample_size = sample_sizes_by_blob[blob_id]
+            covered_end = 0
+            for start, end, _result_index in sorted(intervals):
+                if start > covered_end:
+                    break
+                covered_end = max(covered_end, end)
+                if covered_end >= sample_size:
+                    for _start, _end, result_index in intervals:
+                        results[result_index]["covers_whole_sample"] = True
+                    break
         return results
 
     async def _verify_task_targeted_measurements(
