@@ -118,7 +118,21 @@ ADVISOR_REPARSE_TOOL_NAME = "advisor.reparse"
 ADVISOR_REPARSE_SCHEMA_VERSION = "advisor-reparse.v1"
 ADVISOR_OPERATOR_TOOL_NAMES = frozenset({ADVISOR_TOOL_NAME, ADVISOR_REPARSE_TOOL_NAME})
 _UUID = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-_ARTICLE_CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
+_UUID_REFERENCE_IN_QUESTION = re.compile(
+    r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+)
+_UUID_OBSERVATION_REFERENCE_IN_QUESTION = re.compile(
+    r"(?i)\b(?:observation|evidence|référence|reference|ref)\s*[:=#]?\s*"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
+_UUID_FINDING_REFERENCE_IN_QUESTION = re.compile(
+    r"(?i)\bfinding\s*[:=#]?\s*"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
+_ARTICLE_CLAIM_TOKEN_CANDIDATE = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
+_ARTICLE_CLAIM_ID = re.compile(
+    r"(?i)\b(?:S[1-9]\d*P[1-9]\d*(?:\.[1-9]\d*)?|L[1-9]\d*(?:\.[1-9]\d*)?|T[1-9]\d*)\b"
+)
 ADVISOR_RESPONSE_SCHEMA_V2 = "advisor-response.v2"
 ADVISOR_RESPONSE_SCHEMA = ADVISOR_RESPONSE_SCHEMA_V2
 _TYPED_CONSULTATION_TYPES = frozenset(
@@ -147,6 +161,65 @@ logger = logging.getLogger(__name__)
 
 _REFERENCE_PAYLOAD_CACHE_ENTRIES = 48
 _REFERENCE_ANSWER_CACHE_ENTRIES = 50_000
+
+
+def _requested_observation_ids(question: str) -> tuple[UUID, ...]:
+    return tuple(
+        dict.fromkeys(
+            UUID(value) for value in _UUID_OBSERVATION_REFERENCE_IN_QUESTION.findall(question)
+        )
+    )
+
+
+def _requested_uuid_references(question: str) -> tuple[UUID, ...]:
+    return tuple(
+        dict.fromkeys(UUID(value) for value in _UUID_REFERENCE_IN_QUESTION.findall(question))
+    )
+
+
+def _requested_finding_ids(question: str) -> tuple[UUID, ...]:
+    return tuple(
+        dict.fromkeys(
+            UUID(value) for value in _UUID_FINDING_REFERENCE_IN_QUESTION.findall(question)
+        )
+    )
+
+
+def _sanitize_malformed_claim_tokens(question: str) -> tuple[str, tuple[str, ...]]:
+    valid_tokens = {item.casefold() for item in _ARTICLE_CLAIM_ID.findall(question)}
+    ignored: list[str] = []
+
+    def replace_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token.casefold() in valid_tokens:
+            return token
+        ignored.append(token)
+        return ""
+
+    return _ARTICLE_CLAIM_TOKEN_CANDIDATE.sub(replace_token, question), tuple(ignored)
+
+
+def _safe_ignored_advisor_field(value: object) -> str:
+    field = str(value)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", field) is None:
+        return "<invalid-field-name>"
+    if re.search(r"(?i)(?:api[_ -]?key|token|password|secret|credential|authorization)", field):
+        return "<sensitive-field>"
+    return field
+
+
+def _valid_optional_advisor_field(field: str, value: object) -> bool:
+    if field == "opinion_id":
+        return isinstance(value, str) and _UUID.fullmatch(value) is not None
+    if field == "opinion_version":
+        return type(value) is int and value >= 1
+    if field == "form":
+        return isinstance(value, str) and value in {"body", "analyst_note"}
+    if field == "anchor":
+        return isinstance(value, str) and 0 < len(value) <= 128
+    if field == "block_type":
+        return isinstance(value, str) and value in {item.value for item in OpinionBlockType}
+    return True
 
 
 class _AdvisorStageTiming:
@@ -336,7 +409,7 @@ class InvestigationAdvisorTool:
         self._results: dict[str, ToolResult] = {}
         self._response_archive_failures: dict[str, ToolResult] = {}
         self._preflight_refusals: dict[str, dict[str, Any]] = {}
-        self._ignored_evidence_refs: dict[str, tuple[str, ...]] = {}
+        self._ignored_advisor_inputs: dict[str, tuple[dict[str, Any], ...]] = {}
         self._reference_answers: dict[tuple[UUID, str, str], bool] = {}
         self._reference_payloads: dict[tuple[UUID, str], Any | None] = {}
         self._reservation_durations_ms: dict[str, int] = {}
@@ -356,6 +429,35 @@ class InvestigationAdvisorTool:
         timing = _CURRENT_ADVISOR_TIMING.get()
         if timing is not None:
             timing.increment_counter("repo_calls")
+
+    async def _resolved_question_opinion_id(
+        self,
+        investigation_id: UUID,
+        consultation_type: str,
+        question: str,
+        arguments: Mapping[str, Any],
+    ) -> UUID | None:
+        """Return an opinion UUID only when it is a resolved review target."""
+        if consultation_type != "review_text":
+            return None
+        raw_opinion_id = arguments.get("opinion_id")
+        if not isinstance(raw_opinion_id, str) or _UUID.fullmatch(raw_opinion_id) is None:
+            return None
+        opinion_id = UUID(raw_opinion_id)
+        if opinion_id not in _requested_uuid_references(question):
+            return None
+        if opinion_id in set(_requested_observation_ids(question)) | set(
+            _requested_finding_ids(question)
+        ):
+            return None
+        version = arguments.get("opinion_version")
+        if version is not None and (type(version) is not int or version < 1):
+            return None
+        self._record_repo_call()
+        opinion = await self._opinions.get(opinion_id, version=version)
+        if opinion is None or getattr(opinion, "investigation_id", None) != investigation_id:
+            return None
+        return opinion_id
 
     async def _read_consultation_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
         timing = _CURRENT_ADVISOR_TIMING.get()
@@ -600,12 +702,11 @@ class InvestigationAdvisorTool:
             consultation_type = arguments.get("consultation_type")
             question = arguments.get("question", "")
             raw_refs = arguments.get("evidence_refs", ())
-            if (
-                not isinstance(consultation_type, str)
-                or not isinstance(question, str)
-                or not isinstance(raw_refs, (list, tuple))
-            ):
+            if not isinstance(consultation_type, str) or not isinstance(question, str):
                 return no_context_cost
+            if not isinstance(raw_refs, (list, tuple)):
+                raw_refs = ()
+            question, _malformed_claim_tokens = _sanitize_malformed_claim_tokens(question)
             investigation = await self._investigations.get(context.investigation_id)
             if investigation is None:
                 return no_context_cost
@@ -619,12 +720,24 @@ class InvestigationAdvisorTool:
             )
             context_token = _CURRENT_ADVISOR_CONTEXT.set(consultation_context)
             try:
+                requested_refs = _requested_uuid_references(question)
+                resolved_opinion_id = await self._resolved_question_opinion_id(
+                    context.investigation_id,
+                    consultation_type,
+                    question,
+                    arguments,
+                )
+                if resolved_opinion_id is not None:
+                    requested_refs = tuple(
+                        item for item in requested_refs if item != resolved_opinion_id
+                    )
                 explicit_refs: list[UUID] = []
                 for raw_ref in raw_refs:
                     try:
                         explicit_refs.append(UUID(str(raw_ref)))
                     except (TypeError, ValueError):
                         continue
+                explicit_refs.extend(requested_refs)
                 explicit_evidence = await self._load_cited_evidence(
                     context, tuple(dict.fromkeys(explicit_refs))
                 )
@@ -852,39 +965,208 @@ class InvestigationAdvisorTool:
                 "figure_plan",
             }:
                 raise _AdvisorInputValidationError("consultation_type_unsupported")
+            arguments = dict(arguments)
+            ignored_inputs: list[dict[str, Any]] = []
+            known_fields = {
+                "consultation_type",
+                "question",
+                "sample_sha256",
+                "evidence_refs",
+                "measurements",
+                "opinion_id",
+                "opinion_version",
+                "form",
+                "anchor",
+                "block_type",
+                "assertions",
+                "units",
+                "finding_refs",
+            }
+            for field in tuple(arguments):
+                if field not in known_fields:
+                    ignored_inputs.append(
+                        {
+                            "field": _safe_ignored_advisor_field(field),
+                            "reason": "unsupported_field",
+                        }
+                    )
+                    arguments.pop(field, None)
             raw_question = arguments.get("question", "")
             if not isinstance(raw_question, str):
                 raise _AdvisorInputValidationError("question_invalid")
             question = raw_question.strip()
+            question, malformed_claim_tokens = _sanitize_malformed_claim_tokens(question)
+            for index, token in enumerate(malformed_claim_tokens):
+                ignored_inputs.append(
+                    {
+                        "field": "question",
+                        "index": index,
+                        "reference": token,
+                        "reason": "malformed_claim_token",
+                    }
+                )
+            arguments["question"] = question
             raw_refs = arguments.get("evidence_refs", ())
             if not isinstance(raw_refs, (tuple, list)):
-                raise _AdvisorInputValidationError("evidence_refs_invalid")
+                ignored_inputs.append({"field": "evidence_refs", "reason": "invalid_list_ignored"})
+                raw_refs = ()
             sample_sha256 = arguments.get("sample_sha256")
             if sample_sha256 is not None and (
                 not isinstance(sample_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", sample_sha256) is None
             ):
-                raise _AdvisorInputValidationError("sample_hash_invalid")
+                ignored_inputs.append(
+                    {"field": "sample_sha256", "reason": "malformed_optional_hash"}
+                )
+                arguments.pop("sample_sha256", None)
             parsed_refs: list[UUID] = []
-            malformed_refs: list[str] = []
-            for item in raw_refs:
+            seen_ref_ids: set[UUID] = set()
+            for index, item in enumerate(raw_refs):
                 try:
-                    parsed_refs.append(UUID(str(item)))
+                    parsed_ref = UUID(str(item))
                 except (TypeError, ValueError):
-                    malformed_refs.append(str(item)[:64])
-            if raw_refs and not parsed_refs:
-                raise _AdvisorInputValidationError("evidence_ref_invalid")
-            if malformed_refs:
-                self._ignored_evidence_refs[context.idempotency_key] = tuple(malformed_refs)
+                    ignored_inputs.append(
+                        {
+                            "field": "evidence_refs",
+                            "index": index,
+                            "reason": "malformed_reference",
+                        }
+                    )
+                    continue
+                if parsed_ref in seen_ref_ids:
+                    ignored_inputs.append(
+                        {
+                            "field": "evidence_refs",
+                            "index": index,
+                            "reference": str(parsed_ref),
+                            "reason": "duplicate_reference",
+                        }
+                    )
+                    continue
+                seen_ref_ids.add(parsed_ref)
+                parsed_refs.append(parsed_ref)
             evidence_refs = tuple(parsed_refs)
+            if ignored_inputs:
+                existing_ignored = self._ignored_advisor_inputs.get(context.idempotency_key, ())
+                merged_ignored = list(existing_ignored)
+                for item in ignored_inputs:
+                    if item not in merged_ignored:
+                        merged_ignored.append(item)
+                self._ignored_advisor_inputs[context.idempotency_key] = tuple(merged_ignored)
+            optional_fields = (
+                ("opinion_id", "malformed_optional_reference"),
+                ("opinion_version", "invalid_optional_version"),
+                ("form", "unsupported_optional_value"),
+                ("anchor", "invalid_optional_anchor"),
+                ("block_type", "unsupported_optional_value"),
+            )
+            for field, reason in optional_fields:
+                if field in arguments and not _valid_optional_advisor_field(
+                    field, arguments[field]
+                ):
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {"field": field, "reason": reason},
+                    )
+                    arguments.pop(field, None)
+            optional_field_consultations = {
+                "opinion_id": {"review_text"},
+                "opinion_version": {"review_text"},
+                "form": {"review_text"},
+                "anchor": {"review_text"},
+                "block_type": {"review_text"},
+                "assertions": {"draft_text"},
+                "finding_refs": {"figure_plan"},
+            }
+            for field, supported_types in optional_field_consultations.items():
+                if field in arguments and consultation_type not in supported_types:
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {"field": field, "reason": "unsupported_for_consultation_type"},
+                    )
+                    arguments.pop(field, None)
+            if consultation_type == "review_text":
+                if "anchor" in arguments and arguments.get("form", "body") != "analyst_note":
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {"field": "anchor", "reason": "anchor_requires_analyst_note_form"},
+                    )
+                    arguments.pop("anchor", None)
+                if arguments.get("form") == "analyst_note" and not arguments.get("anchor"):
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {"field": "form", "reason": "analyst_note_anchor_missing"},
+                    )
+                    arguments.pop("form", None)
             if "units" in arguments:
                 raw_units = arguments.get("units")
                 if consultation_type not in {"draft_text", "review_text"}:
-                    raise _AdvisorInputValidationError("editorial_units_not_supported")
-                if not isinstance(raw_units, (tuple, list)) or not raw_units:
-                    raise _AdvisorInputValidationError("editorial_units_out_of_bounds")
-                if consultation_type == "draft_text":
-                    _validate_editorial_unit_targets(raw_units)
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {"field": "units", "reason": "unsupported_for_consultation_type"},
+                    )
+                    arguments.pop("units", None)
+                elif not isinstance(raw_units, (tuple, list)) or not raw_units:
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {"field": "units", "reason": "invalid_optional_units_ignored"},
+                    )
+                    arguments.pop("units", None)
+                else:
+                    normalized_units: list[dict[str, Any]] = []
+                    allowed_unit_fields = {"id", "block_type", "form", "anchor", "assertions"}
+                    required_unit_fields = {"id", "block_type", "form", "anchor"}
+                    for index, raw_unit in enumerate(raw_units):
+                        if not isinstance(raw_unit, Mapping):
+                            self._append_ignored_advisor_input(
+                                context.idempotency_key,
+                                {
+                                    "field": f"units[{index}]",
+                                    "reason": "invalid_unit_ignored",
+                                },
+                            )
+                            continue
+                        extra_unit_fields = set(raw_unit) - allowed_unit_fields
+                        if extra_unit_fields:
+                            for field in sorted(extra_unit_fields, key=str):
+                                safe_field = _safe_ignored_advisor_field(field)
+                                self._append_ignored_advisor_input(
+                                    context.idempotency_key,
+                                    {
+                                        "field": f"units[{index}].{safe_field}",
+                                        "reason": "unsupported_field",
+                                    },
+                                )
+                        candidate = {
+                            key: value
+                            for key, value in raw_unit.items()
+                            if key in allowed_unit_fields
+                        }
+                        if not required_unit_fields.issubset(candidate):
+                            self._append_ignored_advisor_input(
+                                context.idempotency_key,
+                                {
+                                    "field": f"units[{index}]",
+                                    "reason": "incomplete_unit_ignored",
+                                },
+                            )
+                            continue
+                        try:
+                            _validate_editorial_unit_targets((*normalized_units, candidate))
+                        except _AdvisorInputValidationError:
+                            self._append_ignored_advisor_input(
+                                context.idempotency_key,
+                                {
+                                    "field": f"units[{index}]",
+                                    "reason": "invalid_or_duplicate_unit_ignored",
+                                },
+                            )
+                            continue
+                        normalized_units.append(candidate)
+                    if normalized_units:
+                        arguments["units"] = normalized_units
+                    else:
+                        arguments.pop("units", None)
         except _AdvisorInputValidationError as exc:
             return await self._input_failure(
                 context,
@@ -972,6 +1254,74 @@ class InvestigationAdvisorTool:
             )
             _CURRENT_ADVISOR_CONTEXT.set(consultation_context)
             listed_observations = consultation_context.observations
+            requested_refs = _requested_uuid_references(question)
+            resolved_opinion_id = await self._resolved_question_opinion_id(
+                context.investigation_id,
+                consultation_type,
+                question,
+                arguments,
+            )
+            if resolved_opinion_id is not None:
+                requested_refs = tuple(
+                    item for item in requested_refs if item != resolved_opinion_id
+                )
+            labelled_observation_refs = set(_requested_observation_ids(question))
+            labelled_finding_refs = set(_requested_finding_ids(question))
+            listed_observation_ids = {
+                item.id
+                for item in listed_observations
+                if item.investigation_id == context.investigation_id
+            }
+            current_findings = self._latest_findings(
+                tuple(
+                    item
+                    for item in consultation_context.findings
+                    if getattr(item, "investigation_id", context.investigation_id)
+                    == context.investigation_id
+                )
+            )
+            available_finding_ids = {item.id for item in current_findings}
+            for requested_ref in requested_refs:
+                if requested_ref in labelled_observation_refs:
+                    if requested_ref not in listed_observation_ids:
+                        return await self._input_failure(
+                            context,
+                            "evidence_reference_not_found",
+                            reference=str(requested_ref),
+                            available_evidence_refs=tuple(
+                                sorted(str(item) for item in listed_observation_ids)
+                            ),
+                        )
+                elif requested_ref in labelled_finding_refs:
+                    if requested_ref not in available_finding_ids:
+                        return await self._input_failure(
+                            context,
+                            "finding_reference_not_found",
+                            reference=str(requested_ref),
+                            available_finding_refs=tuple(
+                                sorted(str(item) for item in available_finding_ids)
+                            ),
+                        )
+                elif (
+                    requested_ref not in listed_observation_ids
+                    and requested_ref not in available_finding_ids
+                ):
+                    return await self._input_failure(
+                        context,
+                        "requested_reference_not_found",
+                        reference=str(requested_ref),
+                        available_evidence_refs=tuple(
+                            sorted(str(item) for item in listed_observation_ids)
+                        ),
+                        available_finding_refs=tuple(
+                            sorted(str(item) for item in available_finding_ids)
+                        ),
+                    )
+            question_refs = tuple(item for item in requested_refs if item in listed_observation_ids)
+            if question_refs:
+                evidence_refs = tuple(dict.fromkeys((*evidence_refs, *question_refs)))
+            if "evidence_refs" in arguments or question_refs:
+                arguments["evidence_refs"] = [str(item) for item in evidence_refs]
             pacing_result = await self._check_advisor_limits(
                 context.investigation_id,
                 g2_bridge_turns_remaining=context.budget.remaining.get(
@@ -982,6 +1332,9 @@ class InvestigationAdvisorTool:
             if pacing_result is not None:
                 return self._finish(context, _attest_advisor_pre_submission(pacing_result))
             explicit_evidence = await self._load_cited_evidence(context, evidence_refs)
+            evidence_refs = tuple(item.id for item in explicit_evidence)
+            if "evidence_refs" in arguments or question_refs:
+                arguments["evidence_refs"] = [str(item) for item in evidence_refs]
             auto_evidence = tuple(
                 sorted(
                     (
@@ -1017,13 +1370,40 @@ class InvestigationAdvisorTool:
                 if consultation_type == "figure_plan":
                     raw_finding_refs = arguments.get("finding_refs", ())
                     if not isinstance(raw_finding_refs, (tuple, list)):
-                        raise _AdvisorInputValidationError("figure_finding_refs_invalid")
-                    try:
-                        requested_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
-                    except (TypeError, ValueError):
-                        raise _AdvisorInputValidationError("figure_finding_refs_invalid") from None
-                    if len(set(requested_ids)) != len(requested_ids):
-                        raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+                        self._append_ignored_advisor_input(
+                            context.idempotency_key,
+                            {"field": "finding_refs", "reason": "invalid_list_ignored"},
+                        )
+                        raw_finding_refs = ()
+                    parsed_finding_refs: list[UUID] = []
+                    seen_finding_refs: set[UUID] = set()
+                    for index, raw_ref in enumerate(raw_finding_refs):
+                        try:
+                            finding_ref = UUID(str(raw_ref))
+                        except (TypeError, ValueError):
+                            self._append_ignored_advisor_input(
+                                context.idempotency_key,
+                                {
+                                    "field": "finding_refs",
+                                    "index": index,
+                                    "reason": "malformed_reference",
+                                },
+                            )
+                            continue
+                        if finding_ref in seen_finding_refs:
+                            self._append_ignored_advisor_input(
+                                context.idempotency_key,
+                                {
+                                    "field": "finding_refs",
+                                    "index": index,
+                                    "reference": str(finding_ref),
+                                    "reason": "duplicate_reference",
+                                },
+                            )
+                            continue
+                        seen_finding_refs.add(finding_ref)
+                        parsed_finding_refs.append(finding_ref)
+                    requested_ids = tuple(parsed_finding_refs)
                     requested_finding_ids = requested_ids
                 else:
                     requested_ids = ()
@@ -1036,6 +1416,23 @@ class InvestigationAdvisorTool:
                         == context.investigation_id
                     )
                 )
+                if requested_finding_ids:
+                    available_finding_ids = {item.id for item in finding_rows}
+                    for missing_ref in set(requested_finding_ids) - available_finding_ids:
+                        self._append_ignored_advisor_input(
+                            context.idempotency_key,
+                            {
+                                "field": "finding_refs",
+                                "reference": str(missing_ref),
+                                "reason": "reference_not_resolvable",
+                            },
+                        )
+                    requested_finding_ids = tuple(
+                        item for item in requested_finding_ids if item in available_finding_ids
+                    )
+                    requested_ids = requested_finding_ids
+                if "finding_refs" in arguments:
+                    arguments["finding_refs"] = [str(item) for item in requested_ids]
                 linked_observation_ids = tuple(
                     dict.fromkeys(
                         ref
@@ -2983,6 +3380,8 @@ class InvestigationAdvisorTool:
         valid_targets: tuple[dict[str, Any], ...] = (),
         valid_article_claim_ids: tuple[str, ...] = (),
         invalid_article_claim_ids: tuple[str, ...] = (),
+        available_evidence_refs: tuple[str, ...] | None = None,
+        available_finding_refs: tuple[str, ...] | None = None,
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
         actionable = {
@@ -3026,6 +3425,14 @@ class InvestigationAdvisorTool:
                 "A selected figure finding is not current in this investigation. Choose a "
                 "current finding or omit finding_refs to use the latest available findings."
             ),
+            "finding_reference_not_found": (
+                "The requested finding reference is not current in this investigation. Use a "
+                "current finding reference or omit the reference."
+            ),
+            "requested_reference_not_found": (
+                "The requested reference is not current in this investigation. Use one of the "
+                "listed observation or finding references."
+            ),
             "opinion_reference_invalid": (
                 "The selected opinion ID is malformed. Use the canonical opinion ID or omit "
                 "the target for a general review."
@@ -3060,6 +3467,18 @@ class InvestigationAdvisorTool:
                 + ", ".join(invalid_article_claim_ids)
                 + ". Valid article claim IDs: "
                 + (", ".join(valid_article_claim_ids) if valid_article_claim_ids else "(none)")
+                + "."
+            )
+        if available_evidence_refs is not None:
+            message += (
+                " Usable observation references: "
+                + (", ".join(available_evidence_refs) if available_evidence_refs else "(none)")
+                + "."
+            )
+        if available_finding_refs is not None:
+            message += (
+                " Usable finding references: "
+                + (", ".join(available_finding_refs) if available_finding_refs else "(none)")
                 + "."
             )
         if reference:
@@ -3144,6 +3563,16 @@ class InvestigationAdvisorTool:
                         "valid_article_claim_ids": list(valid_article_claim_ids),
                     }
                     if invalid_article_claim_ids
+                    else {}
+                ),
+                **(
+                    {"available_evidence_refs": list(available_evidence_refs)}
+                    if available_evidence_refs is not None
+                    else {}
+                ),
+                **(
+                    {"available_finding_refs": list(available_finding_refs)}
+                    if available_finding_refs is not None
                     else {}
                 ),
                 **({"input_error_detail": dict(internal_detail)} if internal_detail else {}),
@@ -3245,12 +3674,24 @@ class InvestigationAdvisorTool:
                 self._record_repo_call()
                 item = await self._observations.get(ref)
             if item is None or item.investigation_id != context.investigation_id:
-                raise _AdvisorInputValidationError(
-                    "evidence_reference_not_found",
-                    reference=str(ref),
+                self._append_ignored_advisor_input(
+                    context.idempotency_key,
+                    {
+                        "field": "evidence_refs",
+                        "reference": str(ref),
+                        "reason": "reference_not_resolvable",
+                    },
                 )
+                continue
             found.append(item)
         return tuple(found)
+
+    def _append_ignored_advisor_input(self, operation_key: str, item: Mapping[str, Any]) -> None:
+        ignored = list(self._ignored_advisor_inputs.get(operation_key, ()))
+        warning = dict(item)
+        if warning not in ignored:
+            ignored.append(warning)
+        self._ignored_advisor_inputs[operation_key] = tuple(ignored)
 
     async def _load_evidence(
         self,
@@ -7054,6 +7495,34 @@ class InvestigationAdvisorTool:
             operational_secret_values=configured_operational_secret_values(self._settings),
         )
         safe_advisory_text = str(safe_output)
+        partial_json_fields = _extract_partial_json_text_fields(safe_advisory_text)
+        parser_warnings = tuple(parsed.get("warnings", ())) if isinstance(parsed, Mapping) else ()
+        parser_normalizations = (
+            tuple(parsed.get("normalizations", ())) if isinstance(parsed, Mapping) else ()
+        )
+        partial_json = (
+            safe_advisory_text.lstrip().startswith("{")
+            and extract_json_object(safe_advisory_text) is None
+        )
+        reference_failure_markers = (
+            "reference_alias_unknown",
+            "reference_alias_invalid",
+            "reference_kind_invalid",
+            "no_valid_references",
+            "reference_list_filtered",
+            "reference_list_invalid",
+            "reference_list_ignored",
+            "review_refs_invalid",
+            "alternative_without_valid_basis",
+            "draft_sentence_reference_invalid",
+            "untransmitted_uuid",
+            "ignored_ref:",
+        )
+        filtered_reference = any(
+            isinstance(item, str)
+            and any(marker in item.casefold() for marker in reference_failure_markers)
+            for item in (*parser_warnings, *parser_normalizations)
+        )
         draft_assertions = prompt_data.get("assertions")
         has_linked_draft_assertion = isinstance(draft_assertions, (list, tuple)) and any(
             isinstance(assertion, Mapping)
@@ -7069,6 +7538,7 @@ class InvestigationAdvisorTool:
         evidence_links_absent = consultation_type == "draft_text" and not has_linked_draft_assertion
         parse_failed = (
             bool(validation_rejection)
+            or partial_json
             or parsed is None
             or (
                 isinstance(parsed, Mapping)
@@ -7096,6 +7566,13 @@ class InvestigationAdvisorTool:
             if isinstance(warnings, list) and "structured_parse_unavailable" not in warnings:
                 warnings.append("structured_parse_unavailable")
             parsed["normalization_status"] = "partial"
+        if partial_json_fields:
+            for field, value in partial_json_fields.items():
+                if not isinstance(parsed.get(field), str) or not parsed[field].strip():
+                    parsed[field] = value
+            warnings = parsed.setdefault("warnings", [])
+            if isinstance(warnings, list) and "partial_json_preserved" not in warnings:
+                warnings.append("partial_json_preserved")
         if evidence_links_absent:
             parsed["status"] = "partial"
             warnings = parsed.setdefault("warnings", [])
@@ -7131,6 +7608,32 @@ class InvestigationAdvisorTool:
             warnings = parsed.setdefault("warnings", [])
             if isinstance(warnings, list) and "secret_redacted" not in warnings:
                 warnings.append("secret_redacted")
+        markdown_extractions = _extract_advisor_markdown(safe_advisory_text)
+        readable = _advisor_reply_is_readable(safe_advisory_text)
+        semantic_rejection = bool(validation_rejection) or (
+            isinstance(parsed, Mapping) and parsed.get("status") in {"invalid", "ambiguous"}
+        )
+        if parse_failed and readable and not semantic_rejection and not filtered_reference:
+            parsed["usable"] = True
+            parsed["status"] = "partial"
+            parsed["normalization_status"] = "partial"
+            parsed["structured_usable"] = False
+            parsed["canonicalization_eligible"] = False
+            if not isinstance(parsed.get("summary"), str) or not parsed["summary"].strip():
+                parsed["summary"] = partial_json_fields.get("summary", safe_advisory_text)
+        parsed["readable"] = readable
+        parsed["advisory_sections"] = markdown_extractions["sections"]
+        parsed["action_items"] = markdown_extractions["items"]
+        parsed["critique_sections"] = markdown_extractions["critiques"]
+        parsed["warning_sections"] = markdown_extractions["warnings"]
+        if consultation_type in {"plan_investigation", "pivot_strategy"}:
+            parsed["suggested_pivots"] = (
+                markdown_extractions["items"]
+                if consultation_type == "pivot_strategy" and not markdown_extractions["sections"]
+                else markdown_extractions["pivots"]
+            )
+        parsed.setdefault("structured_usable", False)
+        parsed.setdefault("canonicalization_eligible", False)
         _mark_rule_advisory_readability(parsed, safe_advisory_text)
         display_text = safe_advisory_text
         if evidence_links_absent and "liens de preuve absents" not in display_text.casefold():
@@ -7362,11 +7865,11 @@ class InvestigationAdvisorTool:
                     "response_received": False,
                 },
             )
-        ignored = self._ignored_evidence_refs.pop(context.idempotency_key, ())
+        ignored = self._ignored_advisor_inputs.pop(context.idempotency_key, ())
         if ignored:
             result = replace(
                 result,
-                output={**dict(result.output), "ignored_evidence_refs": list(ignored)},
+                output={**dict(result.output), "ignored_inputs": list(ignored)},
             )
         result = _attest_advisor_pre_submission(result)
         if (
@@ -7392,32 +7895,6 @@ def register_investigation_advisor_tool(
 ) -> None:
     _authorize_framework_refusal_proof_adapter(adapter)
     max_tool_seconds = _advisor_tool_seconds_limit(adapter._settings)
-    uuid_schema = {
-        "type": "string",
-        "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
-    }
-    editorial_unit_schema = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "pattern": r"^U[1-9][0-9]*$"},
-            "block_type": {
-                "type": "string",
-                "enum": [
-                    item.value
-                    for item in OpinionBlockType
-                    if item is not OpinionBlockType.ANALYST_OBSERVATIONS
-                ],
-            },
-            "form": {"type": "string", "enum": ["body", "analyst_note"]},
-            "anchor": {"type": ["string", "null"], "maxLength": 128},
-            "assertions": {
-                "additionalProperties": True,
-                "items": {"additionalProperties": True},
-            },
-        },
-        "required": ["id", "block_type", "form", "anchor"],
-        "additionalProperties": False,
-    }
     registry.register(
         ToolDefinition(
             name=ADVISOR_TOOL_NAME,
@@ -7438,38 +7915,35 @@ def register_investigation_advisor_tool(
                         ],
                     },
                     "question": {"type": "string"},
-                    "sample_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                    "sample_sha256": {},
                     "evidence_refs": {
-                        "type": "array",
-                        "uniqueItems": True,
-                        "items": uuid_schema,
+                        "additionalProperties": True,
+                        "items": {"additionalProperties": True},
                     },
-                    "measurements": {},
-                    "opinion_id": uuid_schema,
-                    "opinion_version": {"type": "integer", "minimum": 1},
-                    "form": {"type": "string", "enum": ["body", "analyst_note"]},
-                    "anchor": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "block_type": {
-                        "type": "string",
-                        "enum": [item.value for item in OpinionBlockType],
+                    "measurements": {
+                        "additionalProperties": True,
+                        "items": {"additionalProperties": True},
                     },
+                    "opinion_id": {},
+                    "opinion_version": {},
+                    "form": {},
+                    "anchor": {},
+                    "block_type": {},
                     "assertions": {
                         "additionalProperties": True,
                         "items": {"additionalProperties": True},
                     },
                     "units": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": editorial_unit_schema,
+                        "additionalProperties": True,
+                        "items": {"additionalProperties": True},
                     },
                     "finding_refs": {
-                        "type": "array",
-                        "uniqueItems": True,
-                        "items": uuid_schema,
+                        "additionalProperties": True,
+                        "items": {"additionalProperties": True},
                     },
                 },
                 "required": ["consultation_type"],
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
             effect=ToolEffect.EXTERNAL_READ,
             cost_model={
@@ -8779,6 +9253,88 @@ def _advisor_invocation_stage(submission: TurnSubmission) -> str:
     if state in {"submission_attempted", "post_submission"}:
         return "submitted"
     return "submission_failed"
+
+
+def _extract_partial_json_text_fields(raw: str) -> dict[str, str]:
+    """Recover complete prose string fields from an incomplete JSON envelope."""
+    recovered: dict[str, str] = {}
+    for key in ("summary", "opinion", "text", "answer", "response"):
+        match = re.search(
+            rf"""["']{key}["']\s*:\s*("(?:\\.|[^"\\])*")""",
+            raw,
+            re.DOTALL,
+        )
+        if match is None:
+            continue
+        try:
+            value = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, str) and value.strip():
+            recovered["summary"] = value.strip()
+            break
+    return recovered
+
+
+def _advisor_reply_is_readable(raw: str) -> bool:
+    text = raw.strip()
+    if len(text) < 10 or text.casefold() in {"json", "null", "none", "n/a"}:
+        return False
+    words = re.findall(r"[\w]+", text)
+    return len(words) >= 2 or bool(re.search(r"(?m)^\s*(?:rule|alert)\b", text, re.I))
+
+
+def _extract_advisor_markdown(raw: str) -> dict[str, list[Any]]:
+    sections: list[dict[str, str]] = []
+    heading: str | None = None
+    content: list[str] = []
+    items: list[str] = []
+    section_items: list[tuple[str | None, str]] = []
+
+    def flush() -> None:
+        if heading is not None:
+            section_text = "\n".join(content).strip()
+            if section_text:
+                sections.append({"heading": heading, "text": section_text})
+
+    for line in raw.splitlines():
+        match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if match is not None:
+            flush()
+            heading = match.group(1).strip()
+            content = []
+            continue
+        if heading is not None:
+            content.append(line)
+        item = re.match(r"^\s*(?:\d+[.)]|[-*+])\s+(.+?)\s*$", line)
+        if item is not None:
+            item_text = item.group(1).strip()
+            items.append(item_text)
+            section_items.append((heading, item_text))
+
+    flush()
+    critiques = [
+        item
+        for item in sections
+        if re.search(r"(?i)(critique|review|analyse|assessment)", item["heading"])
+    ]
+    warnings = [
+        item
+        for item in sections
+        if re.search(r"(?i)(warning|avertissement|limitation|risk|risque)", item["heading"])
+    ]
+    pivots = [
+        item
+        for section_heading, item in section_items
+        if section_heading is not None and re.search(r"(?i)pivot", section_heading)
+    ]
+    return {
+        "sections": sections,
+        "items": items,
+        "pivots": pivots,
+        "critiques": critiques,
+        "warnings": warnings,
+    }
 
 
 def _mark_rule_advisory_readability(parsed: dict[str, Any], raw_text: str) -> None:

@@ -38,6 +38,7 @@ Pour YARA Bridge, `rule.propose_bridge` conserve la source exacte comme candidat
 
 ## Réactions aux réponses
 
+- Réponse Bridge partielle ou prose seule : conserver et lire le texte brut, exploiter les sections, règles, pivots et avertissements reconnus ; garder la prose inconnue visible. Distinguer reçu, analysé par le parseur, techniquement exploitable, testé, vérifié et artefact validé.
 - Erreur de schéma : relire la version réelle, required et enums ; corriger le champ.
 - Policy_denied : signaler la garde ; ne pas contourner par un nouveau nom/ID.
 - Unavailable : identifier capacité, pack ou worker manquant ; alternative ou blocage.

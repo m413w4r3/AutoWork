@@ -11,6 +11,8 @@ description: Reconstruire le protocole C2 depuis code statique et captures dispo
 
 Si l'article décrit mal les échanges et que le code est exploitable, c'est une branche prioritaire. Demander d'abord à Bridge (`plan_investigation`, avec les méthodes, données et octets déjà acquis) quelles méthodes cibler, où chercher les messages et leur sérialisation, quelles fonctions cryptographiques comprendre, quels champs serviraient une signature réseau et quels tests passifs départageraient les hypothèses. Après l'analyse, faire rédiger par Bridge (`draft_text`, `figure_plan`) la section protocole : le schéma ne contient que les étapes établies et rend les inconnues visibles, sans message ni transaction inventés. Les secrets embarqués utiles à l'analyse vont dans des annexes à accès contrôlé.
 
+Après avoir reconstruit un modèle statique ou mesuré une capture, demander à Bridge (`plan_investigation` ou `suricata_draft`) une critique des champs, séquences et incertitudes ; l'opérateur vérifie les conseils sur les observations passives disponibles, puis Bridge réévalue les résultats utiles. Pour chaque section du livrable, demander un `draft_text` puis un `review_text` si une relecture apporte de la valeur. Ne pas transformer une seule consultation de cadrage en rédaction autonome de tout le rapport ; si Bridge est indisponible, signaler la section incomplète et reprendre après diagnostic.
+
 ## Sans capture : la voie statique est utile
 
 À partir de code PE/.NET/ELF, strings décodées et ressources, inspecter sélectivement :
