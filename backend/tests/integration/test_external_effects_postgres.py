@@ -4038,6 +4038,8 @@ async def _seed_bridge_report_case(
     sample_flags: dict[str, Any] | None,
     lineage: str = "blob",
     canonical_sample_sha256: str | None = None,
+    sample_lineage_hash: str | None = None,
+    sample_blob_sha256: str | None = None,
     report_content: bytes | None = None,
     blob_store: _MemoryBlobStore | None = None,
     object_type: str = "file",
@@ -4057,7 +4059,9 @@ async def _seed_bridge_report_case(
             {
                 "data": {
                     "type": "file",
-                    "id": report_hash,
+                    "id": (
+                        canonical_sample_sha256 if len(report_hash) in {32, 40} else report_hash
+                    ),
                     "attributes": {
                         "md5": md5,
                         "sha1": sha1,
@@ -4096,7 +4100,7 @@ async def _seed_bridge_report_case(
                 session.add(blob)
                 await session.flush()
             if sample_flags is not None:
-                blob_sha256 = (
+                blob_sha256 = sample_blob_sha256 or (
                     canonical_sample_sha256 if lineage == "blob" else uuid4().hex + uuid4().hex
                 )
                 sample_blob = BlobRow(
@@ -4126,10 +4130,14 @@ async def _seed_bridge_report_case(
                         state="quarantined",
                         source_service=None,
                         source_object_id=(
-                            canonical_sample_sha256 if lineage == "source_object_id" else None
+                            (sample_lineage_hash or canonical_sample_sha256)
+                            if lineage == "source_object_id"
+                            else None
                         ),
                         expected_hash=(
-                            canonical_sample_sha256 if lineage == "expected_hash" else None
+                            (sample_lineage_hash or canonical_sample_sha256)
+                            if lineage == "expected_hash"
+                            else None
                         ),
                         validation_actor=None,
                         validation_date=None,
@@ -4423,6 +4431,91 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
 
 
 @pytest.mark.asyncio
+async def test_bridge_md5_report_rejects_conflicting_samples_found_by_report_aliases(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
+    md5 = "a" * 32
+    sha1 = "b" * 40
+    report_sha256 = "c" * 64
+    report_content = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": report_sha256,
+                "attributes": {"md5": md5, "sha1": sha1, "sha256": report_sha256},
+            }
+        }
+    ).encode()
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=md5,
+            observation_source="VirusTotal",
+            sample_flags={"external_llm_allowed": True},
+            lineage="expected_hash",
+            canonical_sample_sha256=report_sha256,
+            sample_lineage_hash=md5,
+            sample_blob_sha256=report_sha256,
+            report_content=report_content,
+            blob_store=blob_store,
+        )
+        await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=sha1,
+            observation_source="VirusTotal",
+            sample_flags={"external_llm_allowed": True},
+            lineage="source_object_id",
+            canonical_sample_sha256=report_sha256,
+            sample_lineage_hash=sha1,
+            sample_blob_sha256="e" * 64,
+            report_content=report_content,
+            blob_store=blob_store,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        report_blob_contents = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        async with session_factory() as session:
+            async with session.begin():
+                with pytest.raises(_ConsumeDenied) as denied:
+                    await store._check_source_restrictions(
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        binding,
+                        report_blob_contents=report_blob_contents,
+                    )
+        assert denied.value.reason == "vt_source_observation_hash_mismatch"
+        assert denied.value.detail is not None
+        assert UUID(reference.id).hex in denied.value.detail
+        assert "t=file" in denied.value.detail
+        assert "s=VirusTotal" in denied.value.detail
+        assert "h=32" in denied.value.detail
+        assert md5 not in denied.value.detail
+        assert sha1 not in denied.value.detail
+        assert report_sha256 not in denied.value.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_bridge_md5_policy_reloads_sample_tlp_between_consume_checks_and_replays_refusal(
     migrated_postgres_url: str,
     tmp_path: Path,
@@ -4584,7 +4677,7 @@ async def test_bridge_refuses_md5_when_vt_report_cannot_be_verified(
         {
             "data": {
                 "type": "file",
-                "id": md5,
+                "id": sha256,
                 "attributes": {
                     "md5": "e" * 32 if report_state == "incoherent" else md5,
                     "sha1": sha1,

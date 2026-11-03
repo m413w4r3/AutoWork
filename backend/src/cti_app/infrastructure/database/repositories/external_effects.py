@@ -13,7 +13,7 @@ from typing import Any, cast
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -34,6 +34,7 @@ from cti_app.application.external_effects import (
     _NoHandoffProofVerifier,
     bridge_may_cite_provider_report_hash_without_sample,
     bridge_provider_report_requires_blob,
+    bridge_provider_report_samples_conflict,
     bridge_refusal_action_for_object_type,
     external_effect_may_resolve_bridge_vt_report,
     external_effect_source_do_not_submit_blocks,
@@ -42,7 +43,7 @@ from cti_app.application.external_effects import (
     external_observation_hash_policy,
     matching_bridge_provider_report_hashes,
     osint_vt_search_may_cite_unassociated_observation_hash,
-    resolve_bridge_vt_file_report_sha256,
+    resolve_bridge_vt_file_report_hashes,
     validate_external_observation_hash,
 )
 from cti_app.domain.blobs import BlobDescriptor
@@ -354,6 +355,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 source=observation.source,
                 object_type=observation.object_type,
                 object_id=observation.object_id,
+                observation_kind=observation.kind,
             ):
                 continue
             reference = references[observation.id]
@@ -380,6 +382,9 @@ class SqlAlchemyExternalEffectClaimStore:
                 and len(content) == descriptor.size
                 and hashlib.sha256(content).hexdigest() == descriptor.sha256
             ):
+                # The recorder is the source of truth for VT blob provenance and currently
+                # leaves invocation_ref unset. Bind the content to the investigation's exact
+                # observation and verify both the attached and content-addressed digests.
                 contents[observation.id] = content
         return contents
 
@@ -1636,7 +1641,9 @@ class SqlAlchemyExternalEffectClaimStore:
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
         provider_report_hashes: set[str] = set()
-        provider_report_observations: dict[str, EvidenceObservationRow] = {}
+        provider_report_aliases: dict[UUID, set[str]] = {}
+        provider_report_sha256s: dict[UUID, str] = {}
+        provider_report_observations: dict[UUID, EvidenceObservationRow] = {}
         observation_file_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
@@ -1744,28 +1751,35 @@ class SqlAlchemyExternalEffectClaimStore:
                     if hash_policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT and len(
                         normalized_observation_hash
                     ) in {32, 40}:
-                        normalized_observation_hash = resolve_bridge_vt_file_report_sha256(
+                        resolved_report = resolve_bridge_vt_file_report_hashes(
                             family=prepared.family,
                             source=observation_source,
                             object_type=observation.object_type,
+                            observation_kind=observation.kind,
                             object_id=observation.object_id,
                             report_content=(report_blob_contents or {}).get(observation.id),
                         )
-                        if normalized_observation_hash is None:
+                        if resolved_report is None:
                             raise _ConsumeDenied(
                                 "unresolvable_evidence_observation_source",
                                 detail=_observation_refusal_detail(observation),
                             )
-                        provider_report_hashes.add(normalized_observation_hash)
-                        provider_report_observations[normalized_observation_hash] = observation
+                        aliases = set(resolved_report.identifiers)
+                        provider_report_hashes.update(aliases)
+                        provider_report_aliases[observation.id] = aliases
+                        provider_report_sha256s[observation.id] = resolved_report.sha256
+                        provider_report_observations[observation.id] = observation
                         continue
                     if vt_file_hash_read:
                         observation_file_hashes.add(normalized_observation_hash)
                     if bridge_may_cite_provider_report_hash_without_sample(
                         family=prepared.family, observation=observation
                     ):
-                        provider_report_hashes.add(normalized_observation_hash)
-                        provider_report_observations[normalized_observation_hash] = observation
+                        aliases = {normalized_observation_hash}
+                        provider_report_hashes.update(aliases)
+                        provider_report_aliases[observation.id] = aliases
+                        provider_report_sha256s[observation.id] = normalized_observation_hash
+                        provider_report_observations[observation.id] = observation
                     elif len(normalized_observation_hash) == 64:
                         observation_hashes.add(normalized_observation_hash)
                 elif object_type in {"source_document", "document"}:
@@ -1874,9 +1888,14 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("sample_not_associated_with_investigation")
 
         report_hash_samples: list[SampleRow] = []
+        report_sample_blob_hashes: dict[UUID, str] = {}
         if provider_report_hashes:
             # A report about a hash is not that hash's bytes, but any sample the subject
             # already holds under it keeps its TLP, licence and external-model restrictions.
+            # Row locks cannot protect this hash lookup from phantom inserts. Hold a table
+            # SHARE lock through the consume transaction so an in-flight sample insert
+            # commits before the lookup, and later inserts wait until the check commits.
+            await session.execute(text("LOCK TABLE samples IN SHARE MODE"))
             report_hash_samples = list(
                 await session.scalars(
                     select(SampleRow)
@@ -1894,6 +1913,17 @@ class SqlAlchemyExternalEffectClaimStore:
                     .execution_options(populate_existing=True)
                 )
             )
+            if report_hash_samples:
+                report_blob_ids = sorted({item.blob_id for item in report_hash_samples}, key=str)
+                report_blobs = list(
+                    await session.scalars(
+                        select(BlobRow)
+                        .where(BlobRow.id.in_(report_blob_ids))
+                        .order_by(BlobRow.id)
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                report_sample_blob_hashes = {item.id: item.sha256 for item in report_blobs}
         if (vt_file_hash_read or prepared.family == "vt.intelligence_search") and source_hashes:
             hash_samples = list(
                 await session.scalars(
@@ -1939,22 +1969,41 @@ class SqlAlchemyExternalEffectClaimStore:
             if restriction_reason is not None:
                 detail = None
                 if sample.id in report_hash_sample_ids:
-                    matching_report_hashes = matching_bridge_provider_report_hashes(
-                        source=sample, report_hashes=provider_report_hashes
-                    )
-                    if not matching_report_hashes:
-                        blob_hash = await session.scalar(
-                            select(BlobRow.sha256).where(BlobRow.id == sample.blob_id)
+                    blob_hash = report_sample_blob_hashes.get(sample.blob_id)
+                    matching_observations = [
+                        provider_report_observations[observation_id]
+                        for observation_id, aliases in provider_report_aliases.items()
+                        if matching_bridge_provider_report_hashes(
+                            source=sample, report_hashes=aliases, blob_sha256=blob_hash
                         )
-                        matching_report_hashes = matching_bridge_provider_report_hashes(
-                            source=sample,
-                            report_hashes=provider_report_hashes,
-                            blob_sha256=blob_hash,
+                    ]
+                    if matching_observations:
+                        detail = _observation_refusal_detail(
+                            sorted(matching_observations, key=lambda item: str(item.id))[0]
                         )
-                    if matching_report_hashes:
-                        report_observation = provider_report_observations[matching_report_hashes[0]]
-                        detail = _observation_refusal_detail(report_observation)
                 raise _ConsumeDenied(restriction_reason, detail=detail)
+
+        for observation_id, aliases in provider_report_aliases.items():
+            observation_samples = [
+                (sample, report_sample_blob_hashes[sample.blob_id])
+                for sample in report_hash_samples
+                if sample.blob_id in report_sample_blob_hashes
+                and matching_bridge_provider_report_hashes(
+                    source=sample,
+                    report_hashes=aliases,
+                    blob_sha256=report_sample_blob_hashes[sample.blob_id],
+                )
+            ]
+            if bridge_provider_report_samples_conflict(
+                report_hashes=aliases,
+                report_sha256=provider_report_sha256s[observation_id],
+                samples=observation_samples,
+            ):
+                observation = provider_report_observations[observation_id]
+                raise _ConsumeDenied(
+                    "vt_source_observation_hash_mismatch",
+                    detail=_observation_refusal_detail(observation),
+                )
         if sample_ids and {sample.id for sample in samples} != sample_ids:
             raise _ConsumeDenied("sample_source_missing")
 

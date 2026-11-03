@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from uuid import UUID
 
+import httpx
 import pytest
 from sqlalchemy.exc import IntegrityError
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.external_effects import resolve_bridge_vt_file_report_hashes
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.virustotal import (
+    VirusTotalCapabilities,
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalPage,
@@ -33,6 +37,8 @@ from cti_app.domain.virustotal import (
     VirusTotalTransportKind,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
+from tests.virustotal_external_effect_fakes import authorized_vt_read, configure_test_vt_adapter
 
 VALID_SHA256 = "a" * 64
 
@@ -230,6 +236,66 @@ async def test_report_is_raw_content_addressed_and_normalized(tmp_path: Path) ->
     # Two independently issued calls remain two distinct observations even
     # though they share one blob: idempotence never merges network history.
     assert first.id != second.id
+
+
+@pytest.mark.asyncio
+async def test_md5_report_keeps_canonical_vt_id_through_adapter_and_recorder(
+    tmp_path: Path,
+) -> None:
+    md5 = "a" * 32
+    sha1 = "b" * 40
+    sha256 = "c" * 64
+    body = json.dumps(
+        {
+            "data": {
+                "id": sha256,
+                "type": "file",
+                "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = VirusTotalHttpAdapter(
+        client=client,
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(
+            file_report=True, file_relationships=True, intelligence_search=True
+        ),
+    )
+    configure_test_vt_adapter(adapter)
+    try:
+        with authorized_vt_read():
+            report = await adapter.file_report(md5)
+    finally:
+        await client.aclose()
+
+    factory = _Factory()
+    store = FilesystemBlobStore(tmp_path / "blobs")
+    recorder = VirusTotalObservationService(BlobCatalogService(store, factory), factory)
+    observation = await recorder.store_file_report(report, observed_at=datetime.now(UTC))
+    stored_blob = factory.blobs[observation.blob_id]
+    recorded_report = await store.read(
+        stored_blob.descriptor, max_bytes=stored_blob.descriptor.size
+    )
+
+    assert report.file.id == sha256
+    assert report.raw_json == body
+    assert recorded_report == body
+    resolved = resolve_bridge_vt_file_report_hashes(
+        family="advisor.consultation.v1",
+        source="VirusTotal",
+        object_type="file",
+        object_id=md5,
+        report_content=recorded_report,
+    )
+    assert resolved is not None
+    assert resolved.sha256 == sha256
+    assert resolved.identifiers == frozenset({md5, sha1, sha256})
 
 
 @pytest.mark.asyncio

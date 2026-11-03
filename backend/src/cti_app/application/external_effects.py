@@ -17,7 +17,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, SupportsIndex, cast
@@ -115,6 +115,8 @@ def external_observation_hash_policy(
     is_bridge_family = family.startswith(_BRIDGE_FAMILY_PREFIXES)
     if is_bridge_family and normalized_type in {"md5", "sha1"}:
         return ExternalObservationHashPolicy.REJECT
+    if is_bridge_family and normalized_type == "file" and object_type != "file":
+        return ExternalObservationHashPolicy.REJECT
     if is_bridge_family and normalized_type == "file" and source == VIRUSTOTAL_OBSERVATION_SOURCE:
         return ExternalObservationHashPolicy.VT_PROVIDER_REPORT
     if family in _VT_SHORT_HASH_FAMILIES:
@@ -148,11 +150,14 @@ def validate_external_observation_hash(
     if policy is ExternalObservationHashPolicy.REJECT:
         return None
     if policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT:
-        if not value.isascii() or not re.fullmatch(
-            r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", value
-        ):
+        if not value.isascii():
             return None
-        return value
+        if len(value) == 64:
+            normalized_sha256 = value.casefold()
+            return normalized_sha256 if re.fullmatch(r"[0-9a-f]{64}", normalized_sha256) else None
+        if len(value) in {32, 40} and re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40})", value):
+            return value
+        return None
     normalized = value.casefold()
     pattern = (
         r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})"
@@ -163,14 +168,19 @@ def validate_external_observation_hash(
 
 
 def bridge_provider_report_requires_blob(
-    *, family: str, source: object, object_type: object, object_id: object
+    *,
+    family: str,
+    source: object,
+    object_type: object,
+    object_id: object,
+    observation_kind: object,
 ) -> bool:
     """Whether a Bridge VirusTotal file report needs its archived raw blob read."""
     return (
         family.startswith(_BRIDGE_FAMILY_PREFIXES)
         and source == VIRUSTOTAL_OBSERVATION_SOURCE
-        and isinstance(object_type, str)
-        and object_type.casefold() == "file"
+        and object_type == "file"
+        and observation_kind == "vt_file_report"
         and isinstance(object_id, str)
         and len(object_id) in {32, 40}
     )
@@ -181,17 +191,34 @@ def external_effect_may_resolve_bridge_vt_report(family: str) -> bool:
     return family.startswith(_BRIDGE_FAMILY_PREFIXES)
 
 
-def resolve_bridge_vt_file_report_sha256(
+@dataclass(frozen=True, slots=True)
+class BridgeVTFileReportHashes:
+    requested_hash: str
+    md5: str
+    sha1: str
+    sha256: str
+
+    @property
+    def identifiers(self) -> frozenset[str]:
+        return frozenset({self.requested_hash, self.md5, self.sha1, self.sha256})
+
+
+def resolve_bridge_vt_file_report_hashes(
     *,
     family: str,
     source: object,
     object_type: object,
+    observation_kind: object = "vt_file_report",
     object_id: object,
     report_content: bytes | None,
-) -> str | None:
-    """Resolve a short Bridge VT file hash only through its verified raw report."""
+) -> BridgeVTFileReportHashes | None:
+    """Resolve short Bridge VT hashes only through their verified raw report."""
     if not bridge_provider_report_requires_blob(
-        family=family, source=source, object_type=object_type, object_id=object_id
+        family=family,
+        source=source,
+        object_type=object_type,
+        object_id=object_id,
+        observation_kind=observation_kind,
     ):
         return None
     assert isinstance(object_id, str)
@@ -206,7 +233,7 @@ def resolve_bridge_vt_file_report_sha256(
     if not isinstance(payload, Mapping):
         return None
     data = payload.get("data")
-    if not isinstance(data, Mapping) or data.get("type") != "file" or data.get("id") != object_id:
+    if not isinstance(data, Mapping) or data.get("type") != "file":
         return None
     attributes = data.get("attributes")
     if not isinstance(attributes, Mapping):
@@ -221,14 +248,64 @@ def resolve_bridge_vt_file_report_sha256(
         and isinstance(sha1, str)
         and sha1.isascii()
         and re.fullmatch(r"[0-9a-f]{40}", sha1)
-        and isinstance(sha256, str)
-        and sha256.isascii()
-        and re.fullmatch(r"[0-9a-f]{64}", sha256)
     ):
+        return None
+
+    data_id = data.get("id")
+    data_id_is_sha256 = (
+        isinstance(data_id, str)
+        and data_id.isascii()
+        and re.fullmatch(r"[0-9a-f]{64}", data_id.casefold()) is not None
+    )
+    if sha256 is None and data_id_is_sha256:
+        assert isinstance(data_id, str)
+        resolved_sha256 = data_id.casefold()
+    elif (
+        isinstance(sha256, str)
+        and sha256.isascii()
+        and re.fullmatch(r"[0-9a-f]{64}", sha256.casefold())
+    ):
+        resolved_sha256 = sha256.casefold()
+    else:
+        return None
+
+    if data_id == object_id:
+        pass
+    elif (
+        not data_id_is_sha256
+        or not isinstance(data_id, str)
+        or data_id.casefold() != resolved_sha256
+    ):
+        return None
+    if isinstance(sha256, str) and sha256.casefold() != resolved_sha256:
         return None
     if (len(object_id) == 32 and md5 != object_id) or (len(object_id) == 40 and sha1 != object_id):
         return None
-    return sha256
+    return BridgeVTFileReportHashes(
+        requested_hash=object_id,
+        md5=md5,
+        sha1=sha1,
+        sha256=resolved_sha256,
+    )
+
+
+def resolve_bridge_vt_file_report_sha256(
+    *,
+    family: str,
+    source: object,
+    object_type: object,
+    object_id: object,
+    report_content: bytes | None,
+) -> str | None:
+    """Resolve the canonical SHA-256 from a verified Bridge VT file report."""
+    resolved = resolve_bridge_vt_file_report_hashes(
+        family=family,
+        source=source,
+        object_type=object_type,
+        object_id=object_id,
+        report_content=report_content,
+    )
+    return resolved.sha256 if resolved is not None else None
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -260,6 +337,25 @@ def matching_bridge_provider_report_hashes(
         or blob_sha256 == report_hash
     }
     return tuple(sorted(matches))
+
+
+def bridge_provider_report_samples_conflict(
+    *,
+    report_hashes: set[str],
+    report_sha256: str,
+    samples: Iterable[tuple[Any, str]],
+) -> bool:
+    """Whether samples linked to one provider report disagree on their real digest."""
+    matched_blob_hashes = {
+        blob_sha256
+        for sample, blob_sha256 in samples
+        if matching_bridge_provider_report_hashes(
+            source=sample, report_hashes=report_hashes, blob_sha256=blob_sha256
+        )
+    }
+    return len(matched_blob_hashes) > 1 or any(
+        blob_sha256 != report_sha256 for blob_sha256 in matched_blob_hashes
+    )
 
 
 def bridge_may_cite_provider_report_hash_without_sample(*, family: str, observation: Any) -> bool:

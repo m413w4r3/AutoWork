@@ -43,6 +43,7 @@ from cti_app.application.external_effects import (
     external_effect_source_do_not_submit_blocks,
     external_observation_hash_policy,
     osint_vt_search_may_cite_unassociated_observation_hash,
+    resolve_bridge_vt_file_report_hashes,
     resolve_bridge_vt_file_report_sha256,
     validate_external_observation_hash,
 )
@@ -2327,7 +2328,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
         {
             "data": {
                 "type": "file",
-                "id": md5,
+                "id": sha256,
                 "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
             }
         }
@@ -2341,6 +2342,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
         sha256=observation_sha256,
         object_type="file",
         object_id=md5,
+        kind="vt_file_report",
     )
     reference = EvidenceReference(
         "evidence_observation", str(observation_id), "vt.v3", observation_sha256
@@ -2359,7 +2361,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
         id=uuid4(),
         subject_id=subject_id,
         blob_id=uuid4(),
-        expected_hash=sha256,
+        expected_hash=md5,
         source_object_id=None,
         tlp="CLEAR",
         external_llm_allowed=False,
@@ -2371,7 +2373,12 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
         def __init__(self) -> None:
             self.calls = 0
             self.resolved_sha256_was_queried = False
+            self.resolved_aliases_were_queried = False
             self.report_sample_populate_existing = False
+            self.sample_catalog_locked = False
+
+        async def execute(self, statement):
+            self.sample_catalog_locked = str(statement) == "LOCK TABLE samples IN SHARE MODE"
 
         async def scalars(self, statement):
             self.calls += 1
@@ -2380,10 +2387,13 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             if self.calls == 2:
                 params = repr(statement.compile().params)
                 self.resolved_sha256_was_queried = sha256 in params
+                self.resolved_aliases_were_queried = md5 in params and sha1 in params
                 self.report_sample_populate_existing = (
                     statement.get_execution_options().get("populate_existing") is True
                 )
                 return [sample] if self.resolved_sha256_was_queried else []
+            if self.calls == 3:
+                return [SimpleNamespace(id=sample.blob_id, sha256=sha256)]
             return []
 
         async def scalar(self, _statement):
@@ -2409,7 +2419,9 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             report_blob_contents={observation_id: report_content},
         )
     assert session.resolved_sha256_was_queried
+    assert session.resolved_aliases_were_queried
     assert session.report_sample_populate_existing
+    assert session.sample_catalog_locked
 
 
 @pytest.mark.asyncio
@@ -3255,7 +3267,7 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
         {
             "data": {
                 "type": "file",
-                "id": md5,
+                "id": sha256,
                 "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
             }
         }
@@ -3270,6 +3282,60 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
             report_content=report,
         )
         == sha256
+    )
+    resolved = resolve_bridge_vt_file_report_hashes(
+        family="advisor.consultation.v1",
+        source="VirusTotal",
+        object_type="file",
+        object_id=md5,
+        report_content=report,
+    )
+    assert resolved is not None
+    assert resolved.identifiers == frozenset({md5, sha1, sha256})
+    id_only_payload = json.loads(report)
+    del id_only_payload["data"]["attributes"]["sha256"]
+    id_only_resolution = resolve_bridge_vt_file_report_hashes(
+        family="advisor.consultation.v1",
+        source="VirusTotal",
+        object_type="file",
+        object_id=md5,
+        report_content=json.dumps(id_only_payload).encode(),
+    )
+    assert id_only_resolution is not None
+    assert id_only_resolution.sha256 == sha256
+    conflicting_id_payload = json.loads(report)
+    conflicting_id_payload["data"]["id"] = "d" * 64
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=json.dumps(conflicting_id_payload).encode(),
+        )
+        is None
+    )
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="FILE",
+            observation_kind="vt_file_report",
+            object_id=md5,
+            report_content=report,
+        )
+        is None
+    )
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            observation_kind="vt_relationship",
+            object_id=md5,
+            report_content=report,
+        )
+        is None
     )
     assert (
         resolve_bridge_vt_file_report_sha256(
@@ -3286,7 +3352,7 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
         {
             "data": {
                 "type": "file",
-                "id": sha1,
+                "id": sha256,
                 "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
             }
         }
@@ -3321,6 +3387,14 @@ def test_bridge_provider_short_hash_is_validated_as_raw_ascii_lower_hex() -> Non
     assert validate_external_observation_hash("a" * 32, policy) == "a" * 32
     assert validate_external_observation_hash("A" * 32, policy) is None
     assert validate_external_observation_hash("\ufb00" + "a" * 30, policy) is None
+
+
+def test_bridge_provider_sha256_keeps_historical_casefolding() -> None:
+    policy = external_observation_hash_policy(
+        family="advisor.consultation.v1", source="VirusTotal", object_type="file"
+    )
+    assert policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT
+    assert validate_external_observation_hash("A" * 64, policy) == "a" * 64
 
 
 @pytest.mark.parametrize("object_type", ["md5", "sha1"])
