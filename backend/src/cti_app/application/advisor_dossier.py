@@ -1373,10 +1373,13 @@ def build_advisor_dossier(
             else ""
         )
         limitations = item.get("limitations", ())
-        limitation_text = (
-            "Limitations: " + "; ".join(_as_text(value) for value in limitations if _as_text(value))
+        limitation_values = (
+            tuple(_as_text(value) for value in limitations if _as_text(value))
             if isinstance(limitations, (list, tuple))
-            else ""
+            else ()
+        )
+        limitation_text = (
+            f"Limitations: {'; '.join(limitation_values)}" if limitation_values else ""
         )
         score = _relevance_score(
             task_terms,
