@@ -996,11 +996,16 @@ async def test_optional_draft_inputs_degrade_with_warnings_and_canonical_measure
     ],
 )
 @pytest.mark.asyncio
-async def test_optional_measurement_fallback_does_not_widen_explicit_scope(
+async def test_optional_measurements_do_not_widen_explicit_scope(
     selector: str, expected_error: str
 ) -> None:
     investigation_id = uuid4()
-    transport = Transport(None)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Only available canonical context was used.", []),
+        )
+    )
     tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
     arguments: dict[str, Any] = {
         "consultation_type": "pivot_strategy",
@@ -1016,9 +1021,16 @@ async def test_optional_measurement_fallback_does_not_widen_explicit_scope(
         make_context(investigation_id, key=f"scope-selector-{selector}"),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.output["input_error_code"] == expected_error
-    assert transport.calls == []
+    if selector == "evidence_refs":
+        assert result.output["advisor_status"] == "insufficient_evidence"
+        assert transport.calls == []
+        assert any(
+            item["reason"] == "reference_not_resolvable" for item in result.output["ignored_inputs"]
+        )
+    else:
+        assert result.status is ToolInvocationStatus.FAILED
+        assert result.output["input_error_code"] == expected_error
+        assert transport.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1295,6 +1307,16 @@ def test_advisor_registered_schema_accepts_canonical_editorial_assertion_refs() 
     }
 
     validate_json_schema(arguments, schema)
+
+    validate_json_schema(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": {"malformed": "optional reference list"},
+            "measurements": "malformed optional selector",
+            "unrecognized_hint": "dropped by the adapter",
+        },
+        schema,
+    )
 
     arguments["units"][0]["assertions"][0]["refs"][0]["id"] = "not-a-uuid"
     # Assertion annotations are optional, so their canonical shape is checked
@@ -2340,7 +2362,12 @@ async def test_pivot_strategy_rejects_a_basis_reference_absent_from_observations
 
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["advisor_status"] == "partial"
-    assert result.output["usable"] is False
+    assert result.output["usable"] is False, {
+        "warnings": result.output.get("warnings"),
+        "normalizations": result.output.get("normalizations"),
+        "structured_usable": result.output.get("structured_usable"),
+        "validation_rejection": result.output.get("validation_rejection"),
+    }
     assert result.output["alternative_hypotheses"] == ()
     assert result.output["recommended_next_tools"] == ()
     assert result.output["normalization_status"] == "partial"
@@ -2359,13 +2386,62 @@ def test_unparsed_bridge_prose_is_returned_complete_with_its_sha256() -> None:
         bridge_invocation_id=str(uuid4()),
     )
 
+    for consultation_type in (
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "suricata_draft",
+        "draft_text",
+        "review_text",
+        "figure_plan",
+    ):
+        result = tool._submission_result(
+            submission,
+            prompt="Synthetic prose consultation prompt.",
+            evidence_refs=(),
+            source_refs=(),
+            input_bytes=128,
+            consultation_type=consultation_type,
+            elapsed_seconds=1,
+            available_tools={},
+            available_tool_schemas={},
+            prompt_data={"transmitted_refs": []},
+        )
+
+        assert result.status is ToolInvocationStatus.PARTIAL, consultation_type
+        assert result.output["advisory_text"].startswith("[UNTRUSTED ADVISORY]\n" + raw_output)
+        assert result.output["raw_output"] == raw_output
+        assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+        assert result.output["raw_output_sha256"] == result.output["output_sha256"]
+        assert result.output["warnings"]
+        assert result.output["usable"] is True, consultation_type
+        assert result.output["readable"] is True, consultation_type
+        assert result.output["canonicalization_eligible"] is False, consultation_type
+
+
+def test_unknown_wire_reference_keeps_prose_readable_but_not_technically_usable() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    raw = (
+        "advisor-wire.v1\n"
+        "TYPE: pivot_strategy\n"
+        "STATUS: partial\n"
+        "SUMMARY: Compare this lead with the canonical evidence before prioritizing it.\n"
+        "ALT: A separate delivery path may explain the observed behavior | refs=R99\n"
+    )
+    submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=raw,
+        bridge_invocation_id=str(uuid4()),
+    )
+
     result = tool._submission_result(
         submission,
-        prompt="Synthetic prose consultation prompt.",
+        prompt="Synthetic pivot consultation prompt.",
         evidence_refs=(),
         source_refs=(),
         input_bytes=128,
-        consultation_type="figure_plan",
+        consultation_type="pivot_strategy",
         elapsed_seconds=1,
         available_tools={},
         available_tool_schemas={},
@@ -2373,12 +2449,56 @@ def test_unparsed_bridge_prose_is_returned_complete_with_its_sha256() -> None:
     )
 
     assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["advisory_text"] == "[UNTRUSTED ADVISORY]\n" + raw_output
-    assert result.output["raw_output"] == raw_output
-    assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
-    assert result.output["raw_output_sha256"] == result.output["output_sha256"]
-    assert "structured_parse_unavailable" in result.output["warnings"]
+    assert result.output["raw_output"] == raw
+    assert result.output["readable"] is True
     assert result.output["usable"] is False
+    assert result.output["structured_usable"] is False
+    assert any(
+        "reference_alias_unknown" in item
+        for item in (*result.output["warnings"], *result.output["normalizations"])
+    )
+
+
+def test_review_with_unresolved_basis_remains_readable_but_not_usable() -> None:
+    investigation_id = uuid4()
+    unknown_reference = str(uuid4())
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    raw = json.dumps(
+        {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+            "consultation_type": "review_text",
+            "status": "succeeded",
+            "language": "fr",
+            "reviews": [
+                {
+                    "unit_id": "U1",
+                    "remarks": ["Separate the measured observation from its interpretation."],
+                    "basis_refs": [{"kind": "observation", "id": unknown_reference}],
+                }
+            ],
+            "limitations": [],
+            "untrusted": True,
+        }
+    )
+
+    result = tool._submission_result(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw),
+        prompt="Synthetic review prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=128,
+        consultation_type="review_text",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={"units": [{"unit_id": "U1", "block_type": "key_findings"}]},
+    )
+
+    assert result.output["readable"] is True
+    assert result.output["usable"] is False
+    assert result.output["structured_usable"] is False
+    assert result.output["raw_output"] == raw
+    assert any("review_refs_invalid" in item for item in result.output["warnings"])
 
 
 def test_unlinked_draft_prose_includes_explicit_consultative_warning() -> None:
@@ -2677,7 +2797,7 @@ async def test_recommendation_without_any_valid_observation_ref_is_dropped_and_t
         if item.source == "advisor.consult"
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=32 * 1024)
     )
     assert persisted["output"]["advisor_status"] == "partial"
     assert persisted["output"]["recommended_next_tools"] == []
@@ -6433,6 +6553,124 @@ async def test_literal_json_advisor_reply_is_partial_and_not_retried() -> None:
     assert len(transport.calls) == 1
 
 
+def test_partial_json_reply_remains_readable_for_every_advisor_consultation_type() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    raw = (
+        '{"summary":"Bridge suggests comparing the marker across associated samples.", '
+        '"unknown_extension":{"retained":"in raw text"}, "unfinished":'
+    )
+
+    for consultation_type in (
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "suricata_draft",
+        "draft_text",
+        "review_text",
+        "figure_plan",
+    ):
+        result = tool._submission_result(
+            TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw),
+            prompt="Synthetic prompt.",
+            evidence_refs=(),
+            source_refs=(),
+            input_bytes=64,
+            consultation_type=consultation_type,
+            elapsed_seconds=1,
+            available_tools={},
+            available_tool_schemas={},
+            prompt_data={"consultation_type": consultation_type},
+        )
+
+        assert result.status is ToolInvocationStatus.PARTIAL, consultation_type
+        assert result.output["usable"] is True, consultation_type
+        assert result.output["readable"] is True, consultation_type
+        assert result.output["raw_output"] == raw, consultation_type
+        assert result.output["canonicalization_eligible"] is False, consultation_type
+
+
+def test_numbered_pivot_suggestions_are_extracted_and_raw_markdown_is_retained() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    raw = (
+        "## Pivots proposés\n"
+        "1. Chercher les échantillons associés partageant le même mutex.\n"
+        "2. Comparer les domaines observés dans les configurations.\n"
+        "## Critique\n"
+        "La piste mutex reste à comparer aux observations indépendantes.\n"
+        "## Avertissements\n"
+        "Une relation passive ne prouve pas un C2 actif.\n"
+        "## Plan d'action\n"
+        "1. Mesurer les nouveaux résultats par hash avant de réviser la règle.\n"
+    )
+
+    result = tool._submission_result(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw),
+        prompt="Synthetic pivot prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=64,
+        consultation_type="pivot_strategy",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={"consultation_type": "pivot_strategy"},
+    )
+
+    assert result.output["suggested_pivots"] == (
+        "Chercher les échantillons associés partageant le même mutex.",
+        "Comparer les domaines observés dans les configurations.",
+    )
+    assert result.output["action_items"] == (
+        "Chercher les échantillons associés partageant le même mutex.",
+        "Comparer les domaines observés dans les configurations.",
+        "Mesurer les nouveaux résultats par hash avant de réviser la règle.",
+    )
+    assert result.output["critique_sections"] == (
+        {
+            "heading": "Critique",
+            "text": "La piste mutex reste à comparer aux observations indépendantes.",
+        },
+    )
+    assert result.output["warning_sections"] == (
+        {
+            "heading": "Avertissements",
+            "text": "Une relation passive ne prouve pas un C2 actif.",
+        },
+    )
+
+
+def test_pivot_strategy_does_not_mislabel_warning_list_as_suggested_pivots() -> None:
+    tool, _sample_blob_id = make_tool(investigation_id=uuid4(), transport=Transport(None))
+    raw = (
+        "## Risks\n"
+        "1. A shared host does not establish a shared operator.\n"
+        "2. Passive sightings do not prove active C2.\n"
+    )
+
+    result = tool._submission_result(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw),
+        prompt="Synthetic pivot prompt.",
+        evidence_refs=(),
+        source_refs=(),
+        input_bytes=64,
+        consultation_type="pivot_strategy",
+        elapsed_seconds=1,
+        available_tools={},
+        available_tool_schemas={},
+        prompt_data={"consultation_type": "pivot_strategy"},
+    )
+
+    assert result.output["suggested_pivots"] == ()
+    assert result.output["action_items"] == (
+        "A shared host does not establish a shared operator.",
+        "Passive sightings do not prove active C2.",
+    )
+    assert result.output["raw_output"] == raw
+    assert [item["heading"] for item in result.output["advisory_sections"]] == ["Risks"]
+
+
 @pytest.mark.asyncio
 async def test_mismatched_json_schema_is_retained_with_a_warning() -> None:
     investigation_id = uuid4()
@@ -8483,7 +8721,7 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
         schema_version="advisor-consult.v1",
         arguments={
             "consultation_type": "plan_investigation",
-            "evidence_refs": [str(observation.id)],
+            "question": f"Review this canonical identifier: {observation.id}",
         },
         purpose="Measure and reserve the advisor prompt before transport.",
         operation_key=context.idempotency_key,
@@ -9275,6 +9513,58 @@ async def test_figure_plan_auto_loads_current_findings_and_accepts_priority_sele
 
     assert [item["finding_id"] for item in implicit["findings"]] == [str(finding.id)]
     assert [item["finding_id"] for item in selected["findings"]] == [str(finding.id)]
+
+
+@pytest.mark.asyncio
+async def test_figure_plan_ignores_unresolvable_optional_finding_refs() -> None:
+    investigation_id = uuid4()
+    finding = SimpleNamespace(
+        id=uuid4(),
+        investigation_id=investigation_id,
+        version=1,
+        kind=SimpleNamespace(value="behavior"),
+        assessment=SimpleNamespace(value="observed"),
+        statement="Une observation disponible décrit une capacité mesurée.",
+        observation_refs=(),
+        claim_refs=(),
+        limitations=(),
+        supersedes=None,
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Le finding courant peut être illustré.", []),
+        )
+    )
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._findings = SimpleNamespace(list_for_investigation=async_get((finding,)))
+    missing_finding_id = uuid4()
+    original_consultation_data = tool._consultation_data
+    sanitized_findings: list[str] = []
+
+    async def record_consultation_data(**kwargs):
+        sanitized_findings.extend(kwargs["arguments"].get("finding_refs", ()))
+        return await original_consultation_data(**kwargs)
+
+    tool._consultation_data = record_consultation_data
+
+    result = await tool.execute(
+        {
+            "consultation_type": "figure_plan",
+            "question": "Propose a useful figure for the current finding.",
+            "finding_refs": [str(missing_finding_id), str(finding.id), str(finding.id)],
+        },
+        make_context(investigation_id, key="advisor:figure-invalid-optional-ref"),
+    )
+
+    assert len(transport.calls) == 1, result.output
+    assert sanitized_findings == [str(finding.id)]
+    assert any(
+        item.get("reference") == str(missing_finding_id)
+        and item["reason"] == "reference_not_resolvable"
+        for item in result.output["ignored_inputs"]
+    )
+    assert any(item["reason"] == "duplicate_reference" for item in result.output["ignored_inputs"])
 
 
 @pytest.mark.asyncio
@@ -10572,6 +10862,10 @@ async def test_review_text_invalid_target_lists_valid_units_before_transport() -
     assert "key_findings" in result.message
     assert transport.calls == []
 
+    transport.submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=advisor_response("The canonical opinion remains available for review.", []),
+    )
     invalid_unit = await tool.execute(
         {
             "consultation_type": "review_text",
@@ -10588,11 +10882,13 @@ async def test_review_text_invalid_target_lists_valid_units_before_transport() -
         },
         make_context(investigation_id, key="operator:advisor:invalid-unit-anchor"),
     )
-    assert invalid_unit.status is ToolInvocationStatus.FAILED
-    assert invalid_unit.output["input_error_code"] == "editorial_unit_target_invalid"
-    assert invalid_unit.output["valid_targets"] == result.output["valid_targets"]
-    assert invalid_unit.output["failure_stage"] == "pre_transport_validation"
-    assert transport.calls == []
+    assert invalid_unit.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert len(transport.calls) == 1
+    assert any(
+        item["reason"] == "invalid_or_duplicate_unit_ignored"
+        for item in invalid_unit.output["ignored_inputs"]
+    )
+    assert "The sole canonical body block." in transport.calls[0]["prompt"]
 
     anchor_only = await tool.execute(
         {
@@ -10603,13 +10899,12 @@ async def test_review_text_invalid_target_lists_valid_units_before_transport() -
         },
         make_context(investigation_id, key="operator:advisor:anchor-without-block-type"),
     )
-    assert anchor_only.status is ToolInvocationStatus.FAILED
-    assert anchor_only.error_code == "advisor_input_invalid"
-    assert anchor_only.output["input_error_code"] == "editorial_unit_target_invalid"
-    assert anchor_only.output["valid_targets"] == result.output["valid_targets"]
-    assert anchor_only.output["failure_stage"] == "pre_transport_validation"
-    assert anchor_only.output["confirmed_non_execution"] is True
-    assert transport.calls == []
+    assert anchor_only.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert len(transport.calls) == 2
+    assert any(
+        item["reason"] == "anchor_requires_analyst_note_form"
+        for item in anchor_only.output["ignored_inputs"]
+    )
 
 
 @pytest.mark.asyncio
@@ -11388,7 +11683,7 @@ async def test_general_contradiction_search_reaches_bridge_without_a_refuted_fin
 
 
 @pytest.mark.asyncio
-async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() -> None:
+async def test_missing_optional_evidence_reference_is_ignored_and_reported() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(investigation_id, {"schema": "offline-test.v1"})
     missing_observation_id = uuid4()
@@ -11403,30 +11698,23 @@ async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() 
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
+            "question": "Inspect the available investigation context.",
             "evidence_refs": [str(missing_observation_id)],
         },
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["advisor_status"] == "invalid_input"
-    assert result.output.get("input_error_code") == "evidence_reference_not_found", result.output
-    assert result.output["preflight_cause"]["ref"] == str(missing_observation_id)
-    assert "canonical observation from this investigation" in result.message
-    assert str(missing_observation_id) in result.message
-    assert result.output["failure_stage"] == "pre_transport_validation"
-    assert result.output["confirmed_non_execution"] is True
-    assert result.output["provider_usage"] == {"status": "not_submitted"}
-    assert (
-        result.framework_pre_submission_proof
-        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    assert len(transport.calls) == 1
+    assert result.output.get("input_error_code") is None
+    assert any(
+        item["reference"] == str(missing_observation_id)
+        and item["reason"] == "reference_not_resolvable"
+        for item in result.output["ignored_inputs"]
     )
-    assert transport.calls == []
 
 
 @pytest.mark.asyncio
-async def test_cross_investigation_evidence_reference_is_rejected_before_bridge() -> None:
+async def test_cross_investigation_optional_evidence_reference_is_ignored() -> None:
     investigation_id = uuid4()
     foreign_observation, foreign_raw = make_observation(uuid4(), {"content": "foreign evidence"})
     transport = Transport(None)
@@ -11440,22 +11728,22 @@ async def test_cross_investigation_evidence_reference_is_rejected_before_bridge(
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
+            "question": "Inspect the available investigation context.",
             "evidence_refs": [str(foreign_observation.id)],
         },
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["failure_stage"] == "pre_transport_validation"
-    assert result.output["preflight_cause"]["ref"] == str(foreign_observation.id)
-    assert "another investigation" in result.output["preflight_cause"]["reason"]
-    assert result.output["confirmed_non_execution"] is True
-    assert transport.calls == []
+    assert len(transport.calls) == 1
+    assert any(
+        item["reference"] == str(foreign_observation.id)
+        and item["reason"] == "reference_not_resolvable"
+        for item in result.output["ignored_inputs"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_mixed_valid_and_cross_investigation_refs_are_rejected_with_pointer() -> None:
+async def test_mixed_valid_and_cross_investigation_refs_keep_valid_context() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(investigation_id, {"content": "Synthetic valid body."})
     foreign, foreign_raw = make_observation(uuid4(), {"content": "Synthetic foreign body."})
@@ -11489,12 +11777,245 @@ async def test_mixed_valid_and_cross_investigation_refs_are_rejected_with_pointe
         make_context(investigation_id, key="operator:advisor:mixed-cross-investigation-refs"),
     )
 
+    assert len(transport.calls) == 1
+    assert "Synthetic valid body." in transport.calls[0]["prompt"]
+    assert any(
+        item["reference"] == str(foreign.id) and item["reason"] == "reference_not_resolvable"
+        for item in result.output["ignored_inputs"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_optional_invalid_advisor_arguments_are_ignored_with_reasons() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id, {"schema": "optional-reference-fixture.v1", "content": "Canonical."}
+    )
+    missing_id = uuid4()
+    response = advisor_response("Use the available canonical context.", [str(observation.id)])
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=response))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id, transport=transport, observation=observation, raw=raw
+    )
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+    original_consultation_data = tool._consultation_data
+    normalized_arguments: dict[str, Any] = {}
+
+    async def capture_normalized_arguments(**kwargs):
+        normalized_arguments.clear()
+        normalized_arguments.update(kwargs["arguments"])
+        return await original_consultation_data(**kwargs)
+
+    tool._consultation_data = capture_normalized_arguments
+
+    context = make_dispatch_context(investigation_id)
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "question": "Review the available canonical context and malformed claim S0P0.",
+            "evidence_refs": [
+                str(observation.id),
+                str(observation.id),
+                "malformed-reference",
+                str(missing_id),
+            ],
+            "opinion_id": str(observation.id),
+            "preflight": "required",
+            "unused_hint": "ignored without disclosure",
+        },
+        purpose="Check that malformed optional consultation hints do not block the valid request.",
+        operation_key=context.idempotency_key,
+    )
+
+    assert len(transport.calls) == 1, result
+    ignored = result.output["ignored_inputs"]
+    assert {item["field"] for item in ignored} == {
+        "evidence_refs",
+        "opinion_id",
+        "question",
+        "preflight",
+        "unused_hint",
+    }
+    assert {item["reason"] for item in ignored} >= {
+        "duplicate_reference",
+        "malformed_reference",
+        "reference_not_resolvable",
+        "unsupported_field",
+        "unsupported_for_consultation_type",
+        "malformed_claim_token",
+    }
+    assert result.output["usable"] is True
+    assert normalized_arguments["evidence_refs"] == [str(observation.id)]
+    assert "opinion_id" not in normalized_arguments
+    assert "preflight" not in normalized_arguments
+    assert "unused_hint" not in normalized_arguments
+
+
+@pytest.mark.asyncio
+async def test_explicit_unknown_uuid_in_advisor_question_names_available_refs() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id, {"schema": "explicit-reference-fixture.v1", "content": "Canonical."}
+    )
+    requested_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id, transport=transport, observation=observation, raw=raw
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Please inspect observation {requested_id}.",
+        },
+        make_context(investigation_id, key="advisor:explicit-missing-reference"),
+    )
+
+    assert result.output["input_error_code"] == "evidence_reference_not_found"
+    assert str(requested_id) in result.message
+    assert str(observation.id) in result.message
     assert transport.calls == []
-    assert result.output.get("input_error_code") == "evidence_reference_not_found", result.output
-    assert result.output["preflight_cause"]["ref"] == str(foreign.id)
-    assert "another investigation" in result.output["preflight_cause"]["reason"]
-    assert str(foreign.id) in result.message
-    assert "Choose a canonical observation" in result.message
+
+
+@pytest.mark.asyncio
+async def test_explicit_unknown_finding_in_question_names_available_findings() -> None:
+    investigation_id = uuid4()
+    available_finding = SimpleNamespace(
+        id=uuid4(), investigation_id=investigation_id, supersedes=None
+    )
+    requested_finding_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._findings = FindingRepository((available_finding,))
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Review finding {requested_finding_id}.",
+        },
+        make_context(investigation_id, key="advisor:explicit-missing-finding"),
+    )
+
+    assert result.output["input_error_code"] == "finding_reference_not_found"
+    assert str(requested_finding_id) in result.message
+    assert str(available_finding.id) in result.message
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_bare_unknown_uuid_in_question_names_usable_references() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id, {"schema": "bare-reference-fixture.v1", "content": "Canonical."}
+    )
+    requested_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Compare this identifier: {requested_id}",
+        },
+        make_context(investigation_id, key="advisor:bare-missing-reference"),
+    )
+
+    assert result.output["input_error_code"] == "requested_reference_not_found"
+    assert str(requested_id) in result.message
+    assert str(observation.id) in result.message
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_opinion_id_does_not_hide_requested_question_reference() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id, {"schema": "opinion-collision-fixture.v1", "content": "Canonical."}
+    )
+    requested_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": f"Compare this identifier: {requested_id}",
+            "opinion_id": str(requested_id),
+        },
+        make_context(investigation_id, key="advisor:opinion-id-collision"),
+    )
+
+    assert result.output["input_error_code"] == "requested_reference_not_found"
+    assert str(requested_id) in result.message
+    assert str(observation.id) in result.message
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_question_opinion_uuid_is_suppressed_only_for_resolved_review_target() -> None:
+    investigation_id = uuid4()
+    opinion_id = uuid4()
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=Transport(None))
+    opinion = SimpleNamespace(id=opinion_id, investigation_id=investigation_id)
+
+    class OpinionRepository:
+        async def get(self, _opinion_id, *, version=None):
+            assert version is None
+            return opinion
+
+    tool._opinions = OpinionRepository()
+    arguments = {"opinion_id": str(opinion_id)}
+
+    resolved = await tool._resolved_question_opinion_id(
+        investigation_id,
+        "review_text",
+        f"Review opinion {opinion_id}",
+        arguments,
+    )
+    unrelated_consultation = await tool._resolved_question_opinion_id(
+        investigation_id,
+        "plan_investigation",
+        f"Review opinion {opinion_id}",
+        arguments,
+    )
+    explicit_observation = await tool._resolved_question_opinion_id(
+        investigation_id,
+        "review_text",
+        f"Review observation {opinion_id}",
+        arguments,
+    )
+
+    assert resolved == opinion_id
+    assert unrelated_consultation is None
+    assert explicit_observation is None
+
+    class MissingOpinionRepository:
+        async def get(self, _opinion_id, *, version=None):
+            assert version is None
+            return None
+
+    tool._opinions = MissingOpinionRepository()
+    unresolved = await tool._resolved_question_opinion_id(
+        investigation_id,
+        "review_text",
+        f"Review opinion {opinion_id}",
+        arguments,
+    )
+    assert unresolved is None
 
 
 def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
@@ -11675,17 +12196,16 @@ def test_cited_unknown_evidence_ref_has_a_specific_provenance_error() -> None:
 
     tool = InvestigationAdvisorTool.__new__(InvestigationAdvisorTool)
     tool._observations = Observations()
-    tool._ignored_evidence_refs = {}
+    tool._ignored_advisor_inputs = {}
     context = SimpleNamespace(investigation_id=case, idempotency_key="key-1")
 
     found = asyncio.run(tool._load_cited_evidence(context, (known,)))
     assert [item.id for item in found] == [known]
-    with pytest.raises(ValueError, match="evidence_reference_not_found") as error:
-        asyncio.run(tool._load_cited_evidence(context, (known, foreign, missing)))
-    assert error.value.reference == str(foreign)
-    with pytest.raises(ValueError, match="evidence_reference_not_found") as error:
-        asyncio.run(tool._load_cited_evidence(context, (foreign, missing)))
-    assert error.value.reference == str(foreign)
+    found = asyncio.run(tool._load_cited_evidence(context, (known, foreign, missing)))
+    assert [item.id for item in found] == [known]
+    ignored = tool._ignored_advisor_inputs["key-1"]
+    assert {item["reference"] for item in ignored} == {str(foreign), str(missing)}
+    assert all(item["reason"] == "reference_not_resolvable" for item in ignored)
 
 
 @pytest.mark.asyncio
