@@ -3413,8 +3413,31 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
         object_id=md5,
         report_content=json.dumps(id_only_payload).encode(),
     )
-    assert id_only_resolution is not None
-    assert id_only_resolution.sha256 == sha256
+    assert id_only_resolution is None
+    missing_md5_payload = json.loads(report)
+    del missing_md5_payload["data"]["attributes"]["md5"]
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=json.dumps(missing_md5_payload).encode(),
+        )
+        is None
+    )
+    missing_sha1_payload = json.loads(report)
+    del missing_sha1_payload["data"]["attributes"]["sha1"]
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha1,
+            report_content=json.dumps(missing_sha1_payload).encode(),
+        )
+        is None
+    )
     conflicting_id_payload = json.loads(report)
     conflicting_id_payload["data"]["id"] = "d" * 64
     assert (
