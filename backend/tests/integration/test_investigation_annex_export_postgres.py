@@ -24,9 +24,12 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     InvestigationBudget,
     InvestigationEnvelope,
+    MotifProvenance,
     SampleAssociation,
     SampleOrigin,
     TLPLevel,
+    ToolInvocation,
+    ToolInvocationStatus,
 )
 from cti_app.domain.production import (
     AnalystInvestigation,
@@ -141,7 +144,6 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             + "x" * 7000
             + '"\n condition:\n  $marker\n}\n'
         )
-        experimental_source = "// author: analyst-a; origin: experiment\n" + rule_body
         bridge_source = "// author: bridge-fixture; origin: Bridge\n" + rule_body
         revised_source = bridge_source.replace("candidate", "candidate_revised")
         suricata_source = (
@@ -205,20 +207,138 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         )
         sample_sha = sample_record.descriptor.sha256
         unacquired_sha = hashlib.sha256(b"synthetic-not-acquired").hexdigest()
-        source_v1 = DetectionCandidateVersion(
+        bridge_invocation_id = uuid4()
+        operator_invocation_id = uuid4()
+        bridge_observation_id = uuid4()
+        operator_observation_id = uuid4()
+        candidate_id = uuid4()
+        source_v1_id = uuid4()
+        source_v1_payload = {
+            "schema": "investigation-tool-observation.v1",
+            "tool_name": "rule.propose_bridge",
+            "result": {
+                "candidate_id": str(candidate_id),
+                "version_id": str(source_v1_id),
+                "source_author": "bridge",
+                "source_attribution": {
+                    "author": "bridge",
+                    "source_author": "bridge",
+                    "origin_author": "bridge",
+                    "change_kind": "bridge_yara_draft",
+                },
+            },
+        }
+        source_v1_blob = await catalog.ingest(
+            BytesIO(_json_bytes(source_v1_payload)),
+            logical_bucket="annex-test",
+            mime_type="application/json",
+        )
+        source_v1_observation = EvidenceObservation(
+            id=bridge_observation_id,
             investigation_id=investigation.id,
-            source=experimental_source,
-            source_sha256=hashlib.sha256(experimental_source.encode()).hexdigest(),
-            motif_provenance=(),
+            kind=EvidenceKind.OTHER,
+            blob_id=source_v1_blob.id,
+            sha256=source_v1_blob.descriptor.sha256,
+            source="rule.propose_bridge",
+            source_version="rule.propose_bridge.v1",
+            observed_at=NOW,
+            object_type="tool_result",
+            object_id="synthetic-bridge-proposal",
+            invocation_ref=bridge_invocation_id,
+        )
+        source_v2_id = uuid4()
+        operator_payload = {
+            "schema": "investigation-tool-observation.v1",
+            "tool_name": "rule.operator_syntax_fix",
+            "result": {
+                "candidate_id": str(candidate_id),
+                "version_id": str(source_v2_id),
+                "source_author": "operator",
+                "source_attribution": {
+                    "author": "operator",
+                    "source_author": "operator",
+                    "origin_author": "bridge",
+                    "change_kind": "operator_syntax_fix",
+                },
+            },
+        }
+        operator_blob = await catalog.ingest(
+            BytesIO(_json_bytes(operator_payload)),
+            logical_bucket="annex-test",
+            mime_type="application/json",
+        )
+        operator_observation = EvidenceObservation(
+            id=operator_observation_id,
+            investigation_id=investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=operator_blob.id,
+            sha256=operator_blob.descriptor.sha256,
+            source="rule.operator_syntax_fix",
+            source_version="rule.operator_syntax_fix.v1",
+            observed_at=NOW,
+            object_type="tool_result",
+            object_id="synthetic-operator-revision",
+            invocation_ref=operator_invocation_id,
+        )
+        bridge_invocation = ToolInvocation(
+            id=bridge_invocation_id,
+            investigation_id=investigation.id,
+            operation_key=f"annex-bridge:{bridge_invocation_id}",
+            tool_name="rule.propose_bridge",
+            schema_version="rule.propose_bridge.v1",
+            normalized_parameters={},
+            purpose="Synthetic canonical provenance fixture",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=(bridge_observation_id,),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        operator_invocation = ToolInvocation(
+            id=operator_invocation_id,
+            investigation_id=investigation.id,
+            operation_key=f"annex-operator:{operator_invocation_id}",
+            tool_name="rule.operator_syntax_fix",
+            schema_version="rule.operator_syntax_fix.v1",
+            normalized_parameters={},
+            purpose="Synthetic canonical provenance fixture",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=(operator_observation_id,),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        source_v1 = DetectionCandidateVersion(
+            id=source_v1_id,
+            candidate_id=candidate_id,
+            investigation_id=investigation.id,
+            source=bridge_source,
+            source_sha256=hashlib.sha256(bridge_source.encode()).hexdigest(),
+            motif_provenance=(
+                MotifProvenance(
+                    motif="bridge marker",
+                    rationale="Synthetic Bridge source provenance",
+                    observation_refs=(bridge_observation_id,),
+                ),
+            ),
             status=DetectionCandidateStatus.EXPERIMENTAL,
             created_at=NOW,
         )
         source_v2 = DetectionCandidateVersion(
+            id=source_v2_id,
             investigation_id=investigation.id,
-            candidate_id=source_v1.candidate_id,
+            candidate_id=candidate_id,
             source=revised_source,
             source_sha256=hashlib.sha256(revised_source.encode()).hexdigest(),
-            motif_provenance=(),
+            motif_provenance=(
+                MotifProvenance(
+                    motif="bridge marker",
+                    rationale=(
+                        "rule-workbench-motif-v1:{\"source_attribution\":"
+                        "{\"author\":\"operator\",\"source_author\":\"operator\","
+                        "\"origin_author\":\"bridge\",\"change_kind\":\"operator_syntax_fix\"}}"
+                    ),
+                    observation_refs=(bridge_observation_id,),
+                ),
+            ),
             status=DetectionCandidateStatus.TESTED,
             version=2,
             parent_version_id=source_v1.id,
@@ -295,7 +415,11 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         )
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             await uow.samples.add(sample)
+            await uow.tool_invocations.add_if_absent(bridge_invocation)
+            await uow.tool_invocations.add_if_absent(operator_invocation)
             await uow.evidence_observations.append_if_absent(vt_observation)
+            await uow.evidence_observations.append_if_absent(source_v1_observation)
+            await uow.evidence_observations.append_if_absent(operator_observation)
             await uow.evidence_observations.append_if_absent(test_observation)
             await uow.evidence_observations.append_if_absent(advisor_observation)
             await uow.evidence_observations.append_if_absent(syntax_observation)
@@ -361,13 +485,31 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         assert any(item["sha256"] == source_v1.source_sha256 for item in yara)
         assert any(item["sha256"] == source_v2.source_sha256 for item in yara)
         assert {item["metadata"]["candidate_status"] for item in yara} >= {"experimental", "tested"}
+        by_version_id = {item["canonical_id"]: item for item in yara}
+        bridge_manifest = by_version_id[str(source_v1.id)]["metadata"]
+        operator_manifest = by_version_id[str(source_v2.id)]["metadata"]
+        assert bridge_manifest["author"] == "bridge"
+        assert bridge_manifest["author_status"] == "recorded"
+        assert bridge_manifest["origin"] == "bridge"
+        assert bridge_manifest["origin_tool"] == "rule.propose_bridge"
+        assert bridge_manifest["origin_invocation_id"] == str(bridge_invocation_id)
+        assert bridge_manifest["source_observation_ids"] == [str(bridge_observation_id)]
+        assert bridge_manifest["parent_version"] is None
+        assert operator_manifest["author"] == "operator"
+        assert operator_manifest["author_status"] == "recorded"
+        assert operator_manifest["origin"] == "operator"
+        assert operator_manifest["origin_tool"] == "rule.operator_syntax_fix"
+        assert operator_manifest["origin_invocation_id"] == str(operator_invocation_id)
+        assert operator_manifest["source_observation_ids"] == sorted(
+            [str(bridge_observation_id), str(operator_observation_id)]
+        )
+        assert operator_manifest["parent_version"] == str(source_v1.id)
         for item in yara:
             assert item["filename"] is not None
             source_bytes = public_files[item["filename"]]
             assert hashlib.sha256(source_bytes).hexdigest() == item["sha256"]
             assert len(source_bytes) > 7000
         yara_sources = [public_files[item["filename"]] for item in yara]
-        assert any(b"author: analyst-a; origin: experiment" in source for source in yara_sources)
         assert any(b"author: bridge-fixture; origin: Bridge" in source for source in yara_sources)
         suricata = by_type["suricata_rule"][0]
         assert suricata["metadata"]["rule_syntax_validation"] == "valid"

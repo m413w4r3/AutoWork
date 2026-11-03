@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from uuid import uuid4
 
@@ -13,6 +14,10 @@ from cti_app.application.investigation_annex_export import (
     AnnexAsset,
     InvestigationAnnexSnapshot,
     write_investigation_annex,
+)
+from cti_app.domain.investigation import DetectionCandidateVersion, MotifProvenance
+from cti_app.infrastructure.database.investigation_annex_reader import (
+    _yara_version_origin_metadata,
 )
 
 
@@ -39,6 +44,107 @@ def _assert_manifest_files(directory: Path, manifest: dict[str, object]) -> None
         content = path.read_bytes()
         assert hashlib.sha256(content).hexdigest() == entry["sha256"]
         assert len(content) == entry["size_bytes"]
+
+
+@pytest.mark.asyncio
+async def test_yara_origin_metadata_uses_verified_observation_and_tool_invocation() -> None:
+    investigation_id = uuid4()
+    candidate_id = uuid4()
+    candidate_version_id = uuid4()
+    observation_id = uuid4()
+    invocation_id = uuid4()
+    blob_id = uuid4()
+    payload = {
+        "schema": "investigation-tool-observation.v1",
+        "result": {
+            "candidate_id": str(candidate_id),
+            "version_id": str(candidate_version_id),
+            "source_author": "bridge",
+            "source_attribution": {
+                "author": "bridge",
+                "source_author": "bridge",
+                "origin_author": "bridge",
+                "change_kind": "bridge_yara_draft",
+            },
+        },
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    observation = SimpleNamespace(
+        id=observation_id,
+        invocation_ref=invocation_id,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    invocation = SimpleNamespace(
+        id=invocation_id,
+        tool_name="rule.propose_bridge",
+        response_refs=(observation_id,),
+    )
+    candidate = DetectionCandidateVersion(
+        id=candidate_version_id,
+        candidate_id=candidate_id,
+        investigation_id=investigation_id,
+        source="rule synthetic { condition: true }",
+        source_sha256=hashlib.sha256(b"rule synthetic { condition: true }").hexdigest(),
+        motif_provenance=(
+            MotifProvenance(
+                motif="synthetic marker",
+                rationale="synthetic observation-backed provenance",
+                observation_refs=(observation_id,),
+            ),
+        ),
+    )
+
+    class ArtifactReader:
+        async def read_bytes(self, requested_blob_id, *, max_bytes=None):
+            assert requested_blob_id == blob_id
+            assert max_bytes is not None
+            return raw
+
+    metadata = await _yara_version_origin_metadata(
+        candidate,
+        observations=(observation,),
+        invocations=(invocation,),
+        artifact_store=ArtifactReader(),
+    )
+
+    assert metadata["author"] == "bridge"
+    assert metadata["author_status"] == "recorded"
+    assert metadata["origin"] == "bridge"
+    assert metadata["origin_tool"] == "rule.propose_bridge"
+    assert metadata["origin_invocation_id"] == str(invocation_id)
+    assert metadata["source_observation_ids"] == (str(observation_id),)
+    assert metadata["parent_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_yara_origin_metadata_does_not_invent_missing_author_or_origin() -> None:
+    source = "rule unattributed { condition: true }"
+    candidate = DetectionCandidateVersion(
+        investigation_id=uuid4(),
+        source=source,
+        source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        motif_provenance=(),
+    )
+
+    class UnusedArtifactReader:
+        async def read_bytes(self, requested_blob_id, *, max_bytes=None):
+            raise AssertionError("No canonical observation should be read")
+
+    metadata = await _yara_version_origin_metadata(
+        candidate,
+        observations=(),
+        invocations=(),
+        artifact_store=UnusedArtifactReader(),
+    )
+
+    assert metadata["author"] is None
+    assert metadata["author_status"] == "not_recorded"
+    assert metadata["origin"] is None
+    assert metadata["origin_tool"] is None
+    assert metadata["origin_invocation_id"] is None
+    assert metadata["source_observation_ids"] == ()
+    assert metadata["parent_version"] is None
 
 
 def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path) -> None:

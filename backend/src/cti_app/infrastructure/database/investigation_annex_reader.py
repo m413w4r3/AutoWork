@@ -25,7 +25,7 @@ from cti_app.application.investigation_audit_export import AuditSourceSnapshot
 from cti_app.application.investigation_governance import g2_envelope_authorization_state
 from cti_app.application.media_assets import MAX_MEDIA_ASSET_READ_BYTES
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.domain.investigation import TLPLevel
+from cti_app.domain.investigation import DetectionCandidateVersion, TLPLevel
 from cti_app.infrastructure.database.investigation_audit_reader import (
     load_investigation_audit_snapshot,
 )
@@ -53,6 +53,9 @@ _IOCS = {
     "urls": "url",
 }
 _NETWORK_CAPTURE_SOURCE = "network.quarantine"
+_RULE_TOOL_PREFIX = "rule."
+_RULE_ATTRIBUTION_KEYS = ("author", "origin_author", "source_author", "attribution")
+_RULE_ATTRIBUTION_RATIONALE_PREFIX = "rule-workbench-motif-v1:"
 
 
 def _value(value: Any) -> Any:
@@ -81,6 +84,181 @@ def _safe_sha256(value: object) -> str | None:
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _rule_attribution_from_rationale(candidate: DetectionCandidateVersion) -> dict[str, Any]:
+    """Read the structured source attribution stored with canonical motif provenance."""
+    for motif in candidate.motif_provenance:
+        rationale = motif.rationale
+        if not rationale.startswith(_RULE_ATTRIBUTION_RATIONALE_PREFIX):
+            continue
+        try:
+            payload = json.loads(rationale[len(_RULE_ATTRIBUTION_RATIONALE_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attribution = _as_mapping(_as_mapping(payload).get("source_attribution"))
+        if attribution:
+            return dict(attribution)
+    return {}
+
+
+def _rule_payload_attribution(payload: Any) -> dict[str, Any]:
+    """Extract only explicit rule author fields from a persisted tool result."""
+    root = _as_mapping(payload)
+    result = _as_mapping(root.get("result"))
+    sources = (result, _as_mapping(result.get("source_attribution")))
+    for source in sources:
+        attribution = _as_mapping(source.get("source_attribution"))
+        values = dict(attribution)
+        for key in _RULE_ATTRIBUTION_KEYS:
+            if key in source:
+                values[key] = source[key]
+        if values:
+            return values
+    return {}
+
+
+def _rule_author(attribution: Mapping[str, Any]) -> str | None:
+    for key in ("author", "source_author", "origin_author"):
+        value = attribution.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _rule_origin(tool_name: str | None, attribution: Mapping[str, Any]) -> str | None:
+    change_kind = attribution.get("change_kind")
+    if isinstance(change_kind, str):
+        if change_kind == "bridge_yara_draft":
+            return "bridge"
+        if change_kind.startswith("operator_"):
+            return "operator"
+    if tool_name == "rule.propose_bridge":
+        return "bridge"
+    if tool_name == "rule.operator_syntax_fix":
+        return "operator"
+    return "tool" if tool_name and tool_name.startswith(_RULE_TOOL_PREFIX) else None
+
+
+async def _yara_version_origin_metadata(
+    candidate: DetectionCandidateVersion,
+    *,
+    observations: Sequence[Any],
+    invocations: Sequence[Any],
+    artifact_store: ProductionArtifactStore,
+) -> dict[str, Any]:
+    """Resolve version attribution through canonical provenance, verified blobs and invocations."""
+    observation_by_id = {item.id: item for item in observations}
+    invocation_by_id = {item.id: item for item in invocations}
+    source_observation_ids = {
+        reference
+        for motif in candidate.motif_provenance
+        for reference in motif.observation_refs
+    }
+    attribution = _rule_attribution_from_rationale(candidate)
+    relevant_observations = [
+        observation_by_id[reference]
+        for reference in source_observation_ids
+        if reference in observation_by_id
+    ]
+    # Only explicit attribution or a tool result that identifies this exact version can
+    # establish its originating invocation. Motif observations may predate the rule.
+    linked_invocation_ids: set[UUID] = set()
+    for key in ("bridge_invocation_id", "origin_invocation_id"):
+        value = attribution.get(key)
+        if isinstance(value, str):
+            try:
+                linked_invocation_ids.add(UUID(value))
+            except ValueError:
+                pass
+
+    # A revision's new tool-result observation may not be part of inherited motif refs.
+    # Match its canonical result to this exact candidate version before using its authorship.
+    rule_invocations = {
+        invocation.id: invocation
+        for invocation in invocations
+        if invocation.tool_name.startswith(_RULE_TOOL_PREFIX)
+    }
+    for observation in observations:
+        invocation_id = observation.invocation_ref
+        invocation = rule_invocations.get(invocation_id)
+        if invocation is None:
+            continue
+        content, failure = await _read_canonical_blob(
+            artifact_store,
+            observation.blob_id,
+            observation.sha256,
+            max_bytes=MAX_EVIDENCE_JSON_BYTES,
+        )
+        if content is None or failure is not None:
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        result = _as_mapping(_as_mapping(payload).get("result"))
+        candidate_version_id = result.get("version_id")
+        if candidate_version_id == str(candidate.id):
+            relevant_observations.append(observation)
+            source_observation_ids.add(observation.id)
+            linked_invocation_ids.add(invocation_id)
+            observed_attribution = _rule_payload_attribution(payload)
+            if observed_attribution:
+                attribution.update(observed_attribution)
+
+    # Source refs can carry the original Bridge attribution in the observation result.
+    if not attribution:
+        for observation in relevant_observations:
+            content, failure = await _read_canonical_blob(
+                artifact_store,
+                observation.blob_id,
+                observation.sha256,
+                max_bytes=MAX_EVIDENCE_JSON_BYTES,
+            )
+            if content is None or failure is not None:
+                continue
+            try:
+                observed_attribution = _rule_payload_attribution(json.loads(content))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if observed_attribution:
+                attribution.update(observed_attribution)
+                break
+
+    invocation = next(
+        (
+            invocation_by_id[item]
+            for item in sorted(linked_invocation_ids, key=str)
+            if item in invocation_by_id
+            and invocation_by_id[item].tool_name.startswith(_RULE_TOOL_PREFIX)
+        ),
+        None,
+    )
+    # Prefer the invocation that returned this exact version over an older source invocation.
+    version_observation_ids = {item.id for item in relevant_observations}
+    invocation = next(
+        (
+            item
+            for item in invocations
+            if item.id in linked_invocation_ids
+            and item.tool_name.startswith(_RULE_TOOL_PREFIX)
+            and version_observation_ids.intersection(item.response_refs)
+        ),
+        invocation,
+    )
+    tool_name = invocation.tool_name if invocation is not None else None
+    author = _rule_author(attribution)
+    return {
+        "author": author,
+        "author_status": "recorded" if author is not None else "not_recorded",
+        "origin": _rule_origin(tool_name, attribution),
+        "origin_tool": tool_name,
+        "origin_invocation_id": str(invocation.id) if invocation is not None else None,
+        "source_observation_ids": tuple(sorted(str(item) for item in source_observation_ids)),
+        "parent_version": str(candidate.parent_version_id)
+        if candidate.parent_version_id is not None
+        else None,
+    }
 
 
 async def _read_canonical_blob(
@@ -497,6 +675,12 @@ async def load_investigation_annex_snapshot(
         candidate_version_id = str(candidate.id)
         test_refs = tuple(sorted(str(item) for item in candidate.test_refs))
         parent_refs = (str(candidate.parent_version_id),) if candidate.parent_version_id else ()
+        origin_metadata = await _yara_version_origin_metadata(
+            candidate,
+            observations=source_snapshot.observations,
+            invocations=source_snapshot.invocations,
+            artifact_store=artifact_store,
+        )
         assets.append(
             AnnexAsset(
                 canonical_id=candidate_version_id,
@@ -511,8 +695,7 @@ async def load_investigation_annex_snapshot(
                 metadata={
                     "candidate_id": candidate_id,
                     "candidate_status": _candidate_status(candidate),
-                    "author": None,
-                    "author_status": "not_recorded_in_canonical_candidate",
+                    **origin_metadata,
                     "rule_kind": "yara",
                     "test_refs": test_refs,
                     "external_llm_allowed": envelope_allowed,
