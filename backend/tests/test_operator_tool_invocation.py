@@ -1906,6 +1906,122 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
 
 
 @pytest.mark.asyncio
+async def test_stale_advisor_checkpoint_is_replaced_with_a_warning_and_audited() -> None:
+    fixture, state, service = await _fixture()
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "bridge.advisor"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+    service._available_capabilities = fixture.available_capabilities
+    old_id = f"no_advisor_consultation@{state.version - 1}"
+    request = {
+        "tool_name": "vt.file_report",
+        "schema_version": "1",
+        "arguments": {"query": "a" * 64},
+        "purpose": format_advisor_trace_purpose(
+            "Poursuivre sans attendre l'avis.",
+            checkpoint={
+                "id": old_id,
+                "status": "skipped",
+                "reason": "operator_proceeded_without_advisor",
+            },
+        ),
+        "expected_version": state.version,
+        "expected_sha256": state.sha256,
+        "idempotency_key": "stale-advisor-checkpoint",
+    }
+
+    result = await service.invoke(**request)
+    expected_id = f"no_advisor_consultation@{state.version}"
+
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["warnings"][0]["previous_id"] == old_id
+    assert result.output["warnings"][0]["current_id"] == expected_id
+    assert "adopted" in result.output["warnings"][0]["message"]
+    assert f"checkpoint {expected_id} skipped" in _trace(result.invocation)
+    assert f"checkpoint_replaced:{old_id}" in _trace(result.invocation)
+
+    replay = await service.invoke(**request)
+    assert replay.idempotent_replay is True
+    assert replay.output["warnings"] == result.output["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_pending_bridge_checkpoint_explains_how_to_resume() -> None:
+    fixture, state, service = await _fixture()
+    pending = state.with_pending_context(uuid4(), "b" * 64)
+    await fixture.states.save_if_version(pending, expected_version=state.version)
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.get_context()
+
+    assert error.value.code == "bridge_checkpoint_pending"
+    next_action = error.value.details["next_action"]
+    assert next_action["code"] == "resume_pending_bridge_checkpoint"
+    assert next_action["status_path"].endswith("/operator-status")
+    assert next_action["path"].endswith("/resume")
+    assert next_action["expected_version"] == pending.version
+    assert next_action["idempotency_key_required"] is True
+    assert "retry operator/context" in next_action["instruction"]
+
+
+@pytest.mark.asyncio
+async def test_context_read_clears_a_pending_checkpoint_for_an_already_consumed_context() -> None:
+    fixture, state, service = await _fixture()
+    context_sha256 = "c" * 64
+    consumed = replace(
+        state,
+        version=state.version + 1,
+        last_context_sha256=context_sha256,
+    )
+    consumed = await fixture.states.save_if_version(consumed, expected_version=state.version)
+    pending = consumed.with_pending_context(uuid4(), context_sha256)
+    pending = await fixture.states.save_if_version(pending, expected_version=consumed.version)
+
+    operator_context = await service.get_context(
+        expected_version=pending.version,
+        expected_sha256=pending.sha256,
+    )
+    latest_state = await fixture.states.get(fixture.investigation_id)
+
+    assert latest_state is not None
+    assert latest_state.pending_context_sha256 is None
+    assert latest_state.pending_context_snapshot_id is None
+    assert latest_state.version == pending.version + 1
+    assert operator_context.working_state_version == latest_state.version
+    assert latest_state.recent_actions[-1] == "operator_pending_context_already_consumed"
+
+
+@pytest.mark.asyncio
+async def test_tool_invocation_continues_after_clearing_a_consumed_pending_context() -> None:
+    fixture, state, service = await _fixture()
+    context_sha256 = "d" * 64
+    consumed = replace(
+        state,
+        version=state.version + 1,
+        last_context_sha256=context_sha256,
+    )
+    consumed = await fixture.states.save_if_version(consumed, expected_version=state.version)
+    pending = consumed.with_pending_context(uuid4(), context_sha256)
+    pending = await fixture.states.save_if_version(pending, expected_version=consumed.version)
+
+    result = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "d" * 64},
+        purpose="Continue after clearing an already-consumed context.",
+        expected_version=pending.version,
+        expected_sha256=pending.sha256,
+        idempotency_key="invoke-after-clearing-consumed-context",
+    )
+    latest_state = await fixture.states.get(fixture.investigation_id)
+
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert latest_state is not None
+    assert latest_state.pending_context_sha256 is None
+    assert latest_state.version == pending.version + 2
+    assert result.working_state_version == latest_state.version
+
+
+@pytest.mark.asyncio
 async def test_reservation_adjustment_exception_is_not_recorded_as_ambiguous(monkeypatch) -> None:
     fixture = _Fixture(
         responses=[],

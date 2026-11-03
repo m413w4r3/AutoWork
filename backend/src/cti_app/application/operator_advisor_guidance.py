@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
+from cti_app.application.advisor_checkpoint import split_advisor_trace_purpose
 from cti_app.domain.investigation import BudgetDimension
 
 ADVISOR_TOOL_NAME = "advisor.consult"
@@ -265,16 +266,22 @@ def _checkpoint(
         index for index, item in enumerate(invocations) if item.tool_name == ADVISOR_TOOL_NAME
     ]
     last_advisor_position = advisor_positions[-1] if advisor_positions else -1
-    subsequent = tuple(invocations[last_advisor_position + 1 :])
-    post_consult = tuple(item for item in subsequent if item.tool_name != ADVISOR_TOOL_NAME)
+    post_consult_positions = tuple(
+        index
+        for index in range(last_advisor_position + 1, len(invocations))
+        if invocations[index].tool_name != ADVISOR_TOOL_NAME
+    )
+    post_consult = tuple(invocations[index] for index in post_consult_positions)
 
-    failed = {"failed", "unavailable", "partial", "needs_review"}
+    failed = {"failed", "unavailable", "needs_review"}
     if len(post_consult) >= 2:
         left, right = post_consult[-2:]
+        left_position = post_consult_positions[-2]
         if (
             left.tool_name == right.tool_name
             and getattr(left.status, "value", left.status) in failed
             and getattr(right.status, "value", right.status) in failed
+            and not _checkpoint_disposition_after(invocations, "repeated_tool_block", left_position)
         ):
             return "repeated_tool_block", "pivot_strategy"
 
@@ -303,16 +310,30 @@ def _checkpoint(
                 for observation in observations
             )
             if not measured_after_pivot:
-                return "pivot_without_measurement", "pivot_strategy"
+                if not _checkpoint_disposition_after(
+                    invocations, "pivot_without_measurement", advisor_positions[-1]
+                ):
+                    return "pivot_without_measurement", "pivot_strategy"
         pivot_ids = {str(item) for item in pivot_observation_ids}
-        if any(
-            str(getattr(item, "id", "")) in pivot_ids
-            and getattr(item, "observed_at", None) is not None
-            and latest_advisor_at is not None
-            and item.observed_at > latest_advisor_at
-            for item in observations
-        ):
-            return "new_pivot_discovered", "pivot_strategy"
+        for item in observations:
+            observed_at = getattr(item, "observed_at", None)
+            if (
+                str(getattr(item, "id", "")) not in pivot_ids
+                or observed_at is None
+                or latest_advisor_at is None
+                or observed_at <= latest_advisor_at
+            ):
+                continue
+            trigger_position = _observation_invocation_position(invocations, item)
+            acknowledged = (
+                _checkpoint_disposition_after(invocations, "new_pivot_discovered", trigger_position)
+                if trigger_position is not None
+                else _checkpoint_disposition_after_time(
+                    invocations, "new_pivot_discovered", observed_at
+                )
+            )
+            if not acknowledged:
+                return "new_pivot_discovered", "pivot_strategy"
 
     analyzed_positions = [
         index
@@ -321,24 +342,24 @@ def _checkpoint(
         and getattr(item.status, "value", item.status) in {"succeeded", "partial"}
     ]
     if analyzed_positions:
-        first_analysis_position = analyzed_positions[0]
+        latest_analysis_position = analyzed_positions[-1]
         later_consults = tuple(
             (index, item)
             for index, item in enumerate(
-                invocations[first_analysis_position + 1 :], start=first_analysis_position + 1
+                invocations[latest_analysis_position + 1 :], start=latest_analysis_position + 1
             )
             if item.tool_name == ADVISOR_TOOL_NAME
         )
-        # Any analysis-informed consultation after the first analysis satisfies this
-        # checkpoint; a YARA draft is one, and waiting for a plan or pivot consultation
-        # would keep it due forever and hide every later checkpoint.
+        # A qualifying consultation or same-reason disposition after the latest analysis
+        # acknowledges this trigger; a later analysis starts a fresh trigger.
         if not any(
             _consultation_type(item) in {"plan_investigation", "pivot_strategy", "yara_draft"}
             for _, item in later_consults
+        ) and not _checkpoint_disposition_after(
+            invocations, "first_significant_decompilation", latest_analysis_position
         ):
             return "first_significant_decompilation", "plan_investigation"
 
-        latest_analysis_position = analyzed_positions[-1]
         later_after_analysis = invocations[latest_analysis_position + 1 :]
         later_analysis_advice = tuple(
             item for item in later_after_analysis if item.tool_name == ADVISOR_TOOL_NAME
@@ -349,6 +370,9 @@ def _checkpoint(
         if (
             not any(_consultation_type(item) == "yara_draft" for item in later_analysis_advice)
             and not rule_proposed_after_analysis
+            and not _checkpoint_disposition_after(
+                invocations, "before_yara_proposal", latest_analysis_position
+            )
         ):
             return "before_yara_proposal", "yara_draft"
 
@@ -365,11 +389,19 @@ def _checkpoint(
             for item in invocations[latest_yara_position + 1 :]
             if item.tool_name == ADVISOR_TOOL_NAME
         )
-        if not any(_consultation_type(item) == "yara_draft" for item in later_yara_advice):
+        if not any(
+            _consultation_type(item) == "yara_draft" for item in later_yara_advice
+        ) and not _checkpoint_disposition_after(
+            invocations, "yara_revision_review", latest_yara_position
+        ):
             return "yara_revision_review", "yara_draft"
         # A measured rule gives invariants worth pivoting on; ask Bridge for a discriminating
         # search strategy before spending VT searches on them.
-        if not any(_consultation_type(item) == "pivot_strategy" for item in later_yara_advice):
+        if not any(
+            _consultation_type(item) == "pivot_strategy" for item in later_yara_advice
+        ) and not _checkpoint_disposition_after(
+            invocations, "before_vt_pivot_campaign", latest_yara_position
+        ):
             return "before_vt_pivot_campaign", "pivot_strategy"
 
     if analyzed_positions:
@@ -379,7 +411,11 @@ def _checkpoint(
             for item in invocations[latest_analysis_position + 1 :]
             if item.tool_name == ADVISOR_TOOL_NAME
         )
-        if not any(_consultation_type(item) == "draft_text" for item in later_analysis_advice):
+        if not any(
+            _consultation_type(item) == "draft_text" for item in later_analysis_advice
+        ) and not _checkpoint_disposition_after(
+            invocations, "editorial_draft_due", latest_analysis_position
+        ):
             return "editorial_draft_due", "draft_text"
 
     opinion_positions = [
@@ -393,14 +429,80 @@ def _checkpoint(
         if not any(
             item.tool_name == ADVISOR_TOOL_NAME and _consultation_type(item) == "review_text"
             for item in invocations[latest_opinion_position + 1 :]
+        ) and not _checkpoint_disposition_after(
+            invocations, "opinion_review_due", latest_opinion_position
         ):
             return "opinion_review_due", "review_text"
 
     if advisor_positions:
         if len(post_consult) >= checkpoint_tool_threshold:
+            threshold_index = (len(post_consult) // checkpoint_tool_threshold) * (
+                checkpoint_tool_threshold
+            ) - 1
+            threshold_position = post_consult_positions[threshold_index]
+            if _checkpoint_disposition_after(
+                invocations, "tool_threshold_reached", threshold_position
+            ):
+                return None, None
             return "tool_threshold_reached", "pivot_strategy"
         return None, None
+    if _checkpoint_disposition_after(invocations, "no_advisor_consultation", -1):
+        return None, None
     return "no_advisor_consultation", "plan_investigation"
+
+
+def _checkpoint_disposition_after(
+    invocations: Sequence[Any], reason: str, trigger_position: int
+) -> bool:
+    """A matching trace acknowledges the source invocation that triggered the checkpoint.
+
+    The stable motif is the checkpoint ID prefix before ``@version``. A later source
+    invocation starts a new trigger; a state-version change alone does not.
+    """
+    for item in invocations[trigger_position + 1 :]:
+        purpose = getattr(item, "purpose", None)
+        if not isinstance(purpose, str):
+            continue
+        try:
+            trace, _human_purpose = split_advisor_trace_purpose(purpose, allow_server_denied=True)
+        except ValueError:
+            continue
+        checkpoint = trace.get("checkpoint") if isinstance(trace, Mapping) else None
+        if not isinstance(checkpoint, Mapping):
+            continue
+        checkpoint_id = checkpoint.get("id")
+        if (
+            isinstance(checkpoint_id, str)
+            and checkpoint_id.partition("@")[0] == reason
+            and checkpoint.get("status") in {"consulted", "skipped", "denied"}
+        ):
+            return True
+    return False
+
+
+def _checkpoint_disposition_after_time(
+    invocations: Sequence[Any], reason: str, trigger_time: Any
+) -> bool:
+    for item in invocations:
+        created_at = getattr(item, "created_at", None)
+        if created_at is None or created_at <= trigger_time:
+            continue
+        if _checkpoint_disposition_after((item,), reason, -1):
+            return True
+    return False
+
+
+def _observation_invocation_position(invocations: Sequence[Any], observation: Any) -> int | None:
+    observation_id = str(getattr(observation, "id", ""))
+    if not observation_id:
+        return None
+    for index in range(len(invocations) - 1, -1, -1):
+        if any(
+            str(reference) == observation_id
+            for reference in getattr(invocations[index], "response_refs", ())
+        ):
+            return index
+    return None
 
 
 def _is_significant_decompilation(tool_name: str) -> bool:

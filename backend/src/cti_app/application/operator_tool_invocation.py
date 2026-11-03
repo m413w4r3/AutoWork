@@ -538,6 +538,70 @@ def _stale_working_state_error(
     )
 
 
+def _bridge_checkpoint_pending_error(
+    state: Any, investigation_id: UUID
+) -> OperatorToolInvocationError:
+    prefix = f"/api/investigations/{investigation_id}"
+    return OperatorToolInvocationError(
+        "bridge_checkpoint_pending",
+        409,
+        details={
+            "pending_context_sha256": state.pending_context_sha256,
+            "pending_context_snapshot_id": (
+                str(state.pending_context_snapshot_id)
+                if state.pending_context_snapshot_id is not None
+                else None
+            ),
+            "next_action": {
+                "code": "resume_pending_bridge_checkpoint",
+                "status_path": f"{prefix}/operator-status",
+                "method": "POST",
+                "path": f"{prefix}/resume",
+                "expected_version": state.version,
+                "idempotency_key_required": True,
+                "instruction": (
+                    "Check operator-status for the pending Bridge turn. After its job is terminal, "
+                    "POST /resume with the current expected_version and an Idempotency-Key; then "
+                    "retry operator/context with the returned working-state version and SHA-256."
+                ),
+            },
+        },
+    )
+
+
+def _checkpoint_replacement_reason(previous_id: str, existing_reason: object) -> str:
+    marker = f"checkpoint_replaced:{previous_id}"
+    if isinstance(existing_reason, str) and existing_reason:
+        marker = f"{marker};{existing_reason}"
+    return marker[:256]
+
+
+def _checkpoint_replacement_warning(invocation: ToolInvocation) -> dict[str, str] | None:
+    try:
+        trace, _human_purpose = split_advisor_trace_purpose(
+            invocation.purpose, allow_server_denied=True
+        )
+    except ValueError:
+        return None
+    checkpoint = trace.get("checkpoint") if isinstance(trace, Mapping) else None
+    reason = checkpoint.get("reason") if isinstance(checkpoint, Mapping) else None
+    checkpoint_id = checkpoint.get("id") if isinstance(checkpoint, Mapping) else None
+    if not isinstance(reason, str) or not reason.startswith("checkpoint_replaced:"):
+        return None
+    previous_id = reason.removeprefix("checkpoint_replaced:").partition(";")[0]
+    if not previous_id or not isinstance(checkpoint_id, str):
+        return None
+    return {
+        "code": "advisor_checkpoint_replaced",
+        "previous_id": previous_id,
+        "current_id": checkpoint_id,
+        "message": (
+            f"Checkpoint {previous_id} was outdated; "
+            f"current checkpoint {checkpoint_id} was adopted."
+        ),
+    }
+
+
 def _operator_reconciliation_path(investigation_id: UUID, invocation: ToolInvocation) -> str:
     prefix = f"/api/investigations/{investigation_id}"
     if invocation.tool_name == "advisor.consult":
@@ -625,8 +689,13 @@ class OperatorToolInvocationService:
             raise _stale_working_state_error(expected_version, expected_sha256, state)
         if expected_sha256 is not None and state.sha256 != expected_sha256:
             raise _stale_working_state_error(expected_version, expected_sha256, state)
+        state = await self._clear_consumed_pending_context(
+            state,
+            expected_version=expected_version,
+            expected_sha256=expected_sha256,
+        )
         if state.pending_context_sha256 is not None:
-            raise OperatorToolInvocationError("bridge_checkpoint_pending", 409)
+            raise _bridge_checkpoint_pending_error(state, self._investigation_id)
         investigation = await self._investigations.get(self._investigation_id)
         if investigation is None:
             raise OperatorToolInvocationError("investigation_not_found", 404)
@@ -710,6 +779,11 @@ class OperatorToolInvocationService:
             raise _stale_working_state_error(expected_version, expected_sha256, state)
         if expected_sha256 is not None and state.sha256 != expected_sha256:
             raise _stale_working_state_error(expected_version, expected_sha256, state)
+        state = await self._clear_consumed_pending_context(
+            state,
+            expected_version=expected_version,
+            expected_sha256=expected_sha256,
+        )
         if cursor is not None:
             if isinstance(cursor, bool):
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
@@ -728,7 +802,7 @@ class OperatorToolInvocationService:
         if offset > 0 and cursor is None:
             raise OperatorToolInvocationError("operator_context_offset_cursor_unsupported", 422)
         if state.pending_context_sha256 is not None:
-            raise OperatorToolInvocationError("bridge_checkpoint_pending", 409)
+            raise _bridge_checkpoint_pending_error(state, self._investigation_id)
         investigation = await self._investigations.get(self._investigation_id)
         if investigation is None:
             raise OperatorToolInvocationError("investigation_not_found", 404)
@@ -976,6 +1050,34 @@ class OperatorToolInvocationService:
             cursor_authentication=None,
         )
 
+    async def _clear_consumed_pending_context(
+        self,
+        state: Any,
+        *,
+        expected_version: int | None,
+        expected_sha256: str | None,
+    ) -> Any:
+        pending_sha256 = state.pending_context_sha256
+        if pending_sha256 is None or pending_sha256 != state.last_context_sha256:
+            return state
+        resolved = replace(
+            state,
+            version=state.version + 1,
+            pending_context_snapshot_id=None,
+            pending_context_sha256=None,
+            recent_actions=(
+                *state.recent_actions,
+                "operator_pending_context_already_consumed",
+            )[-32:],
+        )
+        try:
+            return await self._states.save_if_version(resolved, expected_version=state.version)
+        except (VersionConflictError, InvestigationStateVersionConflict):
+            current_state = await self._states.get(self._investigation_id)
+            raise _stale_working_state_error(
+                expected_version, expected_sha256, current_state
+            ) from None
+
     async def invoke(
         self,
         *,
@@ -1017,11 +1119,6 @@ class OperatorToolInvocationService:
                 )
             except ValueError as exc:
                 raise OperatorToolInvocationError(str(exc), 422) from None
-        if trace is not None and isinstance(trace.get("checkpoint"), Mapping):
-            checkpoint_id = str(trace["checkpoint"].get("id", ""))
-            if not checkpoint_id.endswith(f"@{expected_version}"):
-                raise OperatorToolInvocationError("advisor_checkpoint_stale", 409)
-
         key_digest = hashlib.sha256(
             f"{self._investigation_id}\0{idempotency_key}".encode()
         ).hexdigest()
@@ -1375,6 +1472,18 @@ class OperatorToolInvocationService:
             )
             guidance = operator_context.context.advisor_guidance
             guidance_state_version = operator_context.working_state_version
+            if operator_context.working_state_version != state.version:
+                current_state = await self._states.get(self._investigation_id)
+                if (
+                    current_state is None
+                    or current_state.version != operator_context.working_state_version
+                ):
+                    if not nonblocking_local_freshness:
+                        raise _stale_working_state_error(
+                            expected_version, expected_sha256, current_state
+                        )
+                else:
+                    state = current_state
         except OperatorToolInvocationError as exc:
             if exc.code == "stale_working_state":
                 raise
@@ -1395,76 +1504,86 @@ class OperatorToolInvocationService:
         elif "bridge.advisor" not in self._available_capabilities:
             advisor_denial_reason = "advisor_capability_unavailable"
 
-        if guidance is not None:
-            due_reason = guidance.reason if guidance.checkpoint_due else None
-            expected_checkpoint_id = (
-                f"{due_reason}@{guidance_state_version}" if due_reason is not None else None
-            )
-            if isinstance(checkpoint, Mapping) and tool_name != "advisor.consult":
-                checkpoint_id = checkpoint.get("id")
-                if checkpoint_id != expected_checkpoint_id and not (
-                    tool_name == "advisor.consult"
-                    and not guidance.checkpoint_due
-                    and checkpoint_id == f"operator_requested@{state.version}"
-                ):
-                    raise OperatorToolInvocationError("advisor_checkpoint_stale", 409)
-            elif due_reason is not None:
-                if tool_name == "advisor.consult":
-                    status = "denied" if advisor_denial_reason else "consulted"
-                    checkpoint = {
-                        "id": expected_checkpoint_id,
-                        "status": status,
-                        **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
-                    }
-                else:
-                    checkpoint = {
-                        "id": expected_checkpoint_id,
-                        "status": "denied" if advisor_denial_reason else "skipped",
-                        "reason": advisor_denial_reason or "operator_proceeded_without_advisor",
-                    }
-                _trace = dict(trace or {})
-                _trace["checkpoint"] = checkpoint
-                record_purpose = format_advisor_trace_purpose(
-                    _human_purpose_from_purpose(purpose),
-                    checkpoint=checkpoint,
-                    recommendation=_trace.get("recommendation"),
-                )
-            elif tool_name == "advisor.consult" and checkpoint is None:
-                checkpoint = {
-                    "id": f"operator_requested@{state.version}",
-                    "status": "denied" if advisor_denial_reason else "consulted",
-                    **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
-                }
-                _trace = dict(trace or {})
-                _trace["checkpoint"] = checkpoint
-                record_purpose = format_advisor_trace_purpose(
-                    _human_purpose_from_purpose(purpose),
-                    checkpoint=checkpoint,
-                    recommendation=_trace.get("recommendation"),
-                )
-        elif tool_name == "advisor.consult" and checkpoint is None:
+        due_reason = guidance.reason if guidance is not None and guidance.checkpoint_due else None
+        current_checkpoint_id = (
+            f"{due_reason}@{guidance_state_version}"
+            if due_reason is not None
+            else f"operator_requested@{guidance_state_version}"
+        )
+        stale_checkpoint_id: str | None = None
+        if isinstance(checkpoint, Mapping) and checkpoint.get("id") != current_checkpoint_id:
+            stale_checkpoint_id = str(checkpoint.get("id", ""))
+            status = checkpoint.get("status")
+            reason = checkpoint.get("reason")
+            if due_reason is None and status == "skipped":
+                reason = "checkpoint_no_longer_due"
+            if advisor_denial_reason and (
+                tool_name == "advisor.consult" or (guidance is not None and guidance.checkpoint_due)
+            ):
+                status = "denied"
+                reason = advisor_denial_reason
             checkpoint = {
-                "id": f"operator_requested@{guidance_state_version}",
-                "status": "denied" if advisor_denial_reason else "consulted",
-                **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
+                "id": current_checkpoint_id,
+                "status": status,
+                "reason": _checkpoint_replacement_reason(stale_checkpoint_id, reason),
             }
-            _trace = dict(trace or {})
-            _trace["checkpoint"] = checkpoint
+            trace = dict(trace or {})
+            trace["checkpoint"] = checkpoint
             record_purpose = format_advisor_trace_purpose(
                 _human_purpose_from_purpose(purpose),
                 checkpoint=checkpoint,
-                recommendation=_trace.get("recommendation"),
+                recommendation=trace.get("recommendation"),
+            )
+        elif checkpoint is None and due_reason is not None:
+            status = (
+                "denied"
+                if advisor_denial_reason
+                else ("consulted" if tool_name == "advisor.consult" else "skipped")
+            )
+            checkpoint = {
+                "id": current_checkpoint_id,
+                "status": status,
+                "reason": advisor_denial_reason
+                or ("operator_proceeded_without_advisor" if status == "skipped" else None),
+            }
+            if checkpoint["reason"] is None:
+                checkpoint.pop("reason")
+            trace = dict(trace or {})
+            trace["checkpoint"] = checkpoint
+            record_purpose = format_advisor_trace_purpose(
+                _human_purpose_from_purpose(purpose),
+                checkpoint=checkpoint,
+                recommendation=trace.get("recommendation"),
+            )
+        elif tool_name == "advisor.consult" and checkpoint is None:
+            checkpoint = {
+                "id": current_checkpoint_id,
+                "status": "denied" if advisor_denial_reason else "consulted",
+                **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
+            }
+            trace = dict(trace or {})
+            trace["checkpoint"] = checkpoint
+            record_purpose = format_advisor_trace_purpose(
+                _human_purpose_from_purpose(purpose),
+                checkpoint=checkpoint,
+                recommendation=trace.get("recommendation"),
             )
 
-        if trace is not None and isinstance(trace.get("checkpoint"), Mapping):
+        if isinstance(checkpoint, Mapping):
             if advisor_denial_reason and (
                 tool_name == "advisor.consult" or (guidance is not None and guidance.checkpoint_due)
             ):
                 checkpoint = {
-                    "id": trace["checkpoint"]["id"],
+                    "id": checkpoint["id"],
                     "status": "denied",
-                    "reason": advisor_denial_reason,
+                    "reason": _checkpoint_replacement_reason(
+                        stale_checkpoint_id, advisor_denial_reason
+                    )
+                    if stale_checkpoint_id is not None
+                    else advisor_denial_reason,
                 }
+                trace = dict(trace or {})
+                trace["checkpoint"] = checkpoint
                 record_purpose = format_advisor_trace_purpose(
                     _human_purpose_from_purpose(purpose),
                     checkpoint=checkpoint,
@@ -1922,6 +2041,9 @@ class OperatorToolInvocationService:
                 else None,
             },
         }
+        checkpoint_warning = _checkpoint_replacement_warning(invocation)
+        if checkpoint_warning is not None:
+            output["warnings"] = [checkpoint_warning]
         if invocation.status in {
             ToolInvocationStatus.UNAVAILABLE,
             ToolInvocationStatus.POLICY_DENIED,

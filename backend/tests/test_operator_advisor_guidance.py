@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.advisor_checkpoint import format_advisor_trace_purpose
 from cti_app.application.investigation_contracts import AdvisorGuidanceV1, AdvisorLastAdviceV1
 from cti_app.application.operator_advisor_guidance import (
     DEFAULT_CHECKPOINT_TOOL_THRESHOLD,
@@ -36,6 +37,7 @@ def invocation(
     parameters=None,
     consumed=0,
     response_refs=(),
+    purpose="",
 ):
     stamp = created_at or datetime.now(UTC)
     return SimpleNamespace(
@@ -47,6 +49,7 @@ def invocation(
         normalized_parameters=parameters or {},
         consumed_budget={BudgetDimension.BRIDGE_TURNS: consumed},
         response_refs=response_refs,
+        purpose=purpose,
     )
 
 
@@ -530,3 +533,135 @@ async def test_first_decompilation_checkpoint_is_satisfied_by_a_later_yara_consu
     )
     # The checkpoint no longer hides the next, more specific ones.
     assert (await checkpoint())["reason"] != "first_significant_decompilation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["skipped", "denied"])
+async def test_decompilation_checkpoint_disposition_is_scoped_to_its_trigger(disposition):
+    base = datetime.now(UTC)
+    calls = [
+        invocation(
+            "advisor.consult",
+            created_at=base,
+            parameters={"consultation_type": "plan_investigation"},
+        ),
+        invocation("sample.analyze", created_at=base + timedelta(seconds=1)),
+        invocation(
+            "vt.file_report",
+            created_at=base + timedelta(seconds=2),
+            purpose=format_advisor_trace_purpose(
+                "Continuer avec le choix de l'opérateur.",
+                checkpoint={
+                    "id": "first_significant_decompilation@3",
+                    "status": disposition,
+                    "reason": (
+                        "external_disclosure_denied"
+                        if disposition == "denied"
+                        else "operator_proceeded_without_advisor"
+                    ),
+                },
+            ),
+        ),
+        invocation("vt.file_report", created_at=base + timedelta(seconds=3)),
+    ]
+
+    async def checkpoint():
+        return await build_advisor_guidance(
+            invocations=tuple(calls),
+            observations=(),
+            evidence_summaries=None,
+            available_tools=(),
+        )
+
+    assert (await checkpoint())["reason"] != "first_significant_decompilation"
+
+    calls.append(invocation("sample.analyze", created_at=base + timedelta(seconds=4)))
+    assert (await checkpoint())["reason"] == "first_significant_decompilation"
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_results_do_not_form_a_repeated_tool_block():
+    base = datetime.now(UTC)
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation("advisor.consult", created_at=base - timedelta(seconds=3)),
+            invocation(
+                "vt.file_report",
+                status=ToolInvocationStatus.PARTIAL,
+                created_at=base - timedelta(seconds=2),
+            ),
+            invocation(
+                "vt.file_report",
+                status=ToolInvocationStatus.PARTIAL,
+                created_at=base - timedelta(seconds=1),
+            ),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] != "repeated_tool_block"
+
+
+@pytest.mark.asyncio
+async def test_new_pivot_checkpoint_disposition_does_not_hide_a_later_pivot():
+    base = datetime.now(UTC)
+    first_pivot_id = uuid4()
+    second_pivot_id = uuid4()
+    first_pivot = SimpleNamespace(
+        id=first_pivot_id,
+        observed_at=base + timedelta(seconds=1),
+    )
+    second_pivot = SimpleNamespace(
+        id=second_pivot_id,
+        observed_at=base + timedelta(seconds=4),
+    )
+    calls = [
+        invocation(
+            "advisor.consult",
+            created_at=base,
+            parameters={"consultation_type": "pivot_strategy"},
+        ),
+        invocation(
+            "vt.file_report",
+            created_at=base + timedelta(seconds=2),
+            response_refs=(first_pivot_id,),
+        ),
+        invocation(
+            "vt.file_report",
+            created_at=base + timedelta(seconds=3),
+            purpose=format_advisor_trace_purpose(
+                "Continuer avec le choix de l'opérateur.",
+                checkpoint={
+                    "id": "new_pivot_discovered@3",
+                    "status": "skipped",
+                    "reason": "operator_proceeded_without_advisor",
+                },
+            ),
+        ),
+    ]
+    pivots = [first_pivot]
+    pivot_ids = [first_pivot_id]
+
+    async def checkpoint():
+        return await build_advisor_guidance(
+            invocations=tuple(calls),
+            observations=tuple(pivots),
+            evidence_summaries=None,
+            available_tools=(),
+            pivot_observation_ids=tuple(pivot_ids),
+        )
+
+    assert (await checkpoint())["reason"] != "new_pivot_discovered"
+
+    pivots.append(second_pivot)
+    pivot_ids.append(second_pivot_id)
+    calls.append(
+        invocation(
+            "vt.file_report",
+            created_at=base + timedelta(seconds=5),
+            response_refs=(second_pivot_id,),
+        )
+    )
+    assert (await checkpoint())["reason"] == "new_pivot_discovered"
