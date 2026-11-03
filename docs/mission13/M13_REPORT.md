@@ -69,3 +69,61 @@ Déjà présents : `vt.behaviour_pcap`, `network.capture.inspect`, `network.stre
 ## 9. Verdict de fusion de la PR #23
 
 **Non recommandée à ce stade** pour une mise en production. Techniquement : aucune nouvelle régression vérifiée sur les chemins modifiés, mypy à parité avec `main`, PostgreSQL idempotence testée. Réserves : CI toujours rouge comme `main` (4 étapes, dont frontend et J2 non examinés) ; W15/W16 et 36 unitaires préexistants non résolus ; comportement opérateur non qualifié ; `RULE_WORKBENCH_ENABLED` et déploiement non vérifiés ; latence réelle non mesurée. La fusion et le déploiement requièrent une décision humaine.
+
+---
+
+# Mise à jour — qualification DeepSeek et audit (cycle 2, 2026-11-02)
+
+## 10. Journal de qualification (DeepSeek Flash 1M, thinking `max`, enquête vierge)
+
+Autorisations reçues de l'utilisateur : déploiements nécessaires, recherches VT et consultations Bridge autorisées et obligatoires, arrêt de l'opérateur avec signalement si VT ou Bridge échouent, partir d'une analyse vierge.
+
+| Essai | Code déployé | Enquête | Résultat |
+| --- | --- | --- | --- |
+| 1 | `c44bcc3e` | `b68f65c5…` (run `fcc7abc1`) | **Arrêté par l'orchestrateur** : première consultation Bridge refusée avant envoi (`osint_policy_denied`). Défaut de plateforme, VT fonctionnait (15 rapports + 1 téléchargement). |
+| 2 | `619d0f10` | `62be6fcf…` (run `007a0760`) | Terminé : avis brouillon v4, 14 findings canoniques, 5 règles YARA candidates. Audit indépendant : **C**. |
+
+**Défaut de l'essai 1 (corrigé).** Une enquête vierge ne contient que des rapports VT sans échantillon associé ; le garde de divulgation Bridge exigeait un échantillon associé et l'exception ne couvrait que `vt.intelligence_search`. Correctif `e4ce6aa8` puis `619d0f10` : pour Bridge uniquement, une observation `source == "VirusTotal"` n'exige plus d'association, mais reste soumise aux restrictions (TLP RED, licence, veto LLM) de tout échantillon que le sujet détient par digest, `expected_hash` ou `source_object_id`. Deux revues Luna xhigh ont fait échouer la première version (provenance irréaliste dans les fixtures) ; la seconde ferme ces points. Les tests PostgreSQL de chaque garde échouent quand la partie correspondante du correctif est retirée.
+
+**Mesures de l'essai 2 (état canonique, non récit de l'opérateur).**
+
+- Durée 19:38 → 20:36 (≈58 min), 167 invocations : 114 réussies, 26 échecs (dont erreurs de validation d'arguments), 17 partielles, 5 indisponibles, 3 vides, 2 refus de politique.
+- Bridge : 5 consultations, première à **+2 min** (essais M12-Q : +33 min) : `plan_investigation` (4 min), `yara_draft` (9 min), `draft_text` (6 min), `review_text` (6 min), plus un échec de validation côté opérateur. Aucun `pivot_strategy`.
+- Dossiers Bridge : 29 Ko / 389 ms de construction (plan) ; **23,9 Mo / 79 s** (YARA) ; 2 Mo / 61 s (revue). Le M12-Q avait mesuré ≈27 min pour un dossier sur une enquête bien plus chargée : comparaison indicative, pas à charge égale.
+- VT : 21 `file_report`, 12 `download_sample`, 5 `relationships`, 3 `behaviour`, 1 `object_report`, 1 `behaviour_pcap` en échec ; **0 `intelligence_search`**.
+- Échantillons associés : 12 = 6 du corpus initial, 3 déjà connus de la plateforme (pool de 240 hérité du sujet), **3 réellement nouveaux** : un conteneur (`Client.zip`), un hôte légitime signé (`vshost32.exe`, 0/62 VT) et sa configuration. Pas de variante : découverte faible.
+- Traçabilité : 156 invocations portent un checkpoint (5 `consulted`, **150 `skipped`**) ; 2 dispositions de recommandation (`accepted`).
+- Détection : 5 règles YARA candidates compilées (YARA 4.5.0), 1 match et 11 non-matches sur 12 fichiers pour chacune ; aucun goodware ni holdout, donc non validées.
+
+## 11. Audit indépendant (Luna xhigh, lecture seule) — verdict C
+
+Constats vérifiés par l'auditeur : le rapport est utile et nuancé, mais (a) 32 capacités annoncées contre 37 dans l'observation capa ; (b) la configuration Blackwood « déchiffrée » est `supported` alors que le déchiffrement a eu lieu hors enquête, sans observation de sortie ; (c) la classification VT de `vshost32.exe` cite une observation qui n'est pas le rapport VT ; (d) retests YARA sur reconstructions non tracés ; (e) critères des pivots VT non reconstructibles ; (f) bloc `implant_materials` vu en JSON brut dans l'export (c'est la représentation typée rendue ensuite par la publication, à confirmer au rendu).
+
+### Classement
+
+| Catégorie | Défaut | État |
+| --- | --- | --- |
+| Plateforme | Consultation Bridge refusée en enquête vierge | Corrigé (`619d0f10`), déployé |
+| Plateforme | `draft_text` : brouillon exploitable déclaré `usable=false` (manque de liens de preuve, facultatifs) ⇒ référence Bridge refusée dans l'avis, provenance perdue | Corrigé (`82e059fe`), **non déployé** |
+| Plateforme | Réponse Bridge à plusieurs règles YARA non canonisable (`exactly_one_rule_required`) | Corrigé (`cec56215`), **non déployé** |
+| Plateforme | Checkpoint `first_significant_decompilation` dû pendant 40 min, masquant les suivants | Corrigé (`8b63991e`), non déployé |
+| Plateforme | Export d'audit : 95/167 outils `UNKNOWN`, objectif et paramètres des pivots absents | Corrigé (`8b63991e`) : noms lisibles + option `include_operator_text` (désactivée par défaut) |
+| Plateforme | Message d'erreur opaque si l'enveloppe d'appel est imbriquée dans `arguments` | Corrigé (`8b63991e`) |
+| Plateforme | Lecture PCAP VT impossible : route proxy seule, tout 3xx est une erreur, CDN `vtbehaviour…` non autorisé ; import officiel refuse un PCAP déjà détenu | **Ouvert, décision requise** (routage deny-by-default) |
+| Comportement | Valeurs dérivées hors outil citées en `supported` ; chiffres retapés | Skills corrigés (`391bfa49`), à requalifier |
+| Comportement | Aucun pivot par motif (`intelligence_search`), aucun `pivot_strategy` malgré `new_pivot_discovered` | Skills + checkpoint corrigés, à requalifier |
+| Limite réelle | Pas de PCAP exploitable, charge `RuntimeBrokerApi.dll` non déchiffrée, pas de goodware/holdout | Non corrigeable |
+
+### Reste ouvert (préexistant, non aggravé)
+
+- Résultats Suricata dérivés d'un PCAP VT restreint pouvant entrer dans un dossier Bridge (observation `capture_sha256` non reliée au sample) ; observations MD5/SHA1 citées seules à Bridge non contrôlées ; révocation concurrente après le point de consommation.
+- Instruments : `compact` de `/operator-status` n'expose pas `advisor_guidance`.
+- Pool de 240 échantillons hérité du sujet : octets réutilisables sans téléchargement (fuite d'octets, pas de conclusions).
+
+## 12. Tests de ce cycle
+
+Unitaire hors intégration : **36 échecs, tous ceux de `main`** (aucun nouveau), 5 821 passés, 2 skips (Ghidra, image d'analyse). PostgreSQL : effets externes 87, import idempotent 3, vertical 14, persistance 4 passés. FAST gate : mêmes 2 échecs que `main` (W15, W16). `test_analyst_opinion_publication_postgres` échoue identiquement sur `main` (même cause que W16). Typage : 11 erreurs, identiques à `main`.
+
+## 13. Non réalisé
+
+Troisième qualification après les correctifs L1/L2/checkpoints/export : **à faire**, voir `docs/mission13/M13_HANDOFF.md`. Aucune validation de production n'est revendiquée.
