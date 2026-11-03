@@ -181,7 +181,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     def uow_factory() -> UnitOfWork:
         return SqlAlchemyUnitOfWork(session_factory)
 
-    external_effect_coordinator = create_external_effect_coordinator(session_factory)
     model_gateway = create_model_gateway(settings, uow_factory)
     vt_proxy_client: httpx.AsyncClient | None = None
     vt_direct_client: httpx.AsyncClient | None = None
@@ -255,6 +254,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             secure=settings.s3_secure,
         ),
         physical_bucket=settings.s3_bucket,
+    )
+    external_effect_coordinator = create_external_effect_coordinator(
+        session_factory, blob_store=blob_store
     )
     selection_service = SelectionService(
         uow_factory,

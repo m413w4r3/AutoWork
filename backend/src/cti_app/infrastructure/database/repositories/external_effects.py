@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
@@ -12,11 +13,12 @@ from typing import Any, cast
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
+from cti_app.application.blob_storage import BlobStore
 from cti_app.application.external_effects import (
     ConsumeCommitted,
     ConsumePolicyContext,
@@ -25,14 +27,26 @@ from cti_app.application.external_effects import (
     ExistingClaim,
     ExternalEffectClaim,
     ExternalEffectPolicyGuard,
+    ExternalObservationHashPolicy,
     NoSubmissionProofKind,
     ReuseDecision,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
     bridge_may_cite_provider_report_hash_without_sample,
+    bridge_provider_report_requires_blob,
+    bridge_provider_report_samples_conflict,
+    bridge_refusal_action_for_object_type,
+    external_effect_may_resolve_bridge_vt_report,
     external_effect_source_do_not_submit_blocks,
+    external_effect_source_restriction_reason,
+    external_effect_vt_file_hash_read,
+    external_observation_hash_policy,
+    matching_bridge_provider_report_hashes,
     osint_vt_search_may_cite_unassociated_observation_hash,
+    resolve_bridge_vt_file_report_hashes,
+    validate_external_observation_hash,
 )
+from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.external_effects import (
     EffectClaimState,
     EvidenceReference,
@@ -85,9 +99,34 @@ from cti_app.infrastructure.database.repositories.investigation import (
 
 
 class _ConsumeDenied(Exception):
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, detail: str | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail
+
+
+def _observation_refusal_detail(observation: EvidenceObservationRow) -> str:
+    """Return a bounded, hash-content-free Bridge refusal detail code."""
+    observation_id = observation.id.hex if isinstance(observation.id, UUID) else "unknown"
+    object_type = observation.object_type
+    source = observation.source
+    object_id = observation.object_id
+    safe_type = (
+        re.sub(r"[^A-Za-z0-9_.-]", "_", object_type)[:16]
+        if isinstance(object_type, str) and object_type
+        else "unknown"
+    )
+    safe_source = (
+        re.sub(r"[^A-Za-z0-9_.-]", "_", source)[:11]
+        if isinstance(source, str) and source
+        else "unknown"
+    )
+    object_id_length = len(object_id) if isinstance(object_id, str) else 0
+    safe_length = str(object_id_length) if object_id_length <= 999 else "large"
+    action = bridge_refusal_action_for_object_type(object_type)
+    # UUID.hex is the same identifier without hyphens. The compact fields keep
+    # the combined code within Bridge's 128-character refusal limit.
+    return f"id={observation_id}:t={safe_type}:s={safe_source}:h={safe_length}:a={action}"
 
 
 SourceReferenceResolver = Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]
@@ -269,11 +308,85 @@ class SqlAlchemyExternalEffectClaimStore:
         *,
         policy_guard: ExternalEffectPolicyGuard | None = None,
         family_bindings: Mapping[str, ExternalEffectFamilyBinding] | None = None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._policy_guard = policy_guard
         self._family_bindings = dict(family_bindings or {})
+        self._blob_store = blob_store
         self._no_handoff_proof_verifier: _NoHandoffProofVerifier | None = None
+
+    async def _read_bridge_vt_report_blobs(
+        self, prepared: PreparedExternalRequest, investigation_id: UUID
+    ) -> dict[UUID, bytes]:
+        """Read candidate report blobs before the source-policy transaction takes locks."""
+        if not external_effect_may_resolve_bridge_vt_report(prepared.family):
+            return {}
+        references: dict[UUID, EvidenceReference] = {}
+        for reference in prepared.evidence_refs:
+            if reference.kind != "evidence_observation":
+                continue
+            try:
+                observation_id = UUID(reference.id)
+            except ValueError:
+                continue
+            references[observation_id] = reference
+        if not references or self._blob_store is None:
+            return {}
+
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(EvidenceObservationRow, BlobRow)
+                        .join(BlobRow, BlobRow.id == EvidenceObservationRow.blob_id)
+                        .where(
+                            EvidenceObservationRow.investigation_id == investigation_id,
+                            EvidenceObservationRow.id.in_(sorted(references, key=str)),
+                        )
+                    )
+                ).all()
+            )
+
+        contents: dict[UUID, bytes] = {}
+        for observation, blob in rows:
+            if not bridge_provider_report_requires_blob(
+                family=prepared.family,
+                source=observation.source,
+                object_type=observation.object_type,
+                object_id=observation.object_id,
+                observation_kind=observation.kind,
+            ):
+                continue
+            reference = references[observation.id]
+            if (
+                reference.sha256 != observation.sha256
+                or reference.version != observation.source_version
+                or blob.sha256 != observation.sha256
+            ):
+                continue
+            try:
+                descriptor = BlobDescriptor(
+                    sha256=blob.sha256,
+                    size=blob.size,
+                    mime_type=blob.mime_type,
+                    logical_bucket=blob.logical_bucket,
+                )
+                content = await self._blob_store.read(descriptor, max_bytes=descriptor.size)
+            except Exception:
+                # An unavailable report is unresolved evidence; the application
+                # policy gate refuses it with the observation reference.
+                continue
+            if (
+                isinstance(content, bytes)
+                and len(content) == descriptor.size
+                and hashlib.sha256(content).hexdigest() == descriptor.sha256
+            ):
+                # The recorder is the source of truth for VT blob provenance and currently
+                # leaves invocation_ref unset. Bind the content to the investigation's exact
+                # observation and verify both the attached and content-addressed digests.
+                contents[observation.id] = content
+        return contents
 
     def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None:
         if type(verifier) is not _NoHandoffProofVerifier:
@@ -402,6 +515,9 @@ class SqlAlchemyExternalEffectClaimStore:
             return ConsumeRefused("family_credential_declaration_mismatch")
         if prepared.normalizer_version not in family_binding.normalizer_versions:
             return ConsumeRefused("unsupported_normalizer_version")
+        report_blob_contents = await self._read_bridge_vt_report_blobs(
+            prepared, authority.investigation_id
+        )
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -536,6 +652,7 @@ class SqlAlchemyExternalEffectClaimStore:
                                 prepared,
                                 investigation.subject_id,
                                 family_binding,
+                                report_blob_contents=report_blob_contents,
                             )
                             await self._lock_and_start_model_attempt(
                                 session,
@@ -547,7 +664,7 @@ class SqlAlchemyExternalEffectClaimStore:
                             result = ConsumeCommitted(row_id)
             return result
         except _ConsumeDenied as denied:
-            return ConsumeRefused(denied.reason)
+            return ConsumeRefused(denied.reason, detail=denied.detail)
 
     async def enter_handoff(
         self,
@@ -825,6 +942,9 @@ class SqlAlchemyExternalEffectClaimStore:
             return None
         if claim.invocation_id is not None and decision.source_invocation_id != claim.invocation_id:
             return None
+        report_blob_contents = await self._read_bridge_vt_report_blobs(
+            prepared, authority.investigation_id
+        )
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -877,6 +997,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         prepared,
                         investigation.subject_id,
                         family_binding,
+                        report_blob_contents=report_blob_contents,
                     )
                     if reservation.status == "released":
                         existing_use = await session.scalar(
@@ -1509,6 +1630,8 @@ class SqlAlchemyExternalEffectClaimStore:
         prepared: PreparedExternalRequest,
         subject_id: UUID,
         family_binding: ExternalEffectFamilyBinding,
+        *,
+        report_blob_contents: Mapping[UUID, bytes] | None = None,
     ) -> None:
         sample_ids: set[UUID] = set()
         referenced_sample_ids: set[UUID] = set()
@@ -1518,16 +1641,14 @@ class SqlAlchemyExternalEffectClaimStore:
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
         provider_report_hashes: set[str] = set()
+        provider_report_aliases: dict[UUID, set[str]] = {}
+        provider_report_sha256s: dict[UUID, str] = {}
+        provider_report_observations: dict[UUID, EvidenceObservationRow] = {}
         observation_file_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
         is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
-        vt_file_hash_read = prepared.family in {
-            "vt.file_report",
-            "vt.behaviour",
-            "vt.behaviour_pcap",
-            "vt.relationships",
-        }
+        vt_file_hash_read = external_effect_vt_file_hash_read(prepared.family)
         # The policy and persisted invocation reference were already checked by
         # _check_authority and _validate_external_source_refs above.
         allows_unassociated_osint_vt_hash = (
@@ -1607,42 +1728,73 @@ class SqlAlchemyExternalEffectClaimStore:
                 ):
                     raise _ConsumeDenied("evidence_observation_version_mismatch")
                 object_type = observation.object_type.casefold()
-                file_object_types = {"sample", "file", "sample_observation"}
-                supports_short_file_hash = prepared.family in {
-                    "vt.file_report",
-                    "vt.relationships",
-                }
-                if supports_short_file_hash:
-                    file_object_types.update({"sha256", "md5", "sha1"})
-                elif vt_file_hash_read:
-                    file_object_types.add("sha256")
-                elif is_bridge_submission:
-                    file_object_types.add("sha256")
-                if object_type in file_object_types:
-                    normalized_observation_hash = observation.object_id.casefold()
-                    hash_pattern = (
-                        r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})"
-                        if supports_short_file_hash
-                        else r"[0-9a-f]{64}"
+                observation_source = getattr(observation, "source", None)
+                hash_policy = external_observation_hash_policy(
+                    family=prepared.family,
+                    source=observation_source,
+                    object_type=observation.object_type,
+                )
+                if hash_policy is ExternalObservationHashPolicy.REJECT:
+                    raise _ConsumeDenied(
+                        "unresolvable_evidence_observation_source",
+                        detail=_observation_refusal_detail(observation),
                     )
-                    if not re.fullmatch(hash_pattern, normalized_observation_hash):
-                        raise _ConsumeDenied("unresolvable_evidence_observation_source")
+                if hash_policy is not None:
+                    normalized_observation_hash = validate_external_observation_hash(
+                        observation.object_id, hash_policy
+                    )
+                    if normalized_observation_hash is None:
+                        raise _ConsumeDenied(
+                            "unresolvable_evidence_observation_source",
+                            detail=_observation_refusal_detail(observation),
+                        )
+                    if hash_policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT and len(
+                        normalized_observation_hash
+                    ) in {32, 40}:
+                        resolved_report = resolve_bridge_vt_file_report_hashes(
+                            family=prepared.family,
+                            source=observation_source,
+                            object_type=observation.object_type,
+                            observation_kind=observation.kind,
+                            object_id=observation.object_id,
+                            report_content=(report_blob_contents or {}).get(observation.id),
+                        )
+                        if resolved_report is None:
+                            raise _ConsumeDenied(
+                                "unresolvable_evidence_observation_source",
+                                detail=_observation_refusal_detail(observation),
+                            )
+                        aliases = set(resolved_report.identifiers)
+                        provider_report_hashes.update(aliases)
+                        provider_report_aliases[observation.id] = aliases
+                        provider_report_sha256s[observation.id] = resolved_report.sha256
+                        provider_report_observations[observation.id] = observation
+                        continue
                     if vt_file_hash_read:
                         observation_file_hashes.add(normalized_observation_hash)
-                    if len(normalized_observation_hash) == 64:
-                        if bridge_may_cite_provider_report_hash_without_sample(
-                            family=prepared.family, observation=observation
-                        ):
-                            provider_report_hashes.add(normalized_observation_hash)
-                        else:
-                            observation_hashes.add(normalized_observation_hash)
+                    if bridge_may_cite_provider_report_hash_without_sample(
+                        family=prepared.family, observation=observation
+                    ):
+                        aliases = {normalized_observation_hash}
+                        provider_report_hashes.update(aliases)
+                        provider_report_aliases[observation.id] = aliases
+                        provider_report_sha256s[observation.id] = normalized_observation_hash
+                        provider_report_observations[observation.id] = observation
+                    elif len(normalized_observation_hash) == 64:
+                        observation_hashes.add(normalized_observation_hash)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
                     except ValueError as exc:
-                        raise _ConsumeDenied("unresolvable_evidence_observation_source") from exc
+                        raise _ConsumeDenied(
+                            "unresolvable_evidence_observation_source",
+                            detail=_observation_refusal_detail(observation),
+                        ) from exc
                 elif is_model_submission and not is_bridge_submission:
-                    raise _ConsumeDenied("unresolvable_evidence_observation_source")
+                    raise _ConsumeDenied(
+                        "unresolvable_evidence_observation_source",
+                        detail=_observation_refusal_detail(observation),
+                    )
 
         if vt_file_hash_read and sample_hashes and not observation_hashes.issubset(sample_hashes):
             raise _ConsumeDenied("vt_source_observation_hash_mismatch")
@@ -1736,9 +1888,14 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("sample_not_associated_with_investigation")
 
         report_hash_samples: list[SampleRow] = []
+        report_sample_blob_hashes: dict[UUID, str] = {}
         if provider_report_hashes:
             # A report about a hash is not that hash's bytes, but any sample the subject
             # already holds under it keeps its TLP, licence and external-model restrictions.
+            # Row locks cannot protect this hash lookup from phantom inserts. Hold a table
+            # SHARE lock through the consume transaction so an in-flight sample insert
+            # commits before the lookup, and later inserts wait until the check commits.
+            await session.execute(text("LOCK TABLE samples IN SHARE MODE"))
             report_hash_samples = list(
                 await session.scalars(
                     select(SampleRow)
@@ -1753,8 +1910,20 @@ class SqlAlchemyExternalEffectClaimStore:
                     )
                     .order_by(SampleRow.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             )
+            if report_hash_samples:
+                report_blob_ids = sorted({item.blob_id for item in report_hash_samples}, key=str)
+                report_blobs = list(
+                    await session.scalars(
+                        select(BlobRow)
+                        .where(BlobRow.id.in_(report_blob_ids))
+                        .order_by(BlobRow.id)
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                report_sample_blob_hashes = {item.id: item.sha256 for item in report_blobs}
         if (vt_file_hash_read or prepared.family == "vt.intelligence_search") and source_hashes:
             hash_samples = list(
                 await session.scalars(
@@ -1788,17 +1957,53 @@ class SqlAlchemyExternalEffectClaimStore:
                 .execution_options(populate_existing=True)
             )
         )
+        report_hash_sample_ids = {item.id for item in report_hash_samples}
         for sample in [*samples, *report_hash_samples]:
-            if (
-                sample.subject_id != subject_id
-                or sample.tlp.casefold() == "red"
-                or (is_model_submission and not sample.external_llm_allowed)
-                or external_effect_source_do_not_submit_blocks(
-                    prepared.family, sample.do_not_submit
+            restriction_reason = external_effect_source_restriction_reason(
+                source_kind="sample",
+                source=sample,
+                subject_id=subject_id,
+                family=prepared.family,
+                is_model_submission=is_model_submission,
+            )
+            if restriction_reason is not None:
+                detail = None
+                if sample.id in report_hash_sample_ids:
+                    blob_hash = report_sample_blob_hashes.get(sample.blob_id)
+                    matching_observations = [
+                        provider_report_observations[observation_id]
+                        for observation_id, aliases in provider_report_aliases.items()
+                        if matching_bridge_provider_report_hashes(
+                            source=sample, report_hashes=aliases, blob_sha256=blob_hash
+                        )
+                    ]
+                    if matching_observations:
+                        detail = _observation_refusal_detail(
+                            sorted(matching_observations, key=lambda item: str(item.id))[0]
+                        )
+                raise _ConsumeDenied(restriction_reason, detail=detail)
+
+        for observation_id, aliases in provider_report_aliases.items():
+            observation_samples = [
+                (sample, report_sample_blob_hashes[sample.blob_id])
+                for sample in report_hash_samples
+                if sample.blob_id in report_sample_blob_hashes
+                and matching_bridge_provider_report_hashes(
+                    source=sample,
+                    report_hashes=aliases,
+                    blob_sha256=report_sample_blob_hashes[sample.blob_id],
                 )
-                or bool((sample.license_restriction or "").strip())
+            ]
+            if bridge_provider_report_samples_conflict(
+                report_hashes=aliases,
+                report_sha256=provider_report_sha256s[observation_id],
+                samples=observation_samples,
             ):
-                raise _ConsumeDenied("sample_source_restricted")
+                observation = provider_report_observations[observation_id]
+                raise _ConsumeDenied(
+                    "vt_source_observation_hash_mismatch",
+                    detail=_observation_refusal_detail(observation),
+                )
         if sample_ids and {sample.id for sample in samples} != sample_ids:
             raise _ConsumeDenied("sample_source_missing")
 
@@ -1816,17 +2021,15 @@ class SqlAlchemyExternalEffectClaimStore:
             )
         )
         for document in documents:
-            if (
-                document.subject_id != subject_id
-                or document.tlp.casefold() == "red"
-                or external_effect_source_do_not_submit_blocks(
-                    prepared.family, document.do_not_submit
-                )
-                or bool(document.license_restriction)
-            ):
-                raise _ConsumeDenied("source_document_restricted")
-            if _is_model_submission(prepared, family_binding) and not document.external_llm_allowed:
-                raise _ConsumeDenied("source_document_external_llm_not_allowed")
+            restriction_reason = external_effect_source_restriction_reason(
+                source_kind="source_document",
+                source=document,
+                subject_id=subject_id,
+                family=prepared.family,
+                is_model_submission=_is_model_submission(prepared, family_binding),
+            )
+            if restriction_reason is not None:
+                raise _ConsumeDenied(restriction_reason)
         if document_ids and {document.id for document in documents} != document_ids:
             raise _ConsumeDenied("source_document_missing")
 

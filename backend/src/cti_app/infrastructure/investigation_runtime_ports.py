@@ -189,6 +189,8 @@ def _bridge_source_reference_resolver(
 
 def create_external_effect_coordinator(
     session_factory: async_sessionmaker[AsyncSession],
+    *,
+    blob_store: BlobStore | None = None,
 ) -> ExternalEffectCoordinator:
     """Create the one runtime coordinator shared by Bridge and VT transports."""
     family_bindings = virustotal_external_effect_family_bindings()
@@ -226,6 +228,7 @@ def create_external_effect_coordinator(
             session_factory,
             policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
             family_bindings=family_bindings,
+            blob_store=blob_store,
         ),
         reuse_policies={
             family: reuse_policy
@@ -337,7 +340,7 @@ def build_investigation_runtime_ports(
     statuses: list[RuntimePortStatus] = []
     coordinator = external_effect_coordinator
     if coordinator is None and session_factory is not None:
-        coordinator = create_external_effect_coordinator(session_factory)
+        coordinator = create_external_effect_coordinator(session_factory, blob_store=blob_store)
 
     configure_vt_effects = getattr(vt_adapter, "configure_external_effects", None)
     vt_effects_ready = bool(

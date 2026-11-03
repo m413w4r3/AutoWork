@@ -13,9 +13,11 @@ inspection, ``gc``, or ``ctypes``.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, SupportsIndex, cast
@@ -49,7 +51,313 @@ def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool
     return do_not_submit and not family.startswith(("vt.", *_BRIDGE_FAMILY_PREFIXES))
 
 
+def external_effect_source_restriction_reason(
+    *,
+    source_kind: str,
+    source: Any,
+    subject_id: UUID,
+    family: str,
+    is_model_submission: bool,
+) -> str | None:
+    """Return the disclosure-policy refusal for a previously resolved source row."""
+    source_subject_id = getattr(source, "subject_id", None)
+    tlp = getattr(source, "tlp", None)
+    if (
+        source_subject_id != subject_id
+        or (isinstance(tlp, str) and tlp.casefold() == "red")
+        or external_effect_source_do_not_submit_blocks(
+            family, bool(getattr(source, "do_not_submit", False))
+        )
+    ):
+        return (
+            "sample_source_restricted" if source_kind == "sample" else "source_document_restricted"
+        )
+    license_restriction = getattr(source, "license_restriction", None)
+    if source_kind == "sample":
+        if bool((license_restriction or "").strip()):
+            return "sample_source_restricted"
+        if is_model_submission and not bool(getattr(source, "external_llm_allowed", False)):
+            return "sample_source_restricted"
+    elif license_restriction:
+        return "source_document_restricted"
+    elif is_model_submission and not bool(getattr(source, "external_llm_allowed", False)):
+        return "source_document_external_llm_not_allowed"
+    return None
+
+
 VIRUSTOTAL_OBSERVATION_SOURCE = "VirusTotal"
+_VT_SHORT_HASH_FAMILIES = frozenset({"vt.file_report", "vt.relationships"})
+_VT_SHA256_OBSERVATION_FAMILIES = frozenset(
+    {"vt.file_report", "vt.behaviour", "vt.behaviour_pcap", "vt.relationships"}
+)
+_BASE_FILE_OBJECT_TYPES = frozenset({"sample", "file", "sample_observation"})
+_HASH_TYPE_ALIASES = frozenset({"md5", "sha1", "sha256"})
+
+
+class ExternalObservationHashPolicy(StrEnum):
+    """Application-owned classification for hashes cited by external effects."""
+
+    SHA256 = "sha256"
+    SHORT_OR_SHA256 = "short_or_sha256"
+    VT_PROVIDER_REPORT = "vt_provider_report"
+    REJECT = "reject"
+
+
+def external_observation_hash_policy(
+    *, family: str, source: object, object_type: object
+) -> ExternalObservationHashPolicy | None:
+    """Classify whether and how an observation hash may ground an external effect.
+
+    This is application policy. The database repository only uses the result to
+    validate a source row and resolve any referenced sample.
+    """
+    normalized_type = object_type.casefold() if isinstance(object_type, str) else ""
+    is_bridge_family = family.startswith(_BRIDGE_FAMILY_PREFIXES)
+    if is_bridge_family and normalized_type in {"md5", "sha1"}:
+        return ExternalObservationHashPolicy.REJECT
+    if is_bridge_family and normalized_type == "file" and object_type != "file":
+        return ExternalObservationHashPolicy.REJECT
+    if is_bridge_family and normalized_type == "file" and source == VIRUSTOTAL_OBSERVATION_SOURCE:
+        return ExternalObservationHashPolicy.VT_PROVIDER_REPORT
+    if family in _VT_SHORT_HASH_FAMILIES:
+        allowed_types = _BASE_FILE_OBJECT_TYPES | _HASH_TYPE_ALIASES
+    elif family in _VT_SHA256_OBSERVATION_FAMILIES or is_bridge_family:
+        allowed_types = _BASE_FILE_OBJECT_TYPES | {"sha256"}
+    else:
+        allowed_types = _BASE_FILE_OBJECT_TYPES
+    if normalized_type not in allowed_types:
+        return None
+    if family in _VT_SHORT_HASH_FAMILIES:
+        return ExternalObservationHashPolicy.SHORT_OR_SHA256
+    return ExternalObservationHashPolicy.SHA256
+
+
+def external_effect_vt_file_hash_read(family: str) -> bool:
+    """Whether this effect family reads a VirusTotal file hash as its target."""
+    return family in _VT_SHA256_OBSERVATION_FAMILIES
+
+
+def validate_external_observation_hash(
+    value: object, policy: ExternalObservationHashPolicy
+) -> str | None:
+    """Validate an observed file hash under an application policy.
+
+    Existing VT and SHA-256 paths retain their historical case-folding. Newly
+    admitted Bridge provider hashes must already be lowercase ASCII hex.
+    """
+    if not isinstance(value, str):
+        return None
+    if policy is ExternalObservationHashPolicy.REJECT:
+        return None
+    if policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT:
+        if not value.isascii():
+            return None
+        if len(value) == 64:
+            normalized_sha256 = value.casefold()
+            return normalized_sha256 if re.fullmatch(r"[0-9a-f]{64}", normalized_sha256) else None
+        if len(value) in {32, 40} and re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40})", value):
+            return value
+        return None
+    normalized = value.casefold()
+    pattern = (
+        r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})"
+        if policy is ExternalObservationHashPolicy.SHORT_OR_SHA256
+        else r"[0-9a-f]{64}"
+    )
+    return normalized if re.fullmatch(pattern, normalized) else None
+
+
+def bridge_provider_report_requires_blob(
+    *,
+    family: str,
+    source: object,
+    object_type: object,
+    object_id: object,
+    observation_kind: object,
+) -> bool:
+    """Whether a Bridge VirusTotal file report needs its archived raw blob read."""
+    return (
+        family.startswith(_BRIDGE_FAMILY_PREFIXES)
+        and source == VIRUSTOTAL_OBSERVATION_SOURCE
+        and object_type == "file"
+        and observation_kind == "vt_file_report"
+        and isinstance(object_id, str)
+        and len(object_id) in {32, 40}
+    )
+
+
+def external_effect_may_resolve_bridge_vt_report(family: str) -> bool:
+    """Whether this external-effect family can cite a Bridge VT file report."""
+    return family.startswith(_BRIDGE_FAMILY_PREFIXES)
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeVTFileReportHashes:
+    requested_hash: str
+    md5: str
+    sha1: str
+    sha256: str
+
+    @property
+    def identifiers(self) -> frozenset[str]:
+        return frozenset({self.requested_hash, self.md5, self.sha1, self.sha256})
+
+
+def resolve_bridge_vt_file_report_hashes(
+    *,
+    family: str,
+    source: object,
+    object_type: object,
+    observation_kind: object = "vt_file_report",
+    object_id: object,
+    report_content: bytes | None,
+) -> BridgeVTFileReportHashes | None:
+    """Resolve short Bridge VT hashes only through their verified raw report."""
+    if not bridge_provider_report_requires_blob(
+        family=family,
+        source=source,
+        object_type=object_type,
+        object_id=object_id,
+        observation_kind=observation_kind,
+    ):
+        return None
+    assert isinstance(object_id, str)
+    if not object_id.isascii() or not re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40})", object_id):
+        return None
+    if not isinstance(report_content, bytes):
+        return None
+    try:
+        payload = json.loads(report_content, object_pairs_hook=_unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, Mapping) or data.get("type") != "file":
+        return None
+    attributes = data.get("attributes")
+    if not isinstance(attributes, Mapping):
+        return None
+    md5 = attributes.get("md5")
+    sha1 = attributes.get("sha1")
+    sha256 = attributes.get("sha256")
+    if not (
+        isinstance(md5, str)
+        and md5.isascii()
+        and re.fullmatch(r"[0-9a-f]{32}", md5)
+        and isinstance(sha1, str)
+        and sha1.isascii()
+        and re.fullmatch(r"[0-9a-f]{40}", sha1)
+    ):
+        return None
+
+    data_id = data.get("id")
+    data_id_is_sha256 = (
+        isinstance(data_id, str)
+        and data_id.isascii()
+        and re.fullmatch(r"[0-9a-f]{64}", data_id.casefold()) is not None
+    )
+    if sha256 is None and data_id_is_sha256:
+        assert isinstance(data_id, str)
+        resolved_sha256 = data_id.casefold()
+    elif (
+        isinstance(sha256, str)
+        and sha256.isascii()
+        and re.fullmatch(r"[0-9a-f]{64}", sha256.casefold())
+    ):
+        resolved_sha256 = sha256.casefold()
+    else:
+        return None
+
+    if data_id == object_id:
+        pass
+    elif (
+        not data_id_is_sha256
+        or not isinstance(data_id, str)
+        or data_id.casefold() != resolved_sha256
+    ):
+        return None
+    if isinstance(sha256, str) and sha256.casefold() != resolved_sha256:
+        return None
+    if (len(object_id) == 32 and md5 != object_id) or (len(object_id) == 40 and sha1 != object_id):
+        return None
+    return BridgeVTFileReportHashes(
+        requested_hash=object_id,
+        md5=md5,
+        sha1=sha1,
+        sha256=resolved_sha256,
+    )
+
+
+def resolve_bridge_vt_file_report_sha256(
+    *,
+    family: str,
+    source: object,
+    object_type: object,
+    object_id: object,
+    report_content: bytes | None,
+) -> str | None:
+    """Resolve the canonical SHA-256 from a verified Bridge VT file report."""
+    resolved = resolve_bridge_vt_file_report_hashes(
+        family=family,
+        source=source,
+        object_type=object_type,
+        object_id=object_id,
+        report_content=report_content,
+    )
+    return resolved.sha256 if resolved is not None else None
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def bridge_refusal_action_for_object_type(object_type: object) -> str:
+    """Return a safe action hint for a Bridge refusal, without exposing the hash."""
+    normalized_type = object_type.casefold() if isinstance(object_type, str) else ""
+    if normalized_type in _BASE_FILE_OBJECT_TYPES | _HASH_TYPE_ALIASES:
+        return "drop_ref_or_cite_sha256"
+    return "drop_ref"
+
+
+def matching_bridge_provider_report_hashes(
+    *, source: Any, report_hashes: set[str], blob_sha256: str | None = None
+) -> tuple[str, ...]:
+    """Map a restricted sample back to report hashes using its stored lineage."""
+    matches = {
+        report_hash
+        for report_hash in report_hashes
+        if getattr(source, "expected_hash", None) == report_hash
+        or getattr(source, "source_object_id", None) == report_hash
+        or blob_sha256 == report_hash
+    }
+    return tuple(sorted(matches))
+
+
+def bridge_provider_report_samples_conflict(
+    *,
+    report_hashes: set[str],
+    report_sha256: str,
+    samples: Iterable[tuple[Any, str]],
+) -> bool:
+    """Whether samples linked to one provider report disagree on their real digest."""
+    # A cross-digest conflict requires a shared MD5/SHA1 alias; compare the actual SHA-256s below.
+    short_report_hashes = {
+        report_hash for report_hash in report_hashes if len(report_hash) in {32, 40}
+    }
+    matched_blob_hashes = {
+        blob_sha256
+        for sample, blob_sha256 in samples
+        if matching_bridge_provider_report_hashes(source=sample, report_hashes=short_report_hashes)
+    }
+    return len(matched_blob_hashes) > 1 or any(
+        blob_sha256 != report_sha256 for blob_sha256 in matched_blob_hashes
+    )
 
 
 def bridge_may_cite_provider_report_hash_without_sample(*, family: str, observation: Any) -> bool:
@@ -141,6 +449,7 @@ class ExistingClaim:
 @dataclass(frozen=True, slots=True)
 class ConsumeRefused:
     reason: str
+    detail: str | None = None
 
 
 ConsumeResult = ConsumeCommitted | ExistingClaim | ConsumeRefused
@@ -454,6 +763,7 @@ class Reused:
 class Refused:
     reason: str
     framework_no_send_proof: FrameworkNoSendProof
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,9 +1089,13 @@ class ExternalEffectCoordinator:
                 )
 
             if isinstance(consume, ConsumeRefused):
+                refusal_reason = consume.reason
+                if consume.detail is not None:
+                    refusal_reason = f"{refusal_reason}:{consume.detail}"
                 return Refused(
-                    reason=consume.reason,
+                    reason=refusal_reason,
                     framework_no_send_proof=FrameworkNoSendProof("PRE_CONSUME", consume.reason),
+                    detail=consume.detail,
                 )
             if isinstance(consume, ExistingClaim):
                 return await self._handle_existing(consume.claim, authority, prepared)
