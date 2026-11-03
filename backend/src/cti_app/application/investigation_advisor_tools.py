@@ -92,6 +92,7 @@ from cti_app.domain.analyst_opinion import (
     investigation_opinion_id,
     render_implant_materials_text,
 )
+from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -235,6 +236,7 @@ class _AdvisorConsultationContext:
     sample_hash_observations: dict[str, tuple[EvidenceObservation, ...]] | None = None
     verified_sample_bytes: dict[UUID, tuple[bytes | None, str]] = field(default_factory=dict)
     sample_blob_metadata: dict[str, tuple[UUID, str, str, str] | None] = field(default_factory=dict)
+    restricted_sample_hashes: set[str] = field(default_factory=set)
     prompt_sample_hashes: set[str] = field(default_factory=set)
     prompt_sample_record_ids_by_hash: dict[str, set[str]] = field(default_factory=dict)
     prompt_sample_association_ids_by_hash: dict[str, set[str]] = field(default_factory=dict)
@@ -365,6 +367,25 @@ class InvestigationAdvisorTool:
             if timing is not None and isinstance(raw, bytes):
                 timing.increment_counter("bytes_read", len(raw))
             return raw
+        finally:
+            if timing is not None:
+                timing.record_elapsed("blob_reads_ms", time.perf_counter() - started_at)
+
+    async def _read_verified_consultation_range(
+        self, blob_id: UUID, *, offset: int, length: int, source_size: int
+    ) -> bytes:
+        timing = _CURRENT_ADVISOR_TIMING.get()
+        started_at = time.perf_counter()
+        if timing is not None:
+            timing.mark("blob_reads")
+            timing.increment_counter("blob_reads")
+        try:
+            fragment = await self._artifact_store.read_verified_range(
+                blob_id, offset=offset, length=length
+            )
+            if timing is not None:
+                timing.increment_counter("bytes_read", source_size)
+            return fragment
         finally:
             if timing is not None:
                 timing.record_elapsed("blob_reads_ms", time.perf_counter() - started_at)
@@ -2101,6 +2122,35 @@ class InvestigationAdvisorTool:
                 ),
             )
         if replayed_response_payload is None:
+            late_sample_policy_failure: ToolResult | None = None
+
+            async def recheck_sample_policy_before_submission() -> bool:
+                nonlocal late_sample_policy_failure
+                try:
+                    late_sample_policy_failure = await self._revalidate_prompt_sample_policy(
+                        context,
+                        consultation_type=consultation_type,
+                        evidence_refs=tuple(item.id for item in evidence),
+                    )
+                except Exception as exc:
+                    late_sample_policy_failure = await self._persist_preflight_failure(
+                        context,
+                        consultation_type=consultation_type,
+                        evidence_refs=tuple(item.id for item in evidence),
+                        output={
+                            "advisor_status": "refused",
+                            "preflight_status": "POLICY_BLOCKED",
+                            "failure_stage": "sample_disclosure_restricted",
+                            "failure_reason": "current_sample_policy_unavailable",
+                            "confirmed_non_execution": True,
+                            "bridge_turns_consumed": 0,
+                            "usable": False,
+                        },
+                        error_code="advisor_admission_recheck_unavailable",
+                        exception_class=type(exc).__name__,
+                    )
+                return late_sample_policy_failure is None
+
             submission = await submit_bridge_consultation_once(
                 self._transport,
                 investigation_id=context.investigation_id,
@@ -2115,6 +2165,7 @@ class InvestigationAdvisorTool:
                 minimum_timeout_seconds=minimum_execution_seconds,
                 clock=execution_clock,
                 on_submission_started=lambda: timing.mark("bridge_post_started"),
+                pre_submission_policy_check=recheck_sample_policy_before_submission,
                 external_effect_binding_context={
                     "authority_context": getattr(context, "external_effect_authority", None),
                     "invocation_arguments": dict(arguments),
@@ -2123,6 +2174,24 @@ class InvestigationAdvisorTool:
                     "reservation_operation_key": reservation_key,
                 },
             )
+            if late_sample_policy_failure is not None:
+                return late_sample_policy_failure
+            if submission.failure_stage == "pre_submission_policy":
+                return await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    output={
+                        "advisor_status": "refused",
+                        "preflight_status": "POLICY_BLOCKED",
+                        "failure_stage": "sample_disclosure_restricted",
+                        "failure_reason": "current_sample_policy_unavailable",
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code="advisor_admission_recheck_unavailable",
+                )
         if timing is not None:
             if submission.output_text is not None:
                 timing.mark(
@@ -3311,6 +3380,7 @@ class InvestigationAdvisorTool:
         question: str,
     ) -> dict[str, Any]:
         raw_observation_refs = arguments.get("evidence_refs", ())
+        current = self._consultation_context(investigation_id)
         input_warnings: list[dict[str, str]] = []
 
         def warn_input(field: str, code: str, detail_safe: str) -> None:
@@ -4178,6 +4248,16 @@ class InvestigationAdvisorTool:
                         "Select a verified measurement by blob_id, kind, offset, and value; "
                         "its canonical length must match the sample bytes."
                     )
+                if (
+                    current is not None
+                    and row.get("sample_sha256") in current.restricted_sample_hashes
+                ):
+                    row["content_excerpts"] = []
+                    row["content_omission_reason"] = "sample_disclosure_restricted"
+                    row["content_request_hint"] = (
+                        "A current sample disclosure restriction prevents sending this content."
+                    )
+                    row.pop("sample_sha256", None)
                 if _is_sample_content_omitted_observation(item):
                     row["content_excerpts"] = []
                     row["content_omission_reason"] = (
@@ -4238,6 +4318,19 @@ class InvestigationAdvisorTool:
                         measured_rows[0].get("sample_sha256"),
                         context.envelope,
                     )
+                restricted_measurement_hashes = {
+                    sample_hash
+                    for sample_hash in sample_hashes
+                    if current is not None and sample_hash in current.restricted_sample_hashes
+                }
+                if restricted_measurement_hashes:
+                    row["content_excerpts"] = []
+                    row["content_omission_reason"] = "sample_disclosure_restricted"
+                    row["content_request_hint"] = (
+                        "A current sample disclosure restriction prevents sending this range."
+                    )
+                    row.pop("sample_sha256", None)
+                    row.pop("sample_sha256s", None)
                 if sample_blob is not None:
                     row["sample_blob_id"] = str(sample_blob[0])
                     row["measurement_count"] = len(measured_rows)
@@ -5040,6 +5133,21 @@ class InvestigationAdvisorTool:
                     sample_hash,
                     envelope,
                 )
+                current = self._consultation_context(investigation_id)
+                if (
+                    sample_hash
+                    and current is not None
+                    and sample_hash in current.restricted_sample_hashes
+                ):
+                    row["content_excerpts"] = []
+                    row["content_omission_reason"] = "sample_disclosure_restricted"
+                    row["content_request_hint"] = (
+                        "A current sample disclosure restriction prevents sending this range."
+                    )
+                    row.pop("sample_sha256", None)
+                    row.pop("sample_sha256s", None)
+                    omitted_sample_bytes = True
+                    continue
                 fact: dict[str, Any] = {
                     "evidence_id": str(item.id),
                     "kind": kind,
@@ -5079,11 +5187,14 @@ class InvestigationAdvisorTool:
                         fact["mime_type"] = mime_type
                 measured_payload.append(fact)
             if omitted_sample_bytes:
-                row["content_omission_reason"] = "sample_bytes_not_included_without_targeted_range"
-                row["content_request_hint"] = (
-                    "Select a verified measurement by blob_id, kind, offset, and value; "
-                    "its canonical length must match the sample bytes."
-                )
+                if row.get("content_omission_reason") != "sample_disclosure_restricted":
+                    row["content_omission_reason"] = (
+                        "sample_bytes_not_included_without_targeted_range"
+                    )
+                    row["content_request_hint"] = (
+                        "Select a verified measurement by blob_id, kind, offset, and value; "
+                        "its canonical length must match the sample bytes."
+                    )
 
         finding_payload = [
             {
@@ -5384,8 +5495,7 @@ class InvestigationAdvisorTool:
         measurements: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
         """Verify explicitly selected byte ranges against their canonical sample blobs."""
-        verified_sample_bytes: dict[UUID, tuple[bytes | None, str]] = {}
-        current = self._consultation_context()
+        verified_sample_ranges: dict[tuple[UUID, int, int], tuple[bytes | None, str]] = {}
         results: list[dict[str, Any]] = []
         for measurement in measurements:
             row = dict(measurement)
@@ -5425,36 +5535,39 @@ class InvestigationAdvisorTool:
                 row.update(range_verified=False, content_omission_reason=reason)
                 results.append(row)
                 continue
-            if blob_id in verified_sample_bytes:
-                sample_content, status = verified_sample_bytes[blob_id]
+            range_key = (blob_id, offset, length)
+            if range_key in verified_sample_ranges:
+                fragment, status = verified_sample_ranges[range_key]
             else:
                 try:
-                    sample_content = await self._read_consultation_blob(
-                        blob_id, max_bytes=descriptor.size
+                    fragment = await self._read_verified_consultation_range(
+                        blob_id,
+                        offset=offset,
+                        length=length,
+                        source_size=descriptor.size,
                     )
                     status = (
                         "verified"
-                        if isinstance(sample_content, bytes)
-                        and len(sample_content) == descriptor.size
-                        and hashlib.sha256(sample_content).hexdigest() == sample_sha256
+                        if isinstance(fragment, bytes) and len(fragment) == length
                         else "sample_content_hash_mismatch"
                     )
                     if status != "verified":
-                        sample_content = None
+                        fragment = None
+                except BlobIntegrityError:
+                    fragment = None
+                    status = "sample_content_hash_mismatch"
                 except Exception:
-                    sample_content = None
+                    fragment = None
                     status = "sample_blob_unreadable"
-                verified_sample_bytes[blob_id] = (sample_content, status)
-                if current is not None:
-                    current.verified_sample_bytes[blob_id] = (sample_content, status)
+                verified_sample_ranges[range_key] = (fragment, status)
             fragment_sha256 = hashlib.sha256(fragment_bytes).hexdigest()
             declared_fragment = row.get("fragment_sha256")
             declared_fragment_sha256 = (
                 _safe_text(declared_fragment, 64) if isinstance(declared_fragment, str) else ""
             )
             if (
-                sample_content is not None
-                and sample_content[offset : offset + length] == fragment_bytes
+                fragment is not None
+                and fragment == fragment_bytes
                 and (not declared_fragment_sha256 or declared_fragment_sha256 == fragment_sha256)
             ):
                 row.update(
@@ -6383,6 +6496,9 @@ class InvestigationAdvisorTool:
             if not _sample_state_allows_advisor_disclosure(sample):
                 continue
             if _sample_disclosure_restriction_sources(sample, envelope):
+                if current is not None:
+                    current.restricted_sample_hashes.add(measured_hash)
+                    current.sample_blob_metadata[measured_hash] = None
                 # A sample-level restriction binds this measurement even when
                 # the case envelope itself permits external disclosure.
                 continue

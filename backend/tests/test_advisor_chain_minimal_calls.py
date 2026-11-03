@@ -9,11 +9,13 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application import bridge_investigator as bridge_module
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
 from cti_app.application.investigation_advisor_tools import register_investigation_advisor_tool
 from cti_app.application.investigation_tools import InMemoryToolRegistry, RegistryToolDispatcher
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
+    BudgetDimension,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
@@ -483,6 +485,88 @@ async def test_unselected_restricted_sample_is_excluded_without_blocking_other_e
 
 
 @pytest.mark.asyncio
+async def test_sample_restricted_during_pacing_is_refused_before_transport(monkeypatch) -> None:
+    investigation_id = uuid4()
+    sample_content = b"sample bytes remain local"
+    tool, transport, observation, *_fixture = _make_downloaded_sample_fixture(
+        investigation_id, sample_content
+    )
+    sample = tool._samples.samples[0]
+
+    class RestrictingPacer:
+        async def wait_for_next_submission(self, *, deadline_monotonic=None):
+            sample.external_llm_allowed = False
+            return True
+
+    monkeypatch.setattr(
+        bridge_module,
+        "_shared_bridge_pacer",
+        lambda **_kwargs: RestrictingPacer(),
+    )
+    context = make_dispatch_context(investigation_id)
+
+    result = await _dispatch(
+        tool,
+        context,
+        "plan_investigation",
+        arguments={
+            "question": "Review the associated sample provenance.",
+            "evidence_refs": [str(observation.id)],
+        },
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted", result.output
+    assert result.output["failure_stage"] == "sample_disclosure_restricted"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    assert context.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert context.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_investigation_sends_sample_provenance_without_whole_bytes() -> None:
+    investigation_id = uuid4()
+    marker = b"WHOLE_SAMPLE_BYTES_MUST_STAY_LOCAL"
+    sample_content = b"small sample prefix:" + marker + b":suffix"
+    tool, transport, observation, _sample_id, _association_id, sample_blob_id, _sample_hash = (
+        _make_downloaded_sample_fixture(investigation_id, sample_content)
+    )
+    sample_blob_reads = 0
+    original_read_bytes = tool._artifact_store.read_bytes
+
+    async def count_sample_blob_reads(blob_id, *, max_bytes):
+        nonlocal sample_blob_reads
+        if blob_id == sample_blob_id:
+            sample_blob_reads += 1
+        return await original_read_bytes(blob_id, max_bytes=max_bytes)
+
+    tool._artifact_store.read_bytes = count_sample_blob_reads
+    transport.submission = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text="The sample is represented by provenance only.",
+    )
+
+    result = await _dispatch(
+        tool,
+        make_dispatch_context(investigation_id),
+        "plan_investigation",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "question": "Summarize the sample provenance.",
+            "evidence_refs": [str(observation.id)],
+        },
+    )
+
+    assert len(transport.calls) == 1, result
+    prompt = transport.calls[0]["prompt"]
+    assert marker.decode("ascii") not in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert sample_blob_reads == 0
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+
+
+@pytest.mark.asyncio
 async def test_large_sample_stays_provenance_only_with_exact_reservation() -> None:
     investigation_id = uuid4()
     sample_content = bytes(index % 251 for index in range(3_200_000))
@@ -494,28 +578,72 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
         output_text="Complete sample received for review.",
     )
     context = make_dispatch_context(investigation_id)
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": "Review the verified associated sample bytes.",
+        "evidence_refs": [str(observation.id)],
+    }
+
+    unjoined_content = b"UNJOINED_SAMPLE_SENTINEL_" + b"u" * 3_200_000
+    unjoined_hash = hashlib.sha256(unjoined_content).hexdigest()
+    unjoined_blob_id = uuid4()
+    tool._blobs.add(
+        unjoined_blob_id,
+        sha256=unjoined_hash,
+        size=len(unjoined_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._artifact_store.values[unjoined_blob_id] = unjoined_content
+    existing_associations = await tool._sample_associations.list_for_investigation(investigation_id)
+    tool._sample_associations = _SampleAssociations(
+        [*(item.sample_sha256 for item in existing_associations), unjoined_hash]
+    )
+    existing_samples = await tool._samples.list_for_subject(uuid4())
+    tool._samples = _Samples(
+        [
+            *existing_samples,
+            SimpleNamespace(
+                id=uuid4(),
+                expected_hash=unjoined_hash,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=unjoined_blob_id,
+                origin_kind="subject_seed",
+                original_name="unjoined-large.bin",
+                source_service="offline-fixture",
+                tlp=TLP.GREEN,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                license_restriction=None,
+            ),
+        ]
+    )
+    estimate = await tool.reservation_cost(arguments, context)
 
     result = await _dispatch(
         tool,
         context,
         "plan_investigation",
-        arguments={
-            "question": "Review the verified associated sample bytes.",
-            "evidence_refs": [str(observation.id)],
-        },
+        arguments=arguments,
     )
 
     assert len(transport.calls) == 1, result
     prompt = transport.calls[0]["prompt"]
     assert base64.b64encode(sample_content).decode("ascii") not in prompt
     assert "content_base64:" not in prompt
+    assert "UNJOINED_SAMPLE_SENTINEL" not in prompt
+    assert unjoined_hash not in prompt
     assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
     assert "content_request_hint=" in prompt
     assert "encoding=base64; offset=0; length=3200000" not in prompt
     assert "byte_length=3200000" in prompt
     assert sample_hash in prompt
-    assert len(prompt.encode("utf-8")) < 32_000
     prompt_bytes = len(prompt.encode("utf-8"))
+    assert estimate[next(key for key in estimate if key.value == "context_bytes")] == prompt_bytes
+    assert (
+        estimate[next(key for key in estimate if key.value == "context_tokens")]
+        == (prompt_bytes + 3) // 4
+    )
     assert (
         result.budget_consumed[
             next(key for key in result.budget_consumed if key.value == "context_bytes")

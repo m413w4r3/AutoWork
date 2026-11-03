@@ -288,6 +288,7 @@ async def submit_bridge_consultation_once(
     clock: Callable[[], float] | None = None,
     on_submission_started: Callable[[], None] | None = None,
     external_effect_binding_context: Mapping[str, Any] | None = None,
+    pre_submission_policy_check: Callable[[], Awaitable[bool]] | None = None,
 ) -> TurnSubmission:
     """Submit one non-decision consultation using Bridge's shared pacing and transport."""
     key = make_investigation_turn_idempotency_key(
@@ -429,6 +430,31 @@ async def submit_bridge_consultation_once(
                 failure_stage="external_effect_authority",
                 failure_reason=failure_reason,
             )
+        if pre_submission_policy_check is not None:
+            try:
+                policy_allows_submission = await pre_submission_policy_check()
+            except Exception:
+                return TurnSubmission(
+                    TurnSubmissionStatus.UNAVAILABLE,
+                    idempotency_key=key,
+                    conversation_id=conversation_id,
+                    detail="A current pre-submission policy check is unavailable.",
+                    error_code="bridge_pre_submission_policy_unavailable",
+                    submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                    failure_stage="pre_submission_policy",
+                    failure_reason="check_unavailable",
+                )
+            if policy_allows_submission is not True:
+                return TurnSubmission(
+                    TurnSubmissionStatus.BLOCKED,
+                    idempotency_key=key,
+                    conversation_id=conversation_id,
+                    detail="The current policy denies Bridge submission.",
+                    error_code="policy_denied",
+                    submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                    failure_stage="pre_submission_policy",
+                    failure_reason="current_policy_denied",
+                )
         if on_submission_started is not None:
             on_submission_started()
         if attempt == 0:

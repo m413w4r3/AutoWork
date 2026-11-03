@@ -472,7 +472,9 @@ async def test_m12_q_reservation_and_execution_characterization(
         "content_omission_reason=whole_sample_not_needed_for_consultation"
         in (transport.calls[0]["prompt"])
     )
-    expected_association_reads = 2
+    # The final pre-send sample-policy recheck reloads associations after
+    # preparation, response lookup, and pacing.
+    expected_association_reads = 3
     assert (
         execution_counts["calls"].get("sample_associations.list_for_investigation")
         == expected_association_reads

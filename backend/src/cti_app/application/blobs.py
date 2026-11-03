@@ -60,6 +60,13 @@ class BlobCatalogService:
         read_limit = blob.descriptor.size if max_bytes is None else max_bytes
         return await self._store.read(blob.descriptor, max_bytes=read_limit)
 
+    async def read_verified_range(self, blob_id: UUID, *, offset: int, length: int) -> bytes:
+        async with self._uow_factory() as uow:
+            blob = await uow.blobs.get(blob_id)
+            if blob is None:
+                raise EntityNotFoundError(f"Blob {blob_id} does not exist")
+        return await self._store.read_verified_range(blob.descriptor, offset=offset, length=length)
+
     @staticmethod
     def _ensure_same_metadata(current: BlobDescriptor, requested: BlobDescriptor) -> None:
         if current.size != requested.size or current.mime_type != requested.mime_type:

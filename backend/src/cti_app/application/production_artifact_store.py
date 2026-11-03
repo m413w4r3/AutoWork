@@ -96,6 +96,12 @@ class ProductionArtifactStore:
         except BlobStorageUnavailableError as exc:
             raise ProductionReuseStorageUnavailableError(str(exc)) from exc
 
+    async def read_verified_range(self, blob_id: UUID, *, offset: int, length: int) -> bytes:
+        try:
+            return await self._catalog.read_verified_range(blob_id, offset=offset, length=length)
+        except BlobStorageUnavailableError as exc:
+            raise ProductionReuseStorageUnavailableError(str(exc)) from exc
+
     async def read_json(self, blob_id: UUID) -> dict[str, Any]:
         payload = json.loads(await self.read_text(blob_id))
         if not isinstance(payload, dict):
