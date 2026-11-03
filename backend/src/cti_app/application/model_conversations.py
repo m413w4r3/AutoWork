@@ -208,6 +208,7 @@ class ConversationTurnFailedError(ModelConversationError):
         code: str,
         status: ConversationTurnStatus,
         submission_state: str | None = None,
+        phase: str | None = None,
         retryable: bool = False,
         retry_after_seconds: float | None = None,
         completed_response: bool = False,
@@ -216,6 +217,7 @@ class ConversationTurnFailedError(ModelConversationError):
         self.code = code
         self.status = status
         self.submission_state = submission_state
+        self.phase = phase
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
         self.completed_response = completed_response
@@ -1041,6 +1043,10 @@ class ModelConversationService:
                         isinstance(failed_details, dict)
                         and failed_details.get("completed_response") is True
                     )
+                    raw_phase = (
+                        failed_details.get("phase") if isinstance(failed_details, dict) else None
+                    )
+                    phase = raw_phase[:64] if isinstance(raw_phase, str) else None
                     if completed_response:
                         submission_state = "post_submission"
                     elif (
@@ -1055,6 +1061,7 @@ class ModelConversationService:
                         code=duplicate.error_code or "conversation_turn_failed",
                         status=duplicate.status,
                         submission_state=submission_state,
+                        phase=phase,
                         completed_response=completed_response,
                         retryable=(
                             isinstance(failed_details, dict)

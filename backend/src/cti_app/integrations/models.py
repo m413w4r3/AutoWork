@@ -238,6 +238,12 @@ class HttpResponsesTransport:
             headers["X-Correlation-ID"] = correlation_id
         read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
         timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
+        submission_started = False
+
+        def mark_request_submission_started() -> None:
+            nonlocal submission_started
+            submission_started = True
+            mark_bridge_submission_started()
 
         try:
             if self._client is not None:
@@ -252,11 +258,11 @@ class HttpResponsesTransport:
                         timeout=timeout,
                     )
                     if is_responses_submission:
-                        mark_bridge_submission_started()
+                        mark_request_submission_started()
                     response = await send(request, follow_redirects=False)
                 else:
                     if is_responses_submission:
-                        mark_bridge_submission_started()
+                        mark_request_submission_started()
                     response = await self._client.request(
                         method,
                         f"{self._base_url}{path}",
@@ -278,8 +284,38 @@ class HttpResponsesTransport:
                         timeout=timeout,
                     )
                     if is_responses_submission:
-                        mark_bridge_submission_started()
+                        mark_request_submission_started()
                     response = await client.send(request, follow_redirects=False)
+        except httpx.UnsupportedProtocol as exc:
+            raise BridgeTransportError(
+                "bridge_unsupported_protocol",
+                "Le transport Bridge ne prend pas en charge le protocole de cette URL.",
+                retryable=False,
+                phase=phase,
+                submission_state=(
+                    "pre_submission" if is_responses_submission or phase == "preflight" else None
+                ),
+            ) from exc
+        except (TypeError, ValueError, httpx.InvalidURL) as exc:
+            state = (
+                "submission_attempted"
+                if is_responses_submission and submission_started
+                else "pre_submission"
+                if is_responses_submission or phase == "preflight"
+                else None
+            )
+            raise BridgeTransportError(
+                "bridge_transport_error" if submission_started else "bridge_request_invalid",
+                (
+                    "Le transport Bridge a échoué après le début possible de l'envoi."
+                    if submission_started
+                    else "La requête Bridge n'a pas été créée à cause "
+                    "d'un paramètre local invalide."
+                ),
+                retryable=False,
+                phase=phase,
+                submission_state=state,
+            ) from exc
         except httpx.PoolTimeout as exc:
             raise BridgeTransportError(
                 "bridge_pool_timeout",
@@ -1131,26 +1167,31 @@ def _should_reconcile_bridge_submission(error: BridgeTransportError) -> bool:
         error.bridge_status == "failed" and error.verified_no_answer and error.bridge_run_id
     ):
         return False
-    if error.submission_state == "pre_submission" and error.bridge_status not in {
-        "queued",
-        "running",
-        "in_progress",
-        "completed",
-        "succeeded",
-    }:
-        return False
+    if error.submission_state == "pre_submission":
+        # This Bridge error is known to be misclassified when its journal says
+        # submission began. Reconcile only that contradictory server error;
+        # explicit pre-send failures remain terminal without a GET.
+        if (
+            error.code == "bridge_server_error"
+            and error.phase in {"submission", "submission_confirmation"}
+            and not error.verified_no_answer
+        ):
+            return True
+        return error.bridge_status in {
+            "queued",
+            "running",
+            "in_progress",
+            "completed",
+            "succeeded",
+        }
     # Generic server failures and UI/wait timeouts can follow a created run.
     # A prose message from an older server is not terminal non-execution proof.
     if error.status_code is not None and error.status_code >= 500:
-        return (
-            error.code
-            not in {
-                "bridge_auth_failed",
-                "bridge_extension_disconnected",
-                "conversation_unavailable",
-            }
-            or error.submission_state != "pre_submission"
-        )
+        return error.code not in {
+            "bridge_auth_failed",
+            "bridge_extension_disconnected",
+            "conversation_unavailable",
+        }
     return error.submission_state != "pre_submission"
 
 
