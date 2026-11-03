@@ -1718,12 +1718,21 @@ async def test_operator_full_source_revision_preserves_bridge_parent_and_is_test
     )
     first, second = history.output["versions"]
     assert first["source_sha256"] == bridge_sha256
-    assert first["signature"]["source_attribution"]["source_author"] == "bridge"
+    first_attribution = first["signature"]["source_attribution"]
+    assert first_attribution["source_author"] == "bridge"
+    assert first_attribution["origin_author"] == "bridge"
     assert second["source_sha256"] == corrected_sha256
-    assert second["signature"]["source_attribution"]["source_author"] == "operator"
-    assert second["signature"]["source_attribution"]["derived_from"]["source_sha256"] == (
-        bridge_sha256
+    second_attribution = second["signature"]["source_attribution"]
+    assert second_attribution["source_author"] == "operator"
+    assert second_attribution["origin_author"] == "bridge"
+    assert second_attribution["derived_from"]["source_sha256"] == bridge_sha256
+    stored_versions = await harness.candidates.list_for_candidate(
+        UUID(proposed.output["candidate_id"])
     )
+    assert stored_versions[0].source == bridge_source
+    assert stored_versions[0].source_sha256 == bridge_sha256
+    assert stored_versions[1].source == corrected_source
+    assert stored_versions[1].parent_version_id == stored_versions[0].id
     assert "source_diff" not in revised.output
     diff_summary = revised.output["source_diff_summary"]
     assert diff_summary["parent_source_sha256"] == bridge_sha256
@@ -2249,6 +2258,13 @@ async def test_rule_cycle_requires_test_and_reports_only_explicit_test_results()
     test_report = second_test.output["report"]
     assert test_report["false_negative_count"] == 0
     assert test_report["false_positive_count"] == 0
+    confirmed_role = next(
+        item for item in test_report["roles"] if item["role"] == "human_confirmed"
+    )
+    assert confirmed_role["matches"] == (hashlib.sha256(positive).hexdigest(),)
+    assert confirmed_role["test_cases"][0]["family_confirmation"] == "not_assessed"
+    assert second_test.output["candidate_status"] == DetectionCandidateStatus.EXPERIMENTAL.value
+    assert second_test.output["validation_status"] == "real_partial"
     assert test_report["rule_version_id"] == revised.output["version_id"]
     assert test_report["rule_source_sha256"] == revised.output["source_sha256"]
     assert test_report["final_status"] == "ONE_RULE_NOT_VALIDATED"
@@ -3572,6 +3588,15 @@ async def test_rule_propose_and_test_expose_unmeasured_goodware_without_a_baseli
     observation = await harness.evidence.repository.get(tested.observation_refs[0])
     assert observation is not None
     persisted = await harness.evidence.read_json(observation.blob_id)
+    report = tested.output["report"]
+    goodware_rate = report["metrics"]["real_goodware_false_positive_rate"]
+    assert report["goodware_measurement"]["status"] == "unmeasured"
+    assert (
+        report["goodware_measurement"]["reason"]
+        == "goodware_baseline_unbound_and_binary_corpus_empty"
+    )
+    assert goodware_rate["status"] == "not_calculable"
+    assert goodware_rate["denominator"] == 0
     assert persisted["goodware_measurement"]["status"] == "unmeasured"
     assert (
         persisted["goodware_measurement"]["reason"]
@@ -3696,6 +3721,16 @@ async def test_synthetic_positive_and_real_goodware_report_provenance() -> None:
     assert payload["validation_status"] == "real_partial"
     assert payload["false_positive_count"] == 0
     assert payload["false_negative_count"] == 0
+    goodware_rate = payload["metrics"]["real_goodware_false_positive_rate"]
+    assert goodware_rate["status"] == "calculated"
+    assert goodware_rate["numerator"] == 0
+    assert goodware_rate["denominator"] == 1
+    assert goodware_rate["estimate"] == 0
+    assert goodware_rate["confidence_interval_95"]["upper"] > 0
+    assert (
+        "does not establish a zero population rate"
+        in payload["evaluation_protocol"]["statistics_interpretation"]
+    )
     assert payload["provenance_counts_by_role"]["new_candidate_unconfirmed"] == {
         "real": 0,
         "synthetic": 1,

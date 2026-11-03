@@ -981,6 +981,29 @@ def test_yara_prose_exposes_each_exact_rule_with_its_own_sha256() -> None:
     assert parsed["canonicalization_eligible"] is False
 
 
+def test_yara_prose_preserves_each_source_line_ending_and_hash() -> None:
+    sources = (
+        'rule First {\r\n    strings:\r\n        $a = "first-marker"\r\n'
+        "    condition:\r\n        $a\r\n}",
+        'rule Second {\n    strings:\r\n        $b = "second-marker"\r'
+        "    condition:\n        $b\r}",
+    )
+    raw = "```yara\r\n" + "\r\n\r\n".join(sources) + "\r\n```\r\n"
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert [item["rule_source"] for item in parsed["rules"]] == list(sources)
+    assert [item["rule_source_sha256"] for item in parsed["rules"]] == [
+        hashlib.sha256(source.encode("utf-8")).hexdigest() for source in sources
+    ]
+
+
 def test_yara_prose_keeps_ambiguous_multi_rule_boundaries_noncanonicalizable() -> None:
     raw = (
         "```yara\n"
