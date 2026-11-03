@@ -162,3 +162,39 @@ Note de qualité de l'audit : **C**, même palier que l'essai 2.
 | Limite réelle | Moyenne | Pas de goodware/holdout/négatif difficile ; associations `candidate` | Non corrigeable ici |
 
 Aucune validation de production. Fusion de la PR #23, route PCAP, plan de reset et mise en production : décisions de l'utilisateur.
+
+---
+
+# Cycle 4 — dossier ciblé, essais 4 et 5 (2026-11-03)
+
+## 16. Chantier « dossier Bridge par pertinence » (branche `m13/dossier-relevance`, fusionnée dans `bridge-simp/integration` @ `f1b32477`)
+
+Principe demandé par l'utilisateur : ne plus envoyer à Bridge les échantillons entiers ; lui envoyer le désassemblé/décompilé pertinent, les observations pertinentes et des octets ciblés. Pas de plafond d'octets (`backend/AGENTS.md`) : sélection par pertinence, omissions observables avec raison.
+
+- Échantillons : provenance seule par défaut pour tous les types de consultation ; octets uniquement par plage explicite vérifiée (SHA-256 du blob complet calculé en flux par blocs de 1 Mio, mémoire indépendante de la taille du blob). Observations `investigation.subject_sample_reuse` jamais rendues en contenu. Une plage explicite couvrant tout le blob reste envoyée (octet demandé) avec `covers_whole_sample=true` (union d'intervalles par blob) ; plage vide omise avec `empty_blob_range`.
+- Réservation G2 == mesure du prompt sélectionné ; un refus liste les éléments les plus lourds.
+- Course de divulgation (préexistante à `0bdc0f8b`) : la restriction d'échantillon (TLP RED, `external_llm_allowed=false`, révocation) est revérifiée dans la porte d'envoi, après le pacing et juste avant le transport (`bridge_investigator.py`, `investigation_advisor_tools.py`).
+- Trois revues Luna xhigh indépendantes ; la dernière a rendu FAIL sur 3 défauts du marqueur d'audit (pas de fuite), corrigés ensuite (`9f6a3b06`) **sans quatrième revue complète** (choix de l'orchestrateur). Les gardes elles-mêmes (`_sample_disclosure_restriction_sources`) n'ont pas été modifiées.
+- Vérifié par l'orchestrateur sur `9f6a3b06` : unitaires 5 837 passés / 39 échecs identiques à la base (le test golden `advisor_prompt` échoue à la base et passe maintenant car ses données attendues ont été modifiées par le chantier), PostgreSQL 129 passés, ruff propre ; mypy et gate FAST non rejoués.
+- Mesure réelle (essai 4) : dossier `plan_investigation` de 29 Ko (0,4 s) contre 173 Mo refusés en essai 3.
+
+## 17. Essai 4 (arrêté) et essai 5
+
+- Essai 4 (`df30d96b`) : arrêté par l'orchestrateur, les 3 lectures VT ayant échoué en `transport_exception_ConnectError` (proxy VT injoignable). L'opérateur avait réconcilié ces lectures en `executed_with_result` sans données : elles apparaissent `succeeded` en base (état trompeur, défaut de plateforme).
+- Essai 5 (`2143a45c`, run `e55a2661`, opérateur `990ae52b`, espace neuf, VT rétabli par l'utilisateur) : 8 findings (7 supported, 1 qualified), 7 règles YARA candidates (3 avec matches), avis brouillon v2 sans Bridge. VT : 20 `file_report`, 11 téléchargements, 5 `relationships`, 1 `intelligence_search`. Bridge : plan OK ; deux `draft_text` refusés avant envoi (`coordinator_consume_refused / unresolvable_evidence_observation_source`, 0 tour consommé).
+- Audit Luna xhigh (SHA-256 du rapport `931f4f04…`) : note **D** (essai 3 : C). Cause du refus : 4 observations VT `file` indexées par MD5 sélectionnées dans les dossiers ; le coordinateur n'accepte que du SHA-256 pour Bridge (`external_effects.py:~1617`) ; **préexistant à `0bdc0f8b`**, pas une régression du chantier. Un assouplissement MD5 risquerait de contourner les contrôles d'association/divulgation : correctif à soumettre à revue.
+- Dossiers `draft_text` encore ≈4 Mo et 73–90 Mo de blobs lus : observations des findings et méthodes décompilées complètes, sélection à resserrer.
+- Comportement : 215 traces `skipped` / 3 `consulted`, une seule consultation a atteint Bridge, aucun échange YARA, `first_significant_decompilation` toujours dû. Valeurs RC4/IP/port/clé non étayées par des observations de sortie dans l'export.
+- Goodware : **aucune baseline importée** (tables vides, cache vide) ; `rule.test` n'a ni sensibilité ni faux positifs mesurables. Sources signalées par l'utilisateur : `/home/nill/tools/yarGen/dbs` (good-exports/imphashes/opcodes/strings). Import en base canonique : à autoriser explicitement.
+
+### Défauts ouverts (plateforme)
+| Gravité | Défaut |
+| --- | --- |
+| Haute | Garde de citation Bridge : observation VT `file` par MD5 non citable (refus opaque, observation fautive non nommée) |
+| Haute | `draft_text` classé `pre_submission` / non soumis alors que Bridge est entré en soumission (`resp_3a49a257` sans fin) |
+| Moyenne | Réconciliation VT permettant `executed_with_result` sans donnée : état `succeeded` trompeur |
+| Moyenne | Checkpoint ignoré (`skipped`) toujours dû ; import d'une réponse YARA Bridge sans prédicat exposé ; export d'audit incomplet |
+| Moyenne | Dossiers de rédaction trop gros (findings → observations/méthodes) |
+| Limite | Aucun goodware/holdout |
+
+Aucune validation de production. Fusion de la PR #23, route PCAP, import goodware, plan de reset, mise en production : décisions de l'utilisateur.
