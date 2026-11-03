@@ -3404,8 +3404,28 @@ def _canonical_tool_measurement(
     measurement: Mapping[str, Any], evidence: Mapping[str, Any] | None
 ) -> bool:
     """Identify tool-observed sample values without claiming blob-range proof."""
-    if evidence is None or not _as_text(measurement.get("sample_sha256")):
+    if not _as_text(measurement.get("sample_sha256")):
         return False
+    if evidence is None:
+        # The observation row is not part of this dossier, but the measurement itself names the
+        # observation (id and digest) and its extraction context; external data never does.
+        measurement_source = _as_text(measurement.get("source")).casefold()
+        return bool(
+            _as_text(measurement.get("evidence_id"))
+            and _as_text(measurement.get("evidence_sha256"))
+            and _as_text(measurement.get("extractor_version"))
+            and type(measurement.get("offset")) is int
+            and measurement.get("offset", -1) >= 0
+            and type(measurement.get("length")) is int
+            and measurement.get("length", 0) > 0
+            and bool(_as_text(measurement.get("value")))
+            and measurement.get("content_omission_reason")
+            not in {"sample_blob_hash_mismatch", "sample_content_hash_mismatch"}
+            and not (
+                measurement_source in {"virustotal", "vt"}
+                or measurement_source.startswith(("virustotal.", "vt."))
+            )
+        )
     integrity_failure_reasons = {
         "sample_blob_hash_mismatch",
         "sample_content_hash_mismatch",
@@ -3424,14 +3444,21 @@ def _canonical_tool_measurement(
         observed_hashes.update(
             _as_text(value) for value in evidence_sample_sha256s if _as_text(value)
         )
+    # Archived and production observation rows do not always repeat the sample digest, the
+    # tool-name ``source`` or a blob-read flag: the tool-derived ``kind`` is enough to separate
+    # our own measurement from VT or other external data. A listed digest must still agree.
+    evidence_source = _as_text(evidence.get("source")).casefold()
+    tool_derived = evidence_source.startswith("autowork.") or (
+        not evidence_source and _as_text(evidence.get("kind")).startswith("binary_")
+    )
     return bool(
         evidence_id
         and evidence_id == _as_text(evidence.get("evidence_id"))
         and evidence_sha256
         and evidence_sha256 == _as_text(evidence.get("sha256"))
-        and _as_text(measurement.get("sample_sha256")) in observed_hashes
-        and _as_text(evidence.get("source")).casefold().startswith("autowork.")
-        and evidence.get("blob_read_verified") is True
+        and (not observed_hashes or _as_text(measurement.get("sample_sha256")) in observed_hashes)
+        and tool_derived
+        and evidence.get("blob_read_verified") is not False
         and type(measurement.get("offset")) is int
         and measurement.get("offset", -1) >= 0
         and type(measurement.get("length")) is int
