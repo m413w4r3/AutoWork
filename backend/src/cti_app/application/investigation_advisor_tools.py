@@ -7045,11 +7045,15 @@ class InvestigationAdvisorTool:
             for assertion in draft_assertions
         )
         evidence_links_absent = consultation_type == "draft_text" and not has_linked_draft_assertion
-        parse_failed = parsed is None or (
-            isinstance(parsed, Mapping)
-            and (
-                parsed.get("status") in {"invalid", "ambiguous"}
-                or (parsed.get("status") == "partial" and parsed.get("usable") is False)
+        parse_failed = (
+            bool(validation_rejection)
+            or parsed is None
+            or (
+                isinstance(parsed, Mapping)
+                and (
+                    parsed.get("status") in {"invalid", "ambiguous"}
+                    or (parsed.get("status") == "partial" and parsed.get("usable") is False)
+                )
             )
         )
         if parsed is None:
@@ -9815,16 +9819,470 @@ def _parse_advisor_output(
 
     text = raw.strip()
     parsed = extract_json_object(text)
-    if parsed is None:
-        return _parse_advisor_wire_legacy(
-            raw,
-            consultation_type=consultation_type,
+    if consultation_type not in _TYPED_CONSULTATION_TYPES:
+        format_warnings: list[str] = []
+        semantic_partial = False
+
+        def is_exploitable_text(value: str) -> bool:
+            words = re.findall(r"[A-Za-zÀ-ÿ0-9_]+", value)
+            if len(value.strip()) < 10 or len(words) < 2:
+                return False
+            distinct_words = {word.casefold() for word in words}
+            return len(words) <= 128 or len(distinct_words) >= min(16, len(words) // 10)
+
+        def warn(code: str, path: str | None = None) -> None:
+            if code not in format_warnings:
+                format_warnings.append(code)
+
+        if parsed is None:
+            legacy_wire_output = _parse_advisor_wire_legacy(
+                raw,
+                consultation_type=consultation_type,
+                prompt_data=prompt_data or {},
+                evidence_refs=evidence_refs,
+                source_refs=source_refs,
+                available_tools=available_tools,
+                available_tool_schemas=available_tool_schemas,
+            )
+            legacy_warnings = legacy_wire_output.get("warnings", ())
+            if isinstance(legacy_warnings, Sequence) and not isinstance(
+                legacy_warnings, str | bytes
+            ):
+                format_warnings.extend(item for item in legacy_warnings if isinstance(item, str))
+            legacy_normalizations = legacy_wire_output.get("normalizations", ())
+            existing_summary = legacy_wire_output.get("summary")
+            summary = (
+                existing_summary.strip()
+                if isinstance(existing_summary, str) and existing_summary.strip()
+                else text
+            )
+            if not text:
+                return legacy_wire_output
+            if legacy_wire_output.get("status") == "refused":
+                return legacy_wire_output
+            provenance_warnings = tuple(
+                warning
+                for warning in (*format_warnings, *legacy_normalizations)
+                if isinstance(warning, str)
+                if any(
+                    marker in warning
+                    for marker in (
+                        "reference_alias_unknown",
+                        "reference_kind_invalid",
+                        "no_valid_references",
+                    )
+                )
+            )
+            content_usable = not provenance_warnings and (
+                legacy_wire_output.get("usable") is True or is_exploitable_text(text)
+            )
+            if (
+                "bridge_reported_partial" in format_warnings
+                or provenance_warnings
+                or not content_usable
+            ):
+                legacy_wire_output["status"] = "partial"
+            else:
+                legacy_wire_output["status"] = "succeeded"
+            legacy_wire_output["summary"] = summary
+            legacy_wire_output["usable"] = content_usable
+            if content_usable:
+                legacy_wire_output.pop("normalization_status", None)
+            else:
+                legacy_wire_output["normalization_status"] = "partial"
+            if not isinstance(existing_summary, str) or not existing_summary.strip():
+                format_warnings.append("unstructured_response")
+            legacy_wire_output["warnings"] = list(dict.fromkeys(format_warnings))
+            return legacy_wire_output
+
+        parsed = _resolve_advisor_json_aliases(
+            parsed,
             prompt_data=prompt_data or {},
             evidence_refs=evidence_refs,
             source_refs=source_refs,
-            available_tools=available_tools,
-            available_tool_schemas=available_tool_schemas,
         )
+        if parsed.get("schema") != ADVISOR_RESPONSE_SCHEMA:
+            warn("schema_missing_or_mismatched", "$.schema")
+        if parsed.get("untrusted") is not True:
+            warn("untrusted_marker_missing_or_mismatched", "$.untrusted")
+        if parsed.get("consultation_type") not in {None, consultation_type}:
+            warn("consultation_type_mismatched", "$.consultation_type")
+        allowed_fields = {
+            "schema",
+            "consultation_type",
+            "status",
+            "refusal_reason",
+            "untrusted",
+            "summary",
+            "opinion",
+            "text",
+            "alternative_hypotheses",
+            "discriminating_experiment",
+            "discarded_lead",
+            "recommended_next_tools",
+            "risks",
+            "questions",
+        }
+        for unknown_field in sorted(set(parsed) - allowed_fields, key=str):
+            safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unknown_field))[:64] or "<unknown>"
+            warn(f"unknown_field_ignored:$.{safe_field}", f"$.{safe_field}")
+
+        status_value = parsed.get("status")
+        status = status_value.strip().casefold() if isinstance(status_value, str) else "succeeded"
+        if status_value is None or status not in {"succeeded", "partial", "refused"}:
+            warn("status_missing_or_unrecognized", "$.status")
+            status = "succeeded"
+        if status == "refused":
+            return {
+                "schema": ADVISOR_RESPONSE_SCHEMA,
+                "consultation_type": consultation_type,
+                "status": "refused",
+                "refusal_reason": parsed.get("refusal_reason", "Bridge refused the consultation."),
+                "untrusted": True,
+                "usable": False,
+                "warnings": list(format_warnings),
+            }
+
+        raw_summary = next(
+            (
+                parsed.get(key)
+                for key in ("summary", "opinion", "text")
+                if isinstance(parsed.get(key), str) and parsed[key].strip()
+            ),
+            text,
+        )
+        summary = raw_summary.strip() if isinstance(raw_summary, str) else text
+        if not summary:
+            summary = text
+            warn("summary_missing_raw_text_used", "$.summary")
+
+        def bounded_rows(value: Any, path: str, *, maximum: int = 32) -> list[Any]:
+            if isinstance(value, Mapping):
+                value = [value]
+                warn("object_normalized_to_array", path)
+            if not isinstance(value, (list, tuple)):
+                if value not in (None, ()):
+                    warn("array_missing_or_invalid_ignored", path)
+                return []
+            rows = list(value)
+            if len(rows) > maximum:
+                warn(f"array_truncated:{path}:{maximum}", path)
+                rows = rows[:maximum]
+            return rows
+
+        def clean_refs(value: Any, path: str, allowed: set[str]) -> list[str]:
+            nonlocal semantic_partial
+            scalar_input = isinstance(value, str)
+            if isinstance(value, str):
+                value = [part for part in re.split(r"[,;\s]+", value) if part]
+                warn(f"reference_list_split:{path}")
+            if value == [] or value == ():
+                return []
+            if value is None:
+                semantic_partial = True
+                warn(f"reference_list_invalid:{path}")
+                normalizations.append(f"{path}:invalid_reference_list")
+                if validation_rejection is not None:
+                    validation_rejection.update(code="invalid_reference_list", path=path)
+                return []
+            if not isinstance(value, (list, tuple)):
+                semantic_partial = True
+                warn(f"reference_list_ignored:{path}")
+                normalizations.append(f"{path}:invalid_reference_list")
+                if validation_rejection is not None:
+                    validation_rejection.update(code="invalid_reference_list", path=path)
+                return []
+            cleaned = _parse_basis_refs(
+                value,
+                allowed,
+                path=path,
+                ignored_references=ignored_references,
+                normalizations=normalizations,
+            )
+            if cleaned is None:
+                semantic_partial = True
+                warn(f"reference_list_invalid:{path}")
+                normalizations.append(f"{path}:invalid_reference_list")
+                if validation_rejection is not None:
+                    validation_rejection.update(code="invalid_reference_list", path=path)
+                return []
+            if len(cleaned) != len(value):
+                semantic_partial = True
+                warn("reference_list_filtered")
+                if not cleaned and scalar_input:
+                    normalizations.append(f"{path}:no_valid_references")
+                    if validation_rejection is not None:
+                        validation_rejection.update(code="invalid_reference_list", path=path)
+            return cleaned
+
+        allowed_observation_refs = {str(item) for item in evidence_refs}
+        allowed_non_tool_refs = allowed_observation_refs | set(source_refs)
+        tolerant_alternatives: list[dict[str, Any]] = []
+        tolerant_raw_alternatives = bounded_rows(
+            parsed.get("alternative_hypotheses", ()), "$.alternative_hypotheses"
+        )
+        for index, item in enumerate(tolerant_raw_alternatives):
+            path = f"$.alternative_hypotheses[{index}]"
+            if not isinstance(item, Mapping):
+                warn(f"array_item_ignored:{path}", path)
+                continue
+            for unknown_field in sorted(
+                set(item) - {"statement", "text", "hypothesis", "basis_refs", "refs"}, key=str
+            ):
+                safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unknown_field))[:64] or "<unknown>"
+                warn(f"unknown_field_ignored:{path}.{safe_field}")
+            statement = next(
+                (
+                    item.get(key)
+                    for key in ("statement", "text", "hypothesis")
+                    if isinstance(item.get(key), str) and item[key].strip()
+                ),
+                "",
+            )
+            if not statement:
+                warn(f"statement_missing:{path}", path)
+                continue
+            tolerant_basis = clean_refs(
+                item.get("basis_refs", item.get("refs", [])),
+                f"{path}.basis_refs",
+                allowed_non_tool_refs,
+            )
+            if not tolerant_basis:
+                warn(f"alternative_without_valid_basis:{path}")
+                continue
+            tolerant_alternatives.append(
+                {"statement": statement.strip(), "basis_refs": tolerant_basis}
+            )
+
+        raw_experiment = parsed.get("discriminating_experiment", {})
+        experiment_path = "$.discriminating_experiment"
+        if not isinstance(raw_experiment, Mapping):
+            warn("experiment_missing_or_invalid", experiment_path)
+            raw_experiment = {}
+        for unknown_field in sorted(
+            set(raw_experiment)
+            - {"question", "tool", "schema_version", "expected_signal", "basis_refs", "refs"},
+            key=str,
+        ):
+            safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unknown_field))[:64] or "<unknown>"
+            warn(f"unknown_field_ignored:{experiment_path}.{safe_field}")
+        experiment_question = raw_experiment.get("question", raw_experiment.get("text", ""))
+        expected_signal = raw_experiment.get("expected_signal", "")
+        if not isinstance(experiment_question, str):
+            experiment_question = ""
+            warn("experiment_question_ignored", f"{experiment_path}.question")
+        if not isinstance(expected_signal, str):
+            expected_signal = ""
+            warn("experiment_signal_ignored", f"{experiment_path}.expected_signal")
+        experiment_tool = raw_experiment.get("tool")
+        experiment_schema = raw_experiment.get("schema_version")
+        if (experiment_tool is None) != (experiment_schema is None):
+            warn("tool_schema_incomplete", f"{experiment_path}.schema_version")
+            experiment_tool = experiment_schema = None
+        elif experiment_tool is not None and (
+            not isinstance(experiment_tool, str)
+            or not isinstance(experiment_schema, str)
+            or available_tools.get(experiment_tool) != experiment_schema
+        ):
+            warn("tool_schema_unavailable", f"{experiment_path}.schema_version")
+            experiment_tool = experiment_schema = None
+        tolerant_experiment_basis = clean_refs(
+            raw_experiment.get("basis_refs", raw_experiment.get("refs", [])),
+            f"{experiment_path}.basis_refs",
+            allowed_non_tool_refs,
+        )
+
+        raw_discarded = parsed.get("discarded_lead", {})
+        discarded_path = "$.discarded_lead"
+        if not isinstance(raw_discarded, Mapping):
+            warn("discarded_lead_missing_or_invalid", discarded_path)
+            raw_discarded = {}
+        for unknown_field in sorted(
+            set(raw_discarded) - {"lead", "reason", "basis_refs", "refs"}, key=str
+        ):
+            safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unknown_field))[:64] or "<unknown>"
+            warn(f"unknown_field_ignored:{discarded_path}.{safe_field}")
+        discarded_lead = raw_discarded.get("lead", "")
+        discarded_reason = raw_discarded.get("reason", "")
+        if not isinstance(discarded_lead, str):
+            discarded_lead = ""
+            warn("discarded_lead_text_ignored", f"{discarded_path}.lead")
+        if not isinstance(discarded_reason, str):
+            discarded_reason = ""
+            warn("discarded_lead_reason_ignored", f"{discarded_path}.reason")
+        tolerant_discarded_basis = clean_refs(
+            raw_discarded.get("basis_refs", raw_discarded.get("refs", [])),
+            f"{discarded_path}.basis_refs",
+            allowed_non_tool_refs,
+        )
+
+        recommendations: list[dict[str, Any]] = []
+        raw_recommendations = bounded_rows(
+            parsed.get("recommended_next_tools", ()), "$.recommended_next_tools"
+        )
+        for index, item in enumerate(raw_recommendations):
+            path = f"$.recommended_next_tools[{index}]"
+            if not isinstance(item, Mapping):
+                warn(f"array_item_ignored:{path}", path)
+                continue
+            for unknown_field in sorted(
+                set(item)
+                - {
+                    "tool",
+                    "schema_version",
+                    "why",
+                    "args_hint",
+                    "expected_signal",
+                    "basis_refs",
+                    "refs",
+                },
+                key=str,
+            ):
+                safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unknown_field))[:64] or "<unknown>"
+                warn(f"unknown_field_ignored:{path}.{safe_field}")
+            name, version = item.get("tool"), item.get("schema_version")
+            if (
+                not isinstance(name, str)
+                or not isinstance(version, str)
+                or available_tools.get(name) != version
+            ):
+                warn("tool_schema_unavailable", f"{path}.schema_version")
+                continue
+            why = item.get("why", item.get("text", ""))
+            signal = item.get("expected_signal", "")
+            if not isinstance(why, str) or not isinstance(signal, str):
+                warn("recommendation_text_incomplete", path)
+                continue
+            tolerant_basis = clean_refs(
+                item.get("basis_refs", item.get("refs", [])),
+                f"{path}.basis_refs",
+                allowed_observation_refs,
+            )
+            if not tolerant_basis:
+                if "reference_list_filtered" not in format_warnings:
+                    warn(f"recommendation_without_valid_basis:{path}")
+                semantic_partial = True
+                continue
+            args_hint_incomplete_by_shape = False
+            if "args_hint" not in item:
+                tolerant_args_hint: Any = {}
+                args_hint_incomplete_by_shape = True
+                normalizations.append(f"{path}.args_hint:absent_to_empty_object")
+            else:
+                tolerant_args_hint = item["args_hint"]
+                if tolerant_args_hint is None:
+                    tolerant_args_hint = {}
+                    args_hint_incomplete_by_shape = True
+                    normalizations.append(f"{path}.args_hint:null_to_empty_object")
+                elif not isinstance(tolerant_args_hint, Mapping):
+                    tolerant_args_hint = {}
+                    args_hint_incomplete_by_shape = True
+                    normalizations.append(f"{path}.args_hint:non_object_to_empty_object")
+            normalizations_before_hint = len(normalizations)
+            clean_args_hint, hint_incomplete = _validated_args_hint(
+                tolerant_args_hint,
+                input_schema=available_tool_schemas.get(name),
+                path=path,
+                normalizations=normalizations,
+            )
+            hint_incomplete = hint_incomplete or args_hint_incomplete_by_shape
+            has_input_schema = available_tool_schemas.get(name) is not None
+            if len(normalizations) > normalizations_before_hint:
+                semantic_partial = True
+            if hint_incomplete and (has_input_schema or args_hint_incomplete_by_shape):
+                semantic_partial = True
+            recommendation: dict[str, Any] = {
+                "tool": name,
+                "schema_version": version,
+                "why": why.strip(),
+                "args_hint": clean_args_hint,
+                "expected_signal": signal.strip(),
+                "basis_refs": tolerant_basis,
+                "basis_observation_refs": tolerant_basis,
+            }
+            if hint_incomplete:
+                recommendation["args_hint_incomplete"] = True
+            recommendations.append(recommendation)
+
+        tolerant_risks = [
+            item.strip()
+            for item in bounded_rows(parsed.get("risks", ()), "$.risks")
+            if isinstance(item, str) and item.strip()
+        ]
+        tolerant_questions = [
+            item.strip()
+            for item in bounded_rows(parsed.get("questions", ()), "$.questions")
+            if isinstance(item, str) and item.strip()
+        ]
+        for key in ("risks", "questions"):
+            if parsed.get(key) is not None and not isinstance(parsed.get(key), (list, tuple)):
+                warn(f"array_normalized:{key}", f"$.{key}")
+
+        basis_observation_refs = tuple(
+            dict.fromkeys(ref for item in recommendations for ref in item["basis_observation_refs"])
+        )
+        has_explicit_summary = any(
+            isinstance(parsed.get(key), str) and parsed[key].strip()
+            for key in ("summary", "opinion", "text")
+        )
+        tolerant_has_valid_reference = bool(
+            tolerant_alternatives
+            or tolerant_experiment_basis
+            or tolerant_discarded_basis
+            or recommendations
+        )
+        has_text = bool(
+            (has_explicit_summary and is_exploitable_text(summary))
+            or tolerant_alternatives
+            or experiment_question.strip()
+            or discarded_lead.strip()
+            or recommendations
+            or tolerant_risks
+            or tolerant_questions
+        )
+        if not has_text:
+            warn("response_text_unusable")
+        response_status = (
+            "partial" if status == "partial" or semantic_partial or not has_text else "succeeded"
+        )
+        tolerant_output: dict[str, Any] = {
+            "schema": ADVISOR_RESPONSE_SCHEMA,
+            "consultation_type": consultation_type,
+            "summary": summary,
+            "alternative_hypotheses": tolerant_alternatives,
+            "discriminating_experiment": {
+                "question": experiment_question.strip(),
+                "tool": experiment_tool,
+                "schema_version": experiment_schema,
+                "expected_signal": expected_signal.strip(),
+                "basis_refs": tolerant_experiment_basis,
+            },
+            "discarded_lead": {
+                "lead": discarded_lead.strip(),
+                "reason": discarded_reason.strip(),
+                "basis_refs": tolerant_discarded_basis,
+            },
+            "basis_observation_refs": list(basis_observation_refs),
+            "recommended_next_tools": recommendations,
+            "risks": tolerant_risks,
+            "questions": tolerant_questions,
+            "untrusted": True,
+            "usable": has_text and (not semantic_partial or tolerant_has_valid_reference),
+            "status": response_status,
+        }
+        if format_warnings:
+            tolerant_output["warnings"] = list(dict.fromkeys(format_warnings))
+        if semantic_partial:
+            tolerant_output["normalizations"] = normalizations
+            tolerant_output["normalization_status"] = "partial"
+        elif normalizations:
+            tolerant_output["normalizations"] = normalizations
+            tolerant_output["normalization_status"] = "complete_with_warnings"
+        return tolerant_output
+
+    if parsed is None:
+        reject("invalid_json", "$")
+        return None
     parsed = _resolve_advisor_json_aliases(
         parsed,
         prompt_data=prompt_data or {},

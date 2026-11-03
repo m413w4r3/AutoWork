@@ -109,7 +109,7 @@ def test_refused_is_terminal_and_preserves_raw_bytes_and_hash() -> None:
     assert result["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
 
 
-def test_partial_requires_and_reports_explicit_incomplete_units() -> None:
+def test_partial_status_without_unit_markers_remains_readable_with_warning() -> None:
     raw = _response(status="partial", incomplete_units=["U2"])
 
     result = parse_advisor_semantic_response(
@@ -125,8 +125,55 @@ def test_partial_requires_and_reports_explicit_incomplete_units() -> None:
         consultation_type="plan_investigation",
         prompt_data=_prompt_data(),
     )
-    assert missing_units["status"] == "invalid"
-    assert missing_units["opinions"] == []
+    assert missing_units["status"] == "partial"
+    assert missing_units["opinions"][0]["text"] == "Inspect the observed configuration."
+    assert "partial_units_marker_missing" in missing_units["warnings"]
+
+
+def test_v4_plan_prose_is_usable_and_retains_raw_text_and_sha() -> None:
+    raw = "Bridge suggests comparing the observed configuration with a second sample."
+
+    result = parse_advisor_semantic_response(
+        raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["usable"] is True
+    assert result["opinions"][0]["text"] == raw
+    assert result["raw_output"] == raw
+    assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert "unstructured_response" in result["warnings"]
+
+
+def test_v4_approximate_json_ignores_named_fields_and_truncates_arrays() -> None:
+    opinions = [
+        {
+            "text": f"Inspect option {index}.",
+            "source_aliases": ["E1"],
+            "bridge_extra": "ignored",
+        }
+        for index in range(70)
+    ]
+    raw = json.dumps(
+        {
+            "opinions": opinions,
+            "bridge_note": "extra top-level field",
+        },
+        ensure_ascii=False,
+    )
+
+    result = parse_advisor_semantic_response(
+        raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["usable"] is True
+    assert len(result["opinions"]) == 64
+    assert any("bridge_note" in warning for warning in result["warnings"])
+    assert any("bridge_extra" in warning for warning in result["warnings"])
+    assert any("opinions" in warning and "truncated" in warning for warning in result["warnings"])
+    assert result["raw_output"] == raw
+    assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -147,21 +194,36 @@ def test_terminal_invalid_and_ambiguous_statuses_drop_all_opinions(
 
 
 @pytest.mark.parametrize(
-    "raw",
+    ("raw", "expected", "warning"),
     [
-        "not a v4 semantic response",
-        '{"schema":"advisor-response.v3","status":"succeeded"}',
-        '{"schema":"advisor-response.v4","schema":"advisor-response.v4"}',
+        ("not a v4 semantic response", "succeeded", "unstructured_response"),
+        ('{"schema":"advisor-response.v3","status":"succeeded"}', "invalid", None),
+        (
+            '{"schema":"advisor-response.v4","schema":"advisor-response.v4"}',
+            "ambiguous",
+            None,
+        ),
     ],
 )
-def test_invalid_or_ambiguous_envelopes_fail_closed(raw: str) -> None:
+def test_permissive_envelopes_preserve_exploitable_text_and_duplicate_keys_fail_closed(
+    raw: str, expected: str, warning: str | None
+) -> None:
     result = parse_advisor_semantic_response(
         raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
     )
 
-    assert result["status"] in {"invalid", "ambiguous"}
-    assert result["opinions"] == []
-    assert result["candidates"] == []
+    assert result["status"] == expected
+    if expected == "succeeded":
+        assert result["usable"] is True
+        assert result["opinions"][0]["text"]
+        assert result["raw_output"] == raw
+        assert warning in result["warnings"]
+    elif expected == "invalid":
+        assert result["usable"] is False
+        assert result["raw_output"] == raw
+    else:
+        assert result["opinions"] == []
+        assert result["candidates"] == []
 
 
 def test_ambiguous_source_alias_is_not_resolved() -> None:
@@ -356,7 +418,7 @@ def test_wire_handles_unicode_crlf_whitespace_and_json_content_as_evidence() -> 
     assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def test_wire_blank_incomplete_unit_is_invalid_before_partial_result() -> None:
+def test_wire_blank_incomplete_unit_is_retained_as_partial_result_with_warning() -> None:
     raw = (
         "advisor-wire.v1\nSCHEMA: advisor-response.v4\n"
         "TYPE: plan_investigation\nSTATUS: partial\n"
@@ -368,9 +430,11 @@ def test_wire_blank_incomplete_unit_is_invalid_before_partial_result() -> None:
         raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
     )
 
-    assert result["status"] == "invalid"
-    assert result["opinions"] == []
-    assert result["candidates"] == []
+    assert result["status"] == "partial"
+    assert result["usable"] is True
+    assert result["opinions"][0]["text"] == "An incomplete opinion."
+    assert "incomplete_unit_ignored:incomplete_units[0]" in result["warnings"]
+    assert result["raw_output"] == raw
 
 
 def test_parser_runs_without_egress_or_bridge_capabilities(monkeypatch) -> None:
@@ -490,6 +554,61 @@ def test_existing_parse_caller_keeps_v3_default_and_requires_explicit_v4_selecti
     assert selected_result is not None
     assert selected_result["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
     assert selected_result["status"] == "succeeded"
+
+
+def test_v3_plan_prose_is_usable_with_observable_format_warning() -> None:
+    raw = "Bridge recommends checking whether the marker appears in another sample."
+
+    parsed = _parse_advisor_output(
+        raw,
+        prompt="",
+        available_tools={},
+        available_tool_schemas={},
+        evidence_refs=(),
+        source_refs=(),
+        consultation_type="plan_investigation",
+        prompt_data=_prompt_data(),
+    )
+
+    assert parsed is not None
+    assert parsed["status"] == "succeeded"
+    assert parsed["usable"] is True
+    assert parsed["summary"] == raw
+    assert "unstructured_response" in parsed["warnings"]
+
+
+def test_v3_approximate_plan_json_ignores_named_fields_and_truncates_alternatives() -> None:
+    ref = "observation:synthetic-1"
+    raw = json.dumps(
+        {
+            "summary": "Compare measured strings across two samples.",
+            "alternative_hypotheses": [
+                {"statement": f"Option {index}.", "basis_refs": [ref]} for index in range(40)
+            ],
+            "unexpected_bridge_field": "ignored",
+        }
+    )
+
+    parsed = _parse_advisor_output(
+        raw,
+        prompt="",
+        available_tools={},
+        available_tool_schemas={},
+        evidence_refs=(),
+        source_refs=(ref,),
+        consultation_type="plan_investigation",
+        prompt_data=_prompt_data(),
+    )
+
+    assert parsed is not None
+    assert parsed["status"] == "succeeded"
+    assert parsed["usable"] is True
+    assert len(parsed["alternative_hypotheses"]) == 32
+    assert any("unexpected_bridge_field" in warning for warning in parsed["warnings"])
+    assert any(
+        "alternative_hypotheses" in warning and "truncated" in warning
+        for warning in parsed["warnings"]
+    )
 
 
 @pytest.mark.parametrize("status", ["invalid", "ambiguous"])

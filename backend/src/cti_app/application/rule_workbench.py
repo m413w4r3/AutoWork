@@ -96,7 +96,13 @@ class RuleValidationReason(StrEnum):
     EXPLICIT_TEST_REQUIRED = "explicit_rule_test_required"
 
 
-_ADVISORY_RULE_VALIDATION_ISSUES = frozenset({"or_branches_disguised_as_multiple_rules_forbidden"})
+_ADVISORY_RULE_VALIDATION_ISSUES = frozenset(
+    {
+        "or_branches_disguised_as_multiple_rules_forbidden",
+        "hash_equality_condition_forbidden",
+        "filesize_only_condition_forbidden",
+    }
+)
 
 
 def classify_rule_validation_issues(
@@ -255,6 +261,14 @@ def validate_single_rule_candidate(rule_source: str) -> tuple[str, ...]:
         reasons.append("exactly_one_rule_required")
     condition_match = re.search(r"(?is)\bcondition\s*:\s*(.*?)(?:\}\s*)?$", source)
     condition = condition_match.group(1).strip() if condition_match else ""
+    compact_condition = re.sub(r"\s+", "", condition).strip("()")
+    hash_only_condition = (
+        re.fullmatch(r'(?i)hash\.sha256\(\d+,filesize\)=="[0-9a-f]{64}"', compact_condition)
+        is not None
+    )
+    filesize_only_condition = (
+        re.fullmatch(r"(?i)filesize==\d+(?:kb|mb|gb)?", compact_condition) is not None
+    )
     if not condition:
         reasons.append("condition_required")
     strings_match = re.search(r"(?is)\bstrings\s*:\s*(.*?)\bcondition\s*:", source)
@@ -271,14 +285,18 @@ def validate_single_rule_candidate(rule_source: str) -> tuple[str, ...]:
     refers_to_all_defined_patterns = (
         re.search(r"(?i)\b(?:any|all|\d+)\s+of\s+them\b", condition) is not None
     )
-    if not condition_identifiers and not refers_to_all_defined_patterns:
+    if (
+        not condition_identifiers
+        and not refers_to_all_defined_patterns
+        and not hash_only_condition
+        and not filesize_only_condition
+    ):
         reasons.append("condition_must_reference_measured_patterns")
     if _condition_has_disguised_or_branches(condition):
         reasons.append("or_branches_disguised_as_multiple_rules_forbidden")
-    compact_condition = re.sub(r"\s+", "", condition).strip("()")
     if re.search(r"(?i)\bhash\.sha256\s*\(", condition):
         reasons.append("hash_equality_condition_forbidden")
-    if re.fullmatch(r"(?i)filesize==\d+(?:kb|mb|gb)?", compact_condition):
+    if filesize_only_condition:
         reasons.append("filesize_only_condition_forbidden")
     if re.search(r'(?i)\bimport\s+["\']dotnet["\']', source) and not (
         string_defs and (condition_identifiers or refers_to_all_defined_patterns)

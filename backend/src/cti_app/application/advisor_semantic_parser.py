@@ -36,6 +36,8 @@ ADVISOR_RESPONSE_SCHEMA_V4 = "advisor-response.v4"
 ADVISOR_SOURCE_PARSER_VERSION_V4 = "advisor-source-parser.v4"
 _ALIAS = re.compile(r"(?i)^[ERT][1-9][0-9]*$")
 _SUPPORTED_STATUSES = frozenset({"succeeded", "partial", "refused", "invalid", "ambiguous"})
+_MAX_RESPONSE_ITEMS = 64
+_MAX_SOURCE_ALIASES = 64
 _RESPONSE_KEYS = frozenset(
     {
         "schema",
@@ -47,6 +49,11 @@ _RESPONSE_KEYS = frozenset(
         "incomplete_units",
         "refusal_reason",
         "limitations",
+        "untrusted",
+        "summary",
+        "text",
+        "answer",
+        "response",
     }
 )
 _OPINION_KEYS = frozenset({"unit_id", "text", "source_aliases", "status"})
@@ -54,6 +61,22 @@ _OPINION_KEYS = frozenset({"unit_id", "text", "source_aliases", "status"})
 
 class _DuplicateJSONKey(ValueError):
     pass
+
+
+def _looks_like_exploitable_text(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped or stripped.casefold() in {
+        "json",
+        "empty",
+        "n/a",
+        "none",
+        "null",
+    }:
+        return False
+    words = re.findall(r"[\w]+", stripped)
+    if len(words) > 128 and len({word.casefold() for word in words}) < min(16, len(words) // 10):
+        return False
+    return True
 
 
 def parse_advisor_semantic_response(
@@ -126,6 +149,7 @@ def parse_advisor_semantic_response(
     except (AttributeError, KeyError, RecursionError, TypeError, UnicodeError, ValueError):
         return terminal("invalid", reason="evidence_context_invalid")
 
+    parse_warnings: list[str] = []
     try:
         response = _decode_response(safe_raw_text, consultation_type)
     except _DuplicateJSONKey:
@@ -135,7 +159,13 @@ def parse_advisor_semantic_response(
         ]
         return result
     except (AttributeError, TypeError, ValueError):
-        return terminal("invalid", reason="response_invalid")
+        response = None
+    if (
+        response is not None
+        and response.get("_content_missing") is True
+        and response.get("_wire_unstructured") is True
+    ):
+        response = None
     heuristic_review: dict[str, Any] | None = None
     heuristic_review_warnings: list[str] = []
     if response is None and consultation_type == "review_text":
@@ -167,12 +197,26 @@ def parse_advisor_semantic_response(
         else:
             response = None
     if response is None:
-        return terminal("invalid", reason="response_invalid")
+        prose = safe_raw_text.strip()
+        if not _looks_like_exploitable_text(prose):
+            return terminal("invalid", reason="response_invalid")
+        response = {
+            "status": "succeeded",
+            "opinions": [{"unit_id": "U1", "text": prose, "source_aliases": []}],
+            "incomplete_units": [],
+        }
+        parse_warnings.append("unstructured_response")
+    raw_parse_warnings = response.pop("_normalization_warnings", ())
+    if isinstance(raw_parse_warnings, Sequence) and not isinstance(raw_parse_warnings, str | bytes):
+        parse_warnings.extend(item for item in raw_parse_warnings if isinstance(item, str))
+    if response.pop("_content_missing", False) is True:
+        return terminal("invalid", reason="response_text_missing")
 
     status_value = response.get("status")
     status = status_value.strip().casefold() if isinstance(status_value, str) else status_value
     if status not in _SUPPORTED_STATUSES:
-        return terminal("invalid", reason="response_status_invalid")
+        status = "succeeded"
+        parse_warnings.append("response_status_missing_or_unrecognized")
     if status == "refused":
         return terminal("refused", reason="advisor_refused")
     if status == "invalid":
@@ -247,7 +291,8 @@ def parse_advisor_semantic_response(
 
     opinions_raw = response.get("opinions")
     if not isinstance(opinions_raw, list):
-        return terminal("invalid", reason="opinions_invalid")
+        opinions_raw = []
+        parse_warnings.append("opinions_missing_or_invalid; preserved raw response")
     if len(opinions_raw) == 0 and status == "succeeded":
         if (
             consultation_type == "review_text"
@@ -256,43 +301,80 @@ def parse_advisor_semantic_response(
         ):
             status = "partial"
         else:
-            return terminal("invalid", reason="opinions_missing")
+            prose = safe_raw_text.strip()
+            if not prose:
+                return terminal("invalid", reason="opinions_missing")
+            opinions_raw = [{"unit_id": "U1", "text": prose, "source_aliases": []}]
+            parse_warnings.append("unstructured_response")
 
     opinions: list[dict[str, Any]] = []
-    incomplete_units: list[str] = list(response.get("incomplete_units", []))
+    raw_incomplete_units = response.get("incomplete_units", [])
+    incomplete_units = (
+        list(raw_incomplete_units[:_MAX_RESPONSE_ITEMS])
+        if isinstance(raw_incomplete_units, list)
+        else []
+    )
+    if isinstance(raw_incomplete_units, list) and len(raw_incomplete_units) > _MAX_RESPONSE_ITEMS:
+        parse_warnings.append(f"array_truncated:incomplete_units:{_MAX_RESPONSE_ITEMS}")
     unresolved_refs: list[dict[str, Any]] = []
     seen_units: set[str] = set()
     inferred_incomplete: set[str] = set()
     any_ambiguous_alias = False
 
-    for item in opinions_raw:
-        if not isinstance(item, Mapping) or set(item) - _OPINION_KEYS:
-            return terminal("invalid", reason="opinion_shape_invalid")
+    if len(opinions_raw) > _MAX_RESPONSE_ITEMS:
+        parse_warnings.append(f"array_truncated:opinions:{_MAX_RESPONSE_ITEMS}")
+        opinions_raw = opinions_raw[:_MAX_RESPONSE_ITEMS]
+    for index, item in enumerate(opinions_raw):
+        if isinstance(item, str):
+            item = {"unit_id": f"U{index + 1}", "text": item, "source_aliases": []}
+            parse_warnings.append(f"opinion_string_normalized:opinions[{index}]")
+        if not isinstance(item, Mapping):
+            parse_warnings.append(f"opinion_ignored:opinions[{index}]")
+            continue
+        unknown_fields = set(item) - _OPINION_KEYS - {"statement", "opinion", "summary", "refs"}
+        for unknown_field in sorted(unknown_fields, key=str):
+            safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unknown_field))[:64]
+            parse_warnings.append(f"unknown_field_ignored:opinions[{index}].{safe_field}")
         unit_id = item.get("unit_id")
-        text = item.get("text")
+        text = item.get("text", item.get("statement", item.get("opinion", item.get("summary"))))
         unit_status = item.get("status", "complete")
+        if not isinstance(unit_id, str) or not unit_id.strip():
+            unit_id = f"U{index + 1}"
+            parse_warnings.append(f"unit_id_missing:opinions[{index}]")
         if isinstance(unit_id, str):
             unit_id = unit_id.strip()
         if isinstance(unit_status, str):
             unit_status = unit_status.strip().casefold()
-        if (
-            not isinstance(unit_id, str)
-            or not unit_id.strip()
-            or unit_id in seen_units
-            or not isinstance(text, str)
-            or not text.strip()
-            or unit_status not in {"complete", "partial"}
-        ):
-            return terminal(
-                "ambiguous" if isinstance(unit_id, str) and unit_id in seen_units else "invalid",
-                reason="opinion_unit_invalid",
-            )
+        if isinstance(unit_id, str) and unit_id in seen_units:
+            unit_id = f"U{index + 1}"
+            if unit_id in seen_units:
+                parse_warnings.append(f"duplicate_opinion_ignored:opinions[{index}]")
+                continue
+            parse_warnings.append(f"duplicate_unit_id_renumbered:opinions[{index}]")
+        if not isinstance(text, str) or not text.strip():
+            parse_warnings.append(f"opinion_text_missing:opinions[{index}]")
+            continue
+        if unit_status not in {"complete", "partial"}:
+            unit_status = "complete"
+            parse_warnings.append(f"unit_status_normalized:opinions[{index}]")
         seen_units.add(unit_id)
-        aliases_raw = item.get("source_aliases", [])
-        if not isinstance(aliases_raw, list) or not all(
-            isinstance(alias, str) for alias in aliases_raw
-        ):
-            return terminal("invalid", reason="source_aliases_invalid")
+        aliases_raw = item.get("source_aliases", item.get("refs", []))
+        if isinstance(aliases_raw, str):
+            aliases_raw = [
+                part.strip() for part in re.split(r"[,;\s]+", aliases_raw) if part.strip()
+            ]
+            parse_warnings.append(f"source_aliases_split:opinions[{index}]")
+        if not isinstance(aliases_raw, list):
+            aliases_raw = []
+            parse_warnings.append(f"source_aliases_ignored:opinions[{index}]")
+        if len(aliases_raw) > _MAX_SOURCE_ALIASES:
+            aliases_raw = aliases_raw[:_MAX_SOURCE_ALIASES]
+            parse_warnings.append(
+                f"array_truncated:opinions[{index}].source_aliases:{_MAX_SOURCE_ALIASES}"
+            )
+        if any(not isinstance(alias, str) for alias in aliases_raw):
+            aliases_raw = [alias for alias in aliases_raw if isinstance(alias, str)]
+            parse_warnings.append(f"source_aliases_filtered:opinions[{index}]")
         if unit_status == "partial":
             inferred_incomplete.add(unit_id)
         source_refs: list[dict[str, Any]] = []
@@ -332,7 +414,19 @@ def parse_advisor_semantic_response(
                     "validated": False,
                 }
             )
-        if not source_refs and consultation_type != "review_text":
+        if (
+            not source_refs
+            and consultation_type != "review_text"
+            and not any(
+                warning in parse_warnings
+                for warning in (
+                    "unstructured_response",
+                    "schema_missing_or_mismatched",
+                    "consultation_type_missing_or_mismatched",
+                    "untrusted_marker_missing_or_mismatched",
+                )
+            )
+        ):
             inferred_incomplete.add(unit_id)
         opinion = {
             "unit_id": unit_id,
@@ -346,7 +440,7 @@ def parse_advisor_semantic_response(
     incomplete_units.extend(sorted(inferred_incomplete))
     incomplete_units = list(dict.fromkeys(incomplete_units))
     if status == "partial" and not incomplete_units and consultation_type != "review_text":
-        return terminal("invalid", reason="partial_units_missing")
+        parse_warnings.append("partial_units_marker_missing")
     if any_ambiguous_alias:
         status = "ambiguous"
         opinions = []
@@ -392,7 +486,7 @@ def parse_advisor_semantic_response(
             status = "partial"
         if redacted_secret_count and "secret_redacted" not in heuristic_review_warnings:
             heuristic_review_warnings.append("secret_redacted")
-    warnings = list(dict.fromkeys(heuristic_review_warnings))
+    warnings = list(dict.fromkeys((*heuristic_review_warnings, *parse_warnings)))
     overall_review = (
         heuristic_review.get("overall_review")
         if heuristic_review is not None and isinstance(heuristic_review.get("overall_review"), str)
@@ -411,7 +505,7 @@ def parse_advisor_semantic_response(
             )
             and status in {"succeeded", "partial"}
             if consultation_type == "review_text"
-            else bool(candidates) and status == "succeeded"
+            else bool(candidates) and status in {"succeeded", "partial"}
         ),
         "opinions": opinions,
         "candidates": candidates,
@@ -451,54 +545,141 @@ def _decode_response(raw: str, consultation_type: str) -> dict[str, Any] | None:
             return None
         if not isinstance(response, dict):
             return None
-        if response.get("schema") != ADVISOR_RESPONSE_SCHEMA_V4:
-            return None
-        if response.get("consultation_type") != consultation_type:
-            return None
-        if set(response) - _RESPONSE_KEYS:
-            return None
-        if "opinions" in response:
-            if not isinstance(response["opinions"], list):
-                return None
-        elif isinstance(response.get("opinion"), str):
-            response["opinions"] = [
-                {
-                    "unit_id": "U1",
-                    "text": response["opinion"],
-                    "source_aliases": response.get("source_aliases", []),
-                }
-            ]
+        warnings: list[str] = []
+        schema = response.get("schema")
+        if schema != ADVISOR_RESPONSE_SCHEMA_V4:
+            warnings.append("schema_missing_or_mismatched")
+        response_type = response.get("consultation_type")
+        if response_type != consultation_type:
+            warnings.append("consultation_type_missing_or_mismatched")
+        if response.get("untrusted") is not True:
+            warnings.append("untrusted_marker_missing_or_mismatched")
+        for field_name in sorted(set(response) - _RESPONSE_KEYS):
+            safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(field_name))[:64] or "<unknown>"
+            warnings.append(f"unknown_field_ignored:$.{safe_field}")
+        status = response.get("status")
+        if not isinstance(status, str) or status.strip().casefold() not in _SUPPORTED_STATUSES:
+            warnings.append("status_missing_or_unrecognized")
+            status = "succeeded"
         else:
-            response["opinions"] = []
+            status = status.strip().casefold()
+
+        raw_opinions = response.get("opinions")
+        if isinstance(raw_opinions, list):
+            opinions: list[Any] = raw_opinions
+        elif raw_opinions is not None:
+            opinions = [raw_opinions]
+            warnings.append("opinions_non_array_normalized")
+        else:
+            opinion = next(
+                (
+                    response[key]
+                    for key in ("opinion", "text", "summary", "answer", "response")
+                    if isinstance(response.get(key), str) and response[key].strip()
+                ),
+                None,
+            )
+            opinions = (
+                [
+                    {
+                        "unit_id": "U1",
+                        "text": opinion,
+                        "source_aliases": response.get("source_aliases", []),
+                    }
+                ]
+                if opinion is not None
+                else []
+            )
+        if isinstance(raw_opinions, list) and len(raw_opinions) > _MAX_RESPONSE_ITEMS:
+            warnings.append(f"array_truncated:opinions:{_MAX_RESPONSE_ITEMS}")
+            opinions = raw_opinions[:_MAX_RESPONSE_ITEMS]
+
         incomplete = response.get("incomplete_units", [])
-        if not isinstance(incomplete, list) or not all(
-            isinstance(unit_id, str) and unit_id.strip() for unit_id in incomplete
-        ):
-            return None
-        response["incomplete_units"] = list(
-            dict.fromkeys(unit_id.strip() for unit_id in incomplete)
+        if not isinstance(incomplete, list):
+            incomplete = []
+            warnings.append("incomplete_units_non_array_ignored")
+        if len(incomplete) > _MAX_RESPONSE_ITEMS:
+            incomplete = incomplete[:_MAX_RESPONSE_ITEMS]
+            warnings.append(f"array_truncated:incomplete_units:{_MAX_RESPONSE_ITEMS}")
+        clean_incomplete: list[str] = []
+        for index, unit_id in enumerate(incomplete):
+            if not isinstance(unit_id, str) or not unit_id.strip():
+                warnings.append(f"incomplete_unit_ignored:incomplete_units[{index}]")
+                continue
+            if unit_id.strip() not in clean_incomplete:
+                clean_incomplete.append(unit_id.strip())
+        normalized_opinions: list[Any] = []
+        for index, item in enumerate(opinions):
+            if not isinstance(item, Mapping):
+                normalized_opinions.append(item)
+                continue
+            allowed = _OPINION_KEYS | {"statement", "opinion", "summary", "refs"}
+            clean_item = dict(item)
+            for field_name in sorted(set(clean_item) - allowed):
+                safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(field_name))[:64] or "<unknown>"
+                warnings.append(f"unknown_field_ignored:opinions[{index}].{safe_field}")
+                clean_item.pop(field_name, None)
+            normalized_opinions.append(clean_item)
+        content_missing = not any(
+            (isinstance(item, str) and item.strip())
+            or (
+                isinstance(item, Mapping)
+                and any(
+                    isinstance(item.get(key), str) and item[key].strip()
+                    for key in ("text", "statement", "opinion", "summary")
+                )
+            )
+            for item in normalized_opinions
         )
-        return response
+        return {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V4,
+            "consultation_type": consultation_type,
+            "status": status,
+            "opinions": normalized_opinions,
+            "incomplete_units": clean_incomplete,
+            "_content_missing": content_missing,
+            "_normalization_warnings": warnings,
+        }
 
     document = parse_advisor_wire(parse_text)
     fields = document.fields
     schema = _single_field(fields, "schema")
     response_type = _single_field(fields, "type")
     status = _single_field(fields, "status")
-    if schema != ADVISOR_RESPONSE_SCHEMA_V4 or response_type != consultation_type or status is None:
-        return None
-    opinions: list[dict[str, Any]] = []
-    wire_incomplete: list[str] = list(fields.get("incomplete_unit", ()))
-    if not all(isinstance(unit_id, str) and unit_id.strip() for unit_id in wire_incomplete):
-        return None
-    wire_incomplete = list(dict.fromkeys(unit_id.strip() for unit_id in wire_incomplete))
+    warnings = []
+    if schema != ADVISOR_RESPONSE_SCHEMA_V4:
+        warnings.append("schema_missing_or_mismatched")
+    if response_type != consultation_type:
+        warnings.append("consultation_type_missing_or_mismatched")
+    if status is None:
+        warnings.append("status_missing_or_unrecognized")
+        status = "succeeded"
+    elif status.casefold() not in _SUPPORTED_STATUSES:
+        warnings.append("status_missing_or_unrecognized")
+        status = "succeeded"
+    else:
+        status = status.casefold()
+    if document.ignored_prose:
+        warnings.append("wire_prose_preserved")
+    wire_opinions: list[dict[str, Any]] = []
+    raw_wire_incomplete = list(fields.get("incomplete_unit", ()))
+    if len(raw_wire_incomplete) > _MAX_RESPONSE_ITEMS:
+        warnings.append(f"array_truncated:incomplete_units:{_MAX_RESPONSE_ITEMS}")
+        raw_wire_incomplete = raw_wire_incomplete[:_MAX_RESPONSE_ITEMS]
+    wire_incomplete: list[str] = []
+    for index, unit_id in enumerate(raw_wire_incomplete):
+        if not isinstance(unit_id, str) or not unit_id.strip():
+            warnings.append(f"incomplete_unit_ignored:incomplete_units[{index}]")
+            continue
+        if unit_id.strip() not in wire_incomplete:
+            wire_incomplete.append(unit_id.strip())
     active: dict[str, Any] | None = None
     top_text = _single_field(fields, "opinion")
     top_aliases = list(fields.get("ref", ()))
     for key, value in document.records:
         if key == "unit":
             if active is not None:
-                opinions.append(active)
+                wire_opinions.append(active)
             active = {"unit_id": value, "text": "", "source_aliases": [], "status": "complete"}
         elif key == "unit_text" and active is not None:
             active["text"] = value
@@ -507,9 +688,9 @@ def _decode_response(raw: str, consultation_type: str) -> dict[str, Any] | None:
         elif key == "unit_status" and active is not None:
             active["status"] = value.casefold()
     if active is not None:
-        opinions.append(active)
+        wire_opinions.append(active)
     elif top_text is not None:
-        opinions = [
+        wire_opinions = [
             {
                 "unit_id": "U1",
                 "text": top_text,
@@ -518,13 +699,24 @@ def _decode_response(raw: str, consultation_type: str) -> dict[str, Any] | None:
             }
         ]
     elif fields.get("unit"):
-        return None
+        warnings.append("unit_text_missing")
+    content_missing = not isinstance(top_text, str) or not top_text.strip()
+    content_missing = content_missing and not any(
+        isinstance(item, Mapping) and isinstance(item.get("text"), str) and item["text"].strip()
+        for item in wire_opinions
+    )
+    if len(wire_opinions) > _MAX_RESPONSE_ITEMS:
+        wire_opinions = wire_opinions[:_MAX_RESPONSE_ITEMS]
+        warnings.append(f"array_truncated:opinions:{_MAX_RESPONSE_ITEMS}")
     return {
-        "schema": schema,
-        "consultation_type": response_type,
-        "status": status.casefold(),
-        "opinions": opinions,
+        "schema": ADVISOR_RESPONSE_SCHEMA_V4,
+        "consultation_type": consultation_type,
+        "status": status,
+        "opinions": wire_opinions,
         "incomplete_units": wire_incomplete,
+        "_content_missing": content_missing,
+        "_wire_unstructured": not document.has_header and not fields and document.ignored_prose,
+        "_normalization_warnings": warnings,
     }
 
 
