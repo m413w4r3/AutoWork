@@ -44,7 +44,6 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.investigation_service import (
     InvestigationService,
-    InvocationReconciliationOutcome,
     ProductionArtifactContextSnapshotRepository,
     ProductionArtifactObservationWriter,
     _confirmed_external_non_execution,
@@ -99,6 +98,7 @@ from cti_app.domain.investigation import (
     InvestigationEnvelope,
     InvestigationExecutionMode,
     InvestigationFinding,
+    InvocationReconciliationOutcome,
     NoveltyClass,
     TLPLevel,
     ToolInvocation,
@@ -1178,6 +1178,62 @@ async def test_operator_passive_vt_reconciliation_only_adopts_its_persisted_resu
     )
     assert persisted_abandon_reservation.status.value == "committed"
     assert persisted_abandon_reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+
+
+@pytest.mark.asyncio
+async def test_passive_vt_execution_with_result_requires_recoverable_observations() -> None:
+    fixture, invocation, _ = await _seed_operator_passive_vt_reconciliation()
+
+    with pytest.raises(ValueError, match="persisted result references"):
+        await fixture.service.reconcile_invocation(
+            fixture.investigation_id,
+            invocation.id,
+            outcome=InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+            actor="analyst-1",
+            reason="The transport failed and no result data were recovered.",
+            expected_version=invocation.version,
+            idempotency_key="vt-result-without-observations",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome_name", "expected_status", "expected_interpretation"),
+    [
+        ("executed_empty_response", ToolInvocationStatus.EMPTY, "verified_empty_response"),
+        ("transport_error", ToolInvocationStatus.NEEDS_REVIEW, "transport_error"),
+        ("external_result_unknown", ToolInvocationStatus.NEEDS_REVIEW, "external_result_unknown"),
+        ("result_unavailable", ToolInvocationStatus.UNAVAILABLE, "result_unavailable"),
+        (
+            "reconciled_without_result",
+            ToolInvocationStatus.UNAVAILABLE,
+            "reconciled_without_result",
+        ),
+    ],
+)
+async def test_passive_vt_reconciliation_keeps_data_less_outcomes_non_successful(
+    outcome_name, expected_status, expected_interpretation
+) -> None:
+    fixture, invocation, _ = await _seed_operator_passive_vt_reconciliation()
+    outcome = InvocationReconciliationOutcome(outcome_name)
+
+    resolved = await fixture.service.reconcile_invocation(
+        fixture.investigation_id,
+        invocation.id,
+        outcome=outcome,
+        actor="operator:agent-client",
+        reason="The passive read has no recoverable result data.",
+        expected_version=invocation.version,
+        idempotency_key=f"vt-no-data-{outcome_name}",
+        actor_provenance="operator_client",
+    )
+
+    assert resolved.status is expected_status
+    assert resolved.response_refs == ()
+    assert await fixture.findings.list_for_investigation(fixture.investigation_id) == ()
+    decision = fixture.analyst_decisions.items[0]
+    assert decision.details["outcome"] == outcome_name
+    assert decision.details["result_interpretation"] == expected_interpretation
 
 
 @pytest.mark.asyncio

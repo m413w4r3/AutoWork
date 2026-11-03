@@ -11,7 +11,6 @@ import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import fields, replace
 from datetime import UTC, datetime
-from enum import StrEnum
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid5
 
@@ -136,6 +135,7 @@ from cti_app.domain.investigation import (
     InvestigationEnvelope,
     InvestigationExecutionMode,
     InvestigationFinding,
+    InvocationReconciliationOutcome,
     NoveltyClass,
     TLPLevel,
     ToolInvocation,
@@ -185,6 +185,35 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
     }
 )
 _VT_PASSIVE_READ_TOOLS = _VT_COORDINATED_READ_TOOLS - {"vt.download_sample"}
+_VT_RECONCILIATION_OUTCOMES = frozenset(
+    {
+        InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+    }
+)
+_VT_RECONCILIATION_WITHOUT_RESULT = frozenset(
+    {
+        InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+        InvocationReconciliationOutcome.NOT_EXECUTED,
+    }
+)
+_RECONCILIATION_INTERPRETATIONS = {
+    InvocationReconciliationOutcome.EXECUTED_WITH_RESULT: "verified_result",
+    InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE: "verified_empty_response",
+    InvocationReconciliationOutcome.TRANSPORT_ERROR: "transport_error",
+    InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN: "external_result_unknown",
+    InvocationReconciliationOutcome.RESULT_UNAVAILABLE: "result_unavailable",
+    InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT: "reconciled_without_result",
+    InvocationReconciliationOutcome.NOT_EXECUTED: "not_executed",
+    InvocationReconciliationOutcome.ABANDON: "abandoned",
+}
 _VT_HASH_READ_TOOLS = frozenset(
     {"vt.file_report", "vt.relationships", "vt.behaviour", "vt.behaviour_pcap"}
 )
@@ -197,14 +226,38 @@ _VT_HASH_NOT_GROUNDED_CORRECTION = (
 )
 
 
-class InvocationReconciliationOutcome(StrEnum):
-    EXECUTED_WITH_RESULT = "executed_with_result"
-    NOT_EXECUTED = "not_executed"
-    ABANDON = "abandon"
-
-
 class _BudgetSnapshotPersistenceError(RuntimeError):
     """Envelope and normalized budget could not be persisted atomically."""
+
+
+def _reconciled_invocation_status(outcome: InvocationReconciliationOutcome) -> ToolInvocationStatus:
+    if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
+        return ToolInvocationStatus.SUCCEEDED
+    if outcome is InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE:
+        return ToolInvocationStatus.EMPTY
+    if outcome in {
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+    }:
+        return ToolInvocationStatus.NEEDS_REVIEW
+    if outcome in {
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+    }:
+        return ToolInvocationStatus.UNAVAILABLE
+    return ToolInvocationStatus.FAILED
+
+
+def _reconciliation_outcome_may_have_executed(outcome: InvocationReconciliationOutcome) -> bool:
+    return outcome in {
+        InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+        InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+        InvocationReconciliationOutcome.ABANDON,
+    }
 
 
 class ToolObservationWriter(Protocol):
@@ -3317,46 +3370,66 @@ class InvestigationService:
         invocation = await self._invocations.get(invocation_id)
         if invocation is None or invocation.investigation_id != investigation_id:
             raise LookupError("Tool invocation does not belong to the investigation")
+        passive_vt_read = invocation.tool_name in VT_PASSIVE_RETRY_TOOL_NAMES
         if actor_provenance is not None and invocation.tool_name not in VT_PASSIVE_RETRY_TOOL_NAMES:
             raise ValueError("Operator-client reconciliation is limited to passive VT reads")
+        if outcome in _VT_RECONCILIATION_OUTCOMES and not passive_vt_read:
+            raise ValueError("This reconciliation outcome is limited to passive VT reads")
         refs = await self._valid_observation_refs(investigation_id, tuple(response_refs))
         if len(refs) != len(set(response_refs)):
             raise ValueError("Reconciliation response references must exist in this investigation")
         if outcome is not InvocationReconciliationOutcome.EXECUTED_WITH_RESULT and refs:
             raise ValueError("Only executed_with_result may attach response references")
+        if passive_vt_read and outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
+            if actor_provenance == "operator_client" and not invocation.response_refs:
+                raise ValueError("Passive VT response has no persisted result to reconcile")
+            if not refs:
+                raise ValueError(
+                    "Passive VT executed_with_result requires persisted result references"
+                )
+            for ref in refs:
+                observation = await self._observations.get(ref)
+                if (
+                    observation is None
+                    or observation.investigation_id != investigation_id
+                    or observation.invocation_ref != invocation.id
+                ):
+                    raise ValueError(
+                        "Passive VT response references must belong to this invocation"
+                    )
+        if (
+            passive_vt_read
+            and outcome in _VT_RECONCILIATION_WITHOUT_RESULT
+            and invocation.response_refs
+        ):
+            if outcome is InvocationReconciliationOutcome.NOT_EXECUTED:
+                raise ValueError(
+                    "A persisted passive VT response cannot be reconciled as not_executed"
+                )
+            raise ValueError(
+                "A persisted passive VT response cannot be reconciled without its data"
+            )
         if actor_provenance == "operator_client":
             if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
-                if not invocation.response_refs:
-                    raise ValueError("Passive VT response has no persisted result to reconcile")
                 if not refs or not set(refs).issubset(invocation.response_refs):
                     raise ValueError(
                         "Passive VT reconciliation must use persisted response references"
                     )
-                for ref in refs:
-                    observation = await self._observations.get(ref)
-                    if (
-                        observation is None
-                        or observation.investigation_id != investigation_id
-                        or observation.invocation_ref != invocation.id
-                    ):
-                        raise ValueError(
-                            "Passive VT response references must belong to this invocation"
-                        )
-            elif (
-                outcome is InvocationReconciliationOutcome.NOT_EXECUTED and invocation.response_refs
-            ):
-                raise ValueError(
-                    "A persisted passive VT response cannot be reconciled as not_executed"
-                )
         if self._audit_decisions is None:
             raise RuntimeError("Invocation reconciliation audit repository is unavailable")
 
         details: dict[str, Any] = {
             "outcome": outcome.value,
+            "result_interpretation": _RECONCILIATION_INTERPRETATIONS[outcome],
             "invocation_id": str(invocation.id),
             "operation_key": invocation.operation_key,
             "response_refs": [str(item) for item in refs],
         }
+        if passive_vt_read and outcome in _VT_RECONCILIATION_WITHOUT_RESULT:
+            details["finding_created"] = False
+            details["negative_evidence_created"] = False
+        if _reconciliation_outcome_may_have_executed(outcome):
+            details["budget_settlement"] = "committed_conservatively"
         # An operator abandon keeps the invocation's persisted provider response
         # linked for audit; only attached (executed) references are ever new.
         retained_refs = (
@@ -3394,7 +3467,11 @@ class InvestigationService:
             investigation_id=investigation_id,
             decision_type=(
                 AnalystDecisionType.PIVOT_APPROVE
-                if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
+                if outcome
+                in {
+                    InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+                    InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+                }
                 else AnalystDecisionType.PIVOT_REJECT
             ),
             target_type=AnalystDecisionTargetType.TOOL,
@@ -3411,11 +3488,7 @@ class InvestigationService:
         if prior is not None:
             if not _same_reconciliation_decision(prior, decision):
                 raise ValueError("Idempotency-Key already records another reconciliation")
-            expected_status = (
-                ToolInvocationStatus.SUCCEEDED
-                if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
-                else ToolInvocationStatus.FAILED
-            )
+            expected_status = _reconciled_invocation_status(outcome)
             if (
                 invocation.status is not expected_status
                 or invocation.response_refs != retained_refs
@@ -3444,20 +3517,15 @@ class InvestigationService:
             if reservation is not None:
                 # A client-declared "not executed" is not proof: settle the reservation
                 # as consumed so that a later read can never be silently unaccounted.
-                if actor_provenance is not None or outcome in {
-                    InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
-                    InvocationReconciliationOutcome.ABANDON,
-                }:
+                if actor_provenance is not None or _reconciliation_outcome_may_have_executed(
+                    outcome
+                ):
                     envelope.budget.commit(invocation.operation_key)
                     consumed = dict(invocation.reserved_budget)
                 else:
                     envelope.budget.release(invocation.operation_key)
 
-        status = (
-            ToolInvocationStatus.SUCCEEDED
-            if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
-            else ToolInvocationStatus.FAILED
-        )
+        status = _reconciled_invocation_status(outcome)
         resolved = replace(
             invocation,
             status=status,
