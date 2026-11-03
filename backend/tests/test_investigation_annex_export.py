@@ -1,0 +1,466 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+from pathlib import Path
+from typing import cast
+from uuid import uuid4
+
+import pytest
+
+from cti_app.application.investigation_annex_export import (
+    AnnexAsset,
+    InvestigationAnnexSnapshot,
+    write_investigation_annex,
+)
+
+
+def _read_manifest(directory: Path) -> dict[str, object]:
+    raw = (directory / "manifest.json").read_bytes()
+    expected = (directory / "manifest.sha256").read_text(encoding="ascii").split()[0]
+    assert hashlib.sha256(raw).hexdigest() == expected
+    return cast(dict[str, object], json.loads(raw))
+
+
+def _file_bytes(directory: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def _assert_manifest_files(directory: Path, manifest: dict[str, object]) -> None:
+    files = manifest["files"]
+    assert isinstance(files, list)
+    for entry in files:
+        path = directory / entry["path"]
+        content = path.read_bytes()
+        assert hashlib.sha256(content).hexdigest() == entry["sha256"]
+        assert len(content) == entry["size_bytes"]
+
+
+def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    candidate_id = str(uuid4())
+    v1 = ('rule first { strings: $a = "first" condition: $a }\n' + "// v1\n" * 2_000).encode()
+    v2 = ('rule second { strings: $a = "second" condition: $a }\n' + "// v2\n" * 2_500).encode()
+    suricata = (
+        'alert tls any any -> any any (msg:"Example"; tls.sni; content:"example.test"; '
+        "sid:9900001; rev:1;)\n" + "# preserved\n" * 1_800
+    ).encode()
+    report = json.dumps({"schema": "test.v1", "cases": ["x" * 256] * 300}).encode()
+    assets = (
+        AnnexAsset(
+            canonical_id="yara-v2",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            version=2,
+            sha256=hashlib.sha256(v2).hexdigest(),
+            source="detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            references=(candidate_id, "yara-report"),
+            content=v2,
+            metadata={
+                "candidate_id": candidate_id,
+                "candidate_status": "experimental",
+                "author": None,
+                "author_status": "not_recorded_in_canonical_candidate",
+                "rule_kind": "yara",
+                "test_refs": ("case-2",),
+            },
+        ),
+        AnnexAsset(
+            canonical_id="yara-v1",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            version=1,
+            sha256=hashlib.sha256(v1).hexdigest(),
+            source="detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            references=(candidate_id,),
+            content=v1,
+            metadata={
+                "candidate_id": candidate_id,
+                "candidate_status": "candidate",
+                "author_status": "not_recorded_in_canonical_candidate",
+                "rule_kind": "yara",
+                "test_refs": ("case-1",),
+            },
+        ),
+        AnnexAsset(
+            canonical_id="suricata-v1",
+            type="suricata_rule",
+            investigation_id=investigation_id,
+            version=1,
+            sha256=hashlib.sha256(suricata).hexdigest(),
+            source="advisor_call_payload.output.rule_source",
+            origin="advisor.consult:suricata_draft",
+            references=("suricata-observation",),
+            content=suricata,
+            metadata={
+                "candidate_status": "experimental",
+                "rule_kind": "suricata",
+                "rule_syntax_validation": "not_tested",
+                "replay_status": "not_tested",
+            },
+        ),
+        AnnexAsset(
+            canonical_id="yara-report",
+            type="yara_test_report",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(report).hexdigest(),
+            source="AutoWork RuleWorkbench",
+            origin="detection_candidate_version",
+            references=("yara-v1", "yara-v2", "case-1", "case-2"),
+            content=report,
+            metadata={"status": "ONE_RULE_NOT_VALIDATED", "rule_kind": "yara"},
+        ),
+    )
+    snapshot = InvestigationAnnexSnapshot(investigation_id, assets)
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    write_investigation_annex(snapshot, first)
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(investigation_id, tuple(reversed(assets))), second
+    )
+
+    assert _file_bytes(first) == _file_bytes(second)
+    assert (first / "yara/candidate-001-v1.yar").read_bytes() == v1
+    assert (first / "yara/candidate-001-v2.yar").read_bytes() == v2
+    assert (first / "suricata/candidate-001-v1.rules").read_bytes() == suricata
+    assert (first / "yara/tests/report-001.json").read_bytes() == report
+    manifest = _read_manifest(first)
+    objects = manifest["objects"]
+    assert isinstance(objects, list)
+    rules = [item for item in objects if item["type"] == "yara_rule"]
+    assert [item["version"] for item in rules] == [1, 2]
+    assert [item["sha256"] for item in rules] == [
+        hashlib.sha256(v1).hexdigest(),
+        hashlib.sha256(v2).hexdigest(),
+    ]
+    assert all(item["origin"] == "canonical_detection_candidate_versions" for item in rules)
+    assert all("author_status" in item["metadata"] for item in rules)
+    assert b"case-1" in (first / "yara/tests/index.json").read_bytes()
+    _assert_manifest_files(first, manifest)
+
+
+def test_default_export_omits_all_restricted_bytes_and_records_policy(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    sample_bytes = bytes(range(256)) * 64
+    capture_bytes = b"\xd4\xc3\xb2\xa1" + bytes(range(255)) * 128
+    note = b'{"host":"sensitive.example","status":"documented_not_observed"}'
+    figure = b'<svg xmlns="http://www.w3.org/2000/svg"><text>restricted figure</text></svg>'
+    assets = (
+        AnnexAsset(
+            canonical_id="sample-id",
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(sample_bytes).hexdigest(),
+            source="samples+blobs",
+            origin="source_seed",
+            content=sample_bytes,
+            metadata={
+                "archive_export_allowed": True,
+                "external_llm_allowed": True,
+                "license_restriction_present": False,
+                "origin_kind": "source_seed",
+                "sample_state": "validated",
+                "tlp": "amber",
+            },
+        ),
+        AnnexAsset(
+            canonical_id="capture-id",
+            type="network_capture",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(capture_bytes).hexdigest(),
+            source="evidence_observations.blob_id",
+            origin="network.quarantine",
+            content=capture_bytes,
+            metadata={"archive_export_allowed": True, "external_llm_allowed": True, "tlp": "amber"},
+        ),
+        AnnexAsset(
+            canonical_id="note-id",
+            type="protocol_note",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(note).hexdigest(),
+            source="protocol_model_blob",
+            origin="canonical_evidence_observation",
+            content=note,
+            filename="protocol-note.json",
+            metadata={"archive_export_allowed": True, "status": "documented_not_observed"},
+        ),
+        AnnexAsset(
+            canonical_id="figure-id",
+            type="technical_figure",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(figure).hexdigest(),
+            source="media_assets+blobs",
+            origin="analyst_opinion.protocol_figures",
+            content=figure,
+            filename="opinion-figure.svg",
+            metadata={"archive_export_allowed": True, "figure_kind": "message_flow"},
+        ),
+    )
+    output = tmp_path / "public"
+    write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, assets), output)
+
+    all_content = b"\n".join(_file_bytes(output).values())
+    assert sample_bytes not in all_content
+    assert capture_bytes not in all_content
+    assert note not in all_content
+    assert figure not in all_content
+    assert not list(output.rglob("*.bin"))
+    assert not list(output.rglob("*.pcap"))
+    assert not list(output.rglob("*.svg"))
+    manifest = _read_manifest(output)
+    restricted = [
+        item
+        for item in manifest["objects"]
+        if item["type"] in {"sample", "network_capture", "protocol_note", "technical_figure"}
+    ]
+    assert len(restricted) == 4
+    assert all(item["availability"] == "restricted" for item in restricted)
+    assert all(
+        "explicit_restricted_archive_flag_required" in item["restrictions"] for item in restricted
+    )
+
+
+def test_restricted_archive_requires_explicit_flag_and_policy_eligibility(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    allowed = b"sample bytes behind policy gate"
+    denied = b"license-restricted sample bytes"
+    capture = b"sensitive capture bytes"
+    figure = b'<svg xmlns="http://www.w3.org/2000/svg"><text>canonical</text></svg>'
+    assets = (
+        AnnexAsset(
+            canonical_id="allowed",
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(allowed).hexdigest(),
+            source="samples+blobs",
+            origin="vt_seed",
+            content=allowed,
+            metadata={"archive_export_allowed": True, "external_llm_allowed": True},
+        ),
+        AnnexAsset(
+            canonical_id="denied",
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(denied).hexdigest(),
+            source="samples+blobs",
+            origin="manual",
+            content=denied,
+            restrictions=(
+                "sample_license_restricted",
+                "sample_external_llm_not_allowed",
+                "tlp_red",
+                "sample_rejected_or_revoked",
+            ),
+            metadata={"archive_export_allowed": False, "external_llm_allowed": False},
+        ),
+        AnnexAsset(
+            canonical_id="capture",
+            type="network_capture",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(capture).hexdigest(),
+            source="network.quarantine",
+            origin="network.quarantine",
+            content=capture,
+            metadata={"archive_export_allowed": True, "external_llm_allowed": True},
+        ),
+        AnnexAsset(
+            canonical_id="figure",
+            type="technical_figure",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(figure).hexdigest(),
+            source="media_assets+blobs",
+            origin="analyst_opinion.protocol_figures",
+            content=figure,
+            filename="opinion-figure.svg",
+            metadata={"archive_export_allowed": True, "figure_kind": "message_flow"},
+        ),
+    )
+    output = tmp_path / "restricted"
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(investigation_id, assets),
+        output,
+        include_restricted_archive=True,
+    )
+
+    assert (
+        output / "samples/restricted/" / f"{hashlib.sha256(allowed).hexdigest()}.bin"
+    ).read_bytes() == allowed
+    assert (
+        output / "network/restricted/captures/" / f"{hashlib.sha256(capture).hexdigest()}.pcap"
+    ).read_bytes() == capture
+    assert (output / "technical/figures/restricted/opinion-figure.svg").read_bytes() == figure
+    assert not list(output.glob("samples/restricted/*license*"))
+    for path in output.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(output).as_posix()
+        expected_mode = (
+            0o400
+            if relative.startswith(("samples/restricted/", "network/restricted/captures/"))
+            else 0o600
+        )
+        assert path.stat().st_mode & 0o777 == expected_mode
+    manifest = _read_manifest(output)
+    denied_entry = next(item for item in manifest["objects"] if item["canonical_id"] == "denied")
+    assert denied_entry["availability"] == "restricted"
+    assert "canonical_policy_denied" in denied_entry["restrictions"]
+    assert {
+        "sample_license_restricted",
+        "sample_external_llm_not_allowed",
+        "tlp_red",
+        "sample_rejected_or_revoked",
+    } <= set(denied_entry["restrictions"])
+
+
+def test_manifest_lists_missing_collections_and_verifies_generated_files(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    observation_id = str(uuid4())
+    assets = (
+        AnnexAsset(
+            canonical_id="candidate-without-test-report",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            version=1,
+            source="detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            content=b"rule candidate { condition: true }\n",
+            metadata={
+                "candidate_id": "candidate-identity",
+                "candidate_status": "candidate",
+                "rule_kind": "yara",
+                "test_refs": (),
+            },
+        ),
+        AnnexAsset(
+            canonical_id=observation_id,
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            sha256="a" * 64,
+            source="VirusTotal",
+            origin="file",
+            references=(observation_id,),
+            metadata={"ioc_type": "file", "value": "b" * 64, "relation": "observed"},
+        ),
+        AnnexAsset(
+            canonical_id="candidate",
+            type="discovered_sample",
+            investigation_id=investigation_id,
+            sha256="c" * 64,
+            source="VirusTotal",
+            origin="search_candidate",
+            metadata={
+                "value": "c" * 64,
+                "status": "not_acquired",
+                "origin_kind": "virustotal_observation",
+                "qualification": "unknown",
+                "relation": "virustotal_candidate_not_family_proof",
+                "pivot_criteria": "canonical_virustotal_summary_candidate",
+            },
+        ),
+    )
+    output = tmp_path / "empty-rules"
+    write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, assets), output)
+
+    manifest = _read_manifest(output)
+    _assert_manifest_files(output, manifest)
+    objects = manifest["objects"]
+    assert isinstance(objects, list)
+    absent = {item["type"] for item in objects if item["availability"] == "absent"}
+    assert {"yara_test_report", "suricata_rule", "suricata_test_report"} <= absent
+    yara_index = json.loads((output / "yara/tests/index.json").read_bytes())
+    assert yara_index[0]["test_report_ids"] == []
+    with (output / "iocs/observed-iocs.csv").open(encoding="utf-8", newline="") as stream:
+        ioc_rows = list(csv.DictReader(stream))
+    assert ioc_rows == [
+        {
+            "type": "file",
+            "value": "b" * 64,
+            "observation_id": observation_id,
+            "source": "VirusTotal",
+            "observation_sha256": "a" * 64,
+            "relation": "observed",
+        }
+    ]
+    with (output / "iocs/discovered-samples.csv").open(encoding="utf-8", newline="") as stream:
+        discovered = list(csv.DictReader(stream))
+    assert discovered[0]["relation"] == "virustotal_candidate_not_family_proof"
+    assert "family" not in discovered[0]["relation"].replace("not_family_proof", "")
+
+
+def test_hostile_names_are_sanitized_and_collisions_are_disambiguated(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    first = b"first protocol note"
+    second = b"second protocol note"
+    assets = (
+        AnnexAsset(
+            canonical_id="protocol-1",
+            type="protocol_note",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(first).hexdigest(),
+            source="protocol_model_blob",
+            origin="canonical_evidence_observation",
+            content=first,
+            filename="../../../../same.json",
+            metadata={"archive_export_allowed": True},
+        ),
+        AnnexAsset(
+            canonical_id="protocol-2",
+            type="protocol_note",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(second).hexdigest(),
+            source="protocol_model_blob",
+            origin="canonical_evidence_observation",
+            content=second,
+            filename="../same.json",
+            metadata={"archive_export_allowed": True},
+        ),
+    )
+    output = tmp_path / "hostile"
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(investigation_id, assets),
+        output,
+        include_restricted_archive=True,
+    )
+
+    note_paths = sorted((output / "network/protocol-notes/restricted").glob("*.json"))
+    assert len(note_paths) == 2
+    assert len({path.name for path in note_paths}) == 2
+    assert sorted(path.read_bytes() for path in note_paths) == sorted((first, second))
+    assert not (tmp_path / "same.json").exists()
+
+
+def test_destination_is_not_overwritten_without_explicit_flag(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    snapshot = InvestigationAnnexSnapshot(investigation_id)
+    replacement_snapshot = InvestigationAnnexSnapshot(
+        investigation_id,
+        (
+            AnnexAsset(
+                canonical_id="new-ioc",
+                type="observed_ioc",
+                investigation_id=investigation_id,
+                source="canonical_observation",
+                origin="test",
+                metadata={"ioc_type": "domain", "value": "new.example"},
+            ),
+        ),
+    )
+    destination = tmp_path / "export"
+    write_investigation_annex(snapshot, destination)
+    before = _file_bytes(destination)
+
+    with pytest.raises(FileExistsError):
+        write_investigation_annex(replacement_snapshot, destination)
+    assert _file_bytes(destination) == before
+    write_investigation_annex(replacement_snapshot, destination, overwrite=True)
+    assert _file_bytes(destination) != before
+    manifest = _read_manifest(destination)
+    assert any(item["canonical_id"] == "new-ioc" for item in manifest["objects"])
