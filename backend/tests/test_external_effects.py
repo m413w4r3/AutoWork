@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import importlib
+import json
 import pickle
 import time
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ExternalEffectCoordinator,
     ExternalEffectReusePolicy,
+    ExternalObservationHashPolicy,
     HandoffGateRefused,
     NoSubmissionProofKind,
     PhysicalSendCapability,
@@ -39,7 +41,10 @@ from cti_app.application.external_effects import (
     _PermitRegistry,
     bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
+    external_observation_hash_policy,
     osint_vt_search_may_cite_unassociated_observation_hash,
+    resolve_bridge_vt_file_report_sha256,
+    validate_external_observation_hash,
 )
 from cti_app.application.model_gateway import BridgeExternalEffectBinding
 from cti_app.domain.external_effects import (
@@ -2314,6 +2319,100 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
 
 
 @pytest.mark.asyncio
+async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls() -> None:
+    md5 = "a" * 32
+    sha1 = "b" * 40
+    sha256 = "c" * 64
+    report_content = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": md5,
+                "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
+            }
+        }
+    ).encode()
+    observation_id = uuid4()
+    observation_sha256 = hashlib.sha256(report_content).hexdigest()
+    observation = SimpleNamespace(
+        id=observation_id,
+        source="VirusTotal",
+        source_version="vt.v3",
+        sha256=observation_sha256,
+        object_type="file",
+        object_id=md5,
+    )
+    reference = EvidenceReference(
+        "evidence_observation", str(observation_id), "vt.v3", observation_sha256
+    )
+    prepared = PreparedExternalRequest.build(
+        family="advisor.consultation.v1",
+        provider="bridge",
+        provider_scope="bridge.responses",
+        normalizer_version="1",
+        canonical_request={"test": "md5-report"},
+        application_request=_wire(target=b"/v1/responses", body=b"{}"),
+        evidence_refs=(reference,),
+    )
+    subject_id = uuid4()
+    sample = SimpleNamespace(
+        id=uuid4(),
+        subject_id=subject_id,
+        blob_id=uuid4(),
+        expected_hash=sha256,
+        source_object_id=None,
+        tlp="CLEAR",
+        external_llm_allowed=False,
+        do_not_submit=True,
+        license_restriction=None,
+    )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.resolved_sha256_was_queried = False
+            self.report_sample_populate_existing = False
+
+        async def scalars(self, statement):
+            self.calls += 1
+            if self.calls == 1:
+                return [observation]
+            if self.calls == 2:
+                params = repr(statement.compile().params)
+                self.resolved_sha256_was_queried = sha256 in params
+                self.report_sample_populate_existing = (
+                    statement.get_execution_options().get("populate_existing") is True
+                )
+                return [sample] if self.resolved_sha256_was_queried else []
+            return []
+
+        async def scalar(self, _statement):
+            raise AssertionError("The matching expected_hash already names the report sample")
+
+    store = SqlAlchemyExternalEffectClaimStore(lambda: None)  # type: ignore[arg-type]
+    authority = _authority()
+    binding = ExternalEffectFamilyBinding(
+        provider="bridge",
+        provider_scopes=frozenset({"bridge.responses"}),
+        normalizer_versions=frozenset({"1"}),
+        invocation_tool_binding=None,
+        model_submission=True,
+    )
+    session = _Session()
+    with pytest.raises(_ConsumeDenied, match="sample_source_restricted"):
+        await store._check_source_restrictions(
+            session,  # type: ignore[arg-type]
+            authority,
+            prepared,
+            subject_id,
+            binding,
+            report_blob_contents={observation_id: report_content},
+        )
+    assert session.resolved_sha256_was_queried
+    assert session.report_sample_populate_existing
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("policy", [True, False])
 async def test_consume_allows_unassociated_vt_hash_only_under_osint_policy(policy: bool) -> None:
     arbitrary_hash = "d" * 64
@@ -3146,3 +3245,107 @@ def test_only_bridge_may_cite_a_provider_report_without_an_acquired_sample(
         )
         is expected
     )
+
+
+def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -> None:
+    md5 = "a" * 32
+    sha1 = "b" * 40
+    sha256 = "c" * 64
+    report = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": md5,
+                "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
+            }
+        }
+    ).encode()
+
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=report,
+        )
+        == sha256
+    )
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=report.replace(md5.encode(), b"d" * 32, 1),
+        )
+        is None
+    )
+
+    sha1_report = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": sha1,
+                "attributes": {"md5": md5, "sha1": sha1, "sha256": sha256},
+            }
+        }
+    ).encode()
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha1,
+            report_content=sha1_report,
+        )
+        == sha256
+    )
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=b"not-json",
+        )
+        is None
+    )
+
+
+def test_bridge_provider_short_hash_is_validated_as_raw_ascii_lower_hex() -> None:
+    policy = external_observation_hash_policy(
+        family="advisor.consultation.v1", source="VirusTotal", object_type="file"
+    )
+    assert policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT
+    assert validate_external_observation_hash("a" * 32, policy) == "a" * 32
+    assert validate_external_observation_hash("A" * 32, policy) is None
+    assert validate_external_observation_hash("\ufb00" + "a" * 30, policy) is None
+
+
+@pytest.mark.parametrize("object_type", ["md5", "sha1"])
+def test_bridge_hash_object_types_without_report_contract_are_explicitly_rejected(
+    object_type: str,
+) -> None:
+    assert (
+        external_observation_hash_policy(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type=object_type,
+        )
+        is ExternalObservationHashPolicy.REJECT
+    )
+
+
+def test_bridge_short_provider_hash_policy_requires_exact_virustotal_source() -> None:
+    assert (
+        external_observation_hash_policy(
+            family="advisor.consultation.v1", source="VirusTotal", object_type="file"
+        )
+        is ExternalObservationHashPolicy.VT_PROVIDER_REPORT
+    )
+    policy = external_observation_hash_policy(
+        family="advisor.consultation.v1", source="virustotal", object_type="file"
+    )
+    assert policy is ExternalObservationHashPolicy.SHA256
+    assert validate_external_observation_hash("a" * 32, policy) is None

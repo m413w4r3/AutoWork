@@ -261,7 +261,9 @@ async def _execute_job(job_id: UUID) -> int | None:
             vt_capabilities,
         )
         production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
-        external_effect_coordinator = create_external_effect_coordinator(session_factory)
+        external_effect_coordinator = create_external_effect_coordinator(
+            session_factory, blob_store=blob_store
+        )
         model_gateway = create_model_gateway(settings, uow_factory)
         # Exactly one bridge capabilities provider for this worker execution
         # context; it also doubles as the ConversationSessionCloser that

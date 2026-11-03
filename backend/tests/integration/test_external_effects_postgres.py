@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from alembic import command
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -51,6 +51,7 @@ from cti_app.application.model_gateway import (
 from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.config import Settings
+from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.external_effects import (
     EffectClaimState,
     EvidenceReference,
@@ -335,6 +336,24 @@ class _PreConsumeFailureStore:
         return getattr(self._delegate, name)
 
 
+class _MemoryBlobStore:
+    """Offline verified blob reader for the Bridge source-policy tests."""
+
+    def __init__(self) -> None:
+        self._content: dict[str, bytes] = {}
+
+    def add(self, descriptor: BlobDescriptor, content: bytes) -> None:
+        self._content[descriptor.sha256] = content
+
+    async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
+        content = self._content[descriptor.sha256]
+        if len(content) != descriptor.size or len(content) > max_bytes:
+            raise ValueError("test blob descriptor mismatch")
+        if hashlib.sha256(content).hexdigest() != descriptor.sha256:
+            raise ValueError("test blob SHA-256 mismatch")
+        return content
+
+
 async def _prepare_case(
     database_url: str,
     tmp_path: Path,
@@ -539,6 +558,7 @@ async def _prepare_model_submission_case(
     suffix: str,
     persisted_request_id: str = "bridge-request-1",
     claimed_request_id: str | None = None,
+    blob_store: Any = None,
 ) -> tuple[
     async_sessionmaker[AsyncSession],
     AsyncEngine,
@@ -674,6 +694,7 @@ async def _prepare_model_submission_case(
     )
     store = SqlAlchemyExternalEffectClaimStore(
         session_factory,
+        blob_store=blob_store,
         family_bindings={
             prepared.family: ExternalEffectFamilyBinding(
                 provider="bridge",
@@ -2454,10 +2475,12 @@ def _store(
     policy_guard: Any = None,
     credential_parameter_names: frozenset[str] = frozenset(),
     model_submission: bool = False,
+    blob_store: Any = None,
 ) -> SqlAlchemyExternalEffectClaimStore:
     return SqlAlchemyExternalEffectClaimStore(
         session_factory,
         policy_guard=policy_guard,
+        blob_store=blob_store,
         family_bindings={
             _FAMILY: ExternalEffectFamilyBinding(
                 provider=_PROVIDER,
@@ -4014,6 +4037,10 @@ async def _seed_bridge_report_case(
     observation_source: str,
     sample_flags: dict[str, Any] | None,
     lineage: str = "blob",
+    canonical_sample_sha256: str | None = None,
+    report_content: bytes | None = None,
+    blob_store: _MemoryBlobStore | None = None,
+    object_type: str = "file",
 ) -> EvidenceReference:
     """Persist a file observation (and optionally a subject sample) for a Bridge citation.
 
@@ -4021,13 +4048,57 @@ async def _seed_bridge_report_case(
     its ``expected_hash`` / ``source_object_id`` while the blob has another digest.
     """
     observation_id = uuid4()
-    observation_sha256 = "e" * 64
+    if canonical_sample_sha256 is None:
+        canonical_sample_sha256 = report_hash if len(report_hash) == 64 else "f" * 64
+    if report_content is None:
+        md5 = report_hash if len(report_hash) == 32 else "a" * 32
+        sha1 = report_hash if len(report_hash) == 40 else "b" * 40
+        report_content = json.dumps(
+            {
+                "data": {
+                    "type": "file",
+                    "id": report_hash,
+                    "attributes": {
+                        "md5": md5,
+                        "sha1": sha1,
+                        "sha256": canonical_sample_sha256,
+                    },
+                }
+            }
+        ).encode()
+    observation_sha256 = hashlib.sha256(report_content).hexdigest()
+    report_descriptor = BlobDescriptor(
+        sha256=observation_sha256,
+        size=len(report_content),
+        mime_type="application/json",
+        logical_bucket="evidence",
+    )
+    if blob_store is not None:
+        blob_store.add(report_descriptor, report_content)
     async with session_factory() as session:
         async with session.begin():
-            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
-            assert blob is not None
+            blob = await session.scalar(
+                select(BlobRow).where(
+                    BlobRow.logical_bucket == report_descriptor.logical_bucket,
+                    BlobRow.sha256 == report_descriptor.sha256,
+                )
+            )
+            if blob is None:
+                blob = BlobRow(
+                    id=uuid4(),
+                    sha256=report_descriptor.sha256,
+                    size=report_descriptor.size,
+                    mime_type=report_descriptor.mime_type,
+                    logical_bucket=report_descriptor.logical_bucket,
+                    object_key=report_descriptor.object_key,
+                    created_at=datetime.now(UTC),
+                )
+                session.add(blob)
+                await session.flush()
             if sample_flags is not None:
-                blob_sha256 = report_hash if lineage == "blob" else uuid4().hex + uuid4().hex
+                blob_sha256 = (
+                    canonical_sample_sha256 if lineage == "blob" else uuid4().hex + uuid4().hex
+                )
                 sample_blob = BlobRow(
                     id=uuid4(),
                     sha256=blob_sha256,
@@ -4054,8 +4125,12 @@ async def _seed_bridge_report_case(
                         origin_kind="manual",
                         state="quarantined",
                         source_service=None,
-                        source_object_id=report_hash if lineage == "source_object_id" else None,
-                        expected_hash=report_hash if lineage == "expected_hash" else None,
+                        source_object_id=(
+                            canonical_sample_sha256 if lineage == "source_object_id" else None
+                        ),
+                        expected_hash=(
+                            canonical_sample_sha256 if lineage == "expected_hash" else None
+                        ),
                         validation_actor=None,
                         validation_date=None,
                         validation_reason=None,
@@ -4084,7 +4159,7 @@ async def _seed_bridge_report_case(
                     source=observation_source,
                     source_version="report-v1",
                     observed_at=datetime.now(UTC),
-                    object_type="file",
+                    object_type=object_type,
                     object_id=report_hash,
                     limitations=[],
                     invocation_ref=None,
@@ -4290,7 +4365,9 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
     observation_id = uuid4()
+    canonical_sample_sha256 = "d" * 64
     try:
         # These are the values emitted by the VT file-report recorder.
         reference = await _seed_bridge_report_case(
@@ -4301,6 +4378,8 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
             observation_source="VirusTotal",
             sample_flags=sample_flags,
             lineage=lineage,
+            canonical_sample_sha256=canonical_sample_sha256,
+            blob_store=blob_store,
         )
         observation_id = UUID(reference.id)
         prepared = _bridge_prepared(reference)
@@ -4311,12 +4390,18 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
             invocation_tool_binding=None,
             model_submission=True,
         )
-        store = _store(session_factory, model_submission=True)
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        report_blob_contents = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
         async with session_factory() as session:
             async with session.begin():
                 try:
                     await store._check_source_restrictions(
-                        session, authority, prepared, subject_id, binding
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        binding,
+                        report_blob_contents=report_blob_contents,
                     )
                     refused: _ConsumeDenied | None = None
                 except _ConsumeDenied as exc:
@@ -4332,6 +4417,80 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
             assert "h=32" in refused.detail
             assert "drop_ref_or_cite_sha256" in refused.detail
             assert "c" * 32 not in refused.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_md5_policy_reloads_sample_tlp_between_consume_checks_and_replays_refusal(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
+    canonical_sample_sha256 = "d" * 64
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash="c" * 32,
+            observation_source="VirusTotal",
+            sample_flags={"external_llm_allowed": True},
+            lineage="expected_hash",
+            canonical_sample_sha256=canonical_sample_sha256,
+            blob_store=blob_store,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        report_blob_contents = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        async with session_factory() as session:
+            sample_id = await session.scalar(
+                select(SampleRow.id).where(SampleRow.expected_hash == canonical_sample_sha256)
+            )
+        assert sample_id is not None
+
+        # Keep the first sample ORM instance in the identity map across commits.
+        async with session_factory() as session:
+            async with session.begin():
+                await store._check_source_restrictions(
+                    session,
+                    authority,
+                    prepared,
+                    subject_id,
+                    binding,
+                    report_blob_contents=report_blob_contents,
+                )
+            async with session_factory() as updater:
+                async with updater.begin():
+                    await updater.execute(
+                        update(SampleRow).where(SampleRow.id == sample_id).values(tlp="RED")
+                    )
+
+            for _attempt in range(2):
+                async with session.begin():
+                    with pytest.raises(_ConsumeDenied) as denied:
+                        await store._check_source_restrictions(
+                            session,
+                            authority,
+                            prepared,
+                            subject_id,
+                            binding,
+                            report_blob_contents=report_blob_contents,
+                        )
+                assert denied.value.reason == "sample_source_restricted"
+                assert denied.value.detail is not None
+                assert UUID(reference.id).hex in denied.value.detail
     finally:
         await engine.dispose()
 
@@ -4392,6 +4551,128 @@ async def test_bridge_rejects_malformed_vt_short_file_hash_with_safe_observation
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "report_state",
+    [
+        pytest.param("unreadable", id="ill-formed-json"),
+        pytest.param("incoherent", id="md5-does-not-match-object-id"),
+        pytest.param("missing", id="report-blob-unavailable"),
+    ],
+)
+async def test_bridge_refuses_md5_when_vt_report_cannot_be_verified(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    report_state: str,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    md5 = "c" * 32
+    sha1 = "b" * 40
+    sha256 = "d" * 64
+    report_content = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": md5,
+                "attributes": {
+                    "md5": "e" * 32 if report_state == "incoherent" else md5,
+                    "sha1": sha1,
+                    "sha256": sha256,
+                },
+            }
+        }
+    ).encode()
+    if report_state == "unreadable":
+        report_content = b"not-json"
+    blob_store = None if report_state == "missing" else _MemoryBlobStore()
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=md5,
+            observation_source="VirusTotal",
+            sample_flags=None,
+            canonical_sample_sha256=sha256,
+            report_content=report_content,
+            blob_store=blob_store,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        report_blob_contents = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        async with session_factory() as session:
+            async with session.begin():
+                with pytest.raises(_ConsumeDenied) as denied:
+                    await store._check_source_restrictions(
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        binding,
+                        report_blob_contents=report_blob_contents,
+                    )
+        assert denied.value.reason == "unresolvable_evidence_observation_source"
+        assert denied.value.detail is not None
+        assert UUID(reference.id).hex in denied.value.detail
+        assert "t=file" in denied.value.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("object_type", ["md5", "sha1"])
+async def test_bridge_refuses_unplanned_md5_and_sha1_observation_types(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    object_type: str,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash="c" * 32,
+            observation_source="VirusTotal",
+            sample_flags=None,
+            object_type=object_type,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True)
+        async with session_factory() as session:
+            async with session.begin():
+                with pytest.raises(_ConsumeDenied) as denied:
+                    await store._check_source_restrictions(
+                        session, authority, prepared, subject_id, binding
+                    )
+        assert denied.value.reason == "unresolvable_evidence_observation_source"
+        assert denied.value.detail is not None
+        assert UUID(reference.id).hex in denied.value.detail
+        assert f"t={object_type}" in denied.value.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("sample_flags", "allowed"),
     [
         pytest.param({"external_llm_allowed": True}, True, id="owned-md5-bridge-consult-allowed"),
@@ -4406,6 +4687,7 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
     sample_flags: dict[str, Any],
     allowed: bool,
 ) -> None:
+    blob_store = _MemoryBlobStore()
     (
         session_factory,
         engine,
@@ -4415,7 +4697,10 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
         store,
         _run_id,
     ) = await _prepare_model_submission_case(
-        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+        migrated_postgres_url,
+        tmp_path,
+        suffix=uuid4().hex[:12],
+        blob_store=blob_store,
     )
     try:
         async with session_factory() as session:
@@ -4429,6 +4714,8 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
             observation_source="VirusTotal",
             sample_flags=sample_flags,
             lineage="expected_hash",
+            canonical_sample_sha256="d" * 64,
+            blob_store=blob_store,
         )
         prepared = replace(base_prepared, evidence_refs=(reference,))
         transport = _CountingTransport()
@@ -4448,6 +4735,12 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
             assert "drop_ref_or_cite_sha256" in outcome.reason
             assert "c" * 32 not in outcome.reason
             assert len(outcome.reason) <= 128
+            assert transport.calls == 0
+            replayed = await ExternalEffectCoordinator(store).send_one(
+                authority, prepared, transport
+            )
+            assert isinstance(replayed, Refused), replayed
+            assert replayed.reason == outcome.reason
             assert transport.calls == 0
     finally:
         await engine.dispose()
