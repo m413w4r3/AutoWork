@@ -13,13 +13,14 @@ from typing import Any, cast
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select, text, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.external_effects import (
+    VIRUSTOTAL_OBSERVATION_SOURCE,
     ConsumeCommitted,
     ConsumePolicyContext,
     ConsumeRefused,
@@ -66,7 +67,12 @@ from cti_app.domain.external_effects import (
 )
 from cti_app.domain.investigation import BudgetReservationStatus
 from cti_app.domain.production import SampleAcquisitionDispatchState
-from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
+from cti_app.infrastructure.database.models.core import (
+    BlobRow,
+    SampleRow,
+    SourceDocumentRow,
+    SubjectRow,
+)
 from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectAcquisitionDispatchRow,
     ExternalEffectClaimRow,
@@ -124,8 +130,8 @@ def _observation_refusal_detail(observation: EvidenceObservationRow) -> str:
     object_id_length = len(object_id) if isinstance(object_id, str) else 0
     safe_length = str(object_id_length) if object_id_length <= 999 else "large"
     action = bridge_refusal_action_for_object_type(object_type)
-    # UUID.hex is the same identifier without hyphens. The compact fields keep
-    # the combined code within Bridge's 128-character refusal limit.
+    # The id field names the failing evidence_observation. UUID.hex and compact
+    # metadata keep the combined code within Bridge's 128-character refusal limit.
     return f"id={observation_id}:t={safe_type}:s={safe_source}:h={safe_length}:a={action}"
 
 
@@ -1729,6 +1735,16 @@ class SqlAlchemyExternalEffectClaimStore:
                     raise _ConsumeDenied("evidence_observation_version_mismatch")
                 object_type = observation.object_type.casefold()
                 observation_source = getattr(observation, "source", None)
+                if (
+                    is_bridge_submission
+                    and observation_source == VIRUSTOTAL_OBSERVATION_SOURCE
+                    and (object_type == "file" or observation.kind == "vt_file_report")
+                    and (observation.object_type != "file" or observation.kind != "vt_file_report")
+                ):
+                    raise _ConsumeDenied(
+                        "unresolvable_evidence_observation_source",
+                        detail=_observation_refusal_detail(observation),
+                    )
                 hash_policy = external_observation_hash_policy(
                     family=prepared.family,
                     source=observation_source,
@@ -1750,7 +1766,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         )
                     if hash_policy is ExternalObservationHashPolicy.VT_PROVIDER_REPORT and len(
                         normalized_observation_hash
-                    ) in {32, 40}:
+                    ) in {32, 40, 64}:
                         resolved_report = resolve_bridge_vt_file_report_hashes(
                             family=prepared.family,
                             source=observation_source,
@@ -1890,12 +1906,19 @@ class SqlAlchemyExternalEffectClaimStore:
         report_hash_samples: list[SampleRow] = []
         report_sample_blob_hashes: dict[UUID, str] = {}
         if provider_report_hashes:
-            # A report about a hash is not that hash's bytes, but any sample the subject
-            # already holds under it keeps its TLP, licence and external-model restrictions.
-            # Row locks cannot protect this hash lookup from phantom inserts. Hold a table
-            # SHARE lock through the consume transaction so an in-flight sample insert
-            # commits before the lookup, and later inserts wait until the check commits.
-            await session.execute(text("LOCK TABLE samples IN SHARE MODE"))
+            # A report is provider metadata, not acquired bytes. Lock only its subject and
+            # matching samples: the subject FOR UPDATE conflicts with the FK KEY SHARE taken
+            # by a concurrent sample insert, while the sample FOR UPDATE below serializes
+            # restriction/revocation updates. This keeps same-subject phantoms ordered without
+            # blocking sample writes for unrelated subjects through a table-level lock.
+            locked_subject = await session.scalar(
+                select(SubjectRow)
+                .where(SubjectRow.id == subject_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if locked_subject is None:
+                raise _ConsumeDenied("sample_subject_missing")
             report_hash_samples = list(
                 await session.scalars(
                     select(SampleRow)
