@@ -198,3 +198,34 @@ Principe demandé par l'utilisateur : ne plus envoyer à Bridge les échantillon
 | Limite | Aucun goodware/holdout |
 
 Aucune validation de production. Fusion de la PR #23, route PCAP, import goodware, plan de reset, mise en production : décisions de l'utilisateur.
+
+---
+
+# Cycle 5 — suppression des frictions Bridge, goodware (2026-11-03, soir)
+
+## 18. Directive utilisateur
+Fluidifier l'échange opérateur↔Bridge : à l'envoi, supprimer les contraintes sauf « envoyer les éléments pertinents avec la/les questions » (et les gardes explicites de `backend/AGENTS.md`) ; à la réception, parsing généreux et souple. Mémoire projet mise à jour (`feedback-simplify-remove-friction`).
+
+## 19. Goodware
+Tables et cache **vides** au départ ; les bases yarGen (`/home/nill/tools/yarGen/dbs`, 769 Mo) sont des **index de fréquences** (strings/opcodes/imphashes/exports), pas des binaires bénins : ils servent à juger la banalité des motifs ; mesurer les faux positifs d'une règle exige des **binaires bénins réels** importés avec le rôle `goodware` (aucun jeu fourni). Index v2 construit hors ligne : `.autowork-runs/m13-q1/goodware-index/v2` (2,0 Go, empreinte baseline `957dc73a…`), **non chargé en base**. Chantier `m13/goodware-loading` : `scripts/goodware_admin.py`, cibles Makefile `goodware-build|load|status`, WARNING + statut dans `/api/health/ready` si baseline absente. Lacune : `rule.propose_bridge` ne mesure pas la banalité des motifs.
+
+## 20. Chantiers de correction (branches fusionnées dans `bridge-simp/integration`)
+| Chantier | Contenu | Vérification orchestrateur |
+| --- | --- | --- |
+| `m13/goodware-loading` | procédure goodware | 102 tests |
+| `m13/checkpoint-no-nag` | skip tracé = checkpoint satisfait, checkpoint périmé adopté, `partial` ≠ échec répété | 39 échecs = base, 5 845 passés |
+| `m13/bridge-receive-tolerant` | import YARA depuis appel parent/lien de réponse, `partial` accepté, plusieurs règles, parsing souple des plans | 39 = base, 5 850 passés, PG 93 |
+| `m13/bridge-md5-citation` (`9fe23a90`) | citation à Bridge d'un rapport VT indexé par MD5/SHA-1 (lien vérifié au SHA-256 du rapport, restrictions des samples détenus, verrou SHARE) ; **5 itérations de correction**, 2 revues FAIL | PG 144 ×2, unitaires 39 = base |
+| `m13/bridge-ambiguous-submission` (`30d86ad8`) | échec post-émission = ambigu, réconciliation GET lecture seule, clé d'idempotence seulement en empreinte dans messages | 39 = base, PG 126 |
+
+Revues Luna xhigh : MD5 n°1 FAIL, n°2 FAIL ; soumission ambiguë n°1 FAIL ; **revues finales n°3 (MD5) et n°2 (ambiguë) lancées, verdict non reçu à la rédaction de ce paragraphe**.
+
+## 21. Intégration (HEAD `28202b7d`) — états rouges connus
+La fusion des cinq branches est propre (aucun conflit) mais révèle trois régressions inter-branches, **en cours de correction** :
+- Rejeu de candidate non idempotent depuis la fusion goodware (`candidate_id_already_exists_with_different_proposal`) : `tests/test_signature_bridge.py::test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate`, `tests/integration/test_rule_corpus_import_postgres.py::test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus`.
+- `tests/test_advisor_wire.py::test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers` (C09, fait [4] absent) : **régression du chantier dossier ciblé**, déjà déployée en `f1b32477` ; ce test ne s'exécute que dans le checkout principal (corpus Run12 git-ignoré).
+Les tests PostgreSQL hors ces deux restent verts (149 passés).
+Non déployé, non requalifié. Le déploiement courant reste `f1b32477`.
+
+## 22. Frictions restantes à traiter (inventaire vérifié, côté envoi)
+F1 (réservation de contexte : double construction du dossier, refus tardif ; option « ne plus refuser sur octets/tokens de contexte, mesurer seulement » : **décision utilisateur**), F4 (preflight « required »), F5 (références inconnues/doublons/jetons de revendication : abandonner l'élément et signaler plutôt que refuser), F6 (échantillons sans plage ciblée : omission observable au lieu de blocage : décision produit), F9 (pacing 20 s ±30 % : attendre plutôt que refuser). Gardes à conserver : TLP/external_llm_allowed, licence d'échantillon, credentials, révocation, idempotence, tours Bridge. À arbitrer : le code refuse aussi le TLP AMBER (`external_effects.py` ≈l.1160) alors que `backend/AGENTS.md` ne cite que RED ; le filtre de secrets d'`operator_tool_invocation.py` peut déclencher à tort sur des chaînes CTI.
