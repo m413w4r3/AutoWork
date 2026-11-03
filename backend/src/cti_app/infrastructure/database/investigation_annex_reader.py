@@ -104,6 +104,11 @@ async def _read_canonical_blob(
     return content, None
 
 
+def _is_tlp_red(value: object) -> bool:
+    """Stored TLP spellings differ by table ("RED" for samples, "red" for envelopes)."""
+    return str(value or "").strip().casefold() == TLPLevel.RED.value
+
+
 def _external_archive_policy(
     envelope: Any, subject_tlp: str | None, decisions: Sequence[Any]
 ) -> tuple[bool, tuple[str, ...]]:
@@ -116,7 +121,7 @@ def _external_archive_policy(
     if g2_envelope_authorization_state(envelope, decisions).revoked:
         reasons.append("g2_envelope_revoked")
     envelope_tlp = _string(getattr(disclosure, "tlp", None))
-    if envelope_tlp == TLPLevel.RED.value or subject_tlp == TLPLevel.RED.value:
+    if _is_tlp_red(envelope_tlp) or _is_tlp_red(subject_tlp):
         reasons.append("tlp_red")
     return not reasons, tuple(sorted(set(reasons)))
 
@@ -141,7 +146,7 @@ def _sample_policy(
         reasons.append("sample_rejected_or_revoked")
     if qualification == "rejected":
         reasons.append("association_rejected_or_revoked")
-    if sample.tlp == TLPLevel.RED.value:
+    if _is_tlp_red(sample.tlp):
         reasons.append("tlp_red")
     return not reasons, tuple(sorted(set(reasons)))
 
@@ -611,7 +616,7 @@ async def load_investigation_annex_snapshot(
             note_bytes = json.dumps(
                 note, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ).encode("utf-8")
-            event_tlp_red = _string(event.tlp) == TLPLevel.RED.value
+            event_tlp_red = _is_tlp_red(event.tlp)
             note_archive_allowed = archive_allowed and not event_tlp_red
             note_available = include_restricted_archive and note_archive_allowed
             note_restrictions = (
