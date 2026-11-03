@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.evidence_recorder import MAX_EVIDENCE_JSON_BYTES
@@ -151,9 +151,7 @@ async def _yara_version_origin_metadata(
     observation_by_id = {item.id: item for item in observations}
     invocation_by_id = {item.id: item for item in invocations}
     source_observation_ids = {
-        reference
-        for motif in candidate.motif_provenance
-        for reference in motif.observation_refs
+        reference for motif in candidate.motif_provenance for reference in motif.observation_refs
     }
     attribution = _rule_attribution_from_rationale(candidate)
     relevant_observations = [
@@ -290,43 +288,47 @@ def _is_tlp_red(value: object) -> bool:
 def _external_archive_policy(
     envelope: Any, subject_tlp: str | None, decisions: Sequence[Any]
 ) -> tuple[bool, tuple[str, ...]]:
+    _, public_restrictions = _public_distribution_policy(envelope, subject_tlp, decisions)
+    reasons = list(public_restrictions)
     if envelope is None:
-        return False, ("g2_envelope_unavailable",)
+        return False, tuple(sorted(set(reasons)))
     disclosure = getattr(envelope, "disclosure", None)
-    reasons: list[str] = []
     if not bool(getattr(disclosure, "external_llm_allowed", False)):
         reasons.append("external_llm_not_allowed")
+    return not reasons, tuple(sorted(set(reasons)))
+
+
+def _public_distribution_policy(
+    envelope: Any, subject_tlp: str | None, decisions: Sequence[Any]
+) -> tuple[bool, tuple[str, ...]]:
+    if envelope is None:
+        return False, ("g2_envelope_unavailable",)
+    reasons: list[str] = []
     if g2_envelope_authorization_state(envelope, decisions).revoked:
         reasons.append("g2_envelope_revoked")
+    disclosure = getattr(envelope, "disclosure", None)
     envelope_tlp = _string(getattr(disclosure, "tlp", None))
     if _is_tlp_red(envelope_tlp) or _is_tlp_red(subject_tlp):
         reasons.append("tlp_red")
     return not reasons, tuple(sorted(set(reasons)))
 
 
-def _sample_policy(
-    sample: SampleRow | None,
+def _sample_public_restrictions(
+    sample: SampleRow,
     qualification: str | None,
     *,
-    envelope_allowed: bool,
-    envelope_restrictions: Sequence[str],
-) -> tuple[bool, tuple[str, ...]]:
-    reasons = list(envelope_restrictions)
-    if sample is None:
-        return False, ("sample_not_acquired",)
-    if not envelope_allowed:
-        reasons.extend(envelope_restrictions)
-    if not bool(sample.external_llm_allowed):
-        reasons.append("sample_external_llm_not_allowed")
+    subject_tlp: str | None,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
     if sample.license_restriction:
         reasons.append("sample_license_restricted")
     if sample.state == "rejected":
         reasons.append("sample_rejected_or_revoked")
     if qualification == "rejected":
         reasons.append("association_rejected_or_revoked")
-    if _is_tlp_red(sample.tlp):
+    if _is_tlp_red(sample.tlp) or _is_tlp_red(subject_tlp):
         reasons.append("tlp_red")
-    return not reasons, tuple(sorted(set(reasons)))
+    return tuple(sorted(set(reasons)))
 
 
 def _sample_acquisition_status(
@@ -537,6 +539,54 @@ async def load_investigation_annex_snapshot(
                     .order_by(SampleRow.id)
                 )
             )
+            sample_blob_ids = {sample.blob_id for sample in samples}
+            related_sample_shas = {
+                sample_sha
+                for association in source_snapshot.sample_associations
+                for sample_sha in (
+                    association.sample_sha256,
+                    *association.related_sample_sha256,
+                )
+            }
+            related_sample_shas.update(
+                sample_sha
+                for observation in source_snapshot.observations
+                if (sample_sha := _safe_sha256(observation.object_id)) is not None
+            )
+            sample_lookup = []
+            if sample_blob_ids:
+                sample_lookup.append(SampleRow.blob_id.in_(tuple(sample_blob_ids)))
+            if related_sample_shas:
+                sample_lookup.append(BlobRow.sha256.in_(tuple(related_sample_shas)))
+            samples_sharing_blobs = (
+                tuple(
+                    await session.scalars(
+                        select(SampleRow)
+                        .join(BlobRow, SampleRow.blob_id == BlobRow.id)
+                        .where(or_(*sample_lookup))
+                        .order_by(SampleRow.subject_id, SampleRow.id)
+                    )
+                )
+                if sample_lookup
+                else ()
+            )
+            restricted_sample_facts = tuple(
+                await session.execute(
+                    select(SampleRow, BlobRow.sha256, SubjectRow.tlp)
+                    .join(BlobRow, SampleRow.blob_id == BlobRow.id)
+                    .join(SubjectRow, SampleRow.subject_id == SubjectRow.id)
+                    .where(
+                        or_(
+                            SampleRow.license_restriction.is_not(None),
+                            SampleRow.state == "rejected",
+                            SampleRow.tlp == TLPLevel.RED.value.upper(),
+                            SubjectRow.tlp == TLPLevel.RED.value.upper(),
+                            SampleRow.external_llm_allowed.is_(False),
+                        )
+                    )
+                    .order_by(BlobRow.sha256, SampleRow.subject_id, SampleRow.id)
+                )
+            )
             sample_ids = tuple(sample.id for sample in samples)
             provenance_events = (
                 tuple(
@@ -552,7 +602,20 @@ async def load_investigation_annex_snapshot(
                 if sample_ids
                 else ()
             )
-            blob_ids = {sample.blob_id for sample in samples}
+            sample_subject_ids = {sample.subject_id for sample in samples_sharing_blobs}
+            subjects_by_id = (
+                {
+                    row.id: row
+                    for row in await session.scalars(
+                        select(SubjectRow).where(SubjectRow.id.in_(tuple(sample_subject_ids)))
+                    )
+                }
+                if sample_subject_ids
+                else {}
+            )
+            sample_subject_tlps = {key: value.tlp for key, value in subjects_by_id.items()}
+            blob_ids = set(sample_blob_ids)
+            blob_ids.update(sample.blob_id for sample in samples_sharing_blobs)
             blob_ids.update(item.blob_id for item in source_snapshot.observations)
             blob_ids.update(row.blob_id for row in media_assets.values())
             blobs = (
@@ -568,11 +631,22 @@ async def load_investigation_annex_snapshot(
 
     investigation_created_at = investigation_row.created_at
     investigation_id_text = str(investigation_id)
+    public_distribution_allowed, public_distribution_restrictions = _public_distribution_policy(
+        envelope, subject_tlp, source_snapshot.analyst_decisions
+    )
     envelope_allowed, envelope_restrictions = _external_archive_policy(
         envelope, subject_tlp, source_snapshot.analyst_decisions
     )
     samples_by_sha: dict[str, SampleRow] = {}
     ambiguous_sample_shas: set[str] = set()
+    samples_by_sha_all: defaultdict[str, list[SampleRow]] = defaultdict(list)
+    for sample in samples_sharing_blobs:
+        blob = blobs.get(sample.blob_id)
+        if blob is None:
+            continue
+        samples_by_sha_all[blob.sha256].append(sample)
+        if len(samples_by_sha_all[blob.sha256]) > 1:
+            ambiguous_sample_shas.add(blob.sha256)
     for sample in samples:
         blob = blobs.get(sample.blob_id)
         if blob is None:
@@ -707,6 +781,36 @@ async def load_investigation_annex_snapshot(
     association_qualification = {
         item.sample_sha256: _metadata_text(item.qualification) for item in associations
     }
+    sample_public_restrictions_by_sha: defaultdict[str, set[str]] = defaultdict(set)
+    sample_archive_restrictions_by_sha: defaultdict[str, set[str]] = defaultdict(set)
+    for related_sample, sample_sha, related_subject_tlp in restricted_sample_facts:
+        row_restrictions = set(
+            _sample_public_restrictions(
+                related_sample,
+                None,
+                subject_tlp=related_subject_tlp,
+            )
+        )
+        sample_public_restrictions_by_sha[sample_sha].update(row_restrictions)
+        sample_archive_restrictions_by_sha[sample_sha].update(row_restrictions)
+        if not bool(related_sample.external_llm_allowed):
+            sample_archive_restrictions_by_sha[sample_sha].add("sample_external_llm_not_allowed")
+    for sample_sha, related_samples in samples_by_sha_all.items():
+        for related_sample in related_samples:
+            row_restrictions = set(
+                _sample_public_restrictions(
+                    related_sample,
+                    association_qualification.get(sample_sha),
+                    subject_tlp=sample_subject_tlps.get(related_sample.subject_id),
+                )
+            )
+            sample_public_restrictions_by_sha[sample_sha].update(row_restrictions)
+            sample_archive_restrictions_by_sha[sample_sha].update(row_restrictions)
+            # external_llm_allowed gates archive export, not distribution to human readers.
+            if not bool(related_sample.external_llm_allowed):
+                sample_archive_restrictions_by_sha[sample_sha].add(
+                    "sample_external_llm_not_allowed"
+                )
     for sample in samples:
         blob = blobs.get(sample.blob_id)
         if blob is None:
@@ -722,17 +826,16 @@ async def load_investigation_annex_snapshot(
             sample_sha in captured_shas or blob.logical_bucket == "network-captures-quarantine"
         )
         object_type = "network_capture" if is_capture else "sample"
-        archive_allowed, restrictions = _sample_policy(
-            sample,
-            qualification,
-            envelope_allowed=envelope_allowed,
-            envelope_restrictions=envelope_restrictions,
-        )
+        public_restrictions = set(public_distribution_restrictions)
+        public_restrictions.update(sample_public_restrictions_by_sha[sample_sha])
+        sample_archive_restrictions = set(envelope_restrictions)
+        sample_archive_restrictions.update(sample_archive_restrictions_by_sha[sample_sha])
+        archive_allowed = not sample_archive_restrictions
         if sample_sha in ambiguous_sample_shas:
             archive_allowed = False
-            restrictions = tuple(
-                sorted(set(restrictions) | {"sample_hash_multiple_subject_records"})
-            )
+            sample_archive_restrictions.add("sample_hash_multiple_subject_records")
+        sample_archive_restrictions.update(public_restrictions)
+        restrictions_tuple = tuple(sorted(sample_archive_restrictions))
         content: bytes | None = None
         availability = "present"
         if include_restricted_archive and archive_allowed:
@@ -741,7 +844,7 @@ async def load_investigation_annex_snapshot(
             )
             if read_failure is not None:
                 availability = "unavailable"
-                restrictions = tuple(sorted(set(restrictions) | {read_failure}))
+                restrictions_tuple = tuple(sorted(set(restrictions_tuple) | {read_failure}))
         elif not archive_allowed:
             availability = "restricted"
         sample_events = tuple(events_by_sample.get(sample.id, ()))
@@ -775,7 +878,9 @@ async def load_investigation_annex_snapshot(
                 origin=_metadata_text(sample.origin),
                 references=refs,
                 availability=availability,
-                restrictions=restrictions,
+                restrictions=restrictions_tuple,
+                public_distribution_allowed=not public_restrictions,
+                archive_export_allowed=archive_allowed,
                 content=content,
                 filename=f"{sample_sha}.bin",
                 metadata={
@@ -807,7 +912,8 @@ async def load_investigation_annex_snapshot(
                 if note_archive_allowed
                 else tuple(
                     sorted(
-                        set(restrictions)
+                        set(sample_archive_restrictions)
+                        | public_restrictions
                         | ({"provenance_event_tlp_red"} if event_tlp_red else set())
                     )
                 )
@@ -827,6 +933,8 @@ async def load_investigation_annex_snapshot(
                     references=tuple(event_refs_for_note),
                     availability="present" if note_available else "restricted",
                     restrictions=note_restrictions,
+                    public_distribution_allowed=not public_restrictions and not event_tlp_red,
+                    archive_export_allowed=note_archive_allowed,
                     content=note_bytes,
                     filename=f"sample-provenance-{event.id}.json",
                     metadata={
@@ -875,6 +983,10 @@ async def load_investigation_annex_snapshot(
                     "relation": "investigation_sample_association",
                     "pivot_criteria": "canonical_sample_association_and_acquisition_time",
                 },
+                availability="restricted" if public_restrictions else "present",
+                restrictions=tuple(sorted(public_restrictions)),
+                public_distribution_allowed=not public_restrictions,
+                archive_export_allowed=archive_allowed,
             )
         )
 
@@ -896,7 +1008,18 @@ async def load_investigation_annex_snapshot(
                 origin=observation.source,
                 references=(str(observation.id),),
                 availability="unavailable",
-                restrictions=("sample_policy_metadata_unavailable",),
+                restrictions=tuple(
+                    sorted(
+                        set(public_distribution_restrictions)
+                        | sample_public_restrictions_by_sha.get(observation.sha256, set())
+                        | {"sample_policy_metadata_unavailable"}
+                    )
+                ),
+                public_distribution_allowed=not (
+                    public_distribution_restrictions
+                    or sample_public_restrictions_by_sha.get(observation.sha256, set())
+                ),
+                archive_export_allowed=False,
                 metadata={"archive_export_allowed": False, "external_llm_allowed": False},
             )
         )
@@ -905,6 +1028,18 @@ async def load_investigation_annex_snapshot(
     for association in associations:
         if association.sample_sha256 not in samples_by_sha:
             qualification = _metadata_text(association.qualification)
+            public_restrictions = set(public_distribution_restrictions)
+            public_restrictions.update(
+                sample_public_restrictions_by_sha.get(association.sample_sha256, set())
+            )
+            if qualification == "rejected":
+                public_restrictions.add("association_rejected_or_revoked")
+            archive_restrictions = set(envelope_restrictions)
+            archive_restrictions.update(
+                sample_archive_restrictions_by_sha.get(association.sample_sha256, set())
+            )
+            if qualification == "rejected":
+                archive_restrictions.add("association_rejected_or_revoked")
             assets.append(
                 AnnexAsset(
                     canonical_id=f"association:{association.id}:unacquired",
@@ -914,6 +1049,10 @@ async def load_investigation_annex_snapshot(
                     source="sample_associations.sample_sha256",
                     origin=_metadata_text(association.origin),
                     references=(str(association.id),),
+                    availability="restricted" if public_restrictions else "present",
+                    restrictions=tuple(sorted(public_restrictions | archive_restrictions)),
+                    public_distribution_allowed=not public_restrictions,
+                    archive_export_allowed=not archive_restrictions,
                     metadata={
                         "value": association.sample_sha256,
                         "status": "rejected_out_of_cluster"
@@ -939,6 +1078,18 @@ async def load_investigation_annex_snapshot(
                 association_id=related_association.id if related_association is not None else None,
             )
             qualification = association_qualification.get(related_sha, "unknown")
+            related_public_restrictions = set(public_distribution_restrictions)
+            related_public_restrictions.update(
+                sample_public_restrictions_by_sha.get(related_sha, set())
+            )
+            if qualification == "rejected":
+                related_public_restrictions.add("association_rejected_or_revoked")
+            related_archive_restrictions = set(envelope_restrictions)
+            related_archive_restrictions.update(
+                sample_archive_restrictions_by_sha.get(related_sha, set())
+            )
+            if qualification == "rejected":
+                related_archive_restrictions.add("association_rejected_or_revoked")
             if related_sha in ambiguous_sample_shas:
                 status = "acquired_ambiguous_subject_records"
             if qualification == "rejected":
@@ -952,6 +1103,12 @@ async def load_investigation_annex_snapshot(
                     source="sample_association_versions.related_sample_sha256",
                     origin=_metadata_text(association.origin),
                     references=(str(association.id), association.sample_sha256),
+                    availability=("restricted" if related_public_restrictions else "present"),
+                    restrictions=tuple(
+                        sorted(related_public_restrictions | related_archive_restrictions)
+                    ),
+                    public_distribution_allowed=not related_public_restrictions,
+                    archive_export_allowed=not related_archive_restrictions,
                     metadata={
                         "value": related_sha,
                         "status": status,
@@ -1345,6 +1502,23 @@ async def load_investigation_annex_snapshot(
         for index, (ioc_type, value) in enumerate(
             _vt_indicators(payload, observation.object_type, observation.object_id)
         ):
+            ioc_public_restrictions = set(public_distribution_restrictions)
+            ioc_archive_restrictions: set[str] = set()
+            observed_sample_sha = _safe_sha256(observation.object_id)
+            if observed_sample_sha is not None:
+                ioc_public_restrictions.update(
+                    sample_public_restrictions_by_sha.get(observed_sample_sha, set())
+                )
+                ioc_archive_restrictions.update(
+                    sample_archive_restrictions_by_sha.get(observed_sample_sha, set())
+                )
+            if ioc_type == "file":
+                ioc_public_restrictions.update(sample_public_restrictions_by_sha.get(value, set()))
+                ioc_archive_restrictions.update(
+                    sample_archive_restrictions_by_sha.get(value, set())
+                )
+            ioc_archive_restrictions.update(envelope_restrictions)
+            ioc_restrictions = ioc_public_restrictions | ioc_archive_restrictions
             assets.append(
                 AnnexAsset(
                     canonical_id=f"{observation.id}:ioc:{index:03d}",
@@ -1354,6 +1528,10 @@ async def load_investigation_annex_snapshot(
                     source=observation.source,
                     origin=observation.object_type,
                     references=(str(observation.id),),
+                    availability=("restricted" if ioc_public_restrictions else "present"),
+                    restrictions=tuple(sorted(ioc_restrictions)),
+                    public_distribution_allowed=not ioc_public_restrictions,
+                    archive_export_allowed=not ioc_archive_restrictions,
                     metadata={
                         "ioc_type": ioc_type,
                         "value": value,
@@ -1364,6 +1542,15 @@ async def load_investigation_annex_snapshot(
                 )
             )
             if ioc_type == "file" and len(value) == 64:
+                discovery_restrictions = set(public_distribution_restrictions)
+                discovery_restrictions.update(sample_public_restrictions_by_sha.get(value, set()))
+                discovery_archive_restrictions = set(envelope_restrictions)
+                discovery_archive_restrictions.update(
+                    sample_archive_restrictions_by_sha.get(value, set())
+                )
+                if association_qualification.get(value) == "rejected":
+                    discovery_restrictions.add("association_rejected_or_revoked")
+                    discovery_archive_restrictions.add("association_rejected_or_revoked")
                 known = samples_by_sha.get(value)
                 known_association = association_by_sha.get(value)
                 known_events = events_by_sample.get(known.id, ()) if known is not None else ()
@@ -1376,6 +1563,12 @@ async def load_investigation_annex_snapshot(
                         source=observation.source,
                         origin=observation.object_type,
                         references=(str(observation.id),),
+                        availability=("restricted" if discovery_restrictions else "present"),
+                        restrictions=tuple(
+                            sorted(discovery_restrictions | discovery_archive_restrictions)
+                        ),
+                        public_distribution_allowed=not discovery_restrictions,
+                        archive_export_allowed=not discovery_archive_restrictions,
                         metadata={
                             "value": value,
                             "status": (
@@ -1591,5 +1784,26 @@ async def load_investigation_annex_snapshot(
                 },
             )
         )
+
+    detection_types = {
+        "yara_rule",
+        "yara_test_report",
+        "suricata_rule",
+        "suricata_test_report",
+    }
+    detection_restrictions: set[str] = set()
+    detection_restrictions.update(public_distribution_restrictions)
+    detection_restrictions.update(envelope_restrictions)
+    assets = [
+        replace(
+            asset,
+            restrictions=tuple(sorted(set(asset.restrictions) | detection_restrictions)),
+            public_distribution_allowed=public_distribution_allowed,
+            archive_export_allowed=envelope_allowed,
+        )
+        if asset.type in detection_types and asset.availability != "absent"
+        else asset
+        for asset in assets
+    ]
 
     return InvestigationAnnexSnapshot(investigation_id=investigation_id_text, assets=tuple(assets))

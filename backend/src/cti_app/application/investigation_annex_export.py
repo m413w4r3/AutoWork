@@ -16,7 +16,7 @@ import tempfile
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -86,6 +86,8 @@ class AnnexAsset:
     references: tuple[str, ...] = ()
     availability: str = "present"
     restrictions: tuple[str, ...] = ()
+    public_distribution_allowed: bool = True
+    archive_export_allowed: bool | None = None
     content: bytes | None = None
     filename: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -257,6 +259,59 @@ def _sorted_refs(asset: AnnexAsset) -> list[str]:
     return sorted({_clean_text(item) for item in asset.references if str(item).strip()})
 
 
+def _public_projection(asset: AnnexAsset, *, include_restricted_archive: bool) -> AnnexAsset:
+    public_restricted = not include_restricted_archive and not asset.public_distribution_allowed
+    archive_restricted = include_restricted_archive and asset.archive_export_allowed is False
+    if not public_restricted and not archive_restricted:
+        return asset
+    restrictions = tuple(sorted(set(asset.restrictions)))
+    if (public_restricted or archive_restricted) and asset.type in {
+        "sample",
+        "network_capture",
+        "discovered_sample",
+        "technical_note",
+    }:
+        # Keep the internal record ID so editors can trace the omission without exposing its hash.
+        return replace(
+            asset,
+            version=None,
+            sha256=None,
+            source="restricted",
+            origin="restricted",
+            references=(),
+            availability="restricted",
+            restrictions=restrictions,
+            content=None,
+            filename=None,
+            metadata={"status": "restricted"},
+        )
+    if asset.type == "observed_ioc" and (public_restricted or archive_restricted):
+        metadata = dict(asset.metadata)
+        metadata.pop("value", None)
+        return replace(
+            asset,
+            availability="restricted",
+            restrictions=restrictions,
+            content=None,
+            filename=None,
+            metadata=metadata,
+        )
+    if asset.type in {
+        "yara_rule",
+        "suricata_rule",
+        "yara_test_report",
+        "suricata_test_report",
+    } and (public_restricted or archive_restricted):
+        return replace(
+            asset,
+            availability="restricted",
+            restrictions=restrictions,
+            content=None,
+            filename=None,
+        )
+    return asset
+
+
 def _project_assets(
     snapshot: InvestigationAnnexSnapshot, *, include_restricted_archive: bool
 ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
@@ -266,9 +321,11 @@ def _project_assets(
     seen_paths: set[str] = set()
     object_rows: list[dict[str, Any]] = []
     files: dict[str, bytes] = {}
+    projected_assets: list[AnnexAsset] = []
     type_ordinals: defaultdict[str, int] = defaultdict(int)
 
     for asset in assets:
+        asset = _public_projection(asset, include_restricted_archive=include_restricted_archive)
         type_ordinals[asset.type] += 1
         path = _asset_path(
             asset,
@@ -287,7 +344,11 @@ def _project_assets(
                     set(restrictions) | {"explicit_restricted_archive_flag_required"}
                 )
                 content = None
-            elif not bool(asset.metadata.get("archive_export_allowed", False)):
+            elif not (
+                asset.archive_export_allowed
+                if asset.archive_export_allowed is not None
+                else bool(asset.metadata.get("archive_export_allowed", False))
+            ):
                 availability = "restricted"
                 restrictions = sorted(set(restrictions) | {"canonical_policy_denied"})
                 content = None
@@ -319,6 +380,15 @@ def _project_assets(
 
         if availability not in _AVAILABILITY:
             raise ValueError("Annex asset has an unsupported availability state")
+        projected_assets.append(
+            replace(
+                asset,
+                availability=availability,
+                restrictions=tuple(restrictions),
+                content=content,
+                filename=path,
+            )
+        )
         row = {
             "canonical_id": _clean_text(asset.canonical_id),
             "type": _clean_text(asset.type),
@@ -337,7 +407,7 @@ def _project_assets(
         object_rows.append(row)
 
     _add_absent_collections(object_rows, snapshot.investigation_id)
-    _add_projection_files(files, assets)
+    _add_projection_files(files, projected_assets)
     return sorted(
         object_rows,
         key=lambda item: (item["type"], item["canonical_id"], str(item["version"] or "")),
@@ -387,19 +457,30 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
         metadata = asset.metadata
         value = metadata.get("value")
         ioc_type = metadata.get("ioc_type")
-        if isinstance(value, str) and isinstance(ioc_type, str):
+        if isinstance(ioc_type, str):
             ioc_rows.append(
                 (
                     ioc_type,
-                    value,
+                    value if isinstance(value, str) else "",
                     asset.canonical_id,
                     asset.source,
                     asset.sha256 or "",
                     str(metadata.get("relation") or "observed"),
+                    asset.availability,
+                    ";".join(asset.restrictions),
                 )
             )
     files["iocs/observed-iocs.csv"] = _csv_bytes(
-        ("type", "value", "observation_id", "source", "observation_sha256", "relation"),
+        (
+            "type",
+            "value",
+            "observation_id",
+            "source",
+            "observation_sha256",
+            "relation",
+            "availability",
+            "restrictions",
+        ),
         sorted(set(ioc_rows), key=lambda row: tuple(str(item) for item in row)),
     )
 
@@ -417,6 +498,8 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
                 metadata.get("related_to") or "",
                 metadata.get("relation") or "observed_relationship_not_family_proof",
                 metadata.get("pivot_criteria") or "canonical_relationship_observation",
+                asset.availability,
+                ";".join(asset.restrictions),
             )
         )
     files["iocs/discovered-samples.csv"] = _csv_bytes(
@@ -428,6 +511,8 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
             "related_to",
             "relation",
             "pivot_criteria",
+            "availability",
+            "restrictions",
         ),
         sorted(set(discovered_rows), key=lambda row: tuple(str(item) for item in row)),
     )
@@ -436,22 +521,31 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
     for asset in assets:
         if asset.type not in {"sample", "network_capture"}:
             continue
+        redacted = asset.sha256 is None and asset.metadata.get("status") == "restricted"
         inventory_rows.append(
             (
+                asset.canonical_id,
                 asset.sha256 or "",
                 asset.type,
-                asset.metadata.get("sample_state") or "unknown",
-                asset.metadata.get("qualification") or "unknown",
-                asset.metadata.get("origin_kind") or asset.origin,
-                asset.metadata.get("tlp") or "unknown",
-                "yes" if asset.metadata.get("license_restriction_present") else "no",
-                "yes" if asset.metadata.get("external_llm_allowed") else "no",
-                asset.metadata.get("source_service") or "unknown",
-                asset.metadata.get("source_object_id") or "",
+                "" if redacted else asset.metadata.get("sample_state") or "unknown",
+                "" if redacted else asset.metadata.get("qualification") or "unknown",
+                "" if redacted else asset.metadata.get("origin_kind") or asset.origin,
+                "" if redacted else asset.metadata.get("tlp") or "unknown",
+                ""
+                if redacted
+                else "yes"
+                if asset.metadata.get("license_restriction_present")
+                else "no",
+                "" if redacted else "yes" if asset.metadata.get("external_llm_allowed") else "no",
+                "" if redacted else asset.metadata.get("source_service") or "unknown",
+                "" if redacted else asset.metadata.get("source_object_id") or "",
+                asset.availability,
+                ";".join(asset.restrictions),
             )
         )
     files["samples/sample-inventory.csv"] = _csv_bytes(
         (
+            "canonical_id",
             "sha256",
             "object_type",
             "sample_state",
@@ -462,6 +556,8 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
             "external_llm_allowed",
             "source_service",
             "source_object_id",
+            "availability",
+            "restrictions",
         ),
         sorted(set(inventory_rows), key=lambda row: tuple(str(item) for item in row)),
     )

@@ -14,7 +14,7 @@ from cti_app.application.investigation_annex_export import write_investigation_a
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
-from cti_app.domain.entities import Sample, SampleState, Subject
+from cti_app.domain.entities import ProvenanceEvent, Sample, SampleState, Subject
 from cti_app.domain.entities import SampleOrigin as StoredSampleOrigin
 from cti_app.domain.investigation import (
     DetectionCandidateStatus,
@@ -51,7 +51,7 @@ pytestmark = pytest.mark.integration
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=UTC)
 
 
-async def _seed_investigation(session_factory):
+async def _seed_investigation(session_factory, *, subject_tlp: TLP = TLP.AMBER):
     suffix = uuid4().hex
     edition = Edition(
         country=f"Annex integration {suffix}",
@@ -65,7 +65,7 @@ async def _seed_investigation(session_factory):
         edition_id=edition.id,
         title="Synthetic annex export subject",
         slug=f"annex-{suffix}",
-        tlp=TLP.AMBER,
+        tlp=subject_tlp,
     )
     run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
     synthesis = ProductionArtifact(
@@ -116,6 +116,7 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
     artifact_store = ProductionArtifactStore(catalog)
     try:
         investigation, subject = await _seed_investigation(session_factory)
+        _, red_subject = await _seed_investigation(session_factory, subject_tlp=TLP.RED)
 
         # Canonical report and IOC observations are persisted as versioned evidence blobs.
         report_id = uuid4()
@@ -205,8 +206,83 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             state=SampleState.QUARANTINED,
             created_at=NOW,
         )
+        shared_bytes = b"SYNTHETIC_SHARED_SAMPLE_BYTES_" + bytes(range(32))
+        shared_blob = await catalog.ingest(
+            BytesIO(shared_bytes),
+            logical_bucket="samples-quarantine",
+            mime_type="application/octet-stream",
+        )
+        shared_authorized_sample = Sample(
+            subject_id=subject.id,
+            blob_id=shared_blob.id,
+            original_name="shared-authorized-synthetic.bin",
+            origin="synthetic integration acquisition",
+            acquired_at=NOW,
+            license_restriction=None,
+            tlp=TLP.AMBER,
+            do_not_submit=False,
+            external_llm_allowed=True,
+            origin_kind=StoredSampleOrigin.MANUAL,
+            state=SampleState.VALIDATED,
+            created_at=NOW,
+        )
+        shared_red_sample = Sample(
+            subject_id=red_subject.id,
+            blob_id=shared_blob.id,
+            original_name="shared-red-synthetic.bin",
+            origin="synthetic integration acquisition",
+            acquired_at=NOW,
+            license_restriction=None,
+            tlp=TLP.AMBER,
+            do_not_submit=False,
+            external_llm_allowed=True,
+            origin_kind=StoredSampleOrigin.MANUAL,
+            state=SampleState.VALIDATED,
+            created_at=NOW,
+        )
+        unacquired_shared_bytes = b"SYNTHETIC_SHARED_UNACQUIRED_REDACTED_BYTES"
+        unacquired_shared_blob = await catalog.ingest(
+            BytesIO(unacquired_shared_bytes),
+            logical_bucket="samples-quarantine",
+            mime_type="application/octet-stream",
+        )
+        unacquired_shared_red_sample = Sample(
+            subject_id=red_subject.id,
+            blob_id=unacquired_shared_blob.id,
+            original_name="red-subject-only-synthetic.bin",
+            origin="synthetic integration acquisition",
+            acquired_at=NOW,
+            license_restriction=None,
+            tlp=TLP.AMBER,
+            do_not_submit=False,
+            external_llm_allowed=True,
+            origin_kind=StoredSampleOrigin.MANUAL,
+            state=SampleState.VALIDATED,
+            created_at=NOW,
+        )
         sample_sha = sample_record.descriptor.sha256
+        shared_sha = shared_blob.descriptor.sha256
+        unacquired_shared_sha = unacquired_shared_blob.descriptor.sha256
         unacquired_sha = hashlib.sha256(b"synthetic-not-acquired").hexdigest()
+        capture_bytes = b"SYNTHETIC_ORPHAN_CAPTURE_REFERENCE"
+        capture_blob = await catalog.ingest(
+            BytesIO(capture_bytes),
+            logical_bucket="network-captures-quarantine",
+            mime_type="application/octet-stream",
+        )
+        capture_sha = capture_blob.descriptor.sha256
+        shared_vt_blob = await catalog.ingest(
+            BytesIO(
+                _json_bytes(
+                    {
+                        "schema": "virustotal-object-report.v1",
+                        "descriptors": [{"type": "file", "id": unacquired_shared_sha}],
+                    }
+                )
+            ),
+            logical_bucket="annex-test",
+            mime_type="application/json",
+        )
         bridge_invocation_id = uuid4()
         operator_invocation_id = uuid4()
         bridge_observation_id = uuid4()
@@ -332,9 +408,9 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
                 MotifProvenance(
                     motif="bridge marker",
                     rationale=(
-                        "rule-workbench-motif-v1:{\"source_attribution\":"
-                        "{\"author\":\"operator\",\"source_author\":\"operator\","
-                        "\"origin_author\":\"bridge\",\"change_kind\":\"operator_syntax_fix\"}}"
+                        'rule-workbench-motif-v1:{"source_attribution":'
+                        '{"author":"operator","source_author":"operator",'
+                        '"origin_author":"bridge","change_kind":"operator_syntax_fix"}}'
                     ),
                     observation_refs=(bridge_observation_id,),
                 ),
@@ -358,6 +434,17 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             sha256=vt_blob.descriptor.sha256,
             source="VirusTotal",
             source_version="synthetic-v1",
+            observed_at=NOW,
+            object_type="file",
+            object_id=sample_sha,
+        )
+        shared_vt_observation = EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.VT_FILE_REPORT,
+            blob_id=shared_vt_blob.id,
+            sha256=shared_vt_blob.descriptor.sha256,
+            source="VirusTotal",
+            source_version="synthetic-shared-v1",
             observed_at=NOW,
             object_type="file",
             object_id=sample_sha,
@@ -407,44 +494,83 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             object_type="synthetic_record",
             object_id="deleted-filesystem-object",
         )
+        capture_observation = EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=capture_blob.id,
+            sha256=capture_sha,
+            source="network.quarantine",
+            source_version="synthetic-capture-v1",
+            observed_at=NOW,
+            object_type="network_capture",
+            object_id=capture_sha,
+        )
         association = SampleAssociation(
             investigation_id=investigation.id,
             sample_sha256=sample_sha,
             origin=SampleOrigin.VT_PIVOT,
             related_sample_sha256=(unacquired_sha,),
         )
+        shared_association = SampleAssociation(
+            investigation_id=investigation.id,
+            sample_sha256=shared_sha,
+            origin=SampleOrigin.VT_PIVOT,
+        )
+        unacquired_shared_association = SampleAssociation(
+            investigation_id=investigation.id,
+            sample_sha256=unacquired_shared_sha,
+            origin=SampleOrigin.VT_PIVOT,
+        )
+        restricted_sample_event = ProvenanceEvent(
+            aggregate_type="sample",
+            aggregate_id=sample.id,
+            subject_id=subject.id,
+            event_type="sample_imported_by_operator",
+            payload={"investigation_id": str(investigation.id), "import_source": "synthetic"},
+            tlp=TLP.RED,
+            actor_id="synthetic-test-operator",
+            occurred_at=NOW,
+        )
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             await uow.samples.add(sample)
+            await uow.samples.add(shared_authorized_sample)
+            await uow.samples.add(shared_red_sample)
+            await uow.samples.add(unacquired_shared_red_sample)
             await uow.tool_invocations.add_if_absent(bridge_invocation)
             await uow.tool_invocations.add_if_absent(operator_invocation)
             await uow.evidence_observations.append_if_absent(vt_observation)
+            await uow.evidence_observations.append_if_absent(shared_vt_observation)
             await uow.evidence_observations.append_if_absent(source_v1_observation)
             await uow.evidence_observations.append_if_absent(operator_observation)
             await uow.evidence_observations.append_if_absent(test_observation)
             await uow.evidence_observations.append_if_absent(advisor_observation)
             await uow.evidence_observations.append_if_absent(syntax_observation)
             await uow.evidence_observations.append_if_absent(unavailable_observation)
+            await uow.evidence_observations.append_if_absent(capture_observation)
             await uow.detection_candidates.append_version(source_v1, expected_previous_id=None)
             await uow.detection_candidates.append_version(
                 source_v2, expected_previous_id=source_v1.id
             )
             await uow.sample_associations.append_version(association, expected_version=0)
-            await uow.investigation_envelopes.save_if_version(
-                InvestigationEnvelope(
-                    investigation_id=investigation.id,
-                    allowed_providers=(),
-                    budget=InvestigationBudget(),
-                    acquire_hits_allowed=False,
-                    disclosure=DisclosureBounds(
-                        tlp=TLPLevel.GREEN,
-                        external_llm_allowed=True,
-                    ),
-                    approval_decision_id=uuid4(),
-                    approval_actor_id="synthetic-test-approver",
-                    approved_at=NOW,
-                ),
-                expected_version=None,
+            await uow.sample_associations.append_version(shared_association, expected_version=0)
+            await uow.sample_associations.append_version(
+                unacquired_shared_association, expected_version=0
             )
+            await uow.provenance.append(restricted_sample_event)
+            green_envelope = InvestigationEnvelope(
+                investigation_id=investigation.id,
+                allowed_providers=(),
+                budget=InvestigationBudget(),
+                acquire_hits_allowed=False,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.GREEN,
+                    external_llm_allowed=True,
+                ),
+                approval_decision_id=uuid4(),
+                approval_actor_id="synthetic-test-approver",
+                approved_at=NOW,
+            )
+            await uow.investigation_envelopes.save_if_version(green_envelope, expected_version=None)
             await uow.commit()
 
         # Simulate a canonical blob record whose backing object is missing.
@@ -473,6 +599,28 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             filename = item["filename"]
             if filename is not None and item["sha256"] is not None:
                 assert hashlib.sha256(public_files[filename]).hexdigest() == item["sha256"]
+        shared_public = next(
+            item
+            for item in manifest["objects"]
+            if item["canonical_id"] == str(shared_authorized_sample.id)
+        )
+        assert shared_public["availability"] == "restricted"
+        assert shared_public["sha256"] is None
+        assert "tlp_red" in shared_public["restrictions"]
+        assert shared_sha not in b"\n".join(public_files.values()).decode("latin1")
+        assert unacquired_shared_bytes not in b"\n".join(public_files.values())
+        assert unacquired_shared_sha.encode() not in b"\n".join(public_files.values())
+        assert capture_sha.encode() in b"\n".join(public_files.values())
+        unacquired_shared_public = next(
+            item
+            for item in manifest["objects"]
+            if item["canonical_id"] == f"association:{unacquired_shared_association.id}:unacquired"
+        )
+        assert unacquired_shared_public["availability"] == "restricted"
+        assert unacquired_shared_public["sha256"] is None
+        assert "tlp_red" in unacquired_shared_public["restrictions"]
+        inventory_rows = (public_files["samples/sample-inventory.csv"]).decode().splitlines()
+        assert all(shared_sha not in row for row in inventory_rows)
         assert any(
             item["type"] == "evidence_observation" and item["availability"] == "unavailable"
             for item in manifest["objects"]
@@ -531,5 +679,85 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         assert all(item["availability"] == "restricted" for item in sample_assets)
         assert all("tlp_red" in item["restrictions"] for item in sample_assets)
         assert sample_bytes not in b"".join(_files(archive_dir).values())
+        assert shared_bytes not in b"".join(_files(archive_dir).values())
+        assert unacquired_shared_bytes not in b"".join(_files(archive_dir).values())
+        archive_bytes = b"".join(_files(archive_dir).values())
+        assert bridge_source.encode() in archive_bytes
+        assert revised_source.encode() in archive_bytes
+        assert suricata_source.encode() in archive_bytes
+        assert b"synthetic integration report" in archive_bytes
+
+        red_envelope = InvestigationEnvelope(
+            investigation_id=investigation.id,
+            allowed_providers=green_envelope.allowed_providers,
+            budget=green_envelope.budget,
+            acquire_hits_allowed=green_envelope.acquire_hits_allowed,
+            disclosure=DisclosureBounds(tlp=TLPLevel.RED, external_llm_allowed=True),
+            approval_decision_id=green_envelope.approval_decision_id,
+            approval_actor_id=green_envelope.approval_actor_id,
+            approved_at=NOW,
+            version=2,
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            await uow.investigation_envelopes.save_if_version(red_envelope, expected_version=1)
+            await uow.commit()
+
+        red_snapshot = await load_investigation_annex_snapshot(
+            session_factory, investigation.id, artifact_store
+        )
+        red_public_dir = tmp_path / "red-public"
+        write_investigation_annex(red_snapshot, red_public_dir)
+        red_public_files = _files(red_public_dir)
+        assert capture_sha.encode() not in b"\n".join(red_public_files.values())
+        red_public_manifest = json.loads(red_public_files["manifest.json"])
+        red_capture = next(
+            item
+            for item in red_public_manifest["objects"]
+            if item["canonical_id"] == str(capture_observation.id)
+        )
+        assert red_capture["availability"] == "restricted"
+        assert red_capture["sha256"] is None
+        assert "tlp_red" in red_capture["restrictions"]
+        assert not any(
+            path.startswith(("yara/tests/report-", "suricata/tests/report-"))
+            for path in red_public_files
+        )
+        assert bridge_source.encode() not in b"".join(red_public_files.values())
+        assert revised_source.encode() not in b"".join(red_public_files.values())
+        assert suricata_source.encode() not in b"".join(red_public_files.values())
+        assert b"synthetic integration report" not in b"".join(red_public_files.values())
+        red_manifest = json.loads(red_public_files["manifest.json"])
+        red_by_type: dict[str, list[dict[str, object]]] = {}
+        for item in red_manifest["objects"]:
+            red_by_type.setdefault(item["type"], []).append(item)
+        red_yara = red_by_type["yara_rule"]
+        assert all(item["availability"] == "restricted" for item in red_yara)
+        assert {item["sha256"] for item in red_yara} >= {
+            source_v1.source_sha256,
+            source_v2.source_sha256,
+        }
+        assert all("tlp_red" in item["restrictions"] for item in red_yara)
+        red_reports = red_by_type["yara_test_report"] + red_by_type["suricata_test_report"]
+        # An absent report has nothing to withhold; every present one must be restricted.
+        assert all(item["availability"] in {"restricted", "absent"} for item in red_reports)
+        assert any(item["availability"] == "restricted" for item in red_reports)
+        assert all(item["filename"] is None for item in red_reports)
+        red_ioc_rows = red_public_files["iocs/observed-iocs.csv"].decode().splitlines()
+        assert all("annex-example.invalid" not in row for row in red_ioc_rows)
+
+        red_archive_snapshot = await load_investigation_annex_snapshot(
+            session_factory,
+            investigation.id,
+            artifact_store,
+            include_restricted_archive=True,
+        )
+        red_archive_dir = tmp_path / "red-archive"
+        write_investigation_annex(
+            red_archive_snapshot, red_archive_dir, include_restricted_archive=True
+        )
+        red_archive_files = _files(red_archive_dir)
+        assert bridge_source.encode() not in b"".join(red_archive_files.values())
+        assert revised_source.encode() not in b"".join(red_archive_files.values())
+        assert suricata_source.encode() not in b"".join(red_archive_files.values())
     finally:
         await engine.dispose()
