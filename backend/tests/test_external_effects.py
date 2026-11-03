@@ -3547,9 +3547,7 @@ def test_bridge_vt_sha256_report_rejects_incomplete_osint_fixture_shape() -> Non
     )
     assert f"id={observation_id.hex}" in refusal_detail
 
-    report_payload["data"]["attributes"].update(
-        {"md5": "a" * 32, "sha1": "b" * 40}
-    )
+    report_payload["data"]["attributes"].update({"md5": "a" * 32, "sha1": "b" * 40})
     complete_report = json.dumps(report_payload).encode()
     assert (
         resolve_bridge_vt_file_report_sha256(
