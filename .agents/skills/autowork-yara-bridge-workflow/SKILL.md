@@ -32,7 +32,7 @@ Le Bridge peut produire une règle réellement utile : `rule.propose_bridge` con
 
 ## 3 bis. Boucle de révision
 
-Bridge → candidate → compilation → test → lecture des résultats par hash → retour à Bridge avec ces résultats → nouvelle version. Transmettre à chaque retour ce qui a été **mesuré** (matches, non-matches, non mesurables, contre-exemples), pas une impression. Sur faux négatif, chercher les motifs absents, la condition et l'appartenance réelle du sample au groupe ; sur faux positif, la sous-expression trop générique et l'origine du contre-exemple. Ne pas modifier sans mesure ; consigner dans le `purpose` suivant la disposition du conseil (voir `autowork-bridge-collaboration`).
+Bridge cadre la candidate ou les motifs → l'opérateur analyse et construit → Bridge critique → l'opérateur compile et teste → Bridge réévalue les résultats mesurés. Transmettre à chaque retour les matches, non-matches, cas non mesurables et contre-exemples, pas une impression. Sur faux négatif, chercher les motifs absents, la condition et l'appartenance réelle du sample au groupe ; sur faux positif, la sous-expression trop générique et l'origine du contre-exemple. Ne pas modifier sans mesure ; consigner dans le `purpose` suivant la disposition du conseil (voir `autowork-bridge-collaboration`). Un nouveau tour est utile lorsque les résultats apportent une décision nouvelle, sans quota ni appel identique redondant.
 
 ## 4. Enregistrer et tester
 
@@ -56,7 +56,7 @@ Ne pas optimiser au hasard jusqu'à faire matcher l'échantillon test. Le status
 - Bridge invocation et observation si utilisées ; conseil accepté/rejeté avec raison.
 - Résultats réellement disponibles : corpus exact par rôle, moteur s'il a exécuté, matches/non_matches/non_measurable et limites ; ne pas inventer les tests absents.
 - Détection candidate, statut de validation réel, risques de faux positifs et condition de reprise.
-- Rédaction : faire expliquer la règle par Bridge (`draft_text` : motifs retenus, caractéristiques représentées, condition, échantillons testés, couverture, limites) puis vérifier le texte contre les tests ; la source YARA exacte reste un fichier d'annexe distinct, identifié par son SHA-256.
+- Rédaction : demander à Bridge `draft_text`, puis `review_text` pour la section YARA si la relecture est utile ; vérifier le texte contre les tests. Une consultation de cadrage unique ne remplace pas cette collaboration par section. La source YARA exacte reste un fichier d'annexe distinct, identifié par son SHA-256.
 - Approbation/publication : exclusivement humains, hors de ce skill.
 
 **Oracle :** dès qu'un invariant discriminant est mesuré, l'agent produit une candidate YARA et la teste si possible, puis utilise ses résultats pour découvrir de nouveaux échantillons. Il ne confond pas candidate/experimental/tested, et l'absence de goodware/holdout ne bloque pas la première version.
