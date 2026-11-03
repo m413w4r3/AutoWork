@@ -10,7 +10,7 @@ Ne lance pas `make clean`. Le reset est une opération séparée : `scripts/ops/
 
 ## 2. État du code
 
-- Branche `bridge-simp/integration` (PR #23), fusionnée dans `main` à la demande de l'utilisateur : voir le SHA de fusion indiqué en fin de fichier.
+- Branche `bridge-simp/integration` (PR #23), HEAD `8e498c77` au moment de ce handoff (plus tout commit ultérieur de ce fichier). **La PR n'est PAS fusionnée** : l'utilisateur l'a demandé, mais `gh pr merge` a été refusé par le contrôle de permissions (« Merge Without Review » : CI rouge, sans revue humaine). N'essaie pas de contourner (pas de merge local ni de push sur `main`). Les contrôles CI en échec sont exactement les quatre étapes déjà rouges sur `main` (mypy à parité à 11 erreurs, FAST gate, J2, e2e frontend). Dis à l'utilisateur qu'il doit soit fusionner lui-même, soit ajouter une règle de permission autorisant ce merge, puis continue sur la branche.
 - **Déployé en ce moment** sur les conteneurs : `619d0f10` (correctif Bridge/rapports VT). **Non déployés** : brouillon `draft_text` utilisable (`82e059fe`), import de plusieurs règles YARA (`cec56215`), déblocage du checkpoint de décompilation + export d'audit + indice d'erreur (`8b63991e`), skills (`391bfa49`, fichiers stagés, pas de déploiement).
 - Le checkout principal `/home/nill/perso/work/AutoWork` est en HEAD détaché sur `619d0f10` (c'était le déploiement). Pour redéployer : se placer sur le commit de `main` voulu, `export RULE_WORKBENCH_ENABLED=true` (le `.env` de l'utilisateur force `false`, ne le lis pas), utiliser `docs/mission07/tools/safe_deploy.sh` avec `RELAY_WORKDIR` pointant sur un répertoire de relais en cours ; **sans relais actif** (aucun ne tourne), vérifie qu'aucun opérateur ni appel n'est en vol puis lance `make up`. Vérifie ensuite : variable `RULE_WORKBENCH_ENABLED=true` dans les conteneurs `backend` et `worker`, présence du nouveau code (`grep` dans `/app/src`), réseau `metaharness-models`, `GET http://chatgpt-bridge:8001/health` depuis le backend.
 - Aucune migration dans cette branche.
@@ -73,4 +73,4 @@ Unitaire : 36 échecs (rendus Typst réels et `test_advisor_prompt_golden`). FAS
 2. Lancer l'essai 3 (§4), surveiller (`watch.sh`), arrêter et signaler selon §3.
 3. Auditer (§7), classer, corriger ce qui est corrigeable, requalifier une dernière fois si un correctif de comportement le justifie.
 4. Soumettre à l'utilisateur : décision sur la route PCAP, plan de reset, verdict de déploiement en production.
-5. Mettre à jour `docs/mission13/M13_REPORT.md`, committer, ne rien pousser sur `main` sans demande (la PR #23 est déjà fusionnée ; ouvre une nouvelle PR pour la suite).
+5. Mettre à jour `docs/mission13/M13_REPORT.md` et committer sur `bridge-simp/integration` (PR #23 encore ouverte) ; ne fusionne ni ne pousse sur `main` sans décision de l'utilisateur.

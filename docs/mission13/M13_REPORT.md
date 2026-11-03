@@ -127,3 +127,7 @@ Unitaire hors intégration : **36 échecs, tous ceux de `main`** (aucun nouveau)
 ## 13. Non réalisé
 
 Troisième qualification après les correctifs L1/L2/checkpoints/export : **à faire**, voir `docs/mission13/M13_HANDOFF.md`. Aucune validation de production n'est revendiquée.
+
+## 14. État de la fusion
+
+PR #23 **non fusionnée** : la fusion demandée par l'utilisateur a été refusée par le contrôle de permissions de l'environnement (CI rouge, pas de revue humaine) et n'a pas été contournée. Les échecs CI sont ceux de `main` (§1 et §12). Décision utilisateur requise.
