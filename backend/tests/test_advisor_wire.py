@@ -37,7 +37,7 @@ _ARCHIVED_RUN12_CORPUS = (
 )
 
 
-def test_wire_dossier_renders_relevant_measurement_with_byte_provenance() -> None:
+def test_wire_dossier_omits_unverified_measurement_bytes_but_keeps_provenance() -> None:
     prompt_data = {
         "question": "Vérifier les octets observés autour de l'offset 15232.",
         "consultation_type": "yara_draft",
@@ -68,18 +68,54 @@ def test_wire_dossier_renders_relevant_measurement_with_byte_provenance() -> Non
     rendered = render_advisor_wire_input(prompt_data)
 
     assert "[E1]" in rendered
-    fragment_sha256 = hashlib.sha256(bytes.fromhex("1944")).hexdigest()
-    assert (
-        "hex, offset 15232; encoding=hex; byte_length=2; length=2; sha256="
-        + fragment_sha256
-        + "; fragment_sha256="
-        + fragment_sha256
-        + ": 1944"
-    ) in rendered
-    assert "offset 0" not in rendered
-    assert "measurement_id" not in rendered
-    assert "a" * 64 not in rendered
-    assert "1" * 64 not in rendered
+    assert "content_omission_reason=sample_range_not_verified_against_canonical_blob" in rendered
+    assert "offset=15232" in rendered
+    assert "1944" not in rendered
+    assert "offset=0" in rendered
+    assert "measurement_id=m002" in rendered
+    assert "a" * 64 in rendered
+    assert "1" * 64 in rendered
+
+
+def test_vt_file_observation_cannot_disclose_unverified_measurement_bytes() -> None:
+    evidence_id = str(uuid4())
+    evidence_sha256 = "a" * 64
+    sentinel = "53454E54494E454C"
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Review the hex bytes at offset 64.",
+            "evidence_refs": [evidence_id],
+            "evidence": [
+                {
+                    "evidence_id": evidence_id,
+                    "sha256": evidence_sha256,
+                    "source": "VirusTotal",
+                    "object_type": "file",
+                    "content_excerpts": [],
+                }
+            ],
+            "measurements": [
+                {
+                    "measurement_id": "m-vt-file",
+                    "evidence_id": evidence_id,
+                    "evidence_sha256": evidence_sha256,
+                    "kind": "hex",
+                    "encoding": "hex",
+                    "offset": 64,
+                    "length": 8,
+                    "value": sentinel,
+                }
+            ],
+        }
+    )
+
+    assert sentinel not in dossier.text
+    assert "sample_range_not_verified_against_canonical_blob" in dossier.text
+    assert evidence_id in dossier.text
+    assert evidence_sha256 in dossier.text
+    assert "offset=64" in dossier.text
+    assert "length=8" in dossier.text
 
 
 def test_advisor_dossier_preserves_large_authorized_evidence_without_a_size_cap() -> None:
@@ -292,7 +328,7 @@ REFS: E1
     assert parsed["reviews"][0]["basis_refs"] == [{"kind": "opinion", "id": source_ref}]
 
 
-def test_unreadable_cited_observations_produce_one_relevant_limit_not_empty_cards() -> None:
+def test_cited_observations_without_loaded_content_keep_reference_and_omission_reason() -> None:
     observation_ids = [str(uuid4()) for _ in range(3)]
     prompt_data = {
         "consultation_type": "review_text",
@@ -319,11 +355,11 @@ def test_unreadable_cited_observations_produce_one_relevant_limit_not_empty_card
 
     dossier = build_advisor_dossier(prompt_data)
 
-    assert dossier.text.count("Limite pertinente:") == 1
-    assert "3 observation(s) citée(s)" in dossier.text
+    assert dossier.text.count("Référence d'observation — contenu omis") == 3
+    assert dossier.text.count("content_omission_reason=") == 3
     assert "Contenu source cité" not in dossier.text
-    assert all(identifier not in dossier.text for identifier in observation_ids)
-    assert dossier.manifest == ()
+    assert all(identifier in dossier.text for identifier in observation_ids)
+    assert len(dossier.manifest) == 3
 
 
 @pytest.mark.skipif(
@@ -2623,7 +2659,9 @@ def test_yara_dossier_keeps_measured_bytes_and_article_context() -> None:
                     "sample_sha256": "c" * 64,
                     "kind": "hex",
                     "offset": 0,
+                    "length": 2,
                     "value": "4d5a",
+                    "range_verified": True,
                 }
             ],
         }

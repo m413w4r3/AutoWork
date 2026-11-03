@@ -296,7 +296,7 @@ def test_contradiction_assertion_with_a_cited_finding_is_informational_not_block
     assert preflight["missing_refs"] == []
 
 
-def test_canonical_contradiction_omitted_from_dossier_requests_retrieval() -> None:
+def test_canonical_contradiction_without_any_loaded_proof_is_insufficient() -> None:
     finding_id = str(uuid4())
     question = "Expose la contradiction dans les constatations canoniques."
     data = _planning_data(
@@ -316,10 +316,8 @@ def test_canonical_contradiction_omitted_from_dossier_requests_retrieval() -> No
     omitted = AdvisorDossier(text="DOSSIER DE FAITS\nAucune preuve sélectionnée.", manifest=())
     preflight = evaluate_advisor_evidence_preflight(data, omitted, f"TASK: {question}")
 
-    assert preflight["status"] == "NEEDS_RETRIEVAL"
-    assert "RETRIEVABLE" in {
-        row["status"] for row in _item(preflight, "finding", finding_id)["statuses"]
-    }
+    assert preflight["status"] == "INSUFFICIENT_EVIDENCE"
+    assert any("No canonical observation" in row["reason"] for row in preflight["missing_refs"])
 
     included = build_advisor_dossier(data)
     recovered = evaluate_advisor_evidence_preflight(
@@ -546,7 +544,13 @@ def test_lexically_omitted_alias_is_reported_as_unverified_selection() -> None:
     preflight = evaluate_advisor_evidence_preflight(data, dossier, dossier.text)
 
     assert selected_id in {row["id"] for row in dossier.manifest}
-    assert alias_id not in {row["id"] for row in dossier.manifest}
+    alias_row = next(
+        row for row in dossier.manifest if row["kind"] == "observation" and row["id"] == alias_id
+    )
+    assert alias_row["origin"] == "observation_reference_only"
+    assert alias_row["content_omission_reason"].startswith(
+        "Canonical content was omitted by task relevance selection"
+    )
     omitted = _item(preflight, "observation", alias_id)
     statuses = {row["status"] for row in omitted["statuses"]}
     reasons = " ".join(row["reason"] for row in omitted["statuses"]).casefold()
@@ -826,6 +830,7 @@ def test_measurement_dossier_labels_fragment_digest_and_complete_provenance(
         "blob_id": "blob-fixture-id",
         "association_id": "association-fixture-id",
         "mime_type": "application/x-fragment-fixture; version=4",
+        "range_verified": True,
     }
     data = _planning_data(question="Review this hex byte measurement.", evidence=[], findings=[])
     data["consultation_type"] = "yara_draft"
@@ -883,6 +888,16 @@ def test_yara_required_measurements_survive_numeric_lexical_selection() -> None:
             "evidence_id": evidence_id,
             "evidence_sha256": "c" * 64,
             "kind": "string",
+            "range_verified": index == 1,
+            **(
+                {}
+                if index == 1
+                else {
+                    "content_omission_reason": (
+                        "sample_range_not_explicitly_selected_or_task_targeted"
+                    )
+                }
+            ),
         }
         for index in range(1, 221)
     ]
@@ -892,7 +907,16 @@ def test_yara_required_measurements_survive_numeric_lexical_selection() -> None:
 
     assert preflight["status"] == "READY"
     assert preflight["missing_refs"] == []
-    assert {item["id"] for item in dossier.manifest if item["kind"] == "measurement"} == {"m001"}
+    measurement_rows = [item for item in dossier.manifest if item["kind"] == "measurement"]
+    assert {item["id"] for item in measurement_rows} == {f"m{index:03d}" for index in range(1, 221)}
+    assert {item["id"] for item in measurement_rows if item["origin"] == "typed_measurement"} == {
+        "m001"
+    }
+    assert all(
+        "SyntheticMarker" not in item["label"]
+        for item in measurement_rows
+        if item["origin"] == "measurement_reference_only"
+    )
     required_measurements = {
         item["id"]
         for item in preflight["items"]
@@ -904,12 +928,16 @@ def test_yara_required_measurements_survive_numeric_lexical_selection() -> None:
         for item in preflight["items"]
         if item["kind"] == "measurement" and item["id"] == "m002"
     )
-    assert {row["status"] for row in omitted["statuses"]} >= {
-        "INFORMATIONAL",
-        "INTENTIONALLY_OMITTED",
-    }
+    assert {row["status"] for row in omitted["statuses"]} >= {"INFORMATIONAL", "IN_DOSSIER"}
+    omitted_manifest_row = next(
+        row for row in dossier.manifest if row["kind"] == "measurement" and row["id"] == "m002"
+    )
+    assert omitted_manifest_row["origin"] == "measurement_reference_only"
+    assert omitted_manifest_row["content_omission_reason"] == (
+        "sample_range_not_explicitly_selected_or_task_targeted"
+    )
     omitted_reasons = " ".join(row["reason"] for row in omitted["statuses"])
-    assert "not selected or explicitly targeted" in omitted_reasons
+    assert "sample_range_not_explicitly_selected_or_task_targeted" in omitted_reasons
 
 
 def test_multi_megabyte_yara_dossier_keeps_every_required_measurement() -> None:
@@ -928,6 +956,7 @@ def test_multi_megabyte_yara_dossier_keeps_every_required_measurement() -> None:
             "evidence_id": "synthetic-observation",
             "evidence_sha256": "b" * 64,
             "kind": "string",
+            "range_verified": True,
         }
         for index in range(1, 5)
     ]

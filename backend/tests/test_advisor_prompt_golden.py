@@ -247,12 +247,12 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
             1266,
         ),
         "pivot_strategy": (
-            "55303b63424d1b0e05d87dc5fa63dece4a8c089d95d14b63748c13d27bce11d2",
-            1367,
+            "aa9b10637ac96222dc80369901ec64d3dccb9df63985953665006f09f2004fec",
+            1241,
         ),
         "yara_draft_base64_hex": (
-            "f5700feb97f39264dbfe453cd59191bb8730aa88a53e53d254af36fe51255552",
-            1829,
+            "7ccf4d806cf7b0686ab7293aa0e5167eb102bbecc8ff50caca95d66edacbdce2",
+            2451,
         ),
         "review_text_multi_unit_versioned": (
             "4957c604edb1ee63e9070f128bff06251386222eb884d0a8cd3a7709847d2213",
@@ -262,10 +262,10 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
             "eb71c1b57c1ba2af5edcaddc89711f7942fb560d63126a17492a74a56c7982f4",
             1221,
         ),
-        "draft_text": ("d75d514e44b376ff7846c355edc5a1b452814023ae6a5ecbb71aebe5ed9946db", 1193),
+        "draft_text": ("4ec7622f59f261687794627bc6d448c2d0c357329628b7384cf8fff834d0867f", 1736),
         "suricata_draft": (
-            "3cac1f343949881b69da80759ca3f8904b935911924600d42e0144608297ca84",
-            1139,
+            "6e219f616c98ec311024f122cd00d3c6e1caea56bf08e160a211cb823fb99c53",
+            1350,
         ),
         "figure_plan": ("7a640d86aa95ad873f2d3230e9f2c75b76e5e67307dd8d76c948b19a061aa7e1", 1307),
         "unicode_crlf": ("7f7d8819f47edabf3f637317308a5d9ea537c2a6594d50576dc2efbde7c88b74", 1180),

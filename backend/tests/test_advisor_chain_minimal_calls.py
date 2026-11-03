@@ -306,7 +306,6 @@ async def test_minimal_call_auto_assembles_canonical_dossier_and_returns_advisor
     tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
     sample_hashes = await _seed_chain(investigation_id, tool)
     context = make_dispatch_context(investigation_id)
-
     result = await _dispatch(tool, context, consultation_type)
     assert len(transport.calls) == 1, (
         result.status.value,
@@ -484,7 +483,7 @@ async def test_unselected_restricted_sample_is_excluded_without_blocking_other_e
 
 
 @pytest.mark.asyncio
-async def test_large_associated_sample_is_sent_complete_with_exact_dispatch_reservation() -> None:
+async def test_large_sample_stays_provenance_only_with_exact_reservation() -> None:
     investigation_id = uuid4()
     sample_content = bytes(index % 251 for index in range(3_200_000))
     tool, transport, observation, _sample_id, _association_id, _blob_id, sample_hash = (
@@ -508,11 +507,14 @@ async def test_large_associated_sample_is_sent_complete_with_exact_dispatch_rese
 
     assert len(transport.calls) == 1, result
     prompt = transport.calls[0]["prompt"]
-    assert base64.b64encode(sample_content).decode("ascii") in prompt
-    assert "length=3200000" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert "content_base64:" not in prompt
+    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    assert "content_request_hint=" in prompt
+    assert "encoding=base64; offset=0; length=3200000" not in prompt
     assert "byte_length=3200000" in prompt
-    assert "omitted_range" not in prompt
     assert sample_hash in prompt
+    assert len(prompt.encode("utf-8")) < 32_000
     prompt_bytes = len(prompt.encode("utf-8"))
     assert (
         result.budget_consumed[

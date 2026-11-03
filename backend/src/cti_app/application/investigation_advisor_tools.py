@@ -33,6 +33,7 @@ from cti_app.application.advisor_contracts import (
 )
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
+    _measurement_explicitly_targeted,
     _sample_disclosure_restriction_sources,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
@@ -521,6 +522,10 @@ class InvestigationAdvisorTool:
                 object_hash = observation.object_id.partition(":")[0]
                 if object_hash in associated_hashes:
                     references.add(object_hash)
+            if _is_sample_content_omitted_observation(observation):
+                for sample_hash in references:
+                    indexed.setdefault(sample_hash, []).append(observation)
+                continue
             payload = await self._load_observation_json_payload(observation)
             references.update(_payload_sample_hashes(payload).intersection(associated_hashes))
             for sample_hash in references:
@@ -544,10 +549,11 @@ class InvestigationAdvisorTool:
         arguments: Mapping[str, Any],
         context: ToolExecutionContext,
     ) -> Mapping[BudgetDimension, int]:
-        """Estimate a conservative context reservation without reading blobs.
+        """Measure the context reservation from the task-selected dossier.
 
-        Execute re-reads mutable policy and verifies the exact prompt before
-        submission. This estimate uses record and blob-descriptor sizes only.
+        The estimate follows the same canonical evidence selection and prompt
+        renderer as execution. Execution rechecks disclosure policy before
+        submission; unselected sample bytes remain outside both prompts.
         """
         started_at = time.perf_counter()
         try:
@@ -584,99 +590,179 @@ class InvestigationAdvisorTool:
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
             if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return no_context_cost
-            observation_list = getattr(self._observations, "list_for_investigation", None)
-            observations = (
-                tuple(await observation_list(context.investigation_id))
-                if callable(observation_list)
-                else ()
+            consultation_context = await self._make_consultation_context(
+                context.investigation_id,
+                investigation,
+                snapshot,
             )
-            association_list = getattr(self._sample_associations, "list_for_investigation", None)
-            associations = (
-                tuple(await association_list(context.investigation_id))
-                if callable(association_list)
-                else ()
-            )
-            sample_list = getattr(self._samples, "list_for_subject", None)
-            samples = (
-                tuple(await sample_list(investigation.subject_id)) if callable(sample_list) else ()
-            )
-            findings: tuple[Any, ...] = ()
-            if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
-                finding_list = getattr(self._findings, "list_for_investigation", None)
-                findings = (
-                    tuple(await finding_list(context.investigation_id))
-                    if callable(finding_list)
-                    else ()
-                )
-
-            descriptor_reader = getattr(self._blobs, "get", None)
-            observation_source_bytes = 0
-            seen_blob_ids: set[UUID] = set()
-            if callable(descriptor_reader):
-                for blob_id in (item.blob_id for item in observations):
-                    if not isinstance(blob_id, UUID) or blob_id in seen_blob_ids:
+            context_token = _CURRENT_ADVISOR_CONTEXT.set(consultation_context)
+            try:
+                explicit_refs: list[UUID] = []
+                for raw_ref in raw_refs:
+                    try:
+                        explicit_refs.append(UUID(str(raw_ref)))
+                    except (TypeError, ValueError):
                         continue
-                    seen_blob_ids.add(blob_id)
-                    blob = await descriptor_reader(blob_id)
-                    descriptor = getattr(blob, "descriptor", None)
-                    size = getattr(descriptor, "size", None)
-                    if type(size) is int and size >= 0:
-                        observation_source_bytes += size
-
-            sample_source_bytes = 0
-            include_sample_content = consultation_type not in {
-                "draft_text",
-                "review_text",
-                "suricata_draft",
-                "figure_plan",
-            }
-            if callable(descriptor_reader) and include_sample_content:
-                association_counts: dict[str, int] = {}
-                for association in associations:
-                    sample_hash = getattr(association, "sample_sha256", None)
-                    if isinstance(sample_hash, str):
-                        association_counts[sample_hash] = association_counts.get(sample_hash, 0) + 1
-                first_sample_by_hash: dict[str, Any] = {}
-                for sample in samples:
-                    sample_hash = getattr(sample, "expected_hash", None) or getattr(
-                        sample, "source_object_id", None
+                explicit_evidence = await self._load_cited_evidence(
+                    context, tuple(dict.fromkeys(explicit_refs))
+                )
+                auto_evidence = tuple(
+                    sorted(
+                        (
+                            item
+                            for item in consultation_context.observations
+                            if item.source not in {ADVISOR_TOOL_NAME, ADVISOR_RESPONSE_SOURCE}
+                        ),
+                        key=lambda item: (item.observed_at, str(item.id)),
+                        reverse=True,
                     )
-                    if isinstance(sample_hash, str) and sample_hash in association_counts:
-                        first_sample_by_hash.setdefault(sample_hash, sample)
-                for sample_hash, association_count in association_counts.items():
-                    sample = first_sample_by_hash.get(sample_hash)
-                    blob_id = getattr(sample, "blob_id", None)
-                    if not isinstance(blob_id, UUID):
-                        continue
-                    blob = await descriptor_reader(blob_id)
-                    descriptor = getattr(blob, "descriptor", None)
-                    size = getattr(descriptor, "size", None)
-                    if type(size) is int and size >= 0:
-                        sample_source_bytes += size * association_count
-
-            structural_bytes = _advisor_structural_size(arguments)
-            structural_bytes += _advisor_structural_size(
-                (
-                    getattr(snapshot, "article", None),
-                    getattr(snapshot, "article_passages", ()),
-                    observations,
-                    findings,
-                    associations,
-                    samples,
                 )
-            )
-            # Sample bytes enter the prompt as Base64 (4/3 expansion). Observation
-            # payloads can be rendered as escaped excerpts and measured facts, so
-            # budget six times their stored JSON size plus twice the structural
-            # metadata and fixed prompt scaffolding. The measured prompt is used
-            # to resize this estimate before transport.
-            estimated_bytes = max(
-                4_096,
-                ((sample_source_bytes + 2) // 3) * 4
-                + observation_source_bytes * 6
-                + structural_bytes * 2
-                + 4_096,
-            )
+                evidence_by_id = {item.id: item for item in (*explicit_evidence, *auto_evidence)}
+                evidence = tuple(evidence_by_id.values())
+                requested_finding_refs: tuple[UUID, ...] = ()
+                linked_finding_observation_refs: tuple[UUID, ...] = ()
+                if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
+                    finding_rows = self._latest_findings(
+                        tuple(
+                            item
+                            for item in consultation_context.findings
+                            if getattr(item, "investigation_id", context.investigation_id)
+                            == context.investigation_id
+                        )
+                    )
+                    if consultation_type == "figure_plan":
+                        try:
+                            requested_finding_refs = tuple(
+                                UUID(str(item)) for item in arguments.get("finding_refs", ())
+                            )
+                        except (TypeError, ValueError):
+                            return no_context_cost
+                    linked_finding_observation_refs = tuple(
+                        dict.fromkeys(
+                            ref
+                            for finding in finding_rows
+                            if not requested_finding_refs or finding.id in requested_finding_refs
+                            for ref in getattr(finding, "observation_refs", ())
+                        )
+                    )
+                    if linked_finding_observation_refs:
+                        linked_evidence = await self._load_evidence(
+                            context.investigation_id, linked_finding_observation_refs
+                        )
+                        evidence_by_id = {item.id: item for item in (*evidence, *linked_evidence)}
+                        evidence = tuple(evidence_by_id.values())
+
+                restricted_hashes = await self._restricted_sample_hashes(
+                    context.investigation_id,
+                    investigation.subject_id,
+                    context.envelope,
+                )
+                protected_refs = set(explicit_refs)
+                if consultation_type == "figure_plan":
+                    protected_refs.update(linked_finding_observation_refs)
+                restricted_evidence_rows: list[EvidenceObservation] = []
+                for item in evidence:
+                    references_restricted_sample = False
+                    for sample_hash in restricted_hashes:
+                        if await self._observation_references_sample(item, sample_hash):
+                            references_restricted_sample = True
+                            break
+                    if references_restricted_sample:
+                        restricted_evidence_rows.append(item)
+                restricted_evidence = tuple(restricted_evidence_rows)
+                restricted_refs = {item.id for item in restricted_evidence}
+                if restricted_refs.intersection(protected_refs):
+                    return no_context_cost
+                evidence = tuple(item for item in evidence if item.id not in restricted_refs)
+                unassociated_hash_evidence: tuple[EvidenceObservation, ...] = ()
+                if consultation_type not in _EDITORIAL_CONSULTATION_TYPES:
+                    (
+                        evidence,
+                        unassociated_hash_evidence,
+                    ) = await self._split_unassociated_hash_observations(
+                        context.investigation_id,
+                        evidence,
+                        protected_refs,
+                    )
+
+                prompt_data = await self._consultation_data(
+                    consultation_type=consultation_type,
+                    investigation_id=context.investigation_id,
+                    investigation=investigation,
+                    snapshot=snapshot,
+                    evidence=evidence,
+                    arguments=arguments,
+                    context=context,
+                    question=question.strip(),
+                )
+                omissions = list(prompt_data.get("_disclosure_omissions", ()))
+                omissions.extend(
+                    {
+                        "kind": "observation",
+                        "id": str(item.id),
+                        "sha256": item.sha256,
+                        "source_ref": {
+                            "kind": "observation",
+                            "id": str(item.id),
+                            "sha256": item.sha256,
+                        },
+                        "reason": (
+                            "Intentionally omitted: not disclosable under current policy "
+                            "because its associated sample is restricted."
+                        ),
+                    }
+                    for item in restricted_evidence
+                )
+                omissions.extend(
+                    {
+                        "kind": "observation",
+                        "id": str(item.id),
+                        "sha256": item.sha256,
+                        "source_ref": {
+                            "kind": "observation",
+                            "id": str(item.id),
+                            "sha256": item.sha256,
+                        },
+                        "reason": (
+                            "Intentionally omitted: not disclosable under current policy "
+                            "because its sample hash is not associated with this investigation."
+                        ),
+                    }
+                    for item in unassociated_hash_evidence
+                )
+                if omissions:
+                    prompt_data["_disclosure_omissions"] = omissions
+                _drop_findings_linked_to_restricted_evidence(prompt_data, tuple(restricted_refs))
+                citation_refs = [str(item.id) for item in explicit_evidence]
+                if consultation_type == "figure_plan":
+                    citation_refs.extend(
+                        str(reference)
+                        for finding in prompt_data.get("findings", ())
+                        if isinstance(finding, Mapping)
+                        for reference in finding.get("observation_refs", ())
+                        if isinstance(reference, str)
+                    )
+                prompt_data["evidence_refs"] = list(dict.fromkeys(citation_refs))
+                prompt_data, _direct_findings = _redact_advisor_payload(
+                    prompt_data, settings=self._settings
+                )
+                dossier = build_advisor_dossier(prompt_data, envelope=context.envelope)
+                prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+                prompt_data["dossier_text"] = dossier.text
+                prompt_data["dossier_sha256"] = dossier.sha256
+                prompt_data["dossier_bytes"] = dossier.byte_size
+                prompt_data["transmitted_refs"] = _transmitted_refs_for_dossier(
+                    prompt_data, snapshot, dossier.manifest
+                )
+                prompt_data["observation_refs"] = [
+                    item["id"]
+                    for item in prompt_data["transmitted_refs"]
+                    if item["kind"] == "observation"
+                ]
+                prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
+                estimated_bytes = len(prompt.encode("utf-8"))
+            finally:
+                _CURRENT_ADVISOR_CONTEXT.reset(context_token)
         except Exception:
             return no_context_cost
         return {
@@ -1283,7 +1369,9 @@ class InvestigationAdvisorTool:
                     },
                     error_code="advisor_disclosure_restricted",
                 )
-            explicit_observation_refs = list(dict.fromkeys(str(item) for item in evidence_refs))
+            explicit_observation_refs = list(
+                dict.fromkeys(str(item.id) for item in explicit_evidence)
+            )
             if consultation_type == "figure_plan":
                 explicit_observation_refs.extend(
                     str(reference)
@@ -1340,6 +1428,7 @@ class InvestigationAdvisorTool:
             prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
             self._record_prompt_sample_hashes(context.investigation_id, prompt, prompt_data)
             encoded = prompt.encode("utf-8")
+            reservation_overrun_details = _advisor_reservation_overrun_details(dossier.manifest)
             timing.record_elapsed("dossier_rendering_ms", time.perf_counter() - dossier_started_at)
             if timing is not None:
                 timing.mark(
@@ -1386,6 +1475,7 @@ class InvestigationAdvisorTool:
                                             BudgetDimension.CONTEXT_TOKENS, 0
                                         ),
                                         "measured_context_tokens": measured_tokens,
+                                        **reservation_overrun_details,
                                         "confirmed_non_execution": True,
                                         "bridge_turns_consumed": 0,
                                         "usable": False,
@@ -1417,6 +1507,7 @@ class InvestigationAdvisorTool:
                                     BudgetDimension.CONTEXT_TOKENS, 0
                                 ),
                                 "measured_context_tokens": measured_tokens,
+                                **reservation_overrun_details,
                                 "confirmed_non_execution": True,
                                 "bridge_turns_consumed": 0,
                                 "usable": False,
@@ -1448,6 +1539,7 @@ class InvestigationAdvisorTool:
                                 BudgetDimension.CONTEXT_TOKENS, 0
                             ),
                             "measured_context_tokens": measured_tokens,
+                            **reservation_overrun_details,
                             "confirmed_non_execution": True,
                             "bridge_turns_consumed": 0,
                             "usable": False,
@@ -3920,6 +4012,8 @@ class InvestigationAdvisorTool:
             payloads: dict[str, Mapping[str, Any]] = {}
             observations_by_id = {str(item.id): item for item in evidence}
             for evidence_item in evidence:
+                if _is_sample_content_omitted_observation(evidence_item):
+                    continue
                 try:
                     payload = await self._measurement_payload(evidence_item)
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
@@ -4070,19 +4164,72 @@ class InvestigationAdvisorTool:
                     "sha256": item.sha256,
                     "source": _safe_text(item.source, 96),
                 }
-                (
-                    row["content_excerpts"],
-                    row["blob_read_verified"],
-                    row["blob_read_failure_reason"],
-                ) = await self._observation_content_projection(
-                    item, include_unclassified=str(item.id) in explicit_observation_ids
-                )
-                try:
-                    measured_rows = await self._measurement_rows(item)
-                except _AdvisorInputValidationError:
-                    raise
-                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                if item.object_type.casefold() in {
+                    "sample",
+                    "file",
+                    "sample_observation",
+                    "sha256",
+                } and re.fullmatch(r"[0-9a-f]{64}", item.object_id.casefold()):
+                    row["sample_sha256"] = item.object_id.casefold()
+                    row["content_omission_reason"] = (
+                        "sample_bytes_not_included_without_targeted_range"
+                    )
+                    row["content_request_hint"] = (
+                        "Select a verified measurement by blob_id, kind, offset, and value; "
+                        "its canonical length must match the sample bytes."
+                    )
+                if _is_sample_content_omitted_observation(item):
+                    row["content_excerpts"] = []
+                    row["content_omission_reason"] = (
+                        "subject_sample_reuse_content_not_for_advisor"
+                        if _is_subject_sample_reuse_observation(item)
+                        else "sample_bytes_not_included_without_targeted_range"
+                    )
+                    row["content_request_hint"] = (
+                        "Select a verified measurement by blob_id, kind, offset, and value; "
+                        "its canonical length must match the sample bytes."
+                    )
+                else:
+                    (
+                        row["content_excerpts"],
+                        row["blob_read_verified"],
+                        row["blob_read_failure_reason"],
+                    ) = await self._observation_content_projection(
+                        item, include_unclassified=str(item.id) in explicit_observation_ids
+                    )
+                    if row["blob_read_verified"] is False:
+                        row["content_omission_reason"] = (
+                            row["blob_read_failure_reason"]
+                            or "canonical_observation_blob_unreadable"
+                        )
+                if _is_sample_content_omitted_observation(item):
                     measured_rows = []
+                else:
+                    try:
+                        measured_rows = await self._measurement_rows(item)
+                    except _AdvisorInputValidationError:
+                        raise
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                        measured_rows = []
+                sample_hashes = tuple(
+                    dict.fromkeys(
+                        value
+                        for measurement in measured_rows
+                        if isinstance((value := measurement.get("sample_sha256")), str) and value
+                    )
+                )
+                if sample_hashes:
+                    row["sample_sha256"] = sample_hashes[0]
+                    row["sample_sha256s"] = list(sample_hashes)
+                    row.setdefault(
+                        "content_omission_reason",
+                        "sample_bytes_not_included_without_targeted_range",
+                    )
+                    row.setdefault(
+                        "content_request_hint",
+                        "Select a verified measurement by blob_id, kind, offset, and value; "
+                        "its canonical length must match the sample bytes.",
+                    )
                 sample_blob = None
                 if measured_rows:
                     sample_blob = await self._sample_blob_for_hash(
@@ -4168,6 +4315,7 @@ class InvestigationAdvisorTool:
             }
             if measurement_candidates is not None or measurement_assertion_refs:
                 measurements, content_patterns = await verified_measurements()
+                selection_fallback = False
                 if measurement_candidates is not None:
                     measurements, selection_fallback = self._advisory_measurement_selection(
                         measurements,
@@ -4207,7 +4355,20 @@ class InvestigationAdvisorTool:
                         if reference["kind"] == "measurement"
                         and reference["id"] in measurement_by_id
                     ]
+                measurement_rows = await self._verify_task_targeted_measurements(
+                    measurement_rows,
+                    task=question,
+                    explicit_selection=(
+                        measurement_candidates is not None and not selection_fallback
+                    )
+                    or bool(measurement_assertion_refs),
+                )
+                measurement_by_id = {str(item["measurement_id"]): item for item in measurement_rows}
                 base["measurements"] = measurement_rows
+                base["explicit_measurement_selection"] = (
+                    measurement_candidates is not None and not selection_fallback
+                )
+                base["measurement_selection_fallback"] = selection_fallback
                 for reference in list(base.get("_explicit_assertion_refs", ())):
                     if reference["kind"] != "measurement":
                         continue
@@ -4257,6 +4418,11 @@ class InvestigationAdvisorTool:
                     "Malformed or unverifiable selections were ignored; only canonical "
                     "measurements were used.",
                 )
+            measurements = await self._verify_task_targeted_measurements(
+                measurements,
+                task=question,
+                explicit_selection=candidates is not None and not selection_fallback,
+            )
             measurements = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -4370,9 +4536,9 @@ class InvestigationAdvisorTool:
                 if set(getattr(item, "observation_refs", ())).issubset(available_observation_ids)
             ]
 
-        if consultation_type == "pivot_strategy" or (
+        if consultation_type in {"plan_investigation", "pivot_strategy"} or (
             consultation_type in _TYPED_CONSULTATION_TYPES
-            and consultation_type not in {"yara_draft", "draft_text", "review_text"}
+            and consultation_type not in {"yara_draft", "draft_text"}
         ):
             measurements, content_patterns = await verified_measurements()
             candidates = arguments.get("measurements")
@@ -4386,6 +4552,11 @@ class InvestigationAdvisorTool:
                     "Malformed or unverifiable selections were ignored; only canonical "
                     "measurements were used.",
                 )
+            measurements = await self._verify_task_targeted_measurements(
+                measurements,
+                task=question,
+                explicit_selection=candidates is not None and not selection_fallback,
+            )
             base["measurements"] = [
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
@@ -4394,20 +4565,13 @@ class InvestigationAdvisorTool:
                 candidates is not None and not selection_fallback
             )
             base["measurement_selection_fallback"] = selection_fallback
-        # Retain sample identity and provenance without attaching complete
-        # binaries to a Suricata, editorial or figure consultation by default.
-        # This is task-relevance selection, not a Bridge prompt size limit.
-        include_sample_content = consultation_type not in {
-            "draft_text",
-            "review_text",
-            "suricata_draft",
-            "figure_plan",
-        }
+        # Every consultation carries sample provenance only. Targeted ranges
+        # flow through verified measurement rows, never through sample inventory.
         sample_rows = await self._sample_inventory(
             investigation_id,
             evidence,
             context.envelope,
-            include_content=include_sample_content,
+            include_content=False,
         )
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
@@ -4445,50 +4609,14 @@ class InvestigationAdvisorTool:
                     None,
                 )
                 if matching_sample is not None:
-                    if matching_sample.get("content_status") == "verified":
-                        encoded_fragment = matching_sample.get("content_base64")
-                        fragment_length = matching_sample.get("fragment_length")
-                        fragment_sha256 = matching_sample.get("fragment_sha256")
-                        if (
-                            isinstance(encoded_fragment, str)
-                            and type(fragment_length) is int
-                            and fragment_length > 0
-                            and isinstance(fragment_sha256, str)
-                            and re.fullmatch(r"[0-9a-f]{64}", fragment_sha256)
-                        ):
-                            sample_sha256 = str(matching_sample["sha256"])
-                            omitted_range = matching_sample.get("omitted_range")
-                            provenance = [
-                                "encoding=base64",
-                                "offset=0",
-                                f"length={fragment_length}",
-                                f"byte_length={matching_sample['byte_length']}",
-                                f"sha256={sample_sha256}",
-                                f"fragment_sha256={fragment_sha256}",
-                                f"sample_sha256={sample_sha256}",
-                                f"sample_id={matching_sample['sample_id']}",
-                                f"association_id={matching_sample['association_id']}",
-                                f"sample_blob_id={matching_sample['blob_id']}",
-                                f"evidence_id={evidence_id}",
-                                f"evidence_sha256={observation.sha256}",
-                                f"mime_type={matching_sample['mime_type']}",
-                            ]
-                            if isinstance(omitted_range, str) and omitted_range:
-                                provenance.append(f"omitted_range={omitted_range}")
-                            excerpts.append(
-                                {
-                                    "kind": "base64",
-                                    "title": "Vérification des octets échantillon; "
-                                    + "; ".join(provenance),
-                                    "text": encoded_fragment,
-                                }
-                            )
-                            evidence_row["blob_read_verified"] = True
-                            matching_sample["content_base64"] = ""
-                            matching_sample["content_omission_reason"] = (
-                                "included_as_cited_observation_fragment"
-                            )
-                    elif matching_sample.get("content_status") != "not_requested_for_consultation":
+                    evidence_row["content_omission_reason"] = (
+                        "sample_bytes_not_included_without_targeted_range"
+                    )
+                    evidence_row["content_request_hint"] = (
+                        "Select a verified measurement by blob_id, kind, offset, and value; "
+                        "its canonical length must match the sample bytes."
+                    )
+                    if matching_sample.get("content_status") != "not_requested_for_consultation":
                         evidence_row["blob_read_failure_reason"] = _sample_blob_failure_reason(
                             matching_sample.get("content_status")
                         )
@@ -4796,25 +4924,54 @@ class InvestigationAdvisorTool:
                 "object_type": _safe_text(item.object_type, 48),
                 "source": _safe_text(item.source, 48),
             }
-            (
-                row["content_excerpts"],
-                row["blob_read_verified"],
-                row["blob_read_failure_reason"],
-            ) = await self._observation_content_projection(
-                item,
-                include_unclassified=(
-                    str(item.id) in explicit_observation_refs
-                    or item.id in finding_linked_observation_refs
-                ),
-            )
+            if item.object_type.casefold() in {
+                "sample",
+                "file",
+                "sample_observation",
+                "sha256",
+            } and re.fullmatch(r"[0-9a-f]{64}", item.object_id.casefold()):
+                row["sample_sha256"] = item.object_id.casefold()
+                row["content_omission_reason"] = "sample_bytes_not_included_without_targeted_range"
+                row["content_request_hint"] = (
+                    "Select a verified measurement by blob_id, kind, offset, and value; "
+                    "its canonical length must match the sample bytes."
+                )
+            sample_content_omitted = _is_sample_content_omitted_observation(item)
+            if sample_content_omitted:
+                row["content_excerpts"] = []
+                row["content_omission_reason"] = (
+                    "subject_sample_reuse_content_not_for_advisor"
+                    if _is_subject_sample_reuse_observation(item)
+                    else "sample_bytes_not_included_without_targeted_range"
+                )
+                row["content_request_hint"] = (
+                    "Select a verified measurement by blob_id, kind, offset, and value; "
+                    "its canonical length must match the sample bytes."
+                )
+            else:
+                (
+                    row["content_excerpts"],
+                    row["blob_read_verified"],
+                    row["blob_read_failure_reason"],
+                ) = await self._observation_content_projection(
+                    item,
+                    include_unclassified=(
+                        str(item.id) in explicit_observation_refs
+                        or item.id in finding_linked_observation_refs
+                    ),
+                )
             observation_payload.append(row)
 
-            try:
-                measurements = await self._measurement_rows(item)
-            except _AdvisorInputValidationError:
-                raise
-            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            if sample_content_omitted:
                 measurements = []
+            else:
+                try:
+                    measurements = await self._measurement_rows(item)
+                except _AdvisorInputValidationError:
+                    raise
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                    measurements = []
+            omitted_sample_bytes = False
             for measurement in measurements:
                 raw_value = measurement.get("value")
                 kind = str(measurement.get("kind", "measurement"))
@@ -4871,6 +5028,12 @@ class InvestigationAdvisorTool:
                                 fragment_bytes = None
 
                 sample_hash = measurement.get("sample_sha256")
+                if sample_hash and (
+                    kind.casefold() in {"hex", "hexdump", "base64", "bytes"}
+                    or encoding in {"hex", "hexdump", "base64", "bytes", "raw"}
+                ):
+                    omitted_sample_bytes = True
+                    continue
                 sample_blob = await self._sample_blob_for_hash(
                     investigation_id,
                     item.object_id,
@@ -4915,6 +5078,12 @@ class InvestigationAdvisorTool:
                     if mime_type:
                         fact["mime_type"] = mime_type
                 measured_payload.append(fact)
+            if omitted_sample_bytes:
+                row["content_omission_reason"] = "sample_bytes_not_included_without_targeted_range"
+                row["content_request_hint"] = (
+                    "Select a verified measurement by blob_id, kind, offset, and value; "
+                    "its canonical length must match the sample bytes."
+                )
 
         finding_payload = [
             {
@@ -4945,7 +5114,7 @@ class InvestigationAdvisorTool:
         observations: tuple[EvidenceObservation, ...],
         envelope: InvestigationEnvelope | None,
         *,
-        include_content: bool = True,
+        include_content: bool = False,
     ) -> list[dict[str, Any]]:
         timing = _CURRENT_ADVISOR_TIMING.get()
         started_at = time.perf_counter()
@@ -4968,7 +5137,7 @@ class InvestigationAdvisorTool:
         observations: tuple[EvidenceObservation, ...],
         envelope: InvestigationEnvelope | None,
         *,
-        include_content: bool = True,
+        include_content: bool = False,
     ) -> list[dict[str, Any]]:
         investigation = await self._get_investigation(investigation_id)
         if investigation is None:
@@ -5052,6 +5221,10 @@ class InvestigationAdvisorTool:
                         "evidence_sha256s": evidence_sha256s,
                         "content_status": reason,
                         "content_base64": "",
+                        "content_omission_reason": "sample_content_unavailable",
+                        "content_request_hint": (
+                            "Restore the canonical sample blob before selecting a verified range."
+                        ),
                     }
                 )
                 if current is not None:
@@ -5128,7 +5301,9 @@ class InvestigationAdvisorTool:
             fragment = blob_content if blob_content is not None else b""
             omitted_range = ""
             content_omission_reason = (
-                "whole_sample_not_needed_for_consultation" if not include_content else ""
+                "whole_sample_not_needed_for_consultation"
+                if not include_content
+                else "whole_sample_not_included_by_advisor_dossier"
             )
             rows.append(
                 {
@@ -5157,6 +5332,10 @@ class InvestigationAdvisorTool:
                     ),
                     "omitted_range": omitted_range,
                     "content_omission_reason": content_omission_reason,
+                    "content_request_hint": (
+                        "Select a verified measurement by blob_id, kind, offset, and value; "
+                        "its canonical length must match the sample bytes."
+                    ),
                     "content_status": content_status,
                     "association_status": _safe_text(
                         getattr(
@@ -5199,6 +5378,131 @@ class InvestigationAdvisorTool:
                     association_id=getattr(association, "id", None),
                 )
         return rows
+
+    async def _verify_targeted_measurement_ranges(
+        self,
+        measurements: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Verify explicitly selected byte ranges against their canonical sample blobs."""
+        verified_sample_bytes: dict[UUID, tuple[bytes | None, str]] = {}
+        current = self._consultation_context()
+        results: list[dict[str, Any]] = []
+        for measurement in measurements:
+            row = dict(measurement)
+            reason = "sample_range_verification_failed"
+            try:
+                blob_id = UUID(str(row.get("blob_id")))
+            except (TypeError, ValueError):
+                row.update(
+                    range_verified=False,
+                    content_omission_reason="sample_range_blob_reference_invalid",
+                )
+                results.append(row)
+                continue
+            offset = row.get("offset")
+            length = row.get("length")
+            sample_sha256 = _safe_text(row.get("sample_sha256"), 64)
+            fragment_bytes = _measurement_fragment_bytes(row)
+            if type(length) is not int and fragment_bytes is not None:
+                length = len(fragment_bytes)
+                row["length"] = length
+            descriptor_blob = await self._get_blob_descriptor(blob_id)
+            descriptor = getattr(descriptor_blob, "descriptor", None)
+            if (
+                type(offset) is not int
+                or offset < 0
+                or type(length) is not int
+                or length <= 0
+                or fragment_bytes is None
+                or len(fragment_bytes) != length
+                or not re.fullmatch(r"[0-9a-f]{64}", sample_sha256)
+                or descriptor is None
+                or descriptor.logical_bucket != "samples-quarantine"
+                or descriptor.sha256 != sample_sha256
+                or type(descriptor.size) is not int
+                or descriptor.size < offset + length
+            ):
+                row.update(range_verified=False, content_omission_reason=reason)
+                results.append(row)
+                continue
+            if blob_id in verified_sample_bytes:
+                sample_content, status = verified_sample_bytes[blob_id]
+            else:
+                try:
+                    sample_content = await self._read_consultation_blob(
+                        blob_id, max_bytes=descriptor.size
+                    )
+                    status = (
+                        "verified"
+                        if isinstance(sample_content, bytes)
+                        and len(sample_content) == descriptor.size
+                        and hashlib.sha256(sample_content).hexdigest() == sample_sha256
+                        else "sample_content_hash_mismatch"
+                    )
+                    if status != "verified":
+                        sample_content = None
+                except Exception:
+                    sample_content = None
+                    status = "sample_blob_unreadable"
+                verified_sample_bytes[blob_id] = (sample_content, status)
+                if current is not None:
+                    current.verified_sample_bytes[blob_id] = (sample_content, status)
+            fragment_sha256 = hashlib.sha256(fragment_bytes).hexdigest()
+            declared_fragment = row.get("fragment_sha256")
+            declared_fragment_sha256 = (
+                _safe_text(declared_fragment, 64) if isinstance(declared_fragment, str) else ""
+            )
+            if (
+                sample_content is not None
+                and sample_content[offset : offset + length] == fragment_bytes
+                and (not declared_fragment_sha256 or declared_fragment_sha256 == fragment_sha256)
+            ):
+                row.update(
+                    range_verified=True,
+                    range_length=length,
+                    fragment_sha256=fragment_sha256,
+                )
+            else:
+                row.update(
+                    range_verified=False,
+                    content_omission_reason=(
+                        "sample_range_not_verified_against_canonical_blob"
+                        if status == "verified"
+                        else status
+                    ),
+                )
+            results.append(row)
+        return results
+
+    async def _verify_task_targeted_measurements(
+        self,
+        measurements: Sequence[Mapping[str, Any]],
+        *,
+        task: str,
+        explicit_selection: bool,
+    ) -> list[dict[str, Any]]:
+        targeted: list[Mapping[str, Any]] = []
+        targeted_positions: list[int] = []
+        results: list[dict[str, Any]] = [dict(item) for item in measurements]
+        for index, item in enumerate(measurements):
+            row = dict(item)
+            is_sample_range = bool(_safe_text(row.get("sample_sha256"), 64))
+            selected = explicit_selection or _measurement_explicitly_targeted(row, task)
+            if is_sample_range and not selected:
+                row.update(
+                    range_verified=False,
+                    content_omission_reason=(
+                        "sample_range_not_explicitly_selected_or_task_targeted"
+                    ),
+                )
+                results[index] = row
+            elif is_sample_range:
+                targeted.append(row)
+                targeted_positions.append(index)
+        verified = await self._verify_targeted_measurement_ranges(targeted)
+        for index, row in zip(targeted_positions, verified, strict=True):
+            results[index] = row
+        return results
 
     async def _documented_protocol_model_facts(
         self, observation: EvidenceObservation, summary: Mapping[str, Any]
@@ -6720,6 +7024,25 @@ class InvestigationAdvisorTool:
                 )
             )
             safe_output.setdefault("refusal_guidance", message)
+        elif stage == "g2_context_reservation":
+            items = safe_output.get("heaviest_items", ())
+            rendered_items = (
+                [
+                    f"{_safe_text(item.get('kind'), 32)}:{_safe_text(item.get('id'), 96)} "
+                    f"{item.get('size_bytes', 0)} bytes ({_safe_text(item.get('origin'), 64)})"
+                    for item in items
+                    if isinstance(item, Mapping)
+                ]
+                if isinstance(items, (list, tuple))
+                else []
+            )
+            guidance = _safe_text(safe_output.get("exclusion_guidance"), 512)
+            message = (
+                "Advisor context exceeds its G2 reservation. Largest selected dossier items: "
+                + ("; ".join(rendered_items) if rendered_items else "unavailable")
+                + (f". To exclude content: {guidance}" if guidance else ".")
+            )
+            safe_output.setdefault("refusal_guidance", message)
         result = ToolResult(
             ToolInvocationStatus.UNAVAILABLE,
             observation_refs=evidence_refs,
@@ -7707,25 +8030,6 @@ def _compact_advisor_data(data: dict[str, Any], consultation_type: str) -> dict[
     return compact
 
 
-def _advisor_structural_size(value: object) -> int:
-    """Estimate UTF-8 structure size without reading or serializing blob content."""
-    if isinstance(value, str):
-        return len(value.encode("utf-8")) + 2
-    if isinstance(value, UUID):
-        return 38
-    if isinstance(value, Mapping):
-        return 2 + sum(
-            _advisor_structural_size(key) + _advisor_structural_size(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, tuple | list | set | frozenset):
-        return 2 + sum(_advisor_structural_size(item) for item in value)
-    attributes = getattr(value, "__dict__", None)
-    if isinstance(attributes, Mapping):
-        return _advisor_structural_size(attributes)
-    return 32
-
-
 def _fit_advisor_prompt(
     consultation_type: str,
     raw_data: Mapping[str, Any],
@@ -8335,6 +8639,38 @@ def _advisor_context_reservation(
         ),
         None,
     )
+
+
+def _advisor_reservation_overrun_details(
+    manifest: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for item in manifest:
+        identifier = _safe_text(item.get("id"), 128)
+        kind = _safe_text(item.get("kind"), 32)
+        origin = _safe_text(item.get("origin"), 96)
+        rendered_bytes = item.get("rendered_bytes")
+        if not identifier or type(rendered_bytes) is not int or rendered_bytes < 0:
+            continue
+        row: dict[str, Any] = {
+            "kind": kind,
+            "id": identifier,
+            "size_bytes": rendered_bytes,
+            "origin": origin,
+        }
+        source_size = item.get("byte_length")
+        if type(source_size) is int and source_size >= 0:
+            row["source_size_bytes"] = source_size
+        rows.append(row)
+    rows.sort(key=lambda item: (-item["size_bytes"], item["kind"], item["id"]))
+    heaviest = rows[:5]
+    return {
+        "heaviest_items": heaviest,
+        "exclusion_guidance": (
+            "remove an unneeded observation from evidence_refs, omit an unneeded measurements "
+            "selector, or narrow question to the facts and offsets needed"
+        ),
+    }
 
 
 def _advisor_reserved_budget(
@@ -10431,6 +10767,26 @@ def _is_downloaded_sample_bytes_observation(observation: EvidenceObservation) ->
     } and observation.object_type.casefold() in {"binary_or_non_json", "sample"}
 
 
+def _is_subject_sample_reuse_observation(observation: EvidenceObservation) -> bool:
+    return observation.source.casefold() == "investigation.subject_sample_reuse"
+
+
+def _is_sample_content_omitted_observation(observation: EvidenceObservation) -> bool:
+    direct_virustotal_sample_bytes = (
+        observation.source.casefold() == "virustotal"
+        and observation.object_type.casefold() == "file"
+        and _object_id_references_sample(observation.object_id, {observation.sha256})
+    )
+    return (
+        direct_virustotal_sample_bytes
+        or _is_subject_sample_reuse_observation(observation)
+        or (
+            _is_downloaded_sample_bytes_observation(observation)
+            and observation.source.casefold() != "investigation.subject_sample_reuse"
+        )
+    )
+
+
 def _sample_state_allows_advisor_disclosure(sample: Any) -> bool:
     return getattr(sample.state, "value", sample.state) in {
         "quarantined",
@@ -10458,6 +10814,51 @@ def _sample_blob_failure_reason(value: object) -> str:
     if isinstance(value, str) and value in reasons:
         return reasons[value]
     return "Required canonical blob is unreadable or its read capability was not verified."
+
+
+def _measurement_fragment_bytes(measurement: Mapping[str, Any]) -> bytes | None:
+    value = measurement.get("value", measurement.get("sample_material"))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, (list, tuple)) and all(
+        type(byte) is int and 0 <= byte <= 255 for byte in value
+    ):
+        return bytes(value)
+    if not isinstance(value, str):
+        return None
+    encoding = _safe_text(measurement.get("encoding"), 24).casefold().replace("-", "")
+    kind = _safe_text(measurement.get("kind"), 24).casefold()
+    if encoding == "legacy_typed":
+        encoding = (
+            "utf16le"
+            if kind in {"wide", "wide_string"}
+            else "ascii"
+            if kind in {"string", "import", "function"}
+            else "hex"
+            if kind == "hex"
+            else "base64"
+            if kind == "base64"
+            else encoding
+        )
+    if encoding in {"ascii", "utf8", "utf16le"}:
+        try:
+            return value.encode(
+                "ascii" if encoding == "ascii" else "utf-8" if encoding == "utf8" else "utf-16le"
+            )
+        except UnicodeEncodeError:
+            return None
+    compact = re.sub(r"\s+", "", value)
+    if encoding in {"raw", "hex", "hexdump", "legacytyped"} or kind == "hex":
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            return None
+    if encoding == "base64" or kind == "base64":
+        try:
+            return base64.b64decode(compact, validate=True)
+        except (ValueError, binascii.Error):
+            return None
+    return None
 
 
 def _object_id_references_sample(object_id: object, sample_hashes: set[str]) -> bool:
