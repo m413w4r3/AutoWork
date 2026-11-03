@@ -41,7 +41,7 @@ def test_bridge_reconciliation_detail_fingerprints_idempotency_key() -> None:
     detail = bridge_module._bridge_reconciliation_detail(key, None)
 
     assert key not in detail
-    assert f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}" in detail
+    assert f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}" in detail
 
 
 class _ManualClock:
@@ -1412,7 +1412,9 @@ async def test_ambiguous_transport_failure_preserves_run_identity_and_blocks_rep
     assert "resp_ambiguous" in first.failure_reason
     assert "model-run:attempt-1" not in first.failure_reason
     assert "model-run:attempt-1" not in first.detail
-    assert f"sha256:{hashlib.sha256(b'model-run:attempt-1').hexdigest()}" in (first.failure_reason)
+    assert f"sha256:{hashlib.sha256(b'model-run:attempt-1').hexdigest()[:16]}" in (
+        first.failure_reason
+    )
     assert _bridge_turns_consumed(first) == 1
     assert _submission_proves_no_execution(first) is False
     assert second.status is TurnSubmissionStatus.NEEDS_REVIEW

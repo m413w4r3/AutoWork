@@ -36,6 +36,7 @@ from cti_app.application.model_gateway import (
     ModelCapabilityError,
     ModelGatewayError,
     SafeModelRequest,
+    mark_bridge_submission_started,
     validate_structured_output,
 )
 from cti_app.domain.external_effects import (
@@ -165,12 +166,7 @@ class HttpResponsesTransport:
     ) -> dict[str, Any]:
         """Read Bridge's durable run snapshot by the exact caller key after POST ambiguity."""
         try:
-            snapshot = await self._request(
-                "GET",
-                f"/bridge/runs/{quote(idempotency_key, safe='')}",
-                phase="bridge_run_reconciliation",
-                timeout_seconds=self._capabilities_timeout,
-            )
+            snapshot = await self.reconcile_bridge_submission(idempotency_key)
         except BridgeTransportError as reconcile_error:
             reconcile_error.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
             if (
@@ -205,6 +201,15 @@ class HttpResponsesTransport:
             bridge_status=status if isinstance(status, str) else None,
         ) from None
 
+    async def reconcile_bridge_submission(self, idempotency_key: str) -> dict[str, Any]:
+        """Read a Bridge run by its exact key without creating another run."""
+        return await self._request(
+            "GET",
+            f"/bridge/runs/{quote(idempotency_key, safe='')}",
+            phase="bridge_run_reconciliation",
+            timeout_seconds=self._capabilities_timeout,
+        )
+
     async def retrieve(self, response_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/responses/{response_id}")
 
@@ -236,22 +241,55 @@ class HttpResponsesTransport:
 
         try:
             if self._client is not None:
-                response = await self._client.request(
-                    method,
-                    f"{self._base_url}{path}",
-                    json=json_body,
-                    headers=headers,
-                    timeout=timeout,
-                )
+                build_request = getattr(self._client, "build_request", None)
+                send = getattr(self._client, "send", None)
+                if callable(build_request) and callable(send):
+                    request = build_request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    if is_responses_submission:
+                        mark_bridge_submission_started()
+                    response = await send(request, follow_redirects=False)
+                else:
+                    if is_responses_submission:
+                        mark_bridge_submission_started()
+                    response = await self._client.request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
+                    )
             else:
                 async with httpx.AsyncClient(
                     timeout=timeout,
                     follow_redirects=False,
                     transport=self._http_transport,
                 ) as client:
-                    response = await client.request(
-                        method, f"{self._base_url}{path}", json=json_body, headers=headers
+                    request = client.build_request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
                     )
+                    if is_responses_submission:
+                        mark_bridge_submission_started()
+                    response = await client.send(request, follow_redirects=False)
+        except httpx.PoolTimeout as exc:
+            raise BridgeTransportError(
+                "bridge_pool_timeout",
+                "Le transport Bridge n'a pas obtenu de connexion avant l'envoi.",
+                retryable=True,
+                phase=phase,
+                submission_state=(
+                    "pre_submission" if phase == "preflight" or is_responses_submission else None
+                ),
+            ) from exc
         except httpx.ConnectError as exc:
             raise BridgeTransportError(
                 "bridge_unreachable",
@@ -620,6 +658,7 @@ class _CoordinatedResponsesPoster:
         if _freeze_httpx_request(self.__request) != request:
             raise RuntimeError("Bridge request changed after it was prepared")
         capability(request)
+        mark_bridge_submission_started()
         response = await self.__client.send(self.__request, follow_redirects=False)
         if response.is_error:
             if response.status_code == 429:
@@ -1092,6 +1131,14 @@ def _should_reconcile_bridge_submission(error: BridgeTransportError) -> bool:
         error.bridge_status == "failed" and error.verified_no_answer and error.bridge_run_id
     ):
         return False
+    if error.submission_state == "pre_submission" and error.bridge_status not in {
+        "queued",
+        "running",
+        "in_progress",
+        "completed",
+        "succeeded",
+    }:
+        return False
     # Generic server failures and UI/wait timeouts can follow a created run.
     # A prose message from an older server is not terminal non-execution proof.
     if error.status_code is not None and error.status_code >= 500:
@@ -1155,7 +1202,7 @@ def _ambiguous_bridge_submission_error(
 
 
 def _bridge_idempotency_fingerprint(idempotency_key: str) -> str:
-    return f"sha256:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()}"
+    return f"sha256:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _safe_bridge_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
@@ -1617,6 +1664,12 @@ class OpenAIResearchAdapter:
     ) -> AdapterResult:
         del role, output_schema
         return _responses_result(await self._transport.retrieve(response_id), self.provider)
+
+    async def reconcile_bridge_submission(self, idempotency_key: str) -> AdapterResult:
+        reconcile = getattr(self._transport, "reconcile_bridge_submission", None)
+        if not callable(reconcile):
+            raise ModelGatewayError("Bridge transport does not support read-only reconciliation")
+        return _responses_result(await reconcile(idempotency_key), self.provider)
 
 
 class OpenAIStructuredAdapter:

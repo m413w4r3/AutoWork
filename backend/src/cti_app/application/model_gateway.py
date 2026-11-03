@@ -7,6 +7,8 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -72,6 +74,39 @@ _BRIDGE_NON_REPLAYABLE_CODES = frozenset(
 _MODEL_SUBMISSION_RECONCILIATION_MESSAGE = (
     "La soumission du modèle doit être réconciliée avant toute nouvelle tentative."
 )
+
+_bridge_submission_started_callback: ContextVar[Callable[[], None] | None] = ContextVar(
+    "bridge_submission_started_callback", default=None
+)
+_bridge_submission_boundary_state: ContextVar[list[bool] | None] = ContextVar(
+    "bridge_submission_boundary_state", default=None
+)
+
+
+@contextmanager
+def bridge_submission_boundary(callback: Callable[[], None] | None):
+    """Carry the consultation's send marker to the HTTP boundary in this task."""
+    callback_token = _bridge_submission_started_callback.set(callback)
+    state_token = _bridge_submission_boundary_state.set([False])
+    try:
+        yield
+    finally:
+        _bridge_submission_boundary_state.reset(state_token)
+        _bridge_submission_started_callback.reset(callback_token)
+
+
+def mark_bridge_submission_started() -> None:
+    state = _bridge_submission_boundary_state.get()
+    if state is not None:
+        state[0] = True
+    callback = _bridge_submission_started_callback.get()
+    if callback is not None:
+        callback()
+
+
+def bridge_submission_has_started() -> bool | None:
+    state = _bridge_submission_boundary_state.get()
+    return state[0] if state is not None else None
 
 
 class ModelSubmissionReconciliationRequiredError(ModelGatewayError):
@@ -627,6 +662,50 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
     async def get_run(self, run_id: UUID) -> ModelRun | None:
         async with self._uow_factory() as uow:
             return await uow.model_runs.get(run_id)
+
+    async def reconcile_bridge_submission(self, run_id: UUID) -> str:
+        """Read the persisted Bridge run by its exact key and adopt a completed answer."""
+        run = await self.get_run(run_id)
+        if (
+            run is None
+            or run.backend is not ModelBackend.CHATGPT_BRIDGE
+            or run.status is not ModelRunStatus.NEEDS_REVIEW
+            or run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+            or run.model_role is None
+        ):
+            return "not_reconcilable"
+        request_id = run.bridge_request_id or _bridge_request_id(run)
+        if not request_id:
+            return "not_reconcilable"
+        adapter = self._router.by_backend(run.backend, run.model_role)
+        reconcile = getattr(adapter, "reconcile_bridge_submission", None)
+        if not callable(reconcile):
+            return "unavailable"
+        if (
+            adapter.provider is not run.provider
+            or adapter.backend is not run.backend
+            or adapter.transport is not run.transport
+        ):
+            return "unavailable"
+        try:
+            result = await reconcile(request_id)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return "not_found"
+            return "unknown"
+        if result.status is AdapterResultStatus.WAITING_BACKGROUND:
+            return "in_progress"
+        if result.status is not AdapterResultStatus.COMPLETED or result.output_text is None:
+            return "unknown"
+        await self.adopt_recovery_output(
+            run.id,
+            result.output_text.encode("utf-8"),
+            provenance="bridge_read_only_reconciliation",
+            actor_id="system:bridge_read_only_reconciliation",
+            recovery_reason="Recovered the exact response using Bridge's read-only run lookup.",
+            bridge_response_id=result.response_id,
+        )
+        return "captured_output"
 
     async def read_output(self, reference: str, *, max_bytes: int | None = None) -> bytes:
         return await self._output_store.read(
@@ -1306,6 +1385,26 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     await uow.model_runs.save(persisted)
                     await uow.commit()
                     return execution
+            except asyncio.CancelledError:
+                if (
+                    adapter.backend is ModelBackend.CHATGPT_BRIDGE
+                    and bridge_submission_has_started() is False
+                ):
+                    async with self._uow_factory() as uow:
+                        persisted = await uow.model_runs.get_for_update(run.id)
+                        if (
+                            persisted is not None
+                            and persisted.status is ModelRunStatus.RUNNING
+                            and persisted.submission_state
+                            in {
+                                ModelSubmissionState.SUBMISSION_IN_PROGRESS,
+                                ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+                            }
+                        ):
+                            persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
+                            await uow.model_runs.save(persisted)
+                            await uow.commit()
+                raise
             except Exception as exc:
                 self._diagnostics.record_failure(
                     event="model.call_failed",
@@ -1754,7 +1853,7 @@ def _reconciliation_details(
     details["submission_state"] = details.get("submission_state", run.submission_state.value)
     details["reconciliation_phase"] = "reconciliation"
     if effective_request_id and "bridge_request_id" not in details:
-        details["bridge_request_id"] = effective_request_id[:255]
+        details["bridge_request_id"] = _bridge_request_fingerprint(effective_request_id)
     return details
 
 
@@ -1787,7 +1886,7 @@ def _error_details(
     if isinstance(source_submission_state, str) and source_submission_state:
         details["submission_state"] = source_submission_state[:32]
     if isinstance(bridge_request_id, str) and bridge_request_id:
-        details["bridge_request_id"] = bridge_request_id[:255]
+        details["bridge_request_id"] = _bridge_request_fingerprint(bridge_request_id)
     diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(diagnostics, dict) and diagnostics:
         details["bridge_diagnostics"] = _safe_error_diagnostics(diagnostics)
@@ -1806,6 +1905,10 @@ def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
                 name = str(key)
                 if any(marker in name.casefold() for marker in ("prompt", "composer_text")):
                     continue
+                if name.casefold() in {"bridge_request_id", "idempotency_key", "request_id"}:
+                    if isinstance(child, str) and child:
+                        result[name[:64]] = _safe_bridge_request_fingerprint(child)
+                    continue
                 cleaned = clean(child, depth + 1)
                 if cleaned is not None:
                     result[name[:64]] = cleaned
@@ -1818,6 +1921,18 @@ def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
 
     result = clean(value)
     return result if isinstance(result, dict) else {}
+
+
+def _bridge_request_fingerprint(request_id: str) -> str:
+    return f"sha256:{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _safe_bridge_request_fingerprint(request_id: str) -> str:
+    if request_id.startswith("sha256:"):
+        digest = request_id.removeprefix("sha256:")
+        if re.fullmatch(r"[0-9a-f]{16,64}", digest):
+            return f"sha256:{digest[:16]}"
+    return _bridge_request_fingerprint(request_id)
 
 
 def _optional_metadata_text(metadata: dict[str, Any], key: str) -> str | None:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -10,6 +12,10 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
+from cti_app.application.bridge_investigator import (
+    BridgeInvestigator,
+    ModelConversationTurnTransport,
+)
 from cti_app.application.jobs import (
     JobExecutor,
     JobService,
@@ -374,7 +380,9 @@ async def test_first_submission_uses_attempt_one_bridge_identity() -> None:
     assert transport.idempotency_keys == [f"{run.id}:a1"]
 
 
-async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnostics() -> None:
+async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     transport = SubmissionAwareResponsesTransport(submission_state="submission_attempted")
     gateway, model_uow, _ = gateway_with_transport(transport)
     model_request = request(external_llm_allowed=True, run_id=uuid4())
@@ -394,6 +402,8 @@ async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnos
     assert run.submission_state.value == "external_state_unknown"
     assert run.submission_attempt == 1
     assert run.bridge_request_id == f"{run.id}:a1"
+    request_key = run.bridge_request_id
+    fingerprint = f"sha256:{hashlib.sha256(request_key.encode()).hexdigest()[:16]}"
     assert run.error_details == {
         "provider": "openai_chatgpt_bridge",
         "phase": "submission_confirmation",
@@ -401,10 +411,113 @@ async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnos
         "retryable": True,
         "attempts": 1,
         "submission_state": "submission_attempted",
-        "bridge_request_id": f"{run.id}:a1",
+        "bridge_request_id": fingerprint,
         "reconciliation_phase": "reconciliation",
         "bridge_diagnostics": {"user_turns_before": 1},
     }
+    assert request_key not in str(run.error_details)
+    assert request_key not in run.error_message
+    assert request_key not in caplog.text
+    assert fingerprint in str(run.error_details)
+
+
+@pytest.mark.parametrize("remote_state", ["completed", "missing", "running"])
+async def test_orphaned_turn_reconciliation_uses_read_only_get_without_second_post(
+    remote_state: str,
+) -> None:
+    class ReadOnlyReconciliationTransport:
+        def __init__(self) -> None:
+            self.post_keys: list[str | None] = []
+            self.get_keys: list[str] = []
+
+        async def create(self, payload, *, idempotency_key=None, timeout_seconds=None):
+            del payload, timeout_seconds
+            self.post_keys.append(idempotency_key)
+            raise BridgeTransportError(
+                "bridge_server_error",
+                "Bridge submission outcome is uncertain.",
+                retryable=False,
+                submission_state="submission_attempted",
+            )
+
+        async def retrieve(self, response_id):
+            raise AssertionError("read-only reconciliation must use the Bridge run GET")
+
+        async def reconcile_bridge_submission(self, idempotency_key: str):
+            self.get_keys.append(idempotency_key)
+            if remote_state == "missing":
+                raise BridgeTransportError(
+                    "bridge_run_not_found",
+                    "Bridge run was not found.",
+                    retryable=False,
+                    phase="bridge_run_reconciliation",
+                    status_code=404,
+                )
+            if remote_state == "running":
+                return {
+                    "id": "bridge-run-pending",
+                    "status": "running",
+                    "model": "chatgpt-web",
+                }
+            return {
+                "id": "bridge-run-completed",
+                "status": "completed",
+                "model": "chatgpt-web",
+                "output_text": "Recovered exact Bridge answer.",
+            }
+
+    transport = ReadOnlyReconciliationTransport()
+    gateway, model_uow, _output_store = gateway_with_transport(transport)
+    run_id = uuid4()
+    model_request = request(external_llm_allowed=True, run_id=run_id)
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+    run = model_uow.state[run_id]
+
+    class LocalConversationRecovery:
+        _gateway = gateway
+
+        async def reconcile_orphaned_investigation_turn(self, **_kwargs):
+            return "needs_review"
+
+        async def turn_content_by_idempotency_key(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                turn=SimpleNamespace(model_run_id=run_id),
+                output_text=None,
+            )
+
+    investigator = BridgeInvestigator(ModelConversationTurnTransport(LocalConversationRecovery()))
+    reconcile_args = {
+        "investigation_id": uuid4(),
+        "turn_index": 2,
+        "context_sha256": "a" * 64,
+        "attempt": 0,
+        "owner_job_terminal": True,
+    }
+
+    if remote_state == "missing":
+        with pytest.raises(ValueError, match=r"404.*remains ambiguous"):
+            await investigator.reconcile_orphaned_turn(**reconcile_args)
+        assert model_uow.state[run_id].status is ModelRunStatus.NEEDS_REVIEW
+        with pytest.raises(ModelSubmissionReconciliationRequiredError):
+            await gateway.research(model_request)
+    elif remote_state == "running":
+        with pytest.raises(ValueError, match="still queued or running"):
+            await investigator.reconcile_orphaned_turn(**reconcile_args)
+        assert model_uow.state[run_id].status is ModelRunStatus.NEEDS_REVIEW
+    else:
+        disposition = await investigator.reconcile_orphaned_turn(**reconcile_args)
+        assert disposition == "captured_output"
+        recovered = model_uow.state[run_id]
+        assert recovered.status is ModelRunStatus.SUCCEEDED
+        assert recovered.output_references
+        assert await gateway.read_output(recovered.output_references[0]) == (
+            b"Recovered exact Bridge answer."
+        )
+
+    assert run.bridge_request_id is not None
+    assert transport.post_keys == [run.bridge_request_id]
+    assert transport.get_keys == [run.bridge_request_id]
 
 
 async def test_restart_keeps_exact_bridge_request_identity_for_reconciliation() -> None:

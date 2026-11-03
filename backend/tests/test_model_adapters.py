@@ -562,7 +562,9 @@ async def test_bridge_classifies_auth_rejection_and_reconciles_ambiguous_server_
     assert "unsafe" not in str(caught.value)
     if status >= 500:
         assert caught.value.submission_state == "external_state_unknown"
-        assert caught.value.bridge_request_id == (f"sha256:{hashlib.sha256(b'stable').hexdigest()}")
+        assert caught.value.bridge_request_id == (
+            f"sha256:{hashlib.sha256(b'stable').hexdigest()[:16]}"
+        )
         assert "stable" not in str(caught.value)
         assert "reconcile_orphaned_turn" in str(caught.value)
 
@@ -712,6 +714,69 @@ async def test_bridge_server_error_without_explicit_non_submission_remains_uncer
     assert error.submission_state is None
 
 
+async def test_typed_pre_submission_502_skips_run_reconciliation_get() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            502,
+            request=request,
+            json={
+                "detail": {
+                    "id": "run-pre-submission",
+                    "status": "failed",
+                    "error": {
+                        "code": "bridge_server_error",
+                        "submission_state": "pre_submission",
+                    },
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create({"input": "synthetic"}, idempotency_key="typed-pre-key")
+
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.bridge_run_id == "run-pre-submission"
+    assert [request.method for request in requests] == ["POST"]
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("pool_timeout", "bridge_pool_timeout"),
+        ("connect_timeout", "bridge_timeout"),
+        ("connect_error", "bridge_unreachable"),
+    ],
+)
+async def test_httpx_failures_before_request_emission_are_retryable_pre_submission(
+    failure_kind: str,
+    expected_code: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if failure_kind == "pool_timeout":
+            raise httpx.PoolTimeout("pool unavailable", request=request)
+        if failure_kind == "connect_timeout":
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+        raise httpx.ConnectError("connection failed", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create({"input": "synthetic"}, idempotency_key="pre-send-key")
+
+    assert caught.value.code == expected_code
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.retryable is True
+    assert [request.method for request in requests] == ["POST"]
+
+
 @pytest.mark.parametrize("failure", ["read_timeout", "server_error"])
 async def test_ambiguous_bridge_submit_reconciles_run_by_idempotency_key(failure: str) -> None:
     requests: list[httpx.Request] = []
@@ -752,7 +817,7 @@ async def test_ambiguous_bridge_submit_reconciles_run_by_idempotency_key(failure
     assert caught.value.submission_state == "submission_attempted"
     assert caught.value.bridge_run_id == "resp_active_1"
     assert caught.value.bridge_request_id == (
-        f"sha256:{hashlib.sha256(b'request-key-1').hexdigest()}"
+        f"sha256:{hashlib.sha256(b'request-key-1').hexdigest()[:16]}"
     )
     assert caught.value.retryable is False
     assert "Bridge a reçu la soumission" in str(caught.value)

@@ -34,6 +34,7 @@ from cti_app.application.model_conversations import (
 from cti_app.application.model_gateway import (
     BridgeExternalEffectBinding,
     BridgeExternalEffectBindingFactory,
+    bridge_submission_boundary,
 )
 from cti_app.config import Settings, get_settings
 from cti_app.domain.investigation import canonical_json_bytes
@@ -232,6 +233,7 @@ class _AttemptAwareInvestigationTurnTransport(Protocol):
         external_llm_allowed: bool,
         timeout_seconds: float | None = None,
         attempt: int,
+        on_submission_started: Callable[[], None] | None = None,
     ) -> TurnSubmission: ...
 
 
@@ -459,9 +461,13 @@ async def submit_bridge_consultation_once(
                     failure_stage="pre_submission_policy",
                     failure_reason="current_policy_denied",
                 )
-        if on_submission_started is not None:
-            on_submission_started()
-        submission_started = True
+        deferred_submission_marker = isinstance(transport, ModelConversationTurnTransport)
+        if not deferred_submission_marker:
+            if on_submission_started is not None:
+                on_submission_started()
+            submission_started = True
+        if deferred_submission_marker:
+            submission_kwargs["on_submission_started"] = on_submission_started
         if attempt == 0:
             return await transport.submit(
                 **submission_kwargs,
@@ -749,8 +755,7 @@ def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | No
 
 
 def _bridge_reconciliation_detail(idempotency_key: str, bridge_run_id: str | None) -> str:
-    idempotency_key = idempotency_key[:255]
-    request_fingerprint = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    request_fingerprint = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
     if bridge_run_id:
         received = f"Bridge a reçu la soumission (run {bridge_run_id[:128]})"
     else:
@@ -827,13 +832,45 @@ class ModelConversationTurnTransport:
         attempt: int,
         owner_job_terminal: bool,
     ) -> str:
-        return await self._model_conversations.reconcile_orphaned_investigation_turn(
+        disposition = await self._model_conversations.reconcile_orphaned_investigation_turn(
             investigation_id=investigation_id,
             turn_index=turn_index,
             context_sha256=context_sha256,
             attempt=attempt,
             owner_job_terminal=owner_job_terminal,
         )
+        if disposition != "needs_review" or not owner_job_terminal:
+            return disposition
+
+        key = make_investigation_turn_idempotency_key(
+            investigation_id=investigation_id,
+            turn_index=turn_index,
+            context_sha256=context_sha256,
+            attempt=attempt,
+        )
+        content = await self._model_conversations.turn_content_by_idempotency_key(
+            make_investigation_conversation_id(investigation_id),
+            key,
+        )
+        if content is None:
+            return disposition
+        gateway = getattr(self._model_conversations, "_gateway", None)
+        reconcile = getattr(gateway, "reconcile_bridge_submission", None)
+        if not callable(reconcile):
+            return disposition
+        remote_disposition = await reconcile(content.turn.model_run_id)
+        if remote_disposition == "captured_output":
+            return "captured_output"
+        if remote_disposition == "in_progress":
+            raise ValueError(
+                "Bridge run is still queued or running; keep this turn pending and do not resubmit."
+            )
+        if remote_disposition == "not_found":
+            raise ValueError(
+                "Bridge returned 404 for this run; the external submission remains ambiguous. "
+                "Do not resubmit this prompt."
+            )
+        return disposition
 
     async def _recover_persisted_output(
         self,
@@ -901,6 +938,7 @@ class ModelConversationTurnTransport:
         timeout_seconds: float | None = None,
         attempt: int = 0,
         bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
+        on_submission_started: Callable[[], None] | None = None,
     ) -> TurnSubmission:
         key = make_investigation_turn_idempotency_key(
             investigation_id=investigation_id,
@@ -1023,19 +1061,20 @@ class ModelConversationTurnTransport:
             # links inside ModelConversationService.
             mode = ConversationMode.FRESH
             failure_stage = "conversation_turn_submit"
-            turn = await self._model_conversations.add_turn(
-                conversation_id,
-                message=prompt,
-                mode=mode,
-                external_llm_allowed=True,
-                stateless_external=True,
-                idempotency_key=key,
-                correlation_id=f"investigation:{investigation_id}:turn:{turn_index}:{key[:16]}",
-                context_subject_id=subject_id,
-                lifecycle_policy=ConversationPolicy.KEEP,
-                timeout_seconds=timeout_seconds,
-                bridge_external_effect_binding=bridge_external_effect_binding,
-            )
+            with bridge_submission_boundary(on_submission_started):
+                turn = await self._model_conversations.add_turn(
+                    conversation_id,
+                    message=prompt,
+                    mode=mode,
+                    external_llm_allowed=True,
+                    stateless_external=True,
+                    idempotency_key=key,
+                    correlation_id=f"investigation:{investigation_id}:turn:{turn_index}:{key[:16]}",
+                    context_subject_id=subject_id,
+                    lifecycle_policy=ConversationPolicy.KEEP,
+                    timeout_seconds=timeout_seconds,
+                    bridge_external_effect_binding=bridge_external_effect_binding,
+                )
             if turn.status is ConversationTurnStatus.NEEDS_REVIEW:
                 captured = await self._recover_persisted_output(
                     conversation_id=conversation_id,
@@ -1316,6 +1355,7 @@ class ModelConversationTurnTransport:
         attempt: int,
         timeout_seconds: float | None = None,
         bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
+        on_submission_started: Callable[[], None] | None = None,
     ) -> TurnSubmission:
         return await self.submit(
             investigation_id=investigation_id,
@@ -1327,6 +1367,7 @@ class ModelConversationTurnTransport:
             timeout_seconds=timeout_seconds,
             attempt=attempt,
             bridge_external_effect_binding=bridge_external_effect_binding,
+            on_submission_started=on_submission_started,
         )
 
 

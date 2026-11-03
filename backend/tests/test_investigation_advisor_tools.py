@@ -11531,6 +11531,8 @@ def test_retry_refusal_keeps_prior_post_out_of_pre_submission_proof() -> None:
 
 def test_ambiguous_persisted_submission_consumes_one_bridge_turn_without_refund() -> None:
     investigation_id = uuid4()
+    idempotency_key = "model-run:attempt-1"
+    idempotency_fingerprint = f"sha256:{hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]}"
     tool, _sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=Transport(None),
@@ -11543,7 +11545,7 @@ def test_ambiguous_persisted_submission_consumes_one_bridge_turn_without_refund(
         failure_reason=(
             "bridge_server_error; Bridge a reçu la soumission; résultat inconnu. "
             "Réconciliez avec "
-            "reconcile_orphaned_turn et la clé model-run:attempt-1."
+            f"reconcile_orphaned_turn et l'empreinte {idempotency_fingerprint}."
         ),
         prior_submission_made=True,
     )
@@ -11568,7 +11570,8 @@ def test_ambiguous_persisted_submission_consumes_one_bridge_turn_without_refund(
     assert result.output["bridge_turns_consumed"] == 1
     assert "bridge_server_error" in result.output["failure_reason"]
     assert "reconcile_orphaned_turn" in result.output["failure_reason"]
-    assert "model-run:attempt-1" in result.output["failure_reason"]
+    assert idempotency_key not in result.output["failure_reason"]
+    assert idempotency_fingerprint in result.output["failure_reason"]
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
     assert result.framework_pre_submission_proof is None
 
