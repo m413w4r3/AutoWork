@@ -35,6 +35,7 @@ from cti_app.application.advisor_dossier import (
     AdvisorDossier,
     _measurement_explicitly_targeted,
     _sample_disclosure_restriction_sources,
+    _terms,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -4962,8 +4963,29 @@ class InvestigationAdvisorTool:
                             )
                             if included:
                                 finding_linked_observation_refs.add(linked_observation.id)
+            target_context = [str(prompt_data.get("question", ""))]
+            for target in (*prompt_data.get("units", ()), prompt_data.get("review_text", {})):
+                if isinstance(target, Mapping):
+                    target_context.extend(
+                        value
+                        for key in ("block_type", "anchor", "text")
+                        if isinstance((value := target.get(key)), str)
+                    )
+            target_terms = _terms(" ".join(target_context))
             for finding in current_findings:
-                if set(getattr(finding, "observation_refs", ())).issubset(
+                finding_context = " ".join(
+                    str(value)
+                    for value in (
+                        getattr(finding, "kind", ""),
+                        getattr(finding, "statement", ""),
+                        *getattr(finding, "limitations", ()),
+                        *getattr(finding, "claim_refs", ()),
+                    )
+                )
+                is_targeted = str(finding.id) in explicit_finding_ids or bool(
+                    target_terms.intersection(_terms(finding_context))
+                )
+                if is_targeted and set(getattr(finding, "observation_refs", ())).issubset(
                     available_observation_ids
                 ):
                     add("finding", finding.id)
