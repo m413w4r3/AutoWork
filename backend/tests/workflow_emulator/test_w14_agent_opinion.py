@@ -372,6 +372,7 @@ async def _approve_opinion(
         UUID(opinion["id"]),
         version=opinion["version"],
         sha256=opinion["content_sha256"],
+        acknowledge_bridge_drafting_gap=True,
     )
     assert approved.status_code == 200, approved.text
     return dict(approved.json()["approved"])

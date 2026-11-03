@@ -1169,15 +1169,30 @@ async def qualify_sample_http(
 
 
 async def approve_opinion_http(
-    client: httpx.AsyncClient, opinion_id: UUID, *, version: int, sha256: str
+    client: httpx.AsyncClient,
+    opinion_id: UUID,
+    *,
+    version: int,
+    sha256: str,
+    acknowledge_bridge_drafting_gap: bool = False,
 ) -> httpx.Response:
+    reason = "Approve the reviewed synthetic opinion version."
+    if acknowledge_bridge_drafting_gap:
+        reason = (
+            "Approve the reviewed synthetic opinion version; this emulator "
+            "scenario did not run Bridge drafting, and the human approver "
+            "explicitly accepts that gap."
+        )
+    payload: dict[str, Any] = {
+        "version": version,
+        "expected_sha256": sha256,
+        "reason": reason,
+    }
+    if acknowledge_bridge_drafting_gap:
+        payload["bridge_drafting_gap_acknowledged"] = True
     return await client.post(
         f"/api/opinions/{opinion_id}/approve",
-        json={
-            "version": version,
-            "expected_sha256": sha256,
-            "reason": "Approve the reviewed synthetic opinion version.",
-        },
+        json=payload,
         headers={"Idempotency-Key": f"workflow-opinion-approve-{opinion_id}-{version}"},
     )
 
@@ -1207,13 +1222,17 @@ async def publish_opinion_http(
     *,
     version: int,
     base_publication_sha256: str,
+    acknowledge_bridge_drafting_gap: bool = False,
 ) -> httpx.Response:
+    payload: dict[str, Any] = {
+        "version": version,
+        "expected_base_publication_sha256": base_publication_sha256,
+    }
+    if acknowledge_bridge_drafting_gap:
+        payload["bridge_drafting_gap_acknowledged"] = True
     return await client.post(
         f"/api/opinions/{opinion_id}/publish",
-        json={
-            "version": version,
-            "expected_base_publication_sha256": base_publication_sha256,
-        },
+        json=payload,
         headers={"Idempotency-Key": f"workflow-opinion-publish-{opinion_id}-{version}"},
     )
 
