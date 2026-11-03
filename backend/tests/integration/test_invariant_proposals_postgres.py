@@ -327,6 +327,17 @@ async def test_p10_propose_uses_persisted_preconditions_and_replays_turn(
     goodware_service = GoodwareService(blob_catalog, uow_factory)
     baseline = await goodware_service.import_index(artifact_dir, source_dir)
     await goodware_service.bind(investigation.id, baseline.id)
+    replayed_baseline = await goodware_service.import_index(artifact_dir, source_dir)
+    await goodware_service.bind(investigation.id, replayed_baseline.id)
+    baseline_status = await goodware_service.status()
+    assert replayed_baseline.id == baseline.id
+    assert baseline_status.state.value == "loaded"
+    assert len(baseline_status.baselines) == 1
+    assert baseline_status.baselines[0].baseline_id == baseline.id
+    assert baseline_status.baselines[0].baseline_fingerprint_sha256 == (
+        baseline.baseline_fingerprint_sha256
+    )
+    assert baseline_status.baselines[0].record_count == 1
     goodware_measurement = GoodwareMeasurementService(
         blob_store,
         uow_factory,

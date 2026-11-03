@@ -576,7 +576,7 @@ def build_investigation_runtime_ports(
             max_memory_bytes=settings.analysis_capa_max_memory_bytes,
         )
         code_features = CodeFeatureService(blob_catalog, uow_factory, SmdaAdapter())
-    if settings.local_analysis_enabled:
+    if settings.local_analysis_enabled or settings.rule_workbench_enabled:
         goodware_measurement = GoodwareMeasurementService(
             blob_store,
             uow_factory,

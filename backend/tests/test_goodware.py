@@ -96,6 +96,134 @@ def test_thresholds_are_ordered() -> None:
         BanalityThresholds(suspicious_count=0, banal_count=1)
 
 
+@pytest.mark.asyncio
+async def test_startup_check_warns_when_no_goodware_baseline_is_loaded(caplog) -> None:
+    class Repository:
+        async def list_all(self):
+            return ()
+
+    class Uow:
+        goodware_baselines = Repository()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    status = await GoodwareService(object(), lambda: Uow()).check_startup()
+
+    assert status.state.value == "absent"
+    assert not status.baselines
+    assert "no goodware baseline is loaded" in caplog.text.casefold()
+
+
+@pytest.mark.asyncio
+async def test_importing_same_goodware_index_twice_does_not_reingest_or_reversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir, artifact_dir = tmp_path / "sources", tmp_path / "artifact"
+    source_dir.mkdir()
+    artifact_dir.mkdir()
+    source_bytes = b"synthetic goodware source"
+    index_bytes = b"synthetic sqlite index"
+    filename = "good-strings.db"
+    (source_dir / filename).write_bytes(source_bytes)
+    (artifact_dir / goodware_application.INDEX_FILENAME).write_bytes(index_bytes)
+    source = {
+        "filename": filename,
+        "feature_kind": "string",
+        "sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "size": len(source_bytes),
+        "entry_count": 1,
+        "occurrence_sum": 1,
+    }
+    source_set = goodware_application._source_set_sha256([source])
+    manifest = {
+        "schema_version": goodware_application.SCHEMA_VERSION,
+        "source_format": goodware_application.SOURCE_FORMAT,
+        "source_set_sha256": source_set,
+        "normalization_version": goodware_application.NORMALIZATION_VERSION,
+        "key_version": goodware_application.KEY_VERSION,
+        "index_format_version": goodware_application.INDEX_FORMAT_VERSION,
+        "baseline_fingerprint_sha256": goodware_application.baseline_fingerprint_sha256(source_set),
+        "record_count": 1,
+        "occurrence_sum": 1,
+        "index_sha256": hashlib.sha256(index_bytes).hexdigest(),
+        "index_size": len(index_bytes),
+        "sources": [source],
+    }
+    (artifact_dir / goodware_application.MANIFEST_FILENAME).write_bytes(
+        goodware_application.canonical_manifest_bytes(manifest)
+    )
+    monkeypatch.setattr(goodware_application, "_validate_artifact", lambda *_: manifest)
+
+    class Blobs:
+        def __init__(self):
+            self.ingests = 0
+
+        async def ingest(self, handle, *, logical_bucket, mime_type):
+            payload = handle.read()
+            self.ingests += 1
+            descriptor = BlobDescriptor(
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size=len(payload),
+                mime_type=mime_type,
+                logical_bucket=logical_bucket,
+            )
+            return SimpleNamespace(id=uuid4(), descriptor=descriptor)
+
+    class Repository:
+        def __init__(self):
+            self.baselines = {}
+            self.source_writes = 0
+            self.artifact_writes = 0
+
+        async def get_by_baseline_fingerprint_sha256(self, fingerprint):
+            return self.baselines.get(fingerprint)
+
+        async def add_if_absent(self, baseline):
+            if baseline.baseline_fingerprint_sha256 in self.baselines:
+                return False
+            self.baselines[baseline.baseline_fingerprint_sha256] = baseline
+            return True
+
+        async def add_sources(self, _baseline_id, _sources):
+            self.source_writes += 1
+
+        async def add_index_artifact(self, _artifact):
+            self.artifact_writes += 1
+
+    repository = Repository()
+
+    class Uow:
+        def __init__(self):
+            self.goodware_baselines = repository
+            self.commits = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def commit(self):
+            self.commits += 1
+
+    uow = Uow()
+    blobs = Blobs()
+    service = GoodwareService(blobs, lambda: uow)
+
+    first = await service.import_index(artifact_dir, source_dir)
+    second = await service.import_index(artifact_dir, source_dir)
+
+    assert second.id == first.id
+    assert blobs.ingests == 3
+    assert repository.source_writes == 1
+    assert repository.artifact_writes == 1
+    assert uow.commits == 1
+
+
 class _LookupRepository:
     def __init__(self, baseline: GoodwareBaseline, artifact: GoodwareIndexArtifact) -> None:
         self.baseline = baseline

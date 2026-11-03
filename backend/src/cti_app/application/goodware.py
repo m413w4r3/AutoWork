@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.goodware import (
     GoodwareBaseline,
     GoodwareIndexArtifact,
+    GoodwareServiceState,
     GoodwareSource,
 )
 from cti_app.domain.goodware_index import (
@@ -70,11 +72,13 @@ __all__ = [
     "_FEATURES_SQL",
     "_MAX_MANIFEST_BYTES",
     "_METADATA_SQL",
+    "GoodwareBaselineStatus",
     "GoodwareImportError",
     "GoodwareMeasurementError",
     "GoodwareMeasurementService",
     "GoodwareSQLiteReader",
     "GoodwareService",
+    "GoodwareServiceStatus",
     "PreparedGoodwareIndex",
     "_canonical_json",
     "_expected_metadata",
@@ -98,6 +102,8 @@ _ensure_ingested_descriptor = ensure_ingested_descriptor
 _expected_metadata = expected_metadata
 _verify_cached_file = verify_cached_file
 _verify_sqlite_index = verify_sqlite_index
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,9 +131,78 @@ class PreparedGoodwareIndex:
         return await asyncio.to_thread(GoodwareSQLiteReader(self.path).lookup_batch, features)
 
 
+@dataclass(frozen=True, slots=True)
+class GoodwareBaselineStatus:
+    baseline_id: UUID
+    baseline_fingerprint_sha256: str
+    normalization_version: str
+    pattern_version: str
+    record_count: int
+    occurrence_sum: int
+    source_count: int
+    schema_version: str | None
+    key_version: str | None
+    index_format_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GoodwareServiceStatus:
+    state: GoodwareServiceState
+    baselines: tuple[GoodwareBaselineStatus, ...] = ()
+    reason: str | None = None
+
+
 class GoodwareService:
     def __init__(self, blobs: BlobCatalogService, uow_factory: UnitOfWorkFactory) -> None:
         self._blobs, self._uow_factory = blobs, uow_factory
+
+    async def status(self) -> GoodwareServiceStatus:
+        async with self._uow_factory() as uow:
+            baselines = await uow.goodware_baselines.list_all()
+            entries: list[GoodwareBaselineStatus] = []
+            for baseline in baselines:
+                artifact = await uow.goodware_baselines.get_index_artifact(
+                    baseline.id,
+                    index_format_version=INDEX_FORMAT_VERSION,
+                    key_version=KEY_VERSION,
+                )
+                entries.append(
+                    GoodwareBaselineStatus(
+                        baseline_id=baseline.id,
+                        baseline_fingerprint_sha256=baseline.baseline_fingerprint_sha256,
+                        normalization_version=baseline.normalization_version,
+                        pattern_version=baseline.pattern_version,
+                        record_count=baseline.record_count,
+                        occurrence_sum=baseline.occurrence_sum,
+                        source_count=len(baseline.sources),
+                        schema_version=artifact.schema_version if artifact else None,
+                        key_version=artifact.key_version if artifact else None,
+                        index_format_version=(artifact.index_format_version if artifact else None),
+                    )
+                )
+        return GoodwareServiceStatus(
+            state=GoodwareServiceState.LOADED if entries else GoodwareServiceState.ABSENT,
+            baselines=tuple(entries),
+        )
+
+    async def check_startup(self) -> GoodwareServiceStatus:
+        try:
+            status = await self.status()
+        except Exception:
+            logger.warning(
+                "Goodware baseline status is unavailable; rule motif banality and goodware "
+                "false-positive measurements may be unavailable."
+            )
+            return GoodwareServiceStatus(
+                state=GoodwareServiceState.UNAVAILABLE,
+                reason="goodware_baseline_inventory_unavailable",
+            )
+        if status.state is GoodwareServiceState.ABSENT:
+            logger.warning(
+                "No goodware baseline is loaded; rule motif banality and goodware "
+                "false-positive measurements will be explicitly reported as unmeasured."
+            )
+        return status
 
     async def import_index(self, artifact_dir: Path, source_dir: Path) -> GoodwareBaseline:
         """Validate and persist one immutable v2 goodware index."""

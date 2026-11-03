@@ -450,6 +450,19 @@ class SqlAlchemyGoodwareBaselineRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def list_all(self) -> tuple[GoodwareBaseline, ...]:
+        rows = await self._session.scalars(
+            select(GoodwareBaselineRow).order_by(
+                GoodwareBaselineRow.created_at.desc(), GoodwareBaselineRow.id
+            )
+        )
+        baselines: list[GoodwareBaseline] = []
+        for row in rows:
+            baseline = await self._from_row(row)
+            if baseline is not None:
+                baselines.append(baseline)
+        return tuple(baselines)
+
     async def get_by_baseline_fingerprint_sha256(
         self, baseline_fingerprint_sha256: str
     ) -> GoodwareBaseline | None:

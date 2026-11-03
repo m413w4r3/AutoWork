@@ -1453,6 +1453,9 @@ def build_investigation_composition(
             corpus_inventory=(
                 cast(Any, dependencies.rule_corpus_bytes) if rule_workbench_available else None
             ),
+            goodware_measurement=dependencies.sample_goodware if rule_workbench_available else None,
+            goodware_suspicious_count=settings.goodware_suspicious_count,
+            goodware_banal_count=settings.goodware_banal_count,
             article_claims=(
                 cast(Any, dependencies.article_snapshots) if rule_workbench_available else None
             ),

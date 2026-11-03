@@ -64,13 +64,13 @@ statut local de l’outil.
 
 ## Corpus d’enquête et octets
 
-Le corpus est reconstruit à chaque test à partir des associations et index
-disponibles pour l’enquête :
+Le corpus est reconstruit à chaque test à partir des associations et imports
+binaires disponibles pour l'enquête :
 
 - associations `confirmed` et seeds documentés non rejetés : `confirmed_positive` ;
 - associations restantes (`candidate`, `related`, `rejected`, `uncertain`) :
   `out_of_cluster_candidate` ;
-- sources du baseline goodware lié à l’enquête : `goodware` ;
+- fichiers binaires importés avec le rôle manuel `goodware` : `goodware` ;
 - hashes du holdout indépendant : `holdout`, lorsque le fournisseur est configuré.
 
 Les cas sont dédupliqués par rôle et SHA-256. Le rapport conserve les hashes
@@ -78,6 +78,14 @@ exacts par rôle, le biais de sélection, la couverture, ainsi que les résultat
 `matches`, `non_matches`, `non_measurable` et erreurs pour chaque rôle. Un
 octet absent ou non lisible reste non mesurable ; il n’est pas traité comme un
 non-match.
+
+Une baseline goodware est un index de fréquences de motifs, sans les octets des
+fichiers sources. Elle mesure la banalité pendant `rule.propose`, mais ne
+fournit pas de cas au rôle `goodware` de `rule.test`. Ce dernier utilise les
+fichiers binaires importés dans le corpus. L'observation expose
+`goodware_measurement` avec `measured`, `partial` ou `unmeasured`, une raison et
+les hashes correspondants; l'absence de baseline et de fichier goodware indique
+explicitement `Goodware non mesuré`.
 
 `QuarantineRuleCorpusBytes` résout les objets par SHA-256 dans la quarantaine
 des échantillons ou le bucket des baselines goodware. Il impose une taille

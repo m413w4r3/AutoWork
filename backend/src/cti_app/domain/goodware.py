@@ -14,6 +14,12 @@ class Banality(StrEnum):
     BANAL = "BANAL"
 
 
+class GoodwareServiceState(StrEnum):
+    LOADED = "loaded"
+    ABSENT = "absent"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GoodwareFeature:
     feature_kind: str
