@@ -16,6 +16,7 @@ from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     ModelConversationTurnTransport,
 )
+from cti_app.application.external_effects import Ambiguous
 from cti_app.application.jobs import (
     JobExecutor,
     JobService,
@@ -27,6 +28,7 @@ from cti_app.application.model_gateway import (
     AdapterResultStatus,
     BackgroundResponsePendingError,
     BinaryModelInputError,
+    BridgeExternalEffectBinding,
     ExternalModelBlockedError,
     ModelCapabilities,
     ModelCapabilityError,
@@ -39,6 +41,7 @@ from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
     sanitize_model_request,
 )
+from cti_app.domain.external_effects import ExternalEffectAuthority
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -62,6 +65,7 @@ from cti_app.integrations.models import (
     OpenAIStructuredAdapter,
     QwenAdapter,
     ResponsesTransport,
+    create_coordinated_http_responses_transport,
 )
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
@@ -393,6 +397,72 @@ async def test_bridge_unsupported_protocol_is_proven_pre_submission() -> None:
 
     assert caught.value.submission_state == "pre_submission"
     assert caught.value.code == "bridge_unsupported_protocol"
+
+
+async def test_coordinated_bridge_unsupported_protocol_is_pre_submission() -> None:
+    transport_calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        transport_calls.append(request.method)
+        raise httpx.UnsupportedProtocol("synthetic unsupported protocol", request=request)
+
+    class UnsupportedProtocolCoordinator:
+        calls = 0
+
+        async def send_one(self, _authority: Any, prepared: Any, physical_transport: Any) -> Any:
+            self.calls += 1
+            try:
+                await physical_transport.submit_once(
+                    prepared.application_request,
+                    lambda _request: None,
+                )
+            except httpx.UnsupportedProtocol:
+                return Ambiguous(uuid4())
+            raise AssertionError("unsupported protocol transport unexpectedly returned")
+
+    coordinator = UnsupportedProtocolCoordinator()
+    bridge_turn_id = uuid4()
+    model_run_id = uuid4()
+    authority = ExternalEffectAuthority(
+        investigation_id=uuid4(),
+        invocation_id=None,
+        operation_key="synthetic-unsupported-bridge-url",
+        reservation_amounts={"bridge_turns": 1},
+        expected_envelope_version=1,
+        approval_decision_id=uuid4(),
+        invocation_arguments_sha256=None,
+        bridge_turn_id=bridge_turn_id,
+        model_run_id=model_run_id,
+    )
+    binding = BridgeExternalEffectBinding(
+        authority=authority,
+        family="bridge.investigation_turn.v1",
+        provider_scope="bridge",
+        normalizer_version="bridge.investigation_turn.v1",
+        bridge_turn_id=bridge_turn_id,
+        model_run_id=model_run_id,
+        model_input_sha256="a" * 64,
+        authorized_input_hash="b" * 64,
+    )
+    client = create_coordinated_http_responses_transport(
+        "ftp://bridge.invalid/v1",
+        api_key=None,
+        coordinator=cast(Any, coordinator),
+        http_transport=httpx.MockTransport(handler),
+    )
+    client._last_capabilities_check = asyncio.get_running_loop().time()
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create(
+            {"input": "synthetic"},
+            idempotency_key="synthetic-unsupported-bridge-url",
+            bridge_external_effect_binding=binding,
+        )
+
+    assert caught.value.code == "bridge_unsupported_protocol"
+    assert caught.value.submission_state == "pre_submission"
+    assert coordinator.calls == 0
+    assert transport_calls == []
 
 
 async def test_bridge_transport_error_after_mock_request_emission_is_ambiguous() -> None:

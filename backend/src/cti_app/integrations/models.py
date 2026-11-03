@@ -483,6 +483,17 @@ class HttpResponsesTransport:
                     headers=headers,
                     timeout=timeout,
                 )
+                if request.url.scheme not in {"http", "https"}:
+                    # HTTPX would reject this only in send(), after the external
+                    # effect coordinator has durably entered handoff. Reject it
+                    # while the failure is still provably local.
+                    raise BridgeTransportError(
+                        "bridge_unsupported_protocol",
+                        "Le transport Bridge ne prend pas en charge le protocole de cette URL.",
+                        retryable=False,
+                        phase="generation",
+                        submission_state="pre_submission",
+                    )
                 frozen_request = _freeze_httpx_request(request)
                 prepared = PreparedExternalRequest.build(
                     family=binding.family,
@@ -503,6 +514,8 @@ class HttpResponsesTransport:
                     evidence_refs=binding.evidence_refs,
                     credential_parameter_names=binding.credential_parameter_names,
                 )
+            except BridgeTransportError:
+                raise
             except (ExternalEffectValidationError, TypeError, ValueError) as exc:
                 reason = type(exc).__name__
                 raise _bridge_external_effect_refusal(
