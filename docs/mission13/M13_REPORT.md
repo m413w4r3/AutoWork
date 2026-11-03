@@ -126,8 +126,39 @@ Unitaire hors intégration : **36 échecs, tous ceux de `main`** (aucun nouveau)
 
 ## 13. Non réalisé
 
-Troisième qualification après les correctifs L1/L2/checkpoints/export : **à faire**, voir `docs/mission13/M13_HANDOFF.md`. Aucune validation de production n'est revendiquée.
+(Cycle 2.) La troisième qualification a eu lieu : voir §15. Aucune validation de production n'est revendiquée.
 
 ## 14. État de la fusion
 
 PR #23 **non fusionnée** : la fusion demandée par l'utilisateur a été refusée par le contrôle de permissions de l'environnement (CI rouge, pas de revue humaine) et n'a pas été contournée. Les échecs CI sont ceux de `main` (§1 et §12). Décision utilisateur requise.
+
+---
+
+# Cycle 3 — essai 3 et audit (2026-11-03)
+
+## 15. Essai 3 (code déployé `0bdc0f8b`, `RULE_WORKBENCH_ENABLED=true` vérifié dans backend et worker)
+
+Enquête vierge `3c63049f…` (run `7b53c852`), opérateur DeepSeek Flash 1M thinking `max`, prompt de trois phrases sans plan ni résultat antérieur. **Contamination à noter** : j'ai arrêté un premier opérateur trop tôt (après un refus de contexte, alors qu'il venait de se corriger) ; le second a repris le même espace de travail et lu ses notes.
+
+Faits (état canonique, export d'audit avec lecteur d'artefacts et `include_operator_text`, audit Luna xhigh en lecture seule : `AUDIT_REPORT.md` hors dépôt, SHA-256 `059d972a…`) :
+- 8 consultations Bridge, 3 réponses persistées (`partial`). Échecs : 1 erreur de référence de l'opérateur ; 3 refus `advisor_context_reservation_mismatch` (dossier mesuré ≈173 Mo / 43 M tokens contre ≈16 M réservés, 245 échantillons dont le pool hérité du sujet ; 0 tour consommé, mais 3 à 5 min de construction) ; 1 `draft_text` (dossier 1,24 Mo) en `bridge_server_error` classé `pre_submission` / `confirmed_non_execution` alors que le journal Bridge montre l'entrée en phase `submission` sans fin (`resp_3a49a257`).
+- Cause du gonflement (mesurée) : les observations `investigation.subject_sample_reuse` (2 × 49 Mo, 5 × 8 Mo…) et la jonction en base64 de tous les échantillons associés pour tout type de consultation hors `draft_text`/`review_text`/`suricata_draft`/`figure_plan` (`investigation_advisor_tools.py` ≈l.4400), plus la réinjection d'un échantillon entier quand son observation d'octets est citée (≈l.4449).
+- Avis brouillon `29eb7a0f` v1, 7 blocs, sans `bridge_draft_ref` ni revue Bridge ; 5 règles YARA candidates, sans goodware ni holdout ; 2 `vt.intelligence_search` (un vide, un réussi), 24 téléchargements VT ; plan et critique de règles Bridge exploités, un import Bridge de règle YARA échoué (`bridge_yara_observation_not_found`, prédicat exact non exporté).
+- Checkpoints : 321 traces `skipped` sur 329 (export final) ; `first_significant_decompilation` apparaît dans 189 traces. Les chiffres 273/280 et 157 que j'avais relevés en cours d'essai sont des mesures intermédiaires ; la raison libre n'est pas exportée (SHA seulement).
+- Invocations : 87 `unavailable` (dont 84 `method.decompile`), 30 `failed`.
+
+Note de qualité de l'audit : **C**, même palier que l'essai 2.
+
+### Classement (audit + mesures de l'orchestrateur)
+| Catégorie | Gravité | Défaut | État |
+| --- | --- | --- | --- |
+| Plateforme | Haute | `draft_text` classé `pre_submission` alors que Bridge est entré en soumission ; run sans état terminal | **Ouvert** |
+| Plateforme | Haute | Dossiers gonflés par les échantillons entiers et le pool hérité ; refus sans liste des éléments lourds | Chantier `m13/dossier-relevance` (commit local `b34a91e3`, **2 tests rouges, correction en cours, non revu, non déployé**) |
+| Plateforme | Moyenne | Un checkpoint ignoré reste dû (`operator_advisor_guidance.py:317-339`, `operator_tool_invocation.py:1411-1431`) | **Ouvert** |
+| Plateforme | Moyenne | Import d'une réponse YARA Bridge : prédicat échoué non exposé | **Ouvert** (ne pas retirer la garde de provenance) |
+| Plateforme | Moyenne | Audit : sorties, causes d'erreur, ids ModelRun/run Bridge absents ; raison de checkpoint hachée | **Ouvert** |
+| Plateforme / environnement | Moyenne | `strings`/`monodis` indisponibles, pagination `methods.list`, extraction `.config` | **Ouvert** |
+| Comportement | Moyenne | Poursuite malgré le checkpoint ; avis écrit sans Bridge | À requalifier après correctifs |
+| Limite réelle | Moyenne | Pas de goodware/holdout/négatif difficile ; associations `candidate` | Non corrigeable ici |
+
+Aucune validation de production. Fusion de la PR #23, route PCAP, plan de reset et mise en production : décisions de l'utilisateur.
