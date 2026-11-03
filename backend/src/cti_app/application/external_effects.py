@@ -346,12 +346,14 @@ def bridge_provider_report_samples_conflict(
     samples: Iterable[tuple[Any, str]],
 ) -> bool:
     """Whether samples linked to one provider report disagree on their real digest."""
+    # A cross-digest conflict requires a shared MD5/SHA1 alias; compare the actual SHA-256s below.
+    short_report_hashes = {
+        report_hash for report_hash in report_hashes if len(report_hash) in {32, 40}
+    }
     matched_blob_hashes = {
         blob_sha256
         for sample, blob_sha256 in samples
-        if matching_bridge_provider_report_hashes(
-            source=sample, report_hashes=report_hashes, blob_sha256=blob_sha256
-        )
+        if matching_bridge_provider_report_hashes(source=sample, report_hashes=short_report_hashes)
     }
     return len(matched_blob_hashes) > 1 or any(
         blob_sha256 != report_sha256 for blob_sha256 in matched_blob_hashes

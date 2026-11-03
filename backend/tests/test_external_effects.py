@@ -2320,7 +2320,29 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
 
 
 @pytest.mark.asyncio
-async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls() -> None:
+@pytest.mark.parametrize(
+    ("sample_hash_alias", "sample_blob_sha256", "external_llm_allowed", "expected_reason"),
+    [
+        pytest.param("md5", "c" * 64, True, None, id="owned-md5-allowed"),
+        pytest.param(
+            "sha256", "d" * 64, True, None, id="owned-sha256-lineage-via-md5-report-allowed"
+        ),
+        pytest.param(
+            "md5",
+            "d" * 64,
+            True,
+            "vt_source_observation_hash_mismatch",
+            id="owned-md5-conflicting-real-digest-denied",
+        ),
+        pytest.param("md5", "c" * 64, False, "sample_source_restricted", id="owned-md5-restricted"),
+    ],
+)
+async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
+    sample_hash_alias: str,
+    sample_blob_sha256: str,
+    external_llm_allowed: bool,
+    expected_reason: str | None,
+) -> None:
     md5 = "a" * 32
     sha1 = "b" * 40
     sha256 = "c" * 64
@@ -2361,10 +2383,10 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
         id=uuid4(),
         subject_id=subject_id,
         blob_id=uuid4(),
-        expected_hash=md5,
+        expected_hash=md5 if sample_hash_alias == "md5" else sha256,
         source_object_id=None,
         tlp="CLEAR",
-        external_llm_allowed=False,
+        external_llm_allowed=external_llm_allowed,
         do_not_submit=True,
         license_restriction=None,
     )
@@ -2393,7 +2415,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
                 )
                 return [sample] if self.resolved_sha256_was_queried else []
             if self.calls == 3:
-                return [SimpleNamespace(id=sample.blob_id, sha256=sha256)]
+                return [SimpleNamespace(id=sample.blob_id, sha256=sample_blob_sha256)]
             return []
 
         async def scalar(self, _statement):
@@ -2409,7 +2431,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
         model_submission=True,
     )
     session = _Session()
-    with pytest.raises(_ConsumeDenied, match="sample_source_restricted"):
+    if expected_reason is None:
         await store._check_source_restrictions(
             session,  # type: ignore[arg-type]
             authority,
@@ -2418,6 +2440,17 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             binding,
             report_blob_contents={observation_id: report_content},
         )
+    else:
+        with pytest.raises(_ConsumeDenied) as denied:
+            await store._check_source_restrictions(
+                session,  # type: ignore[arg-type]
+                authority,
+                prepared,
+                subject_id,
+                binding,
+                report_blob_contents={observation_id: report_content},
+            )
+        assert denied.value.reason == expected_reason
     assert session.resolved_sha256_was_queried
     assert session.resolved_aliases_were_queried
     assert session.report_sample_populate_existing
