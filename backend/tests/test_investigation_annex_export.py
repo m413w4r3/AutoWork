@@ -334,6 +334,262 @@ def test_default_export_omits_all_restricted_bytes_and_records_policy(tmp_path: 
     )
 
 
+def test_public_export_redacts_distribution_restricted_sample_and_ioc(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    restricted_id = str(uuid4())
+    restricted_bytes = b"restricted sample bytes"
+    restricted_sha = hashlib.sha256(restricted_bytes).hexdigest()
+    public_bytes = b"public sample with external LLM disabled"
+    public_sha = hashlib.sha256(public_bytes).hexdigest()
+    archive_only_sample = b"archive-only sample"
+    archive_only_sha = hashlib.sha256(archive_only_sample).hexdigest()
+    assets = (
+        AnnexAsset(
+            canonical_id=restricted_id,
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=restricted_sha,
+            source="samples+blobs",
+            origin="sensitive-acquisition-origin",
+            references=("source-event-id",),
+            availability="restricted",
+            restrictions=("tlp_red",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=restricted_bytes,
+            filename=f"{restricted_sha}.bin",
+            metadata={
+                "archive_export_allowed": False,
+                "external_llm_allowed": True,
+                "license_restriction_present": False,
+                "origin_kind": "manual",
+                "sample_state": "validated",
+                "source_object_id": "sensitive-source-object",
+                "source_service": "sensitive-source-service",
+                "tlp": "red",
+            },
+        ),
+        AnnexAsset(
+            canonical_id="public-external-llm-disabled",
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=public_sha,
+            source="samples+blobs",
+            origin="source_seed",
+            availability="present",
+            restrictions=("sample_external_llm_not_allowed",),
+            public_distribution_allowed=True,
+            archive_export_allowed=False,
+            metadata={
+                "archive_export_allowed": False,
+                "external_llm_allowed": False,
+                "sample_state": "validated",
+                "tlp": "amber",
+            },
+        ),
+        AnnexAsset(
+            canonical_id="restricted-ioc",
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            sha256="a" * 64,
+            source="VirusTotal",
+            origin="file",
+            availability="restricted",
+            restrictions=("g2_envelope_revoked",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            metadata={"ioc_type": "domain", "value": "restricted.example"},
+        ),
+        AnnexAsset(
+            canonical_id="archive-only-ioc",
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            sha256="b" * 64,
+            source="VirusTotal",
+            origin="file",
+            public_distribution_allowed=True,
+            archive_export_allowed=False,
+            metadata={"ioc_type": "domain", "value": "human-public.example"},
+            restrictions=("external_llm_not_allowed",),
+        ),
+        AnnexAsset(
+            canonical_id="missing-g2-ioc",
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            sha256="c" * 64,
+            source="VirusTotal",
+            origin="domain",
+            availability="restricted",
+            restrictions=("g2_envelope_unavailable",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            metadata={"ioc_type": "domain", "value": "missing-g2.example"},
+        ),
+        AnnexAsset(
+            canonical_id="archive-authorized-ioc",
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            source="VirusTotal",
+            origin="domain",
+            restrictions=("sample_license_restricted",),
+            public_distribution_allowed=False,
+            archive_export_allowed=True,
+            metadata={"ioc_type": "domain", "value": "archive-only.example"},
+        ),
+        AnnexAsset(
+            canonical_id="archive-authorized-sample",
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=archive_only_sha,
+            source="samples+blobs",
+            origin="synthetic",
+            availability="present",
+            restrictions=("sample_license_restricted",),
+            public_distribution_allowed=False,
+            archive_export_allowed=True,
+            content=archive_only_sample,
+        ),
+    )
+    output = tmp_path / "public-redacted"
+    write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, assets), output)
+
+    manifest = _read_manifest(output)
+    by_id = {item["canonical_id"]: item for item in manifest["objects"]}
+    restricted = by_id[restricted_id]
+    assert restricted["availability"] == "restricted"
+    assert restricted["sha256"] is None
+    assert restricted["source"] == "restricted"
+    assert restricted["origin"] == "restricted"
+    assert restricted["references"] == []
+    assert restricted["filename"] is None
+    assert restricted["metadata"] == {"status": "restricted"}
+    assert "tlp_red" in restricted["restrictions"]
+    assert by_id["public-external-llm-disabled"]["sha256"] == public_sha
+    assert by_id["public-external-llm-disabled"]["metadata"]["external_llm_allowed"] is False
+
+    inventory = list(csv.DictReader((output / "samples/sample-inventory.csv").open()))
+    restricted_inventory = next(item for item in inventory if item["canonical_id"] == restricted_id)
+    assert restricted_inventory["sha256"] == ""
+    assert restricted_inventory["availability"] == "restricted"
+    assert "tlp_red" in restricted_inventory["restrictions"]
+    assert restricted_sha not in (output / "samples/sample-inventory.csv").read_text()
+    assert public_sha in (output / "samples/sample-inventory.csv").read_text()
+
+    with (output / "iocs/observed-iocs.csv").open(newline="", encoding="utf-8") as stream:
+        ioc_rows = list(csv.DictReader(stream))
+    ioc = next(item for item in ioc_rows if item["observation_id"] == "restricted-ioc")
+    assert ioc["value"] == ""
+    assert ioc["availability"] == "restricted"
+    assert "g2_envelope_revoked" in ioc["restrictions"]
+    assert any(row["value"] == "human-public.example" for row in ioc_rows)
+    assert any(row["value"] == "archive-only.example" for row in ioc_rows) is False
+    assert b"restricted.example" not in _file_bytes(output)["manifest.json"]
+    all_public_bytes = b"\n".join(_file_bytes(output).values())
+    assert b"missing-g2.example" not in all_public_bytes
+    assert b"sensitive-source-object" not in all_public_bytes
+    assert b"sensitive-source-service" not in all_public_bytes
+    assert b"sensitive-acquisition-origin" not in all_public_bytes
+    assert restricted_sha.encode() not in b"\n".join(_file_bytes(output).values())
+    assert archive_only_sha.encode() not in all_public_bytes
+
+    archive_output = tmp_path / "archive-only"
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(investigation_id, assets),
+        archive_output,
+        include_restricted_archive=True,
+    )
+    with (archive_output / "iocs/observed-iocs.csv").open(newline="", encoding="utf-8") as stream:
+        archive_iocs = list(csv.DictReader(stream))
+    archive_ioc = next(row for row in archive_iocs if row["observation_id"] == "archive-only-ioc")
+    assert archive_ioc["value"] == ""
+    assert archive_ioc["availability"] == "restricted"
+    archive_authorized_ioc = next(
+        row for row in archive_iocs if row["observation_id"] == "archive-authorized-ioc"
+    )
+    assert archive_authorized_ioc["value"] == "archive-only.example"
+    archive_bytes = b"\n".join(_file_bytes(archive_output).values())
+    assert b"archive-only sample" in archive_bytes
+    archive_manifest = _read_manifest(archive_output)
+    archive_sample = next(
+        item
+        for item in archive_manifest["objects"]
+        if item["canonical_id"] == "archive-authorized-sample"
+    )
+    assert archive_sample["sha256"] == archive_only_sha
+    assert archive_sample["filename"] is not None
+    assert _file_bytes(archive_output)[archive_sample["filename"]] == archive_only_sample
+
+
+def test_public_export_restricts_detection_sources_under_red_policy(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    yara_source = b'rule red_policy { strings: $a = "private" condition: $a }'
+    report = b'{"schema":"synthetic-test-report.v1","private":"report details"}'
+    public_rule = b'alert http any any -> any any (msg:"public rule"; sid:1; rev:1;)'
+    assets = (
+        AnnexAsset(
+            canonical_id="restricted-yara-rule",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            version=1,
+            sha256=hashlib.sha256(yara_source).hexdigest(),
+            source="detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            availability="present",
+            restrictions=("tlp_red",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=yara_source,
+            metadata={"candidate_id": "candidate", "rule_kind": "yara"},
+        ),
+        AnnexAsset(
+            canonical_id="restricted-yara-report",
+            type="yara_test_report",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(report).hexdigest(),
+            source="AutoWork RuleWorkbench",
+            origin="detection_candidate_version",
+            availability="present",
+            restrictions=("tlp_red",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=report,
+        ),
+        AnnexAsset(
+            canonical_id="public-rule-external-llm-disabled",
+            type="suricata_rule",
+            investigation_id=investigation_id,
+            sha256=hashlib.sha256(public_rule).hexdigest(),
+            source="advisor_call_payload.output.rule_source",
+            origin="advisor.consult:suricata_draft",
+            restrictions=("external_llm_not_allowed",),
+            public_distribution_allowed=True,
+            archive_export_allowed=False,
+            content=public_rule,
+        ),
+    )
+    output = tmp_path / "red-detection"
+    write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, assets), output)
+
+    files = _file_bytes(output)
+    assert yara_source not in b"\n".join(files.values())
+    assert report not in b"\n".join(files.values())
+    assert public_rule in b"\n".join(files.values())
+    manifest = _read_manifest(output)
+    restricted = [item for item in manifest["objects"] if item["availability"] == "restricted"]
+    assert {item["canonical_id"] for item in restricted} == {
+        "restricted-yara-rule",
+        "restricted-yara-report",
+    }
+    yara_manifest = next(item for item in restricted if item["type"] == "yara_rule")
+    assert yara_manifest["sha256"] == hashlib.sha256(yara_source).hexdigest()
+    assert all("tlp_red" in item["restrictions"] for item in restricted)
+    assert any(
+        item["canonical_id"] == "public-rule-external-llm-disabled"
+        and item["availability"] == "present"
+        for item in manifest["objects"]
+    )
+
+
 def test_restricted_archive_requires_explicit_flag_and_policy_eligibility(tmp_path: Path) -> None:
     investigation_id = str(uuid4())
     allowed = b"sample bytes behind policy gate"
@@ -493,6 +749,8 @@ def test_manifest_lists_missing_collections_and_verifies_generated_files(tmp_pat
             "source": "VirusTotal",
             "observation_sha256": "a" * 64,
             "relation": "observed",
+            "availability": "present",
+            "restrictions": "",
         }
     ]
     with (output / "iocs/discovered-samples.csv").open(encoding="utf-8", newline="") as stream:
