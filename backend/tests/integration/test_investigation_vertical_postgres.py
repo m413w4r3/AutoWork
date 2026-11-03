@@ -804,6 +804,10 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         "type": "file",
                         "attributes": {
                             "sha256": candidate_hash,
+                            "md5": hashlib.md5(
+                                material.sample_bytes, usedforsecurity=False
+                            ).hexdigest(),
+                            "sha1": hashlib.sha1(material.sample_bytes).hexdigest(),
                             "meaningful_name": "arbitrary-osint-hash.bin",
                             "size": len(material.sample_bytes),
                             "last_analysis_stats": {"malicious": 0},
@@ -822,6 +826,8 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         "type": "file",
                         "attributes": {
                             "sha256": _SEED_HASH,
+                            "md5": "b" * 32,
+                            "sha1": "c" * 40,
                             "meaningful_name": "article-seed.bin",
                             "size": 123,
                             "last_analysis_stats": {"malicious": 1},
