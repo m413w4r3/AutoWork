@@ -643,6 +643,7 @@ class BridgeTransportError(ModelGatewayError):
         retry_after: float | None = None,
         phase: str = "generation",
         status_code: int | None = None,
+        submission_request: bool | None = None,
         bridge_run_id: str | None = None,
         bridge_request_id: str | None = None,
         bridge_status: str | None = None,
@@ -662,6 +663,7 @@ class BridgeTransportError(ModelGatewayError):
         self.retry_after = retry_after
         self.phase = phase
         self.status_code = status_code
+        self.submission_request = submission_request
         self.bridge_run_id = bridge_run_id
         self.bridge_request_id = bridge_request_id
         self.bridge_status = bridge_status
@@ -1151,6 +1153,7 @@ def _bridge_http_error(
         retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
         phase=phase,
         status_code=status,
+        submission_request=submission_request,
         bridge_run_id=bridge_run_id,
         bridge_status=bridge_status,
         submission_state=submission_state,
@@ -1168,13 +1171,25 @@ def _should_reconcile_bridge_submission(error: BridgeTransportError) -> bool:
     ):
         return False
     if error.submission_state == "pre_submission":
-        # This Bridge error is known to be misclassified when its journal says
-        # submission began. Reconcile only that contradictory server error;
-        # explicit pre-send failures remain terminal without a GET.
+        # A Bridge server error after an emitted POST is ambiguous even when
+        # its phase is omitted and the parser defaults it to "generation".
+        # Explicit pre-send failures remain terminal without a GET.
         if (
             error.code == "bridge_server_error"
-            and error.phase in {"submission", "submission_confirmation"}
             and not error.verified_no_answer
+            and (
+                (
+                    error.phase in {"submission", "submission_confirmation"}
+                    and error.submission_request is not False
+                )
+                or (
+                    (error.status_code or 0) >= 500
+                    and (
+                        error.submission_request is True
+                        or (error.submission_request is None and error.phase != "preflight")
+                    )
+                )
+            )
         ):
             return True
         return error.bridge_status in {
