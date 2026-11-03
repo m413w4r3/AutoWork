@@ -359,7 +359,11 @@ async def submit_bridge_consultation_once(
         await wait_for_pacing()
         transport_timeout = timeout_seconds
 
+    submission_started = False
+
     async def submit(attempt: int, call_timeout_seconds: float | None) -> TurnSubmission | None:
+        nonlocal submission_started
+        submission_started = False
         submission_kwargs: dict[str, Any] = {
             "investigation_id": investigation_id,
             "subject_id": subject_id,
@@ -457,6 +461,7 @@ async def submit_bridge_consultation_once(
                 )
         if on_submission_started is not None:
             on_submission_started()
+        submission_started = True
         if attempt == 0:
             return await transport.submit(
                 **submission_kwargs,
@@ -471,16 +476,30 @@ async def submit_bridge_consultation_once(
         )
 
     def ambiguous_timeout(detail: str) -> TurnSubmission:
+        if not submission_started:
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                idempotency_key=key,
+                conversation_id=conversation_id,
+                detail="Bridge execution deadline expired before the transport request started.",
+                error_code="bridge_execution_timeout",
+                retryable=False,
+                submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                failure_stage="bridge_pre_submission",
+                failure_reason="execution_deadline_before_transport",
+            )
+        reconciliation_detail = _bridge_reconciliation_detail(key, None)
         return TurnSubmission(
             TurnSubmissionStatus.NEEDS_REVIEW,
             idempotency_key=key,
             conversation_id=conversation_id,
-            detail=detail,
+            detail=f"{detail} {reconciliation_detail}",
             error_code="bridge_execution_timeout",
             retryable=False,
             submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
             failure_stage="bridge_execution",
-            failure_reason="execution_deadline_exceeded",
+            failure_reason=f"execution_deadline_exceeded; {reconciliation_detail}",
+            prior_submission_made=True,
         )
 
     async def submit_with_deadline(
@@ -729,6 +748,19 @@ def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | No
         return BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
 
 
+def _bridge_reconciliation_detail(idempotency_key: str, bridge_run_id: str | None) -> str:
+    idempotency_key = idempotency_key[:255]
+    if bridge_run_id:
+        received = f"Bridge a reçu la soumission (run {bridge_run_id[:128]})"
+    else:
+        received = "La soumission a pu atteindre Bridge"
+    return (
+        f"{received}, mais son résultat reste inconnu. Ne la renvoyez pas; "
+        "réconciliez ce tour avec reconcile_orphaned_turn et la clé "
+        f"{idempotency_key}."
+    )
+
+
 def _bounded_retry_backoff(base: float, maximum: float, attempt: int) -> float:
     if not math.isfinite(base) or base <= 0 or not math.isfinite(maximum) or maximum <= 0:
         return 0.0
@@ -958,16 +990,22 @@ class ModelConversationTurnTransport:
                         TurnSubmissionStatus.NEEDS_REVIEW,
                         idempotency_key=key,
                         conversation_id=conversation_id,
-                        detail=sealed.error_message
-                        or "An orphaned Bridge turn needs reconciliation; it was not resubmitted.",
+                        detail=_bridge_reconciliation_detail(key, None),
+                        submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
+                        prior_submission_made=True,
                     )
                 if existing.turn.status is ConversationTurnStatus.NEEDS_REVIEW:
+                    bridge_run_id = getattr(existing.turn, "bridge_run_id", None)
+                    if not isinstance(bridge_run_id, str):
+                        bridge_run_id = None
                     return TurnSubmission(
                         TurnSubmissionStatus.NEEDS_REVIEW,
                         idempotency_key=key,
                         conversation_id=conversation_id,
-                        detail=existing.turn.error_message
-                        or "An existing Bridge turn needs reconciliation; it was not resubmitted.",
+                        detail=_bridge_reconciliation_detail(key, bridge_run_id),
+                        submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
+                        bridge_invocation_id=bridge_run_id,
+                        prior_submission_made=True,
                     )
                 if existing.turn.status is not ConversationTurnStatus.FAILED:
                     return TurnSubmission(
@@ -1009,10 +1047,12 @@ class ModelConversationTurnTransport:
                     TurnSubmissionStatus.NEEDS_REVIEW,
                     idempotency_key=key,
                     conversation_id=conversation_id,
-                    detail=turn.error_message or "Bridge submission outcome needs review.",
+                    detail=_bridge_reconciliation_detail(key, None),
                     error_code=turn.error_code,
+                    submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
                     failure_stage="bridge_turn_result",
                     failure_reason=turn.error_code or turn.status.value,
+                    prior_submission_made=True,
                 )
             if turn.status is ConversationTurnStatus.RUNNING:
                 captured = await self._recover_persisted_output(
@@ -1026,9 +1066,11 @@ class ModelConversationTurnTransport:
                     TurnSubmissionStatus.NEEDS_REVIEW,
                     idempotency_key=key,
                     conversation_id=conversation_id,
-                    detail="An existing Bridge turn is still running; it was not resubmitted.",
+                    detail=_bridge_reconciliation_detail(key, None),
+                    submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
                     failure_stage="bridge_turn_result",
                     failure_reason="turn_still_running",
+                    prior_submission_made=True,
                 )
             if turn.status is not ConversationTurnStatus.SUCCEEDED:
                 captured = await self._recover_persisted_output(
@@ -1077,14 +1119,43 @@ class ModelConversationTurnTransport:
             )
             if captured is not None:
                 return captured
+            details = getattr(exc, "details", None)
+            if not isinstance(details, Mapping):
+                details = {}
+            submission_state = _normalize_bridge_submission_state(
+                details.get("submission_state", getattr(exc, "submission_state", None))
+            )
+            if submission_state is None:
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            raw_bridge_run_id = (
+                details.get("bridge_run_id")
+                or getattr(exc, "bridge_run_id", None)
+                or getattr(exc, "bridge_response_id", None)
+            )
+            bridge_run_id = raw_bridge_run_id if isinstance(raw_bridge_run_id, str) else None
+            raw_bridge_request_id = details.get("bridge_request_id") or getattr(
+                exc, "bridge_request_id", None
+            )
+            bridge_request_id = (
+                raw_bridge_request_id if isinstance(raw_bridge_request_id, str) else key
+            )
+            reconciliation_detail = _bridge_reconciliation_detail(bridge_request_id, bridge_run_id)
+            failure_reason = str(
+                details.get("diagnostic_code") or getattr(exc, "code", "conversation_needs_review")
+            )[:64]
             return TurnSubmission(
                 TurnSubmissionStatus.NEEDS_REVIEW,
                 idempotency_key=key,
                 conversation_id=conversation_id,
-                detail=str(exc),
+                detail=reconciliation_detail,
                 error_code=str(getattr(exc, "code", "conversation_needs_review"))[:64],
                 failure_stage="bridge_response_reconciliation",
-                failure_reason=str(getattr(exc, "code", "conversation_needs_review"))[:64],
+                failure_reason=f"{failure_reason}; {reconciliation_detail}",
+                submission_state=submission_state,
+                bridge_invocation_id=bridge_run_id,
+                prior_submission_made=(
+                    submission_state is not BridgeSubmissionState.PRE_SUBMISSION
+                ),
             )
         except ConversationTurnFailedError as exc:
             captured = await self._recover_persisted_output(
@@ -1097,6 +1168,17 @@ class ModelConversationTurnTransport:
             submission_state = _normalize_bridge_submission_state(exc.submission_state)
             completed_response = exc.completed_response
             submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
+            if submission_state is None:
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            details = getattr(exc, "details", None)
+            if not isinstance(details, Mapping):
+                details = {}
+            raw_bridge_run_id = (
+                details.get("bridge_run_id")
+                or getattr(exc, "bridge_run_id", None)
+                or getattr(exc, "bridge_response_id", None)
+            )
+            bridge_run_id = raw_bridge_run_id if isinstance(raw_bridge_run_id, str) else None
             status = (
                 TurnSubmissionStatus.NEEDS_REVIEW
                 if not completed_response
@@ -1107,7 +1189,11 @@ class ModelConversationTurnTransport:
                 status,
                 idempotency_key=key,
                 conversation_id=conversation_id,
-                detail=str(exc),
+                detail=(
+                    _bridge_reconciliation_detail(key, bridge_run_id)
+                    if status is TurnSubmissionStatus.NEEDS_REVIEW
+                    else str(exc)
+                ),
                 error_code=exc.code,
                 submission_state=submission_state,
                 retryable=exc.retryable and (not submitted or completed_response),
@@ -1122,6 +1208,8 @@ class ModelConversationTurnTransport:
                 ),
                 failure_reason=str(getattr(exc, "failure_reason", exc.code))[:128],
                 completed_response=completed_response,
+                bridge_invocation_id=bridge_run_id,
+                prior_submission_made=submitted,
             )
         except ConversationPolicyError as exc:
             return TurnSubmission(
@@ -1148,15 +1236,41 @@ class ModelConversationTurnTransport:
             if error_code == "model_submission_reconciliation_required":
                 submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
             submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
+            if submission_state is None:
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            details = getattr(exc, "details", None)
+            if not isinstance(details, Mapping):
+                details = {}
+            raw_bridge_run_id = (
+                details.get("bridge_run_id")
+                or getattr(exc, "bridge_run_id", None)
+                or getattr(exc, "bridge_response_id", None)
+            )
+            bridge_run_id = raw_bridge_run_id if isinstance(raw_bridge_run_id, str) else None
+            raw_bridge_request_id = details.get("bridge_request_id") or getattr(
+                exc, "bridge_request_id", None
+            )
+            bridge_request_id = (
+                raw_bridge_request_id if isinstance(raw_bridge_request_id, str) else key
+            )
+            status = (
+                TurnSubmissionStatus.NEEDS_REVIEW
+                if submitted and not completed_response
+                else TurnSubmissionStatus.UNAVAILABLE
+            )
+            reconciliation_detail = _bridge_reconciliation_detail(bridge_request_id, bridge_run_id)
+            failure_reason = str(
+                details.get("diagnostic_code") or error_code or type(exc).__name__
+            )[:64]
             return TurnSubmission(
-                (
-                    TurnSubmissionStatus.NEEDS_REVIEW
-                    if submitted and not completed_response
-                    else TurnSubmissionStatus.UNAVAILABLE
-                ),
+                status,
                 idempotency_key=key,
                 conversation_id=conversation_id,
-                detail=type(exc).__name__,
+                detail=(
+                    reconciliation_detail
+                    if status is TurnSubmissionStatus.NEEDS_REVIEW
+                    else type(exc).__name__
+                ),
                 error_code=error_code,
                 submission_state=submission_state,
                 retryable=(
@@ -1175,12 +1289,18 @@ class ModelConversationTurnTransport:
                         getattr(exc, "failure_stage", None) or getattr(exc, "phase", failure_stage)
                     )[:64]
                 ),
-                failure_reason=str(
-                    getattr(exc, "failure_reason", None)
-                    or getattr(exc, "code", None)
-                    or type(exc).__name__
-                )[:128],
+                failure_reason=(
+                    f"{failure_reason}; {reconciliation_detail}"
+                    if status is TurnSubmissionStatus.NEEDS_REVIEW
+                    else str(
+                        getattr(exc, "failure_reason", None)
+                        or getattr(exc, "code", None)
+                        or type(exc).__name__
+                    )[:128]
+                ),
                 completed_response=completed_response,
+                bridge_invocation_id=bridge_run_id,
+                prior_submission_made=submitted,
             )
 
     async def submit_with_attempt(

@@ -534,11 +534,14 @@ async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "code", "attempts"),
-    [(401, "bridge_auth_failed", 1), (500, "bridge_server_error", 1)],
+    ("status", "code", "calls_expected", "retryable"),
+    [
+        (401, "bridge_auth_failed", 1, False),
+        (500, "bridge_server_error", 2, False),
+    ],
 )
-async def test_bridge_classifies_http_errors_and_never_retries_auth(
-    status: int, code: str, attempts: int
+async def test_bridge_classifies_auth_rejection_and_reconciles_ambiguous_server_errors(
+    status: int, code: str, calls_expected: int, retryable: bool
 ) -> None:
     calls = 0
 
@@ -553,9 +556,13 @@ async def test_bridge_classifies_http_errors_and_never_retries_auth(
             await transport.create({"input": "secret"}, idempotency_key="stable")
 
     assert caught.value.code == code
-    assert caught.value.retryable is (status >= 500)
-    assert calls == attempts
+    assert caught.value.retryable is retryable
+    assert calls == calls_expected
     assert "unsafe" not in str(caught.value)
+    if status >= 500:
+        assert caught.value.submission_state == "external_state_unknown"
+        assert caught.value.bridge_request_id == "stable"
+        assert "reconcile_orphaned_turn" in str(caught.value)
 
 
 async def test_bridge_http_error_preserves_submission_boundary_and_safe_diagnostics() -> None:
@@ -589,9 +596,7 @@ async def test_bridge_http_error_preserves_submission_boundary_and_safe_diagnost
     assert error.diagnostics == {"user_turns_before": 1}
 
 
-async def test_bridge_server_error_explicitly_before_submission_is_confirmed_pre_submission() -> (
-    None
-):
+async def test_bridge_server_error_message_alone_does_not_prove_pre_submission() -> None:
     request = httpx.Request("POST", "https://bridge.test/v1/responses")
     response = httpx.Response(
         503,
@@ -609,7 +614,7 @@ async def test_bridge_server_error_explicitly_before_submission_is_confirmed_pre
 
     assert error.code == "bridge_server_error"
     assert error.retryable is True
-    assert error.submission_state == "pre_submission"
+    assert error.submission_state is None
 
 
 @pytest.mark.parametrize(
@@ -705,6 +710,53 @@ async def test_bridge_server_error_without_explicit_non_submission_remains_uncer
     assert error.submission_state is None
 
 
+@pytest.mark.parametrize("failure", ["read_timeout", "server_error"])
+async def test_ambiguous_bridge_submit_reconciles_run_by_idempotency_key(failure: str) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            if failure == "read_timeout":
+                raise httpx.ReadTimeout("synthetic response timeout", request=request)
+            return httpx.Response(
+                503,
+                request=request,
+                json={
+                    "detail": {
+                        "code": "bridge_server_error",
+                        "message": "Failure happened before submission was confirmed.",
+                    }
+                },
+            )
+        assert request.method == "GET"
+        assert request.url.path == "/v1/bridge/runs/request-key-1"
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "resp_active_1",
+                "object": "response",
+                "status": "running",
+                "metadata": {"bridge_progress": {"phase": "submission"}},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create({"input": "synthetic prompt"}, idempotency_key="request-key-1")
+
+    assert caught.value.submission_state == "submission_attempted"
+    assert caught.value.bridge_run_id == "resp_active_1"
+    assert caught.value.bridge_request_id == "request-key-1"
+    assert caught.value.retryable is False
+    assert "Bridge a reçu la soumission" in str(caught.value)
+    assert "reconcile_orphaned_turn" in str(caught.value)
+    assert [request.method for request in requests] == ["POST", "GET"]
+    assert requests[0].headers["X-Idempotency-Key"] == "request-key-1"
+
+
 async def test_bridge_archive_requires_archived_true_on_http_2xx() -> None:
     conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     requests: list[httpx.Request] = []
@@ -793,6 +845,7 @@ async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried
 
     assert caught.value.code == "bridge_unreachable"
     assert caught.value.retryable is True
+    assert caught.value.submission_state == "pre_submission"
     assert calls == 1
 
 

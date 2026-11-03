@@ -30,6 +30,7 @@ from cti_app.application.investigation_contracts import (
     InvestigationContextV1,
     InvestigationSourceV1,
 )
+from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.domain.investigation import AgentNextAction
 from cti_app.domain.model_conversations import ConversationTurnStatus
 
@@ -1342,6 +1343,72 @@ async def test_model_transport_does_not_call_add_turn_for_ambiguous_persisted_re
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_transport_failure_preserves_run_identity_and_blocks_replay() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    bridge_run_id = "resp_ambiguous"
+    context_sha256 = hashlib.sha256(context.canonical_bytes()).hexdigest()
+    idempotency_key = make_investigation_turn_idempotency_key(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+    )
+
+    class AmbiguousConversationService(_PersistedConversationService):
+        def __init__(self) -> None:
+            super().__init__(status=ConversationTurnStatus.NEEDS_REVIEW)
+
+        async def add_turn(self, conversation_id, *, idempotency_key, **kwargs):
+            self.add_turn_count += 1
+            self.prompts.append(kwargs["message"])
+            turn = SimpleNamespace(
+                id=uuid4(),
+                idempotency_key=idempotency_key,
+                status=ConversationTurnStatus.NEEDS_REVIEW,
+                error_message="Bridge a reçu la soumission; résultat inconnu.",
+                error_code="model_submission_reconciliation_required",
+            )
+            self.contents.append(SimpleNamespace(turn=turn, output_text=None))
+            raise ModelSubmissionReconciliationRequiredError(
+                "Bridge a reçu la soumission; résultat inconnu.",
+                details={
+                    "submission_state": "external_state_unknown",
+                    "diagnostic_code": "bridge_server_error",
+                    "bridge_run_id": bridge_run_id,
+                    "bridge_request_id": "model-run:attempt-1",
+                },
+            )
+
+    conversations = AmbiguousConversationService()
+    transport = ModelConversationTurnTransport(conversations)
+    args = {
+        "investigation_id": investigation_id,
+        "subject_id": context.source.subject_id,
+        "turn_index": 0,
+        "context_sha256": context_sha256,
+        "prompt": "canonical prompt",
+        "external_llm_allowed": True,
+    }
+
+    first = await transport.submit(**args)
+    second = await transport.submit(**args)
+
+    assert first.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert first.submission_state == "external_state_unknown"
+    assert first.prior_submission_made is True
+    assert first.bridge_invocation_id == bridge_run_id
+    assert first.idempotency_key == idempotency_key
+    assert "reconcile_orphaned_turn" in first.detail
+    assert "bridge_server_error" in first.failure_reason
+    assert "resp_ambiguous" in first.failure_reason
+    assert "model-run:attempt-1" in first.failure_reason
+    assert _bridge_turns_consumed(first) == 1
+    assert _submission_proves_no_execution(first) is False
+    assert second.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert conversations.add_turn_count == 1
+
+
+@pytest.mark.asyncio
 async def test_model_transport_reuses_successful_persisted_turn_without_add_turn() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)
@@ -1438,6 +1505,81 @@ async def test_consultation_has_no_short_application_timeout(monkeypatch) -> Non
 
     assert result.status is TurnSubmissionStatus.SUCCEEDED
     assert result.output_text == "response arrived after the former 240 second cutoff"
+
+
+@pytest.mark.asyncio
+async def test_consultation_timeout_after_transport_start_is_ambiguous(monkeypatch) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self, **_kwargs):
+            return True
+
+    class SlowTransport:
+        async def submit(self, **_kwargs):
+            await asyncio.sleep(1)
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    result = await submit_bridge_consultation_once(
+        SlowTransport(),
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=1,
+        context_sha256="b" * 64,
+        prompt="synthetic prompt",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        timeout_seconds=0.001,
+    )
+
+    assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert result.submission_state == "external_state_unknown"
+    assert result.prior_submission_made is True
+    assert result.retryable is False
+    assert _bridge_turns_consumed(result) == 1
+    assert _submission_proves_no_execution(result) is False
+
+
+@pytest.mark.asyncio
+async def test_consultation_timeout_during_pre_submission_check_proves_no_send(monkeypatch) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self, **_kwargs):
+            return True
+
+    class NeverCalledTransport:
+        async def submit(self, **_kwargs):
+            raise AssertionError("transport must not run before the policy check completes")
+
+    async def slow_policy_check() -> bool:
+        await asyncio.sleep(1)
+        return True
+
+    submission_started: list[bool] = []
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    result = await submit_bridge_consultation_once(
+        NeverCalledTransport(),
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=1,
+        context_sha256="c" * 64,
+        prompt="synthetic prompt",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        timeout_seconds=0.001,
+        on_submission_started=lambda: submission_started.append(True),
+        pre_submission_policy_check=slow_policy_check,
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.submission_state == "pre_submission"
+    assert result.prior_submission_made is False
+    assert submission_started == []
+    assert _bridge_turns_consumed(result) == 0
+    assert _submission_proves_no_execution(result) is True
 
 
 @pytest.mark.asyncio

@@ -8693,9 +8693,10 @@ def _bridge_turns_consumed(submission: TurnSubmission) -> int:
         return prior_consumed
     if submission.submission_state == "pre_submission":
         return prior_consumed
+    if submission.status is TurnSubmissionStatus.NEEDS_REVIEW:
+        return max(prior_consumed, 1)
     if submission.status in {
         TurnSubmissionStatus.SUCCEEDED,
-        TurnSubmissionStatus.NEEDS_REVIEW,
     }:
         return prior_consumed + 1
     return prior_consumed + int(
