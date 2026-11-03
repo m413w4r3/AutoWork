@@ -4104,17 +4104,25 @@ async def _seed_bridge_report_case(
                 blob_sha256 = sample_blob_sha256 or (
                     canonical_sample_sha256 if lineage == "blob" else uuid4().hex + uuid4().hex
                 )
-                sample_blob = BlobRow(
-                    id=uuid4(),
-                    sha256=blob_sha256,
-                    size=1,
-                    mime_type="application/octet-stream",
-                    logical_bucket="samples",
-                    object_key=f"samples/{blob_sha256}",
-                    created_at=datetime.now(UTC),
+                # The database is shared across tests and blobs are content-addressed.
+                sample_blob = await session.scalar(
+                    select(BlobRow).where(
+                        BlobRow.logical_bucket == "samples",
+                        BlobRow.sha256 == blob_sha256,
+                    )
                 )
-                session.add(sample_blob)
-                await session.flush()
+                if sample_blob is None:
+                    sample_blob = BlobRow(
+                        id=uuid4(),
+                        sha256=blob_sha256,
+                        size=1,
+                        mime_type="application/octet-stream",
+                        logical_bucket="samples",
+                        object_key=f"samples/{blob_sha256}",
+                        created_at=datetime.now(UTC),
+                    )
+                    session.add(sample_blob)
+                    await session.flush()
                 session.add(
                     SampleRow(
                         id=uuid4(),
