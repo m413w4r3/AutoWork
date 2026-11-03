@@ -498,7 +498,7 @@ async def submit_bridge_consultation_once(
             retryable=False,
             submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
             failure_stage="bridge_execution",
-            failure_reason=f"execution_deadline_exceeded; {reconciliation_detail}",
+            failure_reason="execution_deadline_exceeded",
             prior_submission_made=True,
         )
 
@@ -750,14 +750,15 @@ def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | No
 
 def _bridge_reconciliation_detail(idempotency_key: str, bridge_run_id: str | None) -> str:
     idempotency_key = idempotency_key[:255]
+    request_fingerprint = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
     if bridge_run_id:
         received = f"Bridge a reçu la soumission (run {bridge_run_id[:128]})"
     else:
         received = "La soumission a pu atteindre Bridge"
     return (
         f"{received}, mais son résultat reste inconnu. Ne la renvoyez pas; "
-        "réconciliez ce tour avec reconcile_orphaned_turn et la clé "
-        f"{idempotency_key}."
+        "réconciliez ce tour avec reconcile_orphaned_turn et l'empreinte sha256:"
+        f"{request_fingerprint}."
     )
 
 

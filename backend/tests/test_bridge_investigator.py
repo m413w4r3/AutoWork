@@ -35,6 +35,15 @@ from cti_app.domain.investigation import AgentNextAction
 from cti_app.domain.model_conversations import ConversationTurnStatus
 
 
+def test_bridge_reconciliation_detail_fingerprints_idempotency_key() -> None:
+    key = "idempotency-key-must-not-appear-in-errors"
+
+    detail = bridge_module._bridge_reconciliation_detail(key, None)
+
+    assert key not in detail
+    assert f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}" in detail
+
+
 class _ManualClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -1401,7 +1410,9 @@ async def test_ambiguous_transport_failure_preserves_run_identity_and_blocks_rep
     assert "reconcile_orphaned_turn" in first.detail
     assert "bridge_server_error" in first.failure_reason
     assert "resp_ambiguous" in first.failure_reason
-    assert "model-run:attempt-1" in first.failure_reason
+    assert "model-run:attempt-1" not in first.failure_reason
+    assert "model-run:attempt-1" not in first.detail
+    assert f"sha256:{hashlib.sha256(b'model-run:attempt-1').hexdigest()}" in (first.failure_reason)
     assert _bridge_turns_consumed(first) == 1
     assert _submission_proves_no_execution(first) is False
     assert second.status is TurnSubmissionStatus.NEEDS_REVIEW

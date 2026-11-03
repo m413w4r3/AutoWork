@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -561,7 +562,8 @@ async def test_bridge_classifies_auth_rejection_and_reconciles_ambiguous_server_
     assert "unsafe" not in str(caught.value)
     if status >= 500:
         assert caught.value.submission_state == "external_state_unknown"
-        assert caught.value.bridge_request_id == "stable"
+        assert caught.value.bridge_request_id == (f"sha256:{hashlib.sha256(b'stable').hexdigest()}")
+        assert "stable" not in str(caught.value)
         assert "reconcile_orphaned_turn" in str(caught.value)
 
 
@@ -749,9 +751,12 @@ async def test_ambiguous_bridge_submit_reconciles_run_by_idempotency_key(failure
 
     assert caught.value.submission_state == "submission_attempted"
     assert caught.value.bridge_run_id == "resp_active_1"
-    assert caught.value.bridge_request_id == "request-key-1"
+    assert caught.value.bridge_request_id == (
+        f"sha256:{hashlib.sha256(b'request-key-1').hexdigest()}"
+    )
     assert caught.value.retryable is False
     assert "Bridge a reçu la soumission" in str(caught.value)
+    assert "request-key-1" not in str(caught.value)
     assert "reconcile_orphaned_turn" in str(caught.value)
     assert [request.method for request in requests] == ["POST", "GET"]
     assert requests[0].headers["X-Idempotency-Key"] == "request-key-1"
