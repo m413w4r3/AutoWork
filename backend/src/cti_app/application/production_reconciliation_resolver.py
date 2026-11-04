@@ -277,9 +277,7 @@ def _bridge_identity_in(source: dict[str, Any]) -> tuple[str | None, bool]:
     return None, False
 
 
-def _bridge_identity_for_model_run(
-    value: object, model_run_id: UUID
-) -> tuple[str | None, bool]:
+def _bridge_identity_for_model_run(value: object, model_run_id: UUID) -> tuple[str | None, bool]:
     """Find the bridge identity recorded beside one exact ModelRun id.
 
     The identity may sit deeper than the run's own error details.  Anchoring

@@ -683,8 +683,7 @@ def test_public_export_redacts_distribution_restricted_sample_and_ioc(tmp_path: 
     archive_ioc = next(
         row
         for row in archive_iocs
-        if row["availability"] == "restricted"
-        and "canonical_policy_denied" in row["restrictions"]
+        if row["availability"] == "restricted" and "canonical_policy_denied" in row["restrictions"]
     )
     assert archive_ioc["value"] == ""
     assert archive_ioc["availability"] == "restricted"
@@ -1141,9 +1140,7 @@ def test_restricted_archive_masks_every_policy_denied_sensitive_asset_determinis
     for asset_type in sensitive_types:
         content = f"private-content-{asset_type}".encode()
         digest = hashlib.sha256(content).hexdigest()
-        canonical_id = (
-            digest if asset_type == "sample" else f"private-canonical-id-{asset_type}"
-        )
+        canonical_id = digest if asset_type == "sample" else f"private-canonical-id-{asset_type}"
         filename = f"{digest}.bin"
         denied_values[asset_type] = (canonical_id, content, digest)
         denied_assets.append(
@@ -1202,9 +1199,7 @@ def test_restricted_archive_masks_every_policy_denied_sensitive_asset_determinis
             metadata={"ioc_type": "domain", "value": allowed_ioc_value},
         ),
     )
-    snapshot = InvestigationAnnexSnapshot(
-        investigation_id, (*denied_assets, *authorized_assets)
-    )
+    snapshot = InvestigationAnnexSnapshot(investigation_id, (*denied_assets, *authorized_assets))
     first_output = tmp_path / "restricted-archive-first"
     second_output = tmp_path / "restricted-archive-second"
     write_investigation_annex(snapshot, first_output, include_restricted_archive=True)
@@ -1321,9 +1316,7 @@ def test_related_authorized_asset_cannot_reveal_withheld_sha_in_either_mode(
         assert allowed_entry["sha256"] == authorized_sha
         assert allowed_entry["references"] == []
         assert allowed_entry["metadata"]["related_to"] is None
-        with (output / "iocs/discovered-samples.csv").open(
-            encoding="utf-8", newline=""
-        ) as stream:
+        with (output / "iocs/discovered-samples.csv").open(encoding="utf-8", newline="") as stream:
             discovered = list(csv.DictReader(stream))
         assert all(row["related_to"] != withheld_sha for row in discovered)
 
