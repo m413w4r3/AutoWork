@@ -680,9 +680,15 @@ def test_public_export_redacts_distribution_restricted_sample_and_ioc(tmp_path: 
     )
     with (archive_output / "iocs/observed-iocs.csv").open(newline="", encoding="utf-8") as stream:
         archive_iocs = list(csv.DictReader(stream))
-    archive_ioc = next(row for row in archive_iocs if row["observation_id"] == "archive-only-ioc")
+    archive_ioc = next(
+        row
+        for row in archive_iocs
+        if row["availability"] == "restricted"
+        and "canonical_policy_denied" in row["restrictions"]
+    )
     assert archive_ioc["value"] == ""
     assert archive_ioc["availability"] == "restricted"
+    assert archive_ioc["observation_id"] != "archive-only-ioc"
     archive_authorized_ioc = next(
         row for row in archive_iocs if row["observation_id"] == "archive-authorized-ioc"
     )
@@ -944,9 +950,15 @@ def test_restricted_archive_requires_explicit_flag_and_policy_eligibility(tmp_pa
         )
         assert path.stat().st_mode & 0o777 == expected_mode
     manifest = _read_manifest(output)
-    denied_entry = next(item for item in manifest["objects"] if item["canonical_id"] == "denied")
+    denied_entry = next(
+        item
+        for item in manifest["objects"]
+        if item["type"] == "sample" and "canonical_policy_denied" in item["restrictions"]
+    )
     assert denied_entry["availability"] == "restricted"
     assert "canonical_policy_denied" in denied_entry["restrictions"]
+    assert denied_entry["canonical_id"] != "denied"
+    assert b'"canonical_id": "denied"' not in b"\n".join(_file_bytes(output).values())
     assert {
         "sample_license_restricted",
         "sample_external_llm_not_allowed",
@@ -1105,3 +1117,255 @@ def test_destination_is_not_overwritten_without_explicit_flag(tmp_path: Path) ->
     assert _file_bytes(destination) != before
     manifest = _read_manifest(destination)
     assert any(item["canonical_id"] == "new-ioc" for item in manifest["objects"])
+
+
+def test_restricted_archive_masks_every_policy_denied_sensitive_asset_deterministically(
+    tmp_path: Path,
+) -> None:
+    investigation_id = str(uuid4())
+    sensitive_types = (
+        "sample",
+        "network_capture",
+        "discovered_sample",
+        "technical_note",
+        "technical_figure",
+        "protocol_note",
+        "observed_ioc",
+        "yara_rule",
+        "suricata_rule",
+        "yara_test_report",
+        "suricata_test_report",
+    )
+    denied_assets = []
+    denied_values: dict[str, tuple[str, bytes, str]] = {}
+    for asset_type in sensitive_types:
+        content = f"private-content-{asset_type}".encode()
+        digest = hashlib.sha256(content).hexdigest()
+        canonical_id = (
+            digest if asset_type == "sample" else f"private-canonical-id-{asset_type}"
+        )
+        filename = f"{digest}.bin"
+        denied_values[asset_type] = (canonical_id, content, digest)
+        denied_assets.append(
+            AnnexAsset(
+                canonical_id=canonical_id,
+                type=asset_type,
+                investigation_id=investigation_id,
+                version=7,
+                sha256=digest,
+                source=f"private-source-{asset_type}",
+                origin=f"private-origin-{asset_type}",
+                references=(f"private-proof-reference-{asset_type}",),
+                availability="present",
+                restrictions=("canonical_policy_denied",),
+                public_distribution_allowed=True,
+                archive_export_allowed=(
+                    None if asset_type in {"technical_figure", "protocol_note"} else False
+                ),
+                content=content,
+                filename=filename,
+                metadata={
+                    "archive_export_allowed": False,
+                    "candidate_id": f"private-candidate-{asset_type}",
+                    "ioc_type": "domain",
+                    "value": f"private-value-{asset_type}",
+                    "related_to": digest,
+                    "source_object_id": f"private-object-{asset_type}",
+                },
+            )
+        )
+    allowed_rule = b'rule archive_allowed { strings: $a = "allowed" condition: $a }'
+    allowed_rule_sha = hashlib.sha256(allowed_rule).hexdigest()
+    allowed_ioc_value = "archive-allowed.example"
+    authorized_assets = (
+        AnnexAsset(
+            canonical_id="archive-authorized-rule",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            version=1,
+            sha256=allowed_rule_sha,
+            source="canonical_detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            public_distribution_allowed=True,
+            archive_export_allowed=True,
+            content=allowed_rule,
+            metadata={"archive_export_allowed": True, "rule_kind": "yara"},
+        ),
+        AnnexAsset(
+            canonical_id="archive-authorized-ioc",
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            source="canonical_observation",
+            origin="domain",
+            public_distribution_allowed=True,
+            archive_export_allowed=True,
+            metadata={"ioc_type": "domain", "value": allowed_ioc_value},
+        ),
+    )
+    snapshot = InvestigationAnnexSnapshot(
+        investigation_id, (*denied_assets, *authorized_assets)
+    )
+    first_output = tmp_path / "restricted-archive-first"
+    second_output = tmp_path / "restricted-archive-second"
+    write_investigation_annex(snapshot, first_output, include_restricted_archive=True)
+    write_investigation_annex(snapshot, second_output, include_restricted_archive=True)
+
+    files = _file_bytes(first_output)
+    serialized = b"\n".join(files.values())
+    manifest = _read_manifest(first_output)
+    _assert_manifest_files(first_output, manifest)
+    assert files == _file_bytes(second_output)
+    second_manifest = _read_manifest(second_output)
+    _assert_manifest_files(second_output, second_manifest)
+    assert manifest == second_manifest
+
+    objects = manifest["objects"]
+    for asset_type, (canonical_id, content, digest) in denied_values.items():
+        entry = next(
+            item
+            for item in objects
+            if item["type"] == asset_type and item["availability"] == "restricted"
+        )
+        assert entry["availability"] == "restricted", f"{asset_type}: {entry}"
+        assert "canonical_policy_denied" in entry["restrictions"]
+        assert entry["canonical_id"] != canonical_id
+        assert entry["canonical_id"].startswith(f"restricted-archive-{asset_type}-")
+        assert entry["sha256"] is None
+        assert entry["source"] == entry["origin"] == "restricted"
+        assert entry["references"] == []
+        assert entry["filename"] is None
+        assert entry["metadata"]["status"] == "restricted"
+        assert entry["metadata"].get("value") is None
+        assert entry["metadata"].get("related_to") is None
+        assert canonical_id.encode() not in serialized
+        assert content not in serialized
+        assert digest.encode() not in serialized
+        assert f"{digest}.bin".encode() not in serialized
+        assert f"private-source-{asset_type}".encode() not in serialized
+        assert f"private-origin-{asset_type}".encode() not in serialized
+        assert f"private-proof-reference-{asset_type}".encode() not in serialized
+        assert f"private-value-{asset_type}".encode() not in serialized
+        assert f"private-candidate-{asset_type}".encode() not in serialized
+        assert f"private-object-{asset_type}".encode() not in serialized
+
+    allowed_entry = next(
+        item for item in objects if item["canonical_id"] == "archive-authorized-rule"
+    )
+    assert allowed_entry["availability"] == "present"
+    assert allowed_entry["sha256"] == allowed_rule_sha
+    assert allowed_rule in serialized
+    allowed_ioc_entry = next(
+        item for item in objects if item["canonical_id"] == "archive-authorized-ioc"
+    )
+    assert allowed_ioc_entry["availability"] == "present"
+    assert allowed_ioc_value.encode() in serialized
+
+
+def test_related_authorized_asset_cannot_reveal_withheld_sha_in_either_mode(
+    tmp_path: Path,
+) -> None:
+    investigation_id = str(uuid4())
+    withheld_content = b"policy-withheld sample"
+    withheld_sha = hashlib.sha256(withheld_content).hexdigest()
+    authorized_sha = "b" * 64
+    assets = (
+        AnnexAsset(
+            canonical_id="withheld-sample-id",
+            type="sample",
+            investigation_id=investigation_id,
+            sha256=withheld_sha,
+            source="private-sample-source",
+            origin="private-sample-origin",
+            references=("private-sample-proof",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=withheld_content,
+            metadata={"archive_export_allowed": False},
+        ),
+        AnnexAsset(
+            canonical_id="authorized-related-discovery",
+            type="discovered_sample",
+            investigation_id=investigation_id,
+            sha256=authorized_sha,
+            source="canonical_discovery_source",
+            origin="analyst_pivot",
+            references=(withheld_sha,),
+            public_distribution_allowed=True,
+            archive_export_allowed=True,
+            metadata={
+                "archive_export_allowed": True,
+                "value": authorized_sha,
+                "related_to": withheld_sha,
+                "relation": "reported_related_to_not_family_proof",
+            },
+        ),
+    )
+    snapshot = InvestigationAnnexSnapshot(investigation_id, assets)
+
+    for mode, include_restricted_archive in (("public", False), ("archive", True)):
+        output = tmp_path / mode
+        write_investigation_annex(
+            snapshot,
+            output,
+            include_restricted_archive=include_restricted_archive,
+        )
+        serialized = b"\n".join(_file_bytes(output).values())
+        manifest = _read_manifest(output)
+        assert withheld_sha.encode() not in serialized
+        allowed_entry = next(
+            item
+            for item in manifest["objects"]
+            if item["canonical_id"] == "authorized-related-discovery"
+        )
+        assert allowed_entry["availability"] == "present"
+        assert allowed_entry["sha256"] == authorized_sha
+        assert allowed_entry["references"] == []
+        assert allowed_entry["metadata"]["related_to"] is None
+        with (output / "iocs/discovered-samples.csv").open(
+            encoding="utf-8", newline=""
+        ) as stream:
+            discovered = list(csv.DictReader(stream))
+        assert all(row["related_to"] != withheld_sha for row in discovered)
+
+
+def test_restricted_archive_fails_closed_for_sensitive_assets_without_policy(
+    tmp_path: Path,
+) -> None:
+    investigation_id = str(uuid4())
+    content = b"rule with unresolved archive policy"
+    digest = hashlib.sha256(content).hexdigest()
+    asset = AnnexAsset(
+        canonical_id="unresolved-archive-rule-id",
+        type="yara_rule",
+        investigation_id=investigation_id,
+        sha256=digest,
+        source="private-rule-source",
+        origin="private-rule-origin",
+        references=("private-rule-reference",),
+        public_distribution_allowed=True,
+        content=content,
+        metadata={"candidate_id": "private-rule-candidate"},
+    )
+    output = tmp_path / "unresolved-archive-policy"
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(investigation_id, (asset,)),
+        output,
+        include_restricted_archive=True,
+    )
+
+    files = _file_bytes(output)
+    serialized = b"\n".join(files.values())
+    manifest = _read_manifest(output)
+    entry = next(item for item in manifest["objects"] if item["type"] == "yara_rule")
+    assert entry["availability"] == "restricted"
+    assert "archive_export_policy_unresolved" in entry["restrictions"]
+    assert entry["canonical_id"] != "unresolved-archive-rule-id"
+    assert entry["sha256"] is None
+    assert entry["references"] == []
+    assert entry["source"] == entry["origin"] == "restricted"
+    assert content not in serialized
+    assert digest.encode() not in serialized
+    assert b"private-rule-source" not in serialized
+    assert b"private-rule-origin" not in serialized
+    assert b"private-rule-reference" not in serialized
+    assert b"private-rule-candidate" not in serialized
