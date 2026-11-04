@@ -941,6 +941,7 @@ async def load_investigation_annex_snapshot(
                     sorted(set(restrictions) | set(public_distribution_restrictions))
                 ),
                 public_distribution_allowed=public_distribution_allowed,
+                archive_export_allowed=envelope_allowed,
                 content=figure_content,
                 filename=(f"opinion-{opinion.id}-v{opinion.version}-{figure.kind.value}.svg"),
                 metadata={
@@ -1907,6 +1908,7 @@ async def load_investigation_annex_snapshot(
                     sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
                     known_sample_shas=set(samples_by_sha) | set(association_by_sha),
                 ),
+                archive_export_allowed=envelope_allowed,
                 content=model_raw,
                 filename=f"protocol-{observation.id}.json",
                 metadata={
@@ -1941,6 +1943,7 @@ async def load_investigation_annex_snapshot(
                 availability="present" if envelope_allowed else "restricted",
                 restrictions=() if envelope_allowed else envelope_restrictions,
                 public_distribution_allowed=public_distribution_allowed,
+                archive_export_allowed=envelope_allowed,
                 content=content,
                 filename=f"experiment-{experiment.id}.json",
                 metadata={
@@ -1970,6 +1973,7 @@ async def load_investigation_annex_snapshot(
                 availability="present" if envelope_allowed else "restricted",
                 restrictions=() if envelope_allowed else envelope_restrictions,
                 public_distribution_allowed=public_distribution_allowed,
+                archive_export_allowed=envelope_allowed,
                 content=content,
                 filename=f"finding-{finding.id}.json",
                 metadata={

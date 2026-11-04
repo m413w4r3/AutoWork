@@ -27,6 +27,21 @@ _AVAILABILITY = frozenset({"present", "unavailable", "restricted", "absent"})
 _RESTRICTED_TYPES = frozenset(
     {"sample", "network_capture", "protocol_note", "technical_figure", "technical_note"}
 )
+_POLICY_SENSITIVE_TYPES = frozenset(
+    {
+        "sample",
+        "network_capture",
+        "discovered_sample",
+        "technical_note",
+        "technical_figure",
+        "protocol_note",
+        "observed_ioc",
+        "yara_rule",
+        "suricata_rule",
+        "yara_test_report",
+        "suricata_test_report",
+    }
+)
 _MANIFEST_METADATA_KEYS = frozenset(
     {
         "author",
@@ -259,84 +274,75 @@ def _sorted_refs(asset: AnnexAsset) -> list[str]:
     return sorted({_clean_text(item) for item in asset.references if str(item).strip()})
 
 
+def _archive_export_policy(asset: AnnexAsset) -> bool | None:
+    if asset.archive_export_allowed is not None:
+        return asset.archive_export_allowed
+    metadata_policy = asset.metadata.get("archive_export_allowed")
+    return metadata_policy if isinstance(metadata_policy, bool) else None
+
+
 def _public_projection(asset: AnnexAsset, *, include_restricted_archive: bool) -> AnnexAsset:
     policy_unresolved = not include_restricted_archive and asset.public_distribution_allowed is None
     public_restricted = not include_restricted_archive and (
         policy_unresolved or asset.public_distribution_allowed is False
     )
-    archive_restricted = include_restricted_archive and asset.archive_export_allowed is False
+    archive_policy = _archive_export_policy(asset)
+    archive_policy_unresolved = (
+        include_restricted_archive
+        and asset.type in _POLICY_SENSITIVE_TYPES
+        and asset.availability != "absent"
+        and archive_policy is None
+    )
+    archive_restricted = include_restricted_archive and (
+        archive_policy is False or archive_policy_unresolved
+    )
     if not public_restricted and not archive_restricted:
         return asset
     restrictions = tuple(sorted(set(asset.restrictions)))
     if policy_unresolved:
         restrictions = tuple(sorted(set(restrictions) | {"distribution_policy_unresolved"}))
-    if public_restricted:
-        if asset.type == "observed_ioc":
-            ioc_type = asset.metadata.get("ioc_type")
-            metadata = {"status": "restricted"}
-            if isinstance(ioc_type, str):
-                metadata["ioc_type"] = ioc_type
-        else:
-            metadata = {"status": "restricted"}
-        return replace(
-            asset,
-            version=None,
-            sha256=None,
-            source="restricted",
-            origin="restricted",
-            references=(),
-            availability="restricted",
-            restrictions=restrictions,
-            public_distribution_allowed=False,
-            content=None,
-            filename=None,
-            metadata=metadata,
+    if public_restricted and not policy_unresolved:
+        restrictions = tuple(sorted(set(restrictions) | {"public_distribution_denied"}))
+    if archive_restricted:
+        reason = (
+            "archive_export_policy_unresolved"
+            if archive_policy_unresolved
+            else "canonical_policy_denied"
         )
-    if (public_restricted or archive_restricted) and asset.type in {
-        "sample",
-        "network_capture",
-        "discovered_sample",
-        "technical_note",
-    }:
-        # Keep the internal record ID so editors can trace the omission without exposing its hash.
-        return replace(
-            asset,
-            version=None,
-            sha256=None,
-            source="restricted",
-            origin="restricted",
-            references=(),
-            availability="restricted",
-            restrictions=restrictions,
-            content=None,
-            filename=None,
-            metadata={"status": "restricted"},
-        )
-    if asset.type == "observed_ioc" and (public_restricted or archive_restricted):
-        metadata = dict(asset.metadata)
-        metadata.pop("value", None)
-        return replace(
-            asset,
-            availability="restricted",
-            restrictions=restrictions,
-            content=None,
-            filename=None,
-            metadata=metadata,
-        )
-    if asset.type in {
-        "yara_rule",
-        "suricata_rule",
-        "yara_test_report",
-        "suricata_test_report",
-    } and (public_restricted or archive_restricted):
-        return replace(
-            asset,
-            availability="restricted",
-            restrictions=restrictions,
-            content=None,
-            filename=None,
-        )
-    return asset
+        restrictions = tuple(sorted(set(restrictions) | {reason}))
+
+    metadata = {"status": "restricted"}
+    if asset.type == "observed_ioc":
+        ioc_type = asset.metadata.get("ioc_type")
+        if isinstance(ioc_type, str):
+            metadata["ioc_type"] = ioc_type
+    return replace(
+        asset,
+        version=None,
+        sha256=None,
+        source="restricted",
+        origin="restricted",
+        references=(),
+        availability="restricted",
+        restrictions=restrictions,
+        public_distribution_allowed=(
+            False if public_restricted else asset.public_distribution_allowed
+        ),
+        content=None,
+        filename=None,
+        metadata=metadata,
+    )
+
+
+def _is_export_withheld(asset: AnnexAsset, *, include_restricted_archive: bool) -> bool:
+    projected = _public_projection(asset, include_restricted_archive=include_restricted_archive)
+    if projected.availability == "restricted":
+        return True
+    return (
+        not include_restricted_archive
+        and asset.type in _RESTRICTED_TYPES
+        and asset.availability != "absent"
+    )
 
 
 def _project_assets(
@@ -351,20 +357,13 @@ def _project_assets(
     projected_assets: list[AnnexAsset] = []
     type_ordinals: defaultdict[str, int] = defaultdict(int)
 
-    # A relation must not reveal the hash of a withheld asset (a distributable candidate that is
-    # "related to" a TLP RED sample would otherwise publish that sample's SHA-256).
-    withheld_shas = (
-        {
-            item.sha256
-            for item in assets
-            if item.sha256
-            and _public_projection(item, include_restricted_archive=False).availability
-            == "restricted"
-            and item.availability != "absent"
-        }
-        if not include_restricted_archive
-        else set()
-    )
+    # A relation must not reveal the hash of an asset withheld by the active export policy.
+    withheld_shas = {
+        item.sha256
+        for item in assets
+        if item.sha256
+        and _is_export_withheld(item, include_restricted_archive=include_restricted_archive)
+    }
 
     for asset in assets:
         path_asset = asset
@@ -403,13 +402,14 @@ def _project_assets(
                     set(restrictions) | {"explicit_restricted_archive_flag_required"}
                 )
                 content = None
-            elif not (
-                asset.archive_export_allowed
-                if asset.archive_export_allowed is not None
-                else bool(asset.metadata.get("archive_export_allowed", False))
-            ):
+            elif _archive_export_policy(asset) is not True:
                 availability = "restricted"
-                restrictions = sorted(set(restrictions) | {"canonical_policy_denied"})
+                policy_reason = (
+                    "canonical_policy_denied"
+                    if _archive_export_policy(asset) is False
+                    else "archive_export_policy_unresolved"
+                )
+                restrictions = sorted(set(restrictions) | {policy_reason})
                 content = None
             elif content is None and availability == "present":
                 availability = "unavailable"
@@ -437,16 +437,17 @@ def _project_assets(
         else:
             path = None
 
-        if not include_restricted_archive and availability == "restricted":
+        if availability == "restricted":
             metadata = {"status": "restricted"}
             if asset.type == "observed_ioc":
                 ioc_type = asset.metadata.get("ioc_type")
                 if isinstance(ioc_type, str):
                     metadata["ioc_type"] = ioc_type
+            projection_scope = "public" if not include_restricted_archive else "archive"
             asset = replace(
                 asset,
                 canonical_id=(
-                    f"restricted-public-{_safe_leaf(asset.type, 'asset')}-"
+                    f"restricted-{projection_scope}-{_safe_leaf(asset.type, 'asset')}-"
                     f"{type_ordinals[asset.type]:03d}"
                 ),
                 version=None,
