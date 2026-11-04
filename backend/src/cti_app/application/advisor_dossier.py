@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from cti_app.application.external_effects import advisor_disclosure_policy
 from cti_app.application.publication_secret_guard import is_operational_secret_field_name
 from cti_app.domain.advisor_completeness import (
     AdvisorEvidenceStatus,
@@ -590,6 +591,8 @@ def _contains_sample_context(value: object) -> bool:
 def _sample_disclosure_restriction_sources(
     sample: object,
     envelope: InvestigationEnvelope | None,
+    *,
+    disclosure_profile: str | None = None,
 ) -> tuple[str, ...]:
     """Return disclosure veto names for a sample under the current envelope.
 
@@ -601,6 +604,10 @@ def _sample_disclosure_restriction_sources(
         if isinstance(sample, Mapping):
             return sample.get(name, default)
         return getattr(sample, name, default)
+
+    policy = advisor_disclosure_policy(disclosure_profile)
+    if policy.ignores_restriction_labels("advisor.consult"):
+        return ()
 
     sources: list[str] = []
     tlp = value("tlp")
@@ -642,6 +649,7 @@ def build_advisor_dossier(
     prompt_data: Mapping[str, Any],
     *,
     envelope: InvestigationEnvelope | None = None,
+    disclosure_profile: str | None = None,
 ) -> AdvisorDossier:
     """Select pertinent whole facts and render a shared French task dossier."""
     consultation_type = _as_text(prompt_data.get("consultation_type"))
@@ -826,7 +834,9 @@ def build_advisor_dossier(
     for sample in prompt_data.get("samples", ()):
         if not isinstance(sample, Mapping) or sample.get("verified") is not True:
             continue
-        if envelope is not None and _sample_disclosure_restriction_sources(sample, envelope):
+        if envelope is not None and _sample_disclosure_restriction_sources(
+            sample, envelope, disclosure_profile=disclosure_profile
+        ):
             continue
         sample_id = _as_text(sample.get("sample_id"))
         association_id = _as_text(sample.get("association_id"))

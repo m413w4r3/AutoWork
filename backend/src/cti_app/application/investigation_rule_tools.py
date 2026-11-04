@@ -1609,9 +1609,8 @@ class _RuleTools:
                     "the response link does not identify the requested YARA invocation."
                 )
             linked_invocation_id = payload["bridge_invocation_id"]
-            if (
-                requested_invocation_id is not None
-                and linked_invocation_id != str(requested_invocation_id)
+            if requested_invocation_id is not None and linked_invocation_id != str(
+                requested_invocation_id
             ):
                 raise rejection("the response link does not match bridge_invocation_id.")
             if self.evidence_observations is not None:
@@ -1937,12 +1936,9 @@ class _RuleTools:
                 selected_sources: list[tuple[str, Mapping[str, Any] | None]] = []
                 for index, candidate in enumerate(rule_sources, start=1):
                     item_name = candidate[1].get("name") if candidate[1] is not None else None
-                    name_matches = (
-                        selected_name is None
-                        or (
-                            isinstance(item_name, str)
-                            and item_name.casefold() == selected_name.casefold()
-                        )
+                    name_matches = selected_name is None or (
+                        isinstance(item_name, str)
+                        and item_name.casefold() == selected_name.casefold()
                     )
                     index_matches = selected_index is None or selected_index == index
                     if name_matches and index_matches:
@@ -2116,8 +2112,7 @@ class _RuleTools:
                 matching_rules = [
                     rule_source
                     for rule_source, _name in extracted_rules
-                    if hashlib.sha256(rule_source.encode("utf-8")).hexdigest()
-                    == requested_sha256
+                    if hashlib.sha256(rule_source.encode("utf-8")).hexdigest() == requested_sha256
                 ]
                 if len(matching_rules) == 1:
                     source = matching_rules[0]
@@ -2644,11 +2639,7 @@ class _RuleTools:
         source_observation_refs = tuple(
             dict.fromkeys(
                 (
-                    *(
-                        parent.provenance.observation_refs
-                        if parent.provenance is not None
-                        else ()
-                    ),
+                    *(parent.provenance.observation_refs if parent.provenance is not None else ()),
                     *(ref for item in parent.motif_provenance for ref in item.observation_refs),
                 )
             )
@@ -5261,11 +5252,7 @@ def _operator_source_revision_provenance(
     refs = tuple(
         dict.fromkeys(
             (
-                *(
-                    parent.provenance.observation_refs
-                    if parent.provenance is not None
-                    else ()
-                ),
+                *(parent.provenance.observation_refs if parent.provenance is not None else ()),
                 *(
                     reference
                     for motif in parent.motif_provenance

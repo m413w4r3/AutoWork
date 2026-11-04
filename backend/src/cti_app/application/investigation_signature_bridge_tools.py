@@ -355,9 +355,7 @@ class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
                 "bridge_provenance": {
                     **bridge_provenance,
                     "bridge_invocation_id": (
-                        str(bridge_invocation_id)
-                        if bridge_invocation_id is not None
-                        else None
+                        str(bridge_invocation_id) if bridge_invocation_id is not None else None
                     ),
                     "bridge_invocation_id_kind": bridge_invocation_id_kind,
                     "local_tool_invocation_id": (

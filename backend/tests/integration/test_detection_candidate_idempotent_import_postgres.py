@@ -92,7 +92,7 @@ async def test_candidate_level_provenance_round_trips_without_motifs(
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
     investigation = await _make_investigation(session_factory)
-    source = 'rule bridge_candidate { condition: true }'
+    source = "rule bridge_candidate { condition: true }"
     version = DetectionCandidateVersion(
         investigation_id=investigation.id,
         candidate_id=uuid4(),

@@ -24,6 +24,7 @@ from pydantic import (
 )
 
 from cti_app.application.evidence_recorder import sanitize_evidence_text
+from cti_app.application.external_effects import advisor_disclosure_policy
 from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -1082,7 +1083,10 @@ class RegistryToolDispatcher:
             provider = tool_provider(definition)
             if provider not in envelope.allowed_providers:
                 return ToolInvocationStatus.POLICY_DENIED
-            if envelope.disclosure.tlp is TLPLevel.RED or (
+            if (
+                envelope.disclosure.tlp is TLPLevel.RED
+                and not advisor_disclosure_policy().ignores_restriction_labels(definition.name)
+            ) or (
                 envelope.disclosure.do_not_submit
                 and provider not in {"bridge", "advisor", "vt", "virustotal"}
             ):

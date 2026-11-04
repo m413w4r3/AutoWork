@@ -2143,8 +2143,8 @@ async def test_bridge_yara_proposal_keeps_truncation_diagnostic_and_imports_two_
 @pytest.mark.asyncio
 async def test_bridge_yara_import_recomputes_hash_and_selects_from_raw_multi_rule_text() -> None:
     harness = _harness(samples={})
-    first = 'rule first { condition: true }'
-    second = 'rule second { condition: true }'
+    first = "rule first { condition: true }"
+    second = "rule second { condition: true }"
     source = f"{first}\n{second}\n"
     observation_id, _invocation_id, _source_sha256 = await _bridge_yara_observation(
         harness, source=source, motifs=[]

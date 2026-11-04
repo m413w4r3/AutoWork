@@ -820,6 +820,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                 ("credential", credential_observation, credential_marker),
                 ("signed-url", signed_url_observation, signed_url_marker),
             ):
+                before = len(transport.calls)
                 sensitive_budget = InvestigationBudget(limits=envelope.budget.limits)
                 sensitive_key = f"m05d-sensitive-refusal-{label}-{investigation_id}"
                 sensitive_budget.reserve(
@@ -831,7 +832,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                         BudgetDimension.CONTEXT_TOKENS: 0,
                     },
                 )
-                refusal = await composition.advisor_tool.execute(
+                result = await composition.advisor_tool.execute(
                     {
                         "consultation_type": "plan_investigation",
                         "question": "Review this synthetic no-sample observation.",
@@ -845,24 +846,13 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                         available_capabilities=frozenset({"bridge.advisor"}),
                     ),
                 )
-                assert refusal.status is ToolInvocationStatus.FAILED, label
-                assert refusal.error_code == "advisor_secret_field_remaining", label
-                assert refusal.output["refusal_code"] == (
-                    "autowork_credential_or_signed_url_detected"
-                )
-                assert refusal.output["confirmed_non_execution"] is True
-                secret_findings = refusal.output["secret_findings"]
-                assert secret_findings, label
-                assert refusal.output["redacted_secret_count"] == len(secret_findings), label
-                assert all(
-                    set(finding) == {"location", "type"}
-                    and finding["location"].startswith("$")
-                    and finding["type"] in {"configured_credential", "signed_url"}
-                    and marker not in finding["location"]
-                    for finding in secret_findings
-                ), label
-                assert marker not in str(refusal.output)
-        assert transport.calls == []
+                assert result.status is ToolInvocationStatus.SUCCEEDED, label
+                assert len(transport.calls) == before + 1, label
+                prompt = transport.calls[-1]["prompt"]
+                assert marker not in prompt, label
+                assert "[redacted-autowork-credential]" in prompt, label
+                assert marker not in str(result.output), label
+        assert transport.real_network_calls == 0
         assert transport.real_network_calls == 0
 
         with pytest.raises(AssertionError, match="blocked non-loopback"):
@@ -902,21 +892,21 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         )
         assert missing_ref.status_code == 200, missing_ref.text
         missing_payload = missing_ref.json()
-        # The continued consultation is stopped by the AutoWork-credential preflight (this
-        # fixture seeds a signed URL and a configured credential in canonical evidence):
-        # typed pre-transport proof (confirmed non-execution) => FAILED, not NEEDS_REVIEW.
-        assert missing_payload["invocation"]["status"] == ToolInvocationStatus.FAILED.value
-        assert missing_payload["advisor_output"]["advisor_status"] == "refused"
-        assert (
-            missing_payload["advisor_output"]["refusal_code"]
-            == "autowork_credential_or_signed_url_detected"
-        )
-        assert missing_payload["advisor_output"]["confirmed_non_execution"] is True
-        assert transport.calls == []
+        assert missing_payload["invocation"]["status"] == ToolInvocationStatus.SUCCEEDED.value
+        assert missing_payload["advisor_output"]["advisor_status"] == "succeeded"
+        assert len(transport.calls) == 3
+        sent_prompt = transport.calls[-1]["prompt"]
+        assert credential_marker not in sent_prompt
+        assert signed_url_marker not in sent_prompt
+        manifest_rows = missing_payload["advisor_output"]["bridge_provenance"]["dossier_manifest"]
+        omitted_ids = {row.get("id") for row in manifest_rows if row.get("kind") == "omission"}
+        assert str(credential_observation.id) in omitted_ids
+        assert str(signed_url_observation.id) in omitted_ids
         async with uow_factory() as uow:
             latest_state = await uow.investigation_states.get(investigation_id)
         assert latest_state is not None
 
+        calls_before_allowed = len(transport.calls)
         allowed = await _invoke_advisor(
             client,
             investigation_id,
@@ -927,7 +917,9 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         )
         assert allowed.status_code == 200, allowed.text
         assert allowed.json()["invocation"]["status"] == ToolInvocationStatus.SUCCEEDED.value
-        assert len(transport.calls) == 1
+        assert len(transport.calls) == calls_before_allowed + 1
+        assert credential_marker not in transport.calls[-1]["prompt"]
+        assert signed_url_marker not in transport.calls[-1]["prompt"]
         assert transport.real_network_calls == 0
 
         composed = await compose_opinion_http(client, investigation_id)

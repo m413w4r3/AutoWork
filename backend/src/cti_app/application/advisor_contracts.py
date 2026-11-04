@@ -100,9 +100,11 @@ def parse_typed_advisor_response(
     )
     safe_raw = safe_text(str(redacted_raw), len(str(redacted_raw)) + 1)
     v4_response = extract_json_object(safe_raw)
-    if result is None and not (
-        v4_response is not None and v4_response.get("schema") == "advisor-response.v4"
-    ) and _text_is_intelligible(safe_raw):
+    if (
+        result is None
+        and not (v4_response is not None and v4_response.get("schema") == "advisor-response.v4")
+        and _text_is_intelligible(safe_raw)
+    ):
         result = _opportunistic_text_result(
             safe_raw,
             consultation_type=consultation_type,
@@ -355,8 +357,7 @@ def _opportunistic_text_result(
         "raw_output_sha256": hashlib.sha256(encoded).hexdigest(),
         "raw_output_retained": True,
         "raw_output_truncated": False,
-        "extracted_elements": _opportunistic_extractions(safe_raw)
-        or {"text": safe_raw},
+        "extracted_elements": _opportunistic_extractions(safe_raw) or {"text": safe_raw},
         "warnings": ["opportunistic_unstructured_parse"],
         "limitations": ["Secondary response formatting could not be fully structured."],
     }
@@ -1169,9 +1170,7 @@ def _resolve_typed_json_aliases(
                 mapped = aliases["assertions"].get(item.upper()) or actual_assertions.get(item)
                 if mapped is None:
                     warn()
-                    unresolved_refs.append(
-                        {"reference": item, "reason": "assertion_alias_unknown"}
-                    )
+                    unresolved_refs.append({"reference": item, "reason": "assertion_alias_unknown"})
                 else:
                     resolved.append(str(mapped.get("id")))
                 continue
@@ -2647,9 +2646,7 @@ def _parse_draft_text(
     warnings: list[str] = []
     unit_warnings: dict[str, list[str]] = {}
     unresolved_refs: list[dict[str, Any]] = [
-        dict(item)
-        for item in parsed.get("_unresolved_refs", ())
-        if isinstance(item, Mapping)
+        dict(item) for item in parsed.get("_unresolved_refs", ()) if isinstance(item, Mapping)
     ]
 
     def warn(code: str, unit_id: str | None = None) -> None:
@@ -2808,9 +2805,7 @@ def _parse_draft_text(
                 continue
             if not raw_assertion_ids:
                 warn("sentence_references_missing", error_unit_id)
-                unresolved_refs.append(
-                    {"reference": None, "reason": "sentence_references_missing"}
-                )
+                unresolved_refs.append({"reference": None, "reason": "sentence_references_missing"})
             elif not assertion_ids:
                 warn("sentence_without_valid_assertion", error_unit_id)
             if _REFERENCE_ALIAS_IN_PROSE.search(text_value):

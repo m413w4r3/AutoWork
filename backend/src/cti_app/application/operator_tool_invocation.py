@@ -29,6 +29,7 @@ from cti_app.application.context_pagination import (
     encode_offset_cursor,
 )
 from cti_app.application.evidence_recorder import _sanitize_json
+from cti_app.application.external_effects import advisor_disclosure_policy
 from cti_app.application.investigation_contracts import (
     InvestigationContextV1,
     InvestigationOperatorContextV1,
@@ -643,6 +644,29 @@ class OperatorToolInvocationResult:
     output: Mapping[str, Any]
 
 
+def _disclosure_origin_labels(source: Any) -> dict[str, Any]:
+    disclosure = getattr(source, "disclosure", source)
+    tlp = getattr(disclosure, "tlp", getattr(source, "tlp", None))
+    tlp = getattr(tlp, "value", tlp)
+    external = getattr(
+        disclosure,
+        "external_llm_allowed",
+        getattr(source, "external_llm_allowed", None),
+    )
+    do_not_submit = getattr(
+        disclosure,
+        "do_not_submit",
+        getattr(source, "do_not_submit", None),
+    )
+    license_restriction = getattr(source, "license_restriction", None)
+    return {
+        "tlp": tlp if isinstance(tlp, str) or tlp is None else str(tlp),
+        "external_llm_allowed": external if isinstance(external, bool) else None,
+        "do_not_submit": do_not_submit if isinstance(do_not_submit, bool) else None,
+        "license_restricted": bool(str(license_restriction or "").strip()),
+    }
+
+
 class OperatorToolInvocationService:
     def __init__(
         self,
@@ -660,6 +684,7 @@ class OperatorToolInvocationService:
         observations: Any | None = None,
         evidence_summaries: CanonicalEvidenceSummaryPort | None = None,
         effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
+        disclosure_profile: str | None = None,
     ) -> None:
         self._investigation_id = investigation_id
         self._investigations = investigations
@@ -674,6 +699,7 @@ class OperatorToolInvocationService:
         self._observations = observations
         self._evidence_summaries = evidence_summaries
         self._effective_policy_for = effective_policy_for
+        self._disclosure_policy = advisor_disclosure_policy(disclosure_profile)
 
     async def get_context(
         self,
@@ -729,7 +755,11 @@ class OperatorToolInvocationService:
             osint_policy_authorized=osint_policy_authorized,
             blocked_capabilities=(
                 ("bridge.advisor:external_llm_disclosure_denied",)
-                if not InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
+                if not self._disclosure_policy.allows_disclosure(
+                    InvestigationService.bridge_disclosure_allowed(snapshot, envelope),
+                    envelope_exists=envelope is not None,
+                    family="advisor.consult",
+                )
                 else ()
             ),
         )
@@ -1293,8 +1323,10 @@ class OperatorToolInvocationService:
         snapshot = await self._context_builder.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
-        advisor_external_allowed = InvestigationService.bridge_disclosure_allowed(
-            snapshot, envelope
+        advisor_external_allowed = self._disclosure_policy.allows_disclosure(
+            InvestigationService.bridge_disclosure_allowed(snapshot, envelope),
+            envelope_exists=envelope is not None,
+            family="advisor.consult",
         )
         advisor_disclosure_denied = tool_name == "advisor.consult" and not advisor_external_allowed
         requires_external_disclosure = definition is not None and definition.effect in {
@@ -1304,23 +1336,29 @@ class OperatorToolInvocationService:
             ToolEffect.EXTERNAL_SUBMIT,
         }
         if requires_external_disclosure and not await self._policy_envelope_authorized(envelope):
-            self._require_external_disclosure(snapshot, None)
+            self._require_external_disclosure(snapshot, None, family=tool_name)
         # Start-time policy inheritance is the only path to an OSINT_POLICY
         # envelope. An old or unpinned investigation cannot acquire one here.
         if requires_external_disclosure and envelope is None:
-            self._require_external_disclosure(snapshot, envelope)
+            self._require_external_disclosure(snapshot, envelope, family=tool_name)
         if (
             not advisor_disclosure_denied
             and requires_external_disclosure
             and tool_name != "advisor.consult"
-            and not InvestigationService.external_llm_allowed(snapshot, envelope)
+            and not self._disclosure_policy.allows_disclosure(
+                InvestigationService.external_llm_allowed(snapshot, envelope),
+                envelope_exists=envelope is not None,
+                family=tool_name,
+            )
         ):
-            self._require_external_disclosure(snapshot, envelope)
+            self._require_external_disclosure(snapshot, envelope, family=tool_name)
         if (
             requires_external_disclosure
             and tool_name.startswith("vt.")
-            and not InvestigationService.vt_external_disclosure_allowed(
-                snapshot, envelope, tool_name
+            and not self._disclosure_policy.allows_disclosure(
+                InvestigationService.vt_external_disclosure_allowed(snapshot, envelope, tool_name),
+                envelope_exists=envelope is not None,
+                family=tool_name,
             )
         ):
             raise OperatorToolInvocationError("external_disclosure_denied", 403)
@@ -1434,24 +1472,32 @@ class OperatorToolInvocationService:
         # envelope. Reload it and repeat disclosure checks before reserving the
         # fresh invocation so dispatch uses the current budget and authority.
         envelope = await self._envelopes.get(self._investigation_id)
-        advisor_external_allowed = InvestigationService.bridge_disclosure_allowed(
-            snapshot, envelope
+        advisor_external_allowed = self._disclosure_policy.allows_disclosure(
+            InvestigationService.bridge_disclosure_allowed(snapshot, envelope),
+            envelope_exists=envelope is not None,
+            family="advisor.consult",
         )
         if requires_external_disclosure and not await self._policy_envelope_authorized(envelope):
-            self._require_external_disclosure(snapshot, None)
+            self._require_external_disclosure(snapshot, None, family=tool_name)
         if requires_external_disclosure and envelope is None:
-            self._require_external_disclosure(snapshot, envelope)
+            self._require_external_disclosure(snapshot, envelope, family=tool_name)
         if (
             requires_external_disclosure
             and tool_name != "advisor.consult"
-            and not InvestigationService.external_llm_allowed(snapshot, envelope)
+            and not self._disclosure_policy.allows_disclosure(
+                InvestigationService.external_llm_allowed(snapshot, envelope),
+                envelope_exists=envelope is not None,
+                family=tool_name,
+            )
         ):
-            self._require_external_disclosure(snapshot, envelope)
+            self._require_external_disclosure(snapshot, envelope, family=tool_name)
         if (
             requires_external_disclosure
             and tool_name.startswith("vt.")
-            and not InvestigationService.vt_external_disclosure_allowed(
-                snapshot, envelope, tool_name
+            and not self._disclosure_policy.allows_disclosure(
+                InvestigationService.vt_external_disclosure_allowed(snapshot, envelope, tool_name),
+                envelope_exists=envelope is not None,
+                family=tool_name,
             )
         ):
             raise OperatorToolInvocationError("external_disclosure_denied", 403)
@@ -1589,6 +1635,44 @@ class OperatorToolInvocationService:
                     checkpoint=checkpoint,
                     recommendation=trace.get("recommendation"),
                 )
+
+        if tool_name == "advisor.consult" or tool_name.startswith("vt."):
+            origin_labels: dict[str, Any] = {
+                "article": _disclosure_origin_labels(snapshot),
+                "envelope": _disclosure_origin_labels(envelope),
+                "samples": [],
+            }
+            raw_sample_hash = arguments.get("file_hash")
+            if tool_name == "vt.relationships" and arguments.get("object_type") == "file":
+                raw_sample_hash = arguments.get("object_id")
+            if isinstance(raw_sample_hash, str) and re.fullmatch(
+                r"(?i)[0-9a-f]{64}", raw_sample_hash
+            ):
+                sample_repository = getattr(self._execution, "_samples", None)
+                list_by_hash = getattr(sample_repository, "list_by_subject_and_sha256", None)
+                if callable(list_by_hash):
+                    try:
+                        source_samples = await list_by_hash(
+                            investigation.subject_id, raw_sample_hash
+                        )
+                    except Exception:
+                        source_samples = ()
+                    origin_labels["samples"] = [
+                        {
+                            "sample_sha256": raw_sample_hash,
+                            "sample_id": str(getattr(sample, "id", "unknown")),
+                            "labels": _disclosure_origin_labels(sample),
+                        }
+                        for sample in source_samples
+                    ]
+            audit_record = {
+                "profile": self._disclosure_policy.profile,
+                "origin_labels": origin_labels,
+            }
+            record_purpose = (
+                f"{record_purpose}\n[advisor-disclosure-audit:"
+                f"{json.dumps(audit_record, sort_keys=True, separators=(',', ':'))}]"
+            )
 
         updated_state = state
         if not nonblocking_local_freshness:
@@ -1809,9 +1893,14 @@ class OperatorToolInvocationService:
         if mode is not InvestigationExecutionMode.OPERATOR_LED:
             raise OperatorToolInvocationError("operator_mode_required", 409)
 
-    @staticmethod
-    def _require_external_disclosure(snapshot: Any, envelope: Any) -> None:
-        if not InvestigationService.external_llm_allowed(snapshot, envelope):
+    def _require_external_disclosure(
+        self, snapshot: Any, envelope: Any, *, family: str = "advisor.consult"
+    ) -> None:
+        if not self._disclosure_policy.allows_disclosure(
+            InvestigationService.external_llm_allowed(snapshot, envelope),
+            envelope_exists=envelope is not None,
+            family=family,
+        ):
             raise OperatorToolInvocationError("external_disclosure_denied", 403)
 
     async def _policy_envelope_authorized(self, envelope: Any) -> bool:

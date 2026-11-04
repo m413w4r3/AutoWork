@@ -1727,6 +1727,7 @@ def build_investigation_composition(
         commit_uow=commit_uow if callable(commit_uow) else None,
         rollback_uow=rollback_uow if callable(rollback_uow) else None,
         effective_policy_for=osint_open_policy_service.effective_for_investigation,
+        disclosure_profile=settings.advisor_disclosure_profile,
     )
     return InvestigationComposition(
         service=service,
@@ -1744,6 +1745,7 @@ def build_investigation_composition(
             observations=uow.evidence_observations,
             evidence_summaries=evidence_summaries,
             effective_policy_for=osint_open_policy_service.effective_for_investigation,
+            disclosure_profile=settings.advisor_disclosure_profile,
         ),
         osint_open_policy_service=osint_open_policy_service,
         registry=registry,

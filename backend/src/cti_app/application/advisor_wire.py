@@ -128,8 +128,7 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
             # beyond the exact rule slice. Keep that original source as the
             # import unit instead of adding a second, overlapping candidate.
             if any(
-                existing_name == name
-                and normalized in _normalize_source_whitespace(existing)
+                existing_name == name and normalized in _normalize_source_whitespace(existing)
                 for existing, existing_name in merged
             ):
                 continue
@@ -663,18 +662,14 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
 
 def _foreign_fence_ranges(text: str) -> tuple[tuple[int, int], ...]:
     ranges: list[tuple[int, int]] = []
-    opening_pattern = re.compile(
-        r"(?im)^[ \t]*(?P<fence>`{3,})[ \t]*(?P<info>[^\n]*)\n"
-    )
+    opening_pattern = re.compile(r"(?im)^[ \t]*(?P<fence>`{3,})[ \t]*(?P<info>[^\n]*)\n")
     supported = {"yara", "yar", "yara-rule", "suricata"}
     for opening in opening_pattern.finditer(text):
         info = opening.group("info").strip().casefold()
         if not info or info in supported:
             continue
         fence = opening.group("fence")
-        closing = re.compile(rf"(?m)^[ \t]*`{{{len(fence)},}}[ \t]*$").search(
-            text, opening.end()
-        )
+        closing = re.compile(rf"(?m)^[ \t]*`{{{len(fence)},}}[ \t]*$").search(text, opening.end())
         ranges.append((opening.start(), closing.end() if closing is not None else len(text)))
     return tuple(ranges)
 
@@ -738,9 +733,7 @@ def _extract_yara_rule_slices(
         source = text[start:end]
         extracted.append(
             (
-                _restore_source_line_endings(
-                    source, start, text, source_text, source_offsets
-                ),
+                _restore_source_line_endings(source, start, text, source_text, source_offsets),
                 declaration.group("name"),
             )
         )

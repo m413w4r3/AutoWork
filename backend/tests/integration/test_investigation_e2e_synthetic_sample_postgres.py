@@ -842,18 +842,15 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                     key=f"m05c-advisor-veto:{label}:{uuid4()}",
                 )
                 output = result["advisor_output"]
-                assert output["advisor_status"] == "refused", (
-                    f"{label}: observation={observation.id}; "
-                    f"failure_stage={output.get('failure_stage')}; "
-                    f"refs={output.get('disclosure_restricted_refs')}; "
-                    f"samples={output.get('disclosure_restricted_sample_associations')}"
-                )
-                assert output["refusal_code"] == "autowork_credential_or_signed_url_detected"
-                assert output["confirmed_non_execution"] is True
-                assert len(transport.calls) - before == 0
+                assert output["advisor_status"] == "succeeded", label
+                assert result["invocation"]["status"] == "succeeded"
+                assert len(transport.calls) - before == 1
+                sent_prompt = transport.calls[-1]["prompt"]
+                assert marker not in sent_prompt
+                assert "[redacted-autowork-credential]" in sent_prompt
+                assert marker not in json.dumps(output)
                 if label == "signed-url":
                     assert signed_url_finding.observation_refs == (observation.id,)
-                assert marker not in json.dumps(output)
                 if label == "signed-url":
                     assert signed_url not in json.dumps(output)
 
@@ -880,16 +877,17 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 },
                 key=f"m05c-advisor-veto:missing-ref:{investigation_id}",
             )
-            assert len(transport.calls) == before
-            # The dispatch gates still apply to the continued consultation: this fixture's
-            # canonical evidence carries a signed URL, so the secret preflight refuses it as a
-            # confirmed non-execution before any transport call.
-            assert incomplete["invocation"]["status"] == "failed"
+            assert len(transport.calls) == before + 1
+            assert incomplete["invocation"]["status"] == "succeeded"
             incomplete_output = incomplete["advisor_output"]
-            assert incomplete_output["advisor_status"] == "refused"
-            assert incomplete_output["refusal_code"] == "autowork_credential_or_signed_url_detected"
-            assert incomplete_output["confirmed_non_execution"] is True
-            assert incomplete_output["bridge_turns_consumed"] == 0
+            assert incomplete_output["advisor_status"] == "succeeded"
+            sent_prompt = transport.calls[-1]["prompt"]
+            assert credential_marker not in sent_prompt
+            assert signed_url_marker not in sent_prompt
+            manifest_rows = incomplete_output["bridge_provenance"]["dossier_manifest"]
+            omitted_ids = {row.get("id") for row in manifest_rows if row.get("kind") == "omission"}
+            assert str(advisor_observation.id) in omitted_ids
+            assert str(signed_url_observation.id) in omitted_ids
             assert "reference_not_resolvable" in json.dumps(incomplete["output"], default=str)
             assert str(missing_ref) in json.dumps(incomplete["output"], default=str)
 

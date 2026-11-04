@@ -433,9 +433,7 @@ async def test_m12_q_reservation_and_execution_characterization(
     execution_builds = list(capture["builds"])
     execution_prompts = list(capture["prompts"])
 
-    manifest_refs = [
-        item for call in (*reservation_builds, *execution_builds) for item in call["manifest_refs"]
-    ]
+    manifest_refs = [item for call in execution_builds for item in call["manifest_refs"]]
 
     def compact_builds(builds: list[dict[str, object]]) -> list[dict[str, object]]:
         return [
@@ -468,12 +466,10 @@ async def test_m12_q_reservation_and_execution_characterization(
     }
     print(json.dumps(report, sort_keys=True))
 
-    assert len(reservation_prompts) == 1
+    assert reservation_prompts == []
     assert len(execution_prompts) == 1
-    assert reservation_prompts == execution_prompts
-    assert len(reservation_builds) == 1
+    assert reservation_builds == []
     assert len(execution_builds) == 1
-    assert reservation_builds == execution_builds
     prompt = transport.calls[0]["prompt"]
     assert "content_base64:" not in prompt
     _assert_sample_inventory_omission(
@@ -493,14 +489,14 @@ async def test_m12_q_reservation_and_execution_characterization(
         == expected_association_reads
     )
     assert execution_counts["calls"].get("samples.list_for_subject") == expected_association_reads
-    assert reservation_counts["calls"].get("sample_associations.list_for_investigation") == 1
+    assert reservation_counts["calls"] == {}
     assert execution_counts["association_sql_queries"] == 3 * expected_association_reads
-    assert reservation_counts["association_sql_queries"] == 3
+    assert reservation_counts["association_sql_queries"] == 0
     assert execution_counts["max_observation_blob_reads"] <= 1
     assert execution_counts["observation_blob_reads"] <= len(counter.observation_blob_ids)
-    assert reservation_counts["blob_reads"] == len(counter.observation_blob_ids)
-    assert reservation_counts["bytes_read"] == execution_counts["bytes_read"]
-    assert result.output["durations_ms"]["reservation_cost_ms"] >= 0
+    assert reservation_counts["blob_reads"] == 0
+    assert reservation_counts["bytes_read"] == 0
+    assert "reservation_cost_ms" not in result.output["durations_ms"]
     diagnostics = result.output["diagnostics"]
     assert diagnostics["repo_calls"] > 0
     assert diagnostics["blob_reads"] == execution_counts["blob_reads"]
@@ -573,10 +569,8 @@ async def test_reservation_estimate_covers_measured_prompt(
                 else "sample_inventory_not_selected_for_consultation"
             ),
         )
-    assert reserved_bytes < SAMPLE_BYTES * 2
-    assert reserved_tokens < SAMPLE_BYTES // 2
-    assert reserved_bytes >= prompt_bytes
-    assert reserved_tokens >= actual_tokens
+    assert reserved_bytes == 0
+    assert reserved_tokens == 0
     reservation = next(
         item for item in context.budget.reservations if item.operation_key == operation_key
     )

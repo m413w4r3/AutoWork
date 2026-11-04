@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
+    advisor_disclosure_profile: Literal["standard", "m14_research_permissive"] = "standard"
     api_bind_host: str = "127.0.0.1"
     operator_api_token: SecretStr | None = None
     operator_client_api_token: SecretStr | None = None
@@ -104,7 +105,6 @@ class Settings(BaseSettings):
     production_cooldown_max_seconds: float = Field(default=1200.0, ge=0)
     openai_bridge_base_url: str = "http://127.0.0.1:8001/v1"
     openai_bridge_api_key: SecretStr | None = None
-    advisor_disclosure_profile: Literal["standard", "m14_research_permissive"] = "standard"
     openai_bridge_min_submission_interval_seconds: float = Field(default=20.0, ge=0, le=3600)
     openai_bridge_submission_jitter_fraction: float = Field(default=0.3, ge=0, le=0.3)
     operator_advisor_checkpoint_tool_threshold: int = Field(default=12, ge=1, le=1000)

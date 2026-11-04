@@ -1015,7 +1015,7 @@ def write_investigation_annex(
                 for path, content in tuple(content_files.items()):
                     if path.startswith(source_prefix):
                         content_files.setdefault(
-                            f"{private_prefix}{path[len(source_prefix):]}", content
+                            f"{private_prefix}{path[len(source_prefix) :]}", content
                         )
             content_files.setdefault(
                 "restricted/README.txt",

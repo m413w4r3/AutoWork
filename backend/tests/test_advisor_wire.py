@@ -1714,12 +1714,8 @@ LIMITATION: none
     assert parsed is not None
     assert parsed["status"] == "partial"
     assert parsed["usable"] is True
-    assert parsed["blocks"][0]["sentences"][0]["text"] == (
-        "La capture confirme une requête DNS."
-    )
-    assert any(
-        item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"]
-    )
+    assert parsed["blocks"][0]["sentences"][0]["text"] == ("La capture confirme une requête DNS.")
+    assert any(item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"])
     assert "assertion_alias_unknown" in parsed["warnings"]
 
 
@@ -2133,9 +2129,7 @@ LIMITATION: none""",
     assert cross_unit["blocks"][0]["sentences"][0]["text"] == (
         "La mesure confirme le mutex observé."
     )
-    assert any(
-        item["reason"] == "assertion_wrong_unit" for item in cross_unit["unresolved_refs"]
-    )
+    assert any(item["reason"] == "assertion_wrong_unit" for item in cross_unit["unresolved_refs"])
 
 
 def test_draft_text_keeps_valid_units_and_treats_reference_aliases_as_prose() -> None:
@@ -2291,9 +2285,7 @@ LIMITATION: none
     assert units["U2"]["usable"] is True
     assert units["U2"]["sentences"][0]["assertion_ids"] == ["assertion_two"]
     assert "assertion_alias_unknown" in parsed["warning_classification"]["informative"]
-    assert any(
-        item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"]
-    )
+    assert any(item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"])
 
 
 def test_secret_detection_and_incoherent_byte_warning_block_admissibility() -> None:

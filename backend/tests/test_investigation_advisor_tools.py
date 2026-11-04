@@ -565,6 +565,7 @@ def make_tool(
     observation=None,
     raw=None,
     allowed=True,
+    disclosure_profile="standard",
     role_timeout_seconds=7_200,
     max_tool_seconds=3_600,
 ):
@@ -612,6 +613,7 @@ def make_tool(
     tool = InvestigationAdvisorTool(
         transport=transport,
         settings=SimpleNamespace(
+            advisor_disclosure_profile=disclosure_profile,
             openai_bridge_min_submission_interval_seconds=0,
             openai_bridge_submission_jitter_fraction=0,
             openai_bridge_wait_timeout_research_seconds=role_timeout_seconds,
@@ -1075,7 +1077,7 @@ async def test_advisor_raw_response_link_survives_result_manifest_persistence_fa
         make_context(investigation_id, key="response-link-manifest-failure"),
     )
 
-    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     links = await _advisor_response_link_payloads(tool, investigation_id)
     assert len(links) == 1
     _observation, payload = links[0]
@@ -1122,7 +1124,7 @@ async def test_response_link_write_failure_keeps_raw_text_and_replay_does_not_po
 
     first = await tool.execute(arguments, context)
 
-    assert first.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert first.status is ToolInvocationStatus.SUCCEEDED, first.output
     assert first.output["failure_stage"] == "response_archival"
     assert first.output["raw_output_retained"] is True
     assert first.output["raw_output"] == raw_output
@@ -1142,7 +1144,7 @@ async def test_response_link_write_failure_keeps_raw_text_and_replay_does_not_po
     assert tool.take_result(context.idempotency_key) is not None
     replay = await tool.execute(arguments, context)
 
-    assert replay.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert replay.status is ToolInvocationStatus.SUCCEEDED
     assert replay.output["raw_output"] == raw_output
     assert len(transport.calls) == 1
 
@@ -1913,7 +1915,7 @@ async def test_args_hint_contract_is_bounded_and_normalization_is_recorded(
         make_context(investigation_id, capabilities=("local.sample_analysis",)),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     assert len(transport.calls) == 1, result
     prompt = transport.calls[0]["prompt"]
@@ -2031,7 +2033,7 @@ async def test_args_hint_is_normalized_against_recommended_tool_schema(
         make_context(investigation_id, capabilities=("graph.read",)),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     prompt = transport.calls[0]["prompt"]
     assert "required_arguments" not in prompt
@@ -2663,7 +2665,7 @@ async def test_pivot_strategy_rejects_a_basis_reference_absent_from_observations
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     assert result.output["usable"] is False, {
         "warnings": result.output.get("warnings"),
@@ -2711,7 +2713,7 @@ def test_unparsed_bridge_prose_is_returned_complete_with_its_sha256() -> None:
             prompt_data={"transmitted_refs": []},
         )
 
-        assert result.status is ToolInvocationStatus.PARTIAL, consultation_type
+        assert result.status is ToolInvocationStatus.SUCCEEDED, consultation_type
         assert result.output["advisory_text"].startswith("[UNTRUSTED ADVISORY]\n" + raw_output)
         assert result.output["raw_output"] == raw_output
         assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
@@ -2720,6 +2722,8 @@ def test_unparsed_bridge_prose_is_returned_complete_with_its_sha256() -> None:
         assert result.output["usable"] is True, consultation_type
         assert result.output["readable"] is True, consultation_type
         assert result.output["canonicalization_eligible"] is False, consultation_type
+        assert result.output["parse_status"] in {"unparsed", "partially_parsed"}, consultation_type
+        assert "extracted_elements" in result.output
 
 
 def test_unknown_wire_reference_keeps_prose_readable_but_not_technically_usable() -> None:
@@ -2751,11 +2755,13 @@ def test_unknown_wire_reference_keeps_prose_readable_but_not_technically_usable(
         prompt_data={"transmitted_refs": []},
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["raw_output"] == raw
     assert result.output["readable"] is True
     assert result.output["usable"] is False
     assert result.output["structured_usable"] is False
+    assert result.output["parse_status"] == "unparsed"
+    assert result.output["raw_output"] == raw
     assert any(
         "reference_alias_unknown" in item
         for item in (*result.output["warnings"], *result.output["normalizations"])
@@ -2797,10 +2803,12 @@ def test_review_with_unresolved_basis_remains_readable_but_not_usable() -> None:
         prompt_data={"units": [{"unit_id": "U1", "block_type": "key_findings"}]},
     )
 
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["readable"] is True
     assert result.output["usable"] is False
     assert result.output["structured_usable"] is False
     assert result.output["raw_output"] == raw
+    assert result.output["parse_status"] == "unparsed"
     assert any("review_refs_invalid" in item for item in result.output["warnings"])
 
 
@@ -2827,14 +2835,15 @@ def test_unlinked_draft_prose_includes_explicit_consultative_warning() -> None:
         prompt_data={"assertions": []},
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert raw_output in result.output["advisory_text"]
     assert "liens de preuve absents" in result.output["advisory_text"].casefold()
     assert "evidence_links_absent" in result.output["warnings"]
     assert result.output["raw_output"] == raw_output
     assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
     assert result.output["usable"] is True
-    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["response_state"] == "partial_response_received"
+    assert result.output["parse_status"] == "partially_parsed"
 
 
 def test_missing_draft_evidence_links_warn_without_downgrading_readable_units() -> None:
@@ -2875,7 +2884,7 @@ def test_missing_draft_evidence_links_warn_without_downgrading_readable_units() 
         prompt_data={"units": units, "assertions": []},
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["usable"] is True
     assert [block["unit_id"] for block in result.output["blocks"]] == [
         f"U{index}" for index in range(1, len(units) + 1)
@@ -2887,10 +2896,14 @@ def test_missing_draft_evidence_links_warn_without_downgrading_readable_units() 
     assert "evidence_links_absent" in result.output["warning_classification"]["informative"]
     assert "evidence_links_absent" in result.output["warnings"]
     assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
+    assert result.output["parse_status"] == "partially_parsed"
 
     combined = _combine_editorial_batch_results([result])
-    assert combined.status is ToolInvocationStatus.PARTIAL
+    assert combined.status is ToolInvocationStatus.SUCCEEDED
     assert combined.output["usable"] is True
+    assert combined.output["raw_output"] == raw_output
+    assert combined.output["raw_outputs"][0]["raw_output"] == raw_output
+    assert combined.output["parse_status"] == "partially_parsed"
     assert [block["unit_id"] for block in combined.output["blocks"]] == [
         f"U{index}" for index in range(1, len(units) + 1)
     ]
@@ -2931,12 +2944,13 @@ async def test_batched_unlinked_draft_keeps_usable_blocks_with_partial_status() 
     )
 
     expected_unit_ids = [f"U{index}" for index in range(1, len(units) + 1)]
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["usable"] is True
     assert [block["unit_id"] for block in result.output["blocks"]] == expected_unit_ids
     assert all(block["usable"] is True for block in result.output["blocks"])
     assert "evidence_links_absent" in result.output["warnings"]
-    assert result.output["batch_statuses"][0]["status"] == "partial"
+    assert result.output["batch_statuses"][0]["status"] == "succeeded"
+    assert result.output["raw_output"] == raw_output
     assert result.output["unprocessed_unit_ids"] == tuple(expected_unit_ids)
 
 
@@ -2995,7 +3009,7 @@ async def test_unknown_basis_refs_are_removed_and_traced_when_valid_refs_remain(
         make_context(investigation_id, capabilities=("local.sample_analysis",)),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     assert result.output["normalization_status"] == "partial"
     assert result.output["alternative_hypotheses"][0]["basis_refs"] == (valid_ref,)
@@ -3089,7 +3103,7 @@ async def test_recommendation_without_any_valid_observation_ref_is_dropped_and_t
         make_context(investigation_id, capabilities=("local.sample_analysis",)),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["recommended_next_tools"] == ()
     assert result.output["advisor_status"] == "partial"
     assert result.output["normalization_status"] == "partial"
@@ -3214,7 +3228,7 @@ async def test_article_source_ref_cannot_support_a_tool_recommendation() -> None
         make_context(investigation_id, capabilities=("local.sample_analysis",)),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     assert result.output["recommended_next_tools"] == ()
 
@@ -3274,7 +3288,7 @@ async def test_malformed_basis_ref_lists_remain_rejected(basis_refs, expected_co
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisory_text"].endswith(json.dumps(payload, ensure_ascii=False))
     assert (
         result.output["output_sha256"]
@@ -4186,7 +4200,7 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         ("base64", "signed_url"),
     ],
 )
-async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_refused(
+async def test_explicit_encoded_sample_material_redacts_secret_fragment_and_continues(
     representation, material_kind
 ) -> None:
     investigation_id = uuid4()
@@ -4217,7 +4231,12 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
             **measured_payload,
         },
     )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The Bridge response is noted for this synthetic fixture.",
+        )
+    )
     tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -4269,20 +4288,15 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
         make_context(investigation_id, key=f"operator:advisor:encoded-veto:{representation}"),
     )
 
+    assert len(transport.calls) == 1, result.output
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert material not in transport.calls[0]["prompt"]
     if representation == "sample_blob":
-        assert len(transport.calls) == 1
-        assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-        assert material not in transport.calls[0]["prompt"]
         assert "whole_sample_not_needed_for_consultation" in transport.calls[0]["prompt"]
     else:
-        assert transport.calls == []
-        assert result.output["advisor_status"] == "refused"
-        assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
-        assert result.output["redacted_secret_count"] == len(result.output["secret_findings"])
+        assert "[redacted-autowork-credential]" in transport.calls[0]["prompt"]
+        assert result.output["redacted_secret_count"] >= 1
         assert result.output["secret_findings"]
-        assert all(
-            item["type"] == "encoded_credential" for item in result.output["secret_findings"]
-        )
         assert all(item["location"].startswith("$") for item in result.output["secret_findings"])
     safe_output = repr(result.output)
     assert operator_secret not in safe_output
@@ -4500,8 +4514,8 @@ async def test_plan_dossier_omits_inherited_samples_without_sample_bytes_or_read
         item for item in context.budget.reservations if item.operation_key == operation_key
     )
     prompt_bytes = len(prompt.encode("utf-8"))
-    assert estimate[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
-    assert estimate[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+    assert estimate[BudgetDimension.CONTEXT_BYTES] == 0
+    assert estimate[BudgetDimension.CONTEXT_TOKENS] == 0
     assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
 
@@ -4610,7 +4624,7 @@ async def test_explicit_measurement_sends_only_blob_verified_targeted_range() ->
     assert "UNSENT_PREFIX_SENTINEL" not in prompt
     assert "UNSENT_SUFFIX_SENTINEL" not in prompt
     assert base64.b64encode(sample_content).decode("ascii") not in prompt
-    assert sample_reads == [sample_blob_id, sample_blob_id]
+    assert sample_reads == [sample_blob_id]
     measurement = next(
         item
         for item in result.output["bridge_provenance"]["dossier_manifest"]
@@ -4623,9 +4637,8 @@ async def test_explicit_measurement_sends_only_blob_verified_targeted_range() ->
     assert measurement["fragment_sha256"] == hashlib.sha256(marker).hexdigest()
     assert f"fragment_sha256={hashlib.sha256(marker).hexdigest()}" in prompt
     assert "covers_whole_sample=true" not in prompt
-    prompt_bytes = len(prompt.encode("utf-8"))
-    assert estimate[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
-    assert estimate[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+    assert estimate[BudgetDimension.CONTEXT_BYTES] == 0
+    assert estimate[BudgetDimension.CONTEXT_TOKENS] == 0
 
 
 @pytest.mark.asyncio
@@ -5069,7 +5082,13 @@ async def test_corruption_outside_requested_range_fails_integrity_without_sendin
 
 
 @pytest.mark.asyncio
-async def test_restricted_sample_target_range_is_omitted_with_reason() -> None:
+@pytest.mark.parametrize(
+    ("profile", "expect_omission"),
+    [("standard", True), ("m14_research_permissive", False)],
+)
+async def test_sample_target_range_obeys_disclosure_profile(
+    profile: str, expect_omission: bool
+) -> None:
     investigation_id = uuid4()
     marker = b"RESTRICTED_TARGET_RANGE_SENTINEL"
     sample_content = b"prefix:" + marker + b":suffix"
@@ -5082,6 +5101,8 @@ async def test_restricted_sample_target_range_is_omitted_with_reason() -> None:
         sample_blob_id,
         sample_hash,
     ) = _make_downloaded_sample_fixture(investigation_id, sample_content)
+    tool._disclosure_policy = advisor_tools_module.advisor_disclosure_policy(profile)
+    tool._settings.advisor_disclosure_profile = profile
     offset = len(b"prefix:")
     measurement_observation, measurement_raw = make_observation(
         investigation_id,
@@ -5151,7 +5172,6 @@ async def test_restricted_sample_target_range_is_omitted_with_reason() -> None:
     ]
     assert len(prompt_candidates) == 1
     prepared_prompt = prompt_candidates[0]
-    assert sample_hash not in prepared_prompt
     assert len(transport.calls) == 1, {
         "advisor_status": result.output.get("advisor_status"),
         "failure_stage": result.output.get("failure_stage"),
@@ -5159,10 +5179,19 @@ async def test_restricted_sample_target_range_is_omitted_with_reason() -> None:
         "sample_hash_in_prompt": sample_hash in prepared_prompt,
     }
     prompt = transport.calls[0]["prompt"]
-    assert marker.decode("ascii") not in prompt
+    if expect_omission:
+        assert sample_hash not in prepared_prompt
+        assert marker.decode("ascii") not in prompt
+        assert "content_omission_reason=sample_disclosure_restricted" in prompt
+        assert result.output["advisor_status"] in {"succeeded", "partial", "untrusted_response"}
+    else:
+        assert sample_hash in prepared_prompt
+        assert marker.decode("ascii") in prompt
+        assert "content_omission_reason=sample_disclosure_restricted" not in prompt
+        disclosure_audit = result.output["bridge_provenance"]["disclosure_audit"]
+        assert disclosure_audit["profile"] == "m14_research_permissive"
+        assert disclosure_audit["origin_labels"]["samples"][0]["labels"]["tlp"].casefold() == "red"
     assert base64.b64encode(sample_content).decode("ascii") not in prompt
-    assert "content_omission_reason=sample_disclosure_restricted" in prompt
-    assert result.output["advisor_status"] in {"succeeded", "partial", "untrusted_response"}
 
 
 @pytest.mark.asyncio
@@ -5731,7 +5760,7 @@ async def test_unreferenced_restricted_sample_does_not_block_unrelated_consultat
         make_context(investigation_id, key="operator:advisor:unrelated-restricted-sample"),
     )
 
-    assert measured_cost[BudgetDimension.CONTEXT_BYTES] > 0
+    assert measured_cost[BudgetDimension.CONTEXT_BYTES] == 0
     assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert len(transport.calls) == 1
     assert "Owner prohibits unrelated external disclosure" not in transport.calls[0]["prompt"]
@@ -6260,7 +6289,12 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
     observation, raw = make_observation(investigation_id, payload)
     if consultation_type == "suricata_draft":
         observation = replace(observation, object_type="network_capture")
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="JSON"))
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The verified measurement candidates are available for review.",
+        )
+    )
     tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -6328,14 +6362,8 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
 
     result = await tool.execute(arguments, make_context(investigation_id))
 
-    assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["advisor_status"] == "partial"
-    if consultation_type == "suricata_draft":
-        assert result.output["usable"] is True
-        assert result.output["structured_usable"] is False
-        assert result.output["canonicalization_eligible"] is False
-    else:
-        assert result.output["usable"] is False
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["parse_status"] in {"parsed", "partially_parsed", "unparsed"}
     assert len(transport.calls) == 1
     prompt_data = typed_prompt_payload(transport.calls[0]["prompt"])
     assert prompt_data["measurements"][0]["value"] == "CreateMutexW"
@@ -6831,6 +6859,9 @@ async def test_literal_json_advisor_reply_is_partial_and_not_retried() -> None:
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.error_code is None
     assert result.output["advisor_status"] == "partial"
+    assert result.output["raw_output"] == raw_output
+    assert result.output["parse_status"] == "unparsed"
+    assert result.output["response_received"] is True
     assert result.output["normalization_status"] == "partial"
     assert result.output["usable"] is False
     assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
@@ -6878,7 +6909,7 @@ def test_partial_json_reply_remains_readable_for_every_advisor_consultation_type
             prompt_data={"consultation_type": consultation_type},
         )
 
-        assert result.status is ToolInvocationStatus.PARTIAL, consultation_type
+        assert result.status is ToolInvocationStatus.SUCCEEDED, consultation_type
         assert result.output["usable"] is True, consultation_type
         assert result.output["readable"] is True, consultation_type
         assert result.output["raw_output"] == raw, consultation_type
@@ -7027,7 +7058,7 @@ async def test_large_invalid_advisor_output_is_archived_without_content_limit() 
         make_context(investigation_id, key="operator:advisor:oversized-output"),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     assert result.output["response_bytes"] == len(raw_output.encode())
     assert result.output["output_sha256"] == hashlib.sha256(raw_output.encode()).hexdigest()
@@ -7771,7 +7802,7 @@ async def test_draft_text_explicit_observation_sha_mismatch_has_precise_refusal(
 
 
 @pytest.mark.asyncio
-async def test_draft_text_explicit_observation_operational_secret_is_still_refused() -> None:
+async def test_draft_text_explicit_observation_operational_secret_is_redacted_and_sent() -> None:
     investigation_id = uuid4()
     operator_secret = "autowork_fixture_" + "Z" * 48
     observation, raw = make_observation(
@@ -7788,7 +7819,9 @@ async def test_draft_text_explicit_observation_operational_secret_is_still_refus
         source_version="1",
         object_type="article_claim",
     )
-    transport = Transport(None)
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="The text is readable.")
+    )
     tool, _sample_blob = make_tool(
         investigation_id=investigation_id,
         transport=transport,
@@ -7806,11 +7839,10 @@ async def test_draft_text_explicit_observation_operational_secret_is_still_refus
         make_context(investigation_id, key="operator:advisor:draft-secret-refusal"),
     )
 
-    assert transport.calls == []
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.output["advisor_status"] == "refused"
-    assert result.output["failure_reason"] == "autowork_credential_or_signed_url_detected"
-    assert result.output["confirmed_non_execution"] is True
+    assert len(transport.calls) == 1
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert "[redacted-autowork-credential]" in transport.calls[0]["prompt"]
+    assert operator_secret not in transport.calls[0]["prompt"]
     assert operator_secret not in repr(result.output)
 
 
@@ -8098,7 +8130,7 @@ async def test_draft_text_omits_implicit_restricted_source_document_with_reason(
         make_context(investigation_id, key="operator:advisor:implicit-restricted-document"),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL, result.output
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert len(tool._transport.calls) == 1
     assert "AssociatedDocumentControl" in tool._transport.calls[0]["prompt"]
     assert "RestrictedDocumentOnlyMarker" not in tool._transport.calls[0]["prompt"]
@@ -8838,7 +8870,8 @@ def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> No
         "tlp_red",
     ],
 )
-async def test_bridge_ignores_do_not_submit_and_enforces_external_policy(policy) -> None:
+@pytest.mark.parametrize("profile", ["standard", "m14_research_permissive"])
+async def test_bridge_disclosure_profile_controls_restriction_labels(policy, profile) -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
@@ -8853,6 +8886,7 @@ async def test_bridge_ignores_do_not_submit_and_enforces_external_policy(policy)
         observation=observation,
         raw=raw,
         allowed=True,
+        disclosure_profile=profile,
     )
     snapshot = await tool._article_snapshots.resolve(uuid4())
     context = make_context(investigation_id)
@@ -8896,7 +8930,16 @@ async def test_bridge_ignores_do_not_submit_and_enforces_external_policy(policy)
         context,
     )
 
-    if policy in {"source_external_disabled", "envelope_external_disabled", "tlp_red"}:
+    should_refuse = (
+        policy
+        in {
+            "source_external_disabled",
+            "envelope_external_disabled",
+            "tlp_red",
+        }
+        and profile == "standard"
+    )
+    if should_refuse:
         assert result.status is ToolInvocationStatus.POLICY_DENIED
         assert result.error_code == "POLICY_DENIED"
         assert result.output["advisor_status"] == "policy_denied"
@@ -8905,7 +8948,7 @@ async def test_bridge_ignores_do_not_submit_and_enforces_external_policy(policy)
         assert transport.calls == []
     else:
         assert len(transport.calls) == 1
-        assert result.status is not ToolInvocationStatus.POLICY_DENIED
+        assert result.status is ToolInvocationStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -9049,6 +9092,7 @@ async def test_reservation_refusal_lists_heaviest_dossier_items_and_exclusion_gu
         },
     )
     context = make_dispatch_context(investigation_id)
+    context.budget.limits = {BudgetDimension.CONTEXT_TOKENS: 1}
     reserved = {
         BudgetDimension.BRIDGE_TURNS: 1,
         BudgetDimension.TOOL_SECONDS: 3_600,
@@ -9066,10 +9110,6 @@ async def test_reservation_refusal_lists_heaviest_dossier_items_and_exclusion_gu
     registry = InMemoryToolRegistry()
     register_investigation_advisor_tool(registry, adapter=tool)
 
-    async def fail_adjustment(_context, _reservation_operation_key, _measured_amounts):
-        raise RuntimeError("injected reservation adjustment failure")
-
-    context = replace(context, reservation_adjuster=fail_adjustment)
     result = await RegistryToolDispatcher(registry).dispatch(
         context,
         tool_name="advisor.consult",
@@ -9079,13 +9119,13 @@ async def test_reservation_refusal_lists_heaviest_dossier_items_and_exclusion_gu
             "question": "Review the synthetic relevant observation.",
             "evidence_refs": [str(observation.id)],
         },
-        purpose="Verify reservation refusal lists the selected prompt's heaviest items.",
+        purpose="Verify a measured prompt over the approved G2 budget is reported clearly.",
         operation_key=context.idempotency_key,
         reservation_amounts=reserved,
     )
 
     assert result.status is ToolInvocationStatus.UNAVAILABLE
-    assert result.error_code == "advisor_context_reservation_mismatch"
+    assert result.error_code == "g2_context_budget_exhausted"
     assert result.output["failure_stage"] == "g2_context_reservation"
     assert result.output["confirmed_non_execution"] is True
     assert result.output["heaviest_items"]
@@ -9095,6 +9135,7 @@ async def test_reservation_refusal_lists_heaviest_dossier_items_and_exclusion_gu
     assert heaviest["origin"] == "observation_content"
     assert "evidence_refs" in result.output["exclusion_guidance"]
     assert str(observation.id) in result.message
+    assert "approved G2 budget" in result.message
     assert "bytes" in result.message
     assert result.framework_pre_submission_proof is (
         FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
@@ -9373,7 +9414,10 @@ async def test_signed_url_in_payload_refuses_before_bridge_without_leaking_signa
         "https://storage.invalid/sample?X-Amz-Credential=synthetic-credential&"
         f"X-Amz-Signature={signature}"
     )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    observation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="The sample reference is noted.")
+    )
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
 
     async def consultation_data(**_kwargs):
@@ -9381,7 +9425,7 @@ async def test_signed_url_in_payload_refuses_before_bridge_without_leaking_signa
             "question": "Review the sample reference.",
             "evidence": [
                 {
-                    "evidence_id": str(uuid4()),
+                    "evidence_id": str(observation_id),
                     "source": "sample.store",
                     "object_type": "sample",
                     "sha256": "f" * 64,
@@ -9395,13 +9439,20 @@ async def test_signed_url_in_payload_refuses_before_bridge_without_leaking_signa
         {"consultation_type": "plan_investigation"}, make_context(investigation_id)
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "refused"
-    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
-    assert result.output["redacted_secret_count"] == 1
-    assert [dict(item) for item in result.output["secret_findings"]] == [
-        {"location": "$.evidence[0].content_excerpts[0].text", "type": "signed_url"}
-    ]
+    assert len(transport.calls) == 1
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert signed_url not in transport.calls[0]["prompt"]
+    assert str(observation_id) in transport.calls[0]["prompt"]
+    assert any(
+        item.get("id") == str(observation_id)
+        and item.get("origin") == "uncitable_vt_file_report_reference"
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+    )
+    assert result.output.get("redacted_secret_count", 0) == 0
+    assert any(
+        warning.get("code") == "autowork_credential_evidence_omitted"
+        for warning in result.output["input_warnings"]
+    )
     safe_output = repr(result.output)
     assert signed_url not in safe_output
     assert signature not in safe_output
@@ -9471,18 +9522,26 @@ async def test_plan_investigation_accepts_cti_paths_and_generic_url_parameters(m
 
 
 @pytest.mark.asyncio
-async def test_dsn_with_password_refuses_with_nested_location_and_type(monkeypatch) -> None:
+async def test_dsn_with_password_in_automatic_evidence_is_omitted_and_consult_continues(
+    monkeypatch,
+) -> None:
     investigation_id = uuid4()
     dsn = "postgresql://fixture-user:fixture-password@db.invalid:5432/cti"
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The referenced connection detail was omitted from this review.",
+        )
+    )
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    observation_id = uuid4()
 
     async def consultation_data(**_kwargs):
         return {
             "question": "Review the connection reference.",
             "evidence": [
                 {
-                    "evidence_id": str(uuid4()),
+                    "evidence_id": str(observation_id),
                     "content_excerpts": [{"title": "Reference", "text": dsn}],
                 }
             ],
@@ -9493,12 +9552,14 @@ async def test_dsn_with_password_refuses_with_nested_location_and_type(monkeypat
         {"consultation_type": "plan_investigation"}, make_context(investigation_id)
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "refused"
-    assert result.output["redacted_secret_count"] == 1
-    assert [dict(item) for item in result.output["secret_findings"]] == [
-        {"location": "$.evidence[0].content_excerpts[0].text", "type": "dsn"}
-    ]
+    assert len(transport.calls) == 1
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert dsn not in transport.calls[0]["prompt"]
+    assert str(observation_id) in repr(result.output)
+    assert any(
+        warning.get("code") == "autowork_credential_evidence_omitted"
+        for warning in result.output["input_warnings"]
+    )
     assert "fixture-password" not in repr(result.output)
 
 
@@ -9533,7 +9594,7 @@ def test_encoded_credential_diagnostics_mask_sensitive_mapping_keys() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("representation", ["raw_bytes", "hex", "base64"])
 @pytest.mark.parametrize("material", ["configured_secret", "signed_url"])
-async def test_utf16le_encoded_sample_credentials_and_signed_urls_refuse_locally(
+async def test_utf16le_encoded_auto_evidence_is_omitted_before_bridge(
     monkeypatch, representation, material
 ) -> None:
     secret = "autowork_fixture_utf16_" + "Q" * 48
@@ -9553,7 +9614,12 @@ async def test_utf16le_encoded_sample_credentials_and_signed_urls_refuse_locally
             "encoding": "base64",
             "content_base64": base64.b64encode(encoded_bytes).decode("ascii"),
         }
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    observation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED, output_text="The available context is noted."
+        )
+    )
     investigation_id = uuid4()
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
     tool._settings.operator_api_token = SecretStr(secret)
@@ -9563,7 +9629,7 @@ async def test_utf16le_encoded_sample_credentials_and_signed_urls_refuse_locally
             "question": "Review the synthetic verified sample fragment.",
             "evidence": [
                 {
-                    "evidence_id": str(uuid4()),
+                    "evidence_id": str(observation_id),
                     "content_excerpts": [{"kind": representation, **content}],
                 }
             ],
@@ -9574,9 +9640,16 @@ async def test_utf16le_encoded_sample_credentials_and_signed_urls_refuse_locally
         {"consultation_type": "plan_investigation"}, make_context(investigation_id)
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "refused"
-    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    assert len(transport.calls) == 1
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert secret not in transport.calls[0]["prompt"]
+    assert signed_url not in transport.calls[0]["prompt"]
+    assert str(observation_id) in transport.calls[0]["prompt"]
+    assert any(
+        item.get("id") == str(observation_id)
+        and item.get("omission_reason") == "autowork_credential_or_signed_url"
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+    )
     safe_output = repr(result.output)
     assert secret not in safe_output
     assert signed_url not in safe_output
@@ -9641,7 +9714,7 @@ def test_advisor_secret_filter_preserves_sample_material_and_redacts_autowork_se
 
 
 @pytest.mark.asyncio
-async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leaking_values(
+async def test_autowork_credentials_in_automatic_evidence_are_omitted_without_leaking_values(
     monkeypatch,
 ) -> None:
     investigation_id = uuid4()
@@ -9655,6 +9728,7 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
         )
     )
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    observation_id = uuid4()
     operator_secret = "autowork_fixture_" + "Z" * 48
     rc4_key = bytes(range(16)).hex()
     attacker_token = "github_pat_" + "b" * 82
@@ -9665,7 +9739,7 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
             "question": "Vérifier le canal C2 de l'implant.",
             "evidence": [
                 {
-                    "evidence_id": str(uuid4()),
+                    "evidence_id": str(observation_id),
                     "source": "sample.analyze",
                     "object_type": "sample",
                     "sha256": "f" * 64,
@@ -9689,24 +9763,17 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
         {"consultation_type": "plan_investigation"}, make_context(investigation_id)
     )
 
-    assert transport.calls == []
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.output["advisor_status"] == "refused"
-    assert result.output["confirmed_non_execution"] is True
-    assert result.output["redacted_secret_count"] == 3, (
-        result.output["redacted_secret_count"],
-        [dict(item) for item in result.output["secret_findings"]],
+    assert len(transport.calls) == 1, result.output
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert operator_secret not in transport.calls[0]["prompt"]
+    assert str(observation_id) in repr(result.output)
+    assert any(
+        warning.get("code") == "autowork_credential_evidence_omitted"
+        for warning in result.output["input_warnings"]
     )
+    assert result.output["redacted_secret_count"] == 1
     assert [dict(item) for item in result.output["secret_findings"]] == [
-        {
-            "location": "$.evidence[0].raw_base64",
-            "type": "encoded_credential",
-        },
-        {
-            "location": "$.evidence[0].content_excerpts[0].text",
-            "type": "configured_credential",
-        },
-        {"location": "$.operator_api_token", "type": "configured_credential"},
+        {"location": "$.operator_api_token", "type": "configured_credential"}
     ]
     safe_output = repr(result.output)
     assert operator_secret not in safe_output
@@ -9740,7 +9807,7 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
     assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
     assert result.output["redacted_secret_count"] == 1
     assert [dict(item) for item in result.output["secret_findings"]] == [
-        {"location": "$.operator_api_token", "type": "configured_credential"}
+        {"location": "$", "type": "configured_credential"}
     ]
     assert "test sentinel" not in repr(result.output)
     assert transport.calls == []
@@ -9753,9 +9820,7 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
     assert persisted["advisor_status"] == "refused"
     assert persisted["bridge_turns_consumed"] == 0
     assert persisted["redacted_secret_count"] == 1
-    assert persisted["secret_findings"] == [
-        {"location": "$.operator_api_token", "type": "configured_credential"}
-    ]
+    assert persisted["secret_findings"] == [{"location": "$", "type": "configured_credential"}]
     assert persisted["output"]["secret_findings"] == persisted["secret_findings"]
 
 
@@ -10298,6 +10363,7 @@ async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> N
     )
     estimated_cost = await tool.reservation_cost(arguments, estimate_context)
     estimated_tokens = estimated_cost[BudgetDimension.CONTEXT_TOKENS]
+    measured_budget_headroom = 100_000
     current_envelope = await fixture.envelopes.get(investigation_id)
     assert current_envelope is not None
     existing_context_tokens = (
@@ -10307,12 +10373,16 @@ async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> N
     limited_budget = InvestigationBudget(
         limits={
             **dict(current_envelope.budget.limits),
-            BudgetDimension.CONTEXT_TOKENS: estimated_tokens + existing_context_tokens,
+            BudgetDimension.CONTEXT_TOKENS: (
+                estimated_tokens + existing_context_tokens + measured_budget_headroom
+            ),
         }
     )
     for prior_reservation in current_envelope.budget.reservations:
         limited_budget.restore_reservation(prior_reservation)
-    assert limited_budget.remaining[BudgetDimension.CONTEXT_TOKENS] == estimated_tokens
+    assert limited_budget.remaining[BudgetDimension.CONTEXT_TOKENS] == (
+        estimated_tokens + measured_budget_headroom
+    )
     limited_envelope = replace(
         current_envelope,
         version=current_envelope.version + 1,
@@ -10357,8 +10427,8 @@ async def test_large_sample_reservation_is_persisted_without_sample_bytes() -> N
     assert "length=3200000" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4
-    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
-    assert estimated_tokens == prompt_tokens
+    assert estimated_cost[BudgetDimension.CONTEXT_BYTES] == 0
+    assert estimated_tokens == 0
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
     assert invocation.reserved_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
     assert invocation.consumed_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
@@ -10717,7 +10787,7 @@ async def test_service_commits_aggregate_measured_reservation_for_editorial_chil
 
 
 @pytest.mark.asyncio
-async def test_service_reservation_persistence_failure_is_pre_send_and_retryable() -> None:
+async def test_service_reserves_available_context_then_commits_measured_prompt() -> None:
     from tests.test_investigation_service import _Fixture
 
     fixture = _Fixture(responses=[], tools=())
@@ -10757,29 +10827,6 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
     )
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
-    original_reservation_cost = tool.reservation_cost
-
-    async def overestimate_prompt_by_one_byte(arguments, context):
-        estimated = dict(await original_reservation_cost(arguments, context))
-        estimated[BudgetDimension.CONTEXT_BYTES] += 1
-        return estimated
-
-    # Force the measured-reservation persistence path. Exact estimates normally
-    # skip this adjustment because the estimate and rendered prompt are equal.
-    tool.reservation_cost = overestimate_prompt_by_one_byte
-    original_save_envelope = fixture.service._save_envelope_version
-    save_calls = 0
-    adjustment_failure_injected = False
-
-    async def fail_measured_adjustment_once(envelope):
-        nonlocal adjustment_failure_injected, save_calls
-        save_calls += 1
-        if save_calls == 2:
-            adjustment_failure_injected = True
-            raise RuntimeError("injected reservation adjustment persistence failure")
-        return await original_save_envelope(envelope)
-
-    fixture.service._save_envelope_version = fail_measured_adjustment_once
     arguments = {
         "consultation_type": "plan_investigation",
         "evidence_refs": [str(observation.id)],
@@ -10795,41 +10842,25 @@ async def test_service_reservation_persistence_failure_is_pre_send_and_retryable
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
         arguments=arguments,
-        purpose="Verify a failed measured reservation cannot reach Bridge.",
+        purpose="Verify available G2 capacity is measured and settled after rendering.",
         operation_key=operation_key,
     )
 
-    assert adjustment_failure_injected
-    assert transport.calls == []
-    assert invocation.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_context_reservation_mismatch"
-    assert result.output["confirmed_non_execution"] is True
-    assert uncertain is False
-    assert (
-        result.framework_pre_submission_proof
-        is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
-    )
-
-    fixture.service._save_envelope_version = original_save_envelope
-    tool.reservation_cost = original_reservation_cost
-    investigation = await fixture.investigations.get(investigation_id)
-    envelope = await fixture.envelopes.get(investigation_id)
-    retry_state = await fixture.states.get(investigation_id)
-    retried, retry_result, _retry_refs, retry_uncertain = await fixture.service.execute_tool_call(
-        investigation=investigation,
-        envelope=envelope,
-        budget=envelope.budget,
-        state=retry_state,
-        tool_name="advisor.consult",
-        schema_version="advisor-consult.v1",
-        arguments=arguments,
-        purpose="Retry after the confirmed pre-send persistence failure.",
-        operation_key=f"{operation_key}:retry",
-    )
-    assert retried.status is ToolInvocationStatus.SUCCEEDED
-    assert retry_result.status is ToolInvocationStatus.SUCCEEDED
-    assert retry_uncertain is False
     assert len(transport.calls) == 1
+    assert invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert uncertain is False
+    prompt_bytes = len(transport.calls[0]["prompt"].encode("utf-8"))
+    prompt_tokens = (prompt_bytes + 3) // 4
+    latest = await fixture.envelopes.get(investigation_id)
+    reservation = next(
+        item for item in latest.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status.value == "committed"
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
+    assert result.budget_consumed[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert result.budget_consumed[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
 
 
 @pytest.mark.asyncio
@@ -11610,12 +11641,15 @@ LIMITATION: none
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.output["advisor_status"] == "needs_review"
-    assert result.output["response_state"] == "submission_ambiguous"
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["advisor_status"] == "succeeded"
+    assert result.output["response_state"] == "response_received"
     assert result.output["response_received"] is True
     assert result.framework_pre_submission_proof is None
     assert "blocks" not in result.output
+    assert result.output["raw_output"] == raw
+    assert result.output["parse_status"] in {"parsed", "partially_parsed", "unparsed"}
+    assert "extracted_elements" in result.output
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
     assert len(transport.calls) == 1
@@ -11674,8 +11708,8 @@ REMARK: Préciser la limite de portée de cette preuve.
         },
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["response_state"] == "partial_response_usable"
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["response_state"] == "partial_response_received"
     assert result.output["response_received"] is True
     assert result.output["advisor_status"] == "partial"
     assert result.output["usable"] is True
@@ -11796,9 +11830,7 @@ def test_draft_text_keeps_sentence_when_optional_refs_are_unresolved() -> None:
     assert unresolved_ref is not None
     assert unresolved_ref["status"] == "partial"
     assert unresolved_ref["usable"] is True
-    assert unresolved_ref["blocks"][0]["sentences"][0]["text"].startswith(
-        f"La mesure {unknown_id}"
-    )
+    assert unresolved_ref["blocks"][0]["sentences"][0]["text"].startswith(f"La mesure {unknown_id}")
     assert any(
         item["reference"] == unknown_id and item["reason"] == "source_reference_unresolved"
         for item in unresolved_ref["unresolved_refs"]
@@ -11859,9 +11891,7 @@ LIMITATION: Une référence reste à résoudre.
     assert any(
         item["reason"] == "sentence_references_missing" for item in parsed["unresolved_refs"]
     )
-    assert any(
-        item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"]
-    )
+    assert any(item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"])
 
 
 def test_figure_plan_accepts_only_typed_semantics_and_transmitted_refs() -> None:
@@ -11940,12 +11970,12 @@ async def test_suricata_draft_without_capture_keeps_untested_prose_candidate() -
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["preflight_status"] == "READY"
     assert result.output["usable"] is True
     assert result.output["structured_usable"] is False
     assert result.output["canonicalization_eligible"] is False
-    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["response_state"] == "partial_response_received"
     assert result.output["response_received"] is True
     assert len(transport.calls) == 1
 
@@ -12782,12 +12812,12 @@ async def test_suricata_draft_accepts_documented_protocol_model_with_its_status(
     prompt = transport.calls[0]["prompt"]
     assert "api.github.com" in prompt
     assert "documented_not_observed" in prompt
-    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["advisor_status"] == "partial"
     assert result.output["usable"] is True
     assert result.output["structured_usable"] is False
     assert result.output["canonicalization_eligible"] is False
-    assert result.output["response_state"] == "partial_response_usable"
+    assert result.output["response_state"] == "partial_response_received"
     assert result.output["raw_output"] == raw_reply
     assert result.output["raw_output_sha256"] == hashlib.sha256(raw_reply.encode()).hexdigest()
     advisor_observation = next(

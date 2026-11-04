@@ -1420,10 +1420,7 @@ async def load_investigation_annex_snapshot(
             )
             continue
         capture_sha = _safe_sha256(observation.object_id)
-        if (
-            capture_sha is None
-            or capture_sha in existing_capture_shas
-        ):
+        if capture_sha is None or capture_sha in existing_capture_shas:
             continue
         public_restrictions = set(
             _observation_public_restrictions(

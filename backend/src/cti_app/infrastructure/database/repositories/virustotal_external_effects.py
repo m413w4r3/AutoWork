@@ -13,6 +13,7 @@ from cti_app.application.external_effects import (
     ConsumePolicyContext,
     ExternalEffectClaim,
     ReuseDecision,
+    advisor_disclosure_policy,
     bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
     osint_vt_search_may_cite_unassociated_observation_hash,
@@ -77,6 +78,8 @@ _BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
 
 
 def _source_flags_block(family: str, *, do_not_submit: bool, external_llm_allowed: bool) -> bool:
+    if advisor_disclosure_policy().ignores_restriction_labels(family):
+        return False
     if family.startswith(_BRIDGE_FAMILY_PREFIXES):
         return not external_llm_allowed
     return external_effect_source_do_not_submit_blocks(family, do_not_submit)
@@ -355,10 +358,12 @@ class SqlAlchemyVirusTotalPolicyGuard:
         ):
             return False
         if (
-            pinned.disclosure_tlp.casefold() == "red"
-            or not pinned.disclosure_external_llm_allowed
-            or not await self.authorize_source_disclosure(context)
-        ):
+            (
+                pinned.disclosure_tlp.casefold() == "red"
+                or not pinned.disclosure_external_llm_allowed
+            )
+            and not advisor_disclosure_policy().ignores_restriction_labels(context.prepared.family)
+        ) or not await self.authorize_source_disclosure(context):
             return False
         try:
             scope_kind = OsintScopeKind(pinned.scope_kind)
@@ -571,13 +576,16 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 )
             )
             if {item.id for item in samples} != sample_ids or any(
-                item.tlp.casefold() == "red"
-                or _source_flags_block(
-                    context.prepared.family,
-                    do_not_submit=item.do_not_submit,
-                    external_llm_allowed=item.external_llm_allowed,
+                not advisor_disclosure_policy().ignores_restriction_labels(context.prepared.family)
+                and (
+                    item.tlp.casefold() == "red"
+                    or _source_flags_block(
+                        context.prepared.family,
+                        do_not_submit=item.do_not_submit,
+                        external_llm_allowed=item.external_llm_allowed,
+                    )
+                    or bool((item.license_restriction or "").strip())
                 )
-                or bool((item.license_restriction or "").strip())
                 for item in samples
             ):
                 return False
@@ -605,13 +613,16 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 )
             )
             if any(
-                item.tlp.casefold() == "red"
-                or _source_flags_block(
-                    context.prepared.family,
-                    do_not_submit=item.do_not_submit,
-                    external_llm_allowed=item.external_llm_allowed,
+                not advisor_disclosure_policy().ignores_restriction_labels(context.prepared.family)
+                and (
+                    item.tlp.casefold() == "red"
+                    or _source_flags_block(
+                        context.prepared.family,
+                        do_not_submit=item.do_not_submit,
+                        external_llm_allowed=item.external_llm_allowed,
+                    )
+                    or bool((item.license_restriction or "").strip())
                 )
-                or bool((item.license_restriction or "").strip())
                 for item in hash_samples
             ):
                 return False
@@ -627,13 +638,16 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 )
             )
             if {item.id for item in documents} != document_ids or any(
-                item.tlp.casefold() == "red"
-                or _source_flags_block(
-                    context.prepared.family,
-                    do_not_submit=item.do_not_submit,
-                    external_llm_allowed=item.external_llm_allowed,
+                not advisor_disclosure_policy().ignores_restriction_labels(context.prepared.family)
+                and (
+                    item.tlp.casefold() == "red"
+                    or _source_flags_block(
+                        context.prepared.family,
+                        do_not_submit=item.do_not_submit,
+                        external_llm_allowed=item.external_llm_allowed,
+                    )
+                    or bool((item.license_restriction or "").strip())
                 )
-                or bool((item.license_restriction or "").strip())
                 for item in documents
             ):
                 return False
