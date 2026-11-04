@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.evidence_recorder import MAX_EVIDENCE_JSON_BYTES
 from cti_app.application.investigation_annex_export import (
+    ANNEX_DISCLOSURE_PROFILES,
+    M14_RESEARCH_PERMISSIVE_PROFILE,
     AnnexAsset,
     InvestigationAnnexSnapshot,
 )
@@ -696,8 +698,12 @@ async def load_investigation_annex_snapshot(
     artifact_store: ProductionArtifactStore,
     *,
     include_restricted_archive: bool = False,
+    profile: str = "standard",
 ) -> InvestigationAnnexSnapshot:
     """Read one repeatable-read PostgreSQL snapshot and verified MinIO objects."""
+    if profile not in ANNEX_DISCLOSURE_PROFILES:
+        raise ValueError("Unsupported annex disclosure profile")
+    research_permissive = profile == M14_RESEARCH_PERMISSIVE_PROFILE
     async with session_factory() as session:
         async with session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
@@ -853,6 +859,10 @@ async def load_investigation_annex_snapshot(
     envelope_allowed, envelope_restrictions = _external_archive_policy(
         envelope, subject_tlp, source_snapshot.analyst_decisions
     )
+    envelope_disclosure = getattr(envelope, "disclosure", None)
+    envelope_tlp = _string(getattr(envelope_disclosure, "tlp", None))
+    envelope_external_llm_allowed = getattr(envelope_disclosure, "external_llm_allowed", None)
+    envelope_do_not_submit = getattr(envelope_disclosure, "do_not_submit", None)
     samples_by_sha: dict[str, SampleRow] = {}
     ambiguous_sample_shas: set[str] = set()
     samples_by_sha_all: defaultdict[str, list[SampleRow]] = defaultdict(list)
@@ -902,7 +912,7 @@ async def load_investigation_annex_snapshot(
             restrictions = ("canonical_figure_manifest_mismatch",)
         elif not include_restricted_archive:
             restrictions = ("explicit_restricted_archive_flag_required",)
-        elif not envelope_allowed:
+        elif not envelope_allowed and not research_permissive:
             restrictions = envelope_restrictions or ("canonical_policy_denied",)
         else:
             figure_content, read_failure = await _read_canonical_blob(
@@ -992,8 +1002,10 @@ async def load_investigation_annex_snapshot(
                     **origin_metadata,
                     "rule_kind": "yara",
                     "test_refs": test_refs,
-                    "external_llm_allowed": envelope_allowed,
-                    "tlp": _string(getattr(getattr(envelope, "disclosure", None), "tlp", None)),
+                    "external_llm_allowed": (
+                        envelope_external_llm_allowed if research_permissive else envelope_allowed
+                    ),
+                    "tlp": envelope_tlp,
                 },
             )
         )
@@ -1043,7 +1055,21 @@ async def load_investigation_annex_snapshot(
             continue
         sample_sha = blob.sha256
         association = association_by_sha.get(sample_sha)
-        if association is None:
+        sample_events = tuple(events_by_sample.get(sample.id, ()))
+        acquired_for_investigation = any(
+            event.payload.get("investigation_id") == str(investigation_id)
+            and event.event_type
+            in {
+                "sample_acquired_from_virustotal",
+                "sample_imported_from_vt_sandbox_pcap",
+                "sample_imported_by_operator",
+            }
+            for event in sample_events
+        )
+        if association is None and (
+            not research_permissive
+            or (sample_sha not in captured_shas and not acquired_for_investigation)
+        ):
             continue
         qualification = (
             _metadata_text(association.qualification) if association is not None else "unassociated"
@@ -1064,16 +1090,15 @@ async def load_investigation_annex_snapshot(
         restrictions_tuple = tuple(sorted(sample_archive_restrictions))
         content: bytes | None = None
         availability = "present"
-        if include_restricted_archive and archive_allowed:
+        if include_restricted_archive and (archive_allowed or research_permissive):
             content, read_failure = await _read_canonical_blob(
                 artifact_store, sample.blob_id, sample_sha, max_bytes=None
             )
             if read_failure is not None:
                 availability = "unavailable"
                 restrictions_tuple = tuple(sorted(set(restrictions_tuple) | {read_failure}))
-        elif not archive_allowed:
+        elif not archive_allowed and not research_permissive:
             availability = "restricted"
-        sample_events = tuple(events_by_sample.get(sample.id, ()))
         event_refs = tuple(str(event.id) for event in sample_events)
         vt_search_refs = tuple(
             str(item.id)
@@ -1113,6 +1138,14 @@ async def load_investigation_annex_snapshot(
                     "archive_export_allowed": archive_allowed,
                     "external_llm_allowed": sample.external_llm_allowed,
                     "license_restriction_present": bool(sample.license_restriction),
+                    **(
+                        {
+                            "license_restriction": sample.license_restriction,
+                            "do_not_submit": sample.do_not_submit,
+                        }
+                        if research_permissive
+                        else {}
+                    ),
                     "origin_kind": sample.origin_kind,
                     "qualification": qualification,
                     "sample_state": sample.state,
@@ -1132,7 +1165,9 @@ async def load_investigation_annex_snapshot(
             ).encode("utf-8")
             event_tlp_red = _is_tlp_red(event.tlp)
             note_archive_allowed = archive_allowed and not event_tlp_red
-            note_available = include_restricted_archive and note_archive_allowed
+            note_available = include_restricted_archive and (
+                note_archive_allowed or research_permissive
+            )
             note_restrictions = (
                 ()
                 if note_archive_allowed
@@ -1177,7 +1212,7 @@ async def load_investigation_annex_snapshot(
             investigation_created_at,
             investigation_id=investigation_id,
             provenance_events=sample_events,
-            association_id=association.id,
+            association_id=association.id if association is not None else None,
         )
         if sample_sha in ambiguous_sample_shas:
             acquired_during = "acquired_ambiguous_subject_records"
@@ -1206,44 +1241,21 @@ async def load_investigation_annex_snapshot(
                     "source_service": sample.source_service,
                     "source_object_id": sample.source_object_id,
                     "acquisition_events": acquisition_events,
-                    "relation": "investigation_sample_association",
-                    "pivot_criteria": "canonical_sample_association_and_acquisition_time",
+                    "relation": (
+                        "investigation_sample_association"
+                        if association is not None
+                        else "canonical_acquisition_provenance"
+                    ),
+                    "pivot_criteria": (
+                        "canonical_sample_association_and_acquisition_time"
+                        if association is not None
+                        else "canonical_acquisition_provenance_event"
+                    ),
                 },
                 availability="restricted" if public_restrictions else "present",
                 restrictions=tuple(sorted(public_restrictions)),
                 public_distribution_allowed=not public_restrictions,
                 archive_export_allowed=archive_allowed,
-            )
-        )
-
-    for observation in source_snapshot.observations:
-        if (
-            observation.source != _NETWORK_CAPTURE_SOURCE
-            or observation.object_type != "network_capture"
-            or observation.object_id != observation.sha256
-            or observation.sha256 in association_by_sha
-        ):
-            continue
-        assets.append(
-            AnnexAsset(
-                canonical_id=str(observation.id),
-                type="network_capture",
-                investigation_id=investigation_id_text,
-                sha256=observation.sha256,
-                source="evidence_observations.blob_id",
-                origin=observation.source,
-                references=(str(observation.id),),
-                availability="unavailable",
-                restrictions=tuple(
-                    sorted(
-                        set(public_distribution_restrictions)
-                        | sample_public_restrictions_by_sha.get(observation.sha256, set())
-                        | {"sample_policy_metadata_unavailable"}
-                    )
-                ),
-                public_distribution_allowed=False,
-                archive_export_allowed=False,
-                metadata={"archive_export_allowed": False, "external_llm_allowed": False},
             )
         )
 
@@ -1364,18 +1376,125 @@ async def load_investigation_annex_snapshot(
                 )
             )
 
-    # Read only bounded canonical JSON observations; quarantine captures remain opaque here.
+    existing_capture_shas = {
+        asset.sha256 for asset in assets if asset.type == "network_capture" and asset.sha256
+    }
+    for observation in source_snapshot.observations:
+        if (
+            observation.source != _NETWORK_CAPTURE_SOURCE
+            or observation.object_type != "network_capture"
+        ):
+            continue
+        if not research_permissive:
+            # Preserve the standard profile's fail-closed capture projection. The
+            # qualification profile below reads verified bytes into restricted/.
+            if (
+                observation.object_id != observation.sha256
+                or observation.sha256 in association_by_sha
+            ):
+                continue
+            assets.append(
+                AnnexAsset(
+                    canonical_id=str(observation.id),
+                    type="network_capture",
+                    investigation_id=investigation_id_text,
+                    sha256=observation.sha256,
+                    source="evidence_observations.blob_id",
+                    origin=observation.source,
+                    references=(str(observation.id),),
+                    availability="unavailable",
+                    restrictions=tuple(
+                        sorted(
+                            set(public_distribution_restrictions)
+                            | sample_public_restrictions_by_sha.get(observation.sha256, set())
+                            | {"sample_policy_metadata_unavailable"}
+                        )
+                    ),
+                    public_distribution_allowed=False,
+                    archive_export_allowed=False,
+                    metadata={
+                        "archive_export_allowed": False,
+                        "external_llm_allowed": False,
+                    },
+                )
+            )
+            continue
+        capture_sha = _safe_sha256(observation.object_id)
+        if (
+            capture_sha is None
+            or capture_sha in existing_capture_shas
+        ):
+            continue
+        public_restrictions = set(
+            _observation_public_restrictions(
+                observation,
+                public_distribution_restrictions=public_distribution_restrictions,
+                sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
+                known_sample_shas=set(samples_by_sha) | set(association_by_sha),
+            )
+        )
+        archive_restrictions = set(envelope_restrictions)
+        archive_restrictions.update(sample_archive_restrictions_by_sha.get(capture_sha, set()))
+        observation_sha = _safe_sha256(observation.sha256)
+        capture_digest_matches = observation_sha == capture_sha
+        if not capture_digest_matches:
+            archive_restrictions.add("capture_object_sha256_mismatch")
+        if capture_sha not in samples_by_sha and capture_sha not in association_by_sha:
+            archive_restrictions.add("sample_policy_metadata_unavailable")
+        archive_allowed = not archive_restrictions
+        capture_content: bytes | None = None
+        availability = "present" if capture_digest_matches else "unavailable"
+        if (
+            capture_digest_matches
+            and include_restricted_archive
+            and (archive_allowed or research_permissive)
+        ):
+            capture_content, failure = await _read_canonical_blob(
+                artifact_store, observation.blob_id, observation_sha, max_bytes=None
+            )
+            if capture_content is None:
+                availability = "unavailable"
+                archive_restrictions.add(failure or "canonical_capture_unavailable")
+        elif not archive_allowed and not research_permissive:
+            availability = "restricted"
+        assets.append(
+            AnnexAsset(
+                canonical_id=str(observation.id),
+                type="network_capture",
+                investigation_id=investigation_id_text,
+                version=observation.source_version,
+                sha256=observation_sha,
+                source="evidence_observations+blobs",
+                origin=observation.source,
+                references=(str(observation.id), capture_sha),
+                availability=availability,
+                restrictions=tuple(sorted(public_restrictions | archive_restrictions)),
+                public_distribution_allowed=not public_restrictions,
+                archive_export_allowed=archive_allowed,
+                content=capture_content,
+                filename=f"{capture_sha}.pcap",
+                metadata={
+                    "tlp": envelope_tlp,
+                    "external_llm_allowed": envelope_external_llm_allowed,
+                    "do_not_submit": envelope_do_not_submit,
+                    "origin_kind": "network_capture_observation",
+                },
+            )
+        )
+        existing_capture_shas.add(capture_sha)
+
+    # Read bounded canonical JSON observations; network captures remain opaque byte objects.
     observation_payloads: dict[UUID, tuple[bytes | None, Mapping[str, Any], str | None]] = {}
     for observation in source_snapshot.observations:
-        blob = blobs.get(observation.blob_id)
-        if blob is None:
-            observation_payloads[observation.id] = (None, {}, "blob_record_absent")
-            continue
         if (
             observation.source == _NETWORK_CAPTURE_SOURCE
             and observation.object_type == "network_capture"
         ):
-            observation_payloads[observation.id] = (None, {}, None)
+            observation_payloads[observation.id] = (None, {}, "opaque_network_capture")
+            continue
+        blob = blobs.get(observation.blob_id)
+        if blob is None:
+            observation_payloads[observation.id] = (None, {}, "blob_record_absent")
             continue
         raw, failure = await _read_canonical_blob(
             artifact_store,
@@ -1584,8 +1703,10 @@ async def load_investigation_annex_snapshot(
                 "rule_kind": "suricata",
                 "rule_syntax_validation": "not_tested",
                 "replay_status": "not_tested",
-                "external_llm_allowed": envelope_allowed,
-                "tlp": _string(getattr(getattr(envelope, "disclosure", None), "tlp", None)),
+                "external_llm_allowed": (
+                    envelope_external_llm_allowed if research_permissive else envelope_allowed
+                ),
+                "tlp": envelope_tlp,
             },
         )
         assets.append(asset)
@@ -1629,8 +1750,12 @@ async def load_investigation_annex_snapshot(
                         "test_refs": tuple(str(value) for value in test_refs)
                         if isinstance(test_refs, list | tuple)
                         else (),
-                        "external_llm_allowed": envelope_allowed,
-                        "tlp": _string(getattr(getattr(envelope, "disclosure", None), "tlp", None)),
+                        "external_llm_allowed": (
+                            envelope_external_llm_allowed
+                            if research_permissive
+                            else envelope_allowed
+                        ),
+                        "tlp": envelope_tlp,
                     },
                 )
             )
@@ -1731,8 +1856,12 @@ async def load_investigation_annex_snapshot(
                         if is_replay and engine_status in {"succeeded", "partial"}
                         else "not_assessed",
                         "detection_empirically_validated": False,
-                        "external_llm_allowed": envelope_allowed,
-                        "tlp": _string(getattr(getattr(envelope, "disclosure", None), "tlp", None)),
+                        "external_llm_allowed": (
+                            envelope_external_llm_allowed
+                            if research_permissive
+                            else envelope_allowed
+                        ),
+                        "tlp": envelope_tlp,
                     },
                 )
             )
@@ -1784,8 +1913,12 @@ async def load_investigation_annex_snapshot(
                         "ioc_type": ioc_type,
                         "value": value,
                         "relation": "observed_in_virustotal_response",
-                        "external_llm_allowed": envelope_allowed,
-                        "tlp": _string(getattr(getattr(envelope, "disclosure", None), "tlp", None)),
+                        "external_llm_allowed": (
+                            envelope_external_llm_allowed
+                            if research_permissive
+                            else envelope_allowed
+                        ),
+                        "tlp": envelope_tlp,
                     },
                 )
             )
@@ -1883,7 +2016,7 @@ async def load_investigation_annex_snapshot(
             model_failure = "protocol_model_reference_invalid"
         elif not include_restricted_archive:
             model_failure = "explicit_restricted_archive_flag_required"
-        elif not envelope_allowed:
+        elif not envelope_allowed and not research_permissive:
             model_failure = ",".join(envelope_restrictions) or "canonical_policy_denied"
         else:
             model_raw, model_failure = await _read_canonical_blob(
@@ -2064,6 +2197,19 @@ async def load_investigation_annex_snapshot(
         else asset
         for asset in assets
     ]
+
+    if research_permissive:
+        assets_with_policy_metadata: list[AnnexAsset] = []
+        for asset in assets:
+            metadata = dict(asset.metadata)
+            if asset.type not in {"sample", "network_capture"}:
+                metadata.setdefault("tlp", envelope_tlp)
+                metadata["external_llm_allowed"] = envelope_external_llm_allowed
+                metadata["do_not_submit"] = envelope_do_not_submit
+            metadata["archive_export_allowed"] = asset.archive_export_allowed
+            metadata["public_distribution_allowed"] = asset.public_distribution_allowed
+            assets_with_policy_metadata.append(replace(asset, metadata=metadata))
+        assets = assets_with_policy_metadata
 
     assets = _resolve_public_distribution_for_assets(
         assets,

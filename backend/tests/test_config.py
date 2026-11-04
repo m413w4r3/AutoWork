@@ -33,6 +33,19 @@ def test_settings_are_loaded_from_environment(monkeypatch: pytest.MonkeyPatch) -
     assert settings.readiness_timeout_seconds == 1.5
 
 
+def test_advisor_disclosure_profile_uses_standard_default_and_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ADVISOR_DISCLOSURE_PROFILE", raising=False)
+    assert Settings(_env_file=None).advisor_disclosure_profile == "standard"
+
+    monkeypatch.setenv("ADVISOR_DISCLOSURE_PROFILE", "m14_research_permissive")
+    assert (
+        Settings(_env_file=None).advisor_disclosure_profile
+        == "m14_research_permissive"
+    )
+
+
 def test_model_api_keys_are_secret_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("QWEN_API_KEY", "test-only-secret")
 
