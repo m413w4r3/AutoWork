@@ -426,7 +426,9 @@ class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
                     "candidate_status": "candidate",
                     "source_observation_id": str(observation.id),
                     "candidate_observation_id": str(recorded.id),
-                    "bridge_invocation_id": str(bridge_invocation_id),
+                    "bridge_invocation_id": (
+                        str(bridge_invocation_id) if bridge_invocation_id is not None else None
+                    ),
                     "rule_source_sha256": source_sha256,
                     "rule_syntax_validation": syntax_status,
                     "rule_syntax_validation_error": syntax_error,

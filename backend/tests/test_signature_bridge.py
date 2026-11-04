@@ -1152,6 +1152,7 @@ async def test_suricata_bridge_candidate_syntax_failure_is_still_persisted() -> 
     )
 
     assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["bridge_invocation_id"] is None
     assert result.output["rule_syntax_validation"] == "failed"
     assert result.output["candidate_observation_id"]
     stored = recorder.payloads[recorder.observations[0].blob_id]
