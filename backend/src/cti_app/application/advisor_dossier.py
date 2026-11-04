@@ -654,9 +654,7 @@ def build_advisor_dossier(
     contradiction_requested = _contradiction_is_requested(prompt_data, relevance_text)
     explicitly_referenced = set(_explicit_reference_ids(prompt_data))
     advisor_omissions = [
-        item
-        for item in prompt_data.get("_advisor_omissions", ())
-        if isinstance(item, Mapping)
+        item for item in prompt_data.get("_advisor_omissions", ()) if isinstance(item, Mapping)
     ]
     omitted_observation_ids = {
         _as_text(item.get("id"))

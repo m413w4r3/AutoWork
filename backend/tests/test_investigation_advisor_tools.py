@@ -380,8 +380,7 @@ async def test_advisor_drops_uncitable_vt_file_reference_but_uses_valid_report(
     manifest = result.output["bridge_provenance"]["dossier_manifest"]
     assert any(item["kind"] == "observation" and item["id"] == str(valid.id) for item in manifest)
     assert not any(
-        item["kind"] == "observation" and item["id"] == str(unconfirmed.id)
-        for item in manifest
+        item["kind"] == "observation" and item["id"] == str(unconfirmed.id) for item in manifest
     )
     omission = next(
         item for item in manifest if item.get("omitted_observation_id") == str(unconfirmed.id)
@@ -432,12 +431,10 @@ async def test_advisor_continues_when_only_vt_file_reference_is_uncitable(monkey
     assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     manifest = result.output["bridge_provenance"]["dossier_manifest"]
     assert not any(
-        item["kind"] == "observation" and item["id"] == str(unconfirmed.id)
-        for item in manifest
+        item["kind"] == "observation" and item["id"] == str(unconfirmed.id) for item in manifest
     )
     assert any(
-        item.get("omitted_observation_id") == str(unconfirmed.id)
-        and item["kind"] == "omission"
+        item.get("omitted_observation_id") == str(unconfirmed.id) and item["kind"] == "omission"
         for item in manifest
     )
     assert result.output["omissions"][0]["resource"] == "vt.file_report"
