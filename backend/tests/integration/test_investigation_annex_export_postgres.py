@@ -5,12 +5,13 @@ import json
 from datetime import UTC, date, datetime
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.investigation_annex_export import write_investigation_annex
+from cti_app.application.investigation_governance import InvestigationEnvelopeService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
@@ -587,6 +588,7 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         public_files = _files(public_a)
         assert public_files == _files(public_b)
         assert sample_bytes not in b"".join(public_files.values())
+        assert sample_sha.encode() not in b"\n".join(public_files.values())
         manifest = json.loads(public_files["manifest.json"])
         manifest_digest = hashlib.sha256(public_files["manifest.json"]).hexdigest()
         assert public_files["manifest.sha256"] == f"{manifest_digest}  manifest.json\n".encode()
@@ -602,25 +604,35 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         shared_public = next(
             item
             for item in manifest["objects"]
-            if item["canonical_id"] == str(shared_authorized_sample.id)
+            if item["type"] == "sample" and "tlp_red" in item["restrictions"]
         )
         assert shared_public["availability"] == "restricted"
         assert shared_public["sha256"] is None
         assert "tlp_red" in shared_public["restrictions"]
+        assert str(shared_authorized_sample.id).encode() not in b"\n".join(public_files.values())
+        assert str(shared_red_sample.id).encode() not in b"\n".join(public_files.values())
+        assert str(unacquired_shared_red_sample.id).encode() not in b"\n".join(
+            public_files.values()
+        )
         assert shared_sha not in b"\n".join(public_files.values()).decode("latin1")
         assert unacquired_shared_bytes not in b"\n".join(public_files.values())
         assert unacquired_shared_sha.encode() not in b"\n".join(public_files.values())
-        assert capture_sha.encode() in b"\n".join(public_files.values())
+        assert capture_sha.encode() not in b"\n".join(public_files.values())
         unacquired_shared_public = next(
             item
             for item in manifest["objects"]
-            if item["canonical_id"] == f"association:{unacquired_shared_association.id}:unacquired"
+            if item["type"] == "discovered_sample" and "tlp_red" in item["restrictions"]
         )
         assert unacquired_shared_public["availability"] == "restricted"
         assert unacquired_shared_public["sha256"] is None
         assert "tlp_red" in unacquired_shared_public["restrictions"]
         inventory_rows = (public_files["samples/sample-inventory.csv"]).decode().splitlines()
         assert all(shared_sha not in row for row in inventory_rows)
+        assert all(
+            item["sha256"] is None
+            for item in manifest["objects"]
+            if item["type"] == "sample" and item["availability"] == "restricted"
+        )
         assert any(
             item["type"] == "evidence_observation" and item["availability"] == "unavailable"
             for item in manifest["objects"]
@@ -713,11 +725,12 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         red_capture = next(
             item
             for item in red_public_manifest["objects"]
-            if item["canonical_id"] == str(capture_observation.id)
+            if item["type"] == "network_capture" and "tlp_red" in item["restrictions"]
         )
         assert red_capture["availability"] == "restricted"
         assert red_capture["sha256"] is None
         assert "tlp_red" in red_capture["restrictions"]
+        assert str(capture_observation.id).encode() not in b"\n".join(red_public_files.values())
         assert not any(
             path.startswith(("yara/tests/report-", "suricata/tests/report-"))
             for path in red_public_files
@@ -732,15 +745,16 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             red_by_type.setdefault(item["type"], []).append(item)
         red_yara = red_by_type["yara_rule"]
         assert all(item["availability"] == "restricted" for item in red_yara)
-        assert {item["sha256"] for item in red_yara} >= {
-            source_v1.source_sha256,
-            source_v2.source_sha256,
-        }
-        assert all("tlp_red" in item["restrictions"] for item in red_yara)
+        assert all(item["sha256"] is None for item in red_yara)
+        assert all(item["references"] == [] for item in red_yara)
+        assert source_v1.source_sha256.encode() not in b"\n".join(red_public_files.values())
+        assert source_v2.source_sha256.encode() not in b"\n".join(red_public_files.values())
+        assert all(
+            isinstance(item["restrictions"], list) and "tlp_red" in item["restrictions"]
+            for item in red_yara
+        )
         red_reports = red_by_type["yara_test_report"] + red_by_type["suricata_test_report"]
-        # An absent report has nothing to withhold; every present one must be restricted.
-        assert all(item["availability"] in {"restricted", "absent"} for item in red_reports)
-        assert any(item["availability"] == "restricted" for item in red_reports)
+        assert all(item["availability"] == "restricted" for item in red_reports)
         assert all(item["filename"] is None for item in red_reports)
         red_ioc_rows = red_public_files["iocs/observed-iocs.csv"].decode().splitlines()
         assert all("annex-example.invalid" not in row for row in red_ioc_rows)
@@ -759,5 +773,98 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         assert bridge_source.encode() not in b"".join(red_archive_files.values())
         assert revised_source.encode() not in b"".join(red_archive_files.values())
         assert suricata_source.encode() not in b"".join(red_archive_files.values())
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_annex_detection_policy_requires_current_public_authorization(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    blob_store = FilesystemBlobStore(tmp_path / "annex-policy-blobs")
+    catalog = BlobCatalogService(blob_store, lambda: SqlAlchemyUnitOfWork(session_factory))
+    artifact_store = ProductionArtifactStore(catalog)
+    try:
+        policy_cases: dict[str, tuple[UUID, bytes, UUID]] = {}
+        for case in ("absent", "revoked", "red", "subject_red", "authorized"):
+            investigation, _ = await _seed_investigation(
+                session_factory, subject_tlp=TLP.RED if case == "subject_red" else TLP.AMBER
+            )
+            source_text = f'rule policy_{case} {{ strings: $a = "{case}" condition: $a }}\n'
+            candidate = DetectionCandidateVersion(
+                investigation_id=investigation.id,
+                source=source_text,
+                source_sha256=hashlib.sha256(source_text.encode()).hexdigest(),
+                motif_provenance=(),
+                status=DetectionCandidateStatus.CANDIDATE,
+                created_at=NOW,
+            )
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                await uow.detection_candidates.append_version(candidate, expected_previous_id=None)
+                if case != "absent":
+                    envelope = InvestigationEnvelope(
+                        investigation_id=investigation.id,
+                        allowed_providers=(),
+                        budget=InvestigationBudget(),
+                        acquire_hits_allowed=False,
+                        disclosure=DisclosureBounds(
+                            tlp=TLPLevel.RED if case == "red" else TLPLevel.GREEN,
+                            external_llm_allowed=case != "red",
+                        ),
+                        approval_decision_id=uuid4(),
+                        approval_actor_id="synthetic-test-approver",
+                        approved_at=NOW,
+                    )
+                    await uow.investigation_envelopes.save_if_version(
+                        envelope, expected_version=None
+                    )
+                await uow.commit()
+            if case == "revoked":
+                governance = InvestigationEnvelopeService(
+                    lambda: SqlAlchemyUnitOfWork(session_factory)
+                )
+                await governance.revoke(
+                    investigation.id,
+                    expected_version=1,
+                    actor_id="synthetic-test-approver",
+                    reason="Synthetic integration revocation",
+                    correlation_id=f"annex-policy-revoke-{investigation.id}",
+                )
+            policy_cases[case] = (investigation.id, source_text.encode(), candidate.id)
+
+        for case, (investigation_id, source_bytes, candidate_id) in policy_cases.items():
+            snapshot = await load_investigation_annex_snapshot(
+                session_factory, investigation_id, artifact_store
+            )
+            assert all(asset.public_distribution_allowed is not None for asset in snapshot.assets)
+            output = tmp_path / f"policy-{case}"
+            write_investigation_annex(snapshot, output)
+            files = _files(output)
+            manifest = json.loads(files["manifest.json"])
+            rule = next(item for item in manifest["objects"] if item["type"] == "yara_rule")
+            report = next(
+                item for item in manifest["objects"] if item["type"] == "yara_test_report"
+            )
+            if case == "authorized":
+                assert source_bytes in b"\n".join(files.values())
+                assert rule["availability"] == "present"
+                assert rule["filename"] is not None
+            else:
+                assert source_bytes not in b"\n".join(files.values())
+                assert rule["availability"] == "restricted"
+                assert rule["sha256"] is None
+                assert rule["references"] == []
+                assert report["availability"] == "restricted"
+                assert report["references"] == []
+                assert str(candidate_id).encode() not in b"\n".join(files.values())
+                expected_reason = {
+                    "absent": "g2_envelope_unavailable",
+                    "revoked": "g2_envelope_revoked",
+                    "red": "tlp_red",
+                    "subject_red": "tlp_red",
+                }[case]
+                assert expected_reason in rule["restrictions"]
     finally:
         await engine.dispose()

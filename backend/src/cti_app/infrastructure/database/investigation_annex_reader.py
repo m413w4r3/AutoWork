@@ -313,6 +313,37 @@ def _public_distribution_policy(
     return not reasons, tuple(sorted(set(reasons)))
 
 
+def _observation_public_restrictions(
+    observation: Any,
+    *,
+    public_distribution_restrictions: Sequence[str],
+    sample_public_restrictions_by_sha: Mapping[str, set[str]],
+    known_sample_shas: set[str],
+) -> tuple[str, ...]:
+    restrictions = set(public_distribution_restrictions)
+    object_sha = _safe_sha256(observation.object_id)
+    if object_sha is not None:
+        restrictions.update(sample_public_restrictions_by_sha.get(object_sha, set()))
+        if object_sha not in known_sample_shas:
+            restrictions.add("sample_policy_metadata_unavailable")
+    return tuple(sorted(restrictions))
+
+
+def _observation_public_distribution_allowed(
+    observation: Any,
+    *,
+    public_distribution_restrictions: Sequence[str],
+    sample_public_restrictions_by_sha: Mapping[str, set[str]],
+    known_sample_shas: set[str],
+) -> bool:
+    return not _observation_public_restrictions(
+        observation,
+        public_distribution_restrictions=public_distribution_restrictions,
+        sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
+        known_sample_shas=known_sample_shas,
+    )
+
+
 def _sample_public_restrictions(
     sample: SampleRow,
     qualification: str | None,
@@ -721,7 +752,10 @@ async def load_investigation_annex_snapshot(
                     figure.pin_sha256,
                 ),
                 availability=availability,
-                restrictions=restrictions,
+                restrictions=tuple(
+                    sorted(set(restrictions) | set(public_distribution_restrictions))
+                ),
+                public_distribution_allowed=public_distribution_allowed,
                 content=figure_content,
                 filename=(f"opinion-{opinion.id}-v{opinion.version}-{figure.kind.value}.svg"),
                 metadata={
@@ -1015,10 +1049,7 @@ async def load_investigation_annex_snapshot(
                         | {"sample_policy_metadata_unavailable"}
                     )
                 ),
-                public_distribution_allowed=not (
-                    public_distribution_restrictions
-                    or sample_public_restrictions_by_sha.get(observation.sha256, set())
-                ),
+                public_distribution_allowed=False,
                 archive_export_allowed=False,
                 metadata={"archive_export_allowed": False, "external_llm_allowed": False},
             )
@@ -1181,6 +1212,12 @@ async def load_investigation_annex_snapshot(
                 references=(str(observation.invocation_ref),) if observation.invocation_ref else (),
                 availability="unavailable" if failure else "present",
                 restrictions=(failure,) if failure else (),
+                public_distribution_allowed=_observation_public_distribution_allowed(
+                    observation,
+                    public_distribution_restrictions=public_distribution_restrictions,
+                    sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
+                    known_sample_shas=set(samples_by_sha) | set(association_by_sha),
+                ),
             )
         )
         if (
@@ -1215,7 +1252,25 @@ async def load_investigation_annex_snapshot(
                     origin="protocol_model_observation",
                     references=(str(observation.id),),
                     availability="unavailable",
-                    restrictions=(failure or "protocol_model_schema_unavailable",),
+                    restrictions=tuple(
+                        sorted(
+                            set(
+                                _observation_public_restrictions(
+                                    observation,
+                                    public_distribution_restrictions=public_distribution_restrictions,
+                                    sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
+                                    known_sample_shas=set(samples_by_sha) | set(association_by_sha),
+                                )
+                            )
+                            | {failure or "protocol_model_schema_unavailable"}
+                        )
+                    ),
+                    public_distribution_allowed=_observation_public_distribution_allowed(
+                        observation,
+                        public_distribution_restrictions=public_distribution_restrictions,
+                        sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
+                        known_sample_shas=set(samples_by_sha) | set(association_by_sha),
+                    ),
                     metadata={"archive_export_allowed": False, "status": "unavailable"},
                 )
             )
@@ -1234,6 +1289,7 @@ async def load_investigation_annex_snapshot(
                     references=(str(observation.id),),
                     availability="unavailable",
                     restrictions=(failure or "suricata_result_schema_unavailable",),
+                    public_distribution_allowed=public_distribution_allowed,
                     metadata={
                         "rule_kind": "suricata",
                         "engine_status": "unavailable",
@@ -1654,6 +1710,12 @@ async def load_investigation_annex_snapshot(
                 references=(str(observation.id),),
                 availability=model_availability,
                 restrictions=(model_failure,) if model_failure else (),
+                public_distribution_allowed=_observation_public_distribution_allowed(
+                    observation,
+                    public_distribution_restrictions=public_distribution_restrictions,
+                    sample_public_restrictions_by_sha=sample_public_restrictions_by_sha,
+                    known_sample_shas=set(samples_by_sha) | set(association_by_sha),
+                ),
                 content=model_raw,
                 filename=f"protocol-{observation.id}.json",
                 metadata={
@@ -1687,6 +1749,7 @@ async def load_investigation_annex_snapshot(
                 sha256=hashlib.sha256(content).hexdigest(),
                 availability="present" if envelope_allowed else "restricted",
                 restrictions=() if envelope_allowed else envelope_restrictions,
+                public_distribution_allowed=public_distribution_allowed,
                 content=content,
                 filename=f"experiment-{experiment.id}.json",
                 metadata={
@@ -1715,6 +1778,7 @@ async def load_investigation_annex_snapshot(
                 sha256=hashlib.sha256(content).hexdigest(),
                 availability="present" if envelope_allowed else "restricted",
                 restrictions=() if envelope_allowed else envelope_restrictions,
+                public_distribution_allowed=public_distribution_allowed,
                 content=content,
                 filename=f"finding-{finding.id}.json",
                 metadata={
@@ -1805,5 +1869,122 @@ async def load_investigation_annex_snapshot(
         else asset
         for asset in assets
     ]
+
+    observation_by_text_id = {str(item.id): item for item in source_snapshot.observations}
+    known_sample_shas = set(samples_by_sha) | set(association_by_sha)
+    restricted_asset_reasons_by_id = {
+        asset.canonical_id: set(asset.restrictions) or {"related_asset_distribution_restricted"}
+        for asset in assets
+        if asset.public_distribution_allowed is False
+    }
+    resolved_assets: list[AnnexAsset] = []
+    for asset in assets:
+        asset_public_restrictions = set(public_distribution_restrictions)
+        related_shas = set(asset.references)
+        related_observation_ids = set(asset.references)
+        related_asset_ids = set(asset.references)
+        for metadata_key in ("value", "related_to", "source_object_id"):
+            metadata_value = asset.metadata.get(metadata_key)
+            if isinstance(metadata_value, str):
+                related_shas.add(metadata_value)
+        for metadata_key in ("source_observation_ids", "fact_refs", "test_refs", "test_report_ids"):
+            metadata_values = asset.metadata.get(metadata_key)
+            if isinstance(metadata_values, Sequence) and not isinstance(
+                metadata_values, str | bytes
+            ):
+                related_observation_ids.update(
+                    value for value in metadata_values if isinstance(value, str)
+                )
+                related_asset_ids.update(
+                    value for value in metadata_values if isinstance(value, str)
+                )
+        for related_asset_id in related_asset_ids:
+            asset_public_restrictions.update(
+                restricted_asset_reasons_by_id.get(related_asset_id, set())
+            )
+        for related_value in related_shas:
+            related_sha = _safe_sha256(related_value)
+            if related_sha is not None:
+                asset_public_restrictions.update(
+                    sample_public_restrictions_by_sha.get(related_sha, set())
+                )
+        for observation_id in related_observation_ids:
+            related_observation = observation_by_text_id.get(observation_id)
+            if related_observation is None:
+                continue
+            related_sha = _safe_sha256(related_observation.object_id)
+            if related_sha is None:
+                continue
+            asset_public_restrictions.update(
+                sample_public_restrictions_by_sha.get(related_sha, set())
+            )
+            if (
+                related_observation.object_type in {"file", "network_capture"}
+                and related_sha not in known_sample_shas
+            ):
+                asset_public_restrictions.add("sample_policy_metadata_unavailable")
+        allowed = asset.public_distribution_allowed
+        if asset_public_restrictions or allowed is False:
+            allowed = False
+        elif allowed is None:
+            allowed = public_distribution_allowed
+        restriction_set = set(asset.restrictions)
+        if not allowed:
+            restriction_set.update(asset_public_restrictions)
+        resolved_assets.append(
+            replace(
+                asset,
+                restrictions=tuple(sorted(restriction_set)),
+                public_distribution_allowed=allowed,
+            )
+        )
+    while True:
+        restricted_asset_reasons_by_id = {
+            asset.canonical_id: set(asset.restrictions) or {"related_asset_distribution_restricted"}
+            for asset in resolved_assets
+            if asset.public_distribution_allowed is False
+        }
+        newly_restricted: list[AnnexAsset] = []
+        changed = False
+        for asset in resolved_assets:
+            if asset.public_distribution_allowed is False:
+                newly_restricted.append(asset)
+                continue
+            related_asset_ids = set(asset.references)
+            for metadata_key in (
+                "source_observation_ids",
+                "fact_refs",
+                "test_refs",
+                "test_report_ids",
+            ):
+                metadata_values = asset.metadata.get(metadata_key)
+                if isinstance(metadata_values, Sequence) and not isinstance(
+                    metadata_values, str | bytes
+                ):
+                    related_asset_ids.update(
+                        value for value in metadata_values if isinstance(value, str)
+                    )
+            inherited_restrictions = set().union(
+                *(
+                    restricted_asset_reasons_by_id.get(related_asset_id, set())
+                    for related_asset_id in related_asset_ids
+                )
+            )
+            if inherited_restrictions:
+                resolved_restrictions = set(asset.restrictions) | inherited_restrictions
+                newly_restricted.append(
+                    replace(
+                        asset,
+                        restrictions=tuple(sorted(resolved_restrictions)),
+                        public_distribution_allowed=False,
+                    )
+                )
+                changed = True
+            else:
+                newly_restricted.append(asset)
+        resolved_assets = newly_restricted
+        if not changed:
+            break
+    assets = resolved_assets
 
     return InvestigationAnnexSnapshot(investigation_id=investigation_id_text, assets=tuple(assets))

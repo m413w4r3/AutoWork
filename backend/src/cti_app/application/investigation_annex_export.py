@@ -86,7 +86,7 @@ class AnnexAsset:
     references: tuple[str, ...] = ()
     availability: str = "present"
     restrictions: tuple[str, ...] = ()
-    public_distribution_allowed: bool = True
+    public_distribution_allowed: bool | None = None
     archive_export_allowed: bool | None = None
     content: bytes | None = None
     filename: str | None = None
@@ -260,11 +260,38 @@ def _sorted_refs(asset: AnnexAsset) -> list[str]:
 
 
 def _public_projection(asset: AnnexAsset, *, include_restricted_archive: bool) -> AnnexAsset:
-    public_restricted = not include_restricted_archive and not asset.public_distribution_allowed
+    policy_unresolved = not include_restricted_archive and asset.public_distribution_allowed is None
+    public_restricted = not include_restricted_archive and (
+        policy_unresolved or asset.public_distribution_allowed is False
+    )
     archive_restricted = include_restricted_archive and asset.archive_export_allowed is False
     if not public_restricted and not archive_restricted:
         return asset
     restrictions = tuple(sorted(set(asset.restrictions)))
+    if policy_unresolved:
+        restrictions = tuple(sorted(set(restrictions) | {"distribution_policy_unresolved"}))
+    if public_restricted:
+        if asset.type == "observed_ioc":
+            ioc_type = asset.metadata.get("ioc_type")
+            metadata = {"status": "restricted"}
+            if isinstance(ioc_type, str):
+                metadata["ioc_type"] = ioc_type
+        else:
+            metadata = {"status": "restricted"}
+        return replace(
+            asset,
+            version=None,
+            sha256=None,
+            source="restricted",
+            origin="restricted",
+            references=(),
+            availability="restricted",
+            restrictions=restrictions,
+            public_distribution_allowed=False,
+            content=None,
+            filename=None,
+            metadata=metadata,
+        )
     if (public_restricted or archive_restricted) and asset.type in {
         "sample",
         "network_capture",
@@ -325,10 +352,11 @@ def _project_assets(
     type_ordinals: defaultdict[str, int] = defaultdict(int)
 
     for asset in assets:
+        path_asset = asset
         asset = _public_projection(asset, include_restricted_archive=include_restricted_archive)
         type_ordinals[asset.type] += 1
         path = _asset_path(
-            asset,
+            path_asset,
             yara_numbers=yara_numbers,
             suricata_numbers=suricata_numbers,
             report_number=type_ordinals[asset.type],
@@ -377,6 +405,28 @@ def _project_assets(
                 files[path] = content
         else:
             path = None
+
+        if not include_restricted_archive and availability == "restricted":
+            metadata = {"status": "restricted"}
+            if asset.type == "observed_ioc":
+                ioc_type = asset.metadata.get("ioc_type")
+                if isinstance(ioc_type, str):
+                    metadata["ioc_type"] = ioc_type
+            asset = replace(
+                asset,
+                canonical_id=(
+                    f"restricted-public-{_safe_leaf(asset.type, 'asset')}-"
+                    f"{type_ordinals[asset.type]:03d}"
+                ),
+                version=None,
+                sha256=None,
+                source="restricted",
+                origin="restricted",
+                references=(),
+                content=None,
+                filename=None,
+                metadata=metadata,
+            )
 
         if availability not in _AVAILABILITY:
             raise ValueError("Annex asset has an unsupported availability state")

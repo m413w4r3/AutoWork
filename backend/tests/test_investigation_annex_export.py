@@ -168,6 +168,7 @@ def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path)
             origin="canonical_detection_candidate_versions",
             references=(candidate_id, "yara-report"),
             content=v2,
+            public_distribution_allowed=True,
             metadata={
                 "candidate_id": candidate_id,
                 "candidate_status": "experimental",
@@ -187,6 +188,7 @@ def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path)
             origin="canonical_detection_candidate_versions",
             references=(candidate_id,),
             content=v1,
+            public_distribution_allowed=True,
             metadata={
                 "candidate_id": candidate_id,
                 "candidate_status": "candidate",
@@ -205,6 +207,7 @@ def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path)
             origin="advisor.consult:suricata_draft",
             references=("suricata-observation",),
             content=suricata,
+            public_distribution_allowed=True,
             metadata={
                 "candidate_status": "experimental",
                 "rule_kind": "suricata",
@@ -221,6 +224,7 @@ def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path)
             origin="detection_candidate_version",
             references=("yara-v1", "yara-v2", "case-1", "case-2"),
             content=report,
+            public_distribution_allowed=True,
             metadata={"status": "ONE_RULE_NOT_VALIDATED", "rule_kind": "yara"},
         ),
     )
@@ -454,9 +458,13 @@ def test_public_export_redacts_distribution_restricted_sample_and_ioc(tmp_path: 
     write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, assets), output)
 
     manifest = _read_manifest(output)
-    by_id = {item["canonical_id"]: item for item in manifest["objects"]}
-    restricted = by_id[restricted_id]
+    restricted = next(
+        item
+        for item in manifest["objects"]
+        if item["type"] == "sample" and "tlp_red" in item["restrictions"]
+    )
     assert restricted["availability"] == "restricted"
+    assert restricted["canonical_id"] != restricted_id
     assert restricted["sha256"] is None
     assert restricted["source"] == "restricted"
     assert restricted["origin"] == "restricted"
@@ -464,20 +472,32 @@ def test_public_export_redacts_distribution_restricted_sample_and_ioc(tmp_path: 
     assert restricted["filename"] is None
     assert restricted["metadata"] == {"status": "restricted"}
     assert "tlp_red" in restricted["restrictions"]
-    assert by_id["public-external-llm-disabled"]["sha256"] == public_sha
-    assert by_id["public-external-llm-disabled"]["metadata"]["external_llm_allowed"] is False
+    external_llm_restricted = next(
+        item
+        for item in manifest["objects"]
+        if item["type"] == "sample" and "sample_external_llm_not_allowed" in item["restrictions"]
+    )
+    assert external_llm_restricted["availability"] == "restricted"
+    assert external_llm_restricted["sha256"] is None
+    assert external_llm_restricted["metadata"] == {"status": "restricted"}
+    assert external_llm_restricted["canonical_id"] != "public-external-llm-disabled"
 
     inventory = list(csv.DictReader((output / "samples/sample-inventory.csv").open()))
-    restricted_inventory = next(item for item in inventory if item["canonical_id"] == restricted_id)
+    restricted_inventory = next(item for item in inventory if "tlp_red" in item["restrictions"])
+    assert restricted_inventory["canonical_id"] != restricted_id
     assert restricted_inventory["sha256"] == ""
     assert restricted_inventory["availability"] == "restricted"
     assert "tlp_red" in restricted_inventory["restrictions"]
     assert restricted_sha not in (output / "samples/sample-inventory.csv").read_text()
-    assert public_sha in (output / "samples/sample-inventory.csv").read_text()
+    assert public_sha not in (output / "samples/sample-inventory.csv").read_text()
 
     with (output / "iocs/observed-iocs.csv").open(newline="", encoding="utf-8") as stream:
         ioc_rows = list(csv.DictReader(stream))
-    ioc = next(item for item in ioc_rows if item["observation_id"] == "restricted-ioc")
+    ioc = next(
+        item
+        for item in ioc_rows
+        if item["availability"] == "restricted" and "g2_envelope_revoked" in item["restrictions"]
+    )
     assert ioc["value"] == ""
     assert ioc["availability"] == "restricted"
     assert "g2_envelope_revoked" in ioc["restrictions"]
@@ -489,6 +509,12 @@ def test_public_export_redacts_distribution_restricted_sample_and_ioc(tmp_path: 
     assert b"sensitive-source-object" not in all_public_bytes
     assert b"sensitive-source-service" not in all_public_bytes
     assert b"sensitive-acquisition-origin" not in all_public_bytes
+    assert restricted_id.encode() not in all_public_bytes
+    assert b"restricted-ioc" not in all_public_bytes
+    assert b"missing-g2-ioc" not in all_public_bytes
+    assert b"public-external-llm-disabled" not in all_public_bytes
+    assert b"archive-authorized-sample" not in all_public_bytes
+    assert public_sha.encode() not in all_public_bytes
     assert restricted_sha.encode() not in b"\n".join(_file_bytes(output).values())
     assert archive_only_sha.encode() not in all_public_bytes
 
@@ -576,18 +602,111 @@ def test_public_export_restricts_detection_sources_under_red_policy(tmp_path: Pa
     assert public_rule in b"\n".join(files.values())
     manifest = _read_manifest(output)
     restricted = [item for item in manifest["objects"] if item["availability"] == "restricted"]
-    assert {item["canonical_id"] for item in restricted} == {
-        "restricted-yara-rule",
-        "restricted-yara-report",
-    }
+    assert {item["type"] for item in restricted} == {"yara_rule", "yara_test_report"}
+    assert all(item["canonical_id"].startswith("restricted-public-") for item in restricted)
     yara_manifest = next(item for item in restricted if item["type"] == "yara_rule")
-    assert yara_manifest["sha256"] == hashlib.sha256(yara_source).hexdigest()
+    assert yara_manifest["sha256"] is None
+    assert yara_manifest["references"] == []
+    assert hashlib.sha256(yara_source).hexdigest().encode() not in b"\n".join(files.values())
     assert all("tlp_red" in item["restrictions"] for item in restricted)
+    assert b"restricted-yara-rule" not in b"\n".join(files.values())
+    assert b"restricted-yara-report" not in b"\n".join(files.values())
     assert any(
         item["canonical_id"] == "public-rule-external-llm-disabled"
         and item["availability"] == "present"
         for item in manifest["objects"]
     )
+
+
+def test_public_export_fails_closed_when_distribution_policy_is_unresolved(tmp_path: Path) -> None:
+    investigation_id = str(uuid4())
+    sensitive_types = (
+        "yara_rule",
+        "suricata_rule",
+        "yara_test_report",
+        "suricata_test_report",
+        "observed_ioc",
+        "sample",
+        "network_capture",
+        "evidence_observation",
+        "protocol_note",
+        "technical_note",
+        "technical_figure",
+        "discovered_sample",
+    )
+    assets = (
+        *(
+            AnnexAsset(
+                canonical_id=f"unresolved-{asset_type}",
+                type=asset_type,
+                investigation_id=investigation_id,
+                version=1,
+                sha256=hashlib.sha256(f"PRIVATE_CONTENT_{asset_type}".encode()).hexdigest(),
+                source="private-evidence-source",
+                origin="private-evidence-origin",
+                references=(f"derived-evidence-id-{asset_type}",),
+                content=f"PRIVATE_CONTENT_{asset_type}".encode(),
+                filename=f"private-{asset_type}.bin",
+                metadata={
+                    "value": f"private-value-{asset_type}",
+                    "candidate_id": "private-candidate",
+                },
+            )
+            for asset_type in sensitive_types
+        ),
+        AnnexAsset(
+            canonical_id="absent-unresolved-candidate-id",
+            type="yara_test_report",
+            investigation_id=investigation_id,
+            source="canonical-test-query",
+            origin="detection_candidate_version",
+            availability="absent",
+            references=("absent-candidate-version-id",),
+            metadata={"candidate_id": "absent-candidate-id", "test_refs": ["private-ref"]},
+        ),
+    )
+    output = tmp_path / "unresolved-policy"
+    write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, assets), output)
+
+    files = _file_bytes(output)
+    serialized_files = b"\n".join(files.values())
+    manifest = _read_manifest(output)
+    for asset_type in sensitive_types:
+        entry = next(
+            item
+            for item in manifest["objects"]
+            if item["type"] == asset_type
+            and "distribution_policy_unresolved" in item["restrictions"]
+        )
+        assert entry["availability"] == "restricted"
+        assert "distribution_policy_unresolved" in entry["restrictions"]
+        assert entry["sha256"] is None
+        assert entry["references"] == []
+        assert entry["source"] == entry["origin"] == "restricted"
+        assert entry["filename"] is None
+        assert entry["metadata"] == {"status": "restricted"}
+        assert f"PRIVATE_CONTENT_{asset_type}".encode() not in serialized_files
+        assert f"private-value-{asset_type}".encode() not in serialized_files
+        assert f"derived-evidence-id-{asset_type}".encode() not in serialized_files
+        assert (
+            hashlib.sha256(f"PRIVATE_CONTENT_{asset_type}".encode()).hexdigest().encode()
+            not in serialized_files
+        )
+        assert f"unresolved-{asset_type}".encode() not in serialized_files
+    absent_reports = [
+        item
+        for item in manifest["objects"]
+        if item["type"] == "yara_test_report"
+        and "distribution_policy_unresolved" in item["restrictions"]
+    ]
+    assert len(absent_reports) == 2
+    assert all(item["availability"] == "restricted" for item in absent_reports)
+    assert all(item["references"] == [] for item in absent_reports)
+    assert b"absent-unresolved-candidate-id" not in serialized_files
+    assert b"absent-candidate-version-id" not in serialized_files
+    assert b"absent-candidate-id" not in serialized_files
+    assert b"private-evidence-source" not in serialized_files
+    assert b"private-evidence-origin" not in serialized_files
 
 
 def test_restricted_archive_requires_explicit_flag_and_policy_eligibility(tmp_path: Path) -> None:
@@ -694,6 +813,7 @@ def test_manifest_lists_missing_collections_and_verifies_generated_files(tmp_pat
             source="detection_candidate_versions.source",
             origin="canonical_detection_candidate_versions",
             content=b"rule candidate { condition: true }\n",
+            public_distribution_allowed=True,
             metadata={
                 "candidate_id": "candidate-identity",
                 "candidate_status": "candidate",
@@ -709,6 +829,7 @@ def test_manifest_lists_missing_collections_and_verifies_generated_files(tmp_pat
             source="VirusTotal",
             origin="file",
             references=(observation_id,),
+            public_distribution_allowed=True,
             metadata={"ioc_type": "file", "value": "b" * 64, "relation": "observed"},
         ),
         AnnexAsset(
@@ -718,6 +839,7 @@ def test_manifest_lists_missing_collections_and_verifies_generated_files(tmp_pat
             sha256="c" * 64,
             source="VirusTotal",
             origin="search_candidate",
+            public_distribution_allowed=True,
             metadata={
                 "value": "c" * 64,
                 "status": "not_acquired",
@@ -814,6 +936,7 @@ def test_destination_is_not_overwritten_without_explicit_flag(tmp_path: Path) ->
                 source="canonical_observation",
                 origin="test",
                 metadata={"ioc_type": "domain", "value": "new.example"},
+                public_distribution_allowed=True,
             ),
         ),
     )
