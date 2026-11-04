@@ -301,18 +301,12 @@ def _suricata_candidate_metadata(
         "author": author,
         "author_status": "recorded" if author else "not_recorded",
         "origin": "bridge" if imported else "advisor",
-        "origin_tool": (
-            "rule.import_suricata_bridge_candidate" if imported else "advisor.consult"
-        ),
-        "origin_invocation_id": candidate_provenance.get("bridge_invocation_id")
-        or "not_recorded",
-        "bridge_invocation_id": candidate_provenance.get("bridge_invocation_id")
-        or "not_recorded",
+        "origin_tool": ("rule.import_suricata_bridge_candidate" if imported else "advisor.consult"),
+        "origin_invocation_id": candidate_provenance.get("bridge_invocation_id") or "not_recorded",
+        "bridge_invocation_id": candidate_provenance.get("bridge_invocation_id") or "not_recorded",
         "local_tool_invocation_id": candidate_provenance.get("local_tool_invocation_id")
         or "not_recorded",
-        "candidate_version": candidate_provenance.get(
-            "candidate_version", candidate_version
-        ),
+        "candidate_version": candidate_provenance.get("candidate_version", candidate_version),
         "source_observation_ids": source_observation_ids,
         "parent_version": output.get("parent_version") or "not_recorded",
         "candidate_id": candidate_provenance.get("candidate_id") or output.get("candidate_id"),

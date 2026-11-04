@@ -208,9 +208,12 @@ def test_composition_announces_local_tools_and_only_configured_capabilities() ->
             composition.available_capabilities - {"rule.import_suricata_bridge_candidate"}
         ),
     )
-    assert "rule.import_suricata_bridge_candidate" not in project_tool_availability(
-        composition.registry, import_without_capability
-    ).available_names
+    assert (
+        "rule.import_suricata_bridge_candidate"
+        not in project_tool_availability(
+            composition.registry, import_without_capability
+        ).available_names
+    )
     assert composition.registry.get("advisor.reparse", ADVISOR_REPARSE_SCHEMA_VERSION) is None
     assert composition.service._no_progress_limit == 7
     assert composition.tool_dependencies.virustotal is None

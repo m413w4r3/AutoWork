@@ -551,8 +551,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
         and case["labels"].get("positive_control") is True
     ]
     factual_total = sum(
-        result_by_id[case["case_id"]]["factual_sentence_count"]
-        for case in structural_controls
+        result_by_id[case["case_id"]]["factual_sentence_count"] for case in structural_controls
     )
     anchored_total = sum(
         result_by_id[case["case_id"]]["anchored_factual_sentence_count"]
@@ -562,15 +561,11 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
         case for case in cases if case["labels"].get("unknown_optional_reference") is True
     ]
     optional_reference_usable = sum(
-        bool(
-            result_by_id[case["case_id"]]["metrics"]["unknown_optional_reference_usable"]
-        )
+        bool(result_by_id[case["case_id"]]["metrics"]["unknown_optional_reference_usable"])
         for case in optional_reference_cases
     )
     optional_reference_audited = sum(
-        bool(
-            result_by_id[case["case_id"]]["metrics"]["unknown_optional_reference_audited"]
-        )
+        bool(result_by_id[case["case_id"]]["metrics"]["unknown_optional_reference_audited"])
         for case in optional_reference_cases
     )
     no_proof_cases = [case for case in cases if case["labels"].get("no_proof") is True]
@@ -691,10 +686,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
     per_class_metrics = {}
     for class_name, metric_names in class_metric_names.items():
         if class_name == "structural_anchor":
-            class_case_ids = {
-                case["case_id"]
-                for case in structural_controls
-            }
+            class_case_ids = {case["case_id"] for case in structural_controls}
             class_facts = sum(
                 result_by_id[case_id]["factual_sentence_count"] for case_id in class_case_ids
             )

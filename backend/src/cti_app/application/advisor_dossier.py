@@ -2067,9 +2067,7 @@ def build_advisor_dossier(
         )
 
     unavailable_context = [
-        item
-        for item in prompt_data.get("_context_unavailable", ())
-        if isinstance(item, Mapping)
+        item for item in prompt_data.get("_context_unavailable", ()) if isinstance(item, Mapping)
     ]
     if unavailable_context:
         lines.append("Contexte indisponible / omis:")

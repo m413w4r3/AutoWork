@@ -1500,9 +1500,7 @@ class InvestigationAdvisorTool:
                     *vt_report_omissions,
                 ]
             input_warnings = prompt_data.pop("_input_warnings", [])
-            for ignored_input in self._ignored_advisor_inputs.get(
-                context.idempotency_key, ()
-            ):
+            for ignored_input in self._ignored_advisor_inputs.get(context.idempotency_key, ()):
                 if not isinstance(ignored_input, Mapping):
                     continue
                 warning = {
@@ -1883,9 +1881,7 @@ class InvestigationAdvisorTool:
                 if item["kind"] == "observation"
             ]
             prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
-            initial_preflight = evaluate_advisor_evidence_preflight(
-                prompt_data, dossier, prompt
-            )
+            initial_preflight = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
             preflight_context_gaps = advisor_preflight_context_gaps(initial_preflight)
             if preflight_context_gaps:
                 prompt_data["_context_unavailable"] = [
@@ -10734,8 +10730,7 @@ def _advisor_input_context_gaps(warnings: Sequence[object]) -> list[dict[str, st
         reference = warning.get("reference")
         safe_reference = ""
         if isinstance(reference, str) and (
-            re.fullmatch(r"[0-9a-fA-F-]{36}", reference)
-            or re.fullmatch(r"[0-9a-f]{64}", reference)
+            re.fullmatch(r"[0-9a-fA-F-]{36}", reference) or re.fullmatch(r"[0-9a-f]{64}", reference)
         ):
             safe_reference = reference
         rows.append(
@@ -10838,9 +10833,8 @@ def _transmitted_refs_for_dossier(
                 evidence_id = item.get("evidence_id")
                 if isinstance(evidence_id, str):
                     selected.add(("observation", evidence_id))
-        if (
-            item.get("origin") == "consultation_context_summary"
-            and _safe_text(data.get("article_summary"), 1_000_000)
+        if item.get("origin") == "consultation_context_summary" and _safe_text(
+            data.get("article_summary"), 1_000_000
         ):
             selected.add(("article", _safe_text(getattr(snapshot, "synthesis_sha256", ""), 64)))
     all_refs = _typed_transmitted_refs(data, snapshot)

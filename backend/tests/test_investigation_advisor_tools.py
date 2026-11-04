@@ -1329,9 +1329,7 @@ async def test_optional_measurements_do_not_widen_explicit_scope(
     assert len(transport.calls) == 1
     assert result.output.get("input_error_code") is None
     assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
-    assert any(
-        item["field"] == selector for item in result.output["input_warnings"]
-    )
+    assert any(item["field"] == selector for item in result.output["input_warnings"])
 
 
 @pytest.mark.asyncio
@@ -11218,9 +11216,7 @@ async def test_review_text_invalid_target_warns_and_uses_current_canonical_units
     assert len(transport.calls) == 1
     assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
     assert "The sole canonical body block." in transport.calls[0]["prompt"]
-    assert any(
-        item["field"] == "review_text" for item in result.output["input_warnings"]
-    )
+    assert any(item["field"] == "review_text" for item in result.output["input_warnings"])
 
     transport.submission = TurnSubmission(
         TurnSubmissionStatus.SUCCEEDED,

@@ -170,9 +170,7 @@ def test_playbook_reads_the_guidance_fields_the_backend_exposes() -> None:
 @pytest.mark.parametrize("name", ["playbook", "mandate", "index", *_operator_skill_names()])
 def test_operator_instructions_are_model_neutral_and_generic(name: str) -> None:
     text = _operator_texts()[name]
-    assert not re.search(
-        r"\b(?:Luna|DeepSeek|GPT-\d|Gemini|Qwen|Llama)\b", text, re.I
-    ), (
+    assert not re.search(r"\b(?:Luna|DeepSeek|GPT-\d|Gemini|Qwen|Llama)\b", text, re.I), (
         "the operator model is chosen by the orchestrator"
     )
     assert not re.search(r"\b[0-9a-fA-F]{64}\b", text), "no historical hash in permanent guidance"

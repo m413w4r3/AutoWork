@@ -431,9 +431,7 @@ async def test_unassociated_sample_hash_warns_and_uses_other_available_context()
     assert "Contexte indisponible / omis" in prompt
     assert "sample.analyze" in prompt
     assert absent_hash not in prompt
-    assert any(
-        item["field"] == "sample_sha256" for item in result.output["input_warnings"]
-    )
+    assert any(item["field"] == "sample_sha256" for item in result.output["input_warnings"])
 
 
 @pytest.mark.asyncio
@@ -686,14 +684,11 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation(monkeyp
     prompt_tokens = max(1, (prompt_bytes + 3) // 4)
     context_bytes_dimension = next(key for key in BudgetDimension if key.value == "context_bytes")
     context_tokens_dimension = next(key for key in BudgetDimension if key.value == "context_tokens")
-    assert (
-        result.budget_consumed[context_bytes_dimension] == prompt_bytes
-    )
+    assert result.budget_consumed[context_bytes_dimension] == prompt_bytes
     assert result.budget_consumed[context_tokens_dimension] == prompt_tokens
     assert context.budget.consumed[context_tokens_dimension] == prompt_tokens
     assert (
-        context.budget.remaining[context_tokens_dimension]
-        == initial_context_tokens - prompt_tokens
+        context.budget.remaining[context_tokens_dimension] == initial_context_tokens - prompt_tokens
     )
     reservation = next(
         item

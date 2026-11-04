@@ -1317,7 +1317,9 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert credential_marker not in (audit_dir / "RUN_TRACE.md").read_text()
             assert signed_url_marker not in (audit_dir / "RUN_TRACE.md").read_text()
             assert transport.calls[0]["external_llm_allowed"] is True
-            assert len(transport.calls) >= 1  # redaction-path consultations also reach the transport
+            assert (
+                len(transport.calls) >= 1
+            )  # redaction-path consultations also reach the transport
             assert provider.calls == 1
     finally:
         await engine.dispose()
