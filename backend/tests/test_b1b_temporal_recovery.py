@@ -673,15 +673,30 @@ async def test_transport_timeout_is_ambiguous_and_never_retried(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_unknown_provider_status_is_reviewable_and_never_retried(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("output_text", "submission_state", "completed_response", "expected_tool_status"),
+    [
+        (
+            "untrusted possible answer",
+            "post_submission",
+            True,
+            ToolInvocationStatus.SUCCEEDED,
+        ),
+        (None, "external_state_unknown", False, ToolInvocationStatus.NEEDS_REVIEW),
+    ],
+)
+async def test_unknown_provider_status_is_reviewable_and_never_retried(
+    monkeypatch, output_text, submission_state, completed_response, expected_tool_status
+) -> None:
     clock = _FakeClock()
     transport = _FakeTransport(
         [
             TurnSubmission(
                 TurnSubmissionStatus.NEEDS_REVIEW,
-                output_text="untrusted possible answer",
+                output_text=output_text,
                 error_code="bridge_status_unknown",
-                submission_state="external_state_unknown",
+                submission_state=submission_state,
+                completed_response=completed_response,
             )
         ],
         clock,
@@ -691,8 +706,13 @@ async def test_unknown_provider_status_is_reviewable_and_never_retried(monkeypat
     advisor_result = _advisor_result(result)
 
     assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
-    assert advisor_result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert "blocks" not in advisor_result.output
+    assert advisor_result.status is expected_tool_status
+    if output_text is None:
+        assert advisor_result.output["retry"] is False
+        assert "advisory_text" not in advisor_result.output
+    else:
+        assert output_text in advisor_result.output["advisory_text"]
+        assert isinstance(advisor_result.output["parse_status"], str)
     assert transport.calls == [(0, 10)]
     assert transport.accepted_successes == 0
 

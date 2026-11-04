@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 
 from cti_app.application import bridge_investigator as bridge_module
+from cti_app.application import investigation_advisor_tools as advisor_tools_module
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
 from cti_app.application.investigation_advisor_tools import register_investigation_advisor_tool
 from cti_app.application.investigation_tools import InMemoryToolRegistry, RegistryToolDispatcher
@@ -593,7 +594,7 @@ async def test_plan_investigation_sends_sample_provenance_without_whole_bytes() 
 
 
 @pytest.mark.asyncio
-async def test_large_sample_stays_provenance_only_with_exact_reservation() -> None:
+async def test_large_sample_stays_provenance_only_with_exact_reservation(monkeypatch) -> None:
     investigation_id = uuid4()
     sample_content = bytes(index % 251 for index in range(3_200_000))
     tool, transport, observation, _sample_id, _association_id, _blob_id, sample_hash = (
@@ -604,6 +605,18 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
         output_text="Complete sample received for review.",
     )
     context = make_dispatch_context(investigation_id)
+    approved_context_tokens = 10_000
+    context.budget.limits = {BudgetDimension.CONTEXT_TOKENS: approved_context_tokens}
+    initial_context_tokens = context.budget.remaining[BudgetDimension.CONTEXT_TOKENS]
+    dossier_builds = 0
+    original_build_dossier = advisor_tools_module.build_advisor_dossier
+
+    def count_dossier_build(*args, **kwargs):
+        nonlocal dossier_builds
+        dossier_builds += 1
+        return original_build_dossier(*args, **kwargs)
+
+    monkeypatch.setattr(advisor_tools_module, "build_advisor_dossier", count_dossier_build)
     arguments = {
         "consultation_type": "plan_investigation",
         "question": "Review the verified associated sample bytes.",
@@ -644,8 +657,6 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
             ),
         ]
     )
-    estimate = await tool.reservation_cost(arguments, context)
-
     result = await _dispatch(
         tool,
         context,
@@ -654,6 +665,7 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
     )
 
     assert len(transport.calls) == 1, result
+    assert dossier_builds == 1
     prompt = transport.calls[0]["prompt"]
     assert base64.b64encode(sample_content).decode("ascii") not in prompt
     assert "content_base64:" not in prompt
@@ -665,16 +677,17 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
     assert "byte_length=3200000" in prompt
     assert sample_hash in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
-    assert estimate[next(key for key in estimate if key.value == "context_bytes")] == prompt_bytes
+    prompt_tokens = max(1, (prompt_bytes + 3) // 4)
+    context_bytes_dimension = next(key for key in BudgetDimension if key.value == "context_bytes")
+    context_tokens_dimension = next(key for key in BudgetDimension if key.value == "context_tokens")
     assert (
-        estimate[next(key for key in estimate if key.value == "context_tokens")]
-        == (prompt_bytes + 3) // 4
+        result.budget_consumed[context_bytes_dimension] == prompt_bytes
     )
+    assert result.budget_consumed[context_tokens_dimension] == prompt_tokens
+    assert context.budget.consumed[context_tokens_dimension] == prompt_tokens
     assert (
-        result.budget_consumed[
-            next(key for key in result.budget_consumed if key.value == "context_bytes")
-        ]
-        == prompt_bytes
+        context.budget.remaining[context_tokens_dimension]
+        == initial_context_tokens - prompt_tokens
     )
     reservation = next(
         item
@@ -687,3 +700,4 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
         ]
         == prompt_bytes
     )
+    assert reservation.amounts[context_tokens_dimension] == prompt_tokens
