@@ -485,6 +485,40 @@ class RuleWorkbench:
                 message="YARA compiler failed unexpectedly",
             )
 
+    def compile_received_source(self, rule_source: str) -> YaraEngineResult:
+        """Compile exact received source without applying candidate quality gates."""
+        if not isinstance(rule_source, str) or not rule_source.strip():
+            return YaraEngineResult(
+                status=YaraExecutionStatus.INVALID_INPUT,
+                engine_version="unavailable",
+                message="rule source is empty",
+            )
+        if len(rule_source.encode("utf-8")) > self._policy.maximum_source_bytes:
+            return YaraEngineResult(
+                status=YaraExecutionStatus.RESOURCE_EXCEEDED,
+                engine_version="unavailable",
+                message="rule source exceeds the configured source size limit",
+            )
+        if self._yara_engine is None:
+            family = (
+                self._confined_analysis.family_statuses.get("yara")
+                if self._confined_analysis is not None
+                else None
+            )
+            return YaraEngineResult(
+                status=YaraExecutionStatus.ENGINE_UNAVAILABLE,
+                engine_version=family.version if family and family.version else "unavailable",
+                message="standalone compile check is unavailable",
+            )
+        try:
+            return self._yara_engine.compile(rule_source)
+        except Exception:
+            return YaraEngineResult(
+                status=YaraExecutionStatus.ENGINE_CRASHED,
+                engine_version="unknown",
+                message="YARA compiler failed unexpectedly",
+            )
+
     @property
     def has_confined_test_runner(self) -> bool:
         return self._confined_analysis is not None

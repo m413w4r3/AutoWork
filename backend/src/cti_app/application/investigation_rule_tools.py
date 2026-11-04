@@ -18,6 +18,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID, uuid4, uuid5
 
 from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
+from cti_app.application.advisor_wire import parse_advisor_wire
 from cti_app.application.blob_storage import (
     BlobReadLimitExceededError,
     BlobStorageUnavailableError,
@@ -68,6 +69,7 @@ from cti_app.domain.goodware import Banality, BanalityScorer, BanalityThresholds
 from cti_app.domain.invariants import CandidateInvariant
 from cti_app.domain.investigation import (
     BudgetDimension,
+    DetectionCandidateProvenance,
     DetectionCandidateStatus,
     DetectionCandidateVersion,
     EvidenceKind,
@@ -76,6 +78,7 @@ from cti_app.domain.investigation import (
     SampleAssociation,
     SampleQualification,
     ToolInvocationStatus,
+    thaw_json,
 )
 from cti_app.domain.rule_workbench import (
     GoodwareMotifMeasurementStatus,
@@ -284,12 +287,23 @@ RULE_PROPOSE_BRIDGE_SCHEMA = _schema(
                 "one entry from output.rules; omit it to import every returned rule."
             ),
         },
+        "rule_index": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional one-based rule index; omit to import every detected rule.",
+        },
+        "rule_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Optional case-insensitive rule name selector.",
+        },
         "candidate_id": _allow_empty_optional(
             {"type": "string", "pattern": _UUID_PATTERN},
             "Optional UUID; omit or leave empty to create a new candidate.",
         ),
     },
-    ("bridge_observation_id", "bridge_invocation_id"),
+    ("bridge_observation_id",),
 )
 
 RULE_OPERATOR_SYNTAX_FIX_SCHEMA = _schema(
@@ -1506,7 +1520,7 @@ class _RuleTools:
         self,
         received_id: UUID,
         *,
-        requested_invocation_id: UUID,
+        requested_invocation_id: UUID | None,
         context: ToolExecutionContext,
     ) -> tuple[EvidenceObservation, EvidenceObservation]:
         assert self.evidence_observations is not None and self.evidence_payloads is not None
@@ -1523,7 +1537,8 @@ class _RuleTools:
                     f"source {received_source!r}); {detail} Expected an advisor_call for "
                     "yara_draft in this investigation, or an advisor response-link / related "
                     "observation from the same invocation. Pass its observation ID and the "
-                    "matching bridge_invocation_id."
+                    "matching bridge_invocation_id, or omit that optional field to use the "
+                    "invocation linked on the persisted advisor observation."
                 ),
             )
 
@@ -1594,6 +1609,11 @@ class _RuleTools:
                     "the response link does not identify the requested YARA invocation."
                 )
             linked_invocation_id = payload["bridge_invocation_id"]
+            if (
+                requested_invocation_id is not None
+                and linked_invocation_id != str(requested_invocation_id)
+            ):
+                raise rejection("the response link does not match bridge_invocation_id.")
             if self.evidence_observations is not None:
                 for candidate in await self.evidence_observations.list_for_investigation(
                     context.investigation_id
@@ -1626,7 +1646,17 @@ class _RuleTools:
         if self.evidence_observations is None or self.evidence_payloads is None:
             raise _ToolUnavailable("bridge_rule_provenance_unavailable")
         supplied_observation_id = UUID(arguments["bridge_observation_id"])
-        requested_invocation_id = UUID(arguments["bridge_invocation_id"])
+        raw_invocation_id = _empty_optional_value(arguments.get("bridge_invocation_id"))
+        try:
+            requested_invocation_id = UUID(raw_invocation_id) if raw_invocation_id else None
+        except (TypeError, ValueError) as exc:
+            raise _ToolFailed(
+                "bridge_yara_invocation_id_invalid",
+                agent_message=(
+                    "Predicate bridge_invocation_id_valid failed. Pass a UUID or omit this "
+                    "optional selector and use the persisted advisor observation."
+                ),
+            ) from exc
         requested_sha256 = _empty_optional_value(arguments.get("rule_source_sha256"))
         observation, received_observation = await self._resolve_bridge_yara_observation(
             received_observation_id or supplied_observation_id,
@@ -1644,6 +1674,25 @@ class _RuleTools:
         persisted_invocation_id = (
             persisted.get("bridge_invocation_id") if isinstance(persisted, Mapping) else None
         )
+        try:
+            linked_invocation_id = UUID(str(persisted_invocation_id))
+        except (TypeError, ValueError) as exc:
+            raise _ToolFailed(
+                "bridge_yara_invocation_id_missing",
+                agent_message=(
+                    "Predicate persisted_bridge_invocation_id_valid failed. Reparse the saved "
+                    "advisor response so its invocation provenance is present."
+                ),
+            ) from exc
+        if requested_invocation_id is not None and requested_invocation_id != linked_invocation_id:
+            raise _ToolFailed(
+                "bridge_yara_invocation_id_mismatch",
+                agent_message=(
+                    "Predicate bridge_invocation_id_matches_observation failed. Use the UUID "
+                    "persisted on this advisor observation or omit the optional selector."
+                ),
+            )
+        requested_invocation_id = linked_invocation_id
         reparsed_from = persisted.get("reparsed_from_observation_id")
         reparsed = (
             observation.source_version == ADVISOR_SOURCE_PARSER_VERSION
@@ -1651,10 +1700,10 @@ class _RuleTools:
             and isinstance(reparsed_from, str)
         )
         parse_status_allowed = (
-            persisted.get("advisor_status") in {"partial", "succeeded"}
+            persisted.get("advisor_status") != "refused"
             and isinstance(output, Mapping)
-            and output.get("status") in {"partial", "succeeded"}
-            and output.get("advisor_status") in {"partial", "succeeded"}
+            and output.get("status") != "refused"
+            and output.get("advisor_status") != "refused"
         )
         if reparsed:
             try:
@@ -1741,11 +1790,17 @@ class _RuleTools:
                 raise _ToolFailed("bridge_yara_measurement_catalog_mismatch")
             if (
                 not isinstance(output, Mapping)
-                or output.get("status") not in {"partial", "succeeded"}
-                or output.get("advisor_status") not in {"partial", "succeeded"}
-                or persisted.get("advisor_status") not in {"partial", "succeeded"}
+                or output.get("status") == "refused"
+                or output.get("advisor_status") == "refused"
+                or persisted.get("advisor_status") == "refused"
             ):
-                raise _ToolFailed("bridge_yara_advisor_status_not_succeeded")
+                raise _ToolFailed(
+                    "bridge_yara_advisor_refused",
+                    agent_message=(
+                        "Predicate advisor_response_not_refused failed. Select a non-refusal "
+                        "YARA response before importing a candidate."
+                    ),
+                )
             parse_status_allowed = True
         if persisted.get("schema") != "operator-advisor-call.v1":
             raise _ToolFailed("bridge_yara_observation_schema_mismatch")
@@ -1771,10 +1826,10 @@ class _RuleTools:
             )
         if not parse_status_allowed:
             raise _ToolFailed(
-                "bridge_yara_advisor_status_not_succeeded",
+                "bridge_yara_advisor_refused",
                 agent_message=(
-                    "The advisor parse status is not succeeded. Reparse the original YARA "
-                    "response and resolve its normalization warnings."
+                    "Predicate advisor_response_not_refused failed. Select a non-refusal "
+                    "YARA response before importing a candidate."
                 ),
             )
         if not isinstance(bridge_provenance, Mapping):
@@ -1829,40 +1884,93 @@ class _RuleTools:
                         skipped_rules.append({"index": str(index), "reason": "rule_entry_invalid"})
                         continue
                     candidate_source = item.get("rule_source")
-                    candidate_sha256 = item.get("rule_source_sha256")
                     if not isinstance(candidate_source, str) or not candidate_source.strip():
-                        skipped_rules.append({"index": str(index), "reason": "rule_source_missing"})
                         continue
                     computed_sha256 = hashlib.sha256(candidate_source.encode("utf-8")).hexdigest()
-                    if candidate_sha256 != computed_sha256:
-                        skipped_rules.append(
-                            {
-                                "index": str(index),
-                                "reason": "rule_source_sha256_mismatch",
-                            }
+                    normalized_item = dict(item)
+                    normalized_item["rule_source_sha256"] = computed_sha256
+                    rule_sources.append((computed_sha256, normalized_item))
+
+            candidate_texts: list[str] = []
+            if isinstance(source, str) and source.strip():
+                candidate_texts.append(source)
+            raw_output = output.get("raw_output")
+            if (
+                isinstance(raw_output, str)
+                and raw_output.strip()
+                and raw_output not in candidate_texts
+            ):
+                candidate_texts.append(raw_output)
+            seen_rule_hashes = {rule_sha for rule_sha, _item in rule_sources}
+            for candidate_text in candidate_texts:
+                document = parse_advisor_wire(candidate_text)
+                extracted = list(document.yara_rules)
+                if not extracted and document.source_language == "yara" and document.source:
+                    extracted = [(document.source, _yara_rule_name(document.source) or "")]
+                if (
+                    isinstance(source, str)
+                    and candidate_text == source
+                    and observed_sha256 == hashlib.sha256(source.encode("utf-8")).hexdigest()
+                    and len(extracted) == 1
+                ):
+                    extracted = [(source, extracted[0][1])]
+                if extracted:
+                    for candidate_source, name in extracted:
+                        computed_sha256 = hashlib.sha256(
+                            candidate_source.encode("utf-8")
+                        ).hexdigest()
+                        if computed_sha256 in seen_rule_hashes:
+                            continue
+                        rule_name = name or _yara_rule_name(candidate_source)
+                        item = {"name": rule_name} if rule_name else None
+                        rule_sources.append((computed_sha256, item))
+                        seen_rule_hashes.add(computed_sha256)
+                elif not rule_sources:
+                    computed_sha256 = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
+                    if _yara_rule_name(candidate_text) and computed_sha256 not in seen_rule_hashes:
+                        rule_sources.append((computed_sha256, None))
+                        seen_rule_hashes.add(computed_sha256)
+
+            selected_index = arguments.get("rule_index")
+            selected_name = _empty_optional_value(arguments.get("rule_name"))
+            if selected_index is not None or selected_name is not None:
+                selected_sources: list[tuple[str, Mapping[str, Any] | None]] = []
+                for index, candidate in enumerate(rule_sources, start=1):
+                    item_name = candidate[1].get("name") if candidate[1] is not None else None
+                    name_matches = (
+                        selected_name is None
+                        or (
+                            isinstance(item_name, str)
+                            and item_name.casefold() == selected_name.casefold()
                         )
-                        continue
-                    rule_sources.append((computed_sha256, item))
-            elif isinstance(source, str) and source.strip():
-                computed_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
-                if observed_sha256 not in {None, computed_sha256}:
-                    skipped_rules.append({"index": "0", "reason": "rule_source_sha256_mismatch"})
-                else:
-                    rule_sources.append((computed_sha256, None))
+                    )
+                    index_matches = selected_index is None or selected_index == index
+                    if name_matches and index_matches:
+                        selected_sources.append(candidate)
+                rule_sources = selected_sources
+                if not rule_sources:
+                    raise _ToolFailed(
+                        "bridge_yara_rule_selector_not_found",
+                        agent_message=(
+                            "Predicate rule_index/rule_name did not select a detected YARA rule. "
+                            "Check the one-based rule_index or provide the exact rule_name."
+                        ),
+                    )
 
             if not rule_sources:
                 raise _ToolFailed(
                     "bridge_yara_source_missing_or_sha256_invalid",
                     agent_message=(
-                        f"Observation {received_observation.id} (type "
-                        f"{received_observation.object_type!r}) contains no YARA rule with a "
-                        "matching source SHA-256. Reparse the saved response or select a rule "
-                        "whose persisted source and rule_source_sha256 agree."
+                        f"Predicate detected_yara_source failed for observation "
+                        f"{received_observation.id}. Reparse the saved response or provide a "
+                        "complete YARA rule in the persisted advisor output."
                     ),
                 )
 
             if len(rule_sources) == 1 and not skipped_rules:
                 child_arguments = dict(arguments)
+                child_arguments.pop("rule_index", None)
+                child_arguments.pop("rule_name", None)
                 child_arguments["bridge_observation_id"] = str(observation.id)
                 child_arguments["rule_source_sha256"] = rule_sources[0][0]
                 return await self.propose_from_bridge(
@@ -1884,6 +1992,8 @@ class _RuleTools:
                     f"bridge-rule-import-all:{candidate_seed}:{index}:{rule_sha256}",
                 )
                 child_arguments = dict(arguments)
+                child_arguments.pop("rule_index", None)
+                child_arguments.pop("rule_name", None)
                 child_arguments.update(
                     bridge_observation_id=str(observation.id),
                     rule_source_sha256=rule_sha256,
@@ -1915,7 +2025,11 @@ class _RuleTools:
                         "Use a complete rule block with a matching SHA-256."
                     ),
                 )
-            warnings = ["multiple_rules_imported_without_selection"]
+            warnings = (
+                ["multiple_rules_imported_without_selection"]
+                if len(imported_candidates) > 1 and selected_index is None and selected_name is None
+                else []
+            )
             if skipped_rules:
                 warnings.append("some_rules_skipped; inspect skipped_rules for details")
             aggregate_status = (
@@ -1942,7 +2056,10 @@ class _RuleTools:
             matching_rules = [
                 item
                 for item in raw_rules
-                if isinstance(item, Mapping) and item.get("rule_source_sha256") == requested_sha256
+                if isinstance(item, Mapping)
+                and isinstance(item.get("rule_source"), str)
+                and hashlib.sha256(item["rule_source"].encode("utf-8")).hexdigest()
+                == requested_sha256
             ]
             if len(matching_rules) > 1:
                 raise _ToolFailed(
@@ -1953,14 +2070,18 @@ class _RuleTools:
                         reason_code="bridge_yara_rule_source_sha256_ambiguous",
                     ),
                 )
-            if raw_rules and not matching_rules:
+            if (
+                raw_rules
+                and not matching_rules
+                and not isinstance(source, str)
+                and not isinstance(output.get("raw_output"), str)
+            ):
                 raise _ToolFailed(
                     "bridge_yara_source_sha256_mismatch",
                     agent_message=(
                         f"Observation {received_observation.id} (type "
                         f"{received_observation.object_type!r}) has no rule with the requested "
-                        "SHA-256. Use the exact rule_source_sha256 stored with a rule in this "
-                        "advisor response."
+                        "SHA-256. Use the exact rule_source_sha256 for a persisted rule."
                     ),
                     diagnostic=_rule_diagnostic(
                         stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
@@ -1972,7 +2093,7 @@ class _RuleTools:
             if len(matching_rules) == 1:
                 selected_rule = matching_rules[0]
                 source = selected_rule.get("rule_source")
-                observed_sha256 = selected_rule.get("rule_source_sha256")
+                observed_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         if not isinstance(source, str) or not source.strip():
             raise _ToolFailed(
                 "bridge_yara_source_missing_or_truncated",
@@ -1982,6 +2103,25 @@ class _RuleTools:
                     reason_code="bridge_yara_source_missing",
                 ),
             )
+        if requested_sha256 != observed_sha256:
+            candidate_text = source if isinstance(source, str) else None
+            if not isinstance(candidate_text, str) or not candidate_text.strip():
+                raw_output = output.get("raw_output")
+                candidate_text = raw_output if isinstance(raw_output, str) else None
+            if isinstance(candidate_text, str) and candidate_text.strip():
+                document = parse_advisor_wire(candidate_text)
+                extracted_rules = list(document.yara_rules)
+                if not extracted_rules and document.source_language == "yara" and document.source:
+                    extracted_rules = [(document.source, _yara_rule_name(document.source) or "")]
+                matching_rules = [
+                    rule_source
+                    for rule_source, _name in extracted_rules
+                    if hashlib.sha256(rule_source.encode("utf-8")).hexdigest()
+                    == requested_sha256
+                ]
+                if len(matching_rules) == 1:
+                    source = matching_rules[0]
+                    observed_sha256 = requested_sha256
         computed_source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         if observed_sha256 != requested_sha256 or computed_source_sha256 != observed_sha256:
             raise _ToolFailed(
@@ -2003,20 +2143,6 @@ class _RuleTools:
                 ),
             )
         source_issues = validate_single_rule_candidate(source)
-        blocking_issues, advisory_issues = classify_rule_validation_issues(source_issues)
-        if blocking_issues:
-            raise _ToolFailed(
-                "bridge_yara_source_rejected:" + ",".join(blocking_issues),
-                diagnostic=_rule_diagnostic(
-                    stage=RuleDiagnosticStage.SOURCE_VALIDATOR,
-                    status=RuleDiagnosticStatus.FAILED,
-                    reason_code=blocking_issues[0],
-                    details={
-                        "validator_findings": list(blocking_issues),
-                        "advisory_findings": list(advisory_issues),
-                    },
-                ),
-            )
         candidate_value = _empty_optional_value(arguments.get("candidate_id"))
         import_identity = (
             f"{context.investigation_id}:{observation.id}:"
@@ -2084,12 +2210,15 @@ class _RuleTools:
             else ()
         )
         input_refs = persisted.get("input_refs", ())
+        unresolved_input_refs: list[str] = []
         if not isinstance(input_refs, Sequence) or isinstance(input_refs, str | bytes):
-            raise _ToolFailed("bridge_yara_input_refs_invalid")
+            unresolved_input_refs.append("input_refs_invalid")
+            input_refs = ()
         source_observation_refs: list[UUID] = []
         transmitted_measurements: set[tuple[str, str]] = set()
         for reference in input_refs:
             if not isinstance(reference, Mapping):
+                unresolved_input_refs.append("input_ref_invalid")
                 continue
             if reference.get("kind") == "measurement":
                 measurement_id = reference.get("id")
@@ -2100,6 +2229,7 @@ class _RuleTools:
                     or not isinstance(measurement_sha256, str)
                     or re.fullmatch(_SHA256_PATTERN, measurement_sha256) is None
                 ):
+                    unresolved_input_refs.append("measurement_ref_unresolved")
                     continue
                 transmitted_measurements.add((measurement_id, measurement_sha256))
                 continue
@@ -2107,15 +2237,17 @@ class _RuleTools:
                 continue
             try:
                 source_ref = UUID(str(reference["id"]))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise _ToolFailed("bridge_yara_input_ref_invalid") from exc
+            except (KeyError, TypeError, ValueError):
+                unresolved_input_refs.append("observation_ref_invalid")
+                continue
             source_observation = await self.evidence_observations.get(source_ref)
             if (
                 source_observation is None
                 or source_observation.investigation_id != context.investigation_id
                 or source_observation.sha256 != reference.get("sha256")
             ):
-                raise _ToolFailed("bridge_yara_input_ref_not_verified")
+                unresolved_input_refs.append(str(source_ref))
+                continue
             source_observation_refs.append(source_ref)
 
         motif_provenance: list[MotifProvenance] = []
@@ -2131,7 +2263,8 @@ class _RuleTools:
             "bridge_observation_id": str(observation.id),
             "bridge_received_observation_id": str(received_observation.id),
             "bridge_rule_source_sha256": observed_sha256,
-            "validator_findings": list(advisory_issues),
+            "validator_findings": list(source_issues),
+            "unresolved_input_refs": list(dict.fromkeys(unresolved_input_refs)),
             "bridge_warning_findings": _bridge_warning_codes(output),
         }
         verified_links_by_name = _verified_bridge_measurement_links(
@@ -2140,8 +2273,7 @@ class _RuleTools:
             catalog=measurement_catalog,
             transmitted_measurements=transmitted_measurements,
         )
-        corpus = await self._build_corpus(context.investigation_id)
-        compile_check = self.workbench.compile_check(source)
+        compile_check = self.workbench.compile_received_source(source)
         source_attribution["compile_status"] = compile_check.status.value
         source_attribution["compile_diagnostic"] = _execution_diagnostic(compile_check)
         for name in yara_string_names(source):
@@ -2181,9 +2313,14 @@ class _RuleTools:
             source=source,
             source_sha256=observed_sha256,
             motif_provenance=tuple(motif_provenance),
+            provenance=DetectionCandidateProvenance(
+                kind="bridge_yara_draft",
+                metadata=source_attribution,
+                observation_refs=observation_refs,
+            ),
             status=DetectionCandidateStatus.CANDIDATE,
             version=1,
-            test_refs=tuple(dict.fromkeys(case.id for case in corpus.cases)),
+            test_refs=(),
         )
         try:
             stored, replayed = await self.candidates.append_version_idempotently(version)
@@ -2262,6 +2399,11 @@ class _RuleTools:
             validator_findings, str | bytes
         ):
             validator_findings = ()
+        unresolved_input_refs = attribution.get("unresolved_input_refs", ())
+        if not isinstance(unresolved_input_refs, Sequence) or isinstance(
+            unresolved_input_refs, str | bytes
+        ):
+            unresolved_input_refs = ()
         invocation_id = attribution.get("bridge_invocation_id")
         observation_id = attribution.get("bridge_observation_id")
         output_value = {
@@ -2297,6 +2439,7 @@ class _RuleTools:
             ),
             "bridge_rule_source_sha256": attribution.get("bridge_rule_source_sha256"),
             "validator_findings": list(validator_findings),
+            "unresolved_input_refs": list(unresolved_input_refs),
             "compile_status": compile_status.value,
             "compile_diagnostic": compile_diagnostic,
             "test_refs": [str(reference) for reference in version.test_refs],
@@ -2479,6 +2622,8 @@ class _RuleTools:
         else:
             next_attribution.pop("operator_diff_summary", None)
             next_attribution["operator_diff"] = diff or ""
+        next_attribution["compile_status"] = compile_check.status.value
+        next_attribution["compile_diagnostic"] = _execution_diagnostic(compile_check)
         provenance = (
             _operator_source_revision_provenance(
                 parent=parent,
@@ -2496,6 +2641,23 @@ class _RuleTools:
                 for item in parent.motif_provenance
             )
         )
+        source_observation_refs = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        parent.provenance.observation_refs
+                        if parent.provenance is not None
+                        else ()
+                    ),
+                    *(ref for item in parent.motif_provenance for ref in item.observation_refs),
+                )
+            )
+        )
+        candidate_provenance = DetectionCandidateProvenance(
+            kind=(parent.provenance.kind if parent.provenance is not None else "bridge_yara_draft"),
+            metadata=next_attribution,
+            observation_refs=source_observation_refs,
+        )
         # Approval is bound to an immutable version ID and SHA.
         # Revisions always start as candidates.
         version = DetectionCandidateVersion(
@@ -2508,6 +2670,7 @@ class _RuleTools:
             version=parent.version + 1,
             parent_version_id=parent.id,
             test_refs=parent.test_refs,
+            provenance=candidate_provenance,
         )
         stored = await self.candidates.append_version(version, expected_previous_id=parent.id)
         return (
@@ -2540,7 +2703,14 @@ class _RuleTools:
             else ToolInvocationStatus.PARTIAL,
             tuple(
                 dict.fromkeys(
-                    ref for motif in parent.motif_provenance for ref in motif.observation_refs
+                    (
+                        *source_observation_refs,
+                        *(
+                            ref
+                            for motif in parent.motif_provenance
+                            for ref in motif.observation_refs
+                        ),
+                    )
                 )
             ),
         )
@@ -4538,7 +4708,7 @@ def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, 
         "version_id": str(version.id),
         "version": version.version,
         "source_sha256": version.source_sha256,
-        "source_attribution": _source_attribution_from_version(version),
+        "source_attribution": thaw_json(_source_attribution_from_version(version)),
         "source_validator_findings": sorted(source_validator_findings),
         "justification_gaps": sorted(justification_gaps),
         "family": meta.get("family"),
@@ -5090,7 +5260,18 @@ def _operator_source_revision_provenance(
 ) -> tuple[MotifProvenance, ...]:
     refs = tuple(
         dict.fromkeys(
-            reference for motif in parent.motif_provenance for reference in motif.observation_refs
+            (
+                *(
+                    parent.provenance.observation_refs
+                    if parent.provenance is not None
+                    else ()
+                ),
+                *(
+                    reference
+                    for motif in parent.motif_provenance
+                    for reference in motif.observation_refs
+                ),
+            )
         )
     )
     verified_links_by_bytes: dict[bytes, list[Mapping[str, Any]]] = {}
@@ -5308,6 +5489,13 @@ def _add_source_attribution(rationale: str, attribution: Mapping[str, Any]) -> s
 def _source_attribution_from_version(
     version: DetectionCandidateVersion,
 ) -> Mapping[str, Any] | None:
+    candidate_provenance = getattr(version, "provenance", None)
+    if (
+        candidate_provenance is not None
+        and isinstance(candidate_provenance.metadata, Mapping)
+        and candidate_provenance.kind == "bridge_yara_draft"
+    ):
+        return candidate_provenance.metadata
     for motif in version.motif_provenance:
         rationale = motif.rationale
         if not rationale.startswith(_PERSISTED_MOTIF_PREFIX):
@@ -5320,6 +5508,14 @@ def _source_attribution_from_version(
         if isinstance(attribution, Mapping):
             return attribution
     return None
+
+
+def _yara_rule_name(source: str) -> str | None:
+    match = re.search(
+        r"(?im)^\s*(?:(?:private|global)\s+)*rule\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        source,
+    )
+    return match.group(1) if match is not None else None
 
 
 def _is_same_bridge_import(
@@ -5346,7 +5542,7 @@ def _is_same_bridge_import(
 
 def _version_provenance_output(version: DetectionCandidateVersion) -> dict[str, Any]:
     attribution = _source_attribution_from_version(version) or {}
-    output_attribution = dict(attribution)
+    output_attribution = thaw_json(attribution)
     legacy_diff = output_attribution.get("operator_diff")
     if output_attribution.get("change_kind") == "operator_source_revision" and isinstance(
         legacy_diff, str

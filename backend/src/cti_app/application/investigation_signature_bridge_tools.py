@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from math import ceil
 from time import monotonic
 from typing import Any, Protocol
 from uuid import UUID, uuid5
 
+from cti_app.application.advisor_wire import parse_advisor_wire
 from cti_app.application.evidence_recorder import EvidenceRecorder
 from cti_app.application.invariants import InvariantRegistryService
-from cti_app.application.investigation_persistence import SampleAssociationRepository
+from cti_app.application.investigation_persistence import (
+    EvidenceObservationRepository,
+    SampleAssociationRepository,
+)
 from cti_app.application.investigation_tools import (
     ToolAdapter,
     ToolConfidentiality,
@@ -21,6 +26,7 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_similarity import SampleSimilarityError, SampleSimilarityService
 from cti_app.domain.invariants import (
     CodeFeatureProvenance,
@@ -46,9 +52,12 @@ from cti_app.domain.sample_similarity import (
     SignatureMotifKind,
     SimilarityFeatureKind,
 )
+from cti_app.infrastructure.confined_suricata import validate_suricata_rule_source
 
 _TOOL_NAME = "rule.propose_from_candidates"
+_SURICATA_IMPORT_TOOL_NAME = "rule.import_suricata_bridge_candidate"
 _BRIDGE_NAMESPACE = UUID("ab274b5d-c1d9-5e88-8c9d-7cbca02a4120")
+_SURICATA_CANDIDATE_NAMESPACE = UUID("19729379-b0ba-4e39-8f2e-89a66f0342ce")
 _UUID_PATTERN = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
@@ -90,6 +99,17 @@ RULE_PROPOSE_FROM_CANDIDATES_SCHEMA: Mapping[str, Any] = {
     },
     "required": ["sample_sha256s", "feature_keys", "condition"],
 }
+SURICATA_IMPORT_BRIDGE_CANDIDATE_SCHEMA: Mapping[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "bridge_observation_id": {"type": "string", "format": "uuid"},
+        "candidate_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"},
+        "candidate_version": {"type": "integer", "minimum": 1, "maximum": 100_000},
+    },
+    "required": ["bridge_observation_id"],
+}
 
 
 class RuleToolExecutionPort(Protocol):
@@ -118,7 +138,12 @@ def signature_bridge_tool_capabilities(
     uow_factory: UnitOfWorkFactory | None,
     invariant_registry: InvariantRegistryService | None,
     rule_tools: RuleToolExecutionPort | None,
+    observations: EvidenceObservationRepository | None = None,
+    artifact_store: ProductionArtifactStore | None = None,
 ) -> frozenset[str]:
+    capabilities: set[str] = set()
+    if recorder is not None and observations is not None and artifact_store is not None:
+        capabilities.add(_SURICATA_IMPORT_TOOL_NAME)
     if (
         service is None
         or sample_associations is None
@@ -128,8 +153,9 @@ def signature_bridge_tool_capabilities(
         or rule_tools is None
         or not rule_tools.signature_bridge_available
     ):
-        return frozenset()
-    return frozenset({_TOOL_NAME})
+        return frozenset(capabilities)
+    capabilities.add(_TOOL_NAME)
+    return frozenset(capabilities)
 
 
 def register_signature_bridge_tools(
@@ -141,6 +167,8 @@ def register_signature_bridge_tools(
     uow_factory: UnitOfWorkFactory | None,
     invariant_registry: InvariantRegistryService | None,
     rule_tools: RuleToolExecutionPort | None,
+    observations: EvidenceObservationRepository | None = None,
+    artifact_store: ProductionArtifactStore | None = None,
     max_tool_seconds: int = 30,
 ) -> None:
     """Register the optional L2 → P09 → existing rule-tool bridge."""
@@ -174,6 +202,267 @@ def register_signature_bridge_tools(
             reserved_seconds=max_tool_seconds * 4,
         ),
     )
+    if recorder is not None and observations is not None and artifact_store is not None:
+        registry.register(
+            ToolDefinition(
+                name=_SURICATA_IMPORT_TOOL_NAME,
+                schema_version="1",
+                input_schema=SURICATA_IMPORT_BRIDGE_CANDIDATE_SCHEMA,
+                effect=ToolEffect.LOCAL_COMPUTE,
+                cost_model={BudgetDimension.TOOL_SECONDS: max_tool_seconds},
+                confidentiality=ToolConfidentiality.RESTRICTED,
+                limitations=(
+                    "Importe une proposition Suricata Bridge non fiable comme candidate canonique.",
+                    "La syntaxe est vérifiée localement; aucune capture PCAP n'est requise "
+                    "ni testée.",
+                    "Cette importation ne valide, ne publie et ne promeut jamais la candidate.",
+                ),
+                capability_key=_SURICATA_IMPORT_TOOL_NAME,
+            ),
+            _SuricataBridgeCandidateImportAdapter(
+                recorder=recorder,
+                observations=observations,
+                artifact_store=artifact_store,
+            ),
+        )
+
+
+class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
+    """Import an already persisted Suricata draft as an inert canonical candidate."""
+
+    def __init__(
+        self,
+        *,
+        recorder: EvidenceRecorder,
+        observations: EvidenceObservationRepository,
+        artifact_store: ProductionArtifactStore,
+    ) -> None:
+        self._recorder = recorder
+        self._observations = observations
+        self._artifact_store = artifact_store
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        try:
+            observation_id = UUID(str(arguments.get("bridge_observation_id")))
+        except (TypeError, ValueError):
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                error_code="predicate_bridge_observation_id_invalid",
+                message=(
+                    "bridge_observation_id must identify a persisted advisor.consult result; "
+                    "read the advisor observation and retry with its UUID."
+                ),
+            )
+        try:
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != context.investigation_id
+                or observation.source != "advisor.consult"
+                or observation.object_type != "advisor_call"
+                or observation.object_id != "suricata_draft"
+            ):
+                raise ValueError("bridge_observation_identity_mismatch")
+            payload = await self._artifact_store.read_json(observation.blob_id)
+            encoded = ProductionArtifactStore.canonical_json_bytes(payload)
+            if hashlib.sha256(encoded).hexdigest() != observation.sha256:
+                raise ValueError("bridge_observation_payload_sha256_mismatch")
+            if payload.get("schema") != "operator-advisor-call.v1":
+                raise ValueError("bridge_observation_schema_unsupported")
+            if payload.get("consultation_type") != "suricata_draft":
+                raise ValueError("bridge_observation_consultation_type_mismatch")
+            output = payload.get("output")
+            if not isinstance(output, Mapping):
+                raise ValueError("bridge_output_missing")
+            if payload.get("advisor_status") == "refused" or output.get("status") == "refused":
+                raise ValueError("bridge_refusal_cannot_be_imported")
+            if output.get("usable") is False and payload.get("advisor_status") not in {
+                "succeeded",
+                "partial",
+            }:
+                raise ValueError("bridge_output_not_usable")
+            raw_text = output.get("raw_output")
+            source = output.get("rule_source")
+            if not isinstance(source, str) or not source.strip():
+                source = None
+            if source is None and isinstance(raw_text, str):
+                document = parse_advisor_wire(raw_text)
+                if document.source_language == "suricata":
+                    source = document.source
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError("suricata_rule_source_not_found")
+
+            bridge_invocation_id = _bridge_invocation_id(payload, output)
+            bridge_invocation_id_kind = (
+                "conversation_turn" if bridge_invocation_id is not None else "unavailable"
+            )
+            local_invocation_id = observation.invocation_ref
+            source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            candidate_version = arguments.get("candidate_version", 1)
+            if isinstance(candidate_version, bool) or not isinstance(candidate_version, int):
+                raise ValueError("candidate_version_invalid")
+            candidate_id = arguments.get("candidate_id")
+            if candidate_id is None:
+                candidate_token = uuid5(
+                    _SURICATA_CANDIDATE_NAMESPACE, f"{observation.id}:{source_sha256}"
+                ).hex[:24]
+                candidate_id = f"bridge-{candidate_token}"
+            if not isinstance(candidate_id, str):
+                raise ValueError("candidate_id_invalid")
+
+            syntax_status = "valid"
+            syntax_error: str | None = None
+            try:
+                source = validate_suricata_rule_source(
+                    source,
+                    candidate_id=candidate_id,
+                    candidate_version=str(candidate_version),
+                )
+            except ValueError as exc:
+                syntax_status = "failed"
+                syntax_error = str(exc)
+            source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            bridge_provenance = output.get("bridge_provenance")
+            bridge_provenance = (
+                dict(bridge_provenance) if isinstance(bridge_provenance, Mapping) else {}
+            )
+            fact_refs = output.get("fact_refs")
+            if not isinstance(fact_refs, list):
+                fact_refs = bridge_provenance.get("input_refs", [])
+            if not isinstance(fact_refs, list):
+                fact_refs = []
+            candidate_provenance = {
+                "candidate_id": candidate_id,
+                "candidate_version": candidate_version,
+                "source_observation_id": str(observation.id),
+                "bridge_invocation_id": (
+                    str(bridge_invocation_id) if bridge_invocation_id is not None else None
+                ),
+                "bridge_invocation_id_kind": bridge_invocation_id_kind,
+                "local_tool_invocation_id": (
+                    str(local_invocation_id) if local_invocation_id is not None else None
+                ),
+                "source_rule_sha256": source_sha256,
+            }
+            imported_output = {
+                "rule_source": source,
+                "rule_source_sha256": source_sha256,
+                "candidate_id": candidate_id,
+                "candidate_version": candidate_version,
+                "candidate_provenance": candidate_provenance,
+                "bridge_provenance": {
+                    **bridge_provenance,
+                    "bridge_invocation_id": (
+                        str(bridge_invocation_id)
+                        if bridge_invocation_id is not None
+                        else None
+                    ),
+                    "bridge_invocation_id_kind": bridge_invocation_id_kind,
+                    "local_tool_invocation_id": (
+                        str(local_invocation_id) if local_invocation_id is not None else None
+                    ),
+                    "source_observation_id": str(observation.id),
+                    "source_output_sha256": output.get("raw_output_sha256")
+                    or payload.get("output_sha256"),
+                },
+                "fact_refs": fact_refs,
+                "rule_syntax_validation": syntax_status,
+                "rule_syntax_validation_error": syntax_error,
+                "pcap_test_status": "not_tested",
+                "replay_status": "not_tested",
+                "canonicalization_eligible": False,
+                "untrusted": True,
+            }
+            candidate_payload = {
+                "schema": "operator-advisor-call.v1",
+                "advisor_response_schema": payload.get("advisor_response_schema"),
+                "consultation_type": "suricata_draft",
+                "advisor_status": (
+                    "partial" if syntax_error else payload.get("advisor_status", "partial")
+                ),
+                "bridge_invocation_id": (
+                    str(bridge_invocation_id) if bridge_invocation_id is not None else None
+                ),
+                "bridge_invocation_id_kind": bridge_invocation_id_kind,
+                "local_tool_invocation_id": (
+                    str(local_invocation_id) if local_invocation_id is not None else None
+                ),
+                "bridge_observation_id": str(observation.id),
+                "output_sha256": output.get("raw_output_sha256") or payload.get("output_sha256"),
+                "output": imported_output,
+                "candidate_import": {
+                    "schema": "suricata-bridge-candidate-import.v1",
+                    "candidate_status": "candidate",
+                    "rule_syntax_validation": syntax_status,
+                    "pcap_test_status": "not_tested",
+                },
+            }
+            recorded = await self._recorder.record_json(
+                investigation_id=context.investigation_id,
+                kind=EvidenceKind.OTHER,
+                payload=candidate_payload,
+                source="advisor.consult",
+                source_version="suricata-bridge-candidate-import.v1",
+                object_type="advisor_call",
+                object_id="suricata_draft",
+                limitations=(
+                    "Imported Bridge rule remains an untrusted candidate.",
+                    "Syntax status is local source validation; PCAP validation/replay was "
+                    "not tested.",
+                    "No validation or publication approval is implied.",
+                ),
+                invocation_ref=observation.invocation_ref,
+                idempotency_key=(
+                    f"suricata-bridge-candidate:{observation.id}:{source_sha256}:"
+                    f"{candidate_id}:{candidate_version}"
+                ),
+            )
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL if syntax_error else ToolInvocationStatus.SUCCEEDED,
+                observation_refs=(observation.id, recorded.id),
+                output={
+                    "candidate_id": candidate_id,
+                    "candidate_version": candidate_version,
+                    "candidate_status": "candidate",
+                    "source_observation_id": str(observation.id),
+                    "candidate_observation_id": str(recorded.id),
+                    "bridge_invocation_id": str(bridge_invocation_id),
+                    "rule_source_sha256": source_sha256,
+                    "rule_syntax_validation": syntax_status,
+                    "rule_syntax_validation_error": syntax_error,
+                    "pcap_test_status": "not_tested",
+                },
+                message=(
+                    "Suricata candidate imported; correct its syntax and retry the import."
+                    if syntax_error
+                    else "Suricata candidate imported; PCAP validation remains not_tested."
+                ),
+            )
+        except (OSError, UnicodeError, TypeError, ValueError, KeyError) as exc:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                error_code=f"predicate_{str(exc)[:80]}",
+                message=(
+                    f"The named import predicate failed ({exc}); inspect the persisted advisor "
+                    "observation and correct its source or provenance before retrying."
+                ),
+            )
+
+
+def _bridge_invocation_id(payload: Mapping[str, Any], output: Mapping[str, Any]) -> UUID | None:
+    value = payload.get("bridge_invocation_id")
+    if value is None:
+        provenance = output.get("bridge_provenance")
+        if isinstance(provenance, Mapping):
+            value = provenance.get("bridge_invocation_id")
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 class _SignatureBridgeAdapter(ToolAdapter):

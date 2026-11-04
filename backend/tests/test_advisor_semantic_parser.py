@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from cti_app.application.advisor_contracts import parse_typed_advisor_response
 from cti_app.application.advisor_semantic_parser import (
     ADVISOR_RESPONSE_SCHEMA_V4,
     ADVISOR_SOURCE_PARSER_VERSION_V4,
@@ -145,6 +146,70 @@ def test_v4_plan_prose_is_usable_and_retains_raw_text_and_sha() -> None:
     assert "unstructured_response" in result["warnings"]
 
 
+@pytest.mark.parametrize(
+    "consultation_type",
+    [
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "suricata_draft",
+        "draft_text",
+        "review_text",
+        "figure_plan",
+    ],
+)
+def test_typed_parser_preserves_intelligible_prose_for_each_consultation_type(
+    consultation_type: str,
+) -> None:
+    raw = (
+        "Bridge recommends preserving the complete draft for analyst review. "
+        "The optional structure can be completed later."
+    )
+
+    result = parse_typed_advisor_response(
+        raw,
+        consultation_type=consultation_type,
+        prompt_data={"consultation_type": consultation_type},
+        safe_text=lambda value, _limit: value.strip(),
+    )
+
+    assert result is not None
+    assert result["status"] in {"succeeded", "partial"}
+    assert result["parse_status"] == "partial"
+    assert result["raw_output"] == raw
+    assert result["raw_output_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert isinstance(result["extracted_elements"], dict)
+    assert result["extracted_elements"]
+
+
+@pytest.mark.parametrize("consultation_type", ["plan_investigation", "yara_draft", "draft_text"])
+def test_semantic_parser_keeps_malformed_but_readable_text_as_partial(
+    consultation_type: str,
+) -> None:
+    raw = (
+        '{"schema":"advisor-response.v4","consultation_type":"plan_investigation",'
+        '"opinions":[{"text":"Readable recommendation despite duplicate key."}],'
+        '"status":"succeeded","status":"invalid"}'
+    )
+    prompt_data = {**_prompt_data(), "consultation_type": consultation_type}
+
+    result = parse_advisor_semantic_response(
+        raw,
+        consultation_type=consultation_type,
+        prompt_data=prompt_data,
+    )
+
+    assert result["status"] == "partial"
+    assert result["parse_status"] == "partial"
+    assert result["usable"] is True
+    assert result["raw_output"] == raw
+    assert result["raw_output_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert (
+        "Readable recommendation" in result["opinions"][0]["text"]
+        or raw in result["opinions"][0]["text"]
+    )
+
+
 def test_v4_approximate_json_ignores_named_fields_and_truncates_arrays() -> None:
     opinions = [
         {
@@ -176,21 +241,19 @@ def test_v4_approximate_json_ignores_named_fields_and_truncates_arrays() -> None
     assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-@pytest.mark.parametrize(
-    ("status", "expected"), [("invalid", "invalid"), ("ambiguous", "ambiguous")]
-)
-def test_terminal_invalid_and_ambiguous_statuses_drop_all_opinions(
-    status: str, expected: str
-) -> None:
+@pytest.mark.parametrize("status", ["invalid", "ambiguous"])
+def test_secondary_invalid_and_ambiguous_markers_keep_readable_text(status: str) -> None:
     result = parse_advisor_semantic_response(
         _response(status=status),
         consultation_type="plan_investigation",
         prompt_data=_prompt_data(),
     )
 
-    assert result["status"] == expected
-    assert result["opinions"] == []
-    assert result["candidates"] == []
+    assert result["status"] == "partial"
+    assert result["parse_status"] == "partial"
+    assert result["usable"] is True
+    assert result["opinions"][0]["text"]
+    assert result["candidates"][0]["validated"] is False
 
 
 @pytest.mark.parametrize(
@@ -200,7 +263,7 @@ def test_terminal_invalid_and_ambiguous_statuses_drop_all_opinions(
         ('{"schema":"advisor-response.v3","status":"succeeded"}', "invalid", None),
         (
             '{"schema":"advisor-response.v4","schema":"advisor-response.v4"}',
-            "ambiguous",
+            "partial",
             None,
         ),
     ],
@@ -222,8 +285,8 @@ def test_permissive_envelopes_preserve_exploitable_text_and_duplicate_keys_fail_
         assert result["usable"] is False
         assert result["raw_output"] == raw
     else:
-        assert result["opinions"] == []
-        assert result["candidates"] == []
+        assert result["usable"] is True
+        assert result["raw_output"] == raw
 
 
 def test_ambiguous_source_alias_is_not_resolved() -> None:
@@ -237,8 +300,8 @@ def test_ambiguous_source_alias_is_not_resolved() -> None:
         _response(), consultation_type="plan_investigation", prompt_data=data
     )
 
-    assert result["status"] == "ambiguous"
-    assert result["opinions"] == []
+    assert result["status"] == "partial"
+    assert result["opinions"][0]["text"]
     assert result["unresolved_refs"][0]["reason"] == "ambiguous_alias"
 
 
@@ -612,7 +675,9 @@ def test_v3_approximate_plan_json_ignores_named_fields_and_truncates_alternative
 
 
 @pytest.mark.parametrize("status", ["invalid", "ambiguous"])
-def test_explicit_v4_failures_map_to_needs_review_without_changing_v3_default(status: str) -> None:
+def test_explicit_v4_format_statuses_map_to_partial_without_changing_v3_default(
+    status: str,
+) -> None:
     caller_args = {
         "raw": _response(status=status),
         "prompt": "",
@@ -630,9 +695,9 @@ def test_explicit_v4_failures_map_to_needs_review_without_changing_v3_default(st
     assert parsed_v4 is not None
     advisor_status, invocation_status = _advisor_output_result_status(parsed_v4)
 
-    assert parsed_v4["status"] == status
-    assert advisor_status == status
-    assert invocation_status is ToolInvocationStatus.NEEDS_REVIEW
+    assert parsed_v4["status"] == "partial"
+    assert advisor_status == "partial"
+    assert invocation_status is ToolInvocationStatus.PARTIAL
     assert _advisor_output_result_status({"status": "invalid"}) == (
         "succeeded",
         ToolInvocationStatus.SUCCEEDED,

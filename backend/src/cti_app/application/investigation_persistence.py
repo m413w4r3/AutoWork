@@ -171,6 +171,7 @@ def _same_detection_candidate_version(
         and left.source == right.source
         and left.source_sha256 == right.source_sha256
         and left.motif_provenance == right.motif_provenance
+        and left.provenance == right.provenance
         and left.status is right.status
         and left.version == right.version
         and left.parent_version_id == right.parent_version_id

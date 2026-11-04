@@ -559,6 +559,8 @@ def _register_signature_bridge_tool_family(
         uow_factory=uow_factory,
         invariant_registry=invariant_registry,
         rule_tools=rule_tools,
+        observations=dependencies.observations,
+        artifact_store=dependencies.artifact_store,
     )
     enabled.update(
         signature_bridge_tool_capabilities(
@@ -568,6 +570,8 @@ def _register_signature_bridge_tool_family(
             uow_factory=uow_factory,
             invariant_registry=invariant_registry,
             rule_tools=rule_tools,
+            observations=dependencies.observations,
+            artifact_store=dependencies.artifact_store,
         )
     )
 
