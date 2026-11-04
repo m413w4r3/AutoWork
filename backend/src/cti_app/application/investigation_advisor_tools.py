@@ -1084,6 +1084,7 @@ class InvestigationAdvisorTool:
                 seen_ref_ids.add(parsed_ref)
                 parsed_refs.append(parsed_ref)
             evidence_refs = tuple(parsed_refs)
+            operator_evidence_refs = evidence_refs
             if ignored_inputs:
                 existing_ignored = self._ignored_advisor_inputs.get(context.idempotency_key, ())
                 merged_ignored = list(existing_ignored)
@@ -1358,8 +1359,6 @@ class InvestigationAdvisorTool:
             question_refs = tuple(item for item in requested_refs if item in listed_observation_ids)
             if question_refs:
                 evidence_refs = tuple(dict.fromkeys((*evidence_refs, *question_refs)))
-            if "evidence_refs" in arguments or question_refs:
-                arguments["evidence_refs"] = [str(item) for item in evidence_refs]
             pacing_result = await self._check_advisor_limits(
                 context.investigation_id,
                 g2_bridge_turns_remaining=context.budget.remaining.get(
@@ -1371,8 +1370,14 @@ class InvestigationAdvisorTool:
                 return self._finish(context, _attest_advisor_pre_submission(pacing_result))
             explicit_evidence = await self._load_cited_evidence(context, evidence_refs)
             evidence_refs = tuple(item.id for item in explicit_evidence)
-            if "evidence_refs" in arguments or question_refs:
-                arguments["evidence_refs"] = [str(item) for item in evidence_refs]
+            # Invocation parameters audit the operator's explicit selector. Question
+            # citations and automatically assembled observations belong to the dossier.
+            operator_evidence_ref_set = set(operator_evidence_refs)
+            normalized_operator_refs = tuple(
+                item.id for item in explicit_evidence if item.id in operator_evidence_ref_set
+            )
+            if "evidence_refs" in arguments:
+                arguments["evidence_refs"] = [str(item) for item in normalized_operator_refs]
             auto_evidence = tuple(
                 sorted(
                     (
@@ -1642,7 +1647,11 @@ class InvestigationAdvisorTool:
                 explicit_evidence = tuple(
                     item for item in explicit_evidence if item.id not in omitted_ids
                 )
-                arguments["evidence_refs"] = [str(item.id) for item in explicit_evidence]
+                arguments["evidence_refs"] = [
+                    str(item.id)
+                    for item in explicit_evidence
+                    if item.id in operator_evidence_ref_set
+                ]
             prompt_data = await self._consultation_data(
                 consultation_type=consultation_type,
                 investigation_id=context.investigation_id,
