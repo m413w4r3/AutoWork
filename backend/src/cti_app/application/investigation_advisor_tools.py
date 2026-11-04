@@ -36,6 +36,7 @@ from cti_app.application.advisor_dossier import (
     _measurement_explicitly_targeted,
     _sample_disclosure_restriction_sources,
     _terms,
+    advisor_preflight_context_gaps,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -435,7 +436,6 @@ class InvestigationAdvisorTool:
         self._registry = registry
         self._results: dict[str, ToolResult] = {}
         self._response_archive_failures: dict[str, ToolResult] = {}
-        self._preflight_refusals: dict[str, dict[str, Any]] = {}
         self._ignored_advisor_inputs: dict[str, tuple[dict[str, Any], ...]] = {}
         self._reference_answers: dict[tuple[UUID, str, str], bool] = {}
         self._reference_payloads: dict[tuple[UUID, str], Any | None] = {}
@@ -790,6 +790,7 @@ class InvestigationAdvisorTool:
                         }
                     )
                     arguments.pop(field, None)
+            question_was_provided = "question" in arguments
             raw_question = arguments.get("question", "")
             if not isinstance(raw_question, str):
                 raise _AdvisorInputValidationError("question_invalid")
@@ -805,6 +806,19 @@ class InvestigationAdvisorTool:
                     }
                 )
             arguments["question"] = question
+            if question_was_provided and not question:
+                has_editorial_text_target = (
+                    consultation_type == "draft_text"
+                    and any(arguments.get(field) for field in ("units", "assertions"))
+                ) or (
+                    consultation_type == "review_text"
+                    and any(
+                        arguments.get(field)
+                        for field in ("opinion_id", "units", "anchor", "form", "block_type")
+                    )
+                )
+                if not has_editorial_text_target:
+                    raise _AdvisorInputValidationError("question_invalid")
             raw_refs = arguments.get("evidence_refs", ())
             if not isinstance(raw_refs, (tuple, list)):
                 ignored_inputs.append({"field": "evidence_refs", "reason": "invalid_list_ignored"})
@@ -1082,41 +1096,34 @@ class InvestigationAdvisorTool:
             )
             available_finding_ids = {item.id for item in current_findings}
             for requested_ref in requested_refs:
-                if requested_ref in labelled_observation_refs:
-                    if requested_ref not in listed_observation_ids:
-                        return await self._input_failure(
-                            context,
-                            "evidence_reference_not_found",
-                            reference=str(requested_ref),
-                            available_evidence_refs=tuple(
-                                sorted(str(item) for item in listed_observation_ids)
+                available = (
+                    requested_ref in listed_observation_ids
+                    if requested_ref in labelled_observation_refs
+                    else requested_ref in available_finding_ids
+                    if requested_ref in labelled_finding_refs
+                    else requested_ref in listed_observation_ids
+                    or requested_ref in available_finding_ids
+                )
+                if not available:
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {
+                            "field": (
+                                "evidence_refs"
+                                if requested_ref in labelled_observation_refs
+                                else "finding_refs"
+                                if requested_ref in labelled_finding_refs
+                                else "question"
                             ),
-                        )
-                elif requested_ref in labelled_finding_refs:
-                    if requested_ref not in available_finding_ids:
-                        return await self._input_failure(
-                            context,
-                            "finding_reference_not_found",
-                            reference=str(requested_ref),
-                            available_finding_refs=tuple(
-                                sorted(str(item) for item in available_finding_ids)
-                            ),
-                        )
-                elif (
-                    requested_ref not in listed_observation_ids
-                    and requested_ref not in available_finding_ids
-                ):
-                    return await self._input_failure(
-                        context,
-                        "requested_reference_not_found",
-                        reference=str(requested_ref),
-                        available_evidence_refs=tuple(
-                            sorted(str(item) for item in listed_observation_ids)
-                        ),
-                        available_finding_refs=tuple(
-                            sorted(str(item) for item in available_finding_ids)
-                        ),
+                            "reference": str(requested_ref),
+                            "reason": "reference_not_resolvable",
+                        },
                     )
+            requested_refs = tuple(
+                item
+                for item in requested_refs
+                if item in listed_observation_ids or item in available_finding_ids
+            )
             question_refs = tuple(item for item in requested_refs if item in listed_observation_ids)
             if question_refs:
                 evidence_refs = tuple(dict.fromkeys((*evidence_refs, *question_refs)))
@@ -1256,11 +1263,17 @@ class InvestigationAdvisorTool:
                 if not any(
                     getattr(item, "sample_sha256", None) == sample_sha256 for item in associations
                 ):
-                    return await self._input_failure(
-                        context,
-                        "sample_hash_not_associated",
-                        observation_refs=tuple(item.id for item in evidence),
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {
+                            "field": "sample_sha256",
+                            "reference": sample_sha256,
+                            "reason": "sample_hash_not_associated",
+                        },
                     )
+                    arguments.pop("sample_sha256", None)
+                    sample_sha256 = None
+            if sample_sha256 is not None:
                 sample_rows = await self._list_subject_samples(investigation.subject_id)
                 matching_samples = tuple(
                     item
@@ -1269,11 +1282,18 @@ class InvestigationAdvisorTool:
                     or getattr(item, "source_object_id", None) == sample_sha256
                 )
                 if not matching_samples:
-                    return await self._input_failure(
-                        context,
-                        "sample_hash_unavailable",
-                        observation_refs=tuple(item.id for item in evidence),
+                    self._append_ignored_advisor_input(
+                        context.idempotency_key,
+                        {
+                            "field": "sample_sha256",
+                            "reference": sample_sha256,
+                            "reason": "sample_hash_unavailable",
+                        },
                     )
+                    arguments.pop("sample_sha256", None)
+                    sample_sha256 = None
+                    matching_samples = ()
+            if sample_sha256 is not None:
                 restrictions = tuple(
                     sorted(
                         {
@@ -1419,22 +1439,79 @@ class InvestigationAdvisorTool:
                     for item in explicit_evidence
                     if item.id in operator_evidence_ref_set
                 ]
-            prompt_data = await self._consultation_data(
-                consultation_type=consultation_type,
-                investigation_id=context.investigation_id,
-                investigation=investigation,
-                snapshot=snapshot,
-                evidence=evidence,
-                arguments=arguments,
-                context=context,
-                question=question,
-            )
+            try:
+                prompt_data = await self._consultation_data(
+                    consultation_type=consultation_type,
+                    investigation_id=context.investigation_id,
+                    investigation=investigation,
+                    snapshot=snapshot,
+                    evidence=evidence,
+                    arguments=arguments,
+                    context=context,
+                    question=question,
+                )
+            except _AdvisorInputValidationError as exc:
+                review_selector_errors = {
+                    "opinion_reference_invalid",
+                    "opinion_version_invalid",
+                    "opinion_not_found",
+                    "opinion_review_targets_unavailable",
+                    "editorial_unit_invalid",
+                    "editorial_unit_target_invalid",
+                    "opinion_target_invalid",
+                }
+                if (
+                    consultation_type != "review_text"
+                    or exc.reason_code not in review_selector_errors
+                ):
+                    raise
+                if exc.reason_code in {"opinion_not_found", "opinion_reference_invalid"}:
+                    arguments["opinion_id"] = str(
+                        investigation_opinion_id(context.investigation_id)
+                    )
+                    arguments.pop("opinion_version", None)
+                elif exc.reason_code == "opinion_version_invalid":
+                    arguments.pop("opinion_version", None)
+                for field in ("units", "form", "anchor", "block_type"):
+                    arguments.pop(field, None)
+                self._append_ignored_advisor_input(
+                    context.idempotency_key,
+                    {
+                        "field": "review_text",
+                        "reason": "optional_review_selector_unavailable",
+                    },
+                )
+                prompt_data = await self._consultation_data(
+                    consultation_type=consultation_type,
+                    investigation_id=context.investigation_id,
+                    investigation=investigation,
+                    snapshot=snapshot,
+                    evidence=evidence,
+                    arguments=arguments,
+                    context=context,
+                    question=question,
+                )
             if vt_report_omissions:
                 prompt_data["_advisor_omissions"] = [
                     *prompt_data.get("_advisor_omissions", ()),
                     *vt_report_omissions,
                 ]
             input_warnings = prompt_data.pop("_input_warnings", [])
+            for ignored_input in self._ignored_advisor_inputs.get(
+                context.idempotency_key, ()
+            ):
+                if not isinstance(ignored_input, Mapping):
+                    continue
+                warning = {
+                    "field": _safe_ignored_advisor_field(ignored_input.get("field")),
+                    "code": "optional_input_omitted",
+                    "detail_safe": (
+                        "An optional selection was malformed, unavailable, or duplicated "
+                        "and was omitted from the consultation."
+                    ),
+                }
+                if warning not in input_warnings:
+                    input_warnings.append(warning)
             if unassociated_hash_evidence:
                 prompt_data["_disclosure_omissions"] = [
                     *prompt_data.get("_disclosure_omissions", ()),
@@ -1734,6 +1811,14 @@ class InvestigationAdvisorTool:
                     }
                     for item in secret_findings
                 )
+            prompt_data["_context_unavailable"] = [
+                *(
+                    item
+                    for item in prompt_data.get("_context_unavailable", ())
+                    if isinstance(item, Mapping)
+                ),
+                *_advisor_input_context_gaps(input_warnings),
+            ]
             dossier_started_at = time.perf_counter()
             timing.mark("dossier_rendering")
             dossier = build_advisor_dossier(
@@ -1748,12 +1833,93 @@ class InvestigationAdvisorTool:
             prompt_data["transmitted_refs"] = _transmitted_refs_for_dossier(
                 prompt_data, snapshot, dossier.manifest
             )
+            source_document_warnings: list[dict[str, str]] = []
+            external_effect_evidence_refs = await _advisor_external_effect_evidence_refs(
+                _prompt_transmitted_refs(prompt_data),
+                evidence,
+                observation_repository=self._observations,
+                investigation_id=context.investigation_id,
+                snapshot=snapshot,
+                synthesis_artifact_id=investigation.synthesis_artifact_id,
+                source_document_repository=self._source_documents,
+                blob_repository=self._blobs,
+                record_repo_call=self._record_repo_call,
+                warnings=source_document_warnings,
+            )
+            if source_document_warnings:
+                input_warnings.extend(source_document_warnings)
+                omitted_source_document_ids = {
+                    item.get("reference")
+                    for item in source_document_warnings
+                    if isinstance(item.get("reference"), str)
+                }
+                prompt_data["transmitted_refs"] = [
+                    item
+                    for item in prompt_data["transmitted_refs"]
+                    if not (
+                        item.get("kind") == "source_document"
+                        and item.get("id") in omitted_source_document_ids
+                    )
+                ]
+                prompt_data["_context_unavailable"] = [
+                    *prompt_data["_context_unavailable"],
+                    *_advisor_input_context_gaps(source_document_warnings),
+                ]
+                dossier = build_advisor_dossier(
+                    prompt_data,
+                    envelope=context.envelope,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
+                prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+                prompt_data["dossier_text"] = dossier.text
+                prompt_data["dossier_sha256"] = dossier.sha256
+                prompt_data["dossier_bytes"] = dossier.byte_size
             prompt_data["observation_refs"] = [
                 item["id"]
                 for item in prompt_data["transmitted_refs"]
                 if item["kind"] == "observation"
             ]
             prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
+            initial_preflight = evaluate_advisor_evidence_preflight(
+                prompt_data, dossier, prompt
+            )
+            preflight_context_gaps = advisor_preflight_context_gaps(initial_preflight)
+            if preflight_context_gaps:
+                prompt_data["_context_unavailable"] = [
+                    *prompt_data["_context_unavailable"],
+                    *preflight_context_gaps,
+                ]
+                input_warnings.extend(
+                    {
+                        "field": "evidence_preflight",
+                        "code": "canonical_context_unavailable",
+                        "detail_safe": (
+                            "Some requested canonical context is not loaded; Bridge will receive "
+                            "the available dossier and can ask for the missing source."
+                        ),
+                        "missing": item["missing"],
+                        "tool_hint": item["tool"],
+                    }
+                    for item in preflight_context_gaps
+                )
+                next_action_hint = initial_preflight.get("next_action")
+                dossier = build_advisor_dossier(
+                    prompt_data,
+                    envelope=context.envelope,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
+                prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+                prompt_data["dossier_text"] = dossier.text
+                prompt_data["dossier_sha256"] = dossier.sha256
+                prompt_data["dossier_bytes"] = dossier.byte_size
+                prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
+            else:
+                next_action_hint = None
+            prompt_data["advisor_context_omissions"] = [
+                dict(item)
+                for item in prompt_data.get("_context_unavailable", ())
+                if isinstance(item, Mapping)
+            ]
             self._record_prompt_sample_hashes(context.investigation_id, prompt, prompt_data)
             encoded = prompt.encode("utf-8")
             reservation_overrun_details = _advisor_reservation_overrun_details(dossier.manifest)
@@ -1953,142 +2119,39 @@ class InvestigationAdvisorTool:
                 )
             evidence_preflight = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
             prompt_data["evidence_preflight"] = evidence_preflight
-            if evidence_preflight["status"] != "READY":
-                preflight_status = str(evidence_preflight["status"])
-                refusal_context_sha256 = hashlib.sha256(
-                    encoded
-                    + b"\0"
-                    + json.dumps(
-                        [dict(item) for item in dossier.manifest],
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest()
-                refusal_fingerprint = hashlib.sha256(
-                    (
-                        consultation_type + ":" + refusal_context_sha256 + ":" + preflight_status
-                    ).encode("utf-8")
-                ).hexdigest()
-                cached_refusal = self._preflight_refusals.get(refusal_fingerprint)
-                if cached_refusal is not None:
-                    refusal_output = {
-                        **cached_refusal,
-                        **(
-                            {"omissions": [dict(item) for item in vt_report_omissions]}
-                            if vt_report_omissions
-                            else {}
-                        ),
-                        "repeat_refusal_short_circuited": True,
-                        "refusal_fingerprint": refusal_fingerprint,
-                        "confirmed_non_execution": True,
-                        "bridge_turns_consumed": 0,
-                        "usable": False,
-                    }
-                    return self._finish(
-                        context,
-                        ToolResult(
-                            ToolInvocationStatus.UNAVAILABLE,
-                            observation_refs=tuple(item.id for item in evidence),
-                            budget_consumed={BudgetDimension.BRIDGE_TURNS: 0},
-                            error_code=f"advisor_preflight_{preflight_status.casefold()}",
-                            message=(
-                                str(cached_refusal.get("next_action", ""))
-                                or "The same advisor evidence preflight refusal was already "
-                                "returned for this prompt and dossier."
-                            ),
-                            output=refusal_output,
-                        ),
-                    )
+            if evidence_preflight["status"] == "TECHNICAL_BLOCKED":
                 missing_rows = evidence_preflight["missing_refs"]
                 first_cause = (
                     dict(missing_rows[0])
                     if isinstance(missing_rows, list) and missing_rows
                     else {
-                        "ref": "evidence_preflight",
-                        "reason": f"Advisor evidence preflight returned {preflight_status}.",
+                        "ref": "canonical_source",
+                        "reason": "Canonical source could not be verified.",
                     }
                 )
-                refusal_output = {
-                    "advisor_status": preflight_status.casefold(),
-                    "preflight_status": preflight_status,
-                    "failure_stage": "evidence_preflight",
-                    "failure_reason": "required_canonical_evidence_not_in_payload",
-                    "preflight_cause": first_cause,
-                    "missing_refs": [first_cause],
-                    "additional_missing_ref_count": max(0, len(missing_rows) - 1),
-                    **(
-                        {"next_action": evidence_preflight["next_action"]}
-                        if evidence_preflight.get("next_action")
-                        else {}
-                    ),
-                    "completeness_counts": evidence_preflight["counts"],
-                    "completeness_manifest": evidence_preflight["items"],
-                    "dossier_sha256": dossier.sha256,
-                    "dossier_bytes": dossier.byte_size,
-                    **(
-                        {"omissions": [dict(item) for item in vt_report_omissions]}
-                        if vt_report_omissions
-                        else {}
-                    ),
-                    **(
-                        {
-                            "disclosure_restricted_refs": [
-                                str(item) for item in restricted_evidence_refs
-                            ]
-                        }
-                        if restricted_evidence_refs
-                        else {}
-                    ),
-                    "confirmed_non_execution": True,
-                    "bridge_turns_consumed": 0,
-                    "usable": False,
-                }
-                refusal = await self._persist_preflight_failure(
+                return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
                     evidence_refs=tuple(item.id for item in evidence),
-                    output=refusal_output,
-                    error_code=f"advisor_preflight_{preflight_status.casefold()}",
+                    output={
+                        "advisor_status": "technical_blocked",
+                        "preflight_status": "TECHNICAL_BLOCKED",
+                        "failure_stage": "evidence_preflight",
+                        "failure_reason": "canonical_evidence_unverifiable",
+                        "preflight_cause": first_cause,
+                        "missing_refs": [first_cause],
+                        "additional_missing_ref_count": max(0, len(missing_rows) - 1),
+                        "completeness_counts": evidence_preflight["counts"],
+                        "completeness_manifest": evidence_preflight["items"],
+                        "dossier_sha256": dossier.sha256,
+                        "dossier_bytes": dossier.byte_size,
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code="advisor_preflight_technical_blocked",
                 )
-                if (
-                    refusal.status is ToolInvocationStatus.UNAVAILABLE
-                    and refusal.output.get("failure_stage") == "evidence_preflight"
-                ):
-                    self._preflight_refusals[refusal_fingerprint] = {
-                        key: value
-                        for key, value in refusal.output.items()
-                        if key
-                        in {
-                            "advisor_status",
-                            "preflight_status",
-                            "failure_stage",
-                            "failure_reason",
-                            "preflight_cause",
-                            "missing_refs",
-                            "additional_missing_ref_count",
-                            "next_action",
-                            "refusal_guidance",
-                            "completeness_counts",
-                            "dossier_sha256",
-                            "dossier_bytes",
-                            "omissions",
-                        }
-                    }
-                    if len(self._preflight_refusals) > 128:
-                        self._preflight_refusals.pop(next(iter(self._preflight_refusals)))
-                return refusal
             transmitted_refs = _prompt_transmitted_refs(prompt_data)
-            external_effect_evidence_refs = await _advisor_external_effect_evidence_refs(
-                transmitted_refs,
-                evidence,
-                observation_repository=self._observations,
-                investigation_id=context.investigation_id,
-                snapshot=snapshot,
-                source_document_repository=self._source_documents,
-                blob_repository=self._blobs,
-                record_repo_call=self._record_repo_call,
-            )
             advisor_observation_refs = tuple(
                 UUID(item["id"]) for item in transmitted_refs if item["kind"] == "observation"
             )
@@ -2761,12 +2824,20 @@ class InvestigationAdvisorTool:
                     ],
                 },
             )
-        if vt_report_omissions:
+        reported_omissions = [
+            *[dict(item) for item in vt_report_omissions],
+            *[
+                dict(item)
+                for item in prompt_data.get("advisor_context_omissions", ())
+                if isinstance(item, Mapping)
+            ],
+        ]
+        if reported_omissions:
             result = replace(
                 result,
                 output={
                     **dict(result.output),
-                    "omissions": [dict(item) for item in vt_report_omissions],
+                    "omissions": reported_omissions,
                 },
             )
         if response_link_observation is not None:
@@ -2783,7 +2854,11 @@ class InvestigationAdvisorTool:
         if input_warnings:
             result = replace(
                 result,
-                output={**dict(result.output), "input_warnings": input_warnings},
+                output={
+                    **dict(result.output),
+                    "input_warnings": input_warnings,
+                    **({"next_action_hint": next_action_hint} if next_action_hint else {}),
+                },
             )
         response_received = submission.output_text is not None
         response_state = _advisor_response_state(result, submission)
@@ -2864,6 +2939,10 @@ class InvestigationAdvisorTool:
         }
         if input_warnings:
             provenance["input_warnings"] = input_warnings
+        if prompt_data.get("advisor_context_omissions"):
+            provenance["omissions"] = list(prompt_data["advisor_context_omissions"])
+        if next_action_hint:
+            provenance["next_action_hint"] = next_action_hint
         if restricted_evidence_refs:
             provenance["disclosure_restricted_refs"] = [
                 str(item) for item in restricted_evidence_refs
@@ -4430,6 +4509,7 @@ class InvestigationAdvisorTool:
         candidate_rules: list[dict[str, Any]] = []
 
         if editorial:
+            base["_input_warnings"] = input_warnings
             (
                 evidence,
                 evidence_payload,
@@ -4476,9 +4556,13 @@ class InvestigationAdvisorTool:
                 if reference["kind"] in {"observation", "finding"}:
                     actual_sha256 = actual_assertion_sha256.get(key)
                     if actual_sha256 is None:
-                        raise _AdvisorInputValidationError(
-                            "editorial_reference_unavailable", reference=reference["id"]
+                        warn_input(
+                            "units.assertions" if "units" in arguments else "assertions",
+                            "optional_draft_assertion_ignored",
+                            "An assertion with an unavailable canonical reference was omitted.",
                         )
+                        ignored_assertion_ref_keys.add(key)
+                        continue
                     declared_sha256 = expected_assertion_sha256.get(key)
                     if declared_sha256 is not None and declared_sha256 != actual_sha256:
                         warn_input(
@@ -5030,20 +5114,51 @@ class InvestigationAdvisorTool:
         elif consultation_type == "figure_plan":
             raw_finding_refs = arguments.get("finding_refs", ())
             if not isinstance(raw_finding_refs, (list, tuple)):
-                raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+                warn_input(
+                    "finding_refs",
+                    "optional_finding_selection_ignored",
+                    "Malformed optional finding references were omitted; current findings "
+                    "will be used.",
+                )
+                raw_finding_refs = ()
+            requested_finding_ids_list: list[UUID] = []
             try:
-                requested_finding_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+                for item in raw_finding_refs:
+                    identifier = UUID(str(item))
+                    if identifier not in requested_finding_ids_list:
+                        requested_finding_ids_list.append(identifier)
+                    else:
+                        warn_input(
+                            "finding_refs",
+                            "optional_finding_selection_ignored",
+                            "Duplicate optional finding references were omitted.",
+                        )
             except (TypeError, ValueError):
-                raise _AdvisorInputValidationError("figure_finding_refs_invalid") from None
-            if len(set(requested_finding_ids)) != len(requested_finding_ids):
-                raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+                warn_input(
+                    "finding_refs",
+                    "optional_finding_selection_ignored",
+                    "Malformed optional finding references were omitted; current findings "
+                    "will be used.",
+                )
+                requested_finding_ids_list = []
+            requested_finding_ids = tuple(requested_finding_ids_list)
             all_findings = {
                 item.id: item
                 for item in await self._list_findings(investigation_id)
                 if item.investigation_id == investigation_id
             }
-            if any(item not in all_findings for item in requested_finding_ids):
-                raise _AdvisorInputValidationError("figure_finding_not_found")
+            missing_finding_ids = [
+                item for item in requested_finding_ids if item not in all_findings
+            ]
+            if missing_finding_ids:
+                warn_input(
+                    "finding_refs",
+                    "optional_finding_selection_ignored",
+                    "Unavailable optional findings were omitted; current findings will be used.",
+                )
+                requested_finding_ids = tuple(
+                    item for item in requested_finding_ids if item in all_findings
+                )
             available_observation_ids = {item.id for item in evidence}
             selected_finding_ids = requested_finding_ids or tuple(
                 item.id
@@ -5481,7 +5596,23 @@ class InvestigationAdvisorTool:
                     ),
                     None,
                 )
-            raise _AdvisorInputValidationError("editorial_reference_unavailable")
+            return None
+
+        def warn_unavailable_reference(kind: str, identifier: UUID) -> None:
+            warnings = prompt_data.get("_input_warnings")
+            if not isinstance(warnings, list):
+                return
+            warning = {
+                "field": "editorial_assertions",
+                "code": "optional_draft_assertion_ignored",
+                "detail_safe": (
+                    f"An optional {kind} reference was not available in the current "
+                    "investigation context and was omitted."
+                ),
+                "reference": str(identifier),
+            }
+            if warning not in warnings:
+                warnings.append(warning)
 
         for kind, identifier in references:
             if kind == "observation":
@@ -5489,9 +5620,8 @@ class InvestigationAdvisorTool:
                 if item is None:
                     item = await find_one(self._observations, identifier)
                 if item is None or item.investigation_id != investigation_id:
-                    raise _AdvisorInputValidationError(
-                        "evidence_reference_not_found", reference=str(identifier)
-                    )
+                    warn_unavailable_reference(kind, identifier)
+                    continue
                 if not await consider_observation(
                     item, explicit=str(identifier) in explicit_observation_refs
                 ):
@@ -5501,9 +5631,8 @@ class InvestigationAdvisorTool:
             else:
                 item = await find_one(self._findings, identifier)
                 if item is None or item.investigation_id != investigation_id:
-                    raise _AdvisorInputValidationError(
-                        "editorial_reference_unavailable", reference=str(identifier)
-                    )
+                    warn_unavailable_reference(kind, identifier)
+                    continue
                 finding_items.append(item)
 
         observation_payload: list[dict[str, Any]] = []
@@ -10525,24 +10654,6 @@ def _consultation_article_passages(snapshot: Any, question: str) -> list[dict[st
     passage_ids = {
         str(item.get("claim_id", "")).casefold() for item in passages if isinstance(item, Mapping)
     }
-    valid_claims: dict[str, str] = {}
-    for claim in getattr(article, "claims", ()):
-        claim_id = claim.id
-        if isinstance(claim_id, str) and claim_id.strip():
-            valid_claims.setdefault(claim_id.casefold(), claim_id)
-    for passage in passages:
-        claim_id = passage.get("claim_id") if isinstance(passage, Mapping) else None
-        if isinstance(claim_id, str) and claim_id.strip():
-            valid_claims.setdefault(claim_id.casefold(), claim_id)
-    unknown_claim_ids = cited_claim_ids - set(valid_claims)
-    if unknown_claim_ids:
-        raise _AdvisorInputValidationError(
-            "article_claim_not_found",
-            valid_article_claim_ids=tuple(sorted(valid_claims.values(), key=str.casefold)),
-            invalid_article_claim_ids=tuple(
-                sorted(cited_claims[claim_id] for claim_id in unknown_claim_ids)
-            ),
-        )
     publication_anchors = tuple(getattr(article, "publication_anchors", ()))
 
     def matching_anchor(text: str) -> Any | None:
@@ -10583,6 +10694,55 @@ def _consultation_article_passages(snapshot: Any, question: str) -> list[dict[st
             }
         )
     return passages
+
+
+def _advisor_input_context_gaps(warnings: Sequence[object]) -> list[dict[str, str]]:
+    """Turn local selector warnings into short, safe dossier notes."""
+    rows: list[dict[str, str]] = []
+    for warning in warnings:
+        if not isinstance(warning, Mapping):
+            continue
+        raw_field = warning.get("field")
+        field = (
+            _safe_ignored_advisor_field(raw_field)
+            if isinstance(raw_field, str)
+            else "entrée facultative"
+        )
+        code = warning.get("code")
+        code = code if isinstance(code, str) else "optional_input_omitted"
+        if code == "advisor_evidence_reference_mismatch":
+            reason = "un lien documentaire facultatif n'a pas pu être vérifié"
+            tool = "charger le document source canonique"
+        elif field == "sample_sha256":
+            reason = "le SHA-256 facultatif n'est pas associé à cette enquête"
+            tool = "sample.analyze après association du bon échantillon"
+        elif code.startswith("optional_draft_assertion"):
+            reason = "une assertion ou référence éditoriale facultative a été écartée"
+            tool = "apporter une référence canonique valide si elle est nécessaire"
+        elif code == "optional_measurements_ignored":
+            reason = "une sélection de mesures facultative n'a pas été retenue"
+            tool = "sample.analyze sur l'échantillon associé"
+        elif code.startswith("autowork_credential"):
+            reason = "un fragment contenant un secret opérationnel a été expurgé"
+            tool = "fournir un extrait expurgé si ce contexte est nécessaire"
+        else:
+            reason = "une sélection facultative était mal formée ou indisponible"
+            tool = "fournir une référence canonique valide ou demander à Bridge la source utile"
+        reference = warning.get("reference")
+        safe_reference = ""
+        if isinstance(reference, str) and (
+            re.fullmatch(r"[0-9a-fA-F-]{36}", reference)
+            or re.fullmatch(r"[0-9a-f]{64}", reference)
+        ):
+            safe_reference = reference
+        rows.append(
+            {
+                "missing": f"{field}: {safe_reference}" if safe_reference else field,
+                "reason": reason,
+                "tool": tool,
+            }
+        )
+    return rows[:5]
 
 
 def _typed_transmitted_refs(data: Mapping[str, Any], snapshot: Any) -> list[dict[str, str]]:
@@ -10675,6 +10835,11 @@ def _transmitted_refs_for_dossier(
                 evidence_id = item.get("evidence_id")
                 if isinstance(evidence_id, str):
                     selected.add(("observation", evidence_id))
+        if (
+            item.get("origin") == "consultation_context_summary"
+            and _safe_text(data.get("article_summary"), 1_000_000)
+        ):
+            selected.add(("article", _safe_text(getattr(snapshot, "synthesis_sha256", ""), 64)))
     all_refs = _typed_transmitted_refs(data, snapshot)
     return [item for item in all_refs if (item["kind"], item["id"]) in selected]
 
@@ -10703,30 +10868,59 @@ async def _advisor_external_effect_evidence_refs(
     observation_repository: Any,
     investigation_id: UUID,
     snapshot: Any,
+    synthesis_artifact_id: UUID,
     source_document_repository: Any | None,
     blob_repository: Any,
     record_repo_call: Callable[[], None] | None = None,
+    warnings: list[dict[str, str]] | None = None,
 ) -> tuple[EvidenceReference, ...]:
     """Resolve transmitted observations and source documents canonically."""
     observations = {str(item.id): item for item in evidence}
     references: dict[tuple[str, str], EvidenceReference] = {}
     for reference in transmitted_refs:
+        if reference["kind"] == "article":
+            synthesis_sha256 = getattr(snapshot, "synthesis_sha256", None)
+            artifact_id = getattr(snapshot, "synthesis_artifact_id", None) or synthesis_artifact_id
+            if (
+                reference["id"] != synthesis_sha256
+                or reference["sha256"] != synthesis_sha256
+                or not isinstance(synthesis_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", synthesis_sha256) is None
+                or not isinstance(artifact_id, UUID)
+            ):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            synthesis_version = getattr(snapshot, "synthesis_version", None)
+            resolved = EvidenceReference(
+                kind="article",
+                id=str(artifact_id),
+                version=(
+                    f"synthesis:v{synthesis_version}"
+                    if type(synthesis_version) is int and synthesis_version > 0
+                    else f"synthesis-artifact:{artifact_id}"
+                ),
+                sha256=synthesis_sha256,
+            )
+            references[(resolved.kind, resolved.id)] = resolved
+            continue
         if reference["kind"] == "source_document":
             if (
                 source_document_repository is None
                 or blob_repository is None
                 or reference["sha256"] != getattr(snapshot, "synthesis_sha256", None)
             ):
-                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+                _warn_optional_source_document(warnings, reference["id"])
+                continue
             try:
                 document_id = UUID(reference["id"])
-            except ValueError as exc:
-                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            except ValueError:
+                _warn_optional_source_document(warnings, reference["id"])
+                continue
             if record_repo_call is not None:
                 record_repo_call()
             document = await source_document_repository.get(document_id)
             if document is None or document.subject_id != getattr(snapshot, "subject_id", None):
-                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+                _warn_optional_source_document(warnings, reference["id"])
+                continue
             if record_repo_call is not None:
                 record_repo_call()
             blob = await blob_repository.get(document.blob_id)
@@ -10736,7 +10930,8 @@ async def _advisor_external_effect_evidence_refs(
                 not isinstance(blob_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", blob_sha256) is None
             ):
-                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+                _warn_optional_source_document(warnings, reference["id"])
+                continue
             resolved = EvidenceReference(
                 kind="source_document",
                 id=str(document.id),
@@ -10770,6 +10965,24 @@ async def _advisor_external_effect_evidence_refs(
         )
         references[(resolved.kind, resolved.id)] = resolved
     return tuple(references[key] for key in sorted(references))
+
+
+def _warn_optional_source_document(
+    warnings: list[dict[str, str]] | None, reference_id: str
+) -> None:
+    if warnings is None:
+        return
+    warning = {
+        "field": "source_document_ids",
+        "code": "advisor_evidence_reference_mismatch",
+        "detail_safe": (
+            "An optional source-document link could not be verified and was omitted; "
+            "the verified article snapshot remains available."
+        ),
+        "reference": reference_id,
+    }
+    if warning not in warnings:
+        warnings.append(warning)
 
 
 def _attach_advisor_provenance(result: ToolResult, provenance: Mapping[str, Any]) -> ToolResult:

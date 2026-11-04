@@ -887,6 +887,10 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             sent_prompt = transport.calls[-1]["prompt"]
             assert credential_marker not in sent_prompt
             assert signed_url_marker not in sent_prompt
+            assert "Contexte indisponible / omis" in sent_prompt
+            assert incomplete_output["input_warnings"]
+            assert incomplete_output["omissions"]
+            assert incomplete_output["next_action_hint"]
             manifest_rows = incomplete_output["bridge_provenance"]["dossier_manifest"]
             omitted_ids = {row.get("id") for row in manifest_rows if row.get("kind") == "omission"}
             assert str(advisor_observation.id) in omitted_ids

@@ -357,11 +357,11 @@ def test_secret_guard_redactions_and_preflight_omissions_are_observable() -> Non
 
     incomplete = _projection(question="Vérifier les preuves disponibles.")
     incomplete["consultation_type"] = "plan_investigation"
-    refusal = prepare(incomplete)
-    assert isinstance(refusal, PreparationRefusal)
-    assert refusal.reason_code.startswith("evidence_preflight_")
-    assert refusal.completeness is not None
-    assert refusal.completeness["counts"]["missing"] > 0
+    prepared = prepare(incomplete)
+    assert isinstance(prepared, PreparedConsultation)
+    assert prepared.completeness["status"] == "INSUFFICIENT_EVIDENCE"
+    assert prepared.completeness["counts"]["missing"] > 0
+    assert "Contexte indisponible / omis" in prepared.dossier_text
 
 
 def test_malformed_projection_returns_a_fail_closed_refusal() -> None:

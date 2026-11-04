@@ -1294,15 +1294,15 @@ async def test_optional_draft_inputs_degrade_with_warnings_and_canonical_measure
 
 
 @pytest.mark.parametrize(
-    ("selector", "expected_error"),
+    "selector",
     [
-        pytest.param("evidence_refs", "evidence_reference_not_found", id="evidence-ref"),
-        pytest.param("sample_sha256", "sample_hash_not_associated", id="sample-hash"),
+        pytest.param("evidence_refs", id="evidence-ref"),
+        pytest.param("sample_sha256", id="sample-hash"),
     ],
 )
 @pytest.mark.asyncio
 async def test_optional_measurements_do_not_widen_explicit_scope(
-    selector: str, expected_error: str
+    selector: str,
 ) -> None:
     investigation_id = uuid4()
     transport = Transport(
@@ -1326,16 +1326,27 @@ async def test_optional_measurements_do_not_widen_explicit_scope(
         make_context(investigation_id, key=f"scope-selector-{selector}"),
     )
 
-    if selector == "evidence_refs":
-        assert result.output["advisor_status"] == "insufficient_evidence"
-        assert transport.calls == []
-        assert any(
-            item["reason"] == "reference_not_resolvable" for item in result.output["ignored_inputs"]
-        )
-    else:
-        assert result.status is ToolInvocationStatus.FAILED
-        assert result.output["input_error_code"] == expected_error
-        assert transport.calls == []
+    assert len(transport.calls) == 1
+    assert result.output.get("input_error_code") is None
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert any(
+        item["field"] == selector for item in result.output["input_warnings"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_question_without_editorial_text_stays_blocked() -> None:
+    investigation_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+
+    result = await tool.execute(
+        {"consultation_type": "plan_investigation", "question": "  "},
+        make_context(investigation_id, key="empty-advisor-question"),
+    )
+
+    assert result.output["input_error_code"] == "question_invalid"
+    assert transport.calls == []
 
 
 @pytest.mark.parametrize(
@@ -2308,14 +2319,16 @@ async def test_yara_draft_preserves_claims_and_sends_only_verified_offsets() -> 
         },
         make_context(investigation_id, key="operator:advisor:unknown-article-claim"),
     )
-    assert unknown_claim.status is ToolInvocationStatus.FAILED
-    assert unknown_claim.output["input_error_code"] == "article_claim_not_found"
-    assert unknown_claim.output["invalid_article_claim_ids"] == ("s9p9",)
-    assert unknown_claim.output["valid_article_claim_ids"] == ("S3P2.1", "S4P1.1")
-    assert "valid article claim ids: s3p2.1, s4p1.1" in unknown_claim.message.casefold()
-    # The malformed optional-measurement consult and the valid request above both reached Bridge;
-    # the unknown-claim request is rejected before transport.
-    assert len(transport.calls) == 2
+    assert unknown_claim.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert unknown_claim.output.get("input_error_code") is None
+    assert unknown_claim.output["bridge_provenance"]["preflight_status"] == "INSUFFICIENT_EVIDENCE"
+    assert "Contexte indisponible / omis" in transport.calls[-1]["prompt"]
+    assert any(
+        item["code"] == "canonical_context_unavailable"
+        for item in unknown_claim.output["input_warnings"]
+    )
+    # The claim omission is visible to Bridge while the available measurements are retained.
+    assert len(transport.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -5975,7 +5988,7 @@ async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
     archived = json.loads(
         await tool._artifact_store.read_bytes(archived_call.blob_id, max_bytes=1_000_000)
     )
-    assert archived["output"]["failure_reason"] == "required_canonical_evidence_not_in_payload"
+    assert archived["output"]["failure_reason"] == "canonical_evidence_unverifiable"
     assert archived["output"]["missing_refs"] == [
         dict(item) for item in result.output["missing_refs"]
     ]
@@ -9005,6 +9018,16 @@ async def test_transmitted_article_passage_resolves_canonical_source_document(
         )
         assert external_effect_context["evidence_refs"] == (
             EvidenceReference(
+                kind="article",
+                id=str(investigation.synthesis_artifact_id),
+                version=(
+                    f"synthesis:v{snapshot.synthesis_version}"
+                    if getattr(snapshot, "synthesis_version", None) is not None
+                    else f"synthesis-artifact:{investigation.synthesis_artifact_id}"
+                ),
+                sha256="a" * 64,
+            ),
+            EvidenceReference(
                 kind="source_document",
                 id=str(document_id),
                 version=f"blob:{blob_id}",
@@ -9012,8 +9035,29 @@ async def test_transmitted_article_passage_resolves_canonical_source_document(
             ),
         )
     else:
-        assert result.output["input_error_code"] == "advisor_evidence_reference_mismatch"
-        assert transport.calls == []
+        assert len(transport.calls) == 1
+        assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+        assert any(
+            item["code"] == "advisor_evidence_reference_mismatch"
+            for item in result.output["input_warnings"]
+        )
+        assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+        external_effect_context = transport.binding_context
+        assert external_effect_context["transmitted_refs"] == (
+            {"kind": "article", "id": "a" * 64, "sha256": "a" * 64},
+        )
+        assert external_effect_context["evidence_refs"] == (
+            EvidenceReference(
+                kind="article",
+                id=str(investigation.synthesis_artifact_id),
+                version=(
+                    f"synthesis:v{snapshot.synthesis_version}"
+                    if getattr(snapshot, "synthesis_version", None) is not None
+                    else f"synthesis-artifact:{investigation.synthesis_artifact_id}"
+                ),
+                sha256="a" * 64,
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -11134,7 +11178,7 @@ async def test_review_text_without_targets_reviews_all_canonical_opinion_units()
 
 
 @pytest.mark.asyncio
-async def test_review_text_invalid_target_lists_valid_units_before_transport() -> None:
+async def test_review_text_invalid_target_warns_and_uses_current_canonical_units() -> None:
     investigation_id = uuid4()
     opinion_id = uuid4()
     opinion = SimpleNamespace(
@@ -11170,23 +11214,13 @@ async def test_review_text_invalid_target_lists_valid_units_before_transport() -
         make_context(investigation_id, key="operator:advisor:invalid-opinion-target"),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "editorial_unit_target_invalid"
-    assert result.output["valid_targets"] == (
-        {
-            "block_type": OpinionBlockType.KEY_FINDINGS.value,
-            "form": "body",
-            "anchor": None,
-            "title": OpinionBlockType.KEY_FINDINGS.value,
-            "request_shape": "units",
-        },
+    assert result.output.get("input_error_code") is None
+    assert len(transport.calls) == 1
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert "The sole canonical body block." in transport.calls[0]["prompt"]
+    assert any(
+        item["field"] == "review_text" for item in result.output["input_warnings"]
     )
-    assert result.output["failure_stage"] == "pre_transport_validation"
-    assert result.output["confirmed_non_execution"] is True
-    assert result.output["provider_usage"] == {"status": "not_submitted"}
-    assert "key_findings" in result.message
-    assert transport.calls == []
 
     transport.submission = TurnSubmission(
         TurnSubmissionStatus.SUCCEEDED,
@@ -11209,7 +11243,7 @@ async def test_review_text_invalid_target_lists_valid_units_before_transport() -
         make_context(investigation_id, key="operator:advisor:invalid-unit-anchor"),
     )
     assert invalid_unit.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 2
     assert any(
         item["reason"] == "invalid_or_duplicate_unit_ignored"
         for item in invalid_unit.output["ignored_inputs"]
@@ -11226,7 +11260,7 @@ async def test_review_text_invalid_target_lists_valid_units_before_transport() -
         make_context(investigation_id, key="operator:advisor:anchor-without-block-type"),
     )
     assert anchor_only.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
-    assert len(transport.calls) == 2
+    assert len(transport.calls) == 3
     assert any(
         item["reason"] == "anchor_requires_analyst_note_form"
         for item in anchor_only.output["ignored_inputs"]
@@ -11998,24 +12032,19 @@ async def test_suricata_draft_without_capture_keeps_untested_prose_candidate() -
 
 
 @pytest.mark.asyncio
-async def test_identical_preflight_refusal_short_circuits_but_new_question_runs_again() -> None:
+async def test_identical_incomplete_preflight_calls_bridge_each_time_with_gap_warnings() -> None:
     investigation_id = uuid4()
-    transport = Transport(None)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Available evidence is incomplete.", []),
+        )
+    )
     tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
     snapshot = await tool._article_snapshots.resolve(uuid4())
     snapshot.article_passages = ()
     snapshot.article = SimpleNamespace(short_summary="", open_questions=())
     tool._article_snapshots.resolve = async_get(snapshot)
-    artifact_store = tool._artifact_store
-    original_put = artifact_store.put_canonical_json
-    persisted_refusals = 0
-
-    async def count_put(*args, **kwargs):
-        nonlocal persisted_refusals
-        persisted_refusals += 1
-        return await original_put(*args, **kwargs)
-
-    artifact_store.put_canonical_json = count_put
     arguments = {
         "consultation_type": "yara_draft",
         "question": "Draft a YARA rule from the available canonical evidence.",
@@ -12028,13 +12057,13 @@ async def test_identical_preflight_refusal_short_circuits_but_new_question_runs_
         make_context(investigation_id, key="advisor:new-hypothesis"),
     )
 
-    assert first.output["preflight_status"] == "INSUFFICIENT_EVIDENCE"
-    assert repeated.output["repeat_refusal_short_circuited"] is True
-    assert repeated.output["preflight_cause"] == first.output["preflight_cause"]
-    assert repeated.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    assert first.output["bridge_provenance"]["preflight_status"] == "INSUFFICIENT_EVIDENCE"
+    assert repeated.output["bridge_provenance"]["preflight_status"] == "INSUFFICIENT_EVIDENCE"
+    assert "repeat_refusal_short_circuited" not in repeated.output
     assert "repeat_refusal_short_circuited" not in changed.output
-    assert persisted_refusals == 2
-    assert transport.calls == []
+    assert all("Contexte indisponible / omis" in call["prompt"] for call in transport.calls)
+    assert all(item.output["input_warnings"] for item in (first, repeated, changed))
+    assert len(transport.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -12096,6 +12125,9 @@ async def test_missing_optional_evidence_reference_is_ignored_and_reported() -> 
         and item["reason"] == "reference_not_resolvable"
         for item in result.output["ignored_inputs"]
     )
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert result.output["input_warnings"]
+    assert result.output["omissions"]
 
 
 @pytest.mark.asyncio
@@ -12295,7 +12327,7 @@ async def test_context_evidence_is_not_added_to_normalized_operator_refs() -> No
 
 
 @pytest.mark.asyncio
-async def test_explicit_unknown_uuid_in_advisor_question_names_available_refs() -> None:
+async def test_explicit_unknown_uuid_in_advisor_question_reaches_bridge_with_gap_warning() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id, {"schema": "explicit-reference-fixture.v1", "content": "Canonical."}
@@ -12314,17 +12346,27 @@ async def test_explicit_unknown_uuid_in_advisor_question_names_available_refs() 
         make_context(investigation_id, key="advisor:explicit-missing-reference"),
     )
 
-    assert result.output["input_error_code"] == "evidence_reference_not_found"
-    assert str(requested_id) in result.message
-    assert str(observation.id) in result.message
-    assert transport.calls == []
+    assert result.output.get("input_error_code") is None
+    assert len(transport.calls) == 1
+    assert str(requested_id) in transport.calls[0]["prompt"]
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert result.output["input_warnings"]
 
 
 @pytest.mark.asyncio
-async def test_explicit_unknown_finding_in_question_names_available_findings() -> None:
+async def test_explicit_unknown_finding_in_question_reaches_bridge_with_gap_warning() -> None:
     investigation_id = uuid4()
     available_finding = SimpleNamespace(
-        id=uuid4(), investigation_id=investigation_id, supersedes=None
+        id=uuid4(),
+        investigation_id=investigation_id,
+        version=1,
+        kind=SimpleNamespace(value="behavior"),
+        assessment=SimpleNamespace(value="observed"),
+        statement="The available finding describes a synthetic observation.",
+        observation_refs=(),
+        claim_refs=(),
+        limitations=(),
+        supersedes=None,
     )
     requested_finding_id = uuid4()
     transport = Transport(None)
@@ -12339,14 +12381,15 @@ async def test_explicit_unknown_finding_in_question_names_available_findings() -
         make_context(investigation_id, key="advisor:explicit-missing-finding"),
     )
 
-    assert result.output["input_error_code"] == "finding_reference_not_found"
-    assert str(requested_finding_id) in result.message
-    assert str(available_finding.id) in result.message
-    assert transport.calls == []
+    assert result.output.get("input_error_code") is None
+    assert len(transport.calls) == 1, result.output
+    assert str(requested_finding_id) in transport.calls[0]["prompt"]
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert result.output["input_warnings"]
 
 
 @pytest.mark.asyncio
-async def test_bare_unknown_uuid_in_question_names_usable_references() -> None:
+async def test_bare_unknown_uuid_in_question_reaches_bridge_with_gap_warning() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id, {"schema": "bare-reference-fixture.v1", "content": "Canonical."}
@@ -12368,10 +12411,11 @@ async def test_bare_unknown_uuid_in_question_names_usable_references() -> None:
         make_context(investigation_id, key="advisor:bare-missing-reference"),
     )
 
-    assert result.output["input_error_code"] == "requested_reference_not_found"
-    assert str(requested_id) in result.message
-    assert str(observation.id) in result.message
-    assert transport.calls == []
+    assert result.output.get("input_error_code") is None
+    assert len(transport.calls) == 1
+    assert str(requested_id) in transport.calls[0]["prompt"]
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert result.output["input_warnings"]
 
 
 @pytest.mark.asyncio
@@ -12398,10 +12442,11 @@ async def test_irrelevant_opinion_id_does_not_hide_requested_question_reference(
         make_context(investigation_id, key="advisor:opinion-id-collision"),
     )
 
-    assert result.output["input_error_code"] == "requested_reference_not_found"
-    assert str(requested_id) in result.message
-    assert str(observation.id) in result.message
-    assert transport.calls == []
+    assert result.output.get("input_error_code") is None
+    assert len(transport.calls) == 1
+    assert str(requested_id) in transport.calls[0]["prompt"]
+    assert "Contexte indisponible / omis" in transport.calls[0]["prompt"]
+    assert result.output["input_warnings"]
 
 
 @pytest.mark.asyncio

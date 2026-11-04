@@ -2066,6 +2066,29 @@ def build_advisor_dossier(
             f"{len(unavailable_observations)} observation(s) citée(s)."
         )
 
+    unavailable_context = [
+        item
+        for item in prompt_data.get("_context_unavailable", ())
+        if isinstance(item, Mapping)
+    ]
+    if unavailable_context:
+        lines.append("Contexte indisponible / omis:")
+        for item in unavailable_context[:5]:
+            missing = _safe_context_gap_text(item.get("missing"))
+            reason = _safe_context_gap_text(item.get("reason"))
+            tool = _safe_context_gap_text(item.get("tool"))
+            detail = missing or "contexte facultatif"
+            if reason:
+                detail += f" — {reason}"
+            if tool:
+                detail += f" Action suggérée: {tool}."
+            lines.append(f"- {detail}")
+        if len(unavailable_context) > 5:
+            lines.append(
+                f"- {len(unavailable_context) - 5} autre(s) omission(s) "
+                "résumée(s) dans la réponse opérateur."
+            )
+
     if contradiction_requested:
         selected_claims = {
             _as_text(item.get("extra", {}).get("claim_id")).casefold()
@@ -3040,6 +3063,53 @@ def evaluate_advisor_evidence_preflight(
     }
 
 
+def advisor_preflight_context_gaps(completeness: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Describe incomplete local proof as consultation context, not a dispatch gate."""
+    if completeness.get("status") not in {
+        AdvisorPreflightStatus.NEEDS_RETRIEVAL.value,
+        AdvisorPreflightStatus.INSUFFICIENT_EVIDENCE.value,
+    }:
+        return []
+    next_action = _as_text(completeness.get("next_action"))
+    gaps: list[dict[str, str]] = []
+    rows = completeness.get("missing_refs", ())
+    if not isinstance(rows, (list, tuple)):
+        return gaps
+    for item in rows[:5]:
+        if not isinstance(item, Mapping):
+            continue
+        reference = _as_text(item.get("ref"))
+        # Only include a canonical identifier or a short claim token in a gap note.
+        if not (
+            _UUID.fullmatch(reference)
+            or re.fullmatch(r"[0-9a-f]{64}", reference)
+            or _CLAIM_ID.fullmatch(reference)
+            or reference == "question-proof"
+        ):
+            reference = "référence demandée"
+        kind = reference.split(":", 1)[0].casefold()
+        if "sample.analyze" in next_action or "network.capture.inspect" in next_action:
+            tool = next_action
+        elif kind in {"observation", "sample", "question-proof"}:
+            tool = (
+                "apporter l'observation canonique; sample.analyze si un échantillon associé manque"
+            )
+        elif kind in {"article", "claim"}:
+            tool = "charger la synthèse/article canonique"
+        elif kind == "finding":
+            tool = "charger le finding canonique"
+        else:
+            tool = "apporter la source canonique correspondante"
+        gaps.append(
+            {
+                "missing": reference,
+                "reason": "la preuve demandée n'est pas chargée dans ce dossier",
+                "tool": tool,
+            }
+        )
+    return gaps
+
+
 def _advisor_preflight_next_action(consultation_type: str, prompt_data: Mapping[str, Any]) -> str:
     sample_sha = next(
         (
@@ -3099,6 +3169,14 @@ def _candidate(
         "extra": dict(extra or {}),
         "body_occurrences": tuple(body_occurrences),
     }
+
+
+def _safe_context_gap_text(value: object) -> str:
+    """Keep only short, plain context-gap labels in the prompt dossier."""
+    text = _as_text(value)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = " ".join(text.split())
+    return text[:180]
 
 
 def _body_occurrences_for_content(
