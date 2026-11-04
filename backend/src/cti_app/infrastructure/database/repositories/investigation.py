@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -39,6 +40,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservation,
     BudgetReservationStatus,
+    DetectionCandidateProvenance,
     DetectionCandidateStatus,
     DetectionCandidateVersion,
     DisclosureBounds,
@@ -96,6 +98,9 @@ from cti_app.infrastructure.database.models.investigation import (
     SampleAssociationRow as SampleAssociationIdentityRow,
 )
 from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
+
+_CANDIDATE_PROVENANCE_PREFIX = "detection-candidate-provenance.v1:"
+_CANDIDATE_PROVENANCE_MOTIF = "__candidate_provenance__"
 
 
 def _budget_to_payload(budget: InvestigationBudget) -> dict[str, Any]:
@@ -1250,6 +1255,7 @@ class SqlAlchemyDetectionCandidateRepository:
         return version
 
     async def _append_candidate_details(self, version: DetectionCandidateVersion) -> None:
+        provenance_position = len(version.motif_provenance)
         motif_rows = [
             DetectionCandidateMotifRow(
                 version_id=version.id,
@@ -1259,6 +1265,27 @@ class SqlAlchemyDetectionCandidateRepository:
             )
             for motif_index, motif in enumerate(version.motif_provenance)
         ]
+        if version.provenance is not None:
+            provenance_payload = {
+                "kind": version.provenance.kind,
+                "metadata": thaw_json(version.provenance.metadata),
+            }
+            motif_rows.append(
+                DetectionCandidateMotifRow(
+                    version_id=version.id,
+                    position=provenance_position,
+                    motif=_CANDIDATE_PROVENANCE_MOTIF,
+                    rationale=(
+                        _CANDIDATE_PROVENANCE_PREFIX
+                        + json.dumps(
+                            provenance_payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    ),
+                )
+            )
         self._session.add_all(motif_rows)
         await self._session.flush()
         for motif_index, motif in enumerate(version.motif_provenance):
@@ -1271,6 +1298,20 @@ class SqlAlchemyDetectionCandidateRepository:
                         observation_id=observation_id,
                     )
                     for observation_index, observation_id in enumerate(motif.observation_refs)
+                ]
+            )
+        if version.provenance is not None:
+            self._session.add_all(
+                [
+                    DetectionCandidateMotifObservationRow(
+                        version_id=version.id,
+                        motif_position=provenance_position,
+                        observation_position=observation_index,
+                        observation_id=observation_id,
+                    )
+                    for observation_index, observation_id in enumerate(
+                        version.provenance.observation_refs
+                    )
                 ]
             )
         self._session.add_all(
@@ -1292,6 +1333,7 @@ class SqlAlchemyDetectionCandidateRepository:
             .order_by(DetectionCandidateMotifRow.position)
         )
         motifs: list[MotifProvenance] = []
+        provenance: DetectionCandidateProvenance | None = None
         for motif_row in motif_rows:
             refs = await self._session.scalars(
                 select(DetectionCandidateMotifObservationRow.observation_id)
@@ -1301,6 +1343,20 @@ class SqlAlchemyDetectionCandidateRepository:
                 )
                 .order_by(DetectionCandidateMotifObservationRow.observation_position)
             )
+            if motif_row.motif == _CANDIDATE_PROVENANCE_MOTIF:
+                if not motif_row.rationale.startswith(_CANDIDATE_PROVENANCE_PREFIX):
+                    raise ValueError("Persisted detection candidate provenance is invalid")
+                payload = json.loads(motif_row.rationale[len(_CANDIDATE_PROVENANCE_PREFIX) :])
+                if not isinstance(payload, Mapping) or not isinstance(
+                    payload.get("metadata"), Mapping
+                ):
+                    raise ValueError("Persisted detection candidate provenance is invalid")
+                provenance = DetectionCandidateProvenance(
+                    kind=str(payload.get("kind", "")),
+                    metadata=payload["metadata"],
+                    observation_refs=tuple(refs),
+                )
+                continue
             motifs.append(
                 MotifProvenance(
                     motif=motif_row.motif,
@@ -1324,6 +1380,7 @@ class SqlAlchemyDetectionCandidateRepository:
             version=row.version,
             parent_version_id=row.parent_version_id,
             test_refs=tuple(test_refs),
+            provenance=provenance,
             created_at=row.created_at,
         )
 

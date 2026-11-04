@@ -77,6 +77,25 @@ def test_wire_dossier_omits_unverified_measurement_bytes_but_keeps_provenance() 
     assert "1" * 64 in rendered
 
 
+def test_wire_opportunistically_extracts_multiple_yara_rules_from_mixed_prose() -> None:
+    raw = (
+        "Bridge proposes two independent candidates.\n\n"
+        "```yara\n"
+        'rule FirstMarker { strings: $a = "first-marker" condition: $a }\n'
+        "```\n\n"
+        "A short explanation separates the rules.\n"
+        'rule SecondMarker { strings: $b = "second-marker" condition: $b }\n'
+        "These are candidates only.\n"
+    )
+
+    document = parse_advisor_wire(raw)
+
+    assert len(document.yara_rules) == 2
+    assert [name for _source, name in document.yara_rules] == ["FirstMarker", "SecondMarker"]
+    assert document.yara_rules[0][0] in raw
+    assert document.yara_rules[1][0] in raw
+
+
 def test_vt_file_observation_cannot_disclose_unverified_measurement_bytes() -> None:
     evidence_id = str(uuid4())
     evidence_sha256 = "a" * 64
@@ -1180,10 +1199,9 @@ def test_yara_prose_keeps_ambiguous_multi_rule_boundaries_noncanonicalizable() -
     )
 
     assert parsed is not None
-    assert parsed["usable"] is False
     assert parsed["canonicalization_eligible"] is False
     assert "multiple_yara_rules_split_ambiguous" in parsed["warnings"]
-    assert parsed.get("rules", []) == []
+    assert [item["name"] for item in parsed["rules"]] == ["First", "Second"]
 
 
 def test_yara_unfenced_bridge_shape_extracts_and_links_both_measured_strings() -> None:
@@ -1669,7 +1687,7 @@ def test_suricata_prose_reply_keeps_rule_with_or_without_dossier_fact_refs() -> 
     assert "fact_references_missing" in refused["warning_classification"]["blocking"]
 
 
-def test_draft_wire_rejects_unknown_assertion_alias_as_a_unit_blocker() -> None:
+def test_draft_wire_keeps_text_when_assertion_alias_is_unknown() -> None:
     observation_id = str(uuid4())
     assertion = {
         "id": "claim-1",
@@ -1695,8 +1713,13 @@ LIMITATION: none
 
     assert parsed is not None
     assert parsed["status"] == "partial"
-    assert parsed["blocks"] == []
-    assert parsed["usable"] is False
+    assert parsed["usable"] is True
+    assert parsed["blocks"][0]["sentences"][0]["text"] == (
+        "La capture confirme une requête DNS."
+    )
+    assert any(
+        item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"]
+    )
     assert "assertion_alias_unknown" in parsed["warnings"]
 
 
@@ -2106,7 +2129,13 @@ LIMITATION: none""",
     )
     assert cross_unit is not None
     assert cross_unit["status"] == "partial"
-    assert [item["unit_id"] for item in cross_unit["blocks"]] == ["U2"]
+    assert [item["unit_id"] for item in cross_unit["blocks"]] == ["U1", "U2"]
+    assert cross_unit["blocks"][0]["sentences"][0]["text"] == (
+        "La mesure confirme le mutex observé."
+    )
+    assert any(
+        item["reason"] == "assertion_wrong_unit" for item in cross_unit["unresolved_refs"]
+    )
 
 
 def test_draft_text_keeps_valid_units_and_treats_reference_aliases_as_prose() -> None:
@@ -2258,10 +2287,13 @@ LIMITATION: none
 
     assert parsed is not None
     units = {item["unit_id"]: item for item in parsed["blocks"]}
-    assert units["U1"]["usable"] is False
+    assert units["U1"]["usable"] is True
     assert units["U2"]["usable"] is True
     assert units["U2"]["sentences"][0]["assertion_ids"] == ["assertion_two"]
-    assert "assertion_alias_unknown" in parsed["warning_classification"]["blocking"]
+    assert "assertion_alias_unknown" in parsed["warning_classification"]["informative"]
+    assert any(
+        item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"]
+    )
 
 
 def test_secret_detection_and_incoherent_byte_warning_block_admissibility() -> None:

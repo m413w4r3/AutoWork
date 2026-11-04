@@ -11739,7 +11739,7 @@ def test_yara_v3_preserves_complete_rule_over_summary_limit_and_checks_measureme
     assert parsed["motifs"][0]["measurement_refs"][0]["sha256"] == measurement_sha
 
 
-def test_draft_text_rejects_untransmitted_uuid_and_requires_sentence_assertion() -> None:
+def test_draft_text_keeps_sentence_when_optional_refs_are_unresolved() -> None:
     observation_id = str(uuid4())
     unknown_id = str(uuid4())
     assertion = {
@@ -11779,13 +11779,13 @@ def test_draft_text_rejects_untransmitted_uuid_and_requires_sentence_assertion()
         prompt_data=prompt_data,
         safe_text=_safe_text,
     )
-    rejected_ref = parse_typed_advisor_response(
+    unresolved_ref = parse_typed_advisor_response(
         response(f"La mesure {unknown_id} établit le chemin observé.", ["fact-1"]),
         consultation_type="draft_text",
         prompt_data=prompt_data,
         safe_text=_safe_text,
     )
-    rejected_assertion = parse_typed_advisor_response(
+    unresolved_assertion = parse_typed_advisor_response(
         response("La mesure établit le chemin observé.", ["invented"]),
         consultation_type="draft_text",
         prompt_data=prompt_data,
@@ -11793,15 +11793,75 @@ def test_draft_text_rejects_untransmitted_uuid_and_requires_sentence_assertion()
     )
 
     assert accepted is not None
-    assert rejected_ref is not None
-    assert rejected_ref["status"] == "partial"
-    assert rejected_ref["usable"] is False
-    assert rejected_ref["blocks"] == []
-    assert "draft_sentence_reference_invalid" in rejected_ref["warnings"]
-    assert rejected_assertion is not None
-    assert rejected_assertion["status"] == "partial"
-    assert rejected_assertion.get("blocks", []) == []
-    assert "reference_alias_unknown" in rejected_assertion["warnings"]
+    assert unresolved_ref is not None
+    assert unresolved_ref["status"] == "partial"
+    assert unresolved_ref["usable"] is True
+    assert unresolved_ref["blocks"][0]["sentences"][0]["text"].startswith(
+        f"La mesure {unknown_id}"
+    )
+    assert any(
+        item["reference"] == unknown_id and item["reason"] == "source_reference_unresolved"
+        for item in unresolved_ref["unresolved_refs"]
+    )
+    assert unresolved_assertion is not None
+    assert unresolved_assertion["status"] == "partial"
+    assert unresolved_assertion["usable"] is True
+    assert unresolved_assertion["blocks"][0]["sentences"][0]["text"] == (
+        "La mesure établit le chemin observé."
+    )
+    assert any(
+        item["reason"] == "assertion_alias_unknown"
+        for item in unresolved_assertion["unresolved_refs"]
+    )
+
+
+def test_draft_wire_keeps_unreferenced_sentence_and_lists_optional_refs() -> None:
+    assertion = {
+        "id": "fact-1",
+        "unit_id": "U1",
+        "refs": [{"kind": "observation", "id": str(uuid4()), "sha256": "a" * 64}],
+    }
+    raw = """advisor-wire.v1
+TYPE: draft_text
+STATUS: partial
+UNIT: U1
+S: Le comportement décrit reste exploitable sans alias de mesure.
+S: La seconde phrase conserve le texte. [A404]
+LIMITATION: Une référence reste à résoudre.
+"""
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="draft_text",
+        prompt_data={
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "key_findings",
+                    "form": "body",
+                    "anchor": None,
+                }
+            ],
+            "assertions": [assertion],
+        },
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert parsed["status"] == "partial"
+    assert parsed["usable"] is True
+    sentences = parsed["blocks"][0]["sentences"]
+    assert [item["text"] for item in sentences] == [
+        "Le comportement décrit reste exploitable sans alias de mesure.",
+        "La seconde phrase conserve le texte.",
+    ]
+    assert any(
+        item["reason"] == "sentence_references_missing" for item in parsed["unresolved_refs"]
+    )
+    assert any(
+        item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"]
+    )
 
 
 def test_figure_plan_accepts_only_typed_semantics_and_transmitted_refs() -> None:

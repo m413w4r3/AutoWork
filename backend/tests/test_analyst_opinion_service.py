@@ -767,6 +767,11 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
             "output": {
                 "schema": "advisor-response.v3",
                 "usable": False,
+                "raw_output": source_text,
+                "raw_output_sha256": source_text_sha256,
+                "unresolved_refs": [
+                    {"reference": "A404", "reason": "assertion_alias_unknown"}
+                ],
                 "output_sha256": draft_output_sha,
                 "warnings": [
                     "unstructured_draft",
@@ -787,7 +792,9 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
                         "form": "body",
                         "anchor": None,
                         "usable": True,
-                        "sentences": [{"text": source_text, "assertion_ids": ["a1"]}],
+                        "sentences": [
+                            {"text": source_text, "assertion_ids": ["a1", "A404"]}
+                        ],
                     },
                     {
                         "block_type": "implant_materials",

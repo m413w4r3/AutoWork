@@ -11,7 +11,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cti_app.application.investigation_persistence import VersionConflictError
-from cti_app.domain.investigation import DetectionCandidateStatus, DetectionCandidateVersion
+from cti_app.domain.investigation import (
+    DetectionCandidateProvenance,
+    DetectionCandidateStatus,
+    DetectionCandidateVersion,
+)
 from cti_app.infrastructure.database.models.investigation import DetectionCandidateVersionRow
 from cti_app.infrastructure.database.repositories.investigation import (
     SqlAlchemyDetectionCandidateRepository,
@@ -77,6 +81,40 @@ async def test_sequential_import_replay_returns_the_stored_first_version(
         assert again.source == version.source
         assert again.source_sha256 == version.source_sha256
         assert await _row_count(engine, [version.candidate_id]) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_candidate_level_provenance_round_trips_without_motifs(
+    migrated_postgres_url: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    investigation = await _make_investigation(session_factory)
+    source = 'rule bridge_candidate { condition: true }'
+    version = DetectionCandidateVersion(
+        investigation_id=investigation.id,
+        candidate_id=uuid4(),
+        source=source,
+        source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        motif_provenance=(),
+        provenance=DetectionCandidateProvenance(
+            kind="bridge_yara_draft",
+            metadata={"bridge_invocation_id": str(uuid4()), "compile_status": "ok"},
+        ),
+        created_at=NOW,
+    )
+    try:
+        stored, replayed = await _import(session_factory, version)
+        assert replayed is False
+        assert stored.provenance == version.provenance
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            loaded = await uow.detection_candidates.list_for_candidate(version.candidate_id)
+        assert loaded == (version,)
+        replay, replayed_again = await _import(session_factory, version)
+        assert replayed_again is True
+        assert replay.provenance == version.provenance
     finally:
         await engine.dispose()
 

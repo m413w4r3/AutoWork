@@ -1009,3 +1009,153 @@ async def test_real_workbench_v1_v2_holdout_fp_and_trivial_motif_gate() -> None:
         coverage_statement="One positive and one goodware sample were measured.",
     )
     assert fp_version.status is DetectionCandidateStatus.REJECTED
+
+
+class _OneObservationRepository:
+    def __init__(self, observation: Any) -> None:
+        self.observation = observation
+
+    async def get(self, observation_id: UUID) -> Any | None:
+        return self.observation if observation_id == self.observation.id else None
+
+
+@pytest.mark.asyncio
+async def test_suricata_bridge_candidate_import_persists_source_and_untested_status() -> None:
+    invocation_id = uuid4()
+    local_invocation_id = uuid4()
+    source_observation_id = uuid4()
+    source = (
+        'alert tls any any -> any any (msg:"Synthetic SNI"; tls.sni; '
+        'content:"updates.example.test"; sid:9900001; rev:1;)\n'
+    )
+    source_sha256 = hashlib.sha256(source.encode()).hexdigest()
+    payload = {
+        "schema": "operator-advisor-call.v1",
+        "consultation_type": "suricata_draft",
+        "advisor_status": "partial",
+        "bridge_invocation_id": str(invocation_id),
+        "output_sha256": source_sha256,
+        "output": {
+            "schema": "advisor-response.v3",
+            "usable": True,
+            "raw_output": source,
+            "raw_output_sha256": source_sha256,
+            "rule_source": source,
+            "bridge_provenance": {
+                "bridge_invocation_id": str(invocation_id),
+                "output_sha256": source_sha256,
+                "input_refs": [],
+            },
+        },
+    }
+    blob_id = uuid4()
+    observation = SimpleNamespace(
+        id=source_observation_id,
+        investigation_id=_INVESTIGATION_ID,
+        source="advisor.consult",
+        object_type="advisor_call",
+        object_id="suricata_draft",
+        blob_id=blob_id,
+        sha256=hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest(),
+        invocation_ref=local_invocation_id,
+    )
+
+    class ArtifactReader:
+        async def read_json(self, requested_blob_id: UUID) -> Mapping[str, Any]:
+            assert requested_blob_id == blob_id
+            return payload
+
+    recorder = _FakeRecorder()
+    registry = InMemoryToolRegistry()
+    register_signature_bridge_tools(
+        registry,
+        service=None,
+        sample_associations=None,
+        recorder=recorder,  # type: ignore[arg-type]
+        uow_factory=None,
+        invariant_registry=None,
+        rule_tools=None,
+        observations=_OneObservationRepository(observation),  # type: ignore[arg-type]
+        artifact_store=ArtifactReader(),  # type: ignore[arg-type]
+    )
+    registration = registry.get("rule.import_suricata_bridge_candidate", "1")
+    assert registration is not None
+    adapter = registration[1]
+
+    result = await adapter.execute(
+        {"bridge_observation_id": str(source_observation_id)}, _bridge_context()
+    )
+    replay = await adapter.execute(
+        {"bridge_observation_id": str(source_observation_id)}, _bridge_context()
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert replay.output["candidate_observation_id"] == result.output["candidate_observation_id"]
+    assert result.output["rule_source_sha256"] == source_sha256
+    assert result.output["rule_syntax_validation"] == "valid"
+    assert result.output["pcap_test_status"] == "not_tested"
+    assert len(recorder.observations) == 1
+    stored = recorder.payloads[recorder.observations[0].blob_id]
+    assert stored["bridge_observation_id"] == str(source_observation_id)
+    assert stored["bridge_invocation_id"] == str(invocation_id)
+    assert stored["local_tool_invocation_id"] == str(local_invocation_id)
+    assert stored["output"]["rule_source"] == source
+    assert stored["output"]["rule_source_sha256"] == source_sha256
+    assert stored["output"]["pcap_test_status"] == "not_tested"
+
+
+@pytest.mark.asyncio
+async def test_suricata_bridge_candidate_syntax_failure_is_still_persisted() -> None:
+    local_invocation_id = uuid4()
+    source_observation_id = uuid4()
+    raw_output = "alert tcp any any -> any any (sid:1; rev:1;)"
+    payload = {
+        "schema": "operator-advisor-call.v1",
+        "consultation_type": "suricata_draft",
+        "advisor_status": "partial",
+        "output": {"usable": True, "rule_source": raw_output},
+    }
+    blob_id = uuid4()
+    observation = SimpleNamespace(
+        id=source_observation_id,
+        investigation_id=_INVESTIGATION_ID,
+        source="advisor.consult",
+        object_type="advisor_call",
+        object_id="suricata_draft",
+        blob_id=blob_id,
+        sha256=hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest(),
+        invocation_ref=local_invocation_id,
+    )
+
+    class ArtifactReader:
+        async def read_json(self, requested_blob_id: UUID) -> Mapping[str, Any]:
+            assert requested_blob_id == blob_id
+            return payload
+
+    recorder = _FakeRecorder()
+    registry = InMemoryToolRegistry()
+    register_signature_bridge_tools(
+        registry,
+        service=None,
+        sample_associations=None,
+        recorder=recorder,  # type: ignore[arg-type]
+        uow_factory=None,
+        invariant_registry=None,
+        rule_tools=None,
+        observations=_OneObservationRepository(observation),  # type: ignore[arg-type]
+        artifact_store=ArtifactReader(),  # type: ignore[arg-type]
+    )
+    registration = registry.get("rule.import_suricata_bridge_candidate", "1")
+    assert registration is not None
+    result = await registration[1].execute(
+        {"bridge_observation_id": str(source_observation_id)}, _bridge_context()
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["rule_syntax_validation"] == "failed"
+    assert result.output["candidate_observation_id"]
+    stored = recorder.payloads[recorder.observations[0].blob_id]
+    assert stored["output"]["rule_source"] == raw_output
+    assert stored["output"]["pcap_test_status"] == "not_tested"
+    assert stored["bridge_invocation_id"] is None
+    assert stored["local_tool_invocation_id"] == str(local_invocation_id)
