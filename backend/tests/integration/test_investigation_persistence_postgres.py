@@ -40,6 +40,7 @@ from cti_app.domain.entities import Subject
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
+    DetectionCandidateProvenance,
     DetectionCandidateStatus,
     DetectionCandidateVersion,
     DisclosureBounds,
@@ -389,13 +390,17 @@ async def _assert_repository_contract(
         source_sha256=hashlib.sha256(yara_source.encode()).hexdigest(),
         motif_provenance=(
             MotifProvenance(
-                motif="network marker",
+                motif="__candidate_provenance__",
                 observation_refs=(observation.id,),
                 rationale="The cited report contains the marker.",
             ),
         ),
         status=DetectionCandidateStatus.CANDIDATE,
         test_refs=(uuid4(),),
+        provenance=DetectionCandidateProvenance(
+            kind="test_candidate_source",
+            metadata={"source": "fixture"},
+        ),
         created_at=NOW,
     )
     assert (
