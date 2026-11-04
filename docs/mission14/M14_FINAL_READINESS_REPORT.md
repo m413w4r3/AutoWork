@@ -40,9 +40,9 @@ Import exact + provenance + idempotence concurrente : voir §1. Rapport de tests
 
 Environnement : Typst réel via le binaire épinglé (`TYPST_BINARY=~/.local/share/autowork-tools/typst`, `FONT_BUNDLE_ROOT=…/chpTypst`, `TMPDIR` sous `$HOME`), PostgreSQL de test local `127.0.0.1:55432`.
 
-| Contrôle | Base `684e6546` | Fin M14 (`efe1cbb6`) |
+| Contrôle | Base `684e6546` | Fin M14 (`6599afbf`) |
 | --- | --- | --- |
-| Unitaires hors intégration | 39 échecs (35 Typst d'environnement, 3 `test_confined_analysis_dispatch` d'environnement, 1 golden/C09) | **3 échecs, 6 016 passés** — uniquement les 3 `test_confined_analysis_dispatch` (déjà rouges sur la base, environnement). Les 35 « Typst » passent avec le binaire épinglé. |
+| Unitaires hors intégration | 39 échecs (35 Typst d'environnement, 3 `test_confined_analysis_dispatch` d'environnement, 1 golden/C09) | **3 échecs, 6 020 passés** — uniquement les 3 `test_confined_analysis_dispatch` (déjà rouges sur la base, environnement). Les 35 « Typst » passent avec le binaire épinglé. |
 | PostgreSQL `tests/integration` | 9 échecs | **1 échec, 521 passés** — `test_operator_context_cas_and_advisor_egress_guard_postgres` (échoue aussi sur la base, voir §7) |
 | Workflow emulator FAST | 20 passés, 2 échecs | **20 passés, mêmes 2 échecs préexistants** (W15, W16) |
 | Test d'archive réel C01–C13 (corpus Run12, checkout principal) | échec C09 (48 octets) | passe |
@@ -65,7 +65,8 @@ Environnement : Typst réel via le binaire épinglé (`TYPST_BINARY=~/.local/sha
 - **P3 (accepté)** : `_canonical_tool_measurement` sans ligne d'observation fait confiance à des champs d'un dossier assemblé en interne (jamais fournis par l'opérateur) ; un resserrement sur `source_file` casse des mesures archivées réelles.
 - **W15/W16** (reprise d'invocations ambiguës) toujours rouges comme sur la base.
 - **Non mesuré** : latence et qualité réelles des consultations Bridge ; effet des skills sur un opérateur réel ; aucune variante/PCAP/goodware (limites réelles de la plateforme actuelle).
-- **Revues indépendantes (Luna xhigh, lecture seule)** : A/B/C → FAIL/FAIL/PASS-réserves (corrigés A2, B2) ; D/E2/F → PASS/PASS/FAIL (F corrigé F4→F6) ; finale → A2 FAIL (clé brute dans la vue de statut, sanitiseur : corrigés A3), F3/F4 FAIL (règles : corrigé F5), B2 PASS-réserves, D2/E1/E3 PASS ; **revue du delta final (A3, E4, E6, F5, F6, correctif de relations)** : voir l'addendum ci-dessous.
+- **Revues indépendantes (Luna xhigh, lecture seule)** : A/B/C → FAIL/FAIL/PASS-réserves (corrigés A2, B2) ; D/E2/F → PASS/PASS/FAIL (F corrigé F4→F6) ; revue finale → A2 FAIL (clé brute dans la vue de statut, sanitiseur : corrigés A3), F3/F4 FAIL (règles : corrigé F5), B2 PASS-réserves, D2/E1/E3 PASS ; **revue du dernier delta** → FAIL : (1) métadonnées d'assets refusés visibles en archive restreinte, (2) relation révélant le SHA d'un asset refusé en mode archive, (3) clé Bridge brute dans les diagnostics. **Corrigés ensuite (F7, A4) avec tests, mais ces deux correctifs n'ont PAS été re-relus par un auditeur indépendant** — à faire avant tout usage de l'export en mode archive restreinte. Aucune de ces revues n'a pu exécuter PostgreSQL ; l'orchestrateur a rejoué les tests PG.
+- **Course TLP non-RED au plafond de l'enveloppe** (revue : P1 plausible, limite déjà documentée dans `docs/advisor_preflight_catalog.md` ~l.129) : un échantillon qui passe de GREEN à AMBER entre la dernière vérification advisor et le `consume` n'est pas comparé au plafond de l'enveloppe ; préexistant, non corrigé.
 
 ## 8. Livrables de la mission
 
