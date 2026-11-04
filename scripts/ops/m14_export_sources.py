@@ -26,6 +26,7 @@ from cti_app.infrastructure.database.models.editions import EditionRow
 from cti_app.infrastructure.database.session import create_postgres_engine
 from minio import Minio
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 DEFAULT_SUBJECT_ID = UUID("d22822d4-27ce-47d2-9cc5-f84cf312986a")
 FORMAT = "autowork.m14-source-manifest"
@@ -87,15 +88,16 @@ async def export_sources(
     try:
         async with engine.connect() as connection, connection.begin():
             await connection.execute(text("SET TRANSACTION READ ONLY"))
+            session = AsyncSession(bind=connection)
             subject = (
-                await connection.execute(
+                await session.execute(
                     select(SubjectRow).where(SubjectRow.id == subject_id)
                 )
             ).scalar_one_or_none()
             if subject is None:
                 raise ValueError("subject not found")
             edition = (
-                await connection.execute(
+                await session.execute(
                     select(EditionRow).where(EditionRow.id == subject.edition_id)
                 )
             ).scalar_one_or_none()
@@ -103,7 +105,7 @@ async def export_sources(
                 raise ValueError("subject edition not found")
             source_rows = list(
                 (
-                    await connection.execute(
+                    await session.execute(
                         select(SourceDocumentRow)
                         .where(SourceDocumentRow.subject_id == subject_id)
                         .order_by(SourceDocumentRow.created_at, SourceDocumentRow.id)
@@ -116,7 +118,7 @@ async def export_sources(
             blob_rows = {
                 row.id: row
                 for row in (
-                    await connection.execute(
+                    await session.execute(
                         select(BlobRow).where(BlobRow.id.in_(blob_ids))
                     )
                 ).scalars()
@@ -130,7 +132,7 @@ async def export_sources(
                 {
                     row.id: row
                     for row in (
-                        await connection.execute(
+                        await session.execute(
                             select(SourceCollectionRow).where(
                                 SourceCollectionRow.id.in_(collection_ids)
                             )

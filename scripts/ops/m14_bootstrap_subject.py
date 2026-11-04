@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import calendar
+import gzip
 import hashlib
 import json
 import os
@@ -73,6 +74,14 @@ class SourceInput:
     size: int
     mime_type: str
     path: Path
+    # Exported raw bytes may be gzip (stored as received); the archive route
+    # sniffs the media type, so the decoded bytes are what gets uploaded.
+    upload_sha256: str = ""
+    upload_size: int = 0
+
+    def upload_bytes(self) -> bytes:
+        content = self.path.read_bytes()
+        return gzip.decompress(content) if content[:2] == b"\x1f\x8b" else content
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +244,7 @@ def load_inputs(
         size = document.get("size", len(content))
         if type(size) is not int or size < 0 or size != len(content):
             raise ValueError(f"source bytes do not match manifest size for {digest}")
+        upload = gzip.decompress(content) if content[:2] == b"\x1f\x8b" else content
         mime_type = (
             document.get("mime") or document.get("stored_mime") or "application/octet-stream"
         )
@@ -249,6 +259,8 @@ def load_inputs(
                 size=size,
                 mime_type=mime_type.strip(),
                 path=path,
+                upload_sha256=hashlib.sha256(upload).hexdigest(),
+                upload_size=len(upload),
             )
         )
 
@@ -521,8 +533,8 @@ def _receipt_matches(entry: dict[str, Any], source: SourceInput) -> bool:
     receipt = entry.get("archive_receipt")
     return (
         isinstance(receipt, dict)
-        and receipt.get("encoded_sha256") == source.sha256
-        and receipt.get("bytes") == source.size
+        and receipt.get("encoded_sha256") == (source.upload_sha256 or source.sha256)
+        and receipt.get("bytes") == (source.upload_size or source.size)
     )
 
 
@@ -566,8 +578,11 @@ async def _archive_sources(
                     f"Existing archived source for {source.url} does not match its exported bytes.",
                 )
             continue
-        content = source.path.read_bytes()
-        if len(content) != source.size or hashlib.sha256(content).hexdigest() != source.sha256:
+        content = source.upload_bytes()
+        if (
+            len(content) != (source.upload_size or source.size)
+            or hashlib.sha256(content).hexdigest() != (source.upload_sha256 or source.sha256)
+        ):
             raise BootstrapError(
                 "source_bytes_changed", f"Source file changed after preflight: {source.sha256}."
             )
