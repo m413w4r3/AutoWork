@@ -16,7 +16,7 @@ REFERENCES_PROMPT_VERSION = "10"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v11-adaptive-section-headings"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v12-french-coverage-diagnostics"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
 SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = "synthesis-targeted-revision-v4-grounded-heading-terms"
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v3-after-formats"
@@ -192,10 +192,13 @@ TEXT: <one or two short French sentences supported only by this source>
 @@END SOURCE NOTE@@
 
 An optional diagnostic block may appear after all synthesis blocks. Use it
-only for concrete missing-coverage observations, never for publication prose:
+only for concrete missing-coverage observations, never for publication prose.
+Write each observation in the publication language (in French for a French
+publication), as one short, plain-text sentence. Keep the literal marker
+`MISSING COVERAGE:` unchanged; translate the observation after it:
 
 @@DIAGNOSTICS@@
-MISSING COVERAGE: <theme absent from the supplied evidence>
+MISSING COVERAGE: <thème absent des preuves fournies, en une phrase française>
 @@END DIAGNOSTICS@@
 """
 # Editorial-only prompt changes preserve REFERENCES, EXTRACTION, RELEVANCE_PROJECTION,

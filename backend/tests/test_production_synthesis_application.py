@@ -1086,7 +1086,7 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         "synthesis-validator-v7-grounded-section-heading-facts"
     )
     assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
-        "synthesis-draft-v11-adaptive-section-headings"
+        "synthesis-draft-v12-french-coverage-diagnostics"
     )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
         "synthesis-text-parser-v6-heading-warning-recovery"
