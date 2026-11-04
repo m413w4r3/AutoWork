@@ -1985,9 +1985,9 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 == audit_before_replay
             )
 
-            refusal_key = f"m07.operator.advisor-presend-refusal:{investigation_id}"
-            posts_before_refusal = bridge_http_calls.count(("POST", "/v1/responses"))
-            pretransport_refusal = await invoke_operator_tool(
+            incomplete_key = f"m07.operator.advisor-incomplete-context:{investigation_id}"
+            posts_before_incomplete = bridge_http_calls.count(("POST", "/v1/responses"))
+            incomplete_advisor = await invoke_operator_tool(
                 "advisor.consult",
                 "advisor-consult.v1",
                 {
@@ -1996,57 +1996,50 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         f"pretransport-unassociated:{investigation_id}:{uuid4()}".encode()
                     ).hexdigest(),
                 },
-                key=refusal_key,
+                key=incomplete_key,
                 purpose=(
-                    "Verify durable budget release after an unassociated sample hash is refused."
+                    "Verify an unassociated optional sample selector is reported while Bridge "
+                    "receives the available investigation context."
                 ),
             )
-            assert_tool_status("advisor.consult", pretransport_refusal, "failed")
-            assert (
-                pretransport_refusal["advisor_output"]["input_error_code"]
-                == "sample_hash_not_associated"
-            ), tool_diagnostic("advisor.consult", pretransport_refusal)
-            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
-            refusal_invocation_id = UUID(pretransport_refusal["invocation"]["id"])
+            assert incomplete_advisor["invocation"]["status"] in {"succeeded", "partial"}
+            incomplete_output = incomplete_advisor["advisor_output"]
+            assert incomplete_output["input_warnings"]
+            assert incomplete_output["omissions"]
+            assert any(
+                item["field"] == "sample_sha256"
+                for item in incomplete_output["input_warnings"]
+            )
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_incomplete + 1
+            incomplete_invocation_id = UUID(incomplete_advisor["invocation"]["id"])
             async with uow_factory() as uow:
-                refusal_invocation = await uow.tool_invocations.get(refusal_invocation_id)
+                incomplete_invocation = await uow.tool_invocations.get(incomplete_invocation_id)
                 latest_envelope = await uow.investigation_envelopes.get(investigation_id)
                 budget_snapshot = await uow.investigation_budgets.get(investigation_id)
-                refusal_observations = tuple(
-                    await uow.evidence_observations.list_for_investigation(investigation_id)
-                )
-            assert refusal_invocation is not None
+            assert incomplete_invocation is not None
             assert latest_envelope is not None and budget_snapshot is not None
-            refusal_reservation = next(
+            incomplete_reservation = next(
                 item
                 for item in latest_envelope.budget.reservations
-                if item.operation_key == refusal_invocation.operation_key
+                if item.operation_key == incomplete_invocation.operation_key
             )
-            assert refusal_reservation.amounts[BudgetDimension.BRIDGE_TURNS] > 0
-            assert refusal_reservation.amounts[BudgetDimension.TOOL_SECONDS] > 0
-            assert refusal_reservation.status is BudgetReservationStatus.RELEASED
-            assert refusal_invocation.consumed_budget == {}
+            assert incomplete_reservation.amounts[BudgetDimension.BRIDGE_TURNS] > 0
+            assert incomplete_reservation.amounts[BudgetDimension.TOOL_SECONDS] > 0
+            assert incomplete_reservation.status is BudgetReservationStatus.COMMITTED
+            assert incomplete_invocation.consumed_budget
             assert budget_snapshot.budget == latest_envelope.budget
-            refusal_proof = next(
-                item
-                for item in refusal_observations
-                if item.invocation_ref == refusal_invocation_id
-                and item.object_type
-                == FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL.value
+            incomplete_request = next(
+                request for name, key, request in operator_requests if key == incomplete_key
             )
-            assert refusal_proof.object_id == refusal_invocation.operation_key
-            refusal_request = next(
-                request for name, key, request in operator_requests if key == refusal_key
-            )
-            replay_refusal = await client.post(
+            replay_incomplete = await client.post(
                 f"/api/investigations/{investigation_id}/operator/tools/advisor.consult",
-                headers={"Idempotency-Key": refusal_key},
-                json=refusal_request,
+                headers={"Idempotency-Key": incomplete_key},
+                json=incomplete_request,
             )
-            assert replay_refusal.status_code == 200, replay_refusal.text
-            assert replay_refusal.json()["idempotent_replay"] is True
-            assert replay_refusal.json()["invocation"]["id"] == str(refusal_invocation_id)
-            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
+            assert replay_incomplete.status_code == 200, replay_incomplete.text
+            assert replay_incomplete.json()["idempotent_replay"] is True
+            assert replay_incomplete.json()["invocation"]["id"] == str(incomplete_invocation_id)
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_incomplete + 1
     finally:
         await vt_adapter._client.aclose()
         await effect_engine.dispose()

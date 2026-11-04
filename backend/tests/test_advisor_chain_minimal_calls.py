@@ -409,7 +409,7 @@ async def test_revoked_g2_stays_blocked_before_fake_bridge() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unassociated_sample_hash_is_rejected_with_association_action() -> None:
+async def test_unassociated_sample_hash_warns_and_uses_other_available_context() -> None:
     investigation_id = uuid4()
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
     tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
@@ -424,9 +424,15 @@ async def test_unassociated_sample_hash_is_rejected_with_association_action() ->
         arguments={"sample_sha256": absent_hash},
     )
 
-    assert result.status in {ToolInvocationStatus.FAILED, ToolInvocationStatus.POLICY_DENIED}
-    assert "sample.analyze" in result.message
-    assert transport.calls == []
+    assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "Contexte indisponible / omis" in prompt
+    assert "sample.analyze" in prompt
+    assert absent_hash not in prompt
+    assert any(
+        item["field"] == "sample_sha256" for item in result.output["input_warnings"]
+    )
 
 
 @pytest.mark.asyncio
@@ -665,11 +671,10 @@ async def test_large_sample_stays_provenance_only_with_exact_reservation() -> No
     assert "byte_length=3200000" in prompt
     assert sample_hash in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
-    assert estimate[next(key for key in estimate if key.value == "context_bytes")] == prompt_bytes
-    assert (
-        estimate[next(key for key in estimate if key.value == "context_tokens")]
-        == (prompt_bytes + 3) // 4
-    )
+    # The reservation estimate defers context accounting until dispatch has rendered
+    # and measured the exact prompt; the committed reservation below is the oracle.
+    assert estimate[next(key for key in estimate if key.value == "context_bytes")] == 0
+    assert estimate[next(key for key in estimate if key.value == "context_tokens")] == 0
     assert (
         result.budget_consumed[
             next(key for key in result.budget_consumed if key.value == "context_bytes")
