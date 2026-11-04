@@ -156,6 +156,11 @@ async def _yara_version_origin_metadata(
         reference for motif in candidate.motif_provenance for reference in motif.observation_refs
     }
     attribution = _rule_attribution_from_rationale(candidate)
+    if candidate.provenance is not None:
+        source_observation_ids.update(candidate.provenance.observation_refs)
+        # Candidate level provenance is canonical even when this version has no
+        # strings and therefore no motif provenance rows.
+        attribution = {**dict(candidate.provenance.metadata), **attribution}
     relevant_observations = [
         observation_by_id[reference]
         for reference in source_observation_ids
@@ -247,17 +252,83 @@ async def _yara_version_origin_metadata(
         invocation,
     )
     tool_name = invocation.tool_name if invocation is not None else None
+    if tool_name is None and attribution.get("change_kind") == "bridge_yara_draft":
+        tool_name = "rule.propose_bridge"
     author = _rule_author(attribution)
+    origin = _rule_origin(tool_name, attribution)
     return {
         "author": author,
         "author_status": "recorded" if author is not None else "not_recorded",
-        "origin": _rule_origin(tool_name, attribution),
-        "origin_tool": tool_name,
-        "origin_invocation_id": str(invocation.id) if invocation is not None else None,
+        "origin": origin or "not_recorded",
+        "origin_tool": tool_name or "not_recorded",
+        "origin_invocation_id": (
+            str(invocation.id)
+            if invocation is not None
+            else str(sorted(linked_invocation_ids, key=str)[0])
+            if linked_invocation_ids
+            else "not_recorded"
+        ),
         "source_observation_ids": tuple(sorted(str(item) for item in source_observation_ids)),
         "parent_version": str(candidate.parent_version_id)
         if candidate.parent_version_id is not None
         else None,
+    }
+
+
+def _suricata_candidate_metadata(
+    output: Mapping[str, Any],
+    *,
+    observation_id: UUID,
+    candidate_version: Any,
+    fact_refs: Sequence[Any],
+    imported: bool,
+    envelope_external_llm_allowed: bool | None,
+    envelope_allowed: bool,
+    envelope_tlp: str | None,
+    research_permissive: bool,
+) -> dict[str, Any]:
+    candidate_provenance = _as_mapping(output.get("candidate_provenance"))
+    bridge_provenance = _as_mapping(output.get("bridge_provenance"))
+    source_observation_ids = tuple(
+        str(item)
+        for item in (candidate_provenance.get("source_observation_id"), str(observation_id))
+        if item
+    )
+    author = output.get("author") or bridge_provenance.get("author")
+    if not author and imported:
+        author = "bridge"
+    return {
+        "author": author,
+        "author_status": "recorded" if author else "not_recorded",
+        "origin": "bridge" if imported else "advisor",
+        "origin_tool": (
+            "rule.import_suricata_bridge_candidate" if imported else "advisor.consult"
+        ),
+        "origin_invocation_id": candidate_provenance.get("bridge_invocation_id")
+        or "not_recorded",
+        "bridge_invocation_id": candidate_provenance.get("bridge_invocation_id")
+        or "not_recorded",
+        "local_tool_invocation_id": candidate_provenance.get("local_tool_invocation_id")
+        or "not_recorded",
+        "candidate_version": candidate_provenance.get(
+            "candidate_version", candidate_version
+        ),
+        "source_observation_ids": source_observation_ids,
+        "parent_version": output.get("parent_version") or "not_recorded",
+        "candidate_id": candidate_provenance.get("candidate_id") or output.get("candidate_id"),
+        "candidate_status": "experimental"
+        if output.get("canonicalization_eligible") is not True
+        else "candidate",
+        "fact_refs": tuple(str(item) for item in fact_refs),
+        "rule_kind": "suricata",
+        "rule_syntax_validation": output.get("rule_syntax_validation", "not_tested"),
+        "rule_syntax_validation_error": output.get("rule_syntax_validation_error"),
+        "pcap_test_status": output.get("pcap_test_status", "not_tested"),
+        "replay_status": output.get("replay_status", "not_tested"),
+        "external_llm_allowed": (
+            envelope_external_llm_allowed if research_permissive else envelope_allowed
+        ),
+        "tlp": envelope_tlp,
     }
 
 
@@ -1612,6 +1683,18 @@ async def load_investigation_annex_snapshot(
 
     # Use only typed advisor output fields for Suricata rules; raw prompts and prose are omitted.
     suricata_by_sha: dict[str, list[AnnexAsset]] = defaultdict(list)
+    imported_suricata_shas = {
+        digest
+        for observation in source_snapshot.observations
+        if observation.source == "advisor.consult"
+        and observation.object_id == "suricata_draft"
+        and observation.source_version == "suricata-bridge-candidate-import.v1"
+        for _, payload, _ in (observation_payloads.get(observation.id, (None, {}, None)),)
+        for output in (_as_mapping(payload.get("output")),)
+        for source in (output.get("rule_source"),)
+        if isinstance(source, str) and source
+        for digest in (hashlib.sha256(source.encode("utf-8")).hexdigest(),)
+    }
     for observation in source_snapshot.observations:
         if observation.source != "advisor.consult" or observation.object_id != "suricata_draft":
             continue
@@ -1619,6 +1702,11 @@ async def load_investigation_annex_snapshot(
             observation.id, (None, {}, "blob_unavailable")
         )
         output = _as_mapping(payload.get("output"))
+        is_imported_candidate = (
+            observation.source_version == "suricata-bridge-candidate-import.v1"
+            and _as_mapping(payload.get("candidate_import")).get("schema")
+            == "suricata-bridge-candidate-import.v1"
+        )
         source = output.get("rule_source")
         if not isinstance(source, str) or not source:
             digest = _safe_sha256(output.get("rule_source_sha256"))
@@ -1663,10 +1751,11 @@ async def load_investigation_annex_snapshot(
                 )
             continue
         content = source.encode("utf-8")
-        digest = (
-            _safe_sha256(output.get("rule_source_sha256")) or hashlib.sha256(content).hexdigest()
-        )
-        matches = hashlib.sha256(content).hexdigest() == digest
+        digest = hashlib.sha256(content).hexdigest()
+        declared_digest = _safe_sha256(output.get("rule_source_sha256"))
+        matches = declared_digest is None or declared_digest == digest
+        if not is_imported_candidate and digest in imported_suricata_shas:
+            continue
         candidate_provenance = _as_mapping(output.get("candidate_provenance"))
         fact_refs = output.get("fact_refs")
         if not isinstance(fact_refs, list):
@@ -1675,6 +1764,15 @@ async def load_investigation_annex_snapshot(
         if not isinstance(fact_refs, list):
             fact_refs = []
         candidate_version = output.get("candidate_version")
+        candidate_observation_ids = tuple(
+            str(value)
+            for value in (
+                candidate_provenance.get("source_observation_id"),
+                candidate_provenance.get("local_tool_invocation_id"),
+                candidate_provenance.get("bridge_invocation_id"),
+            )
+            if value
+        )
         asset = AnnexAsset(
             canonical_id=str(observation.id),
             type="suricata_rule",
@@ -1683,31 +1781,31 @@ async def load_investigation_annex_snapshot(
             sha256=digest,
             source="advisor_call_payload.output.rule_source",
             origin="advisor.consult:suricata_draft",
-            references=tuple([str(observation.id), *(str(item) for item in fact_refs)]),
+            references=tuple(
+                dict.fromkeys(
+                    [
+                        str(observation.id),
+                        *candidate_observation_ids,
+                        *(str(item) for item in fact_refs),
+                    ]
+                )
+            ),
             availability="present" if matches and failure is None else "unavailable",
             restrictions=()
             if matches and failure is None
             else ("rule_source_digest_unavailable_or_mismatched",),
             content=content if matches and failure is None else None,
-            metadata={
-                "author": output.get("author"),
-                "author_status": "not_recorded_in_canonical_candidate"
-                if not output.get("author")
-                else "recorded",
-                "candidate_id": candidate_provenance.get("candidate_id")
-                or output.get("candidate_id"),
-                "candidate_status": "experimental"
-                if output.get("canonicalization_eligible") is not True
-                else "candidate",
-                "fact_refs": tuple(str(item) for item in fact_refs),
-                "rule_kind": "suricata",
-                "rule_syntax_validation": "not_tested",
-                "replay_status": "not_tested",
-                "external_llm_allowed": (
-                    envelope_external_llm_allowed if research_permissive else envelope_allowed
-                ),
-                "tlp": envelope_tlp,
-            },
+            metadata=_suricata_candidate_metadata(
+                output,
+                observation_id=observation.id,
+                candidate_version=candidate_version,
+                fact_refs=fact_refs,
+                imported=is_imported_candidate,
+                envelope_external_llm_allowed=envelope_external_llm_allowed,
+                envelope_allowed=envelope_allowed,
+                envelope_tlp=envelope_tlp,
+                research_permissive=research_permissive,
+            ),
         )
         assets.append(asset)
         suricata_by_sha[digest].append(asset)
@@ -1825,6 +1923,7 @@ async def load_investigation_annex_snapshot(
                         updated_metadata["rule_syntax_validation"] = syntax
                     else:
                         updated_metadata["replay_status"] = replay_status
+                        updated_metadata["pcap_test_status"] = replay_status
                     index = next(i for i, item in enumerate(assets) if item is rule)
                     updated_rule = replace(rule, metadata=updated_metadata)
                     assets[index] = updated_rule
@@ -1852,6 +1951,7 @@ async def load_investigation_annex_snapshot(
                         "rule_kind": "suricata",
                         "rule_syntax_validation": syntax,
                         "replay_status": replay_status,
+                        "pcap_test_status": replay_status if is_replay else "not_tested",
                         "detection_result": "single_capture_replay_only"
                         if is_replay and engine_status in {"succeeded", "partial"}
                         else "not_assessed",

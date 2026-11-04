@@ -15,12 +15,17 @@ from cti_app.application.investigation_annex_export import (
     InvestigationAnnexSnapshot,
     write_investigation_annex,
 )
-from cti_app.domain.investigation import DetectionCandidateVersion, MotifProvenance
+from cti_app.domain.investigation import (
+    DetectionCandidateProvenance,
+    DetectionCandidateVersion,
+    MotifProvenance,
+)
 from cti_app.infrastructure.database import investigation_annex_reader
 from cti_app.infrastructure.database.investigation_annex_reader import (
     _provenance_event_public_restrictions_by_sha,
     _public_distribution_policy,
     _resolve_public_distribution_for_assets,
+    _suricata_candidate_metadata,
     _yara_version_origin_metadata,
 )
 
@@ -144,11 +149,123 @@ async def test_yara_origin_metadata_does_not_invent_missing_author_or_origin() -
 
     assert metadata["author"] is None
     assert metadata["author_status"] == "not_recorded"
-    assert metadata["origin"] is None
-    assert metadata["origin_tool"] is None
-    assert metadata["origin_invocation_id"] is None
+    assert metadata["origin"] == "not_recorded"
+    assert metadata["origin_tool"] == "not_recorded"
+    assert metadata["origin_invocation_id"] == "not_recorded"
     assert metadata["source_observation_ids"] == ()
     assert metadata["parent_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_yara_origin_metadata_uses_candidate_provenance_without_motifs() -> None:
+    source = "rule unattributed { condition: true }"
+    investigation_id = uuid4()
+    candidate_id = uuid4()
+    candidate_version_id = uuid4()
+    source_observation_id = uuid4()
+    invocation_id = uuid4()
+    candidate = DetectionCandidateVersion(
+        id=candidate_version_id,
+        candidate_id=candidate_id,
+        investigation_id=investigation_id,
+        source=source,
+        source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        motif_provenance=(),
+        provenance=DetectionCandidateProvenance(
+            kind="bridge_yara_draft",
+            metadata={
+                "author": "bridge",
+                "change_kind": "bridge_yara_draft",
+                "bridge_invocation_id": str(invocation_id),
+            },
+            observation_refs=(source_observation_id,),
+        ),
+    )
+
+    class UnusedArtifactReader:
+        async def read_bytes(self, requested_blob_id, *, max_bytes=None):
+            raise AssertionError("Explicit candidate provenance needs no blob read")
+
+    metadata = await _yara_version_origin_metadata(
+        candidate,
+        observations=(),
+        invocations=(),
+        artifact_store=UnusedArtifactReader(),
+    )
+
+    assert metadata["author"] == "bridge"
+    assert metadata["author_status"] == "recorded"
+    assert metadata["origin"] == "bridge"
+    assert metadata["origin_invocation_id"] == str(invocation_id)
+    assert metadata["source_observation_ids"] == (str(source_observation_id),)
+    assert metadata["parent_version"] is None
+
+
+def test_suricata_candidate_metadata_projects_import_provenance_and_statuses() -> None:
+    observation_id = uuid4()
+    source_observation_id = uuid4()
+    bridge_invocation_id = uuid4()
+    local_invocation_id = uuid4()
+    metadata = _suricata_candidate_metadata(
+        {
+            "candidate_id": "bridge-candidate-7",
+            "candidate_version": 7,
+            "candidate_provenance": {
+                "candidate_id": "bridge-candidate-7",
+                "candidate_version": 7,
+                "source_observation_id": str(source_observation_id),
+                "bridge_invocation_id": str(bridge_invocation_id),
+                "local_tool_invocation_id": str(local_invocation_id),
+            },
+            "rule_syntax_validation": "failed",
+            "rule_syntax_validation_error": "synthetic syntax failure",
+            "pcap_test_status": "not_tested",
+        },
+        observation_id=observation_id,
+        candidate_version=7,
+        fact_refs=("fact-1",),
+        imported=True,
+        envelope_external_llm_allowed=True,
+        envelope_allowed=False,
+        envelope_tlp="GREEN",
+        research_permissive=True,
+    )
+
+    assert metadata["author"] == "bridge"
+    assert metadata["origin"] == "bridge"
+    assert metadata["origin_tool"] == "rule.import_suricata_bridge_candidate"
+    assert metadata["origin_invocation_id"] == str(bridge_invocation_id)
+    assert metadata["local_tool_invocation_id"] == str(local_invocation_id)
+    assert metadata["candidate_version"] == 7
+    assert metadata["source_observation_ids"] == (
+        str(source_observation_id),
+        str(observation_id),
+    )
+    assert metadata["fact_refs"] == ("fact-1",)
+    assert metadata["rule_syntax_validation"] == "failed"
+    assert metadata["rule_syntax_validation_error"] == "synthetic syntax failure"
+    assert metadata["pcap_test_status"] == "not_tested"
+    assert metadata["external_llm_allowed"] is True
+
+
+def test_suricata_candidate_metadata_marks_missing_provenance_not_recorded() -> None:
+    metadata = _suricata_candidate_metadata(
+        {},
+        observation_id=uuid4(),
+        candidate_version=None,
+        fact_refs=(),
+        imported=False,
+        envelope_external_llm_allowed=False,
+        envelope_allowed=False,
+        envelope_tlp="AMBER",
+        research_permissive=False,
+    )
+
+    assert metadata["author"] is None
+    assert metadata["author_status"] == "not_recorded"
+    assert metadata["origin_tool"] == "advisor.consult"
+    assert metadata["origin_invocation_id"] == "not_recorded"
+    assert metadata["parent_version"] == "not_recorded"
 
 
 @pytest.mark.parametrize(

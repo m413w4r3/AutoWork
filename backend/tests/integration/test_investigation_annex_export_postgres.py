@@ -21,6 +21,7 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.entities import ProvenanceEvent, Sample, SampleState, Subject
 from cti_app.domain.entities import SampleOrigin as StoredSampleOrigin
 from cti_app.domain.investigation import (
+    DetectionCandidateProvenance,
     DetectionCandidateStatus,
     DetectionCandidateVersion,
     DisclosureBounds,
@@ -167,6 +168,47 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         }
         advisor_blob = await catalog.ingest(
             BytesIO(_json_bytes(advisor_payload)),
+            logical_bucket="annex-test",
+            mime_type="application/json",
+        )
+        suricata_candidate_id = "bridge-annex-synthetic"
+        suricata_bridge_invocation_id = uuid4()
+        suricata_import_invocation_id = uuid4()
+        suricata_source_observation_id = uuid4()
+        imported_suricata_payload = {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "suricata_draft",
+            "advisor_status": "succeeded",
+            "bridge_invocation_id": str(suricata_bridge_invocation_id),
+            "bridge_observation_id": str(suricata_source_observation_id),
+            "candidate_import": {
+                "schema": "suricata-bridge-candidate-import.v1",
+                "candidate_status": "candidate",
+                "rule_syntax_validation": "valid",
+                "pcap_test_status": "not_tested",
+            },
+            "output": {
+                "rule_source": suricata_source,
+                "rule_source_sha256": hashlib.sha256(suricata_source.encode()).hexdigest(),
+                "candidate_id": suricata_candidate_id,
+                "candidate_version": 2,
+                "candidate_provenance": {
+                    "candidate_id": suricata_candidate_id,
+                    "candidate_version": 2,
+                    "source_observation_id": str(suricata_source_observation_id),
+                    "bridge_invocation_id": str(suricata_bridge_invocation_id),
+                    "local_tool_invocation_id": str(suricata_import_invocation_id),
+                },
+                "bridge_provenance": {"author": "Bridge synthetic fixture"},
+                "fact_refs": ["synthetic-fact-observation"],
+                "rule_syntax_validation": "valid",
+                "rule_syntax_validation_error": None,
+                "pcap_test_status": "not_tested",
+                "replay_status": "not_tested",
+            },
+        }
+        imported_advisor_blob = await catalog.ingest(
+            BytesIO(_json_bytes(imported_suricata_payload)),
             logical_bucket="annex-test",
             mime_type="application/json",
         )
@@ -426,6 +468,69 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             test_refs=(report_id,),
             created_at=NOW,
         )
+        no_motif_source = "rule bridge_candidate_without_strings { condition: true }"
+        no_motif_candidate_id = uuid4()
+        no_motif_version_id = uuid4()
+        no_motif_observation_id = uuid4()
+        no_motif_invocation_id = uuid4()
+        no_motif_payload = {
+            "schema": "investigation-tool-observation.v1",
+            "result": {
+                "candidate_id": str(no_motif_candidate_id),
+                "version_id": str(no_motif_version_id),
+            },
+        }
+        no_motif_blob = await catalog.ingest(
+            BytesIO(_json_bytes(no_motif_payload)),
+            logical_bucket="annex-test",
+            mime_type="application/json",
+        )
+        no_motif_observation = EvidenceObservation(
+            id=no_motif_observation_id,
+            investigation_id=investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=no_motif_blob.id,
+            sha256=no_motif_blob.descriptor.sha256,
+            source="rule.propose_bridge",
+            source_version="rule.propose_bridge.v1",
+            observed_at=NOW,
+            object_type="tool_result",
+            object_id="synthetic-empty-motif-candidate",
+            invocation_ref=no_motif_invocation_id,
+        )
+        no_motif_invocation = ToolInvocation(
+            id=no_motif_invocation_id,
+            investigation_id=investigation.id,
+            operation_key=f"annex-bridge-empty:{no_motif_invocation_id}",
+            tool_name="rule.propose_bridge",
+            schema_version="rule.propose_bridge.v1",
+            normalized_parameters={},
+            purpose="Synthetic candidate-level provenance fixture",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=(no_motif_observation_id,),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        no_motif_candidate = DetectionCandidateVersion(
+            id=no_motif_version_id,
+            candidate_id=no_motif_candidate_id,
+            investigation_id=investigation.id,
+            source=no_motif_source,
+            source_sha256=hashlib.sha256(no_motif_source.encode()).hexdigest(),
+            motif_provenance=(),
+            provenance=DetectionCandidateProvenance(
+                kind="bridge_yara_draft",
+                metadata={
+                    "author": "bridge",
+                    "source_author": "bridge",
+                    "origin_author": "bridge",
+                    "change_kind": "bridge_yara_draft",
+                    "bridge_invocation_id": str(no_motif_invocation_id),
+                },
+                observation_refs=(no_motif_observation_id,),
+            ),
+            created_at=NOW,
+        )
         report.update(
             {"version_id": str(source_v2.id), "candidate_id": str(source_v1.candidate_id)}
         )
@@ -467,6 +572,7 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             id=report_id,
         )
         advisor_observation = EvidenceObservation(
+            id=suricata_source_observation_id,
             investigation_id=investigation.id,
             kind=EvidenceKind.OTHER,
             blob_id=advisor_blob.id,
@@ -476,6 +582,44 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             observed_at=NOW,
             object_type="advisor_call",
             object_id="suricata_draft",
+        )
+        imported_advisor_observation = EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=imported_advisor_blob.id,
+            sha256=imported_advisor_blob.descriptor.sha256,
+            source="advisor.consult",
+            source_version="suricata-bridge-candidate-import.v1",
+            observed_at=NOW,
+            object_type="advisor_call",
+            object_id="suricata_draft",
+            invocation_ref=suricata_import_invocation_id,
+        )
+        suricata_bridge_invocation = ToolInvocation(
+            id=suricata_bridge_invocation_id,
+            investigation_id=investigation.id,
+            operation_key=f"annex-suricata-bridge:{suricata_bridge_invocation_id}",
+            tool_name="bridge.consult",
+            schema_version="bridge.consult.v1",
+            normalized_parameters={},
+            purpose="Synthetic Suricata candidate provenance fixture",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=(),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        suricata_import_invocation = ToolInvocation(
+            id=suricata_import_invocation_id,
+            investigation_id=investigation.id,
+            operation_key=f"annex-suricata-import:{suricata_import_invocation_id}",
+            tool_name="rule.import_suricata_bridge_candidate",
+            schema_version="rule.import_suricata_bridge_candidate.v1",
+            normalized_parameters={},
+            purpose="Synthetic Suricata candidate import fixture",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=(imported_advisor_observation.id,),
+            created_at=NOW,
+            updated_at=NOW,
         )
         syntax_observation = EvidenceObservation(
             investigation_id=investigation.id,
@@ -543,18 +687,26 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             await uow.samples.add(unacquired_shared_red_sample)
             await uow.tool_invocations.add_if_absent(bridge_invocation)
             await uow.tool_invocations.add_if_absent(operator_invocation)
+            await uow.tool_invocations.add_if_absent(no_motif_invocation)
+            await uow.tool_invocations.add_if_absent(suricata_bridge_invocation)
+            await uow.tool_invocations.add_if_absent(suricata_import_invocation)
             await uow.evidence_observations.append_if_absent(vt_observation)
             await uow.evidence_observations.append_if_absent(shared_vt_observation)
             await uow.evidence_observations.append_if_absent(source_v1_observation)
             await uow.evidence_observations.append_if_absent(operator_observation)
             await uow.evidence_observations.append_if_absent(test_observation)
             await uow.evidence_observations.append_if_absent(advisor_observation)
+            await uow.evidence_observations.append_if_absent(imported_advisor_observation)
+            await uow.evidence_observations.append_if_absent(no_motif_observation)
             await uow.evidence_observations.append_if_absent(syntax_observation)
             await uow.evidence_observations.append_if_absent(unavailable_observation)
             await uow.evidence_observations.append_if_absent(capture_observation)
             await uow.detection_candidates.append_version(source_v1, expected_previous_id=None)
             await uow.detection_candidates.append_version(
                 source_v2, expected_previous_id=source_v1.id
+            )
+            await uow.detection_candidates.append_version(
+                no_motif_candidate, expected_previous_id=None
             )
             await uow.sample_associations.append_version(association, expected_version=0)
             await uow.sample_associations.append_version(shared_association, expected_version=0)
@@ -668,6 +820,13 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             [str(bridge_observation_id), str(operator_observation_id)]
         )
         assert operator_manifest["parent_version"] == str(source_v1.id)
+        no_motif_manifest = by_version_id[str(no_motif_candidate.id)]["metadata"]
+        assert no_motif_manifest["author"] == "bridge"
+        assert no_motif_manifest["origin"] == "bridge"
+        assert no_motif_manifest["origin_tool"] == "rule.propose_bridge"
+        assert no_motif_manifest["origin_invocation_id"] == str(no_motif_invocation_id)
+        assert no_motif_manifest["source_observation_ids"] == [str(no_motif_observation_id)]
+        assert no_motif_manifest["parent_version"] is None
         for item in yara:
             assert item["filename"] is not None
             source_bytes = public_files[item["filename"]]
@@ -675,8 +834,23 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
             assert len(source_bytes) > 7000
         yara_sources = [public_files[item["filename"]] for item in yara]
         assert any(b"author: bridge-fixture; origin: Bridge" in source for source in yara_sources)
+        assert len(by_type["suricata_rule"]) == 1
         suricata = by_type["suricata_rule"][0]
+        assert suricata["canonical_id"] == str(imported_advisor_observation.id)
         assert suricata["metadata"]["rule_syntax_validation"] == "valid"
+        assert suricata["metadata"]["pcap_test_status"] == "not_tested"
+        assert suricata["metadata"]["author"] == "Bridge synthetic fixture"
+        assert suricata["metadata"]["origin"] == "bridge"
+        assert suricata["metadata"]["origin_tool"] == "rule.import_suricata_bridge_candidate"
+        assert suricata["metadata"]["origin_invocation_id"] == str(
+            suricata_bridge_invocation_id
+        )
+        assert suricata["metadata"]["local_tool_invocation_id"] == str(
+            suricata_import_invocation_id
+        )
+        assert suricata["metadata"]["source_observation_ids"] == [
+            str(suricata_source_observation_id), str(imported_advisor_observation.id)
+        ]
         assert suricata["metadata"]["replay_status"] == "not_tested"
         assert suricata["filename"] is not None
         assert public_files[suricata["filename"]] == suricata_source.encode()
@@ -852,6 +1026,22 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         assert sample_bytes not in public_file_bytes
         assert capture_bytes not in public_file_bytes
         cli_manifest = json.loads(cli_files["manifest.json"])
+        cli_objects = cli_manifest["objects"]
+        cli_no_motif = next(
+            item
+            for item in cli_objects
+            if item["type"] == "yara_rule"
+            and item["canonical_id"] == str(no_motif_candidate.id)
+        )
+        assert cli_files[cli_no_motif["filename"]] == no_motif_source.encode()
+        assert cli_no_motif["metadata"]["author"] == "bridge"
+        assert cli_no_motif["metadata"]["origin_tool"] == "rule.propose_bridge"
+        cli_suricata = [item for item in cli_objects if item["type"] == "suricata_rule"]
+        assert len(cli_suricata) == 1
+        assert cli_files[cli_suricata[0]["filename"]] == suricata_source.encode()
+        assert cli_suricata[0]["metadata"]["candidate_id"] == suricata_candidate_id
+        assert cli_suricata[0]["metadata"]["rule_syntax_validation"] == "valid"
+        assert cli_suricata[0]["metadata"]["pcap_test_status"] == "not_tested"
         assert cli_manifest["opinion_preview"]["status"] == "indisponible"
         assert cli_manifest["opinion_preview"]["reason"] == (
             "indisponible: aucun avis brouillon disponible"
