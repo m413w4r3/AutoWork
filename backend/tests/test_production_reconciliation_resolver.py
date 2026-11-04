@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -630,3 +631,49 @@ def test_bridge_lookup_id_ignores_the_sha256_fingerprint_of_the_idempotency_key(
     assert _bridge_id_in({"bridge_request_id": "11111111-2222-3333-4444-555555555555:a1"}) == (
         "11111111-2222-3333-4444-555555555555:a1"
     )
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_persisted_model_key_after_details_are_fingerprinted() -> None:
+    resolver, run, model, bridge, _ = _fixture(
+        BridgeTransportError(
+            "bridge_protocol_error",
+            "not found",
+            retryable=False,
+            status_code=404,
+            verified_no_answer=True,
+        )
+    )
+    request_id = model.bridge_request_id
+    assert request_id is not None
+    run.error_details = {
+        "bridge_request_id": f"sha256:{hashlib.sha256(request_id.encode()).hexdigest()[:16]}"
+    }
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=None)
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
+    assert bridge.calls == [request_id]
+    assert not run.requires_reconciliation
+
+
+@pytest.mark.asyncio
+async def test_probe_stays_undecided_when_no_reliable_bridge_identity_exists() -> None:
+    resolver, run, model, bridge, _ = _fixture(
+        BridgeTransportError(
+            "bridge_protocol_error",
+            "not found",
+            retryable=False,
+            status_code=404,
+            verified_no_answer=True,
+        )
+    )
+    model.bridge_request_id = None
+    model.submission_attempt = 0
+    run.error_details = {"bridge_request_id": "sha256:fa4502c0d2eb1b78"}
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=None)
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+    assert bridge.calls == []
+    assert run.requires_reconciliation

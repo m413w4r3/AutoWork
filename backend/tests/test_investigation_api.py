@@ -1030,6 +1030,7 @@ def test_start_accepts_explicit_operator_led_execution_mode() -> None:
 
 def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
     client, store = _client()
+    request_key = "operator-status-private-key-canary"
     store.investigations[INVESTIGATION_ID].version = 1
     pending_state = replace(
         _working_state(),
@@ -1043,7 +1044,7 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
         id=uuid4(),
         status=SimpleNamespace(value="needs_review"),
         error_code="operator_interrupted",
-        idempotency_key="synthetic-pending-turn-key",
+        idempotency_key=request_key,
     )
 
     response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
@@ -1056,6 +1057,9 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
         "lifecycle": "temporary_chat_per_turn",
     }
     assert body["last_operation"]["conversation_id_scope"] == ("local_autowork_record_only")
+    expected_fingerprint = f"sha256:{hashlib.sha256(request_key.encode()).hexdigest()[:16]}"
+    assert body["last_operation"]["id"] == expected_fingerprint
+    assert request_key not in response.text
     assert body["last_operation"]["decision_expected"] == (
         "reconcile interrupted Bridge turn before resume"
     )

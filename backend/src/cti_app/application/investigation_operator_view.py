@@ -10,6 +10,9 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
+from cti_app.application.bridge_identity import (
+    bridge_request_fingerprint,
+)
 from cti_app.application.bridge_investigator import (
     make_investigation_conversation_id,
     make_investigation_turn_idempotency_key,
@@ -241,9 +244,12 @@ def build_investigation_operator_view(
     )
 
     if pending_bridge_key is not None:
+        operator_pending_bridge_key = bridge_request_fingerprint(
+            pending_bridge_turn_key or pending_bridge_key
+        )
         last_operation: dict[str, Any] | None = {
             "kind": "bridge_turn",
-            "id": pending_bridge_turn_key or pending_bridge_key,
+            "id": operator_pending_bridge_key,
             "turn_id": pending_bridge_turn_id,
             "conversation_id": bridge_conversation_id,
             "conversation_id_scope": "local_autowork_record_only",
@@ -942,6 +948,14 @@ def _next_action(
     operator_reconciliation_vt_tool_versions: frozenset[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     prefix = f"/api/investigations/{investigation.id}"
+    pending_bridge_request_key = pending_bridge_turn_key
+    if pending_bridge_request_key is None:
+        pending_bridge_request_key = pending_bridge_key
+    operator_pending_bridge_key = (
+        bridge_request_fingerprint(pending_bridge_request_key)
+        if pending_bridge_request_key is not None
+        else None
+    )
     if active_jobs:
         return {
             "code": OperatorNextAction.WAIT_FOR_WORKER.value,
@@ -1059,7 +1073,7 @@ def _next_action(
             "preview_path": f"{turn_prefix}/visible/preview",
             "adopt_path": f"{turn_prefix}/visible/adopt",
             "query": {"subject_id": str(investigation.subject_id)},
-            "submission_key": pending_bridge_turn_key or pending_bridge_key,
+            "submission_key": operator_pending_bridge_key,
             "requires_human_reconciliation": True,
             "adoption_requires_expected_sha256": True,
             "resubmission_allowed": False,
@@ -1092,7 +1106,7 @@ def _next_action(
                 "preview_path": f"{turn_prefix}/visible/preview",
                 "adopt_path": f"{turn_prefix}/visible/adopt",
                 "query": {"subject_id": str(investigation.subject_id)},
-                "submission_key": pending_bridge_turn_key or pending_bridge_key,
+                "submission_key": operator_pending_bridge_key,
                 "requires_human_reconciliation": True,
                 "adoption_requires_expected_sha256": True,
                 "adoption_is_not_g2_g3_approval": True,
@@ -1103,7 +1117,7 @@ def _next_action(
             "method": "GET",
             "path": f"/api/model-conversations/{bridge_conversation_id}/turns",
             "query": {"subject_id": str(investigation.subject_id)},
-            "submission_key": pending_bridge_key,
+            "submission_key": operator_pending_bridge_key,
             "requires_human_reconciliation": True,
         }
     if state.stop_reason is StopReason.PERMISSION_REQUIRED:
