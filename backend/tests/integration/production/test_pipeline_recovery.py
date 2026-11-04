@@ -649,6 +649,7 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=1)
+    scenario.model.use_chatgpt_bridge_identity()
     scenario.model.script.q2(
         source_url=urls[0],
         response=BridgeTransportError(
