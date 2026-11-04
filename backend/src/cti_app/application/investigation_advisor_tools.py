@@ -397,6 +397,9 @@ class _AdvisorToolResultSnapshot:
 
 
 class InvestigationAdvisorTool:
+    # The context cost is measured on the one real prompt, not estimated up front.
+    reservation_cost_deferred = True
+
     def __init__(
         self,
         *,

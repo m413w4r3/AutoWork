@@ -1544,8 +1544,13 @@ class InvestigationService:
                         # its one real prompt, then resize this provisional amount
                         # to the measured cost before the provider handoff.
                         requested_cost[BudgetDimension.CONTEXT_TOKENS] = token_limit_remaining
+                # An adapter that defers its context estimate to the one real, measured prompt
+                # (the registered Advisor) keeps the full operator request as the durable, audited
+                # parameters; for any other adapter a zero estimate still predicts a refusal and
+                # only non-free-text identity fields are persisted.
                 advisor_preflight_refusal_expected = (
                     tool_name == "advisor.consult"
+                    and not getattr(adapter, "reservation_cost_deferred", False)
                     and dynamic_cost.get(BudgetDimension.CONTEXT_BYTES, 0) == 0
                     and dynamic_cost.get(BudgetDimension.CONTEXT_TOKENS, 0) == 0
                 )
@@ -1834,9 +1839,10 @@ class InvestigationService:
                 expected_envelope_version=envelope.version,
                 approval_decision_id=envelope.approval_decision_id,
                 invocation_arguments_sha256=invocation_arguments_digest(
-                    arguments
-                    if tool_name == "advisor.consult"
-                    else invocation.normalized_parameters,
+                    # The coordinator re-derives this digest from the persisted invocation
+                    # parameters (the operator's request), never from tool-internal rewrites
+                    # such as an ignored unknown optional reference.
+                    invocation.normalized_parameters,
                     passive_read_retry_trusted=(
                         None
                         if tool_name == "advisor.consult"

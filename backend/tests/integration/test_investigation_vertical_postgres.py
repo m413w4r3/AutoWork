@@ -1413,7 +1413,11 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             pivot_invocation = invocations_by_name["vt.intelligence_search"]
             download_invocation = invocations_by_name["vt.download_sample"]
             analysis_invocation = invocations_by_name["sample.analyze"]
-            advisor_invocation = invocations_by_name["advisor.consult"]
+            # Several advisor.consult invocations exist (the pre-transport refusal follows the
+            # real consultation): bind to the consultation by its invocation id.
+            advisor_invocation = next(
+                item for item in invocations if str(item.id) == advisor_result["invocation"]["id"]
+            )
             for name, invocation in invocations_by_name.items():
                 assert invocation.status.value == operator_results[name]["invocation"]["status"], (
                     tool_diagnostic(name, operator_results[name])
@@ -2007,8 +2011,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert incomplete_output["input_warnings"]
             assert incomplete_output["omissions"]
             assert any(
-                item["field"] == "sample_sha256"
-                for item in incomplete_output["input_warnings"]
+                item["field"] == "sample_sha256" for item in incomplete_output["input_warnings"]
             )
             assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_incomplete + 1
             incomplete_invocation_id = UUID(incomplete_advisor["invocation"]["id"])

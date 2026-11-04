@@ -1496,6 +1496,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 "sample_association",
                 "source_document",
                 "document",
+                "article",
                 "evidence_observation",
             }:
                 try:
@@ -1678,6 +1679,7 @@ class SqlAlchemyExternalEffectClaimStore:
             "sample_hash",
             "source_document",
             "document",
+            "article",
             "evidence_observation",
         }
         for reference in prepared.evidence_refs:

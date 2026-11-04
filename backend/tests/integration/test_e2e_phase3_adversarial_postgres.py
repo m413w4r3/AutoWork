@@ -954,6 +954,8 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             draft.opinion.id,
             version=revised_draft["version"],
             sha256=revised_draft["content_sha256"],
+            # No Bridge drafting in this journey: the human approver acknowledges the gap.
+            acknowledge_bridge_drafting_gap=True,
         )
         assert approved_opinion.status_code == 200, approved_opinion.text
         identity_provider.actor_id = "approver:m05d-human"
@@ -1045,9 +1047,8 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             revoked_attempt.json()["invocation"]["status"] == ToolInvocationStatus.UNAVAILABLE.value
         )
         assert revoked_attempt.json()["invocation"]["error_code"] == "tool_unavailable"
-        assert (
-            revoked_attempt.json()["output"]["error"]["reason"] == "external_llm_disclosure_denied"
-        )
+        # ``error.reason`` carries the operator-facing correction text for a denied disclosure.
+        assert "disclosure approval" in revoked_attempt.json()["output"]["error"]["reason"]
         assert len(transport.calls) == 4  # credential + signed-url + missing-ref + allowed
         assert transport.real_network_calls == 0
 
