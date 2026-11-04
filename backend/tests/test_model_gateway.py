@@ -953,6 +953,32 @@ async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() 
     assert transport.idempotency_keys == [f"{run.id}:a1", f"{run.id}:a2"]
 
 
+async def test_new_model_run_can_continue_the_bridge_attempt_suffix() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {
+                "id": "resp_attempt_two",
+                "status": "completed",
+                "output_text": "answered",
+            }
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_run_id = uuid4()
+    model_request = replace(
+        request(external_llm_allowed=True, run_id=model_run_id),
+        submission_attempt_offset=1,
+    )
+
+    execution = await gateway.research(model_request)
+
+    assert execution.output_text == "answered"
+    assert execution.run.submission_attempt == 2
+    assert execution.run.bridge_request_id == f"{model_run_id}:a2"
+    assert transport.idempotency_keys == [f"{model_run_id}:a2"]
+    assert model_uow.state[model_run_id].submission_attempt == 2
+
+
 async def test_qwen_trusted_gateway_runs_when_external_llm_is_forbidden() -> None:
     qwen = QwenAdapter(FixedChatTransport(), model="Qwen3-32B", is_external=False)
     model_uow = InMemoryModelRunUnitOfWorkFactory()

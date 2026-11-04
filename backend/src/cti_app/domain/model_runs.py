@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -511,6 +512,47 @@ class ModelRun:
             raise ValueError("ModelRun terminal failure was not verified")
         self.submission_state = ModelSubmissionState.NOT_SUBMITTED
         self.updated_at = now or datetime.now(UTC)
+
+    def reopen_after_verified_reconciliation_failure(
+        self, *, bridge_status: str, now: datetime | None = None
+    ) -> None:
+        """Make a Bridge-confirmed terminal failure eligible for the next attempt."""
+        if self.status is not ModelRunStatus.NEEDS_REVIEW:
+            raise ValueError("Only a ModelRun needing review can resolve a submission")
+        if self.submission_state is not ModelSubmissionState.EXTERNAL_STATE_UNKNOWN:
+            raise ValueError("ModelRun has no unresolved external submission")
+        status = " ".join(bridge_status.split()).casefold()
+        if status not in {
+            "failed",
+            "error",
+            "cancelled",
+            "canceled",
+            "rejected",
+            "not_found",
+        }:
+            raise ValueError("Bridge did not confirm a terminal failure")
+
+        timestamp = now or datetime.now(UTC)
+        previous_details = dict(self.error_details or {})
+        previous_details["verified_terminal_failure"] = {
+            "bridge_status": status,
+            "bridge_request_id_sha256": (
+                hashlib.sha256(self.bridge_request_id.encode()).hexdigest()
+                if self.bridge_request_id
+                else None
+            ),
+            "response_id": self.response_id,
+            "verified_at": timestamp.isoformat(),
+        }
+        self.status = ModelRunStatus.RUNNING
+        self.submission_state = ModelSubmissionState.VERIFIED_TERMINAL_FAILURE
+        self.error_code = None
+        self.error_message = None
+        self.error_details = previous_details
+        self.finished_at = None
+        self.updated_at = timestamp
+        self.response_id = None
+        self.reopen_after_confirmed_terminal_failure(now=timestamp)
 
     def begin_submission_attempt(
         self, *, bridge_request_id: str | None = None, now: datetime | None = None

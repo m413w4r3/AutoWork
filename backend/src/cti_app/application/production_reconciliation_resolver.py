@@ -78,8 +78,12 @@ class ProductionReconciliationResolver:
                 bridge_status = exc.bridge_status
                 if bridge_status is None and exc.status_code == 404:
                     bridge_status = "not_found"
-                if bridge_status in _FAILED_STATUSES | {"not_found"} and exc.verified_no_answer:
-                    outcome = await self._release(run_id, run)
+                self._last_bridge_status = bridge_status
+                if bridge_status in _FAILED_STATUSES and (exc.verified_no_answer or exc.retryable):
+                    outcome = await self._release(run_id, run, verified_bridge_status=bridge_status)
+                    return outcome
+                if bridge_status == "not_found" and exc.verified_no_answer:
+                    outcome = await self._release(run_id, run, verified_bridge_status=bridge_status)
                     return outcome
                 # A missing lookup or a generic transport failure does not prove
                 # that the exact submission can no longer yield an answer.
@@ -99,9 +103,17 @@ class ProductionReconciliationResolver:
                 return outcome
             if bridge_status in _PENDING_STATUSES:
                 return outcome
-            if bridge_status in _FAILED_STATUSES and _verified_no_answer(payload):
-                outcome = await self._release(run_id, run)
-                return outcome
+            if bridge_status in _FAILED_STATUSES:
+                text = _output_text(payload)
+                if text is not None:
+                    # A response is stronger evidence than a failed/retryable
+                    # marker. Adopt it and keep the exact attempt; never release
+                    # an available answer for a new prompt submission.
+                    outcome = await self._adopt_and_resume(run_id, run, payload, text)
+                    return outcome
+                if _verified_no_answer(payload) or _retryable(payload):
+                    outcome = await self._release(run_id, run, verified_bridge_status=bridge_status)
+                    return outcome
             # Failed without verified_no_answer, missing, and unknown states all
             # remain undecided. They must never authorize a new prompt POST.
             return outcome
@@ -138,15 +150,48 @@ class ProductionReconciliationResolver:
         if reconciliation.production_run_id != original.id:
             return ReconciliationOutcome.UNDECIDED
 
-        model = await self._model_gateway.adopt_recovery_output(
-            reconciliation.model_run_id,
-            text.encode("utf-8"),
-            provenance="automatic_bridge_retrieval",
-            actor_id="system:production-reconciliation",
-            external_turn_id=_verified_external_turn_id(payload),
-            bridge_response_id=_verified_bridge_response_id(payload),
-        )
         expected_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        get_model = getattr(self._model_gateway, "get_run", None)
+        existing_model = (
+            await get_model(reconciliation.model_run_id) if callable(get_model) else None
+        )
+        bridge_response_id = _verified_bridge_response_id(payload)
+        if existing_model is not None and (
+            existing_model.raw_output_reference is not None
+            or existing_model.raw_output_sha256 is not None
+        ):
+            if (
+                existing_model.status is not ModelRunStatus.SUCCEEDED
+                or existing_model.raw_output_reference is None
+                or existing_model.raw_output_sha256 != expected_sha256
+                or (
+                    bridge_response_id
+                    and existing_model.response_id
+                    and existing_model.response_id != bridge_response_id
+                )
+            ):
+                return ReconciliationOutcome.UNDECIDED
+            read_output = getattr(self._model_gateway, "read_output", None)
+            if not callable(read_output):
+                return ReconciliationOutcome.UNDECIDED
+            try:
+                archived = await read_output(existing_model.raw_output_reference, max_bytes=None)
+            except Exception:
+                return ReconciliationOutcome.UNDECIDED
+            if hashlib.sha256(archived).hexdigest() != expected_sha256:
+                return ReconciliationOutcome.UNDECIDED
+            # The exact bytes are already archived. Reuse the persisted result
+            # instead of asking the gateway to replace it with a second recovery.
+            model = existing_model
+        else:
+            model = await self._model_gateway.adopt_recovery_output(
+                reconciliation.model_run_id,
+                text.encode("utf-8"),
+                provenance="automatic_bridge_retrieval",
+                actor_id="system:production-reconciliation",
+                external_turn_id=_verified_external_turn_id(payload),
+                bridge_response_id=bridge_response_id,
+            )
         if (
             model.status is not ModelRunStatus.SUCCEEDED
             or model.raw_output_sha256 != expected_sha256
@@ -191,6 +236,7 @@ class ProductionReconciliationResolver:
         reason: str = "bridge_run_unavailable",
         audit_reason: str | None = None,
         actor_id: str | None = None,
+        verified_bridge_status: str | None = None,
     ) -> ReconciliationOutcome:
         bridge_run_id, is_request_key = _bridge_run_identity(original)
         if bridge_run_id is None and original.reconciliation is not None:
@@ -202,6 +248,41 @@ class ProductionReconciliationResolver:
                 return ReconciliationOutcome.UNDECIDED
             if run.reconciliation is None or run.current_stage is not original.current_stage:
                 return ReconciliationOutcome.UNDECIDED
+            model_runs = getattr(uow, "model_runs", None)
+            if model_runs is not None:
+                get_for_update = getattr(model_runs, "get_for_update", None)
+                model_run = await (
+                    get_for_update(run.reconciliation.model_run_id)
+                    if callable(get_for_update)
+                    else model_runs.get(run.reconciliation.model_run_id)
+                )
+                if (
+                    model_run is None
+                    or model_run.status is ModelRunStatus.SUCCEEDED
+                    or model_run.raw_output_reference is not None
+                    or model_run.raw_output_sha256 is not None
+                ):
+                    # A locally archived response wins over a lost declaration
+                    # or a stale Bridge failure marker.
+                    return ReconciliationOutcome.UNDECIDED
+                if audit_reason is not None:
+                    if model_run.status is not ModelRunStatus.NEEDS_REVIEW:
+                        return ReconciliationOutcome.UNDECIDED
+                    model_run.abandon_uncertain_submission(
+                        actor_id=actor_id or "unknown", reason=audit_reason
+                    )
+                else:
+                    if (
+                        model_run.status is not ModelRunStatus.NEEDS_REVIEW
+                        or verified_bridge_status is None
+                    ):
+                        return ReconciliationOutcome.UNDECIDED
+                    model_run.reopen_after_verified_reconciliation_failure(
+                        bridge_status=verified_bridge_status
+                    )
+                save_model = getattr(model_runs, "save", None)
+                if callable(save_model):
+                    await save_model(model_run)
             run.release_reconciliation(expected_stage=run.current_stage, reason=reason)
             await uow.production_runs.save(run)
             await uow.commit()
@@ -339,6 +420,13 @@ def _verified_no_answer(payload: dict[str, Any]) -> bool:
         return True
     error = payload.get("error")
     return isinstance(error, dict) and error.get("verified_no_answer") is True
+
+
+def _retryable(payload: dict[str, Any]) -> bool:
+    if payload.get("retryable") is True:
+        return True
+    error = payload.get("error")
+    return isinstance(error, dict) and error.get("retryable") is True
 
 
 def _output_text(payload: dict[str, Any]) -> str | None:

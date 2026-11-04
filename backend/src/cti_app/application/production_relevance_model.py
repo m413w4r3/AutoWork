@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
@@ -340,10 +340,18 @@ def relevance_classifier_invocation_hash(
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
-def relevance_classifier_model_run_id(run: ProductionRun, invocation_hash: str) -> UUID:
+def relevance_classifier_model_run_id(
+    run: ProductionRun, invocation_hash: str, *, generation: int = 0
+) -> UUID:
     if not isinstance(run, ProductionRun) or _SHA256.fullmatch(invocation_hash) is None:
         raise ValueError("Relevance classifier invocation identity is invalid")
-    return uuid5(NAMESPACE_URL, f"production-relevance-classifier:{run.id}:{invocation_hash}")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("Relevance classifier generation is invalid")
+    identity = f"production-relevance-classifier:{run.id}:{invocation_hash}"
+    # Preserve the original first-generation identity for deployed ModelRuns.
+    if generation:
+        identity += f":g{generation}"
+    return uuid5(NAMESPACE_URL, identity)
 
 
 def relevance_classifier_parse_identity(
@@ -490,7 +498,9 @@ def build_relevance_classifier_model_request(
         web_search=False,
         background=False,
         conversation=None,
-        run_id=relevance_classifier_model_run_id(run, invocation_hash),
+        run_id=relevance_classifier_model_run_id(
+            run, invocation_hash, generation=run.pipeline_generation
+        ),
         allow_failed_resubmit=True,
     )
 
@@ -863,6 +873,7 @@ class ModelRelevanceClassifier:
             contract_version=self._contract_version,
         )
         invocation_hash = str(request.metadata["relevance_classifier_invocation_hash"])
+        request = await self._request_for_generation(run, request, invocation_hash)
         model_calls = 0
         try:
             execution, archive_error = await self._verified_existing_execution(request)
@@ -1053,6 +1064,46 @@ class ModelRelevanceClassifier:
                 "warnings": list(parsed.warnings),
             },
         )
+
+    async def _request_for_generation(
+        self,
+        run: ProductionRun,
+        request: ModelRequest,
+        invocation_hash: str,
+    ) -> ModelRequest:
+        """Keep safe retries on their ModelRun; allocate a new identity after abandonment."""
+        if run.pipeline_generation <= 0 or request.run_id is None:
+            return request
+        current = await self._model_gateway.get_run(request.run_id)
+        if current is not None:
+            return request
+
+        previous: Any | None = None
+        for generation in range(run.pipeline_generation - 1, -1, -1):
+            previous_id = relevance_classifier_model_run_id(
+                run, invocation_hash, generation=generation
+            )
+            previous = await self._model_gateway.get_run(previous_id)
+            if previous is not None:
+                break
+        if previous is None:
+            return request
+
+        # An operator's lost declaration explicitly closes an uncertain attempt
+        # but cannot make it a provider-verified failure. Keep that row and its
+        # Bridge key intact, and use a fresh row for the next POST. Carry the
+        # ordinal forward so the external idempotency key is still `:a2` (or
+        # later) rather than being mistaken for the first attempt.
+        if previous.status is ModelRunStatus.FAILED and previous.error_code == "operator_abandoned":
+            return replace(
+                request,
+                submission_attempt_offset=max(0, int(previous.submission_attempt)),
+            )
+
+        # Verified terminal failures are reopened on the exact ModelRun so the
+        # gateway can safely allocate the next suffix on its existing identity.
+        # Successful archived output is also reused without another provider call.
+        return replace(request, run_id=previous.id)
 
     async def _verified_existing_execution(
         self, request: ModelRequest

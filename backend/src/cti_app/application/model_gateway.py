@@ -253,6 +253,10 @@ class ModelRequest:
     # Stateless requests (bulk extraction, drafting) carry no conversation at all.
     conversation: ConversationContext | None = None
     run_id: UUID | None = None
+    # Continue the ordinal for a deliberate new ModelRun that follows an
+    # operator-abandoned attempt. The prior ModelRun keeps its own immutable
+    # Bridge identity; this offset makes the next key end in the next `:aN`.
+    submission_attempt_offset: int = 0
     # A failed request is never retried implicitly.  This escape hatch is only
     # for a caller that has proved no provider submission took place.
     allow_failed_resubmit: bool = False
@@ -277,6 +281,12 @@ class ModelRequest:
             or self.timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be a finite positive number")
+        if (
+            isinstance(self.submission_attempt_offset, bool)
+            or not isinstance(self.submission_attempt_offset, int)
+            or self.submission_attempt_offset < 0
+        ):
+            raise ValueError("submission_attempt_offset must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -975,6 +985,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             evidence_pack_hash=request.evidence_pack_hash,
             parameters=safe_request.parameters,
             id=request.run_id or uuid4(),
+            submission_attempt=request.submission_attempt_offset,
         )
 
     async def resume(
