@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import ModelGateway, bridge_request_id_for_run
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
@@ -51,12 +52,19 @@ class ProductionReconciliationResolver:
 
     async def resolve(self, run_id: UUID) -> ReconciliationOutcome:
         run = await self._get_run(run_id)
-        bridge_run_id = _bridge_run_id(run) if run is not None else None
+        bridge_run_id, is_request_key = (
+            _bridge_run_identity(run) if run is not None else (None, False)
+        )
         if bridge_run_id is None and run is not None and run.reconciliation is not None:
             bridge_run_id = await self._bridge_lookup_id_from_model_run(run)
+            is_request_key = bridge_run_id is not None
         bridge_status: str | None = None
         outcome = ReconciliationOutcome.UNDECIDED
-        self._last_bridge_run_id = bridge_run_id
+        self._last_bridge_run_id = (
+            bridge_request_fingerprint(bridge_run_id)
+            if bridge_run_id is not None and is_request_key
+            else bridge_run_id
+        )
         self._last_bridge_status = None
         try:
             if run is None or not run.requires_reconciliation:
@@ -184,7 +192,10 @@ class ProductionReconciliationResolver:
         audit_reason: str | None = None,
         actor_id: str | None = None,
     ) -> ReconciliationOutcome:
-        bridge_run_id = _bridge_run_id(original)
+        bridge_run_id, is_request_key = _bridge_run_identity(original)
+        if bridge_run_id is None and original.reconciliation is not None:
+            bridge_run_id = await self._bridge_lookup_id_from_model_run(original)
+            is_request_key = bridge_run_id is not None
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get_for_update(run_id)
             if run is None or not run.requires_reconciliation:
@@ -200,7 +211,11 @@ class ProductionReconciliationResolver:
                 run_id=run_id,
                 subject_id=original.subject_id,
                 stage=original.current_stage.value,
-                bridge_run_id=bridge_run_id,
+                bridge_run_id=(
+                    bridge_request_fingerprint(bridge_run_id)
+                    if bridge_run_id is not None and is_request_key
+                    else bridge_run_id
+                ),
                 actor_id=actor_id or "unknown",
                 reason=audit_reason,
             )
@@ -243,17 +258,28 @@ def _bridge_id_in(source: dict[str, Any]) -> str | None:
     # timeout may leave only bridge_request_id (`<uuid>:aN`). The bridge route
     # accepts that exact idempotency key as a lookup alias; preserve the suffix
     # instead of guessing a different provider identity.
-    for key in ("bridge_run_id", "bridge_response_id", "bridge_request_id"):
+    identity, _ = _bridge_identity_in(source)
+    return identity
+
+
+def _bridge_identity_in(source: dict[str, Any]) -> tuple[str | None, bool]:
+    for key, is_request_key in (
+        ("bridge_run_id", False),
+        ("bridge_response_id", False),
+        ("bridge_request_id", True),
+    ):
         value = source.get(key)
         # Persisted error details expose only a ``sha256:`` fingerprint of the idempotency key
         # (never the key); a fingerprint cannot be looked up on Bridge, so keep searching and
         # fall back to the key stored on the ModelRun/reconciliation record.
         if isinstance(value, str) and value.strip() and not value.strip().startswith("sha256:"):
-            return value.strip()[:255]
-    return None
+            return value.strip()[:255], is_request_key
+    return None, False
 
 
-def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
+def _bridge_identity_for_model_run(
+    value: object, model_run_id: UUID
+) -> tuple[str | None, bool]:
     """Find the bridge identity recorded beside one exact ModelRun id.
 
     The identity may sit deeper than the run's own error details.  Anchoring
@@ -262,47 +288,47 @@ def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
     """
     if isinstance(value, list):
         for child in value:
-            found = _bridge_id_for_model_run(child, model_run_id)
-            if found is not None:
+            found = _bridge_identity_for_model_run(child, model_run_id)
+            if found[0] is not None:
                 return found
-        return None
+        return None, False
     if not isinstance(value, dict):
-        return None
+        return None, False
     if str(value.get("model_run_id")) == str(model_run_id):
-        found = _bridge_id_in(value)
+        found = _bridge_identity_in(value)
         nested = value.get("details")
-        if found is None and isinstance(nested, dict):
-            found = _bridge_id_in(nested)
-        if found is not None:
+        if found[0] is None and isinstance(nested, dict):
+            found = _bridge_identity_in(nested)
+        if found[0] is not None:
             return found
     for child in value.values():
-        found = _bridge_id_for_model_run(child, model_run_id)
-        if found is not None:
+        found = _bridge_identity_for_model_run(child, model_run_id)
+        if found[0] is not None:
             return found
-    return None
+    return None, False
 
 
-def _bridge_run_id(run: ProductionRun) -> str | None:
+def _bridge_run_identity(run: ProductionRun) -> tuple[str | None, bool]:
     details = run.error_details if isinstance(run.error_details, dict) else {}
     nested = details.get("details")
     sources = (details, nested) if isinstance(nested, dict) else (details,)
 
     for source in sources:
-        found = _bridge_id_in(source)
-        if found is not None:
+        found = _bridge_identity_in(source)
+        if found[0] is not None:
             return found
     reconciliation = run.reconciliation
     if reconciliation is None:
-        return None
-    anchored = _bridge_id_for_model_run(details, reconciliation.model_run_id)
-    if anchored is not None:
+        return None, False
+    anchored = _bridge_identity_for_model_run(details, reconciliation.model_run_id)
+    if anchored[0] is not None:
         return anchored
     if reconciliation.bridge_response_id:
-        return reconciliation.bridge_response_id[:255]
+        return reconciliation.bridge_response_id[:255], False
     if reconciliation.bridge_request_id:
         # The bridge supports its idempotency key as an exact GET lookup alias.
-        return reconciliation.bridge_request_id[:255]
-    return None
+        return reconciliation.bridge_request_id[:255], True
+    return None, False
 
 
 def _status(payload: dict[str, Any]) -> str | None:
