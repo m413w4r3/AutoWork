@@ -17,6 +17,7 @@ import httpx
 from pydantic import BaseModel
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.external_effects import (
     Ambiguous,
     Completed,
@@ -150,7 +151,7 @@ class HttpResponsesTransport:
             )
         except BridgeTransportError as exc:
             if idempotency_key:
-                exc.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
+                exc.bridge_request_id = bridge_request_fingerprint(idempotency_key)
             if not idempotency_key or not _should_reconcile_bridge_submission(exc):
                 raise
             return await self._reconcile_ambiguous_submission(
@@ -168,7 +169,7 @@ class HttpResponsesTransport:
         try:
             snapshot = await self.reconcile_bridge_submission(idempotency_key)
         except BridgeTransportError as reconcile_error:
-            reconcile_error.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
+            reconcile_error.bridge_request_id = bridge_request_fingerprint(idempotency_key)
             if (
                 reconcile_error.bridge_status == "failed"
                 and reconcile_error.verified_no_answer
@@ -1240,7 +1241,7 @@ def _ambiguous_bridge_submission_error(
 ) -> BridgeTransportError:
     run_id = bridge_run_id or submit_error.bridge_run_id
     received = confirmed_received or run_id is not None
-    request_fingerprint = _bridge_idempotency_fingerprint(idempotency_key)
+    request_fingerprint = bridge_request_fingerprint(idempotency_key)
     if received:
         message = (
             f"Bridge a reçu la soumission (run {run_id or 'identifiant indisponible'}), "
@@ -1275,10 +1276,6 @@ def _ambiguous_bridge_submission_error(
         conversation_id=submit_error.conversation_id,
         reason=submit_error.reason,
     )
-
-
-def _bridge_idempotency_fingerprint(idempotency_key: str) -> str:
-    return f"sha256:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _safe_bridge_diagnostics(value: dict[str, Any]) -> dict[str, Any]:

@@ -18,6 +18,10 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
+from cti_app.application.bridge_identity import (
+    bridge_request_fingerprint,
+    safe_bridge_request_fingerprint,
+)
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.external_effects import Reused
 from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
@@ -1877,7 +1881,7 @@ def _reconciliation_details(
     details["submission_state"] = details.get("submission_state", run.submission_state.value)
     details["reconciliation_phase"] = "reconciliation"
     if effective_request_id and "bridge_request_id" not in details:
-        details["bridge_request_id"] = _bridge_request_fingerprint(effective_request_id)
+        details["bridge_request_id"] = bridge_request_fingerprint(effective_request_id)
     return details
 
 
@@ -1910,7 +1914,7 @@ def _error_details(
     if isinstance(source_submission_state, str) and source_submission_state:
         details["submission_state"] = source_submission_state[:32]
     if isinstance(bridge_request_id, str) and bridge_request_id:
-        details["bridge_request_id"] = _bridge_request_fingerprint(bridge_request_id)
+        details["bridge_request_id"] = bridge_request_fingerprint(bridge_request_id)
     diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(diagnostics, dict) and diagnostics:
         details["bridge_diagnostics"] = _safe_error_diagnostics(diagnostics)
@@ -1931,7 +1935,7 @@ def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
                     continue
                 if name.casefold() in {"bridge_request_id", "idempotency_key", "request_id"}:
                     if isinstance(child, str) and child:
-                        result[name[:64]] = _safe_bridge_request_fingerprint(child)
+                        result[name[:64]] = safe_bridge_request_fingerprint(child)
                     continue
                 cleaned = clean(child, depth + 1)
                 if cleaned is not None:
@@ -1945,18 +1949,6 @@ def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
 
     result = clean(value)
     return result if isinstance(result, dict) else {}
-
-
-def _bridge_request_fingerprint(request_id: str) -> str:
-    return f"sha256:{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:16]}"
-
-
-def _safe_bridge_request_fingerprint(request_id: str) -> str:
-    if request_id.startswith("sha256:"):
-        digest = request_id.removeprefix("sha256:")
-        if re.fullmatch(r"[0-9a-f]{16,64}", digest):
-            return f"sha256:{digest[:16]}"
-    return _bridge_request_fingerprint(request_id)
 
 
 def _optional_metadata_text(metadata: dict[str, Any], key: str) -> str | None:

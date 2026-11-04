@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -1118,7 +1119,7 @@ def reconciliation_view(
         model_run_id=str(reconciliation.model_run_id),
         bridge_response_id=reconciliation.bridge_response_id,
         bridge_request_id=(
-            f"sha256:{hashlib.sha256(reconciliation.bridge_request_id.encode('utf-8')).hexdigest()[:16]}"
+            bridge_request_fingerprint(reconciliation.bridge_request_id)
             if reconciliation.bridge_request_id
             else None
         ),
