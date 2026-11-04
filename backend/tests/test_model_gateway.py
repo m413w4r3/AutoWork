@@ -2310,3 +2310,6 @@ def test_external_effect_refusal_reason_keeps_key_value_diagnostics_but_not_free
     assert _safe_external_effect_reason("free text with spaces and a secret") == (
         "unclassified_refusal"
     )
+    assert _safe_external_effect_reason("api_key=sk-live-1234") == "unclassified_refusal"
+    assert _safe_external_effect_reason("token=abc") == "unclassified_refusal"
+    assert _safe_external_effect_reason("a" + ("b" * 255)) == "unclassified_refusal"

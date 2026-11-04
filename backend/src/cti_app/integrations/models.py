@@ -799,7 +799,14 @@ def _bridge_submission_reconciliation_error(
 
 def _safe_external_effect_reason(value: object) -> str:
     """Keep internal refusal codes while excluding arbitrary exception text."""
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:=-]{0,255}", value):
+    if (
+        isinstance(value, str)
+        and len(value) <= 255
+        and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_.-]{0,95}(?::(?:id|t|s|h|a)=[A-Za-z0-9_.-]{1,64})*",
+            value,
+        )
+    ):
         return value
     return "unclassified_refusal"
 
