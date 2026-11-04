@@ -36,16 +36,20 @@ Import exact + provenance + idempotence concurrente : voir §1. Rapport de tests
 
 `backend/scripts/export_investigation_annex.py` → `manifest.json` + `manifest.sha256` déterministes, YARA (toutes versions, auteur/origine **dérivés de l'état canonique**, `not_recorded` sinon), Suricata (« non testée sur PCAP », jamais de replay inventé), IOC, inventaire samples, relations, hors-ligne depuis PostgreSQL + blobs vérifiés par SHA. Vue **publique** par défaut sans octets ; archive **restreinte** sur drapeau explicite et politique. Test PG de bout en bout (11 tests dont PG). **Défaut de sécurité réel trouvé par ce test et corrigé** : `samples.tlp` stocké en `RED` majuscules comparé à `'red'` → un échantillon TLP RED aurait été exportable. Revue indépendante : fuites de politique dans la vue publique (IOC, métadonnées, hash partagé entre sujets, règles) corrigées en F4.
 
-## 5. Tests exécutés (par l'orchestrateur, Python 3.12, sauf mention)
+## 5. Tests exécutés (par l'orchestrateur, Python 3.12)
 
-| Contrôle | Base `684e6546` | Fin M14 |
+Environnement : Typst réel via le binaire épinglé (`TYPST_BINARY=~/.local/share/autowork-tools/typst`, `FONT_BUNDLE_ROOT=…/chpTypst`, `TMPDIR` sous `$HOME`), PostgreSQL de test local `127.0.0.1:55432`.
+
+| Contrôle | Base `684e6546` | Fin M14 (`efe1cbb6`) |
 | --- | --- | --- |
-| Unitaires hors intégration | 39 échecs | **38 échecs, 5 964 passés** (aucun nouveau ; les 35 « Typst » passent avec le binaire épinglé `TYPST_BINARY=~/.local/share/autowork-tools/typst`, 3 `test_confined_analysis_dispatch` = environnement) |
-| PostgreSQL (`tests/integration`) | 9 échecs | **à reprendre en §7** |
-| Workflow emulator FAST | 20 passés, 2 échecs (W15, W16) | **20 passés, mêmes 2 échecs préexistants** |
-| `ruff check` / `format` | — | propre |
-| `mypy src tests` | 32 erreurs | 31–32 (aucune ligne modifiée) — l'écart avec la référence « 11 » de la mission est antérieur |
-| Frontend (investigation + api), typecheck, lint | non lancé | **29 tests passés, typecheck et lint propres** |
+| Unitaires hors intégration | 39 échecs (35 Typst d'environnement, 3 `test_confined_analysis_dispatch` d'environnement, 1 golden/C09) | **3 échecs, 6 016 passés** — uniquement les 3 `test_confined_analysis_dispatch` (déjà rouges sur la base, environnement). Les 35 « Typst » passent avec le binaire épinglé. |
+| PostgreSQL `tests/integration` | 9 échecs | **1 échec, 521 passés** — `test_operator_context_cas_and_advisor_egress_guard_postgres` (échoue aussi sur la base, voir §7) |
+| Workflow emulator FAST | 20 passés, 2 échecs | **20 passés, mêmes 2 échecs préexistants** (W15, W16) |
+| Test d'archive réel C01–C13 (corpus Run12, checkout principal) | échec C09 (48 octets) | passe |
+| Concurrence YARA (3 tests PG) | échec 12/40 exécutions | **0/40**, puis 3 exécutions supplémentaires vertes |
+| `ruff check` / `ruff format --check` | — | propres |
+| `mypy src tests` | 32 erreurs | 31 erreurs (aucune dans une ligne modifiée ; l'écart avec la « référence 11 » du mandat est antérieur) |
+| Frontend `pnpm test` (investigation + api, 29 tests), `typecheck`, `lint` | non lancé | passent |
 
 ## 6. Non fait / décisions utilisateur
 
@@ -55,8 +59,14 @@ Import exact + provenance + idempotence concurrente : voir §1. Rapport de tests
 
 ## 7. Risques et points ouverts connus
 
-- **P1 (revue finale, F)** : l'export public pouvait inclure la source de règles quand l'enveloppe est absente/révoquée — correctif fail-closed en cours (lot F5), à vérifier avant tout usage de l'export.
-- **Préexistant** : un scénario d'intégration (`test_operator_context_cas_and_advisor_egress_guard_postgres`, 2ᵉ consultation « autorisée ») échoue **aussi sur la base** : des preuves non citées ajoutées automatiquement au dossier portent des secrets AutoWork et le préflight bloque toute la consultation. Piste : écarter ces preuves auto-ajoutées avec omission observable plutôt que refuser.
-- **Plausible P2** : une révocation concurrente peut être validée entre la consommation et le handoff (la consommation est le point de linéarisation actuel).
-- W15/W16 (reprise d'invocations ambiguës) toujours rouges comme sur la base.
-- Un seul opérateur DeepSeek réel n'a pas été relancé : le gain de comportement dû aux skills est **non mesuré**.
+- **Préexistant, non corrigé** : `test_operator_context_cas_and_advisor_egress_guard_postgres` échoue aussi sur la base (2ᵉ consultation « autorisée » refusée) : des preuves non citées ajoutées automatiquement au dossier portent des secrets AutoWork (jeu de test volontaire) et le préflight de secrets bloque toute la consultation. Piste : écarter ces preuves auto-ajoutées avec omission observable, tout en gardant le refus dur pour une preuve explicitement citée.
+- **Contrat à confirmer** : des `evidence_refs` entièrement inconnues sont ignorées et signalées, la consultation continue sur le contexte canonique (lecture littérale de 4.3 : arguments facultatifs) ; une référence *nommée dans la question* et inexistante est une erreur avec références utilisables. Le préflight de secrets et les gardes de divulgation s'appliquent toujours au dossier continué (vérifié par les scénarios d'intégration). À confirmer par l'utilisateur si une erreur est préférée.
+- **P2 plausible (non corrigé)** : une révocation concurrente peut être validée entre la consommation (point de linéarisation actuel) et le handoff ; hors périmètre M14 (`external_effects` : `consume` puis `enter_handoff` en deux transactions).
+- **P3 (accepté)** : `_canonical_tool_measurement` sans ligne d'observation fait confiance à des champs d'un dossier assemblé en interne (jamais fournis par l'opérateur) ; un resserrement sur `source_file` casse des mesures archivées réelles.
+- **W15/W16** (reprise d'invocations ambiguës) toujours rouges comme sur la base.
+- **Non mesuré** : latence et qualité réelles des consultations Bridge ; effet des skills sur un opérateur réel ; aucune variante/PCAP/goodware (limites réelles de la plateforme actuelle).
+- **Revues indépendantes (Luna xhigh, lecture seule)** : A/B/C → FAIL/FAIL/PASS-réserves (corrigés A2, B2) ; D/E2/F → PASS/PASS/FAIL (F corrigé F4→F6) ; finale → A2 FAIL (clé brute dans la vue de statut, sanitiseur : corrigés A3), F3/F4 FAIL (règles : corrigé F5), B2 PASS-réserves, D2/E1/E3 PASS ; **revue du delta final (A3, E4, E6, F5, F6, correctif de relations)** : voir l'addendum ci-dessous.
+
+## 8. Livrables de la mission
+
+`docs/mission14/` : ce rapport, `M14_RESET_PLAN.md` (plan prêt, non exécuté), `M14_QUALIFICATION_PROTOCOL.md` (prêt, non exécuté). Archive historique vérifiée : `/home/nill/perso/work/AutoWork-backups/m14-pre-reset-20261103/`. Export d'annexes : `backend/scripts/export_investigation_annex.py`. Branche : `m14/final-production-readiness` (sous-branches `m14/*` mergées ; worktrees Paseo `~/.paseo/worktrees/0y1qsxa1/m14-*` à nettoyer après décision).
