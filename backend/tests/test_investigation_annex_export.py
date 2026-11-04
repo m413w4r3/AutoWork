@@ -230,9 +230,7 @@ def test_discovered_sample_distribution_uses_its_own_policy_gates(
     assert resolved_candidate.public_distribution_allowed is allowed
 
     output = tmp_path / case
-    write_investigation_annex(
-        InvestigationAnnexSnapshot(investigation_id, tuple(resolved)), output
-    )
+    write_investigation_annex(InvestigationAnnexSnapshot(investigation_id, tuple(resolved)), output)
     files = _file_bytes(output)
     manifest = _read_manifest(output)
     entry = next(item for item in manifest["objects"] if item["type"] == "discovered_sample")
