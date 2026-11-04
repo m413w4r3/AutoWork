@@ -16,7 +16,11 @@ from cti_app.application.investigation_annex_export import (
     write_investigation_annex,
 )
 from cti_app.domain.investigation import DetectionCandidateVersion, MotifProvenance
+from cti_app.infrastructure.database import investigation_annex_reader
 from cti_app.infrastructure.database.investigation_annex_reader import (
+    _provenance_event_public_restrictions_by_sha,
+    _public_distribution_policy,
+    _resolve_public_distribution_for_assets,
     _yara_version_origin_metadata,
 )
 
@@ -145,6 +149,158 @@ async def test_yara_origin_metadata_does_not_invent_missing_author_or_origin() -
     assert metadata["origin_invocation_id"] is None
     assert metadata["source_observation_ids"] == ()
     assert metadata["parent_version"] is None
+
+
+@pytest.mark.parametrize(
+    ("case", "candidate_sha", "global_restrictions", "sample_restrictions", "allowed"),
+    (
+        ("unacquired", "a" * 64, (), {"b" * 64: {"tlp_red"}}, True),
+        ("shared-red-sample", "b" * 64, (), {"b" * 64: {"tlp_red"}}, False),
+        (
+            "revoked-envelope",
+            "a" * 64,
+            ("g2_envelope_revoked",),
+            {"b" * 64: {"tlp_red"}},
+            False,
+        ),
+    ),
+)
+def test_discovered_sample_distribution_uses_its_own_policy_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    candidate_sha: str,
+    global_restrictions: tuple[str, ...],
+    sample_restrictions: dict[str, set[str]],
+    allowed: bool,
+) -> None:
+    if case == "revoked-envelope":
+        monkeypatch.setattr(
+            investigation_annex_reader,
+            "g2_envelope_authorization_state",
+            lambda envelope, decisions: SimpleNamespace(revoked=True),
+        )
+        policy_allowed, resolved_restrictions = _public_distribution_policy(
+            SimpleNamespace(disclosure=SimpleNamespace(tlp="green")), None, ()
+        )
+        assert policy_allowed is False
+        assert resolved_restrictions == global_restrictions
+
+    investigation_id = str(uuid4())
+    observation_id = str(uuid4())
+    pivot_sha = "b" * 64
+    candidate = AnnexAsset(
+        canonical_id=f"discovery:{case}",
+        type="discovered_sample",
+        investigation_id=investigation_id,
+        sha256=candidate_sha,
+        source="VirusTotal",
+        origin="file",
+        references=(observation_id,),
+        availability="present",
+        public_distribution_allowed=True,
+        metadata={"value": candidate_sha, "status": "not_acquired"},
+    )
+    restricted_observation = AnnexAsset(
+        canonical_id=observation_id,
+        type="evidence_observation",
+        investigation_id=investigation_id,
+        source="evidence_observations",
+        origin="file",
+        availability="restricted",
+        restrictions=("tlp_red",),
+        public_distribution_allowed=False,
+        metadata={"status": "restricted"},
+    )
+    pivot_observation = SimpleNamespace(
+        id=observation_id,
+        object_id=pivot_sha,
+        object_type="file",
+    )
+
+    resolved = _resolve_public_distribution_for_assets(
+        (restricted_observation, candidate),
+        public_distribution_allowed=not global_restrictions,
+        public_distribution_restrictions=global_restrictions,
+        sample_public_restrictions_by_sha=sample_restrictions,
+        known_sample_shas={pivot_sha},
+        observations=(pivot_observation,),
+    )
+    resolved_candidate = next(asset for asset in resolved if asset.type == "discovered_sample")
+    assert resolved_candidate.public_distribution_allowed is allowed
+
+    output = tmp_path / case
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(investigation_id, tuple(resolved)), output
+    )
+    files = _file_bytes(output)
+    manifest = _read_manifest(output)
+    entry = next(item for item in manifest["objects"] if item["type"] == "discovered_sample")
+    if allowed:
+        assert entry["availability"] == "present"
+        assert entry["sha256"] == candidate_sha
+        assert entry["metadata"]["status"] == "not_acquired"
+        assert candidate_sha.encode() in b"\n".join(files.values())
+    else:
+        assert entry["availability"] == "restricted"
+        assert entry["sha256"] is None
+        assert entry["metadata"] == {"status": "restricted"}
+        assert candidate_sha.encode() not in b"\n".join(files.values())
+
+
+def test_red_provenance_event_restricts_only_its_sample_hash(tmp_path: Path) -> None:
+    sample_id = uuid4()
+    red_sample = SimpleNamespace(id=sample_id)
+    red_event = SimpleNamespace(tlp="RED")
+    unrelated_sample = SimpleNamespace(id=uuid4())
+    green_event = SimpleNamespace(tlp="GREEN")
+
+    restrictions = _provenance_event_public_restrictions_by_sha(
+        {
+            "a" * 64: (red_sample,),
+            "b" * 64: (unrelated_sample,),
+        },
+        {
+            sample_id: (red_event,),
+            unrelated_sample.id: (green_event,),
+        },
+        red_event_sample_shas=("c" * 64,),
+    )
+
+    assert restrictions == {
+        "a" * 64: {"provenance_event_tlp_red"},
+        "c" * 64: {"provenance_event_tlp_red"},
+    }
+    candidate = AnnexAsset(
+        canonical_id="red-event-candidate",
+        type="discovered_sample",
+        investigation_id=str(uuid4()),
+        sha256="c" * 64,
+        source="VirusTotal",
+        origin="file",
+        public_distribution_allowed=True,
+        metadata={"status": "not_acquired", "value": "c" * 64},
+    )
+    resolved = _resolve_public_distribution_for_assets(
+        (candidate,),
+        public_distribution_allowed=True,
+        public_distribution_restrictions=(),
+        sample_public_restrictions_by_sha=restrictions,
+        known_sample_shas={"c" * 64},
+        observations=(),
+    )
+    assert resolved[0].public_distribution_allowed is False
+    assert "provenance_event_tlp_red" in resolved[0].restrictions
+
+    output = tmp_path / "red-provenance"
+    write_investigation_annex(
+        InvestigationAnnexSnapshot(candidate.investigation_id, tuple(resolved)), output
+    )
+    manifest = _read_manifest(output)
+    entry = next(item for item in manifest["objects"] if item["type"] == "discovered_sample")
+    assert entry["availability"] == "restricted"
+    assert entry["sha256"] is None
+    assert ("c" * 64).encode() not in b"\n".join(_file_bytes(output).values())
 
 
 def test_annex_exports_are_reproducible_and_keep_every_rule_byte(tmp_path: Path) -> None:
