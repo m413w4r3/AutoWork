@@ -458,10 +458,26 @@ async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Pa
         "pid": event["pid"],
         "subject_id": str(run.subject_id),
         "stage": "references",
-        "bridge_run_id": "bridge-request:a1",
+        "bridge_run_id": "sha256:" + hashlib.sha256(b"bridge-request:a1").hexdigest()[:16],
         "actor_id": "analyst-1",
         "reason": "Chrome a été fermé et la conversation est introuvable",
     }
+
+
+@pytest.mark.asyncio
+async def test_declared_lost_keeps_a_real_bridge_run_id_in_diagnostics(tmp_path: Path) -> None:
+    resolver, run, _, _, _ = _fixture(
+        BridgeTransportError("bridge_timeout", "timeout", retryable=True)
+    )
+    resolver._diagnostics = DiagnosticsLog.from_env(tmp_path)
+    run.error_details = {"bridge_run_id": "resp_bridge_123"}
+
+    assert await resolver.release_declared_lost(run.id, "operator confirmed lost") is (
+        ReconciliationOutcome.RELEASED
+    )
+
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    assert event["bridge_run_id"] == "resp_bridge_123"
 
 
 class _Jobs:
@@ -583,9 +599,16 @@ async def test_probe_resumes_a_run_adopted_by_an_api_probe_without_a_stage_job()
 async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
     tmp_path: Path, attempt: int, next_attempt: int
 ) -> None:
-    resolver, run, _, bridge, gateway = _fixture(
+    resolver, run, model, bridge, gateway = _fixture(
         BridgeTransportError("bridge_timeout", "timeout", retryable=True)
     )
+    request_id = model.bridge_request_id
+    assert request_id is not None
+    run.error_details = {
+        "bridge_request_id": f"sha256:{hashlib.sha256(request_id.encode()).hexdigest()[:16]}"
+    }
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=None)
     jobs = _Jobs()
     dispatcher = _Dispatcher()
     chain = ProductionStageChain()
@@ -615,7 +638,10 @@ async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
     assert event["event"] == "production.reconciliation_probe"
     assert event["run_id"] == str(run.id)
     assert event["subject_id"] == str(run.subject_id)
-    assert event["bridge_run_id"] == "bridge-request:a1"
+    request_fingerprint = hashlib.sha256(request_id.encode()).hexdigest()[:16]
+    assert event["bridge_run_id"] == f"sha256:{request_fingerprint}"
+    assert request_id not in json.dumps(event)
+    assert bridge.calls == [request_id]
     assert event["attempt"] == attempt
     assert event["outcome"] == ReconciliationOutcome.UNDECIDED.value
 
