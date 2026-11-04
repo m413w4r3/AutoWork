@@ -19,7 +19,7 @@ Un finding n'est ni une hypothèse ni une réponse Bridge. Proposer un finding *
 
 ## Audit et prose livrée
 
-La provenance (observations, versions, auteurs, hashes) vit dans la couche canonique. Le texte destiné au lecteur n'imprime aucun marqueur interne (`SUPPORTED`, `PARTIAL`, `bridge_authored`, `observation_ref`, `confidence=`) ; les affirmations techniques importantes doivent rester retrouvables dans l'état canonique par un auditeur externe.
+La provenance (observations, versions, auteurs, hashes) vit dans la couche canonique. Pour chaque section analytique destinée au rapport, demande une proposition Bridge avec `draft_text`, puis vérifie les faits et intègre le texte en prose naturelle. Les références sont facultatives; omets celles que tu ne peux pas confirmer. Le texte lecteur n'imprime aucun marqueur interne (`SUPPORTED`, `PARTIAL`, `bridge_authored`, `observation_ref`, `confidence=`); les affirmations techniques importantes restent retrouvables dans l'état canonique.
 
 ## Une valeur dérivée doit exister comme observation
 
