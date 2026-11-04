@@ -65,6 +65,11 @@ from cti_app.application.content_pivot_candidates import (
     verify_content_pattern_candidates,
 )
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+from cti_app.application.external_effects import (
+    VIRUSTOTAL_OBSERVATION_SOURCE,
+    BridgeVTFileReportHashes,
+    resolve_bridge_vt_file_report_hashes,
+)
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_tools import (
     ToolConfidentiality,
@@ -118,6 +123,20 @@ ADVISOR_REPARSE_TOOL_NAME = "advisor.reparse"
 ADVISOR_REPARSE_SCHEMA_VERSION = "advisor-reparse.v1"
 ADVISOR_OPERATOR_TOOL_NAMES = frozenset({ADVISOR_TOOL_NAME, ADVISOR_REPARSE_TOOL_NAME})
 _UUID = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _vt_file_report_has_unconfirmed_marker(payload: object) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    status = payload.get("status")
+    return (
+        payload.get("external_effect_unconfirmed") is True
+        or payload.get("needs_review") is True
+        or payload.get("adapter_output_archived") is False
+        or (isinstance(status, str) and status.casefold() in {"needs_review", "unconfirmed"})
+    )
+
+
 _UUID_REFERENCE_IN_QUESTION = re.compile(
     r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
 )
@@ -304,6 +323,9 @@ class _AdvisorConsultationContext:
     blob_descriptors: dict[UUID, Any | None] = field(default_factory=dict)
     observation_payloads: dict[tuple[UUID, str], Any | None] = field(default_factory=dict)
     observation_payload_failures: dict[tuple[UUID, str], str] = field(default_factory=dict)
+    bridge_vt_file_report_hashes: dict[UUID, BridgeVTFileReportHashes | None] = field(
+        default_factory=dict
+    )
     measurement_rows_by_observation: dict[UUID, tuple[dict[str, Any], ...]] = field(
         default_factory=dict
     )
@@ -820,6 +842,17 @@ class InvestigationAdvisorTool:
                         protected_refs,
                     )
 
+                evidence, vt_report_omissions = await self._filter_uncitable_vt_file_observations(
+                    evidence
+                )
+                if vt_report_omissions:
+                    omitted_ids = {UUID(item["id"]) for item in vt_report_omissions}
+                    explicit_evidence = tuple(
+                        item for item in explicit_evidence if item.id not in omitted_ids
+                    )
+                    arguments = dict(arguments)
+                    arguments["evidence_refs"] = [str(item.id) for item in explicit_evidence]
+
                 prompt_data = await self._consultation_data(
                     consultation_type=consultation_type,
                     investigation_id=context.investigation_id,
@@ -830,6 +863,11 @@ class InvestigationAdvisorTool:
                     context=context,
                     question=question.strip(),
                 )
+                if vt_report_omissions:
+                    prompt_data["_advisor_omissions"] = [
+                        *prompt_data.get("_advisor_omissions", ()),
+                        *vt_report_omissions,
+                    ]
                 omissions = list(prompt_data.get("_disclosure_omissions", ()))
                 omissions.extend(
                     {
@@ -1596,6 +1634,15 @@ class InvestigationAdvisorTool:
                 ) = await self._split_unassociated_hash_observations(
                     context.investigation_id, evidence, protected_refs
                 )
+            evidence, vt_report_omissions = await self._filter_uncitable_vt_file_observations(
+                evidence
+            )
+            if vt_report_omissions:
+                omitted_ids = {UUID(item["id"]) for item in vt_report_omissions}
+                explicit_evidence = tuple(
+                    item for item in explicit_evidence if item.id not in omitted_ids
+                )
+                arguments["evidence_refs"] = [str(item.id) for item in explicit_evidence]
             prompt_data = await self._consultation_data(
                 consultation_type=consultation_type,
                 investigation_id=context.investigation_id,
@@ -1606,6 +1653,11 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            if vt_report_omissions:
+                prompt_data["_advisor_omissions"] = [
+                    *prompt_data.get("_advisor_omissions", ()),
+                    *vt_report_omissions,
+                ]
             input_warnings = prompt_data.pop("_input_warnings", [])
             if unassociated_hash_evidence:
                 prompt_data["_disclosure_omissions"] = [
@@ -2028,6 +2080,11 @@ class InvestigationAdvisorTool:
                 if cached_refusal is not None:
                     refusal_output = {
                         **cached_refusal,
+                        **(
+                            {"omissions": [dict(item) for item in vt_report_omissions]}
+                            if vt_report_omissions
+                            else {}
+                        ),
                         "repeat_refusal_short_circuited": True,
                         "refusal_fingerprint": refusal_fingerprint,
                         "confirmed_non_execution": True,
@@ -2076,6 +2133,11 @@ class InvestigationAdvisorTool:
                     "dossier_sha256": dossier.sha256,
                     "dossier_bytes": dossier.byte_size,
                     **(
+                        {"omissions": [dict(item) for item in vt_report_omissions]}
+                        if vt_report_omissions
+                        else {}
+                    ),
+                    **(
                         {
                             "disclosure_restricted_refs": [
                                 str(item) for item in restricted_evidence_refs
@@ -2116,6 +2178,7 @@ class InvestigationAdvisorTool:
                             "completeness_counts",
                             "dossier_sha256",
                             "dossier_bytes",
+                            "omissions",
                         }
                     }
                     if len(self._preflight_refusals) > 128:
@@ -2774,6 +2837,14 @@ class InvestigationAdvisorTool:
                 },
                 prompt_data=prompt_data,
                 execution_timeout_seconds=execution_timeout_seconds,
+            )
+        if vt_report_omissions:
+            result = replace(
+                result,
+                output={
+                    **dict(result.output),
+                    "omissions": [dict(item) for item in vt_report_omissions],
+                },
             )
         if response_link_observation is not None:
             result = replace(
@@ -6570,11 +6641,18 @@ class InvestigationAdvisorTool:
 
         current = self._consultation_context(observation.investigation_id)
         payload_key = (observation.blob_id, observation.sha256)
+        is_bridge_vt_file_report = (
+            observation.source == VIRUSTOTAL_OBSERVATION_SOURCE
+            and observation.object_type == "file"
+            and observation.kind is EvidenceKind.VT_FILE_REPORT
+        )
         if current is not None and payload_key in current.observation_payloads:
             reason = current.observation_payload_failures.get(payload_key)
             if reason is not None:
                 failed(reason)
             return current.observation_payloads[payload_key]
+        if current is not None and is_bridge_vt_file_report:
+            current.bridge_vt_file_report_hashes[observation.id] = None
         try:
             blob = await self._get_blob_descriptor(observation.blob_id)
         except Exception:
@@ -6591,6 +6669,14 @@ class InvestigationAdvisorTool:
             failure_reason = (
                 "Canonical observation blob is unreadable because its blob descriptor is "
                 "unavailable; restore or repair the canonical blob before retrying."
+            )
+        elif is_bridge_vt_file_report and getattr(descriptor, "logical_bucket", None) not in {
+            "evidence",
+            "investigation-evidence",
+        }:
+            failure_reason = (
+                "Canonical VirusTotal file report is not archived in an evidence bucket; "
+                "restore it to canonical evidence storage before retrying."
             )
         elif getattr(descriptor, "sha256", None) != observation.sha256:
             failure_reason = (
@@ -6617,6 +6703,17 @@ class InvestigationAdvisorTool:
                         "reference."
                     )
                 else:
+                    if current is not None and is_bridge_vt_file_report:
+                        current.bridge_vt_file_report_hashes[observation.id] = (
+                            resolve_bridge_vt_file_report_hashes(
+                                family="advisor.consult",
+                                source=observation.source,
+                                object_type=observation.object_type,
+                                observation_kind=observation.kind.value,
+                                object_id=observation.object_id,
+                                report_content=raw,
+                            )
+                        )
                     payload = json.loads(raw)
             except Exception:
                 failure_reason = (
@@ -6751,6 +6848,70 @@ class InvestigationAdvisorTool:
                     }
                 )
         return rows
+
+    async def _filter_uncitable_vt_file_observations(
+        self, evidence: tuple[EvidenceObservation, ...]
+    ) -> tuple[tuple[EvidenceObservation, ...], tuple[dict[str, Any], ...]]:
+        """Drop VT file references unless their canonical report can ground Bridge."""
+        kept: list[EvidenceObservation] = []
+        omissions: list[dict[str, Any]] = []
+        current = self._consultation_context()
+        for item in evidence:
+            if item.source != VIRUSTOTAL_OBSERVATION_SOURCE or item.object_type != "file":
+                kept.append(item)
+                continue
+
+            cause: str | None = None
+            if item.kind is not EvidenceKind.VT_FILE_REPORT:
+                cause = "observation_kind_not_vt_file_report"
+            elif current is None:
+                cause = "verified_consultation_context_unavailable"
+            else:
+                payload_key = (item.blob_id, item.sha256)
+                if item.id not in current.bridge_vt_file_report_hashes:
+                    # This reader enforces the canonical evidence bucket before it
+                    # delegates to the SHA-verified payload loader. That loader caches
+                    # both the parsed payload and the raw bytes used by the VT resolver.
+                    try:
+                        await self._load_observation_json_payload(item)
+                    except Exception:
+                        # A VT report is optional context. If its descriptor or store
+                        # lookup fails, keep the consultation usable and omit this ref.
+                        current.bridge_vt_file_report_hashes[item.id] = None
+                        cause = "vt_report_archive_lookup_unavailable"
+                payload = current.observation_payloads.get(payload_key)
+                if cause is None and _vt_file_report_has_unconfirmed_marker(payload):
+                    cause = "external_effect_unconfirmed_or_needs_review"
+                elif cause is None and current.bridge_vt_file_report_hashes.get(item.id) is None:
+                    cause = "vt_report_not_archived_or_identity_unverifiable"
+
+            if cause is None:
+                kept.append(item)
+                continue
+
+            observation_id = str(item.id)
+            omissions.append(
+                {
+                    "kind": "observation",
+                    "id": observation_id,
+                    "sha256": item.sha256,
+                    "source_ref": {
+                        "kind": "observation",
+                        "id": observation_id,
+                        "sha256": item.sha256,
+                    },
+                    "reason": "vt_report_not_archived_or_unverifiable",
+                    "cause": cause,
+                    "resource": "vt.file_report",
+                    "citation_hint": "Citer le SHA-256 du rapport VT archivé et vérifié.",
+                    "next_action": (
+                        "Relancer vt.file_report pour archiver un rapport vérifiable, puis citer "
+                        "le SHA-256 de ce rapport."
+                    ),
+                    "policy_omission": False,
+                }
+            )
+        return tuple(kept), tuple(omissions)
 
     async def _split_unassociated_hash_observations(
         self,
