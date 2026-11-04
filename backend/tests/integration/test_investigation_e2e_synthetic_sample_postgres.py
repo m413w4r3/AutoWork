@@ -874,22 +874,24 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 {
                     "consultation_type": "plan_investigation",
                     "question": "Check evidence completeness before local Advisor dispatch.",
-                    # An explicitly cited reference must resolve to this investigation.
+                    # An unresolvable cited reference is an optional hint: it is ignored and
+                    # reported, and the consultation continues on the canonical context.
                     "evidence_refs": [str(missing_ref)],
                 },
                 key=f"m05c-advisor-veto:missing-ref:{investigation_id}",
             )
             assert len(transport.calls) == before
-            # The registered Advisor adapter supplies accepted typed pre-submission
-            # proof (pre_transport_validation), so the refusal is a FAILED
-            # non-execution and the reservation is released.
+            # The dispatch gates still apply to the continued consultation: this fixture's
+            # canonical evidence carries a signed URL, so the secret preflight refuses it as a
+            # confirmed non-execution before any transport call.
             assert incomplete["invocation"]["status"] == "failed"
-            assert incomplete["invocation"]["error_code"] == "advisor_input_invalid"
             incomplete_output = incomplete["advisor_output"]
-            assert incomplete_output["advisor_status"] == "invalid_input"
-            assert incomplete_output["input_error_code"] == "evidence_reference_not_found"
+            assert incomplete_output["advisor_status"] == "refused"
+            assert incomplete_output["refusal_code"] == "autowork_credential_or_signed_url_detected"
             assert incomplete_output["confirmed_non_execution"] is True
-            assert incomplete_output["provider_usage"] == {"status": "not_submitted"}
+            assert incomplete_output["bridge_turns_consumed"] == 0
+            assert "reference_not_resolvable" in json.dumps(incomplete["output"], default=str)
+            assert str(missing_ref) in json.dumps(incomplete["output"], default=str)
 
             async with typed_uow_factory() as uow:
                 current = await uow.investigation_envelopes.get(investigation_id)

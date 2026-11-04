@@ -890,10 +890,11 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                 "arguments": {
                     "consultation_type": "plan_investigation",
                     "question": "Check evidence completeness before local Advisor dispatch.",
-                    # Unknown references are ignored; refusal happens when none resolves.
+                    # An unresolvable cited reference is ignored and reported; the consultation
+                    # continues on the canonical context (M14 4.3).
                     "evidence_refs": [str(uuid4())],
                 },
-                "purpose": "Check that a request citing only an absent reference is refused.",
+                "purpose": "Check that an absent optional reference is ignored, not substituted.",
                 "expected_version": latest_state.version,
                 "expected_sha256": latest_state.sha256,
             },
@@ -901,12 +902,16 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         )
         assert missing_ref.status_code == 200, missing_ref.text
         missing_payload = missing_ref.json()
-        # Typed pre-transport proof (confirmed non-execution) => FAILED, not NEEDS_REVIEW.
+        # The continued consultation is stopped by the AutoWork-credential preflight (this
+        # fixture seeds a signed URL and a configured credential in canonical evidence):
+        # typed pre-transport proof (confirmed non-execution) => FAILED, not NEEDS_REVIEW.
         assert missing_payload["invocation"]["status"] == ToolInvocationStatus.FAILED.value
-        assert missing_payload["invocation"]["error_code"] == "advisor_input_invalid"
-        assert missing_payload["advisor_output"]["advisor_status"] == "invalid_input"
+        assert missing_payload["advisor_output"]["advisor_status"] == "refused"
+        assert (
+            missing_payload["advisor_output"]["refusal_code"]
+            == "autowork_credential_or_signed_url_detected"
+        )
         assert missing_payload["advisor_output"]["confirmed_non_execution"] is True
-        assert missing_payload["advisor_output"]["provider_usage"] == {"status": "not_submitted"}
         assert transport.calls == []
         async with uow_factory() as uow:
             latest_state = await uow.investigation_states.get(investigation_id)
