@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Validate the M14 seed inputs and refuse unsafe partial writes.
+"""OBSOLETE for fresh-stack seeding; use m14_bootstrap_subject.py instead.
 
-The current production-state v5 importer requires the original production input
-lineage to exist locally. This seed intentionally does not synthesize that
-lineage from article text; it reports the incompatibility before any mutation.
+This historical production-state import preflight depends on original lineage
+that a fresh database does not have. Retained for reference only.
 """
 
 from __future__ import annotations
