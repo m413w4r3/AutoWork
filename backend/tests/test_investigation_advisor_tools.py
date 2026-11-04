@@ -12154,6 +12154,60 @@ async def test_optional_invalid_advisor_arguments_are_ignored_with_reasons() -> 
 
 
 @pytest.mark.asyncio
+async def test_context_evidence_is_not_added_to_normalized_operator_refs() -> None:
+    investigation_id = uuid4()
+    requested, requested_raw = make_observation(
+        investigation_id, {"schema": "requested-evidence.v1", "content": "Selected."}
+    )
+    contextual, contextual_raw = make_observation(
+        investigation_id, {"schema": "context-evidence.v1", "content": "Context."}
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The dossier includes both observations.", [str(requested.id)]
+            ),
+        )
+    )
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=requested,
+        raw=requested_raw,
+    )
+    install_advisor_evidence(
+        tool,
+        (requested, contextual),
+        {requested.blob_id: requested_raw, contextual.blob_id: contextual_raw},
+    )
+    original_consultation_data = tool._consultation_data
+    normalized_arguments: dict[str, Any] = {}
+    dossier_observation_ids: set[UUID] = set()
+
+    async def capture_arguments(**kwargs):
+        normalized_arguments.clear()
+        normalized_arguments.update(kwargs["arguments"])
+        dossier_observation_ids.update(item.id for item in kwargs["evidence"])
+        return await original_consultation_data(**kwargs)
+
+    tool._consultation_data = capture_arguments
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "question": "Review the selected analysis.",
+            "evidence_refs": [str(requested.id)],
+        },
+        make_context(investigation_id, key="advisor-explicit-context-refs"),
+    )
+
+    assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert normalized_arguments["evidence_refs"] == [str(requested.id)]
+    assert requested.id in dossier_observation_ids
+    assert contextual.id in dossier_observation_ids
+
+
+@pytest.mark.asyncio
 async def test_explicit_unknown_uuid_in_advisor_question_names_available_refs() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
