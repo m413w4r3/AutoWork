@@ -96,6 +96,7 @@ class BootstrapInputs:
     period_start: str
     period_end: str
     period: str
+    edition_languages: tuple[str, ...] = ("fr", "en")
 
 
 SourceInitializer = Callable[[str], Awaitable[None]]
@@ -275,6 +276,14 @@ def load_inputs(
     year, month = map(int, match.groups())
     if month < 1 or month > 12:
         raise ValueError("edition period month must be between 01 and 12")
+    raw_languages = (manifest.get("edition") or {}).get("languages") or ["fr", "en"]
+    if (
+        not isinstance(raw_languages, list)
+        or not raw_languages
+        or not all(isinstance(item, str) and item.strip() for item in raw_languages)
+    ):
+        raise ValueError("source manifest edition languages are invalid")
+    edition_languages = tuple(item.strip() for item in raw_languages)
     report = _build_report(tuple(sources))
     return BootstrapInputs(
         manifest_path=manifest_path,
@@ -287,6 +296,7 @@ def load_inputs(
         period_start=f"{year:04d}-{month:02d}-01",
         period_end=f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}",
         period=period,
+        edition_languages=edition_languages,
     )
 
 
@@ -306,7 +316,7 @@ def build_plan(inputs: BootstrapInputs, *, create_investigation: bool = False) -
             "country": "Iraq",
             "country_code": "IQ",
             "tlp": inputs.edition_tlp,
-            "languages": ["en"],
+            "languages": list(inputs.edition_languages),
         },
         "discovery": {
             "preview": "POST /api/editions/{edition_id}/discovery/import/preview",
@@ -418,6 +428,12 @@ async def _ensure_edition(client: httpx.AsyncClient, inputs: BootstrapInputs) ->
                 "The matching edition has a lower TLP than the source manifest; "
                 "refusing to import.",
             )
+        if list(edition.get("languages") or []) != list(inputs.edition_languages):
+            raise BootstrapError(
+                "edition_languages_mismatch",
+                "The matching edition has different publication languages than the "
+                "source manifest; use another --period.",
+            )
         return edition
     body = {
         "country": "Iraq",
@@ -425,7 +441,7 @@ async def _ensure_edition(client: httpx.AsyncClient, inputs: BootstrapInputs) ->
         "period_start": inputs.period_start,
         "period_end": inputs.period_end,
         "tlp": inputs.edition_tlp,
-        "languages": ["en"],
+        "languages": list(inputs.edition_languages),
     }
     try:
         return await _request_json(client, "POST", "/api/editions", expected=(201,), json_body=body)
