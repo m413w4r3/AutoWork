@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import tarfile
@@ -800,18 +801,18 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         monkeypatch.setattr(annex_cli, "MinioBlobStore", lambda *args, **kwargs: blob_store)
         monkeypatch.setattr(annex_cli, "create_postgres_engine", _new_engine)
         cli_output = tmp_path / "cli-research-permissive"
-        assert (
-            annex_cli.main(
-                [
-                    str(investigation.id),
-                    str(cli_output),
-                    "--profile",
-                    "m14_research_permissive",
-                    "--include-restricted-archive",
-                ]
-            )
-            == 0
+        # ``main`` is the synchronous CLI entry point (it runs its own event loop).
+        cli_status = await asyncio.to_thread(
+            annex_cli.main,
+            [
+                str(investigation.id),
+                str(cli_output),
+                "--profile",
+                "m14_research_permissive",
+                "--include-restricted-archive",
+            ],
         )
+        assert cli_status == 0
         assert cli_engine_factory_calls == [migrated_postgres_url]
         cli_payload = json.loads(capsys.readouterr().out)
         assert cli_payload["profile"] == "m14_research_permissive"

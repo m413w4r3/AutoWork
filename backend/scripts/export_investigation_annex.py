@@ -203,6 +203,7 @@ async def _render_latest_draft_preview(
     if latest is None:
         return None
     opinion_id, version, _created_at = latest
+
     def uow_factory() -> SqlAlchemyUnitOfWork:
         return SqlAlchemyUnitOfWork(session_factory)
 
@@ -252,8 +253,16 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    except Exception:
-        print("Annex export failed; sensitive source details were not printed", file=sys.stderr)
+    except Exception as exc:
+        print(
+            f"Annex export failed ({type(exc).__name__}); message withheld (may contain evidence)."
+            " Re-run with ANNEX_EXPORT_DEBUG=1 to print the traceback locally.",
+            file=sys.stderr,
+        )
+        if os.environ.get("ANNEX_EXPORT_DEBUG") == "1":
+            import traceback
+
+            traceback.print_exc()
         return 1
 
 
