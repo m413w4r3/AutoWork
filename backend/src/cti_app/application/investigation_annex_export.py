@@ -351,9 +351,40 @@ def _project_assets(
     projected_assets: list[AnnexAsset] = []
     type_ordinals: defaultdict[str, int] = defaultdict(int)
 
+    # A relation must not reveal the hash of a withheld asset (a distributable candidate that is
+    # "related to" a TLP RED sample would otherwise publish that sample's SHA-256).
+    withheld_shas = (
+        {
+            item.sha256
+            for item in assets
+            if item.sha256
+            and _public_projection(item, include_restricted_archive=False).availability
+            == "restricted"
+            and item.availability != "absent"
+        }
+        if not include_restricted_archive
+        else set()
+    )
+
     for asset in assets:
         path_asset = asset
         asset = _public_projection(asset, include_restricted_archive=include_restricted_archive)
+        related_sha = asset.metadata.get("related_to")
+        withheld_refs = tuple(item for item in asset.references if item in withheld_shas)
+        if (isinstance(related_sha, str) and related_sha in withheld_shas) or withheld_refs:
+            asset = replace(
+                asset,
+                references=tuple(item for item in asset.references if item not in withheld_shas),
+                restrictions=tuple(sorted({*asset.restrictions, "related_asset_hash_withheld"})),
+                metadata={
+                    **asset.metadata,
+                    **(
+                        {"related_to": None}
+                        if isinstance(related_sha, str) and related_sha in withheld_shas
+                        else {}
+                    ),
+                },
+            )
         type_ordinals[asset.type] += 1
         path = _asset_path(
             path_asset,
