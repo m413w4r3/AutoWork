@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Create the operator-led handoff and print a separate, unapproved G2 proposal.
+"""OBSOLETE for M14 fresh-stack bootstrap; use --create-investigation instead.
 
-This uses the post-synthesis application service directly. It creates no G2
-envelope and queues no investigation job; approval and the later start request
-remain separate operator actions.
+This historical direct-database helper is retained for reference only.
 """
 
 from __future__ import annotations
