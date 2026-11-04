@@ -901,16 +901,21 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
     )
 
     bridge_http_calls: list[tuple[str, str]] = []
+    bridge_response_counter = 0
 
     def mock_bridge(request: httpx.Request) -> httpx.Response:
+        nonlocal bridge_response_counter
         bridge_http_calls.append((request.method, request.url.path))
         if request.method == "GET" and request.url.path == "/v1/bridge/capabilities":
             return httpx.Response(200, json={"capabilities": []}, request=request)
         if request.method == "POST" and request.url.path == "/v1/responses":
+            # A real Bridge returns one distinct response id per request (model_runs.response_id
+            # is unique), so a second consultation must not reuse the first one's id.
+            bridge_response_counter += 1
             return httpx.Response(
                 200,
                 json={
-                    "id": "synthetic-bridge-response-1",
+                    "id": f"synthetic-bridge-response-{bridge_response_counter}",
                     "status": "completed",
                     "output_text": (
                         "advisor-wire.v1\n"
