@@ -1245,6 +1245,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             analysis_observation_id = analysis_observation.id
             assert str(analysis_observation_id) in analysis_result["invocation"]["response_refs"]
 
+            unknown_advisor_ref = uuid4()
             advisor_result = await invoke_operator_tool(
                 "advisor.consult",
                 "advisor-consult.v1",
@@ -1255,7 +1256,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         "loader candidate from an arbitrary file? State the observation and the "
                         "remaining uncertainty."
                     ),
-                    "evidence_refs": [str(analysis_observation_id)],
+                    "evidence_refs": [str(analysis_observation_id), str(unknown_advisor_ref)],
                     "assertions": [
                         {
                             "id": "static_analysis_measurement",
@@ -1284,6 +1285,12 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert (
                 isinstance(advisor_output, dict)
                 and advisor_output.get("advisor_status") == "succeeded"
+            ), tool_diagnostic("advisor.consult", advisor_result)
+            assert any(
+                item.get("field") == "evidence_refs"
+                and item.get("reference") == str(unknown_advisor_ref)
+                and item.get("reason") == "reference_not_resolvable"
+                for item in advisor_output.get("ignored_inputs", [])
             ), tool_diagnostic("advisor.consult", advisor_result)
             async with uow_factory() as uow:
                 advisor_observation = next(
@@ -1982,12 +1989,20 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 "advisor-consult.v1",
                 {
                     "consultation_type": "plan_investigation",
-                    "evidence_refs": [str(analysis_observation_id), str(uuid4())],
+                    "sample_sha256": hashlib.sha256(
+                        f"pretransport-unassociated:{investigation_id}:{uuid4()}".encode()
+                    ).hexdigest(),
                 },
                 key=refusal_key,
-                purpose="Verify durable budget release after a local pre-transport refusal.",
+                purpose=(
+                    "Verify durable budget release after an unassociated sample hash is refused."
+                ),
             )
             assert_tool_status("advisor.consult", pretransport_refusal, "failed")
+            assert (
+                pretransport_refusal["advisor_output"]["input_error_code"]
+                == "sample_hash_not_associated"
+            ), tool_diagnostic("advisor.consult", pretransport_refusal)
             assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
             refusal_invocation_id = UUID(pretransport_refusal["invocation"]["id"])
             async with uow_factory() as uow:
