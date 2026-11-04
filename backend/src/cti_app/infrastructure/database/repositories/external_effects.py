@@ -33,6 +33,7 @@ from cti_app.application.external_effects import (
     ReuseDecision,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
+    advisor_disclosure_policy,
     bridge_may_cite_provider_report_hash_without_sample,
     bridge_provider_report_requires_blob,
     bridge_provider_report_samples_conflict,
@@ -1285,14 +1286,20 @@ class SqlAlchemyExternalEffectClaimStore:
         if prepared.provider not in envelope.allowed_providers:
             raise _ConsumeDenied("provider_not_allowed")
         disclosure_tlp = (envelope.disclosure_tlp or "").casefold()
-        if disclosure_tlp in {"amber", "red"}:
-            raise _ConsumeDenied(f"tlp_{disclosure_tlp}")
-        if external_effect_source_do_not_submit_blocks(
-            prepared.family, envelope.disclosure_do_not_submit
-        ):
-            raise _ConsumeDenied("do_not_submit")
+        disclosure_policy = advisor_disclosure_policy()
+        if not disclosure_policy.ignores_restriction_labels(prepared.family):
+            if disclosure_tlp in {"amber", "red"}:
+                raise _ConsumeDenied(f"tlp_{disclosure_tlp}")
+            if external_effect_source_do_not_submit_blocks(
+                prepared.family, envelope.disclosure_do_not_submit
+            ):
+                raise _ConsumeDenied("do_not_submit")
         is_model_submission = _is_model_submission(prepared, family_binding)
-        if is_model_submission and not envelope.disclosure_external_llm_allowed:
+        if (
+            is_model_submission
+            and not envelope.disclosure_external_llm_allowed
+            and not disclosure_policy.ignores_restriction_labels(prepared.family)
+        ):
             raise _ConsumeDenied("external_llm_not_allowed")
         if (
             prepared.family.startswith(("acquisition.", "vt.download"))

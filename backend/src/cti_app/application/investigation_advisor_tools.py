@@ -68,6 +68,7 @@ from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.external_effects import (
     VIRUSTOTAL_OBSERVATION_SOURCE,
     BridgeVTFileReportHashes,
+    advisor_disclosure_policy,
     resolve_bridge_vt_file_report_hashes,
 )
 from cti_app.application.investigation_service import InvestigationService
@@ -102,6 +103,7 @@ from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetExceeded,
     BudgetReservation,
     BudgetReservationStatus,
     EvidenceKind,
@@ -415,6 +417,9 @@ class InvestigationAdvisorTool:
     ) -> None:
         self._transport = transport
         self._settings = settings
+        self._disclosure_policy = advisor_disclosure_policy(
+            getattr(settings, "advisor_disclosure_profile", "standard")
+        )
         self._investigations = investigations
         self._observations = observations
         self._findings = findings
@@ -434,7 +439,6 @@ class InvestigationAdvisorTool:
         self._ignored_advisor_inputs: dict[str, tuple[dict[str, Any], ...]] = {}
         self._reference_answers: dict[tuple[UUID, str, str], bool] = {}
         self._reference_payloads: dict[tuple[UUID, str], Any | None] = {}
-        self._reservation_durations_ms: dict[str, int] = {}
 
     def _consultation_context(
         self, investigation_id: UUID | None = None
@@ -695,252 +699,12 @@ class InvestigationAdvisorTool:
         arguments: Mapping[str, Any],
         context: ToolExecutionContext,
     ) -> Mapping[BudgetDimension, int]:
-        """Measure the context reservation from the task-selected dossier.
-
-        The estimate follows the same canonical evidence selection and prompt
-        renderer as execution. Execution rechecks disclosure policy before
-        submission; unselected sample bytes remain outside both prompts.
-        """
-        started_at = time.perf_counter()
-        try:
-            return await self._estimate_reservation_cost(arguments, context)
-        finally:
-            self._reservation_durations_ms[context.idempotency_key] = round(
-                (time.perf_counter() - started_at) * 1000
-            )
-            if len(self._reservation_durations_ms) > 128:
-                self._reservation_durations_ms.pop(next(iter(self._reservation_durations_ms)))
-
-    async def _estimate_reservation_cost(
-        self,
-        arguments: Mapping[str, Any],
-        context: ToolExecutionContext,
-    ) -> Mapping[BudgetDimension, int]:
-        no_context_cost = {
+        """Defer context accounting until the single rendered prompt is measured."""
+        del arguments
+        del context
+        return {
             BudgetDimension.CONTEXT_BYTES: 0,
             BudgetDimension.CONTEXT_TOKENS: 0,
-        }
-        try:
-            consultation_type = arguments.get("consultation_type")
-            question = arguments.get("question", "")
-            raw_refs = arguments.get("evidence_refs", ())
-            if not isinstance(consultation_type, str) or not isinstance(question, str):
-                return no_context_cost
-            if not isinstance(raw_refs, (list, tuple)):
-                raw_refs = ()
-            question, _malformed_claim_tokens = _sanitize_malformed_claim_tokens(question)
-            investigation = await self._investigations.get(context.investigation_id)
-            if investigation is None:
-                return no_context_cost
-            snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
-            if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
-                return no_context_cost
-            consultation_context = await self._make_consultation_context(
-                context.investigation_id,
-                investigation,
-                snapshot,
-            )
-            context_token = _CURRENT_ADVISOR_CONTEXT.set(consultation_context)
-            try:
-                requested_refs = _requested_uuid_references(question)
-                resolved_opinion_id = await self._resolved_question_opinion_id(
-                    context.investigation_id,
-                    consultation_type,
-                    question,
-                    arguments,
-                )
-                if resolved_opinion_id is not None:
-                    requested_refs = tuple(
-                        item for item in requested_refs if item != resolved_opinion_id
-                    )
-                explicit_refs: list[UUID] = []
-                for raw_ref in raw_refs:
-                    try:
-                        explicit_refs.append(UUID(str(raw_ref)))
-                    except (TypeError, ValueError):
-                        continue
-                explicit_refs.extend(requested_refs)
-                explicit_evidence = await self._load_cited_evidence(
-                    context, tuple(dict.fromkeys(explicit_refs))
-                )
-                auto_evidence = tuple(
-                    sorted(
-                        (
-                            item
-                            for item in consultation_context.observations
-                            if item.source not in {ADVISOR_TOOL_NAME, ADVISOR_RESPONSE_SOURCE}
-                        ),
-                        key=lambda item: (item.observed_at, str(item.id)),
-                        reverse=True,
-                    )
-                )
-                evidence_by_id = {item.id: item for item in (*explicit_evidence, *auto_evidence)}
-                evidence = tuple(evidence_by_id.values())
-                requested_finding_refs: tuple[UUID, ...] = ()
-                linked_finding_observation_refs: tuple[UUID, ...] = ()
-                if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
-                    finding_rows = self._latest_findings(
-                        tuple(
-                            item
-                            for item in consultation_context.findings
-                            if getattr(item, "investigation_id", context.investigation_id)
-                            == context.investigation_id
-                        )
-                    )
-                    if consultation_type == "figure_plan":
-                        try:
-                            requested_finding_refs = tuple(
-                                UUID(str(item)) for item in arguments.get("finding_refs", ())
-                            )
-                        except (TypeError, ValueError):
-                            return no_context_cost
-                    linked_finding_observation_refs = tuple(
-                        dict.fromkeys(
-                            ref
-                            for finding in finding_rows
-                            if not requested_finding_refs or finding.id in requested_finding_refs
-                            for ref in getattr(finding, "observation_refs", ())
-                        )
-                    )
-                    if linked_finding_observation_refs:
-                        linked_evidence = await self._load_evidence(
-                            context.investigation_id, linked_finding_observation_refs
-                        )
-                        evidence_by_id = {item.id: item for item in (*evidence, *linked_evidence)}
-                        evidence = tuple(evidence_by_id.values())
-
-                restricted_hashes = await self._restricted_sample_hashes(
-                    context.investigation_id,
-                    investigation.subject_id,
-                    context.envelope,
-                )
-                protected_refs = set(explicit_refs)
-                if consultation_type == "figure_plan":
-                    protected_refs.update(linked_finding_observation_refs)
-                restricted_evidence_rows: list[EvidenceObservation] = []
-                for item in evidence:
-                    references_restricted_sample = False
-                    for sample_hash in restricted_hashes:
-                        if await self._observation_references_sample(item, sample_hash):
-                            references_restricted_sample = True
-                            break
-                    if references_restricted_sample:
-                        restricted_evidence_rows.append(item)
-                restricted_evidence = tuple(restricted_evidence_rows)
-                restricted_refs = {item.id for item in restricted_evidence}
-                if restricted_refs.intersection(protected_refs):
-                    return no_context_cost
-                evidence = tuple(item for item in evidence if item.id not in restricted_refs)
-                unassociated_hash_evidence: tuple[EvidenceObservation, ...] = ()
-                if consultation_type not in _EDITORIAL_CONSULTATION_TYPES:
-                    (
-                        evidence,
-                        unassociated_hash_evidence,
-                    ) = await self._split_unassociated_hash_observations(
-                        context.investigation_id,
-                        evidence,
-                        protected_refs,
-                    )
-
-                evidence, vt_report_omissions = await self._filter_uncitable_vt_file_observations(
-                    evidence
-                )
-                if vt_report_omissions:
-                    omitted_ids = {UUID(item["id"]) for item in vt_report_omissions}
-                    explicit_evidence = tuple(
-                        item for item in explicit_evidence if item.id not in omitted_ids
-                    )
-                    arguments = dict(arguments)
-                    arguments["evidence_refs"] = [str(item.id) for item in explicit_evidence]
-
-                prompt_data = await self._consultation_data(
-                    consultation_type=consultation_type,
-                    investigation_id=context.investigation_id,
-                    investigation=investigation,
-                    snapshot=snapshot,
-                    evidence=evidence,
-                    arguments=arguments,
-                    context=context,
-                    question=question.strip(),
-                )
-                if vt_report_omissions:
-                    prompt_data["_advisor_omissions"] = [
-                        *prompt_data.get("_advisor_omissions", ()),
-                        *vt_report_omissions,
-                    ]
-                omissions = list(prompt_data.get("_disclosure_omissions", ()))
-                omissions.extend(
-                    {
-                        "kind": "observation",
-                        "id": str(item.id),
-                        "sha256": item.sha256,
-                        "source_ref": {
-                            "kind": "observation",
-                            "id": str(item.id),
-                            "sha256": item.sha256,
-                        },
-                        "reason": (
-                            "Intentionally omitted: not disclosable under current policy "
-                            "because its associated sample is restricted."
-                        ),
-                    }
-                    for item in restricted_evidence
-                )
-                omissions.extend(
-                    {
-                        "kind": "observation",
-                        "id": str(item.id),
-                        "sha256": item.sha256,
-                        "source_ref": {
-                            "kind": "observation",
-                            "id": str(item.id),
-                            "sha256": item.sha256,
-                        },
-                        "reason": (
-                            "Intentionally omitted: not disclosable under current policy "
-                            "because its sample hash is not associated with this investigation."
-                        ),
-                    }
-                    for item in unassociated_hash_evidence
-                )
-                if omissions:
-                    prompt_data["_disclosure_omissions"] = omissions
-                _drop_findings_linked_to_restricted_evidence(prompt_data, tuple(restricted_refs))
-                citation_refs = [str(item.id) for item in explicit_evidence]
-                if consultation_type == "figure_plan":
-                    citation_refs.extend(
-                        str(reference)
-                        for finding in prompt_data.get("findings", ())
-                        if isinstance(finding, Mapping)
-                        for reference in finding.get("observation_refs", ())
-                        if isinstance(reference, str)
-                    )
-                prompt_data["evidence_refs"] = list(dict.fromkeys(citation_refs))
-                prompt_data, _direct_findings = _redact_advisor_payload(
-                    prompt_data, settings=self._settings
-                )
-                dossier = build_advisor_dossier(prompt_data, envelope=context.envelope)
-                prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
-                prompt_data["dossier_text"] = dossier.text
-                prompt_data["dossier_sha256"] = dossier.sha256
-                prompt_data["dossier_bytes"] = dossier.byte_size
-                prompt_data["transmitted_refs"] = _transmitted_refs_for_dossier(
-                    prompt_data, snapshot, dossier.manifest
-                )
-                prompt_data["observation_refs"] = [
-                    item["id"]
-                    for item in prompt_data["transmitted_refs"]
-                    if item["kind"] == "observation"
-                ]
-                prompt = _fit_advisor_prompt(consultation_type, prompt_data, dossier=dossier)
-                estimated_bytes = len(prompt.encode("utf-8"))
-            finally:
-                _CURRENT_ADVISOR_CONTEXT.reset(context_token)
-        except Exception:
-            return no_context_cost
-        return {
-            BudgetDimension.CONTEXT_BYTES: estimated_bytes,
-            BudgetDimension.CONTEXT_TOKENS: max(1, (estimated_bytes + 3) // 4),
         }
 
     async def execute(
@@ -957,9 +721,6 @@ class InvestigationAdvisorTool:
         timing = _AdvisorStageTiming()
         token = _CURRENT_ADVISOR_TIMING.set(timing)
         context_token = _CURRENT_ADVISOR_CONTEXT.set(None)
-        reservation_duration = self._reservation_durations_ms.pop(context.idempotency_key, None)
-        if reservation_duration is not None:
-            timing.durations_ms["reservation_cost_ms"] = reservation_duration
         try:
             result = await self._execute(
                 arguments,
@@ -1519,7 +1280,9 @@ class InvestigationAdvisorTool:
                             reason
                             for item in matching_samples
                             for reason in _sample_disclosure_restriction_sources(
-                                item, context.envelope
+                                item,
+                                context.envelope,
+                                disclosure_profile=self._disclosure_policy.profile,
                             )
                         }
                     )
@@ -1614,7 +1377,11 @@ class InvestigationAdvisorTool:
                     },
                     error_code="advisor_disclosure_restricted",
                 )
-            if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
+            if not self._disclosure_policy.allows_disclosure(
+                InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope),
+                envelope_exists=context.envelope is not None,
+                family="advisor.consult",
+            ):
                 return self._finish(
                     context,
                     _attest_advisor_pre_submission(
@@ -1861,38 +1628,119 @@ class InvestigationAdvisorTool:
                     if isinstance(reference, str)
                 )
             prompt_data["evidence_refs"] = list(dict.fromkeys(explicit_observation_refs))
-            encoded_findings = _contains_encoded_operational_secrets(
-                prompt_data, settings=self._settings
-            )
-            prompt_data, direct_findings = _redact_advisor_payload(
-                prompt_data, settings=self._settings
-            )
-            secret_findings = tuple(
-                {
-                    (finding.location, finding.secret_type): finding
-                    for finding in (*encoded_findings, *direct_findings)
-                }.values()
+            prompt_data, secret_findings, secret_omissions = _sanitize_advisor_prompt_secrets(
+                prompt_data,
+                explicit_reference_ids=frozenset(explicit_observation_refs),
+                settings=self._settings,
             )
             redacted_secret_count = len(secret_findings)
-            if secret_findings or _marked_secret_field_survives(
-                prompt_data, settings=self._settings
-            ):
-                if not secret_findings:
-                    _, secret_findings = redact_operational_secrets_with_findings(
-                        prompt_data, settings=self._settings, include_host_paths=False
-                    )
-                    redacted_secret_count = len(secret_findings)
+            if _marked_secret_field_survives(prompt_data, settings=self._settings):
+                remaining_findings = _contains_encoded_operational_secrets(
+                    prompt_data, settings=self._settings
+                )
+                safe_findings = tuple(
+                    {
+                        (item.location, item.secret_type): item
+                        for item in (*secret_findings, *remaining_findings)
+                    }.values()
+                )
+                if not safe_findings:
+                    safe_findings = (PublicationSecretFinding("$", "configured_credential"),)
                 return await self._persist_preflight_refusal(
                     context,
                     consultation_type=consultation_type,
                     evidence_refs=tuple(item.id for item in evidence),
                     reason="autowork_credential_or_signed_url_detected",
-                    redacted_secret_count=redacted_secret_count,
-                    secret_findings=secret_findings,
+                    redacted_secret_count=max(redacted_secret_count, len(safe_findings)),
+                    secret_findings=safe_findings,
+                )
+            redacted_evidence_ids: set[str] = set()
+            for section in ("evidence", "measured_facts"):
+                rows = prompt_data.get(section, ())
+                if not isinstance(rows, (list, tuple)):
+                    continue
+                for source_row in rows:
+                    if not isinstance(
+                        source_row, Mapping
+                    ) or not _contains_advisor_redaction_marker(source_row):
+                        continue
+                    evidence_id = source_row.get("evidence_id", source_row.get("id"))
+                    if isinstance(evidence_id, str):
+                        redacted_evidence_ids.add(evidence_id)
+            for row in prompt_data.get("evidence", ()):
+                if not isinstance(row, dict):
+                    continue
+                identifier = row.get("evidence_id", row.get("id"))
+                if (
+                    not isinstance(identifier, str)
+                    or identifier not in explicit_observation_refs
+                    or identifier not in redacted_evidence_ids
+                ):
+                    continue
+                excerpts = row.get("content_excerpts", ())
+                existing_excerpts = (
+                    [dict(item) for item in excerpts if isinstance(item, Mapping)]
+                    if isinstance(excerpts, (list, tuple))
+                    else []
+                )
+                if not any(
+                    item.get("title") == "Service credential fragment redacted"
+                    for item in existing_excerpts
+                ):
+                    row["content_excerpts"] = [
+                        *existing_excerpts,
+                        {
+                            "kind": "text",
+                            "title": "Service credential fragment redacted",
+                            "text": "[redacted-autowork-credential]",
+                        },
+                    ]
+            if secret_omissions:
+                input_warnings.extend(
+                    {
+                        "field": "evidence",
+                        "code": "autowork_credential_evidence_omitted",
+                        "detail_safe": f"Automatically added evidence {item['id']} was omitted.",
+                    }
+                    for item in secret_omissions
+                )
+            if secret_findings:
+                has_cited_redaction = any(
+                    item.location.startswith(("$.evidence[", "$.measured_facts["))
+                    for item in secret_findings
+                )
+                existing_question = prompt_data.get("question")
+                redaction_notice = (
+                    "AutoWork removed a service credential from the cited evidence. "
+                    "The redacted fragment is [redacted-autowork-credential]."
+                    if has_cited_redaction
+                    else "AutoWork removed a service credential before submission. "
+                    "The redacted fragment is [redacted-autowork-credential]."
+                )
+                prompt_data["question"] = (
+                    f"{existing_question}\n\n{redaction_notice}"
+                    if isinstance(existing_question, str) and existing_question.strip()
+                    else redaction_notice
+                )
+                input_warnings.extend(
+                    {
+                        "field": "evidence",
+                        "code": "autowork_credential_redacted",
+                        "detail_safe": (
+                            "A cited evidence fragment was redacted before Bridge submission."
+                        ),
+                        "location": item.location,
+                        "secret_type": item.secret_type,
+                    }
+                    for item in secret_findings
                 )
             dossier_started_at = time.perf_counter()
             timing.mark("dossier_rendering")
-            dossier = build_advisor_dossier(prompt_data, envelope=context.envelope)
+            dossier = build_advisor_dossier(
+                prompt_data,
+                envelope=context.envelope,
+                disclosure_profile=self._disclosure_policy.profile,
+            )
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
             prompt_data["dossier_text"] = dossier.text
             prompt_data["dossier_sha256"] = dossier.sha256
@@ -1919,15 +1767,15 @@ class InvestigationAdvisorTool:
             reservation_key = _reservation_operation_key or context.idempotency_key
             reservation = _advisor_context_reservation(context, reservation_key)
             reserved_amounts = dict(reservation.amounts) if reservation is not None else {}
+            measured_tokens = max(1, (len(encoded) + 3) // 4)
+            measured_amounts = {
+                BudgetDimension.CONTEXT_BYTES: len(encoded),
+                BudgetDimension.CONTEXT_TOKENS: measured_tokens,
+            }
             if reservation is not None and (
                 BudgetDimension.CONTEXT_BYTES in reservation.amounts
                 or BudgetDimension.CONTEXT_TOKENS in reservation.amounts
             ):
-                measured_tokens = max(1, (len(encoded) + 3) // 4)
-                measured_amounts = {
-                    BudgetDimension.CONTEXT_BYTES: len(encoded),
-                    BudgetDimension.CONTEXT_TOKENS: measured_tokens,
-                }
                 exact_reservation = dict(reservation.amounts)
                 exact_reservation.update(measured_amounts)
                 if exact_reservation != dict(reservation.amounts):
@@ -1937,6 +1785,9 @@ class InvestigationAdvisorTool:
                                 context, reservation_key, measured_amounts
                             )
                             if isinstance(adjustment, FrameworkPreSubmissionProof):
+                                budget_exhausted = (
+                                    adjustment is FrameworkPreSubmissionProof.BUDGET_REJECTED
+                                )
                                 return await self._persist_preflight_failure(
                                     context,
                                     consultation_type=consultation_type,
@@ -1945,7 +1796,11 @@ class InvestigationAdvisorTool:
                                         "advisor_status": "budget_refused",
                                         "preflight_status": "BUDGET_BLOCKED",
                                         "failure_stage": "g2_context_reservation",
-                                        "failure_reason": "measured_prompt_reservation_failed",
+                                        "failure_reason": (
+                                            "approved_g2_budget_cannot_cover_measured_prompt"
+                                            if budget_exhausted
+                                            else "measured_reservation_update_unavailable"
+                                        ),
                                         "reservation_check_code": adjustment.value,
                                         "reserved_context_bytes": reservation.amounts.get(
                                             BudgetDimension.CONTEXT_BYTES, 0
@@ -1955,12 +1810,19 @@ class InvestigationAdvisorTool:
                                             BudgetDimension.CONTEXT_TOKENS, 0
                                         ),
                                         "measured_context_tokens": measured_tokens,
+                                        "remaining_context_tokens": context.budget.remaining.get(
+                                            BudgetDimension.CONTEXT_TOKENS
+                                        ),
                                         **reservation_overrun_details,
                                         "confirmed_non_execution": True,
                                         "bridge_turns_consumed": 0,
                                         "usable": False,
                                     },
-                                    error_code="advisor_context_reservation_mismatch",
+                                    error_code=(
+                                        "g2_context_budget_exhausted"
+                                        if budget_exhausted
+                                        else "advisor_budget_reservation_update_failed"
+                                    ),
                                 )
                             context = adjustment
                         else:
@@ -1969,7 +1831,7 @@ class InvestigationAdvisorTool:
                         reserved_amounts = (
                             dict(reservation.amounts) if reservation is not None else {}
                         )
-                    except Exception as exc:
+                    except BudgetExceeded as exc:
                         return await self._persist_preflight_failure(
                             context,
                             consultation_type=consultation_type,
@@ -1978,7 +1840,8 @@ class InvestigationAdvisorTool:
                                 "advisor_status": "budget_refused",
                                 "preflight_status": "BUDGET_BLOCKED",
                                 "failure_stage": "g2_context_reservation",
-                                "failure_reason": "measured_prompt_reservation_failed",
+                                "failure_reason": "approved_g2_budget_cannot_cover_measured_prompt",
+                                "budget_dimension": exc.dimension.value,
                                 "reserved_context_bytes": reserved_amounts.get(
                                     BudgetDimension.CONTEXT_BYTES, 0
                                 ),
@@ -1992,16 +1855,38 @@ class InvestigationAdvisorTool:
                                 "bridge_turns_consumed": 0,
                                 "usable": False,
                             },
-                            error_code="advisor_context_reservation_mismatch",
+                            error_code="g2_context_budget_exhausted",
+                        )
+                    except Exception as exc:
+                        return await self._persist_preflight_failure(
+                            context,
+                            consultation_type=consultation_type,
+                            evidence_refs=tuple(item.id for item in evidence),
+                            output={
+                                "advisor_status": "budget_refused",
+                                "preflight_status": "BUDGET_BLOCKED",
+                                "failure_stage": "g2_context_reservation",
+                                "failure_reason": "measured_reservation_update_unavailable",
+                                "reserved_context_bytes": reserved_amounts.get(
+                                    BudgetDimension.CONTEXT_BYTES, 0
+                                ),
+                                "measured_context_bytes": len(encoded),
+                                "reserved_context_tokens": reserved_amounts.get(
+                                    BudgetDimension.CONTEXT_TOKENS, 0
+                                ),
+                                "measured_context_tokens": measured_tokens,
+                                **reservation_overrun_details,
+                                "confirmed_non_execution": True,
+                                "bridge_turns_consumed": 0,
+                                "usable": False,
+                            },
+                            error_code="advisor_budget_reservation_update_failed",
                             exception_class=type(exc).__name__,
                         )
-                reservation_covers_prompt = (
-                    reserved_amounts.get(BudgetDimension.CONTEXT_BYTES, 0) >= len(encoded)
-                    and reserved_amounts.get(BudgetDimension.CONTEXT_TOKENS, 0) >= measured_tokens
-                    if context.reservation_adjuster is not None
-                    else reserved_amounts == exact_reservation
-                )
-                if not reservation_covers_prompt:
+                if (
+                    reserved_amounts.get(BudgetDimension.CONTEXT_BYTES, 0) < len(encoded)
+                    or reserved_amounts.get(BudgetDimension.CONTEXT_TOKENS, 0) < measured_tokens
+                ):
                     return await self._persist_preflight_failure(
                         context,
                         consultation_type=consultation_type,
@@ -2010,7 +1895,7 @@ class InvestigationAdvisorTool:
                             "advisor_status": "budget_refused",
                             "preflight_status": "BUDGET_BLOCKED",
                             "failure_stage": "g2_context_reservation",
-                            "failure_reason": "measured_prompt_cost_does_not_match_reservation",
+                            "failure_reason": "approved_g2_budget_cannot_cover_measured_prompt",
                             "reserved_context_bytes": reserved_amounts.get(
                                 BudgetDimension.CONTEXT_BYTES, 0
                             ),
@@ -2024,7 +1909,7 @@ class InvestigationAdvisorTool:
                             "bridge_turns_consumed": 0,
                             "usable": False,
                         },
-                        error_code="advisor_context_reservation_mismatch",
+                        error_code="g2_context_budget_exhausted",
                     )
             if _critical_prompt_data_was_truncated(consultation_type, prompt_data):
                 size_block_completeness = evaluate_advisor_evidence_preflight(
@@ -2795,8 +2680,20 @@ class InvestigationAdvisorTool:
             output_warnings = ["response_archival_failed", "structured_parse_unavailable"]
             if secret_count:
                 output_warnings.append("secret_redacted")
+            readable_unparsed = _advisor_reply_is_readable(advisory_text)
+            markdown_extractions = _extract_advisor_markdown(advisory_text)
+            extracted_elements = {
+                "advisory_sections": markdown_extractions["sections"],
+                "action_items": markdown_extractions["items"],
+                "critique_sections": markdown_extractions["critiques"],
+                "warning_sections": markdown_extractions["warnings"],
+            }
             result = ToolResult(
-                ToolInvocationStatus.NEEDS_REVIEW,
+                (
+                    ToolInvocationStatus.SUCCEEDED
+                    if readable_unparsed
+                    else ToolInvocationStatus.NEEDS_REVIEW
+                ),
                 observation_refs=advisor_observation_refs,
                 budget_consumed={
                     BudgetDimension.BRIDGE_TURNS: consumed_turns,
@@ -2817,6 +2714,10 @@ class InvestigationAdvisorTool:
                     "raw_output_sha256": output_sha256,
                     "raw_output_retained": True,
                     "raw_output_truncated": False,
+                    "parse_status": "partially_parsed"
+                    if any(extracted_elements.values())
+                    else "unparsed",
+                    "extracted_elements": extracted_elements,
                     "output_sha256": output_sha256,
                     "usable": False,
                     "warnings": output_warnings,
@@ -2845,7 +2746,20 @@ class InvestigationAdvisorTool:
                     if isinstance(getattr(item, "input_schema", None), Mapping)
                 },
                 prompt_data=prompt_data,
+                snapshot=snapshot,
                 execution_timeout_seconds=execution_timeout_seconds,
+            )
+        if redacted_secret_count:
+            result = replace(
+                result,
+                output={
+                    **dict(result.output),
+                    "redacted_secret_count": redacted_secret_count,
+                    "secret_findings": [
+                        {"location": item.location, "type": item.secret_type}
+                        for item in secret_findings
+                    ],
+                },
             )
         if vt_report_omissions:
             result = replace(
@@ -2899,6 +2813,12 @@ class InvestigationAdvisorTool:
         invocation_stage = _advisor_invocation_stage(submission)
         response_bytes = len(raw_output_bytes) if raw_output_bytes is not None else 0
         elapsed_before_persistence_ms = round((time.perf_counter() - submission_started_at) * 1000)
+        disclosure_audit = _advisor_disclosure_audit(
+            self._disclosure_policy,
+            snapshot=snapshot,
+            envelope=context.envelope,
+            prompt_data=prompt_data,
+        )
         provenance: dict[str, Any] = {
             "bridge_invocation_id": str(bridge_invocation_id) if bridge_invocation_id else None,
             "bridge_invocation_id_kind": (
@@ -2930,6 +2850,7 @@ class InvestigationAdvisorTool:
             ),
             "diagnostics": dict(timing.counters) if timing is not None else {},
             "redacted_secret_count": redacted_secret_count,
+            "disclosure_audit": disclosure_audit,
             "dossier_manifest": [
                 dict(item)
                 for item in prompt_data.get("dossier_manifest", ())
@@ -3131,10 +3052,22 @@ class InvestigationAdvisorTool:
                 timing.record_duration("manifest_persist", persistence_started_at)
             retained_output = dict(result.output)
             if raw_output is not None:
+                retained_text = retained_output.get("raw_output")
+                if not isinstance(retained_text, str):
+                    retained_text = str(
+                        redact_explicit_operational_secrets(
+                            raw_output,
+                            operational_secret_values=configured_operational_secret_values(
+                                self._settings
+                            ),
+                        )[0]
+                    )
                 retained_output.setdefault("consultation_type", consultation_type)
                 retained_output.setdefault("advisor_status", "partial")
-                retained_output.setdefault("advisory_text", "[UNTRUSTED ADVISORY]\n" + raw_output)
-                retained_output.setdefault("raw_output", raw_output)
+                retained_output.setdefault(
+                    "advisory_text", "[UNTRUSTED ADVISORY]\n" + retained_text
+                )
+                retained_output.setdefault("raw_output", retained_text)
                 retained_output.setdefault("raw_output_sha256", output_sha256)
                 retained_output.setdefault("output_sha256", output_sha256)
                 retained_output.setdefault("raw_output_bytes", response_bytes)
@@ -3142,10 +3075,17 @@ class InvestigationAdvisorTool:
                 retained_output.setdefault("raw_output_truncated", False)
                 retained_output.setdefault("usable", False)
                 retained_output.setdefault("warnings", ["result_persistence_uncertain"])
+                retained_output.setdefault("parse_status", "unparsed")
+                retained_output.setdefault("extracted_elements", {})
             return self._finish(
                 context,
                 ToolResult(
-                    ToolInvocationStatus.NEEDS_REVIEW,
+                    (
+                        ToolInvocationStatus.SUCCEEDED
+                        if isinstance(retained_output.get("raw_output"), str)
+                        and _advisor_reply_is_readable(retained_output["raw_output"])
+                        else ToolInvocationStatus.NEEDS_REVIEW
+                    ),
                     observation_refs=tuple(item.id for item in evidence),
                     budget_consumed=result.budget_consumed,
                     error_code="advisor_result_persistence_uncertain",
@@ -3328,16 +3268,11 @@ class InvestigationAdvisorTool:
                 # This is a mixed outcome: earlier batches already reached Bridge,
                 # while the next batch was refused locally. Preserve their usage
                 # and never let the local refusal clear the whole operation's charge.
-                status = (
-                    ToolInvocationStatus.PARTIAL
-                    if prior_batch_was_submitted
-                    else ToolInvocationStatus.NEEDS_REVIEW
-                )
                 return self._finish(
                     context,
                     replace(
                         combined,
-                        status=status,
+                        status=combined.status,
                         output={
                             **combined.output,
                             "advisor_status": (
@@ -3419,11 +3354,7 @@ class InvestigationAdvisorTool:
                     context,
                     replace(
                         combined,
-                        status=(
-                            ToolInvocationStatus.PARTIAL
-                            if mixed_budget_refusal
-                            else combined.status
-                        ),
+                        status=(combined.status),
                         output={
                             **combined.output,
                             **(
@@ -4772,6 +4703,7 @@ class InvestigationAdvisorTool:
                     )
                 if (
                     current is not None
+                    and not self._disclosure_policy.ignores_restriction_labels("advisor.consult")
                     and row.get("sample_sha256") in current.restricted_sample_hashes
                 ):
                     row["content_excerpts"] = []
@@ -4843,7 +4775,13 @@ class InvestigationAdvisorTool:
                 restricted_measurement_hashes = {
                     sample_hash
                     for sample_hash in sample_hashes
-                    if current is not None and sample_hash in current.restricted_sample_hashes
+                    if (
+                        current is not None
+                        and not self._disclosure_policy.ignores_restriction_labels(
+                            "advisor.consult"
+                        )
+                        and sample_hash in current.restricted_sample_hashes
+                    )
                 }
                 if restricted_measurement_hashes:
                     row["content_excerpts"] = []
@@ -5385,7 +5323,11 @@ class InvestigationAdvisorTool:
                     restrictions = {
                         source
                         for sample in samples_by_hash.get(sample_hash, ())
-                        for source in _sample_disclosure_restriction_sources(sample, envelope)
+                        for source in _sample_disclosure_restriction_sources(
+                            sample,
+                            envelope,
+                            disclosure_profile=self._disclosure_policy.profile,
+                        )
                     }
                     if restrictions:
                         names = ", ".join(sorted(restrictions))
@@ -5414,7 +5356,11 @@ class InvestigationAdvisorTool:
                         "the canonical "
                         "document association or remove the reference",
                     )
-                document_restrictions = _sample_disclosure_restriction_sources(document, envelope)
+                document_restrictions = _sample_disclosure_restriction_sources(
+                    document,
+                    envelope,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
                 if document_restrictions:
                     names = ", ".join(sorted(document_restrictions))
                     return (
@@ -5690,6 +5636,7 @@ class InvestigationAdvisorTool:
                 if (
                     sample_hash
                     and current is not None
+                    and not self._disclosure_policy.ignores_restriction_labels("advisor.consult")
                     and sample_hash in current.restricted_sample_hashes
                 ):
                     row["content_excerpts"] = []
@@ -5832,7 +5779,11 @@ class InvestigationAdvisorTool:
                 )
             if sample is None:
                 continue
-            if _sample_disclosure_restriction_sources(sample, envelope):
+            if _sample_disclosure_restriction_sources(
+                sample,
+                envelope,
+                disclosure_profile=self._disclosure_policy.profile,
+            ):
                 continue
             if current is not None:
                 associated_observations = sorted(
@@ -6029,6 +5980,7 @@ class InvestigationAdvisorTool:
                         16,
                     ),
                     "external_llm_allowed": bool(getattr(sample, "external_llm_allowed", True)),
+                    "do_not_submit": bool(getattr(sample, "do_not_submit", False)),
                     "license_restricted": bool(
                         str(getattr(sample, "license_restriction", "") or "").strip()
                     ),
@@ -6996,7 +6948,11 @@ class InvestigationAdvisorTool:
                             break
             if not matched_hashes:
                 continue
-            if not _sample_disclosure_restriction_sources(sample, envelope):
+            if not _sample_disclosure_restriction_sources(
+                sample,
+                envelope,
+                disclosure_profile=self._disclosure_policy.profile,
+            ):
                 continue
             restricted.update(matched_hashes)
         return restricted
@@ -7054,7 +7010,11 @@ class InvestigationAdvisorTool:
                 {
                     source
                     for item in matching_samples
-                    for source in _sample_disclosure_restriction_sources(item, envelope)
+                    for source in _sample_disclosure_restriction_sources(
+                        item,
+                        envelope,
+                        disclosure_profile=self._disclosure_policy.profile,
+                    )
                 }
             )
             matching_associations = tuple(
@@ -7175,7 +7135,11 @@ class InvestigationAdvisorTool:
                 continue
             if not _sample_state_allows_advisor_disclosure(sample):
                 continue
-            if _sample_disclosure_restriction_sources(sample, envelope):
+            if _sample_disclosure_restriction_sources(
+                sample,
+                envelope,
+                disclosure_profile=self._disclosure_policy.profile,
+            ):
                 if current is not None:
                     current.restricted_sample_hashes.add(measured_hash)
                     current.sample_blob_metadata[measured_hash] = None
@@ -7388,7 +7352,11 @@ class InvestigationAdvisorTool:
                     observation_refs=evidence_refs,
                 )
             if any(
-                _sample_disclosure_restriction_sources(sample, context.envelope)
+                _sample_disclosure_restriction_sources(
+                    sample,
+                    context.envelope,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
                 for sample in matching_samples
             ):
                 return await self._persist_preflight_failure(
@@ -7421,7 +7389,8 @@ class InvestigationAdvisorTool:
         dossier_sha256: str,
     ) -> tuple[EvidenceObservation | None, UUID | None, Mapping[str, Any] | None]:
         """Reuse a response link when a submitted turn is replayed after a crash."""
-        for observation in await self._list_observations(context.investigation_id):
+        observations = await self._list_observations(context.investigation_id)
+        for observation in observations:
             if (
                 observation.source != ADVISOR_RESPONSE_SOURCE
                 or observation.object_type != "advisor_response_received"
@@ -7456,6 +7425,66 @@ class InvestigationAdvisorTool:
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("Stored advisor response link has no valid blob ID") from exc
             return observation, raw_blob_id, payload
+        for observation in observations:
+            if observation.source != ADVISOR_TOOL_NAME or observation.object_type != "advisor_call":
+                continue
+            if not isinstance(getattr(observation, "blob_id", None), UUID) or not isinstance(
+                getattr(observation, "sha256", None), str
+            ):
+                continue
+            encoded = await self._artifact_store.read_bytes(
+                observation.blob_id,
+                max_bytes=int(getattr(self._settings, "model_output_max_bytes", 512 * 1024 * 1024)),
+            )
+            if hashlib.sha256(encoded).hexdigest() != observation.sha256:
+                raise ValueError("Stored advisor call failed its SHA-256 check")
+            call_payload = json.loads(encoded)
+            if (
+                not isinstance(call_payload, Mapping)
+                or call_payload.get("schema") != "operator-advisor-call.v1"
+                or call_payload.get("idempotency_key") != context.idempotency_key
+            ):
+                continue
+            if (
+                call_payload.get("consultation_type") != consultation_type
+                or call_payload.get("input_sha256", call_payload.get("prompt_sha256"))
+                != prompt_sha256
+                or call_payload.get("dossier_sha256") != dossier_sha256
+            ):
+                raise ValueError("Advisor idempotency key was reused with new inputs")
+            output = call_payload.get("output")
+            output = output if isinstance(output, Mapping) else {}
+            if (
+                output.get("response_received") is not True
+                and call_payload.get("bridge_turns_consumed", 0) == 0
+            ):
+                continue
+            try:
+                raw_blob_id = UUID(str(call_payload["output_blob_id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Previously received advisor text has no recoverable blob"
+                ) from exc
+            raw_sha256 = call_payload.get("output_sha256")
+            if not isinstance(raw_sha256, str):
+                raise ValueError("Previously received advisor text has no SHA-256")
+            if output_sha256 is not None and raw_sha256 != output_sha256:
+                raise ValueError("Advisor idempotency key was reused with new response text")
+            replay_payload = {
+                "schema": "operator-advisor-response-link.v1",
+                "consultation_type": consultation_type,
+                "bridge_invocation_id": call_payload.get("bridge_invocation_id"),
+                "bridge_conversation_id": call_payload.get("bridge_conversation_id"),
+                "idempotency_key": context.idempotency_key,
+                "prompt_sha256": prompt_sha256,
+                "dossier_sha256": dossier_sha256,
+                "raw_response_blob_id": str(raw_blob_id),
+                "raw_response_sha256": raw_sha256,
+                "submission_status": call_payload.get("submission_status"),
+                "submission_state": call_payload.get("submission_state"),
+                "provider_usage": call_payload.get("provider_usage", {}),
+            }
+            return observation, raw_blob_id, replay_payload
         return None, None, None
 
     @staticmethod
@@ -7504,6 +7533,7 @@ class InvestigationAdvisorTool:
         available_tool_schemas: Mapping[str, Mapping[str, Any]],
         *,
         prompt_data: Mapping[str, Any],
+        snapshot: Any = None,
         execution_timeout_seconds: int | None = None,
     ) -> ToolResult:
         code = (submission.error_code or "").casefold()
@@ -7521,7 +7551,7 @@ class InvestigationAdvisorTool:
             BudgetDimension.CONTEXT_TOKENS: max(1, (input_bytes + 3) // 4),
             BudgetDimension.TOOL_SECONDS: min(tool_seconds_ceiling, max(1, elapsed_seconds)),
         }
-        if submission.status is TurnSubmissionStatus.BLOCKED:
+        if submission.status is TurnSubmissionStatus.BLOCKED and submission.output_text is None:
             return ToolResult(
                 ToolInvocationStatus.POLICY_DENIED,
                 observation_refs=evidence_refs,
@@ -7533,7 +7563,10 @@ class InvestigationAdvisorTool:
                     "bridge_turns_consumed": bridge_turns_consumed,
                 },
             )
-        if submission.status is TurnSubmissionStatus.NEEDS_REVIEW:
+        if (
+            submission.status is TurnSubmissionStatus.NEEDS_REVIEW
+            and submission.output_text is None
+        ):
             return ToolResult(
                 ToolInvocationStatus.NEEDS_REVIEW,
                 observation_refs=evidence_refs,
@@ -7591,7 +7624,10 @@ class InvestigationAdvisorTool:
                     "prior_submission_made": submission.prior_submission_made,
                 },
             )
-        if submission.status is not TurnSubmissionStatus.SUCCEEDED:
+        if (
+            submission.status is not TurnSubmissionStatus.SUCCEEDED
+            and submission.output_text is None
+        ):
             return ToolResult(
                 ToolInvocationStatus.FAILED
                 if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
@@ -7809,29 +7845,73 @@ class InvestigationAdvisorTool:
         if evidence_links_absent and "liens de preuve absents" not in display_text.casefold():
             display_text += "\n\n[Avertissement consultatif : liens de preuve absents.]"
         tagged = "[UNTRUSTED ADVISORY]\n" + display_text
-        advisor_status, invocation_status = (
+        extracted_keys = (
+            "summary",
+            "recommendations",
+            "alternatives",
+            "next_steps",
+            "action_items",
+            "suggested_pivots",
+            "rules",
+            "rule_source",
+            "figure_plan",
+            "draft_text",
+            "remarks",
+            "advisory_sections",
+            "critique_sections",
+            "warning_sections",
+        )
+        extracted_elements = {
+            key: parsed[key]
+            for key in extracted_keys
+            if key in parsed and parsed[key] not in (None, "", [], {})
+        }
+        if not readable:
+            parse_status = "unparsed"
+        elif parse_failed or parsed.get("status") in {"invalid", "ambiguous"}:
+            meaningful_extractions = set(extracted_elements) - {"summary"}
+            parse_status = (
+                "partially_parsed" if meaningful_extractions or partial_json_fields else "unparsed"
+            )
+        elif parsed.get("normalization_status") == "partial":
+            parse_status = "partially_parsed"
+        elif evidence_links_absent:
+            parse_status = "partially_parsed"
+        else:
+            parse_status = "parsed"
+        parsed["parse_status"] = parse_status
+        parsed["extracted_elements"] = extracted_elements
+        advisor_status, parsed_invocation_status = (
             ("partial", ToolInvocationStatus.PARTIAL)
             if parse_failed or evidence_links_absent
             else _advisor_output_result_status(parsed)
         )
+        invocation_status = ToolInvocationStatus.SUCCEEDED if readable else parsed_invocation_status
         advisor_output = {
             "advisor_status": advisor_status,
             "consultation_type": consultation_type,
             "advisory_text": tagged,
+            "parse_status": parse_status,
+            "extracted_elements": extracted_elements,
             **parsed,
             "untrusted": True,
             "output_sha256": raw_sha256,
             "usable": parsed.get("usable", True),
             "bridge_turns_consumed": bridge_turns_consumed,
             "response_state": (
-                "partial_response_usable"
-                if parsed.get("usable") is True and advisor_status == "partial"
+                "partial_response_received"
+                if parse_status in {"partially_parsed", "unparsed"}
                 else "response_received"
-                if parsed.get("usable") is True
-                else "response_unusable"
             ),
             "response_received": True,
         }
+        if evidence_links_absent:
+            advisor_output["unprocessed_unit_ids"] = tuple(
+                str(unit.get("unit_id", unit.get("id")))
+                for unit in prompt_data.get("units", ())
+                if isinstance(unit, Mapping)
+                and isinstance(unit.get("unit_id", unit.get("id")), str)
+            )
         return ToolResult(
             invocation_status,
             observation_refs=evidence_refs,
@@ -7900,7 +7980,8 @@ class InvestigationAdvisorTool:
             )
             guidance = _safe_text(safe_output.get("exclusion_guidance"), 512)
             message = (
-                "Advisor context exceeds its G2 reservation. Largest selected dossier items: "
+                "The approved G2 budget cannot cover the measured advisor prompt. "
+                "Largest selected dossier items: "
                 + ("; ".join(rendered_items) if rendered_items else "unavailable")
                 + (f". To exclude content: {guidance}" if guidance else ".")
             )
@@ -9184,8 +9265,263 @@ def _redact_advisor_payload(
     )
 
 
+_ADVISOR_SECRET_CONTENT_KEYS = frozenset(
+    {"body", "content", "payload", "text", "raw", "raw_bytes", "bytes", "base64", "excerpt"}
+)
+_ADVISOR_SECRET_LISTS = {
+    "evidence": ("observation", "evidence_id"),
+    "samples": ("sample", "sample_sha256"),
+    "measured_facts": ("measurement", "measurement_id"),
+    "findings": ("finding", "finding_id"),
+    "candidate_rules": ("rule", "rule_id"),
+    "article_passages": ("article", "claim_id"),
+}
+
+
+def _disclosure_label_values(source: Any) -> dict[str, Any]:
+    disclosure = getattr(source, "disclosure", source)
+    tlp = getattr(disclosure, "tlp", None)
+    if tlp is None:
+        tlp = getattr(source, "tlp", None)
+    tlp = getattr(tlp, "value", tlp)
+    external_llm_allowed = getattr(disclosure, "external_llm_allowed", None)
+    if external_llm_allowed is None:
+        external_llm_allowed = getattr(source, "external_llm_allowed", None)
+    do_not_submit = getattr(disclosure, "do_not_submit", None)
+    if do_not_submit is None:
+        do_not_submit = getattr(source, "do_not_submit", None)
+    license_restriction = getattr(source, "license_restriction", None)
+    return {
+        "tlp": tlp if isinstance(tlp, str) or tlp is None else str(tlp),
+        "external_llm_allowed": (
+            external_llm_allowed if isinstance(external_llm_allowed, bool) else None
+        ),
+        "do_not_submit": do_not_submit if isinstance(do_not_submit, bool) else None,
+        "license_restricted": bool(str(license_restriction or "").strip()),
+    }
+
+
+def _advisor_disclosure_audit(
+    policy: Any,
+    *,
+    snapshot: Any,
+    envelope: Any,
+    prompt_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    samples = [
+        {
+            "sample_sha256": item.get("sha256"),
+            "sample_id": item.get("sample_id"),
+            "association_id": item.get("association_id"),
+            "labels": {
+                key: item.get(key)
+                for key in (
+                    "tlp",
+                    "external_llm_allowed",
+                    "do_not_submit",
+                    "license_restricted",
+                    "association_status",
+                )
+                if key in item
+            },
+        }
+        for item in prompt_data.get("samples", ())
+        if isinstance(item, Mapping)
+    ]
+    return {
+        "profile": policy.profile,
+        "origin_labels": {
+            "article": _disclosure_label_values(snapshot),
+            "envelope": _disclosure_label_values(envelope),
+            "samples": samples,
+        },
+    }
+
+
+def _advisor_redaction_marker(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("[clé masquée]", "[redacted-autowork-credential]")
+    if isinstance(value, Mapping):
+        return {key: _advisor_redaction_marker(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_advisor_redaction_marker(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_advisor_redaction_marker(item) for item in value)
+    return value
+
+
+def _advisor_scrub_encoded_leaves(value: Any, *, settings: Settings | None) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _advisor_scrub_encoded_leaves(item, settings=settings)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_advisor_scrub_encoded_leaves(item, settings=settings) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_advisor_scrub_encoded_leaves(item, settings=settings) for item in value)
+    if isinstance(value, str | bytes | bytearray | memoryview):
+        if _contains_encoded_operational_secrets(value, settings=settings):
+            return "[redacted-autowork-credential]"
+    return value
+
+
+def _sanitize_advisor_prompt_secrets(
+    prompt_data: Mapping[str, Any],
+    *,
+    explicit_reference_ids: frozenset[str],
+    settings: Settings | None,
+) -> tuple[dict[str, Any], tuple[PublicationSecretFinding, ...], list[dict[str, str]]]:
+    """Omit secret-bearing automatic evidence and redact cited evidence in place."""
+    cleaned = dict(prompt_data)
+    omissions = [
+        dict(item) for item in cleaned.get("_advisor_omissions", ()) if isinstance(item, Mapping)
+    ]
+    findings: dict[tuple[str, str], PublicationSecretFinding] = {}
+
+    for section, (kind, id_key) in _ADVISOR_SECRET_LISTS.items():
+        rows = cleaned.get(section)
+        if not isinstance(rows, (list, tuple)):
+            continue
+        retained: list[Any] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                retained.append(row)
+                continue
+            encoded = _contains_encoded_operational_secrets(row, settings=settings)
+            redacted_row, direct = _redact_advisor_payload(row, settings=settings)
+            if not encoded and not direct:
+                retained.append(row)
+                continue
+            identifier_value = row.get(id_key)
+            if not isinstance(identifier_value, str):
+                identifier_value = row.get("id") or row.get("sha256") or f"{section}:{index}"
+            identifier = str(identifier_value)
+            explicitly_cited = (section == "evidence" and identifier in explicit_reference_ids) or (
+                section == "measured_facts"
+                and str(row.get("evidence_id", "")) in explicit_reference_ids
+            )
+            if explicitly_cited:
+                for item in (*encoded, *direct):
+                    findings[(item.location, item.secret_type)] = item
+                cited_row = dict(redacted_row) if isinstance(redacted_row, Mapping) else {}
+                if encoded:
+                    cited_row = _redact_encoded_advisor_content(
+                        cited_row,
+                        settings=settings,
+                    )
+                retained.append(cited_row)
+                continue
+            omissions.append(
+                {
+                    "kind": kind,
+                    "id": identifier,
+                    "reason": "autowork_credential_or_signed_url",
+                }
+            )
+        cleaned[section] = retained
+
+    redacted, direct = _redact_advisor_payload(cleaned, settings=settings)
+    for item in direct:
+        findings[(item.location, item.secret_type)] = item
+    safe = _advisor_redaction_marker(redacted)
+    safe = _advisor_scrub_encoded_leaves(safe, settings=settings)
+    if omissions:
+        safe["_advisor_omissions"] = omissions
+    return safe, tuple(findings.values()), omissions
+
+
+def _redact_encoded_advisor_content(
+    value: Any,
+    *,
+    settings: Settings | None,
+    encoding: str | None = None,
+) -> Any:
+    """Decode encoded evidence strings so only secret fragments are redacted."""
+    if isinstance(value, Mapping):
+        declared = value.get("encoding", value.get("kind"))
+        current_encoding = declared.casefold() if isinstance(declared, str) else encoding
+        cleaned: dict[Any, Any] = {}
+        for key, child in value.items():
+            key_name = str(key).casefold()
+            if key_name == "encoding":
+                cleaned[key] = child
+                continue
+            child_encoding = current_encoding
+            if "base64" in key_name:
+                child_encoding = "base64"
+            elif "hex" in key_name:
+                child_encoding = "hex"
+            elif "byte" in key_name or "raw" in key_name:
+                child_encoding = "bytes"
+            cleaned[key] = _redact_encoded_advisor_content(
+                child,
+                settings=settings,
+                encoding=child_encoding,
+            )
+        return cleaned
+    if isinstance(value, list | tuple) and encoding in {"bytes", "raw_bytes"}:
+        if value and all(type(item) is int and 0 <= item <= 255 for item in value):
+            return _redact_encoded_advisor_content(bytes(value), settings=settings)
+        return [
+            _redact_encoded_advisor_content(item, settings=settings, encoding=encoding)
+            for item in value
+        ]
+    if isinstance(value, bytes | bytearray | memoryview):
+        raw = bytes(value)
+        for candidate_encoding in ("utf-8", "utf-16le", "utf-16be", "latin-1"):
+            decoded = raw.decode(candidate_encoding, errors="ignore")
+            redacted, findings = _redact_advisor_payload(decoded, settings=settings)
+            if findings:
+                return redacted
+        return value
+    if isinstance(value, str) and encoding in {"base64", "hex", "bytes", "raw_bytes"}:
+        try:
+            decoded_bytes = (
+                base64.b64decode(re.sub(r"\s+", "", value), validate=True)
+                if encoding == "base64"
+                else bytes.fromhex(re.sub(r"\s+", "", value))
+                if encoding == "hex"
+                else value.encode("latin-1")
+            )
+        except (ValueError, binascii.Error, UnicodeEncodeError):
+            return value
+        redacted = _redact_encoded_advisor_content(decoded_bytes, settings=settings)
+        return redacted.decode("latin-1") if isinstance(redacted, bytes) else redacted
+    return value
+
+
+def _contains_advisor_redaction_marker(value: Any) -> bool:
+    if isinstance(value, str):
+        return "[redacted-autowork-credential]" in value
+    if isinstance(value, Mapping):
+        return any(_contains_advisor_redaction_marker(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_advisor_redaction_marker(item) for item in value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return b"[redacted-autowork-credential]" in bytes(value)
+    return False
+
+
 def _marked_secret_field_survives(value: Any, *, settings: Settings | None = None) -> bool:
-    return contains_operational_secrets(value, settings=settings, include_host_paths=False)
+    def restore_guard_marker(item: Any) -> Any:
+        if isinstance(item, str):
+            return item.replace("[redacted-autowork-credential]", "[clé masquée]")
+        if isinstance(item, Mapping):
+            return {key: restore_guard_marker(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [restore_guard_marker(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(restore_guard_marker(child) for child in item)
+        if isinstance(item, bytes):
+            return item.replace(b"[redacted-autowork-credential]", "[clé masquée]".encode())
+        if isinstance(item, bytearray):
+            return bytearray(restore_guard_marker(bytes(item)))
+        return item
+
+    return contains_operational_secrets(
+        restore_guard_marker(value), settings=settings, include_host_paths=False
+    )
 
 
 def _contains_encoded_operational_secrets(
@@ -9520,21 +9856,16 @@ def _mark_rule_advisory_readability(parsed: dict[str, Any], raw_text: str) -> No
 
 
 def _advisor_response_state(result: ToolResult, submission: TurnSubmission) -> str:
-    if (
+    if submission.output_text is None and (
         submission.status is TurnSubmissionStatus.NEEDS_REVIEW
         or submission.submission_state == "external_state_unknown"
-        or (submission.output_text is None and submission.prior_submission_made)
+        or submission.prior_submission_made
     ):
         return "submission_ambiguous"
     if submission.output_text is not None:
-        if result.output.get("usable") is True:
-            if (
-                result.output.get("advisor_status") == "partial"
-                or result.output.get("status") == "partial"
-            ):
-                return "partial_response_usable"
-            return "response_received"
-        return "response_unusable"
+        if result.output.get("parse_status") in {"partially_parsed", "unparsed"}:
+            return "partial_response_received"
+        return "response_received"
     if (
         result.output.get("confirmed_non_execution") is True
         or submission.submission_state == "pre_submission"
@@ -9888,6 +10219,12 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
             output={"advisor_status": "output_invalid", "usable": False},
         )
     statuses = [item.status for item in results]
+    readable_outputs = [
+        (index, item, item.output.get("raw_output"))
+        for index, item in enumerate(results, start=1)
+        if isinstance(item.output.get("raw_output"), str)
+        and _advisor_reply_is_readable(item.output["raw_output"])
+    ]
     has_usable_content = any(
         item.output.get("usable") is True
         or any(
@@ -9906,7 +10243,9 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
         }
         for item in results
     )
-    if ToolInvocationStatus.POLICY_DENIED in statuses:
+    if readable_outputs:
+        status = ToolInvocationStatus.SUCCEEDED
+    elif ToolInvocationStatus.POLICY_DENIED in statuses:
         status = ToolInvocationStatus.POLICY_DENIED
     elif has_usable_content and has_incomplete_batch:
         status = ToolInvocationStatus.PARTIAL
@@ -9948,6 +10287,14 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
             for review in item.output.get("reviews", ())
             if isinstance(review, Mapping)
         ],
+        "unprocessed_unit_ids": tuple(
+            dict.fromkeys(
+                unit_id
+                for item in results
+                for unit_id in item.output.get("unprocessed_unit_ids", ())
+                if isinstance(unit_id, str)
+            )
+        ),
         "limitations": list(
             dict.fromkeys(
                 limitation
@@ -10019,6 +10366,53 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
             for item in results
         ],
     }
+    if readable_outputs:
+        raw_outputs = [
+            {
+                "batch_index": index,
+                "raw_output": raw_text,
+                "output_sha256": item.output.get("output_sha256")
+                or hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+                "parse_status": item.output.get("parse_status", "unparsed"),
+            }
+            for index, item, raw_text in readable_outputs
+        ]
+        combined_raw = (
+            raw_outputs[0]["raw_output"]
+            if len(raw_outputs) == 1
+            else "\n\n".join(
+                f"[Bridge response {row['batch_index']}]\n{row['raw_output']}"
+                for row in raw_outputs
+            )
+        )
+        parse_statuses = {row["parse_status"] for row in raw_outputs}
+        aggregate_parse_status = (
+            "parsed"
+            if parse_statuses == {"parsed"}
+            else "unparsed"
+            if parse_statuses == {"unparsed"}
+            else "partially_parsed"
+        )
+        output.update(
+            {
+                "advisory_text": "[UNTRUSTED ADVISORY]\n" + combined_raw,
+                "raw_output": combined_raw,
+                "raw_outputs": raw_outputs,
+                "raw_output_sha256": hashlib.sha256(combined_raw.encode("utf-8")).hexdigest(),
+                "output_sha256": hashlib.sha256(combined_raw.encode("utf-8")).hexdigest(),
+                "parse_status": aggregate_parse_status,
+                "extracted_elements": {
+                    "blocks": output["blocks"],
+                    "reviews": output["reviews"],
+                },
+                "readable": True,
+                "response_state": (
+                    "partial_response_received"
+                    if aggregate_parse_status != "parsed"
+                    else "response_received"
+                ),
+            }
+        )
     input_warnings: dict[bytes, dict[str, Any]] = {}
     for result in results:
         for warning in result.output.get("input_warnings", ()):

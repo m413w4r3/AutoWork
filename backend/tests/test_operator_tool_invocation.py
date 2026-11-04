@@ -110,7 +110,12 @@ def _service(
     *,
     observations=None,
     evidence_summaries=None,
+    disclosure_profile: str | None = None,
 ) -> OperatorToolInvocationService:
+    if disclosure_profile is not None:
+        from cti_app.application.external_effects import advisor_disclosure_policy
+
+        fixture.service._disclosure_policy = advisor_disclosure_policy(disclosure_profile)
     return OperatorToolInvocationService(
         investigation_id=fixture.investigation_id,
         investigations=fixture.investigations,
@@ -124,6 +129,7 @@ def _service(
         unavailable_tool_reasons={},
         observations=observations,
         evidence_summaries=evidence_summaries,
+        disclosure_profile=disclosure_profile,
     )
 
 
@@ -1689,7 +1695,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         for item in await fixture.observations.list_for_investigation(fixture.investigation_id)
         if item.source == "advisor.consult"
     ]
-    assert advice.invocation.status is ToolInvocationStatus.PARTIAL, advice.output
+    assert advice.invocation.status is ToolInvocationStatus.SUCCEEDED, advice.output
     assert len(transport.calls) == 1
     assert persisted_advice
     assert advice.invocation.consumed_budget[BudgetDimension.BRIDGE_TURNS] == 1
@@ -2304,6 +2310,38 @@ async def test_vt_disclosure_controls_block_context_before_external_tool_dispatc
     assert error.value.code == "external_disclosure_denied"
     assert fixture.tools["vt.file_report"].calls == []
     assert await fixture.invocations.list_for_investigation(fixture.investigation_id) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restriction", ["red_tlp", "external_llm_denied"])
+async def test_m14_profile_allows_vt_reads_with_restricted_source_labels(
+    restriction: str,
+) -> None:
+    fixture, state, _default_service = await _fixture()
+    if restriction == "red_tlp":
+        article_port = fixture.context_builder.article_snapshots
+        article_port.snapshot = replace(article_port.snapshot, tlp="RED")
+    else:
+        envelope = fixture.envelopes._items[fixture.investigation_id]
+        fixture.envelopes._items[fixture.investigation_id] = replace(
+            envelope,
+            disclosure=replace(envelope.disclosure, external_llm_allowed=False),
+        )
+    service = _service(fixture, disclosure_profile="m14_research_permissive")
+
+    result = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "synthetic fixture"},
+        purpose="read the synthetic VT fixture",
+        expected_version=state.version,
+        idempotency_key=f"m14-disclosure-{restriction}",
+    )
+
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert len(fixture.tools["vt.file_report"].calls) == 1
+    persisted = result.invocation.purpose
+    assert "m14_research_permissive" in persisted
 
 
 @pytest.mark.asyncio

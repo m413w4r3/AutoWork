@@ -41,6 +41,7 @@ from cti_app.application.external_effects import (
     _PermitRegistry,
     bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
+    external_effect_source_restriction_reason,
     external_observation_hash_policy,
     osint_vt_search_may_cite_unassociated_observation_hash,
     resolve_bridge_vt_file_report_hashes,
@@ -393,6 +394,57 @@ def test_source_do_not_submit_blocks_external_upload_families(family: str) -> No
 def test_source_do_not_submit_does_not_block_vt_or_bridge_effects(family: str) -> None:
     assert not external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize("family", ["advisor.consult", "vt.file_report", "vt.download_sample"])
+@pytest.mark.parametrize(
+    ("profile", "expected_reason"),
+    [("standard", "sample_source_restricted"), ("m14_research_permissive", None)],
+)
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"tlp": "RED", "external_llm_allowed": True, "license_restriction": None},
+        {"tlp": "CLEAR", "external_llm_allowed": False, "license_restriction": None},
+        {"tlp": "CLEAR", "external_llm_allowed": True, "license_restriction": "restricted"},
+    ],
+)
+def test_sample_disclosure_profile_controls_source_labels_only(
+    family: str, profile: str, expected_reason: str | None, labels: dict[str, object]
+) -> None:
+    subject_id = uuid4()
+    sample = SimpleNamespace(subject_id=subject_id, do_not_submit=True, **labels)
+
+    actual_reason = external_effect_source_restriction_reason(
+        source_kind="sample",
+        source=sample,
+        subject_id=subject_id,
+        family=family,
+        is_model_submission=family.startswith("advisor."),
+        disclosure_profile=profile,
+    )
+    standard_reason = expected_reason
+    if (
+        profile == "standard"
+        and not family.startswith("advisor.")
+        and labels["tlp"] != "RED"
+        and labels["license_restriction"] is None
+    ):
+        standard_reason = None
+    assert actual_reason == standard_reason
+
+    mismatched = SimpleNamespace(subject_id=uuid4(), do_not_submit=True, **labels)
+    assert (
+        external_effect_source_restriction_reason(
+            source_kind="sample",
+            source=mismatched,
+            subject_id=subject_id,
+            family=family,
+            is_model_submission=True,
+            disclosure_profile=profile,
+        )
+        == "sample_source_restricted"
+    )
 
 
 @pytest.mark.parametrize(

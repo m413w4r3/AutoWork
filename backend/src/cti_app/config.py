@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
+    advisor_disclosure_profile: Literal["standard", "m14_research_permissive"] = "standard"
     api_bind_host: str = "127.0.0.1"
     operator_api_token: SecretStr | None = None
     operator_client_api_token: SecretStr | None = None

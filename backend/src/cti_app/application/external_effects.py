@@ -40,6 +40,39 @@ from cti_app.domain.external_effects import (
 )
 
 _BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
+_VT_FAMILY_PREFIXES = ("vt.",)
+
+
+@dataclass(frozen=True, slots=True)
+class AdvisorDisclosurePolicy:
+    """One profile policy for Bridge and VirusTotal disclosure labels."""
+
+    profile: str
+
+    def ignores_restriction_labels(self, family: str | None = None) -> bool:
+        """Whether this profile treats source disclosure labels as audit metadata."""
+        if self.profile != "m14_research_permissive":
+            return False
+        if family is None:
+            return True
+        return family.startswith((*_BRIDGE_FAMILY_PREFIXES, *_VT_FAMILY_PREFIXES))
+
+    def allows_disclosure(
+        self, currently_allowed: bool, *, envelope_exists: bool, family: str
+    ) -> bool:
+        """Relax source labels while retaining the approved G2 envelope requirement."""
+        return envelope_exists and (currently_allowed or self.ignores_restriction_labels(family))
+
+
+def advisor_disclosure_policy(profile: str | None = None) -> AdvisorDisclosurePolicy:
+    """Return the shared advisor/VT disclosure policy for the configured profile."""
+    if profile is None:
+        from cti_app.config import get_settings
+
+        profile = get_settings().advisor_disclosure_profile
+    if profile not in {"standard", "m14_research_permissive"}:
+        raise ValueError("Unsupported advisor disclosure profile")
+    return AdvisorDisclosurePolicy(profile=profile)
 
 
 def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool) -> bool:
@@ -58,13 +91,18 @@ def external_effect_source_restriction_reason(
     subject_id: UUID,
     family: str,
     is_model_submission: bool,
+    disclosure_profile: str | None = None,
 ) -> str | None:
     """Return the disclosure-policy refusal for a previously resolved source row."""
     source_subject_id = getattr(source, "subject_id", None)
     tlp = getattr(source, "tlp", None)
-    if (
-        source_subject_id != subject_id
-        or (isinstance(tlp, str) and tlp.casefold() == "red")
+    policy = advisor_disclosure_policy(disclosure_profile)
+    if source_subject_id != subject_id:
+        return (
+            "sample_source_restricted" if source_kind == "sample" else "source_document_restricted"
+        )
+    if not policy.ignores_restriction_labels(family) and (
+        (isinstance(tlp, str) and tlp.casefold() == "red")
         or external_effect_source_do_not_submit_blocks(
             family, bool(getattr(source, "do_not_submit", False))
         )
@@ -73,14 +111,23 @@ def external_effect_source_restriction_reason(
             "sample_source_restricted" if source_kind == "sample" else "source_document_restricted"
         )
     license_restriction = getattr(source, "license_restriction", None)
-    if source_kind == "sample":
+    if source_kind == "sample" and not policy.ignores_restriction_labels(family):
         if bool((license_restriction or "").strip()):
             return "sample_source_restricted"
         if is_model_submission and not bool(getattr(source, "external_llm_allowed", False)):
             return "sample_source_restricted"
-    elif license_restriction:
+    elif (
+        source_kind != "sample"
+        and license_restriction
+        and not policy.ignores_restriction_labels(family)
+    ):
         return "source_document_restricted"
-    elif is_model_submission and not bool(getattr(source, "external_llm_allowed", False)):
+    elif (
+        source_kind != "sample"
+        and is_model_submission
+        and not bool(getattr(source, "external_llm_allowed", False))
+        and not policy.ignores_restriction_labels(family)
+    ):
         return "source_document_external_llm_not_allowed"
     return None
 

@@ -31,7 +31,11 @@ from cti_app.application.evidence_recorder import (
     _sanitize_json,
     sanitize_evidence_text,
 )
-from cti_app.application.external_effects import external_effect_source_do_not_submit_blocks
+from cti_app.application.external_effects import (
+    advisor_disclosure_policy,
+    external_effect_source_do_not_submit_blocks,
+    external_effect_source_restriction_reason,
+)
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
     InvestigationContextV1,
@@ -103,7 +107,6 @@ from cti_app.domain.analyst_opinion import (
     opinion_blocks_with_observations,
     verify_opinion_citations,
 )
-from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -428,6 +431,7 @@ class InvestigationService:
         rollback_uow: Callable[[], Awaitable[None]] | None = None,
         audit_decisions: AnalystDecisionRepository | None = None,
         effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
+        disclosure_profile: str | None = None,
     ) -> None:
         if no_progress_limit < 1 or max_turns_per_run < 1:
             raise ValueError("Investigation loop limits must be positive")
@@ -458,6 +462,7 @@ class InvestigationService:
         self._commit_uow = commit_uow
         self._rollback_uow = rollback_uow
         self._effective_policy_for = effective_policy_for
+        self._disclosure_policy = advisor_disclosure_policy(disclosure_profile)
         owner = getattr(commit_uow, "__self__", None)
         self._audit_decisions = audit_decisions or getattr(owner, "analyst_decisions", None)
 
@@ -971,7 +976,11 @@ class InvestigationService:
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
-            allowed = self.bridge_disclosure_allowed(snapshot, envelope)
+            allowed = self._disclosure_policy.allows_disclosure(
+                self.bridge_disclosure_allowed(snapshot, envelope),
+                envelope_exists=envelope is not None,
+                family="bridge.turn",
+            )
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
                 action = self._external_policy_block_action(snapshot, envelope, state.turn_index)
@@ -1914,7 +1923,11 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.vt_external_disclosure_allowed(snapshot, current_envelope, tool_name):
+                if not self._disclosure_policy.allows_disclosure(
+                    self.vt_external_disclosure_allowed(snapshot, current_envelope, tool_name),
+                    envelope_exists=current_envelope is not None,
+                    family=tool_name,
+                ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 rejection_reason: list[str] = []
                 if await self._vt_source_disclosure_restricted(
@@ -1934,7 +1947,11 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.bridge_disclosure_allowed(snapshot, current_envelope):
+                if not self._disclosure_policy.allows_disclosure(
+                    self.bridge_disclosure_allowed(snapshot, current_envelope),
+                    envelope_exists=current_envelope is not None,
+                    family="advisor.consult",
+                ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
 
@@ -2450,9 +2467,15 @@ class InvestigationService:
                 investigation.subject_id, sample_hash
             )
             if any(
-                sample.tlp is TLP.RED
-                or external_effect_source_do_not_submit_blocks(family, sample.do_not_submit)
-                or bool((sample.license_restriction or "").strip())
+                external_effect_source_restriction_reason(
+                    source_kind="sample",
+                    source=sample,
+                    subject_id=investigation.subject_id,
+                    family=family,
+                    is_model_submission=False,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
+                is not None
                 for sample in samples
             ):
                 return True
@@ -2468,10 +2491,15 @@ class InvestigationService:
                 document = await source_documents.get(document_id)
                 if (
                     document is None
-                    or document.subject_id != investigation.subject_id
-                    or document.tlp is TLP.RED
-                    or external_effect_source_do_not_submit_blocks(family, document.do_not_submit)
-                    or bool((document.license_restriction or "").strip())
+                    or external_effect_source_restriction_reason(
+                        source_kind="source_document",
+                        source=document,
+                        subject_id=investigation.subject_id,
+                        family=family,
+                        is_model_submission=False,
+                        disclosure_profile=self._disclosure_policy.profile,
+                    )
+                    is not None
                 ):
                     return True
         return False
@@ -3128,7 +3156,11 @@ class InvestigationService:
                     invocation is not None
                     and current_envelope is not None
                     and invocation.status is ToolInvocationStatus.POLICY_DENIED
-                    and _tool_allowed_by_envelope(definition, current_envelope)
+                    and _tool_allowed_by_envelope(
+                        definition,
+                        current_envelope,
+                        disclosure_profile=self._disclosure_policy.profile,
+                    )
                 ):
                     # A previously denied operation had no external effect. A new G2
                     # version gets a fresh idempotency identity so explicit approval
@@ -3574,7 +3606,12 @@ class InvestigationService:
             if definition.name == exclude_name:
                 continue
             if definition.effect in {ToolEffect.LOCAL_READ, ToolEffect.LOCAL_COMPUTE} or (
-                envelope is not None and _tool_allowed_by_envelope(definition, envelope)
+                envelope is not None
+                and _tool_allowed_by_envelope(
+                    definition,
+                    envelope,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
             ):
                 alternatives.append(definition.name)
         return tuple(sorted(set(alternatives))[:8])
@@ -4799,7 +4836,12 @@ def _envelope_reduced_since(
     )
 
 
-def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope | None) -> bool:
+def _tool_allowed_by_envelope(
+    definition: Any,
+    envelope: InvestigationEnvelope | None,
+    *,
+    disclosure_profile: str | None = None,
+) -> bool:
     if envelope is None or definition.effect is ToolEffect.EXTERNAL_ACTIVE:
         return False
     if definition.effect in {
@@ -4810,7 +4852,13 @@ def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope |
         provider = definition.capability_key.partition(".")[0]
         if (
             provider not in envelope.allowed_providers
-            or (envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red")
+            or (
+                envelope.disclosure.tlp is not None
+                and envelope.disclosure.tlp.value == "red"
+                and not advisor_disclosure_policy(disclosure_profile).ignores_restriction_labels(
+                    definition.name
+                )
+            )
             or (
                 envelope.disclosure.do_not_submit
                 and provider not in {"bridge", "advisor", "vt", "virustotal"}
