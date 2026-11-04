@@ -653,6 +653,19 @@ def build_advisor_dossier(
     explicit_claims = _requested_claim_ids(prompt_data, relevance_text)
     contradiction_requested = _contradiction_is_requested(prompt_data, relevance_text)
     explicitly_referenced = set(_explicit_reference_ids(prompt_data))
+    advisor_omissions = [
+        item
+        for item in prompt_data.get("_advisor_omissions", ())
+        if isinstance(item, Mapping)
+    ]
+    omitted_observation_ids = {
+        _as_text(item.get("id"))
+        for item in advisor_omissions
+        if item.get("kind") == "observation" and _as_text(item.get("id"))
+    }
+    explicitly_referenced.difference_update(
+        ("observation", identifier) for identifier in omitted_observation_ids
+    )
     evidence_rows = [item for item in prompt_data.get("evidence", ()) if isinstance(item, Mapping)]
     evidence_by_id = {
         _as_text(item.get("evidence_id")): item
@@ -765,6 +778,52 @@ def build_advisor_dossier(
                     extra={"context_is_evidence": False},
                 )
             )
+
+    for item in advisor_omissions:
+        if item.get("kind") != "observation":
+            continue
+        identifier = _as_text(item.get("id"))
+        if not identifier:
+            continue
+        reason = _as_text(item.get("reason"))
+        resource = _as_text(item.get("resource"))
+        citation_hint = _as_text(item.get("citation_hint"))
+        next_action = _as_text(item.get("next_action"))
+        source_sha256 = _as_text(item.get("sha256"))
+        body = "\n".join(
+            part
+            for part in (
+                f"omitted_observation_id={identifier}",
+                f"omitted_observation_sha256={source_sha256}",
+                f"omission_reason={reason}",
+                f"resource={resource}",
+                f"citation_hint={citation_hint}",
+                f"next_action={next_action}",
+            )
+            if part
+        )
+        candidates.append(
+            _candidate(
+                kind="omission",
+                identifier=identifier,
+                sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                label="Référence VT omise — rapport non citable",
+                body=body,
+                score=10_000,
+                origin="uncitable_vt_file_report_reference",
+                extra={
+                    "omitted_observation_id": identifier,
+                    "omitted_observation_sha256": source_sha256,
+                    "source_ref": item.get("source_ref"),
+                    "omission_reason": reason,
+                    "omission_cause": _as_text(item.get("cause")),
+                    "resource": resource,
+                    "citation_hint": citation_hint,
+                    "next_action": next_action,
+                    "policy_omission": False,
+                },
+            )
+        )
 
     for sample in prompt_data.get("samples", ()):
         if not isinstance(sample, Mapping) or sample.get("verified") is not True:

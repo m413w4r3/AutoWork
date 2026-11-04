@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import SecretStr
 
+import cti_app.application.investigation_advisor_tools as advisor_tools_module
 from cti_app.application.advisor_contracts import (
     ADVISOR_RESPONSE_SCHEMA_V3,
     extract_json_object,
@@ -253,6 +254,311 @@ def install_advisor_evidence(tool, observations, payloads, *, associated_sample_
         SimpleNamespace(sample_sha256=sample_hash) for sample_hash in associated_sample_hashes
     )
     tool._sample_associations.list_for_investigation = async_get(associations)
+
+
+def _vt_file_report_observation(investigation_id, *, object_id, marker):
+    report_payload = {
+        "data": {
+            "id": object_id,
+            "type": "file",
+            "attributes": {
+                "md5": "b" * 32,
+                "sha1": "c" * 40,
+                "sha256": object_id,
+                "meaningful_name": marker,
+            },
+        }
+    }
+    observation, raw = make_observation(investigation_id, report_payload)
+    return (
+        replace(
+            observation,
+            kind=EvidenceKind.VT_FILE_REPORT,
+            source="VirusTotal",
+            object_type="file",
+            object_id=object_id,
+        ),
+        raw,
+    )
+
+
+def _unconfirmed_vt_file_observation(investigation_id, *, object_id):
+    marker_payload = {
+        "schema": "external-effect-unconfirmed.v1",
+        "external_effect_unconfirmed": True,
+        "needs_review": True,
+        "adapter_output_archived": False,
+        "status": "needs_review",
+    }
+    observation, raw = make_observation(investigation_id, marker_payload)
+    return (
+        replace(
+            observation,
+            kind=EvidenceKind.OTHER,
+            source="VirusTotal",
+            object_type="file",
+            object_id=object_id,
+        ),
+        raw,
+    )
+
+
+def _install_advisor_vt_observations(tool, observations, archived_payloads):
+    tool._observations = ObservationRepository(observations)
+    for observation, raw in archived_payloads:
+        tool._blobs.add(
+            observation.blob_id,
+            sha256=observation.sha256,
+            size=len(raw),
+            logical_bucket="evidence",
+        )
+        tool._artifact_store.values[observation.blob_id] = raw
+
+
+async def _count_advisor_blob_reads(monkeypatch, tool):
+    reads = []
+    original_read = tool._artifact_store.read_bytes
+
+    async def read_bytes(blob_id, *, max_bytes):
+        reads.append(blob_id)
+        return await original_read(blob_id, max_bytes=max_bytes)
+
+    monkeypatch.setattr(tool._artifact_store, "read_bytes", read_bytes)
+    return reads
+
+
+@pytest.mark.asyncio
+async def test_advisor_drops_uncitable_vt_file_reference_but_uses_valid_report(
+    monkeypatch,
+) -> None:
+    investigation_id = uuid4()
+    object_id = "a" * 64
+    valid, valid_raw = _vt_file_report_observation(
+        investigation_id,
+        object_id=object_id,
+        marker="VerifiedVTReportMarker",
+    )
+    unconfirmed, _unconfirmed_raw = _unconfirmed_vt_file_observation(
+        investigation_id,
+        object_id=object_id,
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The archived VirusTotal report supports this analysis.", [str(valid.id)]
+            ),
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    _install_advisor_vt_observations(
+        tool,
+        (valid, unconfirmed),
+        ((valid, valid_raw),),
+    )
+    blob_reads = await _count_advisor_blob_reads(monkeypatch, tool)
+    dossier_builds = []
+    build_dossier = advisor_tools_module.build_advisor_dossier
+
+    def counted_build(*args, **kwargs):
+        dossier_builds.append(None)
+        return build_dossier(*args, **kwargs)
+
+    monkeypatch.setattr(advisor_tools_module, "build_advisor_dossier", counted_build)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Compare the cited VirusTotal reports.",
+            "evidence_refs": [str(valid.id), str(unconfirmed.id)],
+        },
+        make_context(investigation_id, key="advisor-vt-report-plus-unconfirmed"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, dict(result.output)
+    assert len(transport.calls) == 1
+    manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    assert any(item["kind"] == "observation" and item["id"] == str(valid.id) for item in manifest)
+    assert not any(
+        item["kind"] == "observation" and item["id"] == str(unconfirmed.id)
+        for item in manifest
+    )
+    omission = next(
+        item for item in manifest if item.get("omitted_observation_id") == str(unconfirmed.id)
+    )
+    assert omission["kind"] == "omission"
+    assert omission["omission_reason"] == "vt_report_not_archived_or_unverifiable"
+    assert omission["resource"] == "vt.file_report"
+    assert any(
+        item["id"] == str(unconfirmed.id)
+        and item["reason"] == "vt_report_not_archived_or_unverifiable"
+        for item in result.output["omissions"]
+    )
+    assert valid.id in result.observation_refs
+    assert unconfirmed.id not in result.observation_refs
+    assert blob_reads.count(valid.blob_id) == 1
+    assert unconfirmed.blob_id not in blob_reads
+    assert len(dossier_builds) == 1
+
+
+@pytest.mark.asyncio
+async def test_advisor_continues_when_only_vt_file_reference_is_uncitable(monkeypatch) -> None:
+    investigation_id = uuid4()
+    object_id = "d" * 64
+    unconfirmed, _unconfirmed_raw = _unconfirmed_vt_file_observation(
+        investigation_id,
+        object_id=object_id,
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The remaining investigation context is sufficient to proceed.",
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    _install_advisor_vt_observations(tool, (unconfirmed,), ())
+    blob_reads = await _count_advisor_blob_reads(monkeypatch, tool)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the available context.",
+            "evidence_refs": [str(unconfirmed.id)],
+        },
+        make_context(investigation_id, key="advisor-only-unconfirmed-vt-report"),
+    )
+
+    assert len(transport.calls) == 1
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    assert not any(
+        item["kind"] == "observation" and item["id"] == str(unconfirmed.id)
+        for item in manifest
+    )
+    assert any(
+        item.get("omitted_observation_id") == str(unconfirmed.id)
+        and item["kind"] == "omission"
+        for item in manifest
+    )
+    assert result.output["omissions"][0]["resource"] == "vt.file_report"
+    assert unconfirmed.id not in result.observation_refs
+    assert blob_reads == []
+
+
+@pytest.mark.asyncio
+async def test_advisor_does_not_cite_vt_report_outside_evidence_blob_bucket(monkeypatch) -> None:
+    investigation_id = uuid4()
+    report, report_raw = _vt_file_report_observation(
+        investigation_id,
+        object_id="e" * 64,
+        marker="WrongBucketReportMarker",
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The available investigation context is sufficient to proceed.",
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    _install_advisor_vt_observations(tool, (report,), ((report, report_raw),))
+    tool._blobs.descriptors[report.blob_id].descriptor.logical_bucket = "samples-quarantine"
+    blob_reads = await _count_advisor_blob_reads(monkeypatch, tool)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the available context.",
+            "evidence_refs": [str(report.id)],
+        },
+        make_context(investigation_id, key="advisor-vt-report-wrong-bucket"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert report.id not in result.observation_refs
+    assert blob_reads == []
+    assert any(
+        item.get("omitted_observation_id") == str(report.id)
+        and item["kind"] == "omission"
+        and "SHA-256" in item["next_action"]
+        for item in result.output["bridge_provenance"]["dossier_manifest"]
+    )
+    assert "SHA-256" in result.output["omissions"][0]["next_action"]
+
+
+@pytest.mark.asyncio
+async def test_advisor_continues_when_vt_report_descriptor_lookup_fails(monkeypatch) -> None:
+    investigation_id = uuid4()
+    report, report_raw = _vt_file_report_observation(
+        investigation_id,
+        object_id="f" * 64,
+        marker="DescriptorLookupFailureReportMarker",
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="The available investigation context is sufficient to proceed.",
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+    _install_advisor_vt_observations(tool, (report,), ((report, report_raw),))
+    blob_reads = await _count_advisor_blob_reads(monkeypatch, tool)
+
+    async def fail_descriptor_lookup(_blob_id):
+        raise RuntimeError("synthetic descriptor lookup failure")
+
+    monkeypatch.setattr(tool, "_get_blob_descriptor", fail_descriptor_lookup)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the available context.",
+            "evidence_refs": [str(report.id)],
+        },
+        make_context(investigation_id, key="advisor-vt-report-descriptor-failure"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert report.id not in result.observation_refs
+    assert blob_reads == []
+    assert result.output["omissions"][0]["cause"] == "vt_report_archive_lookup_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_advisor_keeps_tlp_red_vt_report_as_hard_disclosure_refusal() -> None:
+    investigation_id = uuid4()
+    (
+        tool,
+        transport,
+        _original_observation,
+        _sample_id,
+        _association_id,
+        sample_blob_id,
+        sample_hash,
+    ) = _make_downloaded_sample_fixture(investigation_id, b"synthetic TLP red sample")
+    report, report_raw = _vt_file_report_observation(
+        investigation_id,
+        object_id=sample_hash,
+        marker="TLPRedReportMarker",
+    )
+    _install_advisor_vt_observations(tool, (report,), ((report, report_raw),))
+    _attach_sample_policy(tool, sample_blob_id, sample_hash, tlp=TLP.RED)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this cited VirusTotal report.",
+            "evidence_refs": [str(report.id)],
+        },
+        make_context(investigation_id, key="advisor-vt-report-tlp-red"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(report.id),)
+    assert result.error_code == "advisor_disclosure_restricted"
 
 
 def make_tool(
@@ -4088,21 +4394,13 @@ async def test_plan_dossier_omits_inherited_samples_without_sample_bytes_or_read
             )
         )
         if index < 2:
-            observation, raw = make_observation(
+            observation, raw = _vt_file_report_observation(
                 investigation_id,
-                {
-                    "schema": "virustotal-file-report.v1",
-                    "analysis_summary": (
-                        f"Cited observation {index} reports a distinct compiled marker "
-                        "for the requested investigation plan."
-                    ),
-                },
-            )
-            observation = replace(
-                observation,
-                source="VirusTotal",
-                object_type="file",
                 object_id=sample_hash,
+                marker=(
+                    f"Cited observation {index} reports a distinct compiled marker "
+                    "for the requested investigation plan."
+                ),
             )
             observations.append(observation)
             evidence_payloads[observation.blob_id] = raw
