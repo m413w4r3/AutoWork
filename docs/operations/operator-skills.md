@@ -1,6 +1,6 @@
 # Skills opérationnels CTI — lots 1 et 2
 
-**Statut : PROPOSED — révision anti-friction M11.** Guides métiers sans changement des politiques d'investigation. Intégration live à valider pour chaque runtime. Les contrats actifs et l'API prennent le pas sur les exemples de noms d'outils.
+Guides métiers génériques sans changement des politiques d'investigation. Vérifier le chargement pour chaque runtime. Les contrats actifs et les outils annoncés par l'application prennent le pas sur les exemples de noms d'outils.
 
 ## Objectif
 
@@ -66,9 +66,8 @@ python3 scripts/ops/test_stage_operator_cti_skills.py
 
 Ce test contrôle la présence des dix guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
 
-La sélection des consultations Bridge, les formes de mesures valides, les règles YARA candidates et la rédaction `draft_text` sont décrites dans [l'audit anti-friction Bridge](bridge-friction-audit-2026-11-01.md). Les opportunités de consultation ne sont pas des étapes obligatoires ni des quotas.
+Copier [le modèle de mandat opérateur](operator-mandate-template.md) comme `MANDATE.md` dans le workspace; sa checklist `FINAL_REPORT.md` est facultative. Le déroulement actif des échanges Bridge et les appels minimaux aux outils figurent dans [le playbook opérateur](operator-playbook-medium.md) et les skills concernés. Le dépôt ne contient pas de générateur de `MANDATE.md`, `PLAYBOOK.md` ou `ENVIRONMENT.md` pour le workspace.
 
 ## Règles de maintenance
 
 Un skill sert de routeur **méthodologique**, jamais de duplication d'un schéma backend ou d'une liste exhaustive de noms d'outils. Après évolution du backend, tester les déclencheurs et les cas réels avant d'éditer les guides. Conserver les règles de preuve et de gouvernance dans leurs contrats canoniques, sans les réécrire contradictoirement ici.
-Pour la dernière vérification opérationnelle avant archivage de R3, voir [le prompt de validation CTI et Bridge](cti-final-operational-validation-prompt.md) ; il mesure les livrables sans imposer de quotas de consultations.

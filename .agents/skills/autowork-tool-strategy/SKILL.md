@@ -9,7 +9,7 @@ Ce skill n'est PAS un catalogue fixe. L'autorité est available_tools, unavailab
 
 ## Un appel auditable
 
-Le `purpose` de chaque appel est le journal de décision : objectif, motif synthétique du choix, ce que le résultat doit apprendre, et si l'appel donne suite à un conseil Bridge (voir `autowork-bridge-collaboration`). Une phrase factuelle suffit ; ne pas y mettre de raisonnement privé ni de secret.
+Une phrase en `purpose` peut noter l’objectif et le résultat recherché; une trace de disposition Bridge reste facultative. N’impose pas un format à chaque échange et n’y place ni raisonnement privé ni secret.
 
 ## Découverte proportionnée
 
@@ -34,18 +34,20 @@ Le `purpose` de chaque appel est le journal de décision : objectif, motif synth
 | Bridge | advisor.consult, advisor.reparse | Dossier ciblé, droits, effet et coût |
 | C2 / Suricata | network.capture.inspect, network.stream.reassemble, network.messages.segment, network.protocol.*, network.suricata_*, advisor.consult (suricata_draft) | Analyse statique possible sans PCAP ; replay Suricata nécessite une capture associée et le moteur disponible |
 
-Pour YARA Bridge, `rule.propose_bridge` conserve la source exacte comme candidate attribuée, avec un gap explicite pour chaque string sans mesure liée. `rule.operator_syntax_fix` permet aussi `revision_mode="full_source"` pour une source opérateur dérivée de la v1 Bridge. Les résultats incluent `{stage, status, reason_code}` et un lifecycle dérivé (`candidate`, `compiled`, `tested`, `validated`) ; après proposition ou révision, appeler `rule.test` sur la candidate.
+Pour `advisor.consult`, donne le `consultation_type` et une question naturelle avec une phrase de contexte; le dossier est assemblé automatiquement. `evidence_refs` est facultatif : omets tout identifiant inconnu. Lis le texte brut Bridge avant le parsing; une réponse lisible reste utile même avec `partially_parsed` ou `unparsed`.
+
+Pour une règle YARA fournie par Bridge, l’appel minimal est `rule.propose_bridge({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`; `rule_index` et `rule_name` sont facultatifs. L’import crée une candidate non validée; appelle `rule.test` avec son `candidate_id` pour la compiler et l’éprouver sur le corpus disponible. Pour une candidate Suricata fournie par Bridge, l’appel minimal est `rule.import_suricata_bridge_candidate({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`; elle reste non validée et n’exige pas de références de mesure. Dans les deux cas, renvoie à Bridge les résultats utiles pour critique ou révision.
 
 ## Réactions aux réponses
 
-- Réponse Bridge partielle ou prose seule : conserver et lire le texte brut, exploiter les sections, règles, pivots et avertissements reconnus ; garder la prose inconnue visible. Distinguer reçu, analysé par le parseur, techniquement exploitable, testé, vérifié et artefact validé.
+- Réponse Bridge partielle ou prose seule : lire d’abord le texte brut, puis les éléments extraits, avertissements et omissions; exploiter chaque recommandation utile. Distinguer reçu, parsé, testé et vérifié sans exiger que ces états coïncident.
 - Erreur de schéma : relire la version réelle, required et enums ; corriger le champ.
 - Policy_denied : signaler la garde ; ne pas contourner par un nouveau nom/ID.
 - Unavailable : identifier capacité, pack ou worker manquant ; alternative ou blocage.
 - Empty : expliciter les paramètres et la couverture, jamais réfutation générale.
 - 409 stale_working_state : relire version/SHA courants, vérifier les effets, refaire une **nouvelle action correcte** uniquement lorsque l'absence de doublon est établie.
 - stale_experiment_version : relire experiment.list ; version du flux ≠ version working state.
-- transport_error/needs_review : retrouver invocation et relais, ne pas renvoyer un POST ambigu. Réconciliation seulement par le chemin/acteur autorisé.
+- transport_error/needs_review : retrouver l’invocation et le résultat; réconcilier par le chemin autorisé avant toute reprise, sans renvoyer le POST ambigu.
 - Sortie tronquée : paginer l'observation canonique ; ne pas reconstruire les octets manquants.
 
 Reporter les coûts fournisseur UNKNOWN si non mesurés ; ne pas transformer octets ou tokens estimés en facturation.

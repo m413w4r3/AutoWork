@@ -1,54 +1,58 @@
 ---
 name: autowork-bridge-collaboration
-description: Travailler avec Bridge comme analyste-conseil tout au long de l'enquête (plan, critique, YARA, pivots, rédaction), agir sur ses conseils et consigner comment ils ont été utilisés. Pour operator_led uniquement.
+description: Collaborer librement avec Bridge pour cadrer, critiquer, tester et rédiger l’analyse CTI, sans quotas ni contrôle de forme entre échanges. Pour operator_led uniquement.
 ---
 
-# Bridge, partenaire de l'enquête
+# Bridge, partenaire de l’enquête
 
-Bridge cadre → l'opérateur analyse → Bridge critique → l'opérateur teste → Bridge réévalue les résultats avec l'opérateur. Une réponse de Bridge est une **hypothèse de travail crédible**, jamais une preuve ni un statut de finding : la mesure par les outils reste de l'opérateur. Une recommandation utile mène normalement à une décision ou un test ; une réponse partielle reste exploitable selon ce qui a été reçu, extrait, testé et vérifié.
+Bridge propose et critique; l’opérateur vérifie les faits, réalise les tests disponibles et choisit la suite. Une réponse Bridge est un conseil, jamais une preuve. Une réponse partiellement parsée ou non parsée reste utile dès que son texte est lisible.
 
-Autorité : G2/TLP, `external_llm_allowed`, capacités et budgets de CETTE enquête. Si Bridge est indisponible ou refusé, poursuivre les branches locales autorisées et écrire dans le résumé final « collaboration Bridge non démontrée : <raison> ».
+## Quand le consulter
 
-## Quand consulter (déclencheurs, pas quotas)
+Déclencher les échanges par leur utilité, sans quota :
 
-Lire `advisor_guidance` dans `GET /operator-status` ou `/operator/context?view=summary` au démarrage et après chaque lot de résultats : `checkpoint_due`, `reason`, `suggested_consultation_type`, `last_advice`. Une consultation due est l'option par défaut ; avancer sans elle est légitime si une branche locale est plus informative, et le serveur le consigne comme `skipped`.
+- Dès que l’article et l’inventaire initial sont disponibles, demander un cadrage (`plan_investigation`) avant d’approfondir l’analyse.
+- Après une découverte CTI importante, demander à Bridge (`plan_investigation`) ce qu’elle change et quelle vérification est utile.
+- Pendant la création ou la révision d’une règle YARA (`yara_draft`), pour choisir des pivots VT discriminants (`pivot_strategy`), et pour le protocole C2 (`plan_investigation` ou `suricata_draft`) quand ces sujets sont pertinents.
+- Pour rédiger **chaque section analytique** du rapport, demander `draft_text`; demander `review_text` ensuite si la relecture peut aider.
 
-| Moment | `consultation_type` | Question utile |
-| --- | --- | --- |
-| Article et inventaire initial disponibles, **avant d'analyser en profondeur** | `plan_investigation` | Plan concret : affirmations à vérifier, échantillons prioritaires, outils de `available_tools`, contradictions possibles, premières pistes YARA/C2/pivots VT, inconnues à mesurer |
-| Premières analyses significatives | `plan_investigation` | Quels faits semblent établis, lesquels restent discutables, quelles analyses ont une valeur réelle ? |
-| Avant une rétro-ingénierie C2 pertinente (protocole, config, crypto) | `plan_investigation` | Méthodes, données, messages ou fonctions les plus instructifs ; tests passifs qui départagent |
-| Construction ou révision d'une YARA | `yara_draft` | Candidate ou motifs observés, puis critique de spécificité et réévaluation des résultats par hash |
-| Avant une campagne de pivots VT | `pivot_strategy` | Planifier des pivots exécutables et discriminants parmi les outils VT réellement exposés |
-| Résultat contradictoire, recherche vide, stagnation | `pivot_strategy` ou `plan_investigation` | Réévaluation : que signifie ce résultat, quelle alternative discriminante ? |
-| Rédaction de chaque section du livrable | `draft_text`, puis `review_text` pour cette section | Prose fondée sur les faits transmis ; `suricata_draft` et `figure_plan` complètent les sections réseau et schéma |
+Évite une question identique lorsque sa réponse est déjà disponible. Reviens vers Bridge quand un résultat nouveau permet une critique ou une réévaluation utile; les sujets distincts peuvent être abordés librement.
 
-Pas de quota de consultations, pas de question de suivi interdite, pas de regroupement forcé de sujets sans rapport. Ne pas répéter une demande identique si aucun fait nouveau ne change la question ; revenir vers Bridge lorsque de nouveaux résultats permettent une réévaluation. Une seule consultation de cadrage ne remplace pas les critiques et échanges de rédaction utiles pour les sections suivantes. Ne jamais renvoyer un POST ambigu (`advisor.reparse` ou réconciliation).
+## Poser la question
 
-## Le dossier est assemblé côté AutoWork
+`advisor.consult` demande `consultation_type`; ajoute une `question` en langage naturel qui tient en une phrase et donne le contexte utile, la découverte ou le test concerné. Le dossier pertinent est assemblé automatiquement. `evidence_refs` et `sample_sha256` sont facultatifs : ne donne une référence que si elle est exacte et utile; omets un identifiant inconnu. Les avertissements ou omissions éventuels restent visibles dans la réponse. Respecte l’enveloppe et les capacités de l’enquête courante.
 
-Poser une question précise en prose avec les références les plus pertinentes (`evidence_refs`, `sample_sha256`) ; ne pas recopier les données. Vérifier que le statut réel des octets de chaque échantillon (acquis, rapporté, associé, mesurable) est celui transmis. Ce qui manque se redemande dans l'échange suivant ; ne jamais le présenter comme vérifié.
+## Lire et exploiter la réponse
 
-## Après chaque réponse importante
+Lis d’abord le texte brut Bridge (`raw_output` ou `advisory_text`), puis `parse_status`, `extracted_elements`, `input_warnings`, `ignored_inputs` et `omissions`. Un statut `partially_parsed` ou `unparsed` ne rend pas inutile un texte intelligible. Traite ses conseils comme des pistes : vérifie les faits, puis exécute chaque recommandation utile avec les outils autorisés, adapte-la ou explique pourquoi elle ne convient pas. Envoie à Bridge les résultats qui permettent une critique ou une révision; ne répète pas la même question sans nouvel élément.
 
-1. Lire la prose et les avertissements ; distinguer reçu, extrait, techniquement exploitable, testé, vérifié et encore manquant. Les éléments non reconnus restent accessibles dans le texte brut conservé.
-2. **Agir** : transformer normalement une recommandation utile en décision ou test autorisé, puis mesurer le résultat. Copier les recommandations dans le rapport ne compte pas comme les avoir utilisées.
-3. Revenir vers Bridge pour réévaluer un résultat qui change matériellement la couverture, la règle, le pivot ou le modèle C2 ; éviter les appels identiques sans faits nouveaux.
-4. Consigner la disposition dans le `purpose` de l'appel d'outil qui suit, préfixé par une ligne de trace puis le but humain :
+Si la réponse contient une règle YARA, importe-la depuis l’observation persistée de cette consultation, même si le parsing est partiel :
+
+```text
+rule.propose_bridge({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})
+```
+
+Ce seul champ est requis. `rule_index` et `rule_name` sont des sélecteurs facultatifs. L’import crée une candidate non validée; appelle ensuite `rule.test` avec le `candidate_id` retourné pour compiler et tester selon le corpus disponible. Pour une correction de syntaxe, utilise `rule.operator_syntax_fix`; pour une amélioration, crée une nouvelle version reliée à son parent courant. Transmets les résultats mesurés à Bridge pour critique ou révision. Ne joins pas de références de mesure ou d’identifiants d’invocation à l’import minimal.
+
+Si la réponse contient une règle Suricata, importe aussi la candidate avec l’observation de la consultation :
+
+```text
+rule.import_suricata_bridge_candidate({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})
+```
+
+L’import est une candidate non validée et n’exige aucune référence de mesure. S’il existe une capture autorisée et les outils nécessaires, valide-la hors ligne; renvoie les résultats à Bridge pour critique ou révision. Sans capture, garde son statut non testé.
+
+## Rédiger le rapport
+
+Fais proposer par Bridge chaque section analytique avec `draft_text`. Demande `review_text` lorsque la relecture apporte quelque chose. L’opérateur vérifie les affirmations contre les observations, adapte le texte et l’intègre dans une prose naturelle. Les références non résolues n’empêchent pas la rédaction; conserve les faits incertains comme incertains. Le rapport final ne contient pas de marqueurs internes. Si Bridge est indisponible, n’attribue aucun texte à Bridge, marque la section incomplète et reprends la collaboration lorsqu’il redevient disponible.
+
+Le `purpose` peut résumer librement une disposition utile. Cette trace structurée facultative est acceptée par le parseur, mais sa présence ou sa forme ne conditionne ni l’action ni l’échange suivant :
 
 ```
 [[advisor-trace.v1]]{"recommendation":{"invocation_id":"<id advisor.consult>","decision":"accepted","reason":"<facultatif>"}}
 <but de l'appel, une phrase>
 ```
 
-`decision` ∈ `accepted`, `adapted`, `refused`, `deferred` ; `reason` (≤ 256 caractères) est requise sauf pour `accepted`. Ajouter `index` seulement pour viser une entrée structurée de `recommended_next_tools` (alors `accepted`/`refused` uniquement, et l'appel doit correspondre à l'outil proposé). Le checkpoint (`consulted`, `skipped`, `denied`) est ajouté par le serveur : ne pas l'écrire.
+Si un POST Bridge a un effet ambigu, réconcilie l’invocation existante avant toute reprise; ne renvoie jamais le POST ambigu.
 
-Le `purpose` de chaque appel dit l'objectif, le motif synthétique du choix et ce qu'on espère apprendre : une justification opérationnelle courte, pas un raisonnement privé.
-
-Si Bridge est indisponible, ne lui attribuer aucun texte : poursuivre les analyses locales autorisées, marquer la section concernée incomplète, diagnostiquer la cause et reprendre l'échange lorsque Bridge redevient disponible.
-
-## Rédaction
-
-Pour chaque section substantielle, demander à Bridge un `draft_text` puis un `review_text` lorsque la relecture apporte une vérification utile. L'opérateur apporte les faits mesurés et vérifie la cohérence avec ses tests ; une édition opérateur reste identifiable. Ne pas rédiger seul tout l'avis après un unique cadrage. Le texte livré ne contient aucun marqueur interne (`SUPPORTED`, `PARTIAL`, `bridge_authored`, `observation_ref`, `confidence=`) : provenance et preuves restent dans la couche d'audit. Les IOC viennent des observations canoniques, la source YARA exacte va en annexe séparée, et on n'invente ni message C2 ni découverte.
-
-**Oracle :** une consultation précoce produit des actions mesurables ; chaque conseil a une disposition retrouvable ; une réponse en prose est exploitée sans exiger de format ; l'absence de Bridge est signalée, jamais maquillée.
+**Oracle :** Bridge est sollicité aux moments utiles, son texte lisible est exploité malgré un parsing partiel, les recommandations utiles mènent à des actions, et les sections analytiques sont vérifiées avant intégration.

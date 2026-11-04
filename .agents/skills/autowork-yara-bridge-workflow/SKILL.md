@@ -1,62 +1,38 @@
 ---
 name: autowork-yara-bridge-workflow
-description: Produire tôt une YARA candidate à partir d'invariants observés, la tester avec le corpus disponible, l'améliorer via Bridge et les nouveaux échantillons sans exiger un holdout préalable.
+description: Proposer tôt des candidates YARA depuis les invariants observés, les compiler et les tester selon le corpus disponible, puis les améliorer avec Bridge et les nouveaux échantillons.
 ---
 
-# YARA + Bridge : concevoir, éprouver, qualifier
+# YARA + Bridge
 
-**Principe :** écrire **tôt** une YARA candidate utile, même sur un seul spécimen, puis élargir son évaluation au fil des pivots. Bridge conseille, le workbench compile et teste, les observations déterminent le niveau de confiance. Un match initial ne vaut pas validation de famille, mais constitue déjà un résultat exploitable.
+Une candidate précoce peut aider à trouver des variantes. Bridge conseille, le workbench importe et teste, et les observations déterminent le statut. Un match initial ne valide pas une famille; l’absence de goodware ou de holdout ne bloque pas la première candidate.
 
-## 1. Préparation légère
+## Choisir des motifs
 
-- Identifier l'objectif : détecter un spécimen, un sous-groupe ou une famille présumée. Choisir les motifs déjà observés et leur provenance, puis vérifier que les outils de proposition/test annoncés sont utilisables.
-- Pour Bridge, respecter G2/TLP, external_llm_allowed et les droits **actuels** ; ne pas ajouter d'autorisation locale spécifique, de plafond de message ni de quota arbitraire.
-- **Aucun minimum de positifs, de goodware ou de holdout pour écrire une candidate.** Si un corpus ou un moteur manque, préparer la proposition et dire ce qui n'a pas pu être compilé/testé ; ne pas baptiser « tested » une candidate non testée. **Ne jamais différer une consultation Bridge uniquement parce que le dossier n'a pas encore de mesure typée : demander une critique ou stratégie à partir des preuves déjà vérifiées ; la canonisation de règle est une étape distincte.**
-- Ne pas exiger un finding supported ou un plan d'expérience complet avant de commencer la rédaction.
+Partir des octets, chaînes, ressources, structures ou fonctions effectivement observés. Préciser si le but est un spécimen, un sous-groupe ou une famille présumée. Un motif mesuré sur un seul échantillon peut soutenir une règle de spécimen explicitement limitée. Ajouter variantes, contre-exemples et goodware au fil de l’enquête.
 
-## 2. Sélectionner des motifs
+## Demander l’avis de Bridge
 
-Extraire des observations mesurées : octets invariants d'une ressource, chaînes spécifiques, structures rares, associations de caractéristiques stables, signatures candidates de features.common / signatures.candidates.
+Quand une première candidate ou une révision mérite une critique, appeler `advisor.consult` avec `consultation_type="yara_draft"` et une question naturelle qui résume en une phrase les motifs, le test ou la découverte à examiner. Le dossier est assemblé automatiquement; les références de preuve sont facultatives. Omet tout identifiant que tu ne peux pas confirmer et ne bloque pas l’échange pour une sélection de mesures ou un format de réponse. Si la réponse est lisible, exploite-la même lorsque `parse_status` indique un résultat partiel ou non parsé.
 
-Conserver pour les motifs retenus leur source (sample, observation et région/feature si disponible) et leur raison de discrimination. Éviter les motifs triviaux ou non mesurés. Un motif propre à un seul échantillon peut néanmoins servir à une **règle de spécimen**, explicitement bornée, au lieu d'être interdit.
+## Importer, compiler, tester
 
-Comparer plusieurs échantillons **si disponibles et utiles**, et élargir ensuite par pivot VT ou similarité. Ne jamais inventer de mesures ou de références pour satisfaire un validateur.
+Dès qu’une réponse Bridge contient du code YARA, importe sa source depuis l’observation persistée de cette consultation, quel que soit le statut de parsing :
 
-## 3. Consultation Bridge : critique et production, sans rituel
+```text
+rule.propose_bridge({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})
+```
 
-Utiliser `advisor.consult` avec `yara_draft` dès qu'une critique des marqueurs, de la condition ou des faux positifs possibles peut améliorer une première candidate : inutile d'attendre goodware et holdout. Le dossier ciblé doit rendre disponibles **octets/strings discriminants et offsets**, type/structure du fichier (PE/CLI, natif, etc.), décodages utiles, contexte de fonction, règle actuelle et mesures par échantillon, contre-exemples, article/passage pertinent et observations canoniques. Vérifier leur présence dans le dossier effectivement transmis ; demander une lecture ciblée si une donnée clé manque. **Ne pas envoyer le binaire entier par réflexe**, mais ne pas écarter un extrait nécessaire. Formuler l'objectif spécimen/sous-groupe/famille et une question concrète. Il est normalement plus simple d'omettre `measurements` pour laisser AutoWork sélectionner les mesures vérifiées ; ne fournir les champs exacts que pour forcer une sélection. Des consultations de `pivot_strategy` peuvent aussi aider à rechercher de nouveaux échantillons. Aucune obligation de multiplier les tours.
+`bridge_observation_id` est l’unique champ requis. `rule_index` et `rule_name` sont facultatifs; une réponse contenant plusieurs règles peut créer plusieurs candidates. L’import conserve la source de Bridge comme candidate non validée et n’exige ni références de mesure ni hashes supplémentaires. Pour chaque candidate, appelle `rule.test` avec le `candidate_id` retourné afin de compiler et éprouver le corpus disponible. Pour une correction syntaxique, utilise `rule.operator_syntax_fix`; pour une amélioration, crée une nouvelle version liée au parent courant. Corrige ou révise selon les faux positifs/négatifs mesurés; une candidate non testée garde ce statut.
 
-Demander à Bridge de critiquer spécificité, fragilité, faux positifs, conditions et propositions de règle **en prose / code YARA selon le contrat**, jamais de répondre en JSON ou de mettre la réponse dans un bloc JSON. Un contrat Bridge ou parseur peut produire des résultats partiels ; ne pas considérer un statut succeeded comme validation sémantique.
+Envoie à Bridge les résultats qui aident la critique ou la révision : matches, non-matches mesurables, erreurs, cas non mesurables et contre-exemples. Pose une question qui résume ces résultats et demande ce qu’ils changent; ne répète pas une question déjà répondue sans résultat nouveau. Agis sur chaque recommandation utile.
 
-Le Bridge peut produire une règle réellement utile : `rule.propose_bridge` conserve sa source exacte persistée comme candidate attribuée, sans exiger un lien de mesure pour chaque string ; les strings non mesurées gardent un `justification.status=gap`. En cas de `measurements_invalid`, regarder `measurement_errors` (forme acceptée : `content_pattern_id` OU quartet `blob_id, kind, offset, value`). Ne répéter aucune soumission ambiguë ; si le texte a été persisté mais mal parsé, envisager `advisor.reparse` sans nouvel envoi.
+## Qualifier et poursuivre
 
-## 3 bis. Boucle de révision
+- Distingue candidate, compilation réussie, tests réalisés et validation selon le cycle réel de l’outil.
+- Un résultat absent ou non mesurable ne vaut pas non-match. Un petit corpus limite la conclusion, sans interdire la candidate.
+- Une règle peut alimenter un pivot VT autorisé; les nouveaux échantillons peuvent apporter des positifs, des contre-exemples ou des motifs discriminants.
+- Pour chaque section analytique du rapport, demande aussi un `draft_text`; demande `review_text` si une seconde lecture apporte une critique utile. Vérifie les faits et intègre une prose naturelle sans marqueurs internes.
+- L’approbation ou la publication reste une décision humaine séparée.
 
-Bridge cadre la candidate ou les motifs → l'opérateur analyse et construit → Bridge critique → l'opérateur compile et teste → Bridge réévalue les résultats mesurés. Transmettre à chaque retour les matches, non-matches, cas non mesurables et contre-exemples, pas une impression. Sur faux négatif, chercher les motifs absents, la condition et l'appartenance réelle du sample au groupe ; sur faux positif, la sous-expression trop générique et l'origine du contre-exemple. Ne pas modifier sans mesure ; consigner dans le `purpose` suivant la disposition du conseil (voir `autowork-bridge-collaboration`). Un nouveau tour est utile lorsque les résultats apportent une décision nouvelle, sans quota ni appel identique redondant.
-
-## 4. Enregistrer et tester
-
-- Voie Bridge : rule.propose_bridge exige les champs réels bridge_observation_id, bridge_invocation_id et rule_source_sha256 du **rule_source complet persisté** ; ne pas les inventer à partir d'un résumé. Vérifier la version du schéma avant l'appel.
-- Voie mesurée locale : rule.propose_from_candidates seulement si les candidats et leurs provenances P09/L2 sont réellement disponibles ; sinon rule.propose avec motifs vérifiés et provenance compatible avec son schéma.
-- rule.operator_syntax_fix accepte `revision_mode="full_source"` pour une source corrigée par l'opérateur depuis une candidate Bridge : la v2 est attribuée à l'opérateur et dérivée de la v1 Bridge, qui reste inchangée.
-- Les résultats portent un diagnostic structuré `{stage, status, reason_code}` et un lifecycle dérivé (`candidate`, `compiled`, `tested`, `validated`). Après proposition ou révision, l'étape suivante est `rule.test` sur la candidate ; la compilation seule ne la teste pas.
-- Lire les mesures réellement présentes par hash et rôle (positif, candidat, goodware, holdout si disponibles). Distinguer matches, non_matches, non_measurable et erreurs ; les absences de bytes ne sont pas des non-matches.
-- Un match goodware mesuré remet en cause la spécificité ; un unique match initial produit une règle expérimentale si tel est le statut du workbench. Le holdout n'est pas un préalable à la première candidate ; s'il sert à l'optimisation, il cesse d'être indépendant.
-
-## 5. Réviser avec un résultat mesuré
-
-Sur faux négatif réellement mesuré, chercher si le motif est non invariant, la condition trop stricte ou l'échantillon hors cluster. Sur faux positif, identifier la sous-expression banale. Réviser selon ce qui apporte de la valeur, via parent_version courant ; tester/comparer les versions quand les octets et capacités existent. Un nouvel échantillon peut devenir un nouveau positif, un contre-exemple ou un nouveau pivot.
-
-Ne pas optimiser au hasard jusqu'à faire matcher l'échantillon test. Le status candidate/experimental/tested/rejected reste défini par le workbench et la couverture effective, pas par l'intention de l'agent.
-
-## Sortie et arrêt
-
-- Objectif, périmètre et motivation des motifs.
-- SHA/version de source YARA et références des mesures.
-- Bridge invocation et observation si utilisées ; conseil accepté/rejeté avec raison.
-- Résultats réellement disponibles : corpus exact par rôle, moteur s'il a exécuté, matches/non_matches/non_measurable et limites ; ne pas inventer les tests absents.
-- Détection candidate, statut de validation réel, risques de faux positifs et condition de reprise.
-- Rédaction : demander à Bridge `draft_text`, puis `review_text` pour la section YARA si la relecture est utile ; vérifier le texte contre les tests. Une consultation de cadrage unique ne remplace pas cette collaboration par section. La source YARA exacte reste un fichier d'annexe distinct, identifié par son SHA-256.
-- Approbation/publication : exclusivement humains, hors de ce skill.
-
-**Oracle :** dès qu'un invariant discriminant est mesuré, l'agent produit une candidate YARA et la teste si possible, puis utilise ses résultats pour découvrir de nouveaux échantillons. Il ne confond pas candidate/experimental/tested, et l'absence de goodware/holdout ne bloque pas la première version.
+**Oracle :** tout texte YARA proposé par Bridge et persisté est importé comme candidate par son observation, testé selon les capacités disponibles et réévalué à partir des résultats mesurés.
