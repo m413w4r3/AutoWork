@@ -98,6 +98,8 @@ _MANIFEST_METADATA_KEYS = frozenset(
         "relation",
         "related_to",
         "replay_status",
+        "pcap_test_status",
+        "local_tool_invocation_id",
         "rule_kind",
         "rule_syntax_validation",
         "sample_state",

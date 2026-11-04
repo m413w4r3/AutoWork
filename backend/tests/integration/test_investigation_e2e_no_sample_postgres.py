@@ -163,11 +163,17 @@ class _ReservationTransport:
         async with self._uow_factory() as uow:
             invocations = await uow.tool_invocations.list_for_investigation(self._investigation_id)
             invocation = next(
-                item
-                for item in invocations
-                if item.tool_name == "advisor.consult"
-                and item.status is ToolInvocationStatus.RUNNING
+                (
+                    item
+                    for item in invocations
+                    if item.tool_name == "advisor.consult"
+                    and item.status is ToolInvocationStatus.RUNNING
+                ),
+                None,
             )
+            if invocation is None:
+                # Direct tool execution (no persisted invocation row): nothing to reconcile.
+                return self._responses.pop(0)
             envelope = await uow.investigation_envelopes.get(self._investigation_id)
             assert envelope is not None
             reservation = next(

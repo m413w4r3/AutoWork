@@ -842,7 +842,10 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                     key=f"m05c-advisor-veto:{label}:{uuid4()}",
                 )
                 output = result["advisor_output"]
-                assert output["advisor_status"] == "succeeded", label
+                # An unknown assertion alias in the reply is informative only (M14): the readable
+                # text is returned with a ``partial`` advisory status and a succeeded tool.
+                assert output["advisor_status"] in {"succeeded", "partial"}, label
+                assert output["usable"] is True, label
                 assert result["invocation"]["status"] == "succeeded"
                 assert len(transport.calls) - before == 1
                 sent_prompt = transport.calls[-1]["prompt"]

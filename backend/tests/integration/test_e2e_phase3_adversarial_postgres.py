@@ -537,10 +537,12 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         uow_factory,
         investigation_id,
         [
+            # credential, signed-url, missing-ref and allowed consultations all reach the transport
             TurnSubmission(
                 TurnSubmissionStatus.SUCCEEDED,
                 output_text=_advisor_raw("succeeded", "The synthetic evidence is bounded."),
             )
+            for _ in range(4)
         ],
     )
     factory = composition_factory(
@@ -1046,7 +1048,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         assert (
             revoked_attempt.json()["output"]["error"]["reason"] == "external_llm_disclosure_denied"
         )
-        assert len(transport.calls) == 1
+        assert len(transport.calls) == 4  # credential + signed-url + missing-ref + allowed
         assert transport.real_network_calls == 0
 
 
