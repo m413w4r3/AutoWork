@@ -6,12 +6,14 @@ import csv
 import ctypes
 import errno
 import fcntl
+import gzip
 import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import tarfile
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
@@ -21,11 +23,26 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 ANNEX_MANIFEST_SCHEMA = "autowork.investigation-annex-manifest.v1"
+ANNEX_DISCLOSURE_PROFILES = frozenset({"standard", "m14_research_permissive"})
+M14_RESEARCH_PERMISSIVE_PROFILE = "m14_research_permissive"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _SAFE_LEAF = re.compile(r"[^A-Za-z0-9._-]+", re.ASCII)
 _AVAILABILITY = frozenset({"present", "unavailable", "restricted", "absent"})
 _RESTRICTED_TYPES = frozenset(
     {"sample", "network_capture", "protocol_note", "technical_figure", "technical_note"}
+)
+_FILE_ASSET_TYPES = frozenset(
+    {
+        "yara_rule",
+        "yara_test_report",
+        "suricata_rule",
+        "suricata_test_report",
+        "sample",
+        "network_capture",
+        "protocol_note",
+        "technical_figure",
+        "technical_note",
+    }
 )
 _POLICY_SENSITIVE_TYPES = frozenset(
     {
@@ -49,6 +66,7 @@ _MANIFEST_METADATA_KEYS = frozenset(
         "candidate_id",
         "candidate_status",
         "candidate_version",
+        "do_not_submit",
         "detection_empirically_validated",
         "detection_result",
         "engine_status",
@@ -57,6 +75,12 @@ _MANIFEST_METADATA_KEYS = frozenset(
         "figure_kind",
         "ioc_type",
         "license_restriction_present",
+        "license_restriction",
+        "opinion_id",
+        "opinion_version",
+        "opinion_sha256",
+        "base_publication_sha256",
+        "lineage_sha256",
         "media_kind",
         "compiler_name",
         "compiler_version",
@@ -64,6 +88,8 @@ _MANIFEST_METADATA_KEYS = frozenset(
         "origin_kind",
         "origin",
         "origin_tool",
+        "archive_export_allowed",
+        "public_distribution_allowed",
         "origin_invocation_id",
         "source_observation_ids",
         "parent_version",
@@ -122,6 +148,14 @@ class AnnexExportResult:
     manifest_sha256: str
     object_count: int
     file_count: int
+
+
+class AnnexIncompleteExportError(ValueError):
+    """A canonical file asset was present but its verified file was not emitted."""
+
+    def __init__(self, asset_type: str) -> None:
+        self.asset_type = asset_type
+        super().__init__(f"Expected canonical {asset_type} bytes were not written")
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -229,6 +263,7 @@ def _asset_path(
     yara_numbers: Mapping[str, int],
     suricata_numbers: Mapping[str, int],
     report_number: int,
+    profile: str = "standard",
 ) -> str | None:
     if asset.type == "yara_rule":
         number = yara_numbers[_rule_key(asset)]
@@ -246,19 +281,44 @@ def _asset_path(
         return f"suricata/tests/report-{report_number:03d}.json"
     if asset.type == "protocol_note":
         leaf = _safe_leaf(asset.filename, f"note-{report_number:03d}.json")
-        return f"network/protocol-notes/restricted/{leaf}"
+        prefix = (
+            "restricted/network/protocol-notes"
+            if profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            else "network/protocol-notes/restricted"
+        )
+        return f"{prefix}/{leaf}"
     if asset.type == "technical_note":
         leaf = _safe_leaf(asset.filename, f"note-{report_number:03d}.txt")
-        return f"technical/notes/restricted/{leaf}"
+        prefix = (
+            "restricted/technical/notes"
+            if profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            else "technical/notes/restricted"
+        )
+        return f"{prefix}/{leaf}"
     if asset.type == "technical_figure":
         leaf = _safe_leaf(asset.filename, f"figure-{report_number:03d}.svg")
-        return f"technical/figures/restricted/{leaf}"
+        prefix = (
+            "restricted/technical/figures"
+            if profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            else "technical/figures/restricted"
+        )
+        return f"{prefix}/{leaf}"
     if asset.type == "sample":
         digest = asset.sha256 or hashlib.sha256(asset.canonical_id.encode()).hexdigest()
-        return f"samples/restricted/{digest}.bin"
+        prefix = (
+            "restricted/samples"
+            if profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            else "samples/restricted"
+        )
+        return f"{prefix}/{digest}.bin"
     if asset.type == "network_capture":
         digest = asset.sha256 or hashlib.sha256(asset.canonical_id.encode()).hexdigest()
-        return f"network/restricted/captures/{digest}.pcap"
+        prefix = (
+            "restricted/network/captures"
+            if profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            else "network/restricted/captures"
+        )
+        return f"{prefix}/{digest}.pcap"
     return None
 
 
@@ -281,7 +341,11 @@ def _archive_export_policy(asset: AnnexAsset) -> bool | None:
     return metadata_policy if isinstance(metadata_policy, bool) else None
 
 
-def _public_projection(asset: AnnexAsset, *, include_restricted_archive: bool) -> AnnexAsset:
+def _public_projection(
+    asset: AnnexAsset, *, include_restricted_archive: bool, profile: str
+) -> AnnexAsset:
+    if profile == M14_RESEARCH_PERMISSIVE_PROFILE:
+        return asset
     policy_unresolved = not include_restricted_archive and asset.public_distribution_allowed is None
     public_restricted = not include_restricted_archive and (
         policy_unresolved or asset.public_distribution_allowed is False
@@ -334,19 +398,29 @@ def _public_projection(asset: AnnexAsset, *, include_restricted_archive: bool) -
     )
 
 
-def _is_export_withheld(asset: AnnexAsset, *, include_restricted_archive: bool) -> bool:
-    projected = _public_projection(asset, include_restricted_archive=include_restricted_archive)
+def _is_export_withheld(
+    asset: AnnexAsset, *, include_restricted_archive: bool, profile: str
+) -> bool:
+    if profile == M14_RESEARCH_PERMISSIVE_PROFILE:
+        return False
+    projected = _public_projection(
+        asset, include_restricted_archive=include_restricted_archive, profile=profile
+    )
     if projected.availability == "restricted":
         return True
     return (
-        not include_restricted_archive
+        profile != M14_RESEARCH_PERMISSIVE_PROFILE
+        and not include_restricted_archive
         and asset.type in _RESTRICTED_TYPES
         and asset.availability != "absent"
     )
 
 
 def _project_assets(
-    snapshot: InvestigationAnnexSnapshot, *, include_restricted_archive: bool
+    snapshot: InvestigationAnnexSnapshot,
+    *,
+    include_restricted_archive: bool,
+    profile: str,
 ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
     assets = sorted(snapshot.assets, key=_asset_identity)
     yara_numbers = _rule_numbers(assets, "yara_rule")
@@ -362,12 +436,16 @@ def _project_assets(
         item.sha256
         for item in assets
         if item.sha256
-        and _is_export_withheld(item, include_restricted_archive=include_restricted_archive)
+        and _is_export_withheld(
+            item, include_restricted_archive=include_restricted_archive, profile=profile
+        )
     }
 
     for asset in assets:
         path_asset = asset
-        asset = _public_projection(asset, include_restricted_archive=include_restricted_archive)
+        asset = _public_projection(
+            asset, include_restricted_archive=include_restricted_archive, profile=profile
+        )
         related_sha = asset.metadata.get("related_to")
         withheld_refs = tuple(item for item in asset.references if item in withheld_shas)
         if (isinstance(related_sha, str) and related_sha in withheld_shas) or withheld_refs:
@@ -390,12 +468,15 @@ def _project_assets(
             yara_numbers=yara_numbers,
             suricata_numbers=suricata_numbers,
             report_number=type_ordinals[asset.type],
+            profile=profile,
         )
         availability = asset.availability
         restrictions = sorted({_clean_text(value) for value in asset.restrictions if value.strip()})
         content = asset.content
 
-        if asset.type in _RESTRICTED_TYPES and availability != "absent":
+        if profile != M14_RESEARCH_PERMISSIVE_PROFILE and (
+            asset.type in _RESTRICTED_TYPES and availability != "absent"
+        ):
             if not include_restricted_archive:
                 availability = "restricted"
                 restrictions = sorted(
@@ -413,6 +494,36 @@ def _project_assets(
                 content = None
             elif content is None and availability == "present":
                 availability = "unavailable"
+
+        if profile == M14_RESEARCH_PERMISSIVE_PROFILE:
+            # The public projection keeps canonical identifiers, hashes, relations, and policy
+            # labels. Raw acquired samples and captures are only written into restricted/.
+            if availability == "restricted" and asset.sha256 is not None:
+                availability = "present"
+            if asset.type in _RESTRICTED_TYPES and availability != "absent":
+                if not include_restricted_archive:
+                    content = None
+                    restrictions = sorted(set(restrictions) | {"bytes_excluded_from_public_view"})
+                    if availability == "restricted" and asset.sha256 is not None:
+                        availability = "present"
+                elif content is not None:
+                    availability = "present"
+
+        if (
+            profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            and include_restricted_archive
+            and asset.type in _RESTRICTED_TYPES
+            and availability == "present"
+            and content is None
+        ):
+            raise AnnexIncompleteExportError(asset.type)
+        if profile == M14_RESEARCH_PERMISSIVE_PROFILE and availability == "present":
+            if (
+                asset.type in _FILE_ASSET_TYPES
+                and content is None
+                and (asset.type not in _RESTRICTED_TYPES or include_restricted_archive)
+            ):
+                raise AnnexIncompleteExportError(asset.type)
 
         if content is not None and availability == "present":
             actual_sha256 = _sha256(content)
@@ -488,8 +599,24 @@ def _project_assets(
         }
         object_rows.append(row)
 
+    for asset in projected_assets:
+        if asset.availability != "present" or asset.type not in _FILE_ASSET_TYPES:
+            continue
+        if (
+            profile == M14_RESEARCH_PERMISSIVE_PROFILE
+            and not include_restricted_archive
+            and asset.type in _RESTRICTED_TYPES
+        ):
+            continue
+        if asset.content is None or asset.filename is None:
+            if profile == M14_RESEARCH_PERMISSIVE_PROFILE:
+                raise AnnexIncompleteExportError(asset.type)
+            continue
+        if files.get(asset.filename) != asset.content:
+            raise AnnexIncompleteExportError(asset.type)
+
     _add_absent_collections(object_rows, snapshot.investigation_id)
-    _add_projection_files(files, projected_assets)
+    _add_projection_files(files, projected_assets, profile=profile)
     return sorted(
         object_rows,
         key=lambda item: (item["type"], item["canonical_id"], str(item["version"] or "")),
@@ -531,7 +658,9 @@ def _add_absent_collections(objects: list[dict[str, Any]], investigation_id: str
         )
 
 
-def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset]) -> None:
+def _add_projection_files(
+    files: dict[str, bytes], assets: Sequence[AnnexAsset], *, profile: str
+) -> None:
     ioc_rows = []
     for asset in assets:
         if asset.type != "observed_ioc":
@@ -643,6 +772,35 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
         ),
         sorted(set(inventory_rows), key=lambda row: tuple(str(item) for item in row)),
     )
+    capture_rows = [
+        (
+            asset.canonical_id,
+            asset.sha256 or "",
+            asset.version or "",
+            asset.source,
+            asset.origin,
+            asset.availability,
+            "yes" if asset.content is not None else "no",
+            ";".join(asset.references),
+            ";".join(asset.restrictions),
+        )
+        for asset in assets
+        if asset.type == "network_capture"
+    ]
+    files["network/captures/index.csv"] = _csv_bytes(
+        (
+            "canonical_id",
+            "sha256",
+            "version",
+            "source",
+            "origin",
+            "availability",
+            "private_bytes_included",
+            "references",
+            "restrictions",
+        ),
+        sorted(set(capture_rows), key=lambda row: tuple(str(item) for item in row)),
+    )
     for rule_type, report_type, directory in (
         ("yara_rule", "yara_test_report", "yara/tests"),
         ("suricata_rule", "suricata_test_report", "suricata/tests"),
@@ -675,6 +833,28 @@ def _add_projection_files(files: dict[str, bytes], assets: Sequence[AnnexAsset])
                 }
             )
         files[f"{directory}/index.json"] = _canonical_json(index_rows)
+    if profile == M14_RESEARCH_PERMISSIVE_PROFILE:
+        suricata_rules = [asset for asset in assets if asset.type == "suricata_rule"]
+        for index, rule in enumerate(suricata_rules, start=1):
+            replay_status = rule.metadata.get("replay_status")
+            pcap_status = (
+                "testée sur PCAP"
+                if replay_status == "single_capture_replay_only"
+                else "testée sur PCAP (échec)"
+                if replay_status == "failed"
+                else "non testée sur PCAP"
+            )
+            candidate = rule.metadata.get("candidate_id") or rule.canonical_id
+            version = rule.version if rule.version is not None else "unknown"
+            files[f"suricata/tests/status-{index:03d}.json"] = _canonical_json(
+                {
+                    "candidate_id": candidate,
+                    "version": version,
+                    "rule_sha256": rule.sha256,
+                    "status": pcap_status,
+                    "replay_status": replay_status or "not_tested",
+                }
+            )
     files["technical/notes/README.txt"] = (
         b"Technical notes and protocol facts are represented by the canonical object references "
         b"in manifest.json. Missing or policy-restricted material is listed there explicitly.\n"
@@ -703,7 +883,14 @@ def _write_file(root: Path, relative_path: str, content: bytes) -> dict[str, Any
         os.fsync(stream.fileno())
     mode = (
         0o400
-        if relative_path.startswith(("samples/restricted/", "network/restricted/captures/"))
+        if relative_path.startswith(
+            (
+                "samples/restricted/",
+                "network/restricted/captures/",
+                "restricted/samples/",
+                "restricted/network/captures/",
+            )
+        )
         else 0o600
     )
     os.chmod(path, mode)
@@ -756,15 +943,54 @@ def _commit_directory(stage: Path, destination: Path, *, overwrite: bool) -> Non
         shutil.rmtree(backup)
 
 
+def _technical_archive_bytes(files: Mapping[str, bytes]) -> bytes:
+    """Build a deterministic gzip tar containing only the private restricted tree."""
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name, content in sorted(files.items()):
+            if not name.startswith("restricted/"):
+                continue
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(content))
+    compressed = io.BytesIO()
+    with gzip.GzipFile(fileobj=compressed, filename="", mode="wb", mtime=0) as stream:
+        stream.write(tar_buffer.getvalue())
+    return compressed.getvalue()
+
+
 def write_investigation_annex(
     snapshot: InvestigationAnnexSnapshot,
     output_dir: str | Path,
     *,
     include_restricted_archive: bool = False,
     overwrite: bool = False,
+    profile: str = "standard",
+    opinion_preview_pdf: bytes | None = None,
+    opinion_preview_unavailable_reason: str | None = None,
+    opinion_preview_metadata: Mapping[str, Any] | None = None,
 ) -> AnnexExportResult:
     """Write a deterministic, policy-aware annex directory from canonical snapshot data."""
     _validate_snapshot(snapshot)
+    if profile not in ANNEX_DISCLOSURE_PROFILES:
+        raise ValueError("Unsupported annex disclosure profile")
+    if profile == M14_RESEARCH_PERMISSIVE_PROFILE and include_restricted_archive:
+        unavailable_asset = next(
+            (
+                asset
+                for asset in snapshot.assets
+                if asset.type in _FILE_ASSET_TYPES and asset.availability == "unavailable"
+            ),
+            None,
+        )
+        if unavailable_asset is not None:
+            raise AnnexIncompleteExportError(unavailable_asset.type)
+    if opinion_preview_pdf is not None and opinion_preview_unavailable_reason is not None:
+        raise ValueError("An opinion preview cannot be both present and unavailable")
     destination = Path(output_dir).expanduser()
     if not destination.name:
         raise ValueError("Annex output directory must name a directory")
@@ -775,8 +1001,50 @@ def write_investigation_annex(
         if (destination.exists() or destination.is_symlink()) and not overwrite:
             raise FileExistsError("Annex destination already exists; use --overwrite to replace it")
         objects, content_files = _project_assets(
-            snapshot, include_restricted_archive=include_restricted_archive
+            snapshot, include_restricted_archive=include_restricted_archive, profile=profile
         )
+        if include_restricted_archive:
+            private_mirrors = (
+                ("samples/restricted/", "restricted/samples/"),
+                ("network/restricted/captures/", "restricted/network/captures/"),
+                ("network/protocol-notes/restricted/", "restricted/network/protocol-notes/"),
+                ("technical/notes/restricted/", "restricted/technical/notes/"),
+                ("technical/figures/restricted/", "restricted/technical/figures/"),
+            )
+            for source_prefix, private_prefix in private_mirrors:
+                for path, content in tuple(content_files.items()):
+                    if path.startswith(source_prefix):
+                        content_files.setdefault(
+                            f"{private_prefix}{path[len(source_prefix):]}", content
+                        )
+            content_files.setdefault(
+                "restricted/README.txt",
+                b"Private technical material selected by the canonical export profile. "
+                b"See manifest.json for source hashes and policy metadata.\n",
+            )
+            archive_bytes = _technical_archive_bytes(content_files)
+            content_files["technical-archive.tar.gz"] = archive_bytes
+            content_files["technical-archive.tar.gz.sha256"] = (
+                f"{_sha256(archive_bytes)}  technical-archive.tar.gz\n".encode()
+            )
+        if opinion_preview_pdf is not None:
+            content_files["opinion/opinion-draft.pdf"] = opinion_preview_pdf
+        preview_entry: dict[str, Any]
+        if opinion_preview_pdf is not None:
+            preview_entry = {
+                "status": "present",
+                "path": "opinion/opinion-draft.pdf",
+                "sha256": _sha256(opinion_preview_pdf),
+            }
+        else:
+            preview_entry = {
+                "status": "indisponible",
+                "reason": _clean_text(
+                    opinion_preview_unavailable_reason or "preview_not_requested"
+                ),
+            }
+        if opinion_preview_metadata:
+            preview_entry.update(_safe_metadata(opinion_preview_metadata))
         stage = Path(tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent))
         os.chmod(stage, 0o700)
         try:
@@ -786,7 +1054,9 @@ def write_investigation_annex(
             manifest = {
                 "schema": ANNEX_MANIFEST_SCHEMA,
                 "investigation_id": snapshot.investigation_id,
+                "profile": profile,
                 "restricted_archive_included": include_restricted_archive,
+                "opinion_preview": preview_entry,
                 "objects": objects,
                 # Exclude manifest files to avoid a hash cycle.
                 "files": generated_files,

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tarfile
 from datetime import UTC, date, datetime
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -45,6 +47,7 @@ from cti_app.infrastructure.database.investigation_annex_reader import (
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from scripts import export_investigation_annex as annex_cli
 from tests.integration.edition_codes import reserve_edition_code
 
 pytestmark = pytest.mark.integration
@@ -108,7 +111,7 @@ def _files(root: Path) -> dict[str, bytes]:
 
 @pytest.mark.asyncio
 async def test_postgres_annex_export_reads_canonical_records_and_filters_restricted_samples(
-    migrated_postgres_url: str, tmp_path: Path
+    migrated_postgres_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
@@ -773,6 +776,90 @@ async def test_postgres_annex_export_reads_canonical_records_and_filters_restric
         assert bridge_source.encode() not in b"".join(red_archive_files.values())
         assert revised_source.encode() not in b"".join(red_archive_files.values())
         assert suricata_source.encode() not in b"".join(red_archive_files.values())
+
+        cli_engine_factory_calls: list[str] = []
+
+        def _new_engine(dsn: str):
+            cli_engine_factory_calls.append(dsn)
+            return create_postgres_engine(migrated_postgres_url)
+
+        monkeypatch.setattr(
+            annex_cli,
+            "get_settings",
+            lambda: SimpleNamespace(
+                postgres_dsn=migrated_postgres_url,
+                advisor_disclosure_profile="standard",
+                s3_endpoint="unused.invalid",
+                s3_access_key="test-only-access-key",
+                s3_secret_key="test-only-secret-key",
+                s3_secure=False,
+                s3_bucket="test-only-bucket",
+            ),
+        )
+        monkeypatch.setattr(annex_cli, "Minio", lambda *args, **kwargs: object())
+        monkeypatch.setattr(annex_cli, "MinioBlobStore", lambda *args, **kwargs: blob_store)
+        monkeypatch.setattr(annex_cli, "create_postgres_engine", _new_engine)
+        cli_output = tmp_path / "cli-research-permissive"
+        assert (
+            annex_cli.main(
+                [
+                    str(investigation.id),
+                    str(cli_output),
+                    "--profile",
+                    "m14_research_permissive",
+                    "--include-restricted-archive",
+                ]
+            )
+            == 0
+        )
+        assert cli_engine_factory_calls == [migrated_postgres_url]
+        cli_payload = json.loads(capsys.readouterr().out)
+        assert cli_payload["profile"] == "m14_research_permissive"
+        cli_files = _files(cli_output)
+        assert cli_files[f"restricted/samples/{sample_sha}.bin"] == sample_bytes
+        assert cli_files[f"restricted/samples/{shared_sha}.bin"] == shared_bytes
+        assert cli_files[f"restricted/network/captures/{capture_sha}.pcap"] == capture_bytes
+        assert cli_files["yara/candidate-001-v1.yar"] == bridge_source.encode()
+        assert cli_files["yara/candidate-001-v2.yar"] == revised_source.encode()
+        assert cli_files["suricata/tests/status-001.json"]
+        assert cli_files["iocs/observed-iocs.csv"]
+        assert cli_files["iocs/discovered-samples.csv"]
+        assert cli_files["samples/sample-inventory.csv"]
+        assert capture_sha.encode() in cli_files["network/captures/index.csv"]
+        assert cli_files["technical-archive.tar.gz"]
+        assert cli_files["technical-archive.tar.gz.sha256"]
+        archive_sha = hashlib.sha256(cli_files["technical-archive.tar.gz"]).hexdigest()
+        assert cli_files["technical-archive.tar.gz.sha256"] == (
+            f"{archive_sha}  technical-archive.tar.gz\n".encode()
+        )
+        with tarfile.open(
+            fileobj=BytesIO(cli_files["technical-archive.tar.gz"]), mode="r:gz"
+        ) as private_archive:
+            private_members = {
+                item.name: private_archive.extractfile(item).read()
+                for item in private_archive.getmembers()
+            }
+        assert private_members[f"restricted/samples/{sample_sha}.bin"] == sample_bytes
+        assert private_members[f"restricted/network/captures/{capture_sha}.pcap"] == capture_bytes
+        public_file_bytes = b"\n".join(
+            content
+            for path, content in cli_files.items()
+            if not path.startswith("restricted/")
+            and not path.startswith("technical-archive.tar.gz")
+            and path not in {"manifest.json", "manifest.sha256"}
+        )
+        assert sample_bytes not in public_file_bytes
+        assert capture_bytes not in public_file_bytes
+        cli_manifest = json.loads(cli_files["manifest.json"])
+        assert cli_manifest["opinion_preview"]["status"] == "indisponible"
+        assert cli_manifest["opinion_preview"]["reason"] == (
+            "indisponible: aucun avis brouillon disponible"
+        )
+        manifest_entries = cli_manifest["files"]
+        assert len(manifest_entries) == cli_payload["file_count"]
+        assert {entry["path"] for entry in manifest_entries} == (
+            set(cli_files) - {"manifest.json", "manifest.sha256"}
+        )
     finally:
         await engine.dispose()
 

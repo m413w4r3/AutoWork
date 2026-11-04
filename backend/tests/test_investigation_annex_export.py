@@ -945,6 +945,7 @@ def test_restricted_archive_requires_explicit_flag_and_policy_eligibility(tmp_pa
         expected_mode = (
             0o400
             if relative.startswith(("samples/restricted/", "network/restricted/captures/"))
+            or relative.startswith(("restricted/samples/", "restricted/network/captures/"))
             else 0o600
         )
         assert path.stat().st_mode & 0o777 == expected_mode
@@ -1362,3 +1363,276 @@ def test_restricted_archive_fails_closed_for_sensitive_assets_without_policy(
     assert b"private-rule-origin" not in serialized
     assert b"private-rule-reference" not in serialized
     assert b"private-rule-candidate" not in serialized
+
+
+def test_m14_research_profile_writes_private_blobs_and_keeps_public_metadata(
+    tmp_path: Path,
+) -> None:
+    investigation_id = str(uuid4())
+    sample = b"synthetic acquired sample bytes"
+    sample_sha = hashlib.sha256(sample).hexdigest()
+    capture = b"synthetic pcap bytes"
+    capture_sha = hashlib.sha256(capture).hexdigest()
+    yara_v1 = b'rule m14_candidate { strings: $a = "old" condition: $a }\n'
+    yara_v2 = b'rule m14_candidate { strings: $a = "new" condition: $a }\n'
+    suricata = b'alert http any any -> any any (msg:"synthetic"; sid:1234567;)\n'
+    yara_report = b'{"status":"not_tested","matches":[]}\n'
+    assets = (
+        AnnexAsset(
+            canonical_id="sample-acquisition-1",
+            type="sample",
+            investigation_id=investigation_id,
+            source="samples+blobs",
+            origin="virustotal",
+            sha256=sample_sha,
+            references=("sample-association-1", "observation-1"),
+            archive_export_allowed=False,
+            public_distribution_allowed=False,
+            content=sample,
+            metadata={
+                "tlp": "red",
+                "license_restriction_present": True,
+                "license_restriction": "qualification-only",
+                "external_llm_allowed": False,
+                "do_not_submit": True,
+                "sample_state": "quarantined",
+            },
+        ),
+        AnnexAsset(
+            canonical_id="capture-acquisition-1",
+            type="network_capture",
+            investigation_id=investigation_id,
+            source="network.quarantine",
+            origin="network_capture",
+            sha256=capture_sha,
+            references=("capture-observation-1", sample_sha),
+            archive_export_allowed=False,
+            public_distribution_allowed=False,
+            content=capture,
+            filename="capture.pcap",
+            metadata={"tlp": "red", "external_llm_allowed": False, "do_not_submit": True},
+        ),
+        AnnexAsset(
+            canonical_id="candidate-v1",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            source="detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            version=1,
+            sha256=hashlib.sha256(yara_v1).hexdigest(),
+            references=("candidate-id",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=yara_v1,
+            metadata={"candidate_id": "candidate-id", "candidate_status": "experimental"},
+        ),
+        AnnexAsset(
+            canonical_id="candidate-v2",
+            type="yara_rule",
+            investigation_id=investigation_id,
+            source="detection_candidate_versions.source",
+            origin="canonical_detection_candidate_versions",
+            version=2,
+            sha256=hashlib.sha256(yara_v2).hexdigest(),
+            references=("candidate-id", "candidate-v1"),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=yara_v2,
+            metadata={"candidate_id": "candidate-id", "candidate_status": "tested"},
+        ),
+        AnnexAsset(
+            canonical_id="candidate-test-1",
+            type="yara_test_report",
+            investigation_id=investigation_id,
+            source="canonical_test_observation",
+            origin="yara_test",
+            sha256=hashlib.sha256(yara_report).hexdigest(),
+            references=("candidate-v2",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=yara_report,
+        ),
+        AnnexAsset(
+            canonical_id="suricata-rule-1",
+            type="suricata_rule",
+            investigation_id=investigation_id,
+            source="advisor_call_payload.output.rule_source",
+            origin="advisor.consult:suricata_draft",
+            version=1,
+            sha256=hashlib.sha256(suricata).hexdigest(),
+            references=("capture-observation-1", sample_sha),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            content=suricata,
+            metadata={
+                "candidate_id": "suricata-candidate",
+                "candidate_status": "experimental",
+                "replay_status": "not_tested",
+            },
+        ),
+        AnnexAsset(
+            canonical_id="observed-ioc-1",
+            type="observed_ioc",
+            investigation_id=investigation_id,
+            source="virustotal",
+            origin="domain",
+            sha256=hashlib.sha256(b"ioc observation").hexdigest(),
+            references=("observation-1", sample_sha),
+            availability="restricted",
+            restrictions=("tlp_red",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            metadata={"ioc_type": "domain", "value": "example.invalid"},
+        ),
+        AnnexAsset(
+            canonical_id="discovered-sample-1",
+            type="discovered_sample",
+            investigation_id=investigation_id,
+            source="virustotal",
+            origin="summary",
+            sha256=capture_sha,
+            references=("observation-1", sample_sha),
+            availability="restricted",
+            restrictions=("tlp_red",),
+            public_distribution_allowed=False,
+            archive_export_allowed=False,
+            metadata={
+                "value": capture_sha,
+                "status": "acquired_during_investigation",
+                "related_to": sample_sha,
+                "relation": "candidate_not_family_proof",
+            },
+        ),
+    )
+    snapshot = InvestigationAnnexSnapshot(investigation_id, assets)
+
+    public_output = tmp_path / "research-public"
+    write_investigation_annex(
+        snapshot,
+        public_output,
+        profile="m14_research_permissive",
+        opinion_preview_unavailable_reason="indisponible: aucun avis brouillon disponible",
+    )
+    public_files = _file_bytes(public_output)
+    public_bytes = b"\n".join(
+        content
+        for path, content in public_files.items()
+        if not path.startswith("restricted/") and not path.startswith("technical-archive.tar.gz")
+    )
+    assert sample not in public_bytes
+    assert capture not in public_bytes
+    assert sample_sha.encode() in public_bytes
+    assert capture_sha.encode() in public_bytes
+    assert capture_sha.encode() in public_files["network/captures/index.csv"]
+    assert sample_sha.encode() in public_files["samples/sample-inventory.csv"]
+    public_manifest = _read_manifest(public_output)
+    assert public_manifest["profile"] == "m14_research_permissive"
+    assert public_manifest["opinion_preview"] == {
+        "status": "indisponible",
+        "reason": "indisponible: aucun avis brouillon disponible",
+    }
+    public_objects = public_manifest["objects"]
+    sample_object = next(
+        item for item in public_objects if item["canonical_id"] == "sample-acquisition-1"
+    )
+    assert sample_object["sha256"] == sample_sha
+    assert sample_object["references"] == ["observation-1", "sample-association-1"]
+    assert sample_object["metadata"]["tlp"] == "red"
+    assert sample_object["metadata"]["license_restriction"] == "qualification-only"
+    assert sample_object["metadata"]["external_llm_allowed"] is False
+    assert sample_object["metadata"]["do_not_submit"] is True
+    assert public_files["yara/candidate-001-v1.yar"] == yara_v1
+    assert public_files["yara/candidate-001-v2.yar"] == yara_v2
+    assert public_files["yara/tests/report-001.json"] == yara_report
+    assert public_files["suricata/candidate-001-v1.rules"] == suricata
+    assert json.loads(public_files["suricata/tests/status-001.json"])["status"] == (
+        "non testée sur PCAP"
+    )
+    assert b"example.invalid" in public_files["iocs/observed-iocs.csv"]
+    assert capture_sha.encode() in public_files["iocs/discovered-samples.csv"]
+
+    archive_output = tmp_path / "research-private"
+    preview_pdf = b"%PDF-1.4 synthetic draft preview\n"
+    opinion_id = str(uuid4())
+    write_investigation_annex(
+        snapshot,
+        archive_output,
+        profile="m14_research_permissive",
+        include_restricted_archive=True,
+        opinion_preview_pdf=preview_pdf,
+        opinion_preview_metadata={
+            "opinion_id": opinion_id,
+            "opinion_version": 3,
+            "opinion_sha256": "a" * 64,
+            "base_publication_sha256": "b" * 64,
+            "lineage_sha256": "c" * 64,
+        },
+    )
+    archive_files = _file_bytes(archive_output)
+    assert archive_files["opinion/opinion-draft.pdf"] == preview_pdf
+    assert archive_files[f"restricted/samples/{sample_sha}.bin"] == sample
+    assert archive_files[f"restricted/network/captures/{capture_sha}.pcap"] == capture
+    assert capture_sha.encode() in archive_files["network/captures/index.csv"]
+    tar_content = archive_files["technical-archive.tar.gz"]
+    assert archive_files["technical-archive.tar.gz.sha256"] == (
+        f"{hashlib.sha256(tar_content).hexdigest()}  technical-archive.tar.gz\n".encode()
+    )
+    import io
+    import tarfile
+
+    with tarfile.open(fileobj=io.BytesIO(tar_content), mode="r:gz") as archive:
+        members = {
+            member.name: archive.extractfile(member).read() for member in archive.getmembers()
+        }
+    assert members[f"restricted/samples/{sample_sha}.bin"] == sample
+    assert members[f"restricted/network/captures/{capture_sha}.pcap"] == capture
+    archive_manifest = _read_manifest(archive_output)
+    yara_versions = [
+        item
+        for item in archive_manifest["objects"]
+        if item["type"] == "yara_rule" and item["canonical_id"] in {"candidate-v1", "candidate-v2"}
+    ]
+    assert {item["metadata"]["candidate_status"] for item in yara_versions} == {
+        "experimental",
+        "tested",
+    }
+    assert archive_manifest["opinion_preview"] == {
+        "status": "present",
+        "path": "opinion/opinion-draft.pdf",
+        "sha256": hashlib.sha256(preview_pdf).hexdigest(),
+        "opinion_id": opinion_id,
+        "opinion_version": 3,
+        "opinion_sha256": "a" * 64,
+        "base_publication_sha256": "b" * 64,
+        "lineage_sha256": "c" * 64,
+    }
+    _assert_manifest_files(archive_output, archive_manifest)
+
+
+def test_m14_research_profile_fails_when_present_private_bytes_are_not_written(
+    tmp_path: Path,
+) -> None:
+    investigation_id = str(uuid4())
+    digest = hashlib.sha256(b"canonical sample bytes").hexdigest()
+    snapshot = InvestigationAnnexSnapshot(
+        investigation_id,
+        (
+            AnnexAsset(
+                canonical_id="missing-canonical-sample",
+                type="sample",
+                investigation_id=investigation_id,
+                source="samples+blobs",
+                origin="canonical_sample_row",
+                sha256=digest,
+                content=None,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Expected canonical sample bytes were not written"):
+        write_investigation_annex(
+            snapshot,
+            tmp_path / "incomplete-private-export",
+            profile="m14_research_permissive",
+            include_restricted_archive=True,
+        )
