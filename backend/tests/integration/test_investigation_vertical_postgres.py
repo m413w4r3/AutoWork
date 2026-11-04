@@ -1491,8 +1491,11 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 str(pivot_observation.id)
             ]
             assert analysis_observation.id in analysis_invocation.response_refs
+            # The audited parameters keep what the operator asked for (including the unknown
+            # reference that the tool ignored and reported), and nothing the system added.
             assert list(advisor_invocation.normalized_parameters["evidence_refs"]) == [
-                str(analysis_observation.id)
+                str(analysis_observation.id),
+                str(unknown_advisor_ref),
             ]
 
             supported_finding = next(
