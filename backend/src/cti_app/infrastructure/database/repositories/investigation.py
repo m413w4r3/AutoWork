@@ -1343,9 +1343,9 @@ class SqlAlchemyDetectionCandidateRepository:
                 )
                 .order_by(DetectionCandidateMotifObservationRow.observation_position)
             )
-            if motif_row.motif == _CANDIDATE_PROVENANCE_MOTIF:
-                if not motif_row.rationale.startswith(_CANDIDATE_PROVENANCE_PREFIX):
-                    raise ValueError("Persisted detection candidate provenance is invalid")
+            if motif_row.motif == _CANDIDATE_PROVENANCE_MOTIF and motif_row.rationale.startswith(
+                _CANDIDATE_PROVENANCE_PREFIX
+            ):
                 payload = json.loads(motif_row.rationale[len(_CANDIDATE_PROVENANCE_PREFIX) :])
                 if not isinstance(payload, Mapping) or not isinstance(
                     payload.get("metadata"), Mapping
@@ -1386,6 +1386,12 @@ class SqlAlchemyDetectionCandidateRepository:
 
 
 def _candidate_values(version: DetectionCandidateVersion) -> dict[str, Any]:
+    if any(
+        motif.motif == _CANDIDATE_PROVENANCE_MOTIF
+        and motif.rationale.startswith(_CANDIDATE_PROVENANCE_PREFIX)
+        for motif in version.motif_provenance
+    ):
+        raise ValueError("Detection candidate motif conflicts with reserved provenance encoding")
     return {
         "id": version.id,
         "candidate_id": version.candidate_id,
