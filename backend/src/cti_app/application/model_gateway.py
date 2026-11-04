@@ -1842,6 +1842,11 @@ def _bridge_request_id(run: ModelRun) -> str | None:
     return f"{run.id}:a{run.submission_attempt}"
 
 
+def bridge_request_id_for_run(run: ModelRun) -> str | None:
+    """The real Bridge idempotency key of a ModelRun (lookup alias; never shown to operators)."""
+    return _bridge_request_id(run)
+
+
 def _next_bridge_request_id(run: ModelRun, adapter: ModelAdapter) -> str | None:
     if adapter.backend is not ModelBackend.CHATGPT_BRIDGE:
         return None

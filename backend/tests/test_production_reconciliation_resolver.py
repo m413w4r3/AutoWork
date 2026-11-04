@@ -617,3 +617,16 @@ async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
     assert event["bridge_run_id"] == "bridge-request:a1"
     assert event["attempt"] == attempt
     assert event["outcome"] == ReconciliationOutcome.UNDECIDED.value
+
+
+def test_bridge_lookup_id_ignores_the_sha256_fingerprint_of_the_idempotency_key() -> None:
+    from cti_app.application.production_reconciliation_resolver import _bridge_id_in
+
+    assert _bridge_id_in({"bridge_request_id": "sha256:fa4502c0d2eb1b78"}) is None
+    assert (
+        _bridge_id_in({"bridge_request_id": "sha256:fa4502c0d2eb1b78", "bridge_run_id": "run-7"})
+        == "run-7"
+    )
+    assert _bridge_id_in({"bridge_request_id": "11111111-2222-3333-4444-555555555555:a1"}) == (
+        "11111111-2222-3333-4444-555555555555:a1"
+    )

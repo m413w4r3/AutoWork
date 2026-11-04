@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.model_gateway import ModelGateway
+from cti_app.application.model_gateway import ModelGateway, bridge_request_id_for_run
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import EditionStatus
@@ -52,6 +52,8 @@ class ProductionReconciliationResolver:
     async def resolve(self, run_id: UUID) -> ReconciliationOutcome:
         run = await self._get_run(run_id)
         bridge_run_id = _bridge_run_id(run) if run is not None else None
+        if bridge_run_id is None and run is not None and run.reconciliation is not None:
+            bridge_run_id = await self._bridge_lookup_id_from_model_run(run)
         bridge_status: str | None = None
         outcome = ReconciliationOutcome.UNDECIDED
         self._last_bridge_run_id = bridge_run_id
@@ -97,6 +99,19 @@ class ProductionReconciliationResolver:
             return outcome
         finally:
             self._last_bridge_status = bridge_status
+
+    async def _bridge_lookup_id_from_model_run(self, run: ProductionRun) -> str | None:
+        """Real idempotency key kept on the ModelRun (persisted error details only hold a
+        fingerprint, which Bridge cannot resolve)."""
+        reconciliation = run.reconciliation
+        if reconciliation is None:
+            return None
+        async with self._uow_factory() as uow:
+            model_run = await uow.model_runs.get(reconciliation.model_run_id)
+        if model_run is None:
+            return None
+        found = bridge_request_id_for_run(model_run)
+        return found[:255] if found else None
 
     async def _get_run(self, run_id: UUID) -> ProductionRun | None:
         async with self._uow_factory() as uow:
@@ -230,7 +245,10 @@ def _bridge_id_in(source: dict[str, Any]) -> str | None:
     # instead of guessing a different provider identity.
     for key in ("bridge_run_id", "bridge_response_id", "bridge_request_id"):
         value = source.get(key)
-        if isinstance(value, str) and value.strip():
+        # Persisted error details expose only a ``sha256:`` fingerprint of the idempotency key
+        # (never the key); a fingerprint cannot be looked up on Bridge, so keep searching and
+        # fall back to the key stored on the ModelRun/reconciliation record.
+        if isinstance(value, str) and value.strip() and not value.strip().startswith("sha256:"):
             return value.strip()[:255]
     return None
 
