@@ -1116,7 +1116,7 @@ describe("Repair Desk en revue historique (lecture seule)", () => {
     expect(
       screen.queryByRole("button", { name: "Accepter la production" }),
     ).not.toBeInTheDocument();
-  }, 10_000);
+  });
 
   it("rend lisibles le corps d’une règle et le détail d’une source", async () => {
     const rule = repairItem({
