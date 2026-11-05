@@ -141,6 +141,7 @@ CLEAN_PATHS := \
 	backend-sync \
 	backend-lock \
 	frontend-sync \
+	stack-clean-stale \
 	reset-backend-env \
 	up \
 	down \
@@ -269,7 +270,25 @@ reset-backend-env: ## Supprime et recrée complètement backend/.venv
 # Docker application stack
 # ==============================================================================
 
-up: ## Démarre la stack applicative
+# Un `up` interrompu laisse un conteneur « Created » (jamais démarré) et des
+# points de terminaison réseau orphelins : Docker refuse alors de recréer le
+# conteneur (« endpoint with name ... already exists in network »). On ne retire
+# que les conteneurs du projet jamais démarrés, donc sans état à perdre ;
+# compose les recrée. Le disconnect est best-effort : « endpoint not found »
+# est le cas normal quand rien n'est orphelin.
+stack-clean-stale: ## Retire les conteneurs jamais démarrés et leurs endpoints réseau orphelins
+	@set -eu; \
+	for id in $$($(STACK_COMPOSE) ps -a --status created -q); do \
+		name="$$($(DOCKER) inspect --format '{{.Name}}' "$$id" | sed 's|^/||')"; \
+		networks="$$($(DOCKER) inspect --format '{{range $$k, $$v := .NetworkSettings.Networks}}{{$$k}} {{end}}' "$$id")"; \
+		echo "Nettoyage: conteneur jamais démarré $$name"; \
+		$(DOCKER) rm "$$id" >/dev/null; \
+		for net in $$networks; do \
+			$(DOCKER) network disconnect -f "$$net" "$$name" >/dev/null 2>&1 || true; \
+		done; \
+	done
+
+up: stack-clean-stale ## Démarre la stack applicative
 	@echo "Stack: compose.models.yaml override = $(COMPOSE_MODELS_ACTIVE)"
 	$(STACK_COMPOSE) up -d --build --wait
 
