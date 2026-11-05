@@ -16,6 +16,7 @@ from cti_app.domain.production_references import (
     ProductionSourceCriticality,
     ProductionSourceCriticalityReason,
 )
+from cti_app.domain.wire_markers import contains_wire_marker_line
 
 
 class ArtifactType(StrEnum):
@@ -172,6 +173,8 @@ class PublicationParagraphV1:
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("Publication paragraph text must be non-empty text")
+        if contains_wire_marker_line(self.text):
+            raise ValueError("Publication paragraph text contains a wire marker")
         object.__setattr__(
             self,
             "evidence_refs",
@@ -190,6 +193,8 @@ class PublicationSectionV1:
             raise ValueError("Publication section kind is invalid")
         if not isinstance(self.heading, str):
             raise ValueError("Publication section heading must be text")
+        if contains_wire_marker_line(self.heading):
+            raise ValueError("Publication section heading contains a wire marker")
         if not isinstance(self.paragraphs, tuple) or not self.paragraphs:
             raise ValueError("Publication section paragraphs must be a non-empty tuple")
         if any(not isinstance(paragraph, PublicationParagraphV1) for paragraph in self.paragraphs):

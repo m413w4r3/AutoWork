@@ -120,6 +120,7 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_section_headings,
 )
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.domain.wire_markers import contains_wire_marker_line
 
 if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
@@ -292,6 +293,7 @@ class _WireSourceNote:
 
 _SYNTHESIS_FENCE = re.compile(r"^\s*```(?:[A-Za-z0-9_-]+)?\s*$")
 _SYNTHESIS_BLOCK_WRAPPERS = re.compile(r"^@@\s*(.*?)\s*@@$")
+_SYNTHESIS_END_MARKER = re.compile(r"^@@\s*END(?:\s+([^@]*?))?\s*@@$", re.IGNORECASE)
 _SYNTHESIS_SECTION_HEADER = re.compile(
     r"^SECTION\s*:?\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+([A-Za-z0-9._-]+))?\s*:?$",
     re.IGNORECASE,
@@ -502,8 +504,82 @@ def parse_synthesis_proposal_wire(
         else:
             warnings.append(SynthesisWireWarning("TITLE", "synthesis_title_duplicate"))
 
+    def active_wire_block_id() -> str:
+        if title_started:
+            return "TITLE"
+        if current_claim is not None:
+            return current_claim.block_id
+        if current_source_note is not None:
+            return current_source_note.block_id
+        if current_section is not None:
+            return current_section.block_id
+        if current_group is not None:
+            return current_group.upper()
+        return "END"
+
+    def close_wire_end_marker(name: str, raw_line: str) -> None:
+        nonlocal current_group
+        block_id = active_wire_block_id()
+        normalized_name = re.sub(r"\s+", " ", name.replace("_", " ").strip().casefold())
+        known_end_names = {
+            "claim",
+            "item",
+            "section",
+            "source note",
+            "title",
+            "editorial title",
+            "diagnostics",
+            "synthesis diagnostics",
+        }
+        if normalized_name not in known_end_names:
+            warnings.append(SynthesisWireWarning(block_id, "synthesis_end_marker_tolerated"))
+
+        if title_started:
+            finish_title()
+            return
+
+        had_claim = current_claim is not None
+        if current_claim is not None:
+            current_claim.raw_lines.append(raw_line)
+            finish_claim()
+        elif current_source_note is not None:
+            current_source_note.raw_lines.append(raw_line)
+            finish_source_note()
+            current_group = None
+            return
+        elif current_section is not None:
+            current_section.raw_lines.append(raw_line)
+            finish_section()
+            current_group = None
+            return
+
+        if normalized_name in {"claim", "item", "title", "editorial title"}:
+            return
+        if normalized_name == "section":
+            if current_section is not None:
+                current_section.raw_lines.append(raw_line)
+            finish_section()
+            current_group = None
+        elif normalized_name == "lead":
+            if current_group == "lead":
+                current_group = None
+        elif normalized_name in {
+            "source note",
+            "diagnostics",
+            "synthesis diagnostics",
+        }:
+            current_group = None
+        elif normalized_name == "" or normalized_name not in known_end_names:
+            if not had_claim:
+                current_group = None
+
     for index, raw_line in enumerate(lines, start=1):
         if _SYNTHESIS_FENCE.fullmatch(raw_line):
+            continue
+        end_marker = _SYNTHESIS_END_MARKER.fullmatch(raw_line.strip())
+        if end_marker is not None:
+            close_wire_end_marker(end_marker.group(1) or "", raw_line)
+            recognized = True
             continue
         line = _wire_line(raw_line)
         if not line or line in {"---", "***"}:
@@ -2244,7 +2320,8 @@ def _validate_plain_text(
 ) -> None:
     stripped = value.strip()
     if (
-        stripped.startswith(("---", "+++"))
+        contains_wire_marker_line(value)
+        or stripped.startswith(("---", "+++"))
         or _contains_markdown_or_html(value, extracted_evidence_texts=extracted_evidence_texts)
         or _MARKDOWN_TABLE_SEPARATOR.search(value)
         or _MARKDOWN_TABLE_ROW.search(value)

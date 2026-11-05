@@ -19,6 +19,7 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
     production_extraction_to_json,
 )
+from cti_app.domain.wire_markers import contains_wire_marker_line
 
 PRODUCTION_SYNTHESIS_SCHEMA_VERSION = 2
 SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION = "sha256-canonical-extraction-element-v1"
@@ -77,6 +78,8 @@ def validate_synthesis_section_heading(
     """
     if not isinstance(heading, str):
         raise ValueError("Synthesis section heading must be text")
+    if contains_wire_marker_line(heading):
+        raise ValueError("Synthesis section heading contains a wire marker")
     normalized = " ".join(unicodedata.normalize("NFKC", heading).split())
     normalized = re.sub(r"^#{1,6}\s*", "", normalized)
     if len(normalized) >= 4 and normalized.startswith("**") and normalized.endswith("**"):
@@ -198,7 +201,11 @@ _EDITORIAL_TITLE_QUOTES = {('"', '"'), ("'", "'"), ("«", "»"), ("“", "”")}
 
 def is_valid_editorial_title(value: object) -> bool:
     """Check the publication's plain ``[Groupe] Titre`` title contract."""
-    if not isinstance(value, str) or len(value) > EDITORIAL_TITLE_MAX_LENGTH:
+    if (
+        not isinstance(value, str)
+        or len(value) > EDITORIAL_TITLE_MAX_LENGTH
+        or contains_wire_marker_line(value)
+    ):
         return False
     match = EDITORIAL_TITLE_PATTERN.fullmatch(value)
     if match is None or value != value.strip():
@@ -283,6 +290,8 @@ class SynthesisParagraphV1:
 
     def __post_init__(self) -> None:
         _require_semantic_text(self.text, "Synthesis paragraph text")
+        if contains_wire_marker_line(self.text):
+            raise ValueError("Synthesis paragraph text contains a wire marker")
         object.__setattr__(
             self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs, "Paragraph")
         )
@@ -606,6 +615,8 @@ class ProductionSynthesisV1:
                 raise ValueError(f"Production synthesis {field_name} must be a lowercase SHA-256")
         _require_semantic_text(self.publication_language, "Publication language")
         _require_semantic_text(self.title, "Synthesis title")
+        if contains_wire_marker_line(self.title):
+            raise ValueError("Synthesis title contains a wire marker")
         if self.synthesis_policy_version != SYNTHESIS_POLICY_VERSION:
             raise ValueError("Production synthesis policy version is unsupported")
         for field_name, values, item_type in (

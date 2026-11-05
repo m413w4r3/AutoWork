@@ -236,6 +236,14 @@ def test_heading_camel_case_grounding_does_not_join_across_sentence_punctuation(
     )
 
 
+def test_section_heading_rejects_residual_wire_marker_line() -> None:
+    with pytest.raises(ValueError, match="wire marker"):
+        validate_synthesis_section_heading(
+            "Overview\n@@END SECTION@@",
+            ("The report describes the activity.",),
+        )
+
+
 def test_stored_synthesis_with_duplicate_headings_is_rejected() -> None:
     payload = production_synthesis_to_json(_synthesis())
     payload["sections"].append(
@@ -359,6 +367,8 @@ def test_sourced_paragraph_rejects_empty_or_duplicate_evidence() -> None:
     ref = _ref()
     with pytest.raises(ValueError):
         SynthesisParagraphV1("A claim.", (ref, ref))
+    with pytest.raises(ValueError, match="wire marker"):
+        SynthesisParagraphV1("A claim.\n@@END CLAIM@@", (ref,))
 
 
 def test_evidence_reference_rejects_invalid_key() -> None:
@@ -391,6 +401,7 @@ def test_editorial_title_contract_accepts_plain_titles_and_rejects_invalid_forms
         "[Groupe] <em>Campagne</em>",
         "[Groupe] <script>campagne</script>",
         "[Groupe] Une campagne E001 documentée",
+        "[Groupe] Titre\n@@END TITLE@@",
         "[Groupe] " + "x" * 105,
     ):
         assert not is_valid_editorial_title(value)

@@ -90,6 +90,7 @@ from cti_app.domain.semantic_annotation import (
     semantic_text_from_json,
     semantic_text_to_json,
 )
+from cti_app.domain.wire_markers import contains_wire_marker_line
 
 PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION = "4"
 PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
@@ -588,6 +589,8 @@ def _validate_publication_core(
         raise ValueError("Publication language must be non-empty text")
     if not isinstance(title, str) or not title.strip():
         raise ValueError("Publication title must be non-empty text")
+    if contains_wire_marker_line(title):
+        raise ValueError("Publication title contains a wire marker")
     tuple_fields: tuple[tuple[str, Any, type[Any]], ...] = (
         ("lead", lead, PublicationParagraphV1),
         ("sections", sections, PublicationSectionV1),

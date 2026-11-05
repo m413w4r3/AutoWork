@@ -374,11 +374,24 @@ def test_paragraph_and_section_require_content_and_preserve_paragraph_order() ->
         PublicationParagraphV1("Finding", ())
     with pytest.raises(ValueError):
         PublicationSectionV1(PublicationSectionKind.OVERVIEW, "Overview", ())
+    with pytest.raises(ValueError, match="wire marker"):
+        PublicationParagraphV1("Finding\n@@END LEAD@@", (ref,))
+    with pytest.raises(ValueError, match="wire marker"):
+        PublicationSectionV1(
+            PublicationSectionKind.OVERVIEW,
+            "Overview\n@@END SECTION@@",
+            (PublicationParagraphV1("Finding", (ref,)),),
+        )
 
     later = PublicationParagraphV1("Second", (ref,))
     earlier = PublicationParagraphV1("First", (ref,))
     section = PublicationSectionV1(PublicationSectionKind.OVERVIEW, "Overview", (later, earlier))
     assert section.paragraphs == (later, earlier)
+
+
+def test_publication_title_rejects_residual_wire_marker_line() -> None:
+    with pytest.raises(ValueError, match="wire marker"):
+        replace(_document(), title="Example report\n@@END TITLE@@")
 
 
 def test_timeline_validates_date_and_text_without_parsing_date_text() -> None:

@@ -125,7 +125,9 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.integrations.models import BridgeTransportError
 
-TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v4-optional-lead"
+TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = (
+    "targeted-synthesis-patch-parser-v5-end-marker-tolerance"
+)
 # The revision contract includes validator-owned evidence grounding behavior.
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v6-source-waivers"
 TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (

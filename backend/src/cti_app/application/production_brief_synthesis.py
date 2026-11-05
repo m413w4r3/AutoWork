@@ -15,6 +15,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisTimelineEntryV1,
     extraction_evidence_elements,
 )
+from cti_app.domain.wire_markers import contains_wire_marker_line
 
 BRIEF_SYNTHESIS_PROMPT_VERSION = "brief-synthesis-v1-french-grounded-chronology"
 
@@ -212,6 +213,8 @@ def validate_brief_narrative(
     if section_count:
         return "brief_sections_forbidden"
     text = "\n".join((title, *tuple(paragraphs)))
+    if contains_wire_marker_line(text):
+        return "brief_wire_marker_forbidden"
     if _BRIEF_LIST_PREFIX.search(text):
         return "brief_list_forbidden"
     if _BRIEF_FORBIDDEN_OUTPUT.search(text) or _BRIEF_RECOMMENDATION_LANGUAGE.search(text):

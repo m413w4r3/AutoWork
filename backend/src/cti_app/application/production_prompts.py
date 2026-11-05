@@ -20,7 +20,7 @@ SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v13-french-coverage-diagnostics"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
 SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = "synthesis-targeted-revision-v4-grounded-heading-terms"
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v3-after-formats"
-SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v6-heading-warning-recovery"
+SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v7-end-marker-tolerance"
 
 SYNTHESIS_EDITORIAL_CONTRACT_V5 = """EDITORIAL CONTRACT
 

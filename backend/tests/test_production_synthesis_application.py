@@ -1098,7 +1098,7 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         SYNTHESIS_EDITORIAL_CONTRACT_V5
     )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
-        "synthesis-text-parser-v6-heading-warning-recovery"
+        "synthesis-text-parser-v7-end-marker-tolerance"
     )
 
 
@@ -1110,6 +1110,7 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         "A claim [S1] was reported.",
         "<p>A claim was reported.</p>",
         "---\ntitle: Campaign\n---",
+        "FooRAT was identified.\n@@END LEAD@@",
     ),
 )
 def test_proposal_rejects_markdown_html_and_source_markers(text: str):
@@ -3302,6 +3303,94 @@ def test_wire_parser_drops_mispositioned_section_heading_and_preserves_claim() -
     ]
 
 
+def test_wire_parser_tolerates_end_markers_without_losing_following_claims() -> None:
+    world = _fresh_setup()
+    raw = (
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: Le rapport décrit une activité du groupe.\n"
+        "@@END@@\n"
+        "@@CLAIM L002@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: Aucun lien de coordination entre ces différents relais médiatiques n'est établi.\n"
+        "@@ END   LEAD @@\n"
+        "@@SECTION overview S001@@\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: Le même rapport décrit le logiciel malveillant.\n"
+        "@@END CLAIM@@\n"
+        "@@CLAIM C002@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: Une seconde observation est documentée.\n"
+        "@@END SECTION@@\n"
+        "@@END@@"
+    )
+
+    parsed = parse_synthesis_proposal_wire(raw)
+
+    assert parsed.proposal is not None
+    assert parsed.rejections == ()
+    assert [claim.text for claim in parsed.proposal.lead] == [
+        "Le rapport décrit une activité du groupe.",
+        "Aucun lien de coordination entre ces différents relais médiatiques n'est établi.",
+    ]
+    assert [claim.text for claim in parsed.proposal.sections[0].claims] == [
+        "Le même rapport décrit le logiciel malveillant.",
+        "Une seconde observation est documentée.",
+    ]
+    assert all("@@" not in claim.text for claim in parsed.proposal.lead)
+    assert all("@@" not in claim.text for claim in parsed.proposal.sections[0].claims)
+    assert any(item.warning_code == "synthesis_end_marker_tolerated" for item in parsed.warnings)
+
+
+def test_targeted_revision_after_claims_accepts_end_lead_marker() -> None:
+    world = _fresh_setup()
+
+    proposal, lead, sections = synthesis_revision_module._parse_after_claims(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT est identifié dans le rapport.\n"
+        "@@END LEAD@@",
+        evidence_pack=world.pack,
+        extraction=world.extraction,
+    )
+
+    assert proposal.lead[0].text == "FooRAT est identifié dans le rapport."
+    assert lead[0].text == "FooRAT est identifié dans le rapport."
+    assert sections == ()
+
+
+def test_brief_structure_validator_rejects_residual_wire_marker_lines() -> None:
+    assert (
+        synthesis_module.validate_brief_narrative(
+            title="[Groupe] Activité observée",
+            paragraphs=("FooRAT est décrit dans le rapport.\n@@END LEAD@@",),
+            section_count=0,
+        )
+        == "brief_wire_marker_forbidden"
+    )
+
+
+def test_wire_parser_keeps_unknown_section_kind_rejection() -> None:
+    world = _fresh_setup()
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT est identifié dans le rapport.\n"
+        "@@SECTION unknown_kind S001@@\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: Une observation est documentée.\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    assert "synthesis_unknown_section_kind" in {item.reason_code for item in parsed.rejections}
+
+
 def test_wire_parser_drops_ambiguous_duplicate_heading_fields_but_keeps_claims() -> None:
     world = _fresh_setup()
     parsed = parse_synthesis_proposal_wire(
@@ -3338,6 +3427,7 @@ async def test_synthesis_diagnostics_are_persisted_separately_from_body():
 @@CLAIM L001@@
 EVIDENCE: {world.handle}
 TEXT: FooRAT was identified in the report.
+@@END LEAD@@
 @@SECTION overview S001@@
 HEADING: E001 Activité examinée
 @@CLAIM BROKEN@@
@@ -3362,15 +3452,26 @@ MISSING COVERAGE: la chaîne de livraison n'est pas documentée dans les sources
     ]
     assert result.details["diagnostics"]["parse_warnings"] == [
         {
+            "block_id": "L001",
+            "warning_code": "synthesis_end_marker_tolerated",
+        },
+        {
             "block_id": "S001",
             "warning_code": "synthesis_section_heading_dropped_invalid",
-        }
+        },
     ]
+    assert (
+        "synthesis_wire_warning:synthesis_end_marker_tolerated"
+        in (world.gateway.diagnostics[0]["transformations"])
+    )
     warning_transformation = "synthesis_wire_warning:synthesis_section_heading_dropped_invalid"
     assert warning_transformation in world.gateway.diagnostics[0]["transformations"]
     synthesis = world.writer.calls[0]["synthesis"]
     assert isinstance(synthesis, ProductionSynthesisV1)
     body = render_synthesis_markdown(synthesis, world.extraction)
+    assert [paragraph.text for paragraph in synthesis.lead] == [
+        "FooRAT was identified in the report."
+    ]
     assert synthesis.sections[0].heading == ""
     assert [paragraph.text for paragraph in synthesis.sections[0].paragraphs] == [
         "FooRAT was also examined technically."
