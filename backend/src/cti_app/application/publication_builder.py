@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Any, Final
@@ -106,6 +105,10 @@ from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_SCHEMA_VERSION,
     SemanticTextV1,
 )
+from cti_app.domain.subject_ioc_eligibility import (
+    is_subject_ioc_eligible,
+    is_supported_subject_ioc_hash,
+)
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
 
 
@@ -201,27 +204,15 @@ def _project_synthesis_publication(
     )
 
 
-_MAIN_IOC_REASONS = frozenset(
-    {
-        RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
-        RelevanceReasonCode.MALICIOUS_SUBJECT_CORROBORATION,
-    }
-)
 _UNDEMONSTRATED_IOC_REASONS = frozenset(
     {
         RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
         RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
     }
 )
-_MAIN_IOC_CLASSIFICATIONS = frozenset(
-    {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
-)
 _UNDEMONSTRATED_IOC_CLASSIFICATIONS = frozenset(
     {RelevanceClassification.INDETERMINATE, RelevanceClassification.CONTEXT}
 )
-
-# MD5, SHA-1 and SHA-256 digests; any other hash-typed value is noise.
-_HASH_VALUE = re.compile(r"[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}")
 
 type _IocOccurrences = dict[tuple[ArtifactType, str], set[UUID]]
 
@@ -345,9 +336,11 @@ def _project_publication_iocs(
                 )
                 continue
             if decision is not None:
-                if (
-                    decision.classification in _MAIN_IOC_CLASSIFICATIONS
-                    and decision.reason_code in _MAIN_IOC_REASONS
+                if is_subject_ioc_eligible(
+                    indicator_status=item.indicator_status,
+                    artifact_type=item.artifact_type,
+                    value=item.value,
+                    relevance=decision,
                 ):
                     destination = main
                 elif (
@@ -393,7 +386,7 @@ def _project_publication_iocs(
                 value = normalize_indicator_value(item.value, item.artifact_type)
             except ValueError as exc:
                 raise ValueError(f"Confirmed IOC {item.value!r} cannot be normalized") from exc
-            if item.artifact_type is ArtifactType.HASH and not _HASH_VALUE.fullmatch(value):
+            if not is_supported_subject_ioc_hash(item.artifact_type, value):
                 detail_candidates.append(
                     (
                         PublicationIOCDetailV1(

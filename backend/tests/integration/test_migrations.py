@@ -71,6 +71,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     model_execution,
     osint_open_policy,
     production,
+    production_routing,
     publication_render,
     publication_review,
     selection,
@@ -85,7 +86,7 @@ def _head_revision() -> str:
 
     The rest of this module compares the full migrated schema against
     ``Base.metadata``. The current head includes additive migrations through
-    ``0007_vt_retry_trust``.
+    ``0008_production_routing``.
     """
     from alembic.script import ScriptDirectory
 
@@ -209,6 +210,10 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     ): "reject_evidence_mutation",
     ("virustotal_observations", "trg_vt_observations_append_only"): "reject_evidence_mutation",
     ("virustotal_file_views", "trg_vt_file_views_append_only"): "reject_evidence_mutation",
+    (
+        "production_routing_decisions",
+        "trg_production_routing_decisions_append_only",
+    ): "reject_evidence_mutation",
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("source_documents", "trg_source_documents_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("samples", "trg_samples_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
@@ -1058,7 +1063,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0007_vt_retry_trust"
+    assert _head_revision() == "0008_production_routing"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -1200,7 +1205,7 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0007_vt_retry_trust"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
         "authority_kind",
@@ -1242,7 +1247,7 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0007_vt_retry_trust"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
@@ -1325,17 +1330,22 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
     assert asyncio.run(_table_names(temporary_postgres_url)) == (
         EXPECTED_TABLES
-        - {"sample_acquisition_dispatch_attempts", "effect_acquisition_dispatch_links"}
+        - {
+            "sample_acquisition_dispatch_attempts",
+            "effect_acquisition_dispatch_links",
+            "production_routing_decisions",
+        }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert "dispatch_attempt_id" not in at_0004["sample_acquisition_attempts"]["columns"]
+    assert "routing_decision_id" not in at_0004["production_runs"]["columns"]
     assert not any(
         index[0] == "uq_sample_acquisition_attempt_dispatch"
         for index in at_0004["sample_acquisition_attempts"]["indexes"]
     )
 
     command.upgrade(config, "head")
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0007_vt_retry_trust"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
 
     command.downgrade(config, "base")
@@ -1359,7 +1369,7 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
     with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
         command.downgrade(config, "0001_baseline")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0007_vt_retry_trust"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
 
     async def _experiment_count() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -1447,7 +1457,7 @@ def test_osint_policy_downgrade_refuses_policy_and_inherited_lineage_rows(
     with pytest.raises(RuntimeError, match="Cannot downgrade populated OSINT_OPEN policy storage"):
         command.downgrade(config, "0002_c2_experiments")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0007_vt_retry_trust"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
     assert asyncio.run(_state_counts()) == (1, 1, 1, 1, 1, 1)
 
 
@@ -1515,4 +1525,4 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
     raw_authority, interpreted_authority = asyncio.run(_read_legacy_envelope())
     assert raw_authority is None
     assert interpreted_authority is EnvelopeAuthorityKind.HUMAN_G2
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0007_vt_retry_trust"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"

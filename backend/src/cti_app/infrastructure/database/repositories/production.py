@@ -367,6 +367,7 @@ class SqlAlchemyProductionRunRepository:
             current_stage=run.current_stage.value,
             run_number=run.run_number,
             pipeline_generation=run.pipeline_generation,
+            routing_decision_id=run.routing_decision_id,
             research_date=run.research_date,
             force_recompute_from_stage=(
                 run.force_recompute_from_stage.value
@@ -1470,6 +1471,7 @@ def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
         current_stage=ProductionStage(row.current_stage),
         run_number=row.run_number,
         pipeline_generation=row.pipeline_generation,
+        routing_decision_id=row.routing_decision_id,
         research_date=row.research_date,
         force_recompute_from_stage=(
             ProductionStage(row.force_recompute_from_stage)

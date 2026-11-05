@@ -14,6 +14,7 @@ EXPECTED_CHAIN = (
     "0005_sample_acquisition_dispatch",
     "0006_tool_seconds_accounting",
     "0007_vt_retry_trust",
+    "0008_production_routing",
 )
 
 
@@ -23,7 +24,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [script.revision for script in revisions]
 
-    assert scripts.get_heads() == ["0007_vt_retry_trust"]
+    assert scripts.get_heads() == ["0008_production_routing"]
     assert all(revision_id for revision_id in revision_ids)
     assert all(len(revision_id) <= 32 for revision_id in revision_ids)
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
@@ -36,4 +37,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0005_sample_acquisition_dispatch": "0004_external_effect_claims",
         "0006_tool_seconds_accounting": "0005_sample_acquisition_dispatch",
         "0007_vt_retry_trust": "0006_tool_seconds_accounting",
+        "0008_production_routing": "0007_vt_retry_trust",
     }
