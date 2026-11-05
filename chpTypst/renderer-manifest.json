@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v35-brief-layout-footnotes",
+  "template_version": "chp-article-v36-brief-paragraph-gap",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

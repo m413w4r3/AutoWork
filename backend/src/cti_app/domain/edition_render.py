@@ -17,8 +17,8 @@ from cti_app.domain.typst_render import (
 )
 
 EDITION_RENDERER = "typst"
-EDITION_RENDERER_VERSION = "edition-v5-typst-v5-brief-layout-footnotes"
-EDITION_RENDER_POLICY_VERSION = "typst-edition-v4-brief-layout-footnotes"
+EDITION_RENDERER_VERSION = "edition-v6-typst-v6-brief-paragraph-gap"
+EDITION_RENDER_POLICY_VERSION = "typst-edition-v5-brief-paragraph-gap"
 
 
 class EditionRenderDisplayStatus(StrEnum):

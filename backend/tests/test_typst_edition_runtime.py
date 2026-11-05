@@ -320,7 +320,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert all(baselines.values())
     first_y = max(baselines["Brief body first paragraph."])
     second_y = max(baselines["Brief body second paragraph."])
-    assert first_y - second_y >= 16
+    assert first_y - second_y >= 21
     assert max(baselines["https://example.test/one"]) < second_y
     assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
     for placeholder in (

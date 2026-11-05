@@ -934,6 +934,20 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert 'style: "italic"' in production_helpers_source
 
 
+def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> None:
+    helpers = (_CHP_TYPST_ROOT / "RENDERER" / "publication_helpers.typ").read_text(encoding="utf-8")
+    assert '#let render-body-block(item, reference-scope: "", paragraph-gap: 3pt) = {' in helpers
+    assert "#block(above: 0pt, below: paragraph-gap)[" in helpers
+    synthesis_start = helpers.index('} else if content_section.type == "synthesis" [')
+    chronology_start = helpers.index('] else if content_section.type == "chronology" [')
+    synthesis = helpers[synthesis_start:chronology_start]
+    assert "paragraph-gap: 10pt" in synthesis
+    assert synthesis.count("render-body-block(") == 2
+    assert synthesis.count("paragraph-gap: 10pt") == 1
+    assert "render-body-block(item, reference-scope: reference-scope)" in synthesis
+    assert "#set par(spacing: 1em)" not in synthesis
+
+
 @pytest.mark.asyncio
 async def test_real_typst_pdf_preserves_chp_publication_structure(
     tmp_path: Path,

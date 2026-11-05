@@ -911,14 +911,14 @@
   }
 }
 
-#let render-body-block(item, reference-scope: "") = {
+#let render-body-block(item, reference-scope: "", paragraph-gap: 3pt) = {
   let body = if item.type == "section_heading" {
     block(sticky: true, above: 7pt, below: 5pt)[
       #heading(level: 3)[#item.text]
     ]
   } else if item.type == "paragraph" {
     [
-      #block(above: 0pt, below: 3pt)[
+      #block(above: 0pt, below: paragraph-gap)[
         #semantic-or-plain(item.text, item.at("semantic_spans", default: none))
         #if item.at("anchor_target", default: none) != none [#label(item.anchor_target)]
       ]
@@ -982,12 +982,13 @@
     } else if content_section.type == "synthesis" [
       #if brief-publication [
         #section-title[Synthèse]
-        #block[
-          #set par(spacing: 1em)
-          #for item in content_section.at("blocks", default: ()) {
-            render-body-block(item, reference-scope: reference-scope)
-          }
-        ]
+        #for item in content_section.at("blocks", default: ()) {
+          render-body-block(
+            item,
+            reference-scope: reference-scope,
+            paragraph-gap: 10pt,
+          )
+        }
       ] else [
         #section-title[SYNTHÈSE]
         #for item in content_section.at("blocks", default: ()) {
