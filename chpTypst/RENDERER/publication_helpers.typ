@@ -1196,8 +1196,19 @@
       #let has-legacy-iocs = has-ioc-values(legacy_indicators)
       #let has-original-iocs = has-ioc-values(legacy_original_indicators)
       #let has-ioc-annex = ioc_rows.len() > 0 or has-legacy-iocs or has-original-iocs
-      #if has-ioc-annex [#set page(flipped: true)]
       #let identity-provenance = content_section.at("publication_identity_provenance", default: none)
+      #let implant_identifier_rows = content_section.at("implant_identifier_rows", default: ())
+      #let opinion_refs = content_section.at("opinion_refs", default: ())
+      #let figure-provenance = content_section.at("protocol_figure_provenance", default: ())
+      #let has-technical-annex-content = (
+        has-ioc-annex
+        or has-text(identity-provenance)
+        or implant_identifier_rows.len() > 0
+        or opinion_refs.len() > 0
+        or figure-provenance.len() > 0
+      )
+      #if has-technical-annex-content [
+      #set page(flipped: true)
       #if has-text(identity-provenance) [
         #section-title[PROVENANCE DE PUBLICATION]
         #text(size: 7.5pt, fill: grey)[Identité de base : #identity-provenance]
@@ -1218,7 +1229,6 @@
           hashes: legacy_indicators.at("hashes", default: ()),
         )
       ]
-      #let implant_identifier_rows = content_section.at("implant_identifier_rows", default: ())
       #if implant_identifier_rows.len() > 0 [
         #v(10pt)
         #section-title[IDENTIFIANT C2 DE L’IMPLANT — IOC]
@@ -1253,7 +1263,6 @@
           hashes: legacy_original_indicators.at("hashes", default: ()),
         )
       ]
-      #let opinion_refs = content_section.at("opinion_refs", default: ())
       #if opinion_refs.len() > 0 [
         #v(10pt)
         #section-title[ANNEXE DE TRAÇABILITÉ]
@@ -1283,7 +1292,6 @@
           ]
         ]
       ]
-      #let figure-provenance = content_section.at("protocol_figure_provenance", default: ())
       #if figure-provenance.len() > 0 [
         #v(10pt)
         #section-title[PROVENANCE DES FIGURES D'AVIS]
@@ -1303,7 +1311,8 @@
           ]
         ]
       ]
-      #if has-ioc-annex [#set page(flipped: false)]
+      #set page(flipped: false)
+      ]
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
     }
