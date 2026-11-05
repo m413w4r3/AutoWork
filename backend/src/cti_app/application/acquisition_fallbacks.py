@@ -20,7 +20,7 @@ from cti_app.application.http_collection import (
     CollectionError,
     _detect_mime,
 )
-from cti_app.domain.collection import SourceAcquisitionMethod
+from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 from cti_app.domain.discovery import canonicalize_http_url
 
 _LINK_RELATIONS = frozenset({"amphtml", "alternate", "canonical", "print"})
@@ -343,6 +343,9 @@ class AcquisitionRequest:
     title: str | None
     published_at: date | None
     response_body: bytes | None
+    response_status: int | None
+    response_content_type: str | None
+    response_headers: dict[str, str]
     link_header: str | None
     fetch: Callable[[str, dict[str, str], float, bool], Awaitable[CollectedResponse]]
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
@@ -362,6 +365,233 @@ class AcquisitionStrategy(Protocol):
     timeout_seconds: float
 
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserRenderResult:
+    rendered_html: str
+
+
+class BrowserRenderAdapter(Protocol):
+    async def render(
+        self, *, url: str, html: str, timeout_seconds: float
+    ) -> BrowserRenderResult: ...
+
+
+class BrowserSidecarUnavailable(RuntimeError):
+    """The isolated renderer is not reachable or did not return a render."""
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarPlaywrightAdapter:
+    """Call the isolated renderer over its private Compose network."""
+
+    service_url: str
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.service_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Playwright sidecar URL must be a credential-free service URL")
+
+    async def render(self, *, url: str, html: str, timeout_seconds: float) -> BrowserRenderResult:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_seconds,
+                trust_env=False,
+            ) as client:
+                response = await client.post(
+                    f"{self.service_url.rstrip('/')}/render",
+                    json={
+                        "url": url,
+                        "html": html,
+                        "timeout_ms": max(500, min(round(timeout_seconds * 1000), 45_000)),
+                    },
+                )
+        except httpx.HTTPError as error:
+            raise BrowserSidecarUnavailable("Playwright sidecar is unavailable") from error
+        if response.status_code in {502, 503, 504}:
+            raise BrowserSidecarUnavailable("Playwright sidecar is unavailable")
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ValueError("Playwright sidecar returned invalid JSON") from error
+        rendered_html = payload.get("rendered_html") if isinstance(payload, dict) else None
+        if not isinstance(rendered_html, str) or not rendered_html.strip():
+            raise ValueError("Playwright sidecar returned no rendered HTML")
+        return BrowserRenderResult(rendered_html=rendered_html)
+
+
+@dataclass(frozen=True, slots=True)
+class PlaywrightStrategy:
+    """Render only HTML collected through the ordinary pinned HTTP transport.
+
+    Chromium receives an already-fetched document. The sidecar blocks all
+    secondary requests, so JavaScript in the article cannot create a new
+    network path around collection policy.
+    """
+
+    adapter: BrowserRenderAdapter | None
+    name: str = "playwright"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PLAYWRIGHT_RENDERED
+    enabled: bool = True
+    timeout_seconds: float = 45.0
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if self.adapter is None:
+            return (
+                _empty_probe(
+                    self.name,
+                    self.version,
+                    self.method,
+                    request.requested_url,
+                    "playwright_sidecar_unavailable",
+                ),
+            )
+        body = request.response_body
+        status = request.response_status
+        headers = dict(request.response_headers or {})
+        started = time.monotonic()
+        if not body:
+            try:
+                response = await request.fetch(
+                    request.requested_url, {}, self.timeout_seconds, False
+                )
+                body = response.decoded_body
+                status = response.status
+                headers = response.headers
+            except CollectionError as error:
+                body = error.response_body
+                status = error.http_status
+                headers = error.headers
+        if not body:
+            return (
+                AcquisitionProbe(
+                    strategy_name=self.name,
+                    strategy_version=self.version,
+                    method=self.method,
+                    requested_url=request.requested_url,
+                    outcome="failed",
+                    reason_code="no_renderable_html_available",
+                    response=None,
+                    http_status=status,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                ),
+            )
+        content_type = headers.get("content-type", "") or "text/html"
+        if request.response_content_type:
+            content_type = request.response_content_type
+        if not content_type.casefold().startswith(("text/html", "application/xhtml+xml")):
+            return (
+                AcquisitionProbe(
+                    strategy_name=self.name,
+                    strategy_version=self.version,
+                    method=self.method,
+                    requested_url=request.requested_url,
+                    outcome="rejected",
+                    reason_code="browser_render_requires_html",
+                    response=None,
+                    http_status=status,
+                    encoded_size=len(body),
+                    encoded_sha256=hashlib.sha256(body).hexdigest(),
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                ),
+            )
+        try:
+            html = body.decode("utf-8-sig", errors="replace")
+            rendered = await self.adapter.render(
+                url=safe_fallback_url(request.requested_url),
+                html=html,
+                timeout_seconds=self.timeout_seconds,
+            )
+        except BrowserSidecarUnavailable:
+            return (
+                AcquisitionProbe(
+                    strategy_name=self.name,
+                    strategy_version=self.version,
+                    method=self.method,
+                    requested_url=request.requested_url,
+                    outcome="skipped",
+                    reason_code="playwright_sidecar_unavailable",
+                    response=None,
+                    http_status=status,
+                    encoded_size=len(body),
+                    encoded_sha256=hashlib.sha256(body).hexdigest(),
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                ),
+            )
+        rendered_body = rendered.rendered_html.encode("utf-8")
+        reason = article_rejection_reason(
+            body=rendered_body,
+            content_type="text/html",
+            requested_url=request.requested_url,
+            expected_title=request.title,
+            min_text_chars=request.min_text_chars,
+            headers=headers,
+            expected_languages=request.expected_languages,
+        )
+        if reason is not None:
+            return (
+                AcquisitionProbe(
+                    strategy_name=self.name,
+                    strategy_version=self.version,
+                    method=self.method,
+                    requested_url=request.requested_url,
+                    outcome="rejected",
+                    reason_code=reason,
+                    response=None,
+                    http_status=status,
+                    encoded_size=len(rendered_body),
+                    encoded_sha256=hashlib.sha256(rendered_body).hexdigest(),
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                ),
+            )
+        digest = hashlib.sha256(rendered_body).hexdigest()
+        acquired = datetime.now(UTC)
+        rendered_response = CollectedResponse(
+            requested_url=request.requested_url,
+            final_url=request.requested_url,
+            redirect_chain=(),
+            status=200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            declared_content_type="text/html",
+            detected_content_type=DetectedMimeType.HTML,
+            encoded_body=rendered_body,
+            decoded_body=rendered_body,
+            encoded_size=len(rendered_body),
+            encoded_sha256=digest,
+            decoded_size=len(rendered_body),
+            decoded_sha256=digest,
+            content_encoding="identity",
+            acquired_at=acquired,
+        )
+        return (
+            AcquisitionProbe(
+                strategy_name=self.name,
+                strategy_version=self.version,
+                method=self.method,
+                requested_url=request.requested_url,
+                outcome="succeeded",
+                reason_code=None,
+                response=rendered_response,
+                http_status=status,
+                encoded_size=len(rendered_body),
+                encoded_sha256=digest,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            ),
+        )
 
 
 async def _probe_url(
@@ -901,6 +1131,7 @@ def default_acquisition_strategies(
     flags: dict[str, bool] | None = None,
     timeouts: dict[str, float] | None = None,
     max_candidates: int = 24,
+    playwright_adapter: BrowserRenderAdapter | None = None,
 ) -> tuple[AcquisitionStrategy, ...]:
     """Ordered default strategy registry. All HTTP calls remain SafeHttpCollector calls."""
     enabled = flags or {}
@@ -959,6 +1190,11 @@ def default_acquisition_strategies(
         MementoStrategy(enabled=on("memento"), timeout_seconds=configured("memento", 15)),
         SearchCacheStrategy(
             enabled=on("search_cache"), timeout_seconds=configured("search_cache", 10)
+        ),
+        PlaywrightStrategy(
+            adapter=playwright_adapter,
+            enabled=on("playwright") and playwright_adapter is not None,
+            timeout_seconds=configured("playwright", 45),
         ),
         BridgeTranscriptionStrategy(
             enabled=on("bridge_transcription"),

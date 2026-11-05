@@ -67,6 +67,7 @@ class SourceAcquisitionMethod(StrEnum):
     COMMON_CRAWL = "common_crawl"
     MEMENTO = "memento"
     SEARCH_CACHE = "search_cache"
+    PLAYWRIGHT_RENDERED = "playwright_rendered"
     BRIDGE_TRANSCRIPTION = "bridge_transcription"
     MANUAL_UPLOAD = "manual_upload"
 

@@ -224,7 +224,7 @@ class Settings(BaseSettings):
             "memento": True,
             "search_cache": True,
             "bridge_transcription": True,
-            "playwright": False,
+            "playwright": True,
         }
     )
     collection_acquisition_strategy_timeout_seconds: dict[str, float] = Field(
@@ -245,6 +245,7 @@ class Settings(BaseSettings):
             "playwright": 45.0,
         }
     )
+    collection_playwright_sidecar_url: str = ""
     pdf_max_document_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
     pdf_max_pages: int = Field(default=200, gt=0, le=10_000)
     pdf_parse_timeout_seconds: float = Field(default=15.0, gt=0, le=300)

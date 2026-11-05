@@ -144,6 +144,13 @@ source core ne devient donc pas une source d'IOC confirmés par le seul fait qu'
 été archivée. Les règles de collecte, les diagnostics et les limites de diffusion sont détaillés
 dans [`source_collection_and_evidence.md`](source_collection_and_evidence.md#chaîne-dacquisition-de-repli).
 
+Le rendu Chromium est facultatif : il n'est activé que si `COLLECTION_PLAYWRIGHT_SIDECAR_URL` pointe
+vers le service `playwright-acquirer` du profil Compose `playwright-acquisition`. Le backend lui
+transmet le HTML déjà obtenu par le transport HTTP épinglé; le sidecar exécute les scripts inline
+dans un profil neuf et bloque toutes les requêtes réseau du navigateur. Il peut donc révéler du DOM
+produit localement, mais ne charge pas les scripts ou API externes de la page. Cette limite garde
+Chromium hors du backend et hors de tout accès réseau non contrôlé par le collecteur.
+
 Le blob RAW conserve le wire format de recherche historique, notamment
 `editorial-title` et `EVENT`, pour la lecture des anciens imports. Ces champs ne font pas partie du
 corpus canonique. `REFERENCES` appelle `ModelGateway` sans conversation canonique. Le hash

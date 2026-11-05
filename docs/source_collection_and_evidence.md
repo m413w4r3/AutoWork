@@ -57,8 +57,9 @@ pas contourner la politique. Une nouvelle collecte globale ne retente pas silenc
 
 Après un blocage ou une indisponibilité terminale, le collecteur essaie dans l'ordre les profils
 HTTP honnêtes, les liens canoniques/AMP/print/feeds et les endpoints publics de représentation,
-puis Wayback, archive.ph et ses miroirs, Common Crawl, Memento et la sonde de cache public. Tous les
-téléchargements HTTP passent par le même contrôle SSRF, les résolutions DNS épinglées, les domaines
+puis Wayback, archive.ph et ses miroirs, Common Crawl, Memento, la sonde de cache public, le rendu
+Chromium facultatif et enfin Bridge. Tous les téléchargements HTTP passent par le même contrôle
+SSRF, les résolutions DNS épinglées, les domaines
 interdits et les limites de collecte. HTTP/2 et curl apparaissent comme ignorés tant qu'un adaptateur
 respectant ces garanties n'existe pas. Les tentatives bornées respectent `Retry-After`; les pages
 trop courtes, incohérentes, sans index autorisé, de consentement, de CAPTCHA, de paywall ou d'erreur
@@ -80,8 +81,12 @@ explicitement un repli existant; un repli ne remplace jamais un document archiv�
 active.
 
 Les stratégies sont configurables avec `COLLECTION_ACQUISITION_STRATEGY_ENABLED` et
-`COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS`. Le navigateur Playwright n'est activé qu'avec
-son adaptateur isolé configuré; il reste désactivé par défaut.
+`COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS`. Playwright nécessite `COLLECTION_PLAYWRIGHT_SIDECAR_URL`
+et le profil Compose `playwright-acquisition`; sans URL configurée, la stratégie reste désactivée.
+Le sidecar n'a aucun montage de secret et n'a pas d'accès Internet. Chromium travaille sur le HTML
+collecté par le transport épinglé, exécute les scripts inline et bloque chaque requête secondaire.
+Ce mode ne charge pas les ressources distantes qu'une page JavaScript pourrait ensuite demander;
+HTTP/2 et curl restent ignorés car aucun adaptateur ne conserve aujourd'hui le DNS épinglé.
 
 ## Raw, decoded et document analyste
 

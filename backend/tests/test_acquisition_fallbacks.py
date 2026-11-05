@@ -12,9 +12,12 @@ from cti_app.application.acquisition_fallbacks import (
     AlternateRepresentationStrategy,
     ArchivePhStrategy,
     BridgeTranscriptionStrategy,
+    BrowserRenderResult,
+    BrowserSidecarUnavailable,
     CommonCrawlStrategy,
     MementoStrategy,
     PinnedHttpProfileStrategy,
+    PlaywrightStrategy,
     SearchCacheStrategy,
     UnavailableTransportStrategy,
     WaybackStrategy,
@@ -110,6 +113,9 @@ def _request(fetch, *, sleep=None):
         title="Report 1: Campaign analysis",
         published_at=date(2026, 1, 10),
         response_body=None,
+        response_status=None,
+        response_content_type=None,
+        response_headers=None,
         link_header=None,
         fetch=fetch,
         sleep=sleep or no_sleep,
@@ -144,6 +150,20 @@ class FakeGateway:
             raw_output_sha256=raw_hash,
         )
         return SimpleNamespace(run=run, output_text=self.output)
+
+
+class FakeBrowserAdapter:
+    def __init__(self, rendered_html: str | None = None, *, unavailable: bool = False) -> None:
+        self.rendered_html = rendered_html
+        self.unavailable = unavailable
+        self.calls: list[tuple[str, str, float]] = []
+
+    async def render(self, *, url: str, html: str, timeout_seconds: float):
+        self.calls.append((url, html, timeout_seconds))
+        if self.unavailable:
+            raise BrowserSidecarUnavailable("offline fake")
+        assert self.rendered_html is not None
+        return BrowserRenderResult(rendered_html=self.rendered_html)
 
 
 async def _service(
@@ -392,6 +412,77 @@ async def test_retry_after_is_honored_with_a_bounded_fake_delay():
 
     assert [probe.outcome for probe in probes] == ["failed", "succeeded"]
     assert delays == [1.5]
+
+
+@pytest.mark.asyncio
+async def test_playwright_strategy_uses_fake_sidecar_and_archives_rendered_dom():
+    adapter = FakeBrowserAdapter(_ARTICLE.decode("utf-8"))
+    request = _request(lambda *args: None)
+    request.response_body = _BLOCKED_WITH_AMP
+    request.response_status = 403
+    request.response_content_type = "text/html"
+
+    probes = await PlaywrightStrategy(adapter=adapter).acquire(request)
+
+    assert probes[0].outcome == "succeeded"
+    assert probes[0].method is SourceAcquisitionMethod.PLAYWRIGHT_RENDERED
+    assert probes[0].http_status == 403
+    assert probes[0].encoded_sha256 == hashlib.sha256(_ARTICLE).hexdigest()
+    assert probes[0].response is not None
+    assert probes[0].response.decoded_body == _ARTICLE
+    assert adapter.calls == [("https://source.example/", _BLOCKED_WITH_AMP.decode("utf-8"), 45.0)]
+
+
+@pytest.mark.asyncio
+async def test_playwright_sidecar_unavailable_is_a_recordable_skip():
+    adapter = FakeBrowserAdapter(unavailable=True)
+    request = _request(lambda *args: None)
+    request.response_body = _ARTICLE
+    request.response_content_type = "text/html"
+
+    probes = await PlaywrightStrategy(adapter=adapter).acquire(request)
+
+    assert probes[0].outcome == "skipped"
+    assert probes[0].reason_code == "playwright_sidecar_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_playwright_rendered_dom_archives_with_distinct_provenance(tmp_path):
+    adapter = FakeBrowserAdapter(_ARTICLE.decode("utf-8"))
+    factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=Transport([_BLOCKED]),
+        strategies=(PlaywrightStrategy(adapter=adapter),),
+    )
+
+    result = await app.archive_one(source.id, uuid4())
+
+    assert result is CollectionState.ARCHIVED
+    receipt = await app.archive_receipt(factory.collections[source.id])
+    assert receipt is not None
+    assert receipt.acquisition_method is SourceAcquisitionMethod.PLAYWRIGHT_RENDERED
+    assert receipt.strategy_name == "playwright"
+    assert receipt.strategy_sha256 == hashlib.sha256(_ARTICLE).hexdigest()
+    archived = next(
+        event for event in factory.provenance if event.event_type == "source.archived_fallback"
+    )
+    assert archived.payload["acquisition_method"] == "playwright_rendered"
+    assert archived.payload["verification_status"] == "archived_http_content"
+
+
+def test_playwright_registry_requires_a_configured_adapter():
+    strategies = default_acquisition_strategies(flags={"playwright": True})
+
+    browser = next(strategy for strategy in strategies if strategy.name == "playwright")
+    assert browser.enabled is False
+
+    configured = default_acquisition_strategies(
+        flags={"playwright": True},
+        playwright_adapter=FakeBrowserAdapter(_ARTICLE.decode("utf-8")),
+    )
+    names = [strategy.name for strategy in configured]
+    assert configured[names.index("playwright")].enabled is True
+    assert names.index("playwright") < names.index("bridge_transcription")
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from cti_app.application.acquisition_fallbacks import (
     AcquisitionProbe,
     AcquisitionRequest,
     AcquisitionStrategy,
+    SidecarPlaywrightAdapter,
     article_rejection_reason,
     bridge_transcription_prompt,
     bridge_url_is_credential_free,
@@ -393,6 +394,7 @@ class SubjectCollectionService:
         fallback_strategy_timeouts: dict[str, float] | None = None,
         fallback_strategies: Sequence[AcquisitionStrategy] | None = None,
         fallback_min_text_chars: int = 200,
+        fallback_playwright_sidecar_url: str | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._collector = collector
@@ -438,6 +440,7 @@ class SubjectCollectionService:
                     "common_crawl",
                     "memento",
                     "search_cache",
+                    "playwright",
                     "bridge_transcription",
                 )
             }
@@ -455,6 +458,11 @@ class SubjectCollectionService:
                 flags=strategy_flags,
                 timeouts=fallback_strategy_timeouts,
                 max_candidates=fallback_max_variants,
+                playwright_adapter=(
+                    SidecarPlaywrightAdapter(fallback_playwright_sidecar_url)
+                    if fallback_playwright_sidecar_url
+                    else None
+                ),
             )
         )
         self._fetch_lease = timedelta(
@@ -1886,6 +1894,21 @@ class SubjectCollectionService:
             title=candidate.title if candidate else collection.title,
             published_at=candidate.published_at if candidate else collection.published_at,
             response_body=fallback_body,
+            response_status=(
+                initial_error.http_status
+                if initial_error is not None
+                else direct_attempt.http_status
+                if direct_attempt is not None
+                else None
+            ),
+            response_content_type=(
+                initial_error.headers.get("content-type")
+                if initial_error is not None
+                else direct_attempt.declared_content_type
+                if direct_attempt is not None
+                else None
+            ),
+            response_headers=dict(initial_error.headers) if initial_error is not None else {},
             link_header=fallback_headers.get("link"),
             fetch=safe_fetch,
             bridge=bridge_attempt,

@@ -363,6 +363,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         fallback_strategy_flags=settings.collection_acquisition_strategy_enabled,
         fallback_strategy_timeouts=settings.collection_acquisition_strategy_timeout_seconds,
         fallback_min_text_chars=settings.collection_fallback_min_text_chars,
+        fallback_playwright_sidecar_url=settings.collection_playwright_sidecar_url or None,
     )
     collection_review_service = CollectionReviewService(
         uow_factory,
