@@ -27,6 +27,7 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.edition_composition import (
@@ -38,6 +39,7 @@ from cti_app.infrastructure.database.models.production import (
     ProductionInputSnapshotRow,
     ProductionRunRow,
 )
+from cti_app.infrastructure.database.models.production_routing import ProductionRoutingDecisionRow
 from cti_app.infrastructure.database.models.publication_review import (
     PublicationReviewDecisionRow,
 )
@@ -227,6 +229,7 @@ class SqlAlchemyEditionReviewReadRepository:
                 ProductionRunRow.pipeline_generation.label("current_pipeline_generation"),
                 ProductionRunRow.status.label("run_status"),
                 ProductionRunRow.current_stage.label("current_stage"),
+                ProductionRoutingDecisionRow.publication_kind.label("routing_publication_kind"),
                 EditionCompositionEntryRow.artifact_id.label("artifact_id"),
                 EditionCompositionEntryRow.artifact_version.label("artifact_version"),
                 EditionCompositionEntryRow.artifact_input_hash.label("artifact_hash"),
@@ -283,6 +286,10 @@ class SqlAlchemyEditionReviewReadRepository:
             .join(
                 ProductionRunRow,
                 ProductionRunRow.id == EditionCompositionEntryRow.production_run_id,
+            )
+            .outerjoin(
+                ProductionRoutingDecisionRow,
+                ProductionRoutingDecisionRow.id == ProductionRunRow.routing_decision_id,
             )
             .outerjoin(
                 ProductionInputSnapshotRow,
@@ -351,6 +358,7 @@ class SqlAlchemyEditionReviewReadRepository:
             "current_pipeline_generation",
             "run_status",
             "current_stage",
+            "routing_publication_kind",
             "artifact_id",
             "artifact_version",
             "artifact_hash",
@@ -688,6 +696,11 @@ def _read_item_from_row(row: Any, *, composition_version: int) -> EditionReviewR
         document_artifact_status=artifact_status,
         error_code=row["error_code"],
         error_message=row["error_message"],
+        publication_kind=(
+            PublicationKind(row["routing_publication_kind"])
+            if row["routing_publication_kind"] is not None
+            else None
+        ),
         effective_decision_id=row["decision_id"],
         effective_decision=(
             PublicationDecision(row["decision"]) if row["decision"] is not None else None
@@ -697,6 +710,11 @@ def _read_item_from_row(row: Any, *, composition_version: int) -> EditionReviewR
             resolve_retry_stage(
                 live_artifact_stages,
                 current_stage=ProductionStage(row["current_stage"]),
+                publication_kind=(
+                    PublicationKind(row["routing_publication_kind"])
+                    if row["routing_publication_kind"] is not None
+                    else None
+                ),
             )
             if can_retry
             else None

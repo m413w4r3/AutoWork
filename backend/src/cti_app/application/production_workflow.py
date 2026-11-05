@@ -25,7 +25,11 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRoutingHint,
 )
-from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.persistence import (
+    PRODUCTION_ROUTING_DECISION_STALE_CODE,
+    UnitOfWork,
+    UnitOfWorkFactory,
+)
 from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
     cross_run_reuse_allowed,
@@ -804,14 +808,14 @@ class ProductionWorkflowOrchestrator:
             expected_version=latest.version,
         )
         if previous_hash is not None and decision.decision_hash != previous_hash:
-            dependent_stages = {
-                ProductionArtifactStage.SYNTHESIS.value,
-                ProductionArtifactStage.PUBLICATION.value,
-            }
-            if (
-                decision.publication_kind is PublicationKind.ARTICLE
-            ) or previous_kind is PublicationKind.ARTICLE:
-                dependent_stages.add(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value)
+            dependent_stages = {ProductionArtifactStage.PUBLICATION.value}
+            if decision.publication_kind is not previous_kind:
+                dependent_stages.add(ProductionArtifactStage.SYNTHESIS.value)
+                if (
+                    decision.publication_kind is PublicationKind.ARTICLE
+                    or previous_kind is PublicationKind.ARTICLE
+                ):
+                    dependent_stages.add(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value)
             async with self._uow_factory() as uow:
                 artifacts = getattr(uow, "production_artifacts", None)
                 if artifacts is not None:
@@ -2291,40 +2295,79 @@ class ProductionWorkflowOrchestrator:
                 )
 
             await self._check_cancellation(run.id, context)
-            ending = await uow.production_runs.get_for_update(run.id)
-            if ending is None or ending.status is ProductionRunStatus.CANCELLED:
-                return {
-                    "stage": "assembly",
-                    "status": "cancelled",
-                }
+            return await _complete_assembly_after_qa(
+                uow,
+                run_id=run.id,
+                captured_route=routing_decision,
+                qa_result=qa_result,
+            )
 
-            if qa_result["passed"]:
-                ending.mark_ready(now=datetime.now(UTC))
-                await uow.production_runs.save(ending)
-                await uow.commit()
 
-                return {
-                    "stage": "assembly",
-                    "status": "success",
-                    "run_status": ProductionRunStatus.READY.value,
-                    "qa": qa_result,
-                }
-            else:
-                ending.mark_needs_review(
-                    code="publication_qa_failed",
-                    message="; ".join(qa_result["errors"]),
-                    details=qa_result,
-                    now=datetime.now(UTC),
-                )
-                await uow.production_runs.save(ending)
-                await uow.commit()
+async def _complete_assembly_after_qa(
+    uow: Any,
+    *,
+    run_id: UUID,
+    captured_route: ProductionRoutingDecisionV1,
+    qa_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Finalize QA only while the run still adopts the route QA examined."""
+    ending = await uow.production_runs.get_for_update(run_id)
+    if ending is None or ending.status is ProductionRunStatus.CANCELLED:
+        return {"stage": "assembly", "status": "cancelled"}
 
-                return {
-                    "stage": "assembly",
-                    "status": "needs_review",
-                    "run_status": ProductionRunStatus.NEEDS_REVIEW.value,
-                    "qa": qa_result,
-                }
+    routes = getattr(uow, "production_routing_decisions", None)
+    adopted_route = (
+        await routes.get(ending.routing_decision_id)
+        if routes is not None and ending.routing_decision_id is not None
+        else None
+    )
+    if (
+        ending.routing_decision_id != captured_route.decision_id
+        or adopted_route is None
+        or adopted_route.decision_hash != captured_route.decision_hash
+        or adopted_route.production_run_id != run_id
+        or adopted_route.pipeline_generation != ending.pipeline_generation
+    ):
+        return {
+            "stage": "assembly",
+            "status": "needs_review",
+            "error_code": PRODUCTION_ROUTING_DECISION_STALE_CODE,
+            "error": "The publication route changed while QA was in progress.",
+            "details": {
+                "captured_routing_decision_id": str(captured_route.decision_id),
+                "current_routing_decision_id": (
+                    str(ending.routing_decision_id)
+                    if ending.routing_decision_id is not None
+                    else None
+                ),
+            },
+        }
+
+    if qa_result["passed"]:
+        ending.mark_ready(now=datetime.now(UTC))
+        await uow.production_runs.save(ending)
+        await uow.commit()
+        return {
+            "stage": "assembly",
+            "status": "success",
+            "run_status": ProductionRunStatus.READY.value,
+            "qa": qa_result,
+        }
+
+    ending.mark_needs_review(
+        code="publication_qa_failed",
+        message="; ".join(qa_result["errors"]),
+        details=qa_result,
+        now=datetime.now(UTC),
+    )
+    await uow.production_runs.save(ending)
+    await uow.commit()
+    return {
+        "stage": "assembly",
+        "status": "needs_review",
+        "run_status": ProductionRunStatus.NEEDS_REVIEW.value,
+        "qa": qa_result,
+    }
 
 
 def _references_input_hash(

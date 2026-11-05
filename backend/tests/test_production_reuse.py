@@ -45,6 +45,7 @@ from cti_app.application.production_synthesis import (
 )
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
+    _complete_assembly_after_qa,
     _references_input_hash,
     production_references_model_run_id,
 )
@@ -93,6 +94,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
 )
 from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication_kind import PublicationKind
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_production_synthesis_storage import canonical_pair
 
@@ -1786,7 +1788,11 @@ def _synthesis_world() -> SimpleNamespace:
 
 
 def _brief_synthesis_world(
-    *, with_chronology: bool = True, external_llm_allowed: bool = True
+    *,
+    with_chronology: bool = True,
+    external_llm_allowed: bool = True,
+    source_date_text: str = "2026-07-02",
+    source_quote: str = "Le 2026-07-02, la campagne commence.",
 ) -> SimpleNamespace:
     world = _synthesis_world()
     source = world.extraction.sources[0]
@@ -1803,10 +1809,10 @@ def _brief_synthesis_world(
             (
                 replace(
                     source.events[0],
-                    date_text="2026-07-02",
+                    date_text=source_date_text,
                     text="La campagne commence.",
                     context="Chronologie de la campagne.",
-                    evidence_quote="Le 2026-07-02, la campagne commence.",
+                    evidence_quote=source_quote,
                 ),
             )
             if with_chronology
@@ -1988,6 +1994,36 @@ async def test_brief_without_source_dated_chronology_goes_to_review_without_call
 
 
 @pytest.mark.asyncio
+async def test_brief_synthesis_rejects_date_text_absent_from_source_quote() -> None:
+    world = _brief_synthesis_world(source_date_text="2026-07-03")
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "brief_chronology_unavailable"
+    assert result["details"]["diagnostic"] == (
+        "brief_timeline_requires_1_to_4_source_dated_entries"
+    )
+    assert world.gateway.requests == []
+    assert world.artifacts.appended == []
+
+
+@pytest.mark.asyncio
+async def test_brief_synthesis_requires_a_complete_date_literal_in_source_quote() -> None:
+    world = _brief_synthesis_world(source_quote="Le 2026-07-020, la campagne commence.")
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "brief_chronology_unavailable"
+    assert result["details"]["diagnostic"] == (
+        "brief_timeline_requires_1_to_4_source_dated_entries"
+    )
+    assert world.gateway.requests == []
+    assert world.artifacts.appended == []
+
+
+@pytest.mark.asyncio
 async def test_brief_external_llm_policy_blocks_drafting() -> None:
     world = _brief_synthesis_world(external_llm_allowed=False)
 
@@ -2024,12 +2060,13 @@ async def test_brief_prompt_version_change_invalidates_only_synthesis(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_routing_policy_version_change_invalidates_route_dependents_only(monkeypatch) -> None:
+async def test_routing_policy_version_change_reuses_same_kind_synthesis(monkeypatch) -> None:
     world = _brief_synthesis_world()
     first = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
     assert first["status"] == "success"
     original_synthesis = world.artifacts.appended[-1]
     prior_route_id = world.run.routing_decision_id
+    stale_before_route_bump = list(world.artifacts.stale)
     assert prior_route_id is not None
 
     next_policy_version = "subject-publication-routing-test-next"
@@ -2038,14 +2075,69 @@ async def test_routing_policy_version_change_invalidates_route_dependents_only(m
 
     second = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
 
-    assert second["status"] == "success"
-    assert len(world.gateway.requests) == 2
+    assert second["status"] == "cached"
+    assert len(world.gateway.requests) == 1
     assert len(world.uow.production_routing_decisions.decisions) == 2
     assert world.run.routing_decision_id != prior_route_id
-    assert original_synthesis.status is ProductionArtifactStatus.STALE
-    assert {stage for _, stage in world.artifacts.stale} == {"synthesis", "publication"}
+    assert original_synthesis.status is ProductionArtifactStatus.VERIFIED
+    assert {stage for _, stage in world.artifacts.stale[len(stale_before_route_bump) :]} == {
+        ProductionArtifactStage.PUBLICATION.value
+    }
     assert world.extraction_artifact.status is ProductionArtifactStatus.VERIFIED
     assert world.projection_artifact.status is ProductionArtifactStatus.VERIFIED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("world_factory", "new_kind"),
+    [
+        (_synthesis_world, PublicationKind.BRIEF),
+        (_brief_synthesis_world, PublicationKind.ARTICLE),
+    ],
+)
+async def test_publication_kind_change_stales_synthesis_and_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    world_factory: Any,
+    new_kind: PublicationKind,
+) -> None:
+    world = world_factory()
+    first = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+    assert first["status"] == "success"
+    stale_before_route_change = list(world.artifacts.stale)
+    prior_id = world.run.routing_decision_id
+    assert prior_id is not None
+
+    next_policy_version = "subject-publication-routing-kind-change"
+    monkeypatch.setattr(production_workflow, "ROUTING_POLICY_VERSION", next_policy_version)
+    next_id = uuid4()
+    next_route = SimpleNamespace(
+        decision_id=next_id,
+        decision_hash="b" * 64,
+        policy_version=next_policy_version,
+        publication_kind=new_kind,
+        production_run_id=world.run.id,
+        pipeline_generation=world.run.pipeline_generation,
+    )
+
+    async def adopt_changed_kind(**_kwargs: object) -> object:
+        world.run.routing_decision_id = next_id
+        return next_route
+
+    monkeypatch.setattr(
+        production_workflow,
+        "decide_and_adopt_production_routing",
+        adopt_changed_kind,
+    )
+
+    adopted = await world.orchestrator._ensure_current_routing_decision(world.run)
+
+    assert adopted is next_route
+    assert world.run.routing_decision_id == next_id
+    assert {stage for _, stage in world.artifacts.stale[len(stale_before_route_change) :]} == {
+        ProductionArtifactStage.SYNTHESIS.value,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
+        ProductionArtifactStage.PUBLICATION.value,
+    }
 
 
 @pytest.mark.asyncio
@@ -2079,6 +2171,114 @@ async def test_synthesis_stage_exact_replay_returns_zero_additional_drafting_cal
     assert first.artifacts.appended[-1] is source_artifact
     # The replay retains its exact routing and projection identity.
     assert source_artifact.metadata["relevance_projection_hash"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["decision_id", "decision_hash"])
+async def test_inflight_synthesis_discards_result_when_route_changes(change: str) -> None:
+    world = _synthesis_world()
+    original_draft = world.gateway.draft
+
+    async def draft_then_change_route(request: ModelRequest, output_schema: object = None):
+        execution = await original_draft(request, output_schema)
+        captured_id = world.run.routing_decision_id
+        assert captured_id is not None
+        current = world.uow.production_routing_decisions.decisions[captured_id]
+        if change == "decision_id":
+            current = SimpleNamespace(
+                decision_hash="b" * 64,
+                production_run_id=world.run.id,
+                pipeline_generation=world.run.pipeline_generation,
+            )
+            current_id = uuid4()
+            world.uow.production_routing_decisions.decisions[current_id] = current
+            world.run.routing_decision_id = current_id
+        else:
+            world.uow.production_routing_decisions.decisions[captured_id] = SimpleNamespace(
+                decision_hash="b" * 64,
+                production_run_id=world.run.id,
+                pipeline_generation=world.run.pipeline_generation,
+            )
+        return execution
+
+    world.gateway.draft = draft_then_change_route
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "production_routing_decision_stale"
+    assert len(world.gateway.requests) == 1
+    assert world.artifacts.appended == []
+    assert world.run.status is ProductionRunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["decision_id", "decision_hash"])
+async def test_assembly_qa_cannot_mark_ready_after_route_changes(change: str) -> None:
+    run = _synthesis_run()
+    captured_id = uuid4()
+    captured_route = SimpleNamespace(
+        decision_id=captured_id,
+        decision_hash="a" * 64,
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+    )
+    run.routing_decision_id = captured_id
+    if change == "decision_id":
+        current_id = uuid4()
+        current_route = SimpleNamespace(
+            decision_id=current_id,
+            decision_hash="b" * 64,
+            production_run_id=run.id,
+            pipeline_generation=run.pipeline_generation,
+        )
+        run.routing_decision_id = current_id
+    else:
+        current_route = SimpleNamespace(
+            decision_id=captured_id,
+            decision_hash="b" * 64,
+            production_run_id=run.id,
+            pipeline_generation=run.pipeline_generation,
+        )
+
+    class Runs:
+        def __init__(self) -> None:
+            self.saved = 0
+
+        async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
+            return run if run_id == run.id else None
+
+        async def save(self, saved_run: ProductionRun) -> None:
+            assert saved_run is run
+            self.saved += 1
+
+    class Routes:
+        async def get(self, decision_id: UUID) -> object | None:
+            return current_route if decision_id == run.routing_decision_id else None
+
+    class Uow:
+        def __init__(self) -> None:
+            self.production_runs = Runs()
+            self.production_routing_decisions = Routes()
+            self.commits = 0
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    uow = Uow()
+
+    result = await _complete_assembly_after_qa(
+        uow,
+        run_id=run.id,
+        captured_route=captured_route,
+        qa_result={"passed": True},
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "production_routing_decision_stale"
+    assert run.status is ProductionRunStatus.RUNNING
+    assert uow.production_runs.saved == 0
+    assert uow.commits == 0
 
 
 @pytest.mark.asyncio

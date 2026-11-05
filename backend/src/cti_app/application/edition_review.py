@@ -35,6 +35,7 @@ from cti_app.domain.production import (
     requires_submission_reconciliation,
 )
 from cti_app.domain.production_pipeline import downstream_artifacts_from_pipeline_stage
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_review import (
     PublicationDecision,
     PublicationReviewDecision,
@@ -58,6 +59,7 @@ class EditionReviewReadItem:
     error_code: str | None
     error_message: str | None
     effective_decision: PublicationDecision | None
+    publication_kind: PublicationKind | None = None
     effective_decision_id: UUID | None = None
     retry_stage: ProductionStage | None = None
     reconciliation: ProductionSubmissionReconciliation | None = None
@@ -122,6 +124,7 @@ class EditionReviewReadItem:
         return resolve_retry_stage(
             self.live_artifact_stages,
             current_stage=ProductionStage.ASSEMBLY,
+            publication_kind=self.publication_kind,
         )
 
 

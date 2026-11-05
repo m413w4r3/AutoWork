@@ -5986,6 +5986,8 @@ class _FailOnceSynthesisWriter:
         expected_current_artifact_id: UUID | None = None,
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
+        expected_routing_decision_id: UUID | None = None,
+        expected_routing_decision_hash: str | None = None,
         stale_stages: set[str] | None = None,
         uow: object | None = None,
     ) -> ProductionArtifact:
@@ -6010,6 +6012,8 @@ class _FailOnceSynthesisWriter:
             expected_current_artifact_id=expected_current_artifact_id,
             expected_current_input_hash=expected_current_input_hash,
             expected_current_canonical_sha256=expected_current_canonical_sha256,
+            expected_routing_decision_id=expected_routing_decision_id,
+            expected_routing_decision_hash=expected_routing_decision_hash,
             stale_stages=stale_stages,
             uow=uow,
         )
@@ -6036,6 +6040,8 @@ class _SynthesisResultWriter(Protocol):
         expected_current_artifact_id: UUID | None = None,
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
+        expected_routing_decision_id: UUID | None = None,
+        expected_routing_decision_hash: str | None = None,
         stale_stages: set[str] | None = None,
         uow: object | None = None,
     ) -> ProductionArtifact: ...

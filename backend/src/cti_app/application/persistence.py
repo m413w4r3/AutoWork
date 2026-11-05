@@ -128,6 +128,13 @@ class StaleProductionRunVersionError(RuntimeError):
     """A production run write used an obsolete optimistic-lock version."""
 
 
+PRODUCTION_ROUTING_DECISION_STALE_CODE = "production_routing_decision_stale"
+
+
+class StaleProductionRoutingDecisionError(RuntimeError):
+    """A worker result was built for a route the run no longer adopts."""
+
+
 if TYPE_CHECKING:
     from cti_app.application.edition_composition import (
         EditionCompositionEventRepository,

@@ -30,10 +30,12 @@ from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
 )
 from cti_app.application.persistence import (
+    PRODUCTION_ROUTING_DECISION_STALE_CODE,
     ProductionUnitOfWork,
     ProductionUnitOfWorkFactory,
     SourceCollectionRepository,
     SourceDocumentRepository,
+    StaleProductionRoutingDecisionError,
 )
 from cti_app.application.production_access_policy import resolve_source_policy
 from cti_app.application.production_artifact_store import (
@@ -1231,8 +1233,6 @@ def _synthesis_identity_payload(
         payload.update(
             {
                 "publication_kind": publication_kind.value,
-                "routing_decision_hash": routing_decision_hash,
-                "publication_routing_policy_version": publication_routing_policy_version,
             }
         )
     return payload
@@ -3327,6 +3327,7 @@ class SynthesisStageErrorCode(StrEnum):
     ACCESS_POLICY_UNAVAILABLE = "synthesis_access_policy_unavailable"
     POLICY_BLOCKED = "synthesis_policy_blocked"
     REUSE_INVALID = "synthesis_reuse_invalid"
+    ROUTING_DECISION_STALE = PRODUCTION_ROUTING_DECISION_STALE_CODE
     MODEL_CALL_FAILED = "synthesis_model_call_failed"
     RECONCILIATION_REQUIRED = PRODUCTION_RECONCILIATION_ERROR_CODE
 
@@ -3497,6 +3498,7 @@ class ProductionSynthesisService:
         routing_decision_hash = (
             routing_decision.decision_hash if routing_decision is not None else None
         )
+        routing_decision_id = routing_decision.decision_id if routing_decision is not None else None
         publication_routing_policy_version = (
             routing_decision.policy_version if routing_decision is not None else None
         )
@@ -3596,6 +3598,7 @@ class ProductionSynthesisService:
             input_hash=input_hash,
             revision=revision,
             publication_kind=publication_kind,
+            routing_decision_id=routing_decision_id,
             routing_decision_hash=routing_decision_hash,
             publication_routing_policy_version=publication_routing_policy_version,
             brief_timeline=brief_timeline,
@@ -4086,6 +4089,7 @@ class ProductionSynthesisService:
         input_hash: str,
         revision: SynthesisRevisionContextV1 | None,
         publication_kind: PublicationKind,
+        routing_decision_id: UUID | None,
         routing_decision_hash: str | None,
         publication_routing_policy_version: str | None,
         brief_timeline: tuple[SynthesisTimelineEntryV1, ...] | None,
@@ -4372,30 +4376,45 @@ class ProductionSynthesisService:
             **wire_diagnostics,
             "warnings": list(synthesis.warnings),
         }
-        artifact = await self._synthesis_service.store_synthesis_result(
-            run_id=run.id,
-            subject_id=snapshot.subject_id,
-            input_hash=input_hash,
-            synthesis=synthesis,
-            extraction=extraction,
-            raw_result=raw_text,
-            model_run_id=model_run.id,
-            mode=mode,
-            model_policy_version=SYNTHESIS_MODEL_POLICY_VERSION,
-            routing_policy_version=SYNTHESIS_ROUTING_POLICY_VERSION,
-            projection_hash=projection.projection_hash if projection is not None else None,
-            diagnostics=diagnostics,
-            metadata_extra=(
-                {
-                    "publication_kind": publication_kind.value,
+        try:
+            artifact = await self._synthesis_service.store_synthesis_result(
+                run_id=run.id,
+                subject_id=snapshot.subject_id,
+                input_hash=input_hash,
+                synthesis=synthesis,
+                extraction=extraction,
+                raw_result=raw_text,
+                model_run_id=model_run.id,
+                mode=mode,
+                model_policy_version=SYNTHESIS_MODEL_POLICY_VERSION,
+                routing_policy_version=SYNTHESIS_ROUTING_POLICY_VERSION,
+                projection_hash=projection.projection_hash if projection is not None else None,
+                diagnostics=diagnostics,
+                metadata_extra=(
+                    {
+                        "publication_kind": publication_kind.value,
+                        "routing_decision_hash": routing_decision_hash,
+                        "publication_routing_policy_version": publication_routing_policy_version,
+                        "synthesis_prompt_version": prompt_version,
+                    }
+                    if routing_decision_hash is not None
+                    else {}
+                ),
+                expected_routing_decision_id=routing_decision_id,
+                expected_routing_decision_hash=routing_decision_hash,
+            )
+        except StaleProductionRoutingDecisionError:
+            return reviewed(
+                SynthesisStageErrorCode.ROUTING_DECISION_STALE.value,
+                "The publication route changed while synthesis was in flight.",
+                run_id=model_run.id,
+                details={
+                    "routing_decision_id": (
+                        str(routing_decision_id) if routing_decision_id is not None else None
+                    ),
                     "routing_decision_hash": routing_decision_hash,
-                    "publication_routing_policy_version": publication_routing_policy_version,
-                    "synthesis_prompt_version": prompt_version,
-                }
-                if routing_decision_hash is not None
-                else {}
-            ),
-        )
+                },
+            )
         return ProductionSynthesisExecution(
             status=SynthesisExecutionStatus.SUCCEEDED,
             mode=mode,

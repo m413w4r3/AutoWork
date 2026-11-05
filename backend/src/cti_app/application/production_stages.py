@@ -10,7 +10,11 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
+from cti_app.application.persistence import (
+    ProductionUnitOfWork,
+    ProductionUnitOfWorkFactory,
+    StaleProductionRoutingDecisionError,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
@@ -543,6 +547,8 @@ class SynthesisService(_ArtifactPayloadMixin):
         expected_current_artifact_id: UUID | None = None,
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
+        expected_routing_decision_id: UUID | None = None,
+        expected_routing_decision_hash: str | None = None,
         stale_stages: set[str] | None = None,
         uow: Any | None = None,
     ) -> ProductionArtifact:
@@ -585,6 +591,36 @@ class SynthesisService(_ArtifactPayloadMixin):
             metadata.update(dict(metadata_extra))
         provided_uow = uow
         async with _uow_scope(self._uow_factory, provided_uow) as uow:
+            if (
+                expected_routing_decision_id is not None
+                or expected_routing_decision_hash is not None
+            ):
+                if expected_routing_decision_id is None or expected_routing_decision_hash is None:
+                    raise ValueError("Complete expected routing decision identity is required")
+                runs = getattr(uow, "production_runs", None)
+                get_for_update = getattr(runs, "get_for_update", None)
+                routing_decisions = getattr(uow, "production_routing_decisions", None)
+                if get_for_update is None or routing_decisions is None:
+                    raise StaleProductionRoutingDecisionError(
+                        "The current publication route cannot be verified under the run lock"
+                    )
+                locked_run = await get_for_update(run_id)
+                current_decision = (
+                    await routing_decisions.get(locked_run.routing_decision_id)
+                    if locked_run is not None and locked_run.routing_decision_id is not None
+                    else None
+                )
+                if (
+                    locked_run is None
+                    or locked_run.routing_decision_id != expected_routing_decision_id
+                    or current_decision is None
+                    or current_decision.decision_hash != expected_routing_decision_hash
+                    or current_decision.production_run_id != run_id
+                    or current_decision.pipeline_generation != locked_run.pipeline_generation
+                ):
+                    raise StaleProductionRoutingDecisionError(
+                        "The synthesis result was built for a stale publication route"
+                    )
             # Not get_current: a synthesis retry stales every prior synthesis
             # artifact first, and get_current excludes STALE rows — using it
             # here would restart numbering at 1 and collide with the
