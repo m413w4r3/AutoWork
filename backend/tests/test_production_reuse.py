@@ -14,6 +14,7 @@ import pytest
 
 from cti_app.application import production_context as production_context_module
 from cti_app.application import production_extraction, production_workflow
+from cti_app.application import production_synthesis as production_synthesis_module
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import ModelExecution, ModelGatewayError, ModelRequest
 from cti_app.application.production_artifact_reuse import (
@@ -23,6 +24,11 @@ from cti_app.application.production_artifact_reuse import (
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
+)
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_SYNTHESIS_PROMPT_VERSION,
+    brief_timeline_from_extraction,
+    build_brief_synthesis_prompt,
 )
 from cti_app.application.production_extraction import extraction_input_hash
 from cti_app.application.production_references import (
@@ -34,6 +40,7 @@ from cti_app.application.production_synthesis import (
     ProductionSynthesisExecution,
     SynthesisExecutionStatus,
     build_synthesis_evidence_pack,
+    canonical_extraction_hash,
     synthesis_input_hash,
 )
 from cti_app.application.production_workflow import (
@@ -41,6 +48,7 @@ from cti_app.application.production_workflow import (
     _references_input_hash,
     production_references_model_run_id,
 )
+from cti_app.domain import production_routing as production_routing_domain
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.domain.discovery import SourceRole
@@ -66,6 +74,8 @@ from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionEventV1,
     ExtractionFactV1,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
@@ -76,7 +86,13 @@ from cti_app.domain.production_references import (
     ProductionReferenceTier,
 )
 from cti_app.domain.production_relevance import relevance_projection_to_json
-from cti_app.domain.production_synthesis import production_synthesis_from_json
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    SynthesisTimelineEntryV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_from_json,
+)
+from cti_app.domain.publication import ArtifactType
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_production_synthesis_storage import canonical_pair
 
@@ -99,6 +115,13 @@ class _Artifacts:
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
         self.stale.append((run_id, stage))
+
+    async def mark_stages_stale(self, run_id: UUID, stages: set[str]) -> list[str]:
+        self.stale.extend((run_id, stage) for stage in sorted(stages))
+        for artifact in self.items:
+            if artifact.production_run_id == run_id and artifact.stage.value in stages:
+                artifact.status = ProductionArtifactStatus.STALE
+        return sorted(stages)
 
     async def find_reusable(
         self,
@@ -744,11 +767,13 @@ class _BlobStore:
 
     def __init__(self) -> None:
         self.blobs: dict[UUID, bytes] = {}
+        self.sha256s: dict[UUID, str] = {}
         self.reads: list[UUID] = []
 
     def put(self, content: bytes) -> UUID:
         blob_id = uuid4()
         self.blobs[blob_id] = content
+        self.sha256s[blob_id] = hashlib.sha256(content).hexdigest()
         return blob_id
 
     async def read_bytes(self, blob_id: UUID) -> bytes:
@@ -1377,6 +1402,13 @@ class _SynthesisArtifacts:
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
         self.stale.append((run_id, stage))
 
+    async def mark_stages_stale(self, run_id: UUID, stages: set[str]) -> list[str]:
+        self.stale.extend((run_id, stage) for stage in sorted(stages))
+        for artifact in self.items:
+            if artifact.production_run_id == run_id and artifact.stage.value in stages:
+                artifact.status = ProductionArtifactStatus.STALE
+        return sorted(stages)
+
 
 class _SynthesisRuns:
     def __init__(self, runs: dict[UUID, ProductionRun]) -> None:
@@ -1410,6 +1442,35 @@ class _SynthesisCollections:
         return None
 
 
+class _SynthesisBlobs:
+    def __init__(self, store: _BlobStore) -> None:
+        self.store = store
+
+    async def get(self, blob_id: UUID) -> SimpleNamespace | None:
+        sha256 = self.store.sha256s.get(blob_id)
+        if sha256 is None:
+            return None
+        return SimpleNamespace(descriptor=SimpleNamespace(sha256=sha256))
+
+
+class _SynthesisRoutingDecisions:
+    def __init__(self, runs: dict[UUID, ProductionRun]) -> None:
+        self.runs = runs
+        self.decisions: dict[UUID, Any] = {}
+
+    async def get(self, decision_id: UUID) -> Any | None:
+        return self.decisions.get(decision_id)
+
+    async def append_and_adopt(self, decision: Any, *, expected_version: int) -> Any:
+        run = self.runs[decision.production_run_id]
+        assert run.version == expected_version
+        assert run.pipeline_generation == decision.pipeline_generation
+        self.decisions[decision.decision_id] = decision
+        run.routing_decision_id = decision.decision_id
+        run.version += 1
+        return decision
+
+
 class _SynthesisUow:
     """Only the frozen snapshot, the extraction and its documents are reachable."""
 
@@ -1419,11 +1480,14 @@ class _SynthesisUow:
         runs: dict[UUID, ProductionRun],
         snapshots: dict[UUID, ProductionInputSnapshot],
         artifacts: _SynthesisArtifacts,
+        store: _BlobStore,
         documents: list[SourceDocument] | None = None,
     ) -> None:
         self.production_runs = _SynthesisRuns(runs)
         self.production_input_snapshots = _SynthesisSnapshots(snapshots)
         self.production_artifacts = artifacts
+        self.blobs = _SynthesisBlobs(store)
+        self.production_routing_decisions = _SynthesisRoutingDecisions(runs)
         self.production_reuse_invalidations = _Invalidations()
         self.source_documents = _SynthesisDocuments(list(documents or []))
         self.source_collections = _SynthesisCollections()
@@ -1449,7 +1513,11 @@ class _SynthesisGateway:
         self.outputs: dict[str, bytes] = {}
 
     def _wire_text(self) -> str:
-        lines = ["@@LEAD@@"]
+        lines: list[str] = []
+        title = self.proposal.get("title")
+        if isinstance(title, str):
+            lines.extend(("@@TITLE@@", title, "@@END TITLE@@"))
+        lines.append("@@LEAD@@")
         lead = cast(list[dict[str, Any]], self.proposal["lead"])
         for index, claim in enumerate(lead, start=1):
             lines.extend(
@@ -1613,7 +1681,17 @@ def _synthesis_extraction(
                 source_document_ids=(source_id,),
             ),
         ),
-        indicators=(),
+        indicators=(
+            ExtractionIndicatorV1(
+                value="ioc.example",
+                artifact_type=ArtifactType.DOMAIN,
+                indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                context="The report identifies this command server.",
+                evidence_quote="The report identifies ioc.example as the command server.",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(source_id,),
+            ),
+        ),
         rules=(),
         uncertainties=("Attribution remains uncertain.",),
     )
@@ -1677,6 +1755,7 @@ def _synthesis_world() -> SimpleNamespace:
         runs={run.id: run},
         snapshots={run.id: snapshot},
         artifacts=artifacts,
+        store=store,
         documents=[document],
     )
     pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
@@ -1704,6 +1783,87 @@ def _synthesis_world() -> SimpleNamespace:
         gateway=gateway,
         orchestrator=orchestrator,
     )
+
+
+def _brief_synthesis_world(
+    *, with_chronology: bool = True, external_llm_allowed: bool = True
+) -> SimpleNamespace:
+    world = _synthesis_world()
+    source = world.extraction.sources[0]
+    source = replace(
+        source,
+        facts=(
+            replace(
+                source.facts[0],
+                context="accès initial",
+                evidence_quote="Le rapport identifie FooRAT.",
+            ),
+        ),
+        events=(
+            (
+                replace(
+                    source.events[0],
+                    date_text="2026-07-02",
+                    text="La campagne commence.",
+                    context="Chronologie de la campagne.",
+                    evidence_quote="Le 2026-07-02, la campagne commence.",
+                ),
+            )
+            if with_chronology
+            else ()
+        ),
+        indicators=(),
+    )
+    extraction = replace(world.extraction, sources=(source,))
+    extraction_blob_id = world.store.put(
+        ProductionArtifactStore.canonical_json_bytes(production_extraction_to_json(extraction))
+    )
+    extraction_artifact = replace(
+        world.extraction_artifact,
+        input_hash=canonical_extraction_hash(extraction),
+        canonical_blob_id=extraction_blob_id,
+    )
+    world.artifacts.items[0] = extraction_artifact
+    projection = build_relevance_projection(world.snapshot, extraction)
+    projection_blob_id = world.store.put(
+        ProductionArtifactStore.canonical_json_bytes(relevance_projection_to_json(projection))
+    )
+    projection_artifact = replace(
+        world.projection_artifact,
+        input_hash=projection.input_hash,
+        canonical_blob_id=projection_blob_id,
+    )
+    world.artifacts.items[1] = projection_artifact
+    world.uow.source_documents.documents[world.document.id] = replace(
+        world.document,
+        external_llm_allowed=external_llm_allowed,
+    )
+    world.extraction = extraction
+    world.extraction_artifact = extraction_artifact
+    world.extraction_blob_id = extraction_blob_id
+    world.projection = projection
+    world.projection_artifact = projection_artifact
+    world.pack = build_synthesis_evidence_pack(world.snapshot, extraction, projection)
+    handles = {str(entry["kind"]): str(entry["handle"]) for entry in world.pack.narrative_evidence}
+    evidence_handles = [handles["fact"]]
+    if "event" in handles:
+        evidence_handles.append(handles["event"])
+    world.gateway.proposal = {
+        "title": "[Groupe] Activité FooRAT observée",
+        "lead": [
+            {
+                "text": (
+                    "Le rapport identifie FooRAT et situe le début de la campagne "
+                    "au 2 juillet 2026."
+                    if "event" in handles
+                    else "Le rapport identifie FooRAT."
+                ),
+                "evidence_handles": evidence_handles,
+            }
+        ],
+        "sections": [],
+    }
+    return world
 
 
 @pytest.mark.asyncio
@@ -1745,58 +1905,180 @@ async def test_synthesis_stage_uses_extraction_and_only_its_relevance_projection
     assert canonical.timeline[0].event_date == date(2026, 7, 2)
 
 
+def test_brief_prompt_is_french_and_treats_word_count_as_a_target() -> None:
+    prompt = build_brief_synthesis_prompt(
+        subject_title="Incident FooRAT",
+        publication_language="fr",
+        tlp="CLEAR",
+        discovery_summary="Résumé de découverte",
+        actor_or_campaign="Campagne exemple",
+        period_start="2026-01-01",
+        period_end="2026-01-31",
+        evidence_blocks=(("@@EVIDENCE E001@@", "Extrait source."),),
+        reserve_blocks=(),
+    )
+
+    assert "Rédige en français" in prompt
+    assert "200 à 450 mots" in prompt
+    assert "jamais une limite ou un filtre" in prompt
+    assert "N'ajoute ni overview, ni catégorie vide, ni liste d'IOC" in prompt
+    assert BRIEF_SYNTHESIS_PROMPT_VERSION in prompt
+
+
+def test_brief_timeline_requires_source_date_and_caps_at_four_entries() -> None:
+    world = _brief_synthesis_world()
+    event_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(world.extraction)
+        if ref.kind is EvidenceKind.EVENT
+    )
+    grounded = SynthesisTimelineEntryV1(
+        event_date=date(2026, 7, 2),
+        date_text=None,
+        text="La campagne commence.",
+        evidence_refs=(event_ref,),
+    )
+    fabricated = replace(grounded, event_date=date(2026, 7, 3))
+
+    assert brief_timeline_from_extraction(world.extraction, (grounded,)) == (grounded,)
+    assert brief_timeline_from_extraction(world.extraction, (fabricated,)) is None
+    assert brief_timeline_from_extraction(
+        world.extraction,
+        (grounded, replace(grounded, text="Second event."), grounded, grounded, grounded),
+    ) == (grounded, replace(grounded, text="Second event."), grounded, grounded)
+
+
 @pytest.mark.asyncio
-async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls() -> None:
+async def test_brief_synthesis_uses_shared_gateway_and_source_dated_timeline() -> None:
+    world = _brief_synthesis_world()
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "success"
+    assert len(world.gateway.requests) == 1
+    request = world.gateway.requests[0]
+    assert request.prompt_template_version == BRIEF_SYNTHESIS_PROMPT_VERSION
+    assert request.metadata["publication_kind"] == "brief"
+    assert request.metadata["routing_decision_hash"]
+    assert "Rédige en français" in request.text
+    stored = world.artifacts.appended[-1]
+    assert stored.canonical_blob_id is not None
+    canonical = production_synthesis_from_json(
+        await world.store.read_json(stored.canonical_blob_id)
+    )
+    assert canonical.title == "[Groupe] Activité FooRAT observée"
+    assert canonical.sections == ()
+    assert len(canonical.timeline) == 1
+    assert canonical.timeline[0].event_date == date(2026, 7, 2)
+
+
+@pytest.mark.asyncio
+async def test_brief_without_source_dated_chronology_goes_to_review_without_call() -> None:
+    world = _brief_synthesis_world(with_chronology=False)
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "brief_chronology_unavailable"
+    assert result["details"]["diagnostic"] == (
+        "brief_timeline_requires_1_to_4_source_dated_entries"
+    )
+    assert world.gateway.requests == []
+    assert world.artifacts.appended == []
+
+
+@pytest.mark.asyncio
+async def test_brief_external_llm_policy_blocks_drafting() -> None:
+    world = _brief_synthesis_world(external_llm_allowed=False)
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "synthesis_policy_blocked"
+    assert result["details"]["external_llm_allowed"] is False
+    assert world.gateway.requests == []
+
+
+@pytest.mark.asyncio
+async def test_brief_prompt_version_change_invalidates_only_synthesis(monkeypatch) -> None:
+    world = _brief_synthesis_world()
+    first = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+    assert first["status"] == "success"
+    assert len(world.gateway.requests) == 1
+
+    monkeypatch.setattr(
+        production_synthesis_module,
+        "BRIEF_SYNTHESIS_PROMPT_VERSION",
+        "brief-synthesis-test-next",
+    )
+    second = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert second["status"] == "success"
+    assert len(world.gateway.requests) == 2
+    assert world.gateway.requests[-1].prompt_template_version == "brief-synthesis-test-next"
+    assert "Prompt version: brief-synthesis-test-next" in world.gateway.requests[-1].text
+    assert len(world.artifacts.appended) == 2
+    assert all(item.stage is ProductionArtifactStage.SYNTHESIS for item in world.artifacts.appended)
+    assert world.extraction_artifact in world.artifacts.items
+    assert world.projection_artifact in world.artifacts.items
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_version_change_invalidates_route_dependents_only(monkeypatch) -> None:
+    world = _brief_synthesis_world()
+    first = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+    assert first["status"] == "success"
+    original_synthesis = world.artifacts.appended[-1]
+    prior_route_id = world.run.routing_decision_id
+    assert prior_route_id is not None
+
+    next_policy_version = "subject-publication-routing-test-next"
+    monkeypatch.setattr(production_workflow, "ROUTING_POLICY_VERSION", next_policy_version)
+    monkeypatch.setattr(production_routing_domain, "ROUTING_POLICY_VERSION", next_policy_version)
+
+    second = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert second["status"] == "success"
+    assert len(world.gateway.requests) == 2
+    assert len(world.uow.production_routing_decisions.decisions) == 2
+    assert world.run.routing_decision_id != prior_route_id
+    assert original_synthesis.status is ProductionArtifactStatus.STALE
+    assert {stage for _, stage in world.artifacts.stale} == {"synthesis", "publication"}
+    assert world.extraction_artifact.status is ProductionArtifactStatus.VERIFIED
+    assert world.projection_artifact.status is ProductionArtifactStatus.VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_publication_renderer_version_change_does_not_call_synthesis(monkeypatch) -> None:
+    world = _brief_synthesis_world()
+    first = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+    assert first["status"] == "success"
+    assert len(world.gateway.requests) == 1
+
+    monkeypatch.setattr(
+        "cti_app.application.publication_rendering.PUBLICATION_RENDERER_VERSION",
+        "publication-test-next",
+    )
+    replay = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert replay["status"] == "cached"
+    assert len(world.gateway.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_synthesis_stage_exact_replay_returns_zero_additional_drafting_calls() -> None:
     first = _synthesis_world()
     result = await first.orchestrator.execute_stage(first.run.id, ProductionStage.SYNTHESIS)
     assert result["status"] == "success"
     source_artifact = first.artifacts.appended[-1]
+    reused = await first.orchestrator.execute_stage(first.run.id, ProductionStage.SYNTHESIS)
 
-    run_b = _synthesis_run(subject_id=first.run.subject_id, edition_id=first.run.edition_id)
-    snapshot_b = replace(first.snapshot, production_run_id=run_b.id)
-    extraction_artifact_b = ProductionArtifact(
-        production_run_id=run_b.id,
-        subject_id=run_b.subject_id,
-        stage=ProductionArtifactStage.EXTRACTION,
-        version=1,
-        input_hash="d" * 64,
-        canonical_blob_id=first.extraction_blob_id,
-    )
-    projection_artifact_b = replace(
-        first.projection_artifact,
-        production_run_id=run_b.id,
-    )
-    artifacts_b = _SynthesisArtifacts(
-        [extraction_artifact_b, projection_artifact_b, source_artifact]
-    )
-    uow_b = _SynthesisUow(
-        runs={run_b.id: run_b},
-        snapshots={run_b.id: snapshot_b},
-        artifacts=artifacts_b,
-        documents=[first.document],
-    )
-    gateway_b = _RefusingDraftGateway()
-    orchestrator_b = ProductionWorkflowOrchestrator(
-        cast(Any, lambda: uow_b),
-        model_gateway=cast(Any, gateway_b),
-        artifact_store=cast(Any, first.store),
-    )
-
-    reused = await orchestrator_b.execute_stage(run_b.id, ProductionStage.SYNTHESIS)
-
-    assert reused["status"] == "reused"
-    assert reused["reused"] is True
-    assert reused["reused_from_artifact_id"] == str(source_artifact.id)
-    assert gateway_b.requests == []
-    cloned = artifacts_b.appended[-1]
-    assert cloned.reused_from_artifact_id == source_artifact.id
-    assert cloned.canonical_blob_id == source_artifact.canonical_blob_id
-    # Assembly checks the projection lineage on a cloned synthesis too.
+    assert reused["status"] == "cached"
+    assert reused["artifact_id"] == str(source_artifact.id)
+    assert len(first.gateway.requests) == 1
+    assert first.artifacts.appended[-1] is source_artifact
+    # The replay retains its exact routing and projection identity.
     assert source_artifact.metadata["relevance_projection_hash"]
-    assert (
-        cloned.metadata["relevance_projection_hash"]
-        == source_artifact.metadata["relevance_projection_hash"]
-    )
 
 
 @pytest.mark.asyncio
@@ -1812,8 +2094,8 @@ async def test_synthesis_stage_rejects_an_invalid_canonical_extraction(failure: 
 
     result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
 
-    assert result["status"] == "terminal_error"
-    assert result["error_code"] == "synthesis_inputs_missing"
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "publication_routing_needs_review"
     assert world.gateway.requests == []
     assert world.artifacts.appended == []
 

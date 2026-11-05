@@ -48,6 +48,8 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.production_routing import RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 
 pytestmark = pytest.mark.asyncio
 
@@ -181,6 +183,28 @@ class _Artifacts:
         return []
 
 
+class _RoutingDecisions:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Any] = {}
+
+    async def get(self, decision_id: UUID) -> Any | None:
+        return self.items.get(decision_id)
+
+    def adopt_article(self, run: ProductionRun) -> None:
+        decision_id = uuid4()
+        self.items[decision_id] = SimpleNamespace(
+            decision_id=decision_id,
+            production_run_id=run.id,
+            pipeline_generation=run.pipeline_generation,
+            status=RoutingStatus.DECIDED,
+            publication_kind=PublicationKind.ARTICLE,
+            policy_version="test-routing-policy",
+            decision_hash="a" * 64,
+        )
+        run.routing_decision_id = decision_id
+        run.version += 1
+
+
 class _SourceCollections:
     def __init__(self, archived: int) -> None:
         self.archived = archived
@@ -216,6 +240,7 @@ class _Uow:
         self.editions = _Editions(edition)
         self.edition_audit = _Audit()
         self.production_artifacts = _Artifacts()
+        self.production_routing_decisions = _RoutingDecisions()
         self.source_collections = _SourceCollections(archived_sources)
         self.jobs = _ExecutionJobs()
         self.model_runs = _ModelRuns()
@@ -323,7 +348,10 @@ class _Orchestrator:
             artifacts.add(run, ProductionArtifactStage.EXTRACTION)
         elif expected_stage is ProductionStage.RELEVANCE_PROJECTION:
             artifacts.add(run, ProductionArtifactStage.RELEVANCE_PROJECTION)
+            self._uow.production_routing_decisions.adopt_article(run)
         elif expected_stage is ProductionStage.SYNTHESIS:
+            if run.routing_decision_id is None:
+                self._uow.production_routing_decisions.adopt_article(run)
             self.model_calls.append("q4")
             artifacts.add(run, ProductionArtifactStage.SYNTHESIS)
         elif expected_stage is ProductionStage.ASSEMBLY:
@@ -390,6 +418,16 @@ class _World:
         )
         self.run.start_running()
         self.uow.production_runs.items[self.run.id] = self.run
+        if (
+            stage
+            in {
+                ProductionStage.SYNTHESIS,
+                ProductionStage.EDITORIAL_ENRICHMENT,
+                ProductionStage.ASSEMBLY,
+            }
+            or ProductionArtifactStage.RELEVANCE_PROJECTION in produced
+        ):
+            self.uow.production_routing_decisions.adopt_article(self.run)
         for artifact_stage in produced:
             self.uow.production_artifacts.add(self.run, artifact_stage)
 

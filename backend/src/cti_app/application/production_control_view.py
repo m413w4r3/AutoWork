@@ -33,6 +33,8 @@ from cti_app.domain.production import (
     ProductionStage,
 )
 from cti_app.domain.production_pipeline import production_stages
+from cti_app.domain.production_routing import RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.typst_render import TypstRenderStatus
 
 
@@ -412,6 +414,19 @@ class ProductionControlViewService:
             page_subjects = list(subjects[:limit])
             subject_ids = [subject.id for subject in page_subjects]
             runs = list(await uow.production_runs.list_for_subjects(subject_ids))
+            publication_kinds: dict[UUID, PublicationKind] = {}
+            routing_repository = getattr(uow, "production_routing_decisions", None)
+            if routing_repository is not None:
+                for run in runs:
+                    if run.routing_decision_id is None:
+                        continue
+                    decision = await routing_repository.get(run.routing_decision_id)
+                    if (
+                        decision is not None
+                        and decision.status is RoutingStatus.DECIDED
+                        and decision.publication_kind is not None
+                    ):
+                        publication_kinds[run.id] = decision.publication_kind
             active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
             recent_batches = list(
                 await uow.edition_production_batches.list_recent_for_edition(edition_id, 10)
@@ -441,6 +456,7 @@ class ProductionControlViewService:
             renders=renders,
             selection_snapshot=selection_snapshot,
             selected_run_id=None,
+            publication_kinds=publication_kinds,
         )
 
     async def run_view(self, run_id: UUID) -> ProductionControlView:
@@ -453,6 +469,16 @@ class ProductionControlViewService:
             if edition is None or subject is None:
                 raise LookupError("run_identity_not_found")
             history = list(await uow.production_runs.list_for_subject(run.subject_id))
+            publication_kinds: dict[UUID, PublicationKind] = {}
+            routing_repository = getattr(uow, "production_routing_decisions", None)
+            if routing_repository is not None and run.routing_decision_id is not None:
+                decision = await routing_repository.get(run.routing_decision_id)
+                if (
+                    decision is not None
+                    and decision.status is RoutingStatus.DECIDED
+                    and decision.publication_kind is not None
+                ):
+                    publication_kinds[run.id] = decision.publication_kind
             current = _latest_run(history)
             active_batch = await uow.edition_production_batches.get_active_for_edition(
                 run.edition_id
@@ -486,6 +512,7 @@ class ProductionControlViewService:
             selection_snapshot=selection_snapshot,
             selected_run_id=run_id,
             current_run_id=current.id if current is not None else None,
+            publication_kinds=publication_kinds,
         )
 
     async def _assemble(
@@ -505,6 +532,7 @@ class ProductionControlViewService:
         renders: list[Any],
         selection_snapshot: Any | None,
         selected_run_id: UUID | None,
+        publication_kinds: dict[UUID, PublicationKind] | None = None,
         current_run_id: UUID | None = None,
     ) -> ProductionControlView:
         runs_by_subject: dict[UUID, list[ProductionRun]] = defaultdict(list)
@@ -651,7 +679,12 @@ class ProductionControlViewService:
                 )
                 run_artifacts = artifacts_by_run.get(selected_subject_run.id, [])
                 current_artifacts = _latest_artifacts(run_artifacts)
-                run_view = self._run_view(selected_subject_run, current_artifacts, current)
+                run_view = self._run_view(
+                    selected_subject_run,
+                    current_artifacts,
+                    current,
+                    publication_kind=(publication_kinds or {}).get(selected_subject_run.id),
+                )
                 matching_jobs = [
                     job
                     for job in jobs_by_subject.get(subject.id, [])
@@ -803,10 +836,17 @@ class ProductionControlViewService:
         run: ProductionRun,
         artifacts: dict[str, ProductionArtifact],
         current: bool,
+        *,
+        publication_kind: PublicationKind | None = None,
     ) -> ControlRun:
-        raw_stages = build_stage_statuses(run, artifacts, research_date=run.research_date)
+        raw_stages = build_stage_statuses(
+            run,
+            artifacts,
+            research_date=run.research_date,
+            publication_kind=publication_kind,
+        )
         stages: list[ControlStage] = []
-        for stage in production_stages():
+        for stage in production_stages(publication_kind):
             artifact_stage = {
                 ProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
                 ProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,

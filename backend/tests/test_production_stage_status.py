@@ -16,6 +16,7 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionStage,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 def _run(stage: ProductionStage) -> ProductionRun:
@@ -79,3 +80,13 @@ def test_failed_run_marks_the_stage_it_stopped_on() -> None:
 
     assert stages["references"]["status"] == "failed"
     assert stages["sources"]["status"] == "succeeded"
+
+
+def test_brief_status_omits_editorial_enrichment() -> None:
+    run = _run(ProductionStage.ASSEMBLY)
+
+    stages = build_stage_statuses(run, {}, publication_kind=PublicationKind.BRIEF)
+
+    assert "editorial_enrichment" not in stages
+    assert stages["synthesis"]["status"] == "succeeded"
+    assert stages["assembly"]["status"] == "running"

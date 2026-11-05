@@ -51,6 +51,8 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.production_routing import RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 
 pytestmark = pytest.mark.asyncio
 
@@ -175,6 +177,28 @@ class _Artifacts:
         return []
 
 
+class _RoutingDecisions:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Any] = {}
+
+    async def get(self, decision_id: UUID) -> Any | None:
+        return self.items.get(decision_id)
+
+    def adopt_article(self, run: ProductionRun) -> None:
+        decision_id = uuid4()
+        self.items[decision_id] = SimpleNamespace(
+            decision_id=decision_id,
+            production_run_id=run.id,
+            pipeline_generation=run.pipeline_generation,
+            status=RoutingStatus.DECIDED,
+            publication_kind=PublicationKind.ARTICLE,
+            policy_version="test-routing-policy",
+            decision_hash="a" * 64,
+        )
+        run.routing_decision_id = decision_id
+        run.version += 1
+
+
 class _Manifests:
     def __init__(self) -> None:
         self.frozen = False
@@ -209,6 +233,7 @@ class _Uow:
         self.editions = _Editions(edition)
         self.edition_audit = _Audit()
         self.production_artifacts = _Artifacts()
+        self.production_routing_decisions = _RoutingDecisions()
         self.publication_manifests = _Manifests()
         self.source_collections = _SourceCollections()
         self.jobs = _ExecutionJobs()
@@ -288,9 +313,9 @@ class _Context:
 class _Orchestrator:
     """Every stage succeeds; only the dispatch backbone is under test."""
 
-    def __init__(self, runs: _Runs) -> None:
+    def __init__(self, uow: _Uow) -> None:
         self.calls: list[ProductionStage] = []
-        self._runs = runs
+        self._uow = uow
 
     async def execute_stage(
         self,
@@ -300,9 +325,13 @@ class _Orchestrator:
         correlation_id: str = "-",
     ) -> dict[str, Any]:
         self.calls.append(expected_stage)
+        run = self._uow.production_runs.items[run_id]
+        if expected_stage is ProductionStage.RELEVANCE_PROJECTION:
+            self._uow.production_routing_decisions.adopt_article(run)
+        elif expected_stage is ProductionStage.SYNTHESIS and run.routing_decision_id is None:
+            self._uow.production_routing_decisions.adopt_article(run)
         if expected_stage is ProductionStage.ASSEMBLY:
             # Assembly is the stage that ends the run, exactly as in production.
-            run = self._runs.items[run_id]
             run.mark_ready()
         return {"stage": expected_stage.value, "status": "success"}
 
@@ -374,7 +403,7 @@ class _World:
 def _register(
     world: _World, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[JobRegistry, _Jobs, _Orchestrator]:
-    orchestrator = _Orchestrator(world.uow.production_runs)
+    orchestrator = _Orchestrator(world.uow)
     monkeypatch.setattr(
         "cti_app.application.production_jobs.ProductionWorkflowOrchestrator",
         lambda *a, **k: orchestrator,

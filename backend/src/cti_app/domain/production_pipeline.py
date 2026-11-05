@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cti_app.domain.production import ProductionArtifactStage, ProductionStage
+from cti_app.domain.publication_kind import PublicationKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,13 +58,31 @@ def _validate_pipeline() -> None:
 _validate_pipeline()
 
 
-def production_stages() -> tuple[ProductionStage, ...]:
-    return tuple(spec.stage for spec in PRODUCTION_PIPELINE)
+def production_stages(
+    publication_kind: PublicationKind | None = None,
+) -> tuple[ProductionStage, ...]:
+    """Return the stages for an explicit route, defaulting to ARTICLE pre-route.
+
+    Before routing is adopted the article path is the conservative superset.
+    Once a BRIEF decision exists, EDITORIAL_ENRICHMENT is not registered for
+    that run and therefore cannot acquire a fake artifact.
+    """
+    if publication_kind is not None and not isinstance(publication_kind, PublicationKind):
+        raise TypeError("publication_kind must be a PublicationKind or None")
+    stages = tuple(spec.stage for spec in PRODUCTION_PIPELINE)
+    if publication_kind is PublicationKind.BRIEF:
+        return tuple(stage for stage in stages if stage is not ProductionStage.EDITORIAL_ENRICHMENT)
+    return stages
 
 
-def production_artifact_stages() -> tuple[ProductionArtifactStage, ...]:
+def production_artifact_stages(
+    publication_kind: PublicationKind | None = None,
+) -> tuple[ProductionArtifactStage, ...]:
+    stages = production_stages(publication_kind)
     return tuple(
-        spec.artifact_stage for spec in PRODUCTION_PIPELINE if spec.artifact_stage is not None
+        spec.artifact_stage
+        for spec in PRODUCTION_PIPELINE
+        if spec.artifact_stage is not None and spec.stage in stages
     )
 
 
@@ -80,10 +99,17 @@ def artifact_stage_for(stage: ProductionStage) -> ProductionArtifactStage | None
     return stage_spec(stage).artifact_stage
 
 
-def prerequisite_artifact_for(stage: ProductionStage) -> ProductionArtifactStage | None:
-    spec = stage_spec(stage)
-    index = PRODUCTION_PIPELINE.index(spec)
-    for previous in reversed(PRODUCTION_PIPELINE[:index]):
+def prerequisite_artifact_for(
+    stage: ProductionStage,
+    *,
+    publication_kind: PublicationKind | None = None,
+) -> ProductionArtifactStage | None:
+    stages = production_stages(publication_kind)
+    if stage not in stages:
+        raise ValueError(f"Stage {stage.value} is not in the selected production route")
+    index = stages.index(stage)
+    for previous_stage in reversed(stages[:index]):
+        previous = stage_spec(previous_stage)
         if previous.artifact_stage is not None:
             return previous.artifact_stage
     return None
@@ -100,10 +126,14 @@ def pipeline_stage_for_artifact(
     raise ValueError(f"Artifact stage {artifact_stage.value} is not in the production pipeline")
 
 
-def next_stage(stage: ProductionStage) -> ProductionStage | None:
+def next_stage(
+    stage: ProductionStage,
+    *,
+    publication_kind: PublicationKind | None = None,
+) -> ProductionStage | None:
     if not isinstance(stage, ProductionStage):
         raise TypeError("next_stage requires a ProductionStage")
-    stages = production_stages()
+    stages = production_stages(publication_kind)
     try:
         index = stages.index(stage)
     except ValueError as exc:
@@ -115,18 +145,19 @@ def downstream_artifacts_from_pipeline_stage(
     stage: ProductionStage,
     *,
     inclusive: bool = False,
+    publication_kind: PublicationKind | None = None,
 ) -> tuple[ProductionArtifactStage, ...]:
     if not isinstance(stage, ProductionStage):
         raise TypeError("downstream helper requires a ProductionStage")
-    pipeline_stages = production_stages()
+    pipeline_stages = production_stages(publication_kind)
     try:
         start = pipeline_stages.index(stage) + (0 if inclusive else 1)
     except ValueError as exc:
         raise ValueError(f"Stage {stage.value} is not valid for the production pipeline") from exc
     return tuple(
         spec.artifact_stage
-        for spec in PRODUCTION_PIPELINE[start:]
-        if spec.artifact_stage is not None
+        for spec in PRODUCTION_PIPELINE
+        if spec.stage in pipeline_stages[start:] and spec.artifact_stage is not None
     )
 
 
@@ -134,10 +165,11 @@ def downstream_artifacts_from_artifact_stage(
     stage: ProductionArtifactStage,
     *,
     inclusive: bool = False,
+    publication_kind: PublicationKind | None = None,
 ) -> tuple[ProductionArtifactStage, ...]:
     if not isinstance(stage, ProductionArtifactStage):
         raise TypeError("downstream helper requires a ProductionArtifactStage")
-    pipeline_stages = production_artifact_stages()
+    pipeline_stages = production_artifact_stages(publication_kind)
     try:
         start = pipeline_stages.index(stage) + (0 if inclusive else 1)
     except ValueError as exc:

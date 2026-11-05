@@ -12,6 +12,7 @@ from cti_app.domain.production import (
     ProductionStage,
 )
 from cti_app.domain.production_pipeline import artifact_stage_for, production_stages
+from cti_app.domain.publication_kind import PublicationKind
 
 
 def build_stage_statuses(
@@ -20,14 +21,20 @@ def build_stage_statuses(
     *,
     archived_sources: int = 0,
     research_date: date | None = None,
+    publication_kind: PublicationKind | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Status of each stage, derived from the run's position and its artifacts.
 
     Stages before the current one are complete, the current one is running, and
     a terminal run reports its outcome on the stage it stopped at.
     """
-    stages_for_pipeline = production_stages()
+    stages_for_pipeline = production_stages(publication_kind)
     current_stage = run.current_stage
+    if current_stage not in stages_for_pipeline:
+        # A route change can remove enrichment from a brief while a stale
+        # control snapshot still points at that old branch. Display only the
+        # active route's stages; the run itself remains fenced by its version.
+        current_stage = ProductionStage.SYNTHESIS
     current_index = stages_for_pipeline.index(current_stage)
     statuses: dict[str, dict[str, Any]] = {}
 

@@ -82,6 +82,7 @@ from cti_app.application.production_repairs import (
     repair_key_for_rejection,
 )
 from cti_app.application.production_resume import EXTRACTION_PROGRESS_COMPLETED_STATUSES
+from cti_app.application.production_routing import decide_and_adopt_production_routing
 from cti_app.application.production_stages import (
     EditorialEnrichmentService,
     ExtractionService,
@@ -127,9 +128,15 @@ from cti_app.domain.production_references import (
     production_source_criticality,
 )
 from cti_app.domain.production_relevance import relevance_projection_from_json
+from cti_app.domain.production_routing import (
+    ROUTING_POLICY_VERSION,
+    ProductionRoutingDecisionV1,
+    RoutingStatus,
+)
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.publication_document import parse_publication_document
+from cti_app.domain.publication_kind import PublicationKind
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -663,6 +670,7 @@ class ProductionWorkflowOrchestrator:
         self._artifact_store = artifact_store
         self._diagnostics = diagnostics or DiagnosticsLog(None)
         self._correlation_id = "-"
+        self._active_generation: int | None = None
         production_uow_factory = cast(Any, uow_factory)
         self._references = ReferenceResearchService(production_uow_factory, artifact_store)
         self._extraction = ExtractionService(production_uow_factory, artifact_store)
@@ -751,8 +759,86 @@ class ProductionWorkflowOrchestrator:
             if runs is None:
                 return
             run = await runs.get(run_id)
-        if run is not None and run.status is ProductionRunStatus.CANCELLED:
+        if run is not None and (
+            run.status is ProductionRunStatus.CANCELLED
+            or (
+                self._active_generation is not None
+                and run.pipeline_generation != self._active_generation
+            )
+        ):
             raise JobCancelledError
+
+    async def _routing_decision(self, run: ProductionRun) -> ProductionRoutingDecisionV1 | None:
+        """Return the route currently adopted by this run, if available."""
+        if run.routing_decision_id is None:
+            return None
+        async with self._uow_factory() as uow:
+            repository = getattr(uow, "production_routing_decisions", None)
+            if repository is None:
+                return None
+            return await repository.get(run.routing_decision_id)
+
+    async def _ensure_current_routing_decision(
+        self, run: ProductionRun
+    ) -> ProductionRoutingDecisionV1 | None:
+        """Adopt the current deterministic policy before any route-dependent stage."""
+        decision = await self._routing_decision(run)
+        if (
+            decision is not None
+            and decision.pipeline_generation == run.pipeline_generation
+            and decision.policy_version == ROUTING_POLICY_VERSION
+        ):
+            return decision
+        if self._artifact_store is None:
+            return decision
+        async with self._uow_factory() as uow:
+            latest = await uow.production_runs.get(run.id)
+        if latest is None or latest.status is ProductionRunStatus.CANCELLED:
+            raise JobCancelledError
+        previous_hash = decision.decision_hash if decision is not None else None
+        previous_kind = decision.publication_kind if decision is not None else None
+        decision = await decide_and_adopt_production_routing(
+            uow_factory=cast(Any, self._uow_factory),
+            artifact_store=self._artifact_store,
+            production_run_id=latest.id,
+            expected_version=latest.version,
+        )
+        if previous_hash is not None and decision.decision_hash != previous_hash:
+            dependent_stages = {
+                ProductionArtifactStage.SYNTHESIS.value,
+                ProductionArtifactStage.PUBLICATION.value,
+            }
+            if (
+                decision.publication_kind is PublicationKind.ARTICLE
+            ) or previous_kind is PublicationKind.ARTICLE:
+                dependent_stages.add(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value)
+            async with self._uow_factory() as uow:
+                artifacts = getattr(uow, "production_artifacts", None)
+                if artifacts is not None:
+                    await artifacts.mark_stages_stale(run.id, dependent_stages)
+                    await uow.commit()
+        return decision
+
+    async def _mark_route_review(
+        self,
+        decision: ProductionRoutingDecisionV1,
+        *,
+        stage: ProductionStage = ProductionStage.RELEVANCE_PROJECTION,
+    ) -> dict[str, Any]:
+        """Map an undecidable route to a durable, explicit review result."""
+        return {
+            "stage": stage.value,
+            "status": "needs_review",
+            "error_code": "publication_routing_needs_review",
+            "error": "La décision de format de publication requiert une revue.",
+            "details": {
+                "routing_decision_id": str(decision.decision_id),
+                "routing_decision_hash": decision.decision_hash,
+                "routing_policy_version": decision.policy_version,
+                "reason_code": decision.reason_code.value,
+                "routing_status": decision.status.value,
+            },
+        }
 
     async def _persist_extraction_progress(
         self,
@@ -770,6 +856,11 @@ class ProductionWorkflowOrchestrator:
                 return
             persisted = await get_run(run_id)
             if persisted is None:
+                return
+            if (
+                self._active_generation is not None
+                and persisted.pipeline_generation != self._active_generation
+            ):
                 return
             persisted.set_extraction_progress(progress)
             save = getattr(runs, "save", None)
@@ -801,6 +892,7 @@ class ProductionWorkflowOrchestrator:
             )
         if not run:
             raise ValueError(f"Production run {run_id} not found")
+        self._active_generation = run.pipeline_generation
         if snapshot is None:
             raise RuntimeError("production_input_snapshot_missing")
 
@@ -830,6 +922,8 @@ class ProductionWorkflowOrchestrator:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
         except ProductionReuseStorageUnavailableError as exc:
             result = self._handle_stage_exception(run, expected_stage.value, exc)
+
+        await self._check_cancellation(run.id, context)
 
         self._diagnostics.record_stage_outcome(
             run_id=run.id,
@@ -1666,6 +1760,16 @@ class ProductionWorkflowOrchestrator:
             projection_artifact = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
             )
+        decision = await self._ensure_current_routing_decision(run)
+        if decision is None:
+            return {
+                "stage": "synthesis",
+                "status": "needs_review",
+                "error_code": "publication_routing_decision_missing",
+                "error": "La décision de format de publication est indisponible.",
+            }
+        if decision.status is RoutingStatus.NEEDS_REVIEW:
+            return await self._mark_route_review(decision, stage=ProductionStage.SYNTHESIS)
         if (
             extraction_artifact is None
             or extraction_artifact.status is not ProductionArtifactStatus.VERIFIED
@@ -1686,7 +1790,11 @@ class ProductionWorkflowOrchestrator:
             }
         try:
             execution = await service.execute(
-                run, snapshot, extraction_artifact, projection_artifact
+                run,
+                snapshot,
+                extraction_artifact,
+                projection_artifact,
+                routing_decision=decision,
             )
         except JobCancelledError:
             raise
@@ -1730,7 +1838,27 @@ class ProductionWorkflowOrchestrator:
                 run, ProductionStage.RELEVANCE_PROJECTION.value, exc
             )
         await self._check_cancellation(run.id, context)
-        return self._relevance_projection_execution_result(execution)
+        result = self._relevance_projection_execution_result(execution)
+        if result["status"] in {"success", "reused"}:
+            decision = await self._ensure_current_routing_decision(run)
+            if decision is None:
+                return {
+                    "stage": ProductionStage.RELEVANCE_PROJECTION.value,
+                    "status": "needs_review",
+                    "error_code": "publication_routing_decision_missing",
+                    "error": "La décision de format de publication est indisponible.",
+                }
+            if decision.status is RoutingStatus.NEEDS_REVIEW:
+                return await self._mark_route_review(decision)
+            result.update(
+                {
+                    "publication_kind": decision.publication_kind.value,
+                    "routing_decision_id": str(decision.decision_id),
+                    "routing_decision_hash": decision.decision_hash,
+                    "routing_policy_version": decision.policy_version,
+                }
+            )
+        return result
 
     @staticmethod
     def _relevance_projection_execution_result(
@@ -1938,6 +2066,18 @@ class ProductionWorkflowOrchestrator:
         """Deterministic: pure rendering from artifacts, no LLM call."""
         started = time.perf_counter()
         await self._check_cancellation(run.id, context)
+        routing_decision = await self._ensure_current_routing_decision(run)
+        if routing_decision is None:
+            return {
+                "stage": "assembly",
+                "status": "needs_review",
+                "error_code": "publication_routing_decision_missing",
+                "error": "La décision de format de publication est indisponible.",
+            }
+        if routing_decision.status is RoutingStatus.NEEDS_REVIEW:
+            return await self._mark_route_review(routing_decision, stage=ProductionStage.ASSEMBLY)
+        publication_kind = routing_decision.publication_kind
+        assert publication_kind is not None
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
@@ -1945,8 +2085,12 @@ class ProductionWorkflowOrchestrator:
                 run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
             )
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
-            enrichment = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+            enrichment = (
+                await uow.production_artifacts.get_current(
+                    run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+                )
+                if publication_kind is PublicationKind.ARTICLE
+                else None
             )
 
             if (
@@ -1954,7 +2098,7 @@ class ProductionWorkflowOrchestrator:
                 or extraction is None
                 or relevance_projection is None
                 or synthesis is None
-                or enrichment is None
+                or (publication_kind is PublicationKind.ARTICLE and enrichment is None)
             ):
                 return {
                     "stage": "assembly",
@@ -1982,7 +2126,7 @@ class ProductionWorkflowOrchestrator:
                     extraction,
                     relevance_projection,
                     synthesis,
-                    enrichment,
+                    *([enrichment] if enrichment is not None else []),
                 )
             ):
                 return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
@@ -2011,10 +2155,16 @@ class ProductionWorkflowOrchestrator:
                             synthesis.metadata.get("relevance_projection_hash")
                             == canonical_relevance_projection.projection_hash,
                         ),
-                        (
-                            "editorial_enrichment",
-                            enrichment.metadata.get("relevance_projection_hash")
-                            == canonical_relevance_projection.projection_hash,
+                        *(
+                            (
+                                (
+                                    "editorial_enrichment",
+                                    enrichment.metadata.get("relevance_projection_hash")
+                                    == canonical_relevance_projection.projection_hash,
+                                ),
+                            )
+                            if enrichment is not None
+                            else ()
                         ),
                     )
                     if not matches
@@ -2026,14 +2176,21 @@ class ProductionWorkflowOrchestrator:
                 canonical_synthesis = production_synthesis_from_json(
                     await self._artifact_store.read_json(cast(UUID, synthesis.canonical_blob_id))
                 )
-                canonical_enrichment = editorial_enrichment_from_json(
-                    await self._artifact_store.read_json(cast(UUID, enrichment.canonical_blob_id))
+                canonical_enrichment = (
+                    editorial_enrichment_from_json(
+                        await self._artifact_store.read_json(
+                            cast(UUID, enrichment.canonical_blob_id)
+                        )
+                    )
+                    if enrichment is not None
+                    else None
                 )
-                validate_editorial_enrichment(
-                    canonical_enrichment,
-                    extraction=canonical_extraction,
-                    synthesis=canonical_synthesis,
-                )
+                if canonical_enrichment is not None:
+                    validate_editorial_enrichment(
+                        canonical_enrichment,
+                        extraction=canonical_extraction,
+                        synthesis=canonical_synthesis,
+                    )
                 assembly = await PublicationAssemblyService(
                     self._artifact_store,
                     uow.production_artifacts,
@@ -2047,13 +2204,20 @@ class ProductionWorkflowOrchestrator:
                     relevance_projection=canonical_relevance_projection,
                     synthesis=canonical_synthesis,
                     editorial_enrichment=canonical_enrichment,
+                    publication_kind=publication_kind,
+                    routing_decision_hash=routing_decision.decision_hash,
+                    routing_policy_version=routing_decision.policy_version,
                     metadata_extra={
                         "input_artifacts": {
                             "references_artifact_id": str(references.id),
                             "extraction_artifact_id": str(extraction.id),
                             "relevance_projection_artifact_id": str(relevance_projection.id),
                             "synthesis_artifact_id": str(synthesis.id),
-                            "editorial_enrichment_artifact_id": str(enrichment.id),
+                            **(
+                                {"editorial_enrichment_artifact_id": str(enrichment.id)}
+                                if enrichment is not None
+                                else {}
+                            ),
                         },
                         "diagnostics": {
                             stage_name: artifact.metadata.get("diagnostics", {})
@@ -2062,7 +2226,11 @@ class ProductionWorkflowOrchestrator:
                                 ("extraction", extraction),
                                 ("relevance_projection", relevance_projection),
                                 ("synthesis", synthesis),
-                                ("editorial_enrichment", enrichment),
+                                *(
+                                    (("editorial_enrichment", enrichment),)
+                                    if enrichment is not None
+                                    else ()
+                                ),
                             )
                         },
                         **(

@@ -65,6 +65,8 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_routing import RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class _Runs:
@@ -307,6 +309,40 @@ async def test_successful_stage_queues_the_next_one(
 
     assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.REFERENCES)]
     assert uow.production_runs.items[run.id].current_stage is (ProductionStage.REFERENCES)
+
+
+async def test_brief_synthesis_queues_assembly_without_enrichment(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, _ = _build(uow, monkeypatch, {"stage": "synthesis", "status": "success"})
+    run = _run(uow, ProductionStage.SYNTHESIS)
+    route_id = uuid4()
+
+    # The worker's route read is async just like the repository port.
+    async def get_route(decision_id: UUID) -> Any | None:
+        if decision_id != route_id:
+            return None
+        return SimpleNamespace(
+            status=RoutingStatus.DECIDED,
+            publication_kind=PublicationKind.BRIEF,
+        )
+
+    uow.production_routing_decisions = SimpleNamespace(get=get_route)
+    run.routing_decision_id = route_id
+    context = _Context()
+
+    await registry.handler(stage_job_kind(ProductionStage.SYNTHESIS))(
+        ProductionStageParameters(
+            run_id=run.id,
+            expected_stage=ProductionStage.SYNTHESIS.value,
+            pipeline_generation=run.pipeline_generation,
+        ),
+        context,  # type: ignore[arg-type]
+    )
+
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.ASSEMBLY)]
+    assert run.current_stage is ProductionStage.ASSEMBLY
+    assert context.progress == [(5, 6)]
 
 
 async def test_before_dispatch_does_not_cancel_a_duplicate_terminal_job() -> None:

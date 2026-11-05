@@ -19,6 +19,7 @@ from cti_app.domain.production_references import (
     ProductionSourceCriticality,
     ProductionSourceCriticalityReason,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class ProductionRunStatus(StrEnum):
@@ -893,14 +894,19 @@ class ProductionRun:
         self.updated_at = self.started_at
         self.version += 1
 
-    def advance_stage(self, *, now: datetime | None = None) -> None:
+    def advance_stage(
+        self,
+        *,
+        publication_kind: PublicationKind | None = None,
+        now: datetime | None = None,
+    ) -> None:
         if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
         # Keep stage transitions owned by the canonical pipeline graph.
         # This local import avoids a cycle: the graph imports enums from here.
         from cti_app.domain.production_pipeline import next_stage
 
-        successor = next_stage(self.current_stage)
+        successor = next_stage(self.current_stage, publication_kind=publication_kind)
         if successor is not None:
             self.current_stage = successor
         self.updated_at = self._timestamp(now, "updated_at")
@@ -1011,6 +1017,7 @@ class ProductionRun:
         self.status = ProductionRunStatus.RUNNING
         self.current_stage = stage
         self.pipeline_generation += 1
+        self.routing_decision_id = None
         if force_recompute:
             self.force_recompute_from_stage = {
                 ProductionStage.SOURCES: ProductionStage.REFERENCES,
@@ -1064,6 +1071,7 @@ class ProductionRun:
         self.status = ProductionRunStatus.RUNNING
         self.current_stage = stage
         self.pipeline_generation += 1
+        self.routing_decision_id = None
         self.force_recompute_from_stage = None
         self.error_code = None
         self.error_message = None
