@@ -131,9 +131,15 @@ def brief_timeline_from_extraction(
                 continue
             source_date_text = payload.get("date_text")
             evidence_quote = payload.get("evidence_quote")
-            if any(
+            # ``date_text`` is extracted model output, not evidence. When it
+            # carries a date, require it to agree with both the canonical sort
+            # date and the cited source quote before displaying it in a brief.
+            source_values = [evidence_quote]
+            if isinstance(source_date_text, str) and source_date_text.strip():
+                source_values.append(source_date_text)
+            if all(
                 isinstance(value, str) and _source_contains_date(value, entry.event_date)
-                for value in (source_date_text, evidence_quote)
+                for value in source_values
             ):
                 source_support = True
                 break
@@ -164,15 +170,25 @@ def validate_brief_narrative(
 def _source_contains_date(value: str, event_date: date) -> bool:
     """Match source date wording at day precision without trusting a sort key."""
     normalized = value.casefold()
+
+    def contains_literal(literal: str) -> bool:
+        return (
+            re.search(
+                rf"(?<!\w){re.escape(literal)}(?!\w)",
+                normalized,
+            )
+            is not None
+        )
+
     iso = event_date.isoformat()
-    if iso in normalized:
+    if contains_literal(iso):
         return True
     numeric = (
         f"{event_date.day:02d}/{event_date.month:02d}/{event_date.year}",
         f"{event_date.day}/{event_date.month}/{event_date.year}",
         f"{event_date.day:02d}-{event_date.month:02d}-{event_date.year}",
     )
-    if any(form in normalized for form in numeric):
+    if any(contains_literal(form) for form in numeric):
         return True
     month_names = (
         ("janvier", "janv", "january", "jan"),
@@ -191,7 +207,7 @@ def _source_contains_date(value: str, event_date: date) -> bool:
     day = str(event_date.day)
     year = str(event_date.year)
     return any(
-        form in normalized
+        contains_literal(form)
         for month in month_names
         for form in (f"{day} {month} {year}", f"{month} {day} {year}")
     )

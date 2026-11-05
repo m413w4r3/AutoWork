@@ -35,7 +35,9 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
+from cti_app.infrastructure.database.repositories.publication_review import _read_item_from_row
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
 SUBJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -43,6 +45,56 @@ RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
 ARTIFACT_ID = UUID("44444444-4444-4444-8444-444444444444")
 INPUT_HASH = "a" * 64
 MODEL_RUN_ID = UUID("55555555-5555-4555-8555-555555555555")
+
+
+def test_read_model_retry_stage_uses_the_run_publication_kind() -> None:
+    row = {
+        "run_status": ProductionRunStatus.FAILED.value,
+        "artifact_status": None,
+        "live_artifact_stages": [
+            "references",
+            "extraction",
+            "relevance_projection",
+            "synthesis",
+            "publication",
+        ],
+        "routing_publication_kind": PublicationKind.BRIEF.value,
+        "current_stage": ProductionStage.ASSEMBLY.value,
+        "error_code": "publication_qa_failed",
+        "reconciliation_model_run_id": None,
+        "reconciliation_stage": None,
+        "reconciliation_submission_state": None,
+        "reconciliation_phase": None,
+        "position": 1,
+        "subject_id": SUBJECT_ID,
+        "title": "Sujet bref",
+        "run_id": RUN_ID,
+        "pipeline_generation": 2,
+        "artifact_id": None,
+        "artifact_version": None,
+        "artifact_hash": None,
+        "error_message": "QA failed",
+        "decision_id": None,
+        "decision": None,
+        "reconciliation_bridge_response_id": None,
+        "reconciliation_bridge_request_id": None,
+        "reconciliation_output_sha256": None,
+        "reconciliation_provenance": None,
+        "rejected_indicator_count": 0,
+        "rejected_ioc_count": 0,
+        "rejected_other_artifact_count": 0,
+        "rejected_rule_count": 0,
+        "published_rule_count": 0,
+        "current_pipeline_generation": 2,
+        "latest_artifact_id": None,
+        "latest_artifact_run_id": None,
+        "latest_artifact_version": None,
+    }
+
+    item = _read_item_from_row(row, composition_version=3)
+
+    assert item.retry_stage is ProductionStage.ASSEMBLY
+    assert item.rebuild_stage is ProductionStage.ASSEMBLY
 
 
 class _DecisionArguments(TypedDict):

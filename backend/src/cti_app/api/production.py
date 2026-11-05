@@ -136,8 +136,6 @@ from cti_app.domain.production import (
     ProductionSubmissionReconciliation,
     SourceAdditionExtractionIntent,
 )
-from cti_app.domain.production_routing import RoutingReasonCode, RoutingStatus
-from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
@@ -155,6 +153,7 @@ from cti_app.domain.production_editorial_revision import (
 )
 from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.production_references import ProductionReferenceKind
+from cti_app.domain.production_routing import RoutingReasonCode, RoutingStatus
 from cti_app.domain.production_source_additions import (
     SourceAdditionOrigin,
     source_addition_to_json,
@@ -165,6 +164,7 @@ from cti_app.domain.publication_document import (
     parse_publication_document,
     serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
@@ -475,7 +475,7 @@ class ProductionStatus(BaseModel):
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
     recovery_disposition: ProductionRecoveryDisposition
-    routing: "ProductionRoutingView"
+    routing: ProductionRoutingView
     extraction_progress: dict[str, Any] | None = None
     extraction_rejections: ExtractionRejections = Field(default_factory=ExtractionRejections)
     reconciliation: ProductionReconciliationView | None = None
@@ -507,7 +507,7 @@ class BatchItemDetail(BaseModel):
     extraction_progress: dict[str, Any] | None = None
     reconciliation: ProductionReconciliationView | None = None
     activity: ProductionActivityView | None = None
-    routing: "ProductionRoutingView"
+    routing: ProductionRoutingView
 
 
 class ProductionRoutingSourceView(BaseModel):
@@ -520,9 +520,7 @@ class ProductionRoutingSourceView(BaseModel):
     policy_version: str
 
 
-ProductionRoutingExtractionState = Literal[
-    "verified", "needs_review", "stale", "not_yet"
-]
+ProductionRoutingExtractionState = Literal["verified", "needs_review", "stale", "not_yet"]
 
 
 class ProductionRoutingView(BaseModel):
@@ -1180,11 +1178,7 @@ async def _production_routing_view(uow: Any, run: ProductionRun) -> ProductionRo
         return _not_yet_production_routing_view(extraction_state)
 
     return ProductionRoutingView(
-        status=(
-            "decided"
-            if decision.status is RoutingStatus.DECIDED
-            else "needs_review"
-        ),
+        status=("decided" if decision.status is RoutingStatus.DECIDED else "needs_review"),
         publication_kind=decision.publication_kind,
         reason_code=decision.reason_code,
         policy_version=decision.policy_version,
@@ -2168,12 +2162,14 @@ async def get_subject_production(
         artifacts_by_stage = {a.stage.value: a for a in artifacts}
         collections = await uow.source_collections.list_for_subject(subject_id)
         archived_sources = sum(1 for c in collections if c.state in _ARCHIVED_STATES)
+        routing = await _production_routing_view(uow, run)
 
         stages = build_stage_statuses(
             run,
             artifacts_by_stage,
             archived_sources=archived_sources,
             research_date=snapshot.research_date,
+            publication_kind=routing.publication_kind,
         )
         completed_stages = completed_stage_count(stages)
         resume_plan = (
@@ -2201,7 +2197,7 @@ async def get_subject_production(
             recovery_disposition=ProductionRecoveryPolicyV1.disposition_for_run(run),
             extraction_progress=run.extraction_progress,
             extraction_rejections=_extraction_rejections(extraction_artifact),
-            routing=await _production_routing_view(uow, run),
+            routing=routing,
             reconciliation=(
                 reconciliation_view(
                     run.id,
