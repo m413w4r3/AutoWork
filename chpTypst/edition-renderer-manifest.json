@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v25-c8-spacing-compat",
+  "template_version": "chp-edition-v26-explicit-kind-brief-layout",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",
