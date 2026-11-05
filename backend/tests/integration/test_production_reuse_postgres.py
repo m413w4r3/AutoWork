@@ -119,6 +119,8 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionEventV1,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
@@ -151,6 +153,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
+from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import (
     SelectionAction,
@@ -777,7 +780,11 @@ async def _store_canonical_first_pass(
     identities the orchestrator recomputes for a second run.
     """
     document_id = document_id or uuid4()
-    source_content = f"Canonical synthesis source {document_id}\n{event_text}\n".encode()
+    ioc_value = f"{subject.slug}.security-lab.io"
+    ioc_quote = f"The report identifies {ioc_value} as command-and-control infrastructure."
+    source_content = (
+        f"Canonical synthesis source {document_id}\n{event_text}\n{ioc_quote}\n"
+    ).encode()
     content_sha256 = content_sha256 or hashlib.sha256(source_content).hexdigest()
     published_at = source.published_at or date(2026, 8, 5)
     raw = "\n".join(
@@ -855,7 +862,17 @@ async def _store_canonical_first_pass(
                         source_document_ids=(document_id,),
                     ),
                 ),
-                indicators=(),
+                indicators=(
+                    ExtractionIndicatorV1(
+                        value=ioc_value,
+                        artifact_type=ArtifactType.DOMAIN,
+                        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                        context="The domain is identified as command-and-control infrastructure.",
+                        evidence_quote=ioc_quote,
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(document_id,),
+                    ),
+                ),
                 rules=(),
                 uncertainties=(),
             ),
@@ -906,6 +923,9 @@ async def _store_canonical_first_pass(
             extraction,
             evidence_pack,
             synthesis_access_policy_hash(policy),
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            publication_routing_policy_version=ROUTING_POLICY_VERSION,
         ),
     )
 
@@ -1454,7 +1474,11 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     # decoded bytes for this source.
     # Unique bytes: source checkpoints are content-addressed and shared by the
     # session-scoped integration database.
-    archived_content = f"Example actor archived source evidence {uuid4().hex}".encode()
+    ioc_value = f"{subject.slug}.security-lab.io"
+    ioc_quote = f"The report identifies {ioc_value} as command-and-control infrastructure."
+    archived_content = (
+        f"Example actor archived source evidence {uuid4().hex}\n{ioc_quote}"
+    ).encode()
     raw_blob = await catalog.ingest(
         BytesIO(archived_content),
         logical_bucket="source-raw",
@@ -1692,9 +1716,18 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     publication_b = artifacts_b[ProductionArtifactStage.PUBLICATION]
     assert publication_b.production_run_id == run_b.id
     assert publication_b.status is ProductionArtifactStatus.VERIFIED
-    assert publication_b.reused_from_artifact_id == publication_a.id
-    assert publication_b.canonical_blob_id == publication_a.canonical_blob_id
+    assert publication_b.reused_from_artifact_id is None
+    assert publication_b.canonical_blob_id != publication_a.canonical_blob_id
     assert publication_b.id != publication_a.id
+    assert publication_b.canonical_blob_id is not None
+    publication_b_payload = await store.read_json(publication_b.canonical_blob_id)
+    async with uow_factory() as uow:
+        assert persisted_b.routing_decision_id is not None
+        routing_b = await uow.production_routing_decisions.get(persisted_b.routing_decision_id)
+    assert routing_b is not None
+    assert publication_b_payload["schema_version"] == "7"
+    assert publication_b_payload["publication_kind"] == PublicationKind.ARTICLE.value
+    assert publication_b_payload["routing_decision_hash"] == routing_b.decision_hash
 
     retry = await production.retry_from_stage(run_b.id, ProductionStage.EXTRACTION)
     assert retry.previous_status is ProductionRunStatus.READY
@@ -1739,6 +1772,10 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     )
 
     retry_adapter = _CountingRetryModelAdapter()
+    retry_adapter._extraction_text = (
+        "FACT actors\n- Example actor :: The campaign is attributed to Example actor.\n\n"
+        f"IOC confirmed domain\n- {ioc_value} :: {ioc_quote}"
+    )
     retry_router = ModelRouter(
         openai_research=retry_adapter,
         openai_structured=retry_adapter,
@@ -2100,8 +2137,16 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
 
     release = await EditionAssemblyService(uow_factory, store).assemble(accepted.manifest.id)
     edition_json = await store.read_json(release.edition_document_blob_id)
-    assert all(item["document"]["schema_version"] == "5" for item in edition_json["publications"])
-    assert [item["document"]["title"] for item in edition_json["publications"]] == [
+    publication_documents = [item["document"] for item in edition_json["publications"]]
+    assert all(document["schema_version"] == "7" for document in publication_documents)
+    assert all(
+        document["publication_kind"] == PublicationKind.ARTICLE.value
+        for document in publication_documents
+    )
+    assert [
+        document["base_publication"]["base_publication"]["title"]
+        for document in publication_documents
+    ] == [
         "[Example publisher] Article A",
         "[Example publisher] Article B",
     ]
