@@ -171,7 +171,7 @@ class AnalystOpinionPreviewService:
         base_sha256 = hashlib.sha256(base_bytes).hexdigest()
         synthesis_sha256 = hashlib.sha256(synthesis_bytes).hexdigest()
         base_document_v5 = publication_document_article_v5_body(document)
-        canonical_bytes = self._artifact_store.canonical_json_bytes(
+        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(
             serialize_publication_document(document)
         )
         if (
@@ -201,6 +201,11 @@ class AnalystOpinionPreviewService:
                 content_sha256="",
             )
 
+        renderer_kwargs: dict[str, Any] = {}
+        if document is not base_document_v5:
+            renderer_kwargs["base_publication_body_sha256"] = (
+                publication_document_v5_sha256(base_document_v5)
+            )
         infrastructure_graph = await self._graph_source.project(
             investigation_id=opinion.investigation_id,
             publication=base_document_v5,
@@ -212,9 +217,7 @@ class AnalystOpinionPreviewService:
                 base_document_v5,
                 render_opinion,
                 parsed_synthesis,
-                base_publication_body_sha256=publication_document_v5_sha256(
-                    base_document_v5
-                ),
+                **renderer_kwargs,
                 findings=findings,
                 evidence_observations=observations,
                 base_publication_identity={
@@ -233,9 +236,7 @@ class AnalystOpinionPreviewService:
                 base_document_v5,
                 render_opinion,
                 parsed_synthesis,
-                base_publication_body_sha256=publication_document_v5_sha256(
-                    base_document_v5
-                ),
+                **renderer_kwargs,
                 infrastructure_graph=infrastructure_graph,
                 findings=findings,
                 evidence_observations=observations,

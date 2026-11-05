@@ -1459,7 +1459,7 @@ class AnalystOpinionService:
             raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
         if publication_document_article_v5_body(document) is None:
             raise OpinionError(OpinionErrorCode.BASE_INVALID)
-        canonical_bytes = self._artifact_store.canonical_json_bytes(
+        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(
             serialize_publication_document(document)
         )
         if canonical_bytes != base_bytes:

@@ -111,7 +111,7 @@ class AnalystPublicationService:
             if base_document_v5 is None:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
             if (
-                self._artifact_store.canonical_json_bytes(
+                ProductionArtifactStore.canonical_json_bytes(
                     serialize_publication_document(document)
                 )
                 != base_bytes

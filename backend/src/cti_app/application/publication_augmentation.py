@@ -408,7 +408,7 @@ class PublicationAugmentationArtifactService:
                     PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
                 )
             if (
-                self._artifact_store.canonical_json_bytes(
+                ProductionArtifactStore.canonical_json_bytes(
                     serialize_publication_document(base_document)
                 )
                 != base_bytes
