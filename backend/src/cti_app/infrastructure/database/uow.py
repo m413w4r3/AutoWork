@@ -59,6 +59,7 @@ from cti_app.application.persistence import (
     ProductionRepairCorrectionRepository,
     ProductionRepairDecisionRepository,
     ProductionReuseInvalidationRepository,
+    ProductionRoutingDecisionRepository,
     ProductionRunRepository,
     ProductionSourceAdditionRepository,
     ProvenanceRepository,
@@ -280,6 +281,7 @@ class SqlAlchemyUnitOfWork:
     investigation_budgets: InvestigationBudgetRepository
     investigation_states: InvestigationStateRepository
     production_runs: ProductionRunRepository
+    production_routing_decisions: ProductionRoutingDecisionRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository

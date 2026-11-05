@@ -14,7 +14,11 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.extraction import _html_encoding, parse_document
-from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.persistence import (
+    ProductionRoutingDecisionRepository,
+    ProductionUnitOfWork,
+    ProductionUnitOfWorkFactory,
+)
 from cti_app.application.production_artifact_store import (
     MAX_REPAIR_EVIDENCE_BYTES,
     REPAIR_CORRECTION_BUCKET,
@@ -111,6 +115,7 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionRepairVerificationState,
+    ProductionRun,
     ProductionRunStatus,
     ProductionStage,
     RepairApplicationStage,
@@ -5174,8 +5179,12 @@ class ProductionRepairMaterializationService:
         return cast(list[str], await marker(run_id, stages))
 
     @staticmethod
-    async def _current_publication_kind(uow: Any, run: Any) -> PublicationKind | None:
-        repository = getattr(uow, "production_routing_decisions", None)
+    async def _current_publication_kind(
+        uow: ProductionUnitOfWork, run: ProductionRun
+    ) -> PublicationKind | None:
+        repository: ProductionRoutingDecisionRepository | None = getattr(
+            uow, "production_routing_decisions", None
+        )
         if repository is None or run.routing_decision_id is None:
             return None
         decision = await repository.get(run.routing_decision_id)

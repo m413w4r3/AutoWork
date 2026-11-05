@@ -96,11 +96,11 @@ from cti_app.domain.production import (
     RepairDecisionApplicationState,
 )
 from cti_app.domain.production import RepairExecutionPlan as DomainRepairExecutionPlan
-from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.production_references import (
     ProductionSourceCriticality,
     ProductionSourceCriticalityReason,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.logging import get_correlation_id
 
