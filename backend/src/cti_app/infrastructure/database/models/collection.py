@@ -27,7 +27,7 @@ COLLECTION_STATE_VALUES_SQL = (
 )
 SOURCE_ROLE_VALUES_SQL = "'primary', 'independent', 'relay', 'aggregator', 'social', 'unknown'"
 ATTEMPT_OUTCOME_VALUES_SQL = (
-    "'succeeded', 'unavailable', 'blocked', 'too_large', 'error', 'interrupted'"
+    "'succeeded', 'unavailable', 'blocked', 'too_large', 'error', 'interrupted', 'skipped'"
 )
 CLAIM_KIND_VALUES_SQL = (
     "'name', 'date', 'ioc', 'cve', 'fact', 'assessment', 'uncertainty', "
@@ -235,6 +235,9 @@ class CollectionAttemptRow(Base):
     transport_classification: Mapped[str | None] = mapped_column(String(32))
     candidate_resolution_url: Mapped[str | None] = mapped_column(Text)
     candidate_resolution_provenance: Mapped[str | None] = mapped_column(String(64))
+    strategy_name: Mapped[str | None] = mapped_column(String(64))
+    strategy_version: Mapped[str | None] = mapped_column(String(32))
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class DerivedArtifactRow(Base):

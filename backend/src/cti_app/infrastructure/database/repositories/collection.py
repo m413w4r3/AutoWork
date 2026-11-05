@@ -348,6 +348,9 @@ def _collection_attempt_values(attempt: CollectionAttempt) -> dict[str, object]:
             if attempt.candidate_resolution_provenance is not None
             else None
         ),
+        "strategy_name": attempt.strategy_name,
+        "strategy_version": attempt.strategy_version,
+        "duration_ms": attempt.duration_ms,
     }
 
 
@@ -388,6 +391,9 @@ def _collection_attempt_from_row(row: CollectionAttemptRow) -> CollectionAttempt
             if row.candidate_resolution_provenance is not None
             else None
         ),
+        strategy_name=row.strategy_name,
+        strategy_version=row.strategy_version,
+        duration_ms=row.duration_ms,
     )
 
 

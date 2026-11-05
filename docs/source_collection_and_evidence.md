@@ -6,10 +6,12 @@ La collecte démarre uniquement à la demande de l'analyste avec
 `POST /api/subjects/{subject_id}/collection`. Cette action crée le job canonique
 `source.collect`; Dramatiq ne transporte que son identifiant.
 
-**La collecte HTTP n'appelle aucun modèle.** Elle n'effectue ni parsing documentaire, ni
-extraction d'IOC/TTP, ni création de claim ou d'artefact dérivé. Qwen, OpenAI et ChatGPT Bridge ne
-font pas partie de ses dépendances. L'analyse sera une action explicite ultérieure, une fois les
-archives contrôlées par l'analyste.
+La collecte directe utilise le transport HTTP épinglé et n'appelle aucun modèle. Si une source
+retourne un blocage d'accès ou une indisponibilité terminale, une chaîne d'acquisition bornée peut
+essayer des variantes publiques, des représentations éditoriales et des archives. Bridge n'est
+considéré qu'en dernier recours, sous la politique TLP et `external_llm_allowed`. Ce résultat reste
+explicitement une transcription de modèle, jamais une preuve primaire. La collecte ne fait toujours
+ni extraction d'IOC/TTP, ni création de claim ou d'artefact dérivé.
 
 Le workflow métier préparé est : Sources → Analyse → Rédaction → Validation. Pour un article
 principal, il deviendra Sources → Analyse → Synthèse → Pivots → Validation. Seule l'étape Sources
@@ -50,6 +52,36 @@ Les retries sont ciblés avec
 `POST /api/subjects/{subject_id}/sources/{source_collection_id}/retry`. Une source bloquée ne peut
 pas contourner la politique. Une nouvelle collecte globale ne retente pas silencieusement les
 échecs antérieurs.
+
+## Chaîne d'acquisition de repli
+
+Après un blocage ou une indisponibilité terminale, le collecteur essaie dans l'ordre les profils
+HTTP honnêtes, les liens canoniques/AMP/print/feeds et les endpoints publics de représentation,
+puis Wayback, archive.ph et ses miroirs, Common Crawl, Memento et la sonde de cache public. Tous les
+téléchargements HTTP passent par le même contrôle SSRF, les résolutions DNS épinglées, les domaines
+interdits et les limites de collecte. HTTP/2 et curl apparaissent comme ignorés tant qu'un adaptateur
+respectant ces garanties n'existe pas. Les tentatives bornées respectent `Retry-After`; les pages
+trop courtes, incohérentes, sans index autorisé, de consentement, de CAPTCHA, de paywall ou d'erreur
+sont rejetées. Aucun cache de moteur de recherche public n'est actuellement pris en charge.
+
+Chaque tentative écrit `strategy_name`, `strategy_version`, durée, statut HTTP, octets, SHA-256,
+résultat et raison dans `collection_attempts` et dans l'événement de provenance. Le corpus
+`REFERENCES` expose ces mêmes diagnostics par source. Les reçus d'archive et `SourceView` portent
+la méthode d'acquisition et, pour Bridge, l'identifiant de run/consultation ainsi que les hashes de
+prompt et de réponse.
+
+Bridge ne reçoit que l'URL publique, le titre et les métadonnées indispensables après contrôle de
+`external_llm_allowed` et du TLP effectif (RED est refusé). Son texte archivé porte
+`acquisition_method=bridge_transcription` et `verification_status=unverified_by_primary_source`.
+Les éléments canoniques extraits portent `evidence_basis=unverified_model_output`; les IOC sont
+`unverified_contextual` et ne peuvent pas seuls produire un article avec IOC confirmés. Une réponse
+ambiguë n'est jamais soumise de nouveau avant réconciliation. Une archive humaine remplace
+explicitement un repli existant; un repli ne remplace jamais un document archivé ou une collecte
+active.
+
+Les stratégies sont configurables avec `COLLECTION_ACQUISITION_STRATEGY_ENABLED` et
+`COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS`. Le navigateur Playwright n'est activé qu'avec
+son adaptateur isolé configuré; il reste désactivé par défaut.
 
 ## Raw, decoded et document analyste
 

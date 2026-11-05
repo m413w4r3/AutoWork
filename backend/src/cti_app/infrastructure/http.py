@@ -47,14 +47,20 @@ class AsyncioPinnedHttpTransport:
                     host_header = host
                     if parsed.port and parsed.port not in {80, 443}:
                         host_header = f"{host}:{parsed.port}"
-                    request_bytes = (
-                        f"GET {target} HTTP/1.1\r\n"
-                        f"Host: {host_header}\r\n"
-                        f"User-Agent: {request.user_agent}\r\n"
-                        "Accept: text/html, application/pdf;q=0.9\r\n"
-                        "Accept-Encoding: gzip, deflate\r\n"
-                        "Connection: close\r\n\r\n"
-                    ).encode("ascii")
+                    supplied = {name.casefold(): value for name, value in request.headers.items()}
+                    accept = supplied.pop("accept", "text/html, application/pdf;q=0.9")
+                    request_lines = [
+                        f"GET {target} HTTP/1.1",
+                        f"Host: {host_header}",
+                        f"User-Agent: {request.user_agent}",
+                        f"Accept: {accept}",
+                        "Accept-Encoding: gzip, deflate",
+                        "Connection: close",
+                    ]
+                    request_lines.extend(
+                        f"{name.title()}: {value}" for name, value in supplied.items()
+                    )
+                    request_bytes = ("\r\n".join(request_lines) + "\r\n\r\n").encode("ascii")
                     writer.write(request_bytes)
                     await writer.drain()
                     status_line = await _read_line(reader, 8 * 1024, "HTTP status line")

@@ -23,7 +23,11 @@ from cti_app.domain.editorial import HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument, Subject
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from tests.discovery_support import InMemoryDiscoveryBatchRepository
-from tests.editorial_support import InMemoryHumanDecisionRepository, InMemorySubjectRepository
+from tests.editorial_support import (
+    InMemoryEditionRepository,
+    InMemoryHumanDecisionRepository,
+    InMemorySubjectRepository,
+)
 
 
 class InMemoryBlobRepository:
@@ -285,6 +289,7 @@ class InMemoryCollectionUnitOfWork:
     def __init__(self, factory: InMemoryCollectionUnitOfWorkFactory) -> None:
         self.blobs = InMemoryBlobRepository(factory.blobs)
         self.subjects = InMemorySubjectRepository(factory.subjects)
+        self.editions = InMemoryEditionRepository(factory.editions)
         self.source_documents = InMemorySourceDocumentRepository(factory.documents)
         self.provenance = InMemoryProvenanceRepository(factory.provenance)
         self.discovery_batches = InMemoryDiscoveryBatchRepository(factory.batches)

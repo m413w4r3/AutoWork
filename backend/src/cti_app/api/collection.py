@@ -16,6 +16,7 @@ from cti_app.application.collection import (
     ManualContentEmptyError,
     ManualContentTooLargeError,
     ManualContentTypeError,
+    SourceArchiveReceipt,
     SubjectCollectionService,
     collection_idempotency_key,
 )
@@ -34,6 +35,7 @@ from cti_app.domain.collection import (
     CollectionState,
     Indicator,
     ReviewStatus,
+    SourceAcquisitionMethod,
     SourceCollection,
 )
 from cti_app.domain.discovery import SourceCandidate, SourceRole
@@ -88,6 +90,18 @@ class ArchiveReceiptView(BaseModel):
     actor_id: str
     correlation_id: str
     completed_at: str
+    acquisition_method: str = SourceAcquisitionMethod.MANUAL_UPLOAD.value
+    model_run_id: UUID | None = None
+    consultation_id: str | None = None
+    prompt_sha256: str | None = None
+    response_sha256: str | None = None
+    verification_status: str | None = None
+    strategy_name: str | None = None
+    strategy_version: str | None = None
+    duration_ms: int | None = None
+    http_status: int | None = None
+    strategy_bytes: int | None = None
+    strategy_sha256: str | None = None
 
 
 class SourceView(BaseModel):
@@ -110,6 +124,7 @@ class SourceView(BaseModel):
     tlp: str | None
     logical_filename: str | None
     detected_mime_type: str | None
+    acquisition_method: str | None = None
     archive_receipt: ArchiveReceiptView | None = None
 
 
@@ -335,7 +350,7 @@ async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
                 candidate,
                 document,
                 discovery_candidate_id=discovery_candidate_id,
-                archive_receipt=await service.manual_archive_receipt(source),
+                archive_receipt=await service.archive_receipt(source),
             )
         )
     claim_views: list[ClaimView] = []
@@ -429,7 +444,7 @@ async def decide_relationship(
         candidate,
         document,
         discovery_candidate_id=discovery_candidate_id,
-        archive_receipt=await service.manual_archive_receipt(source),
+        archive_receipt=await service.archive_receipt(source),
     )
 
 
@@ -514,7 +529,7 @@ def _source_view(
     document: SourceDocument | None,
     *,
     discovery_candidate_id: UUID | None = None,
-    archive_receipt: ManualArchiveReceipt | None = None,
+    archive_receipt: ManualArchiveReceipt | SourceArchiveReceipt | None = None,
 ) -> SourceView:
     return SourceView(
         id=source.id,
@@ -558,6 +573,13 @@ def _source_view(
             if attempt
             else None
         ),
+        acquisition_method=(
+            archive_receipt.acquisition_method.value
+            if isinstance(archive_receipt, SourceArchiveReceipt)
+            else SourceAcquisitionMethod.MANUAL_UPLOAD.value
+            if archive_receipt is not None
+            else None
+        ),
         archive_receipt=(
             ArchiveReceiptView(
                 subject_id=archive_receipt.subject_id,
@@ -577,6 +599,66 @@ def _source_view(
                 actor_id=archive_receipt.actor_id,
                 correlation_id=archive_receipt.correlation_id,
                 completed_at=archive_receipt.completed_at.isoformat(),
+                acquisition_method=(
+                    archive_receipt.acquisition_method.value
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else SourceAcquisitionMethod.MANUAL_UPLOAD.value
+                ),
+                model_run_id=(
+                    archive_receipt.model_run_id
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                consultation_id=(
+                    archive_receipt.consultation_id
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                prompt_sha256=(
+                    archive_receipt.prompt_sha256
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                response_sha256=(
+                    archive_receipt.response_sha256
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                verification_status=(
+                    archive_receipt.verification_status
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                strategy_name=(
+                    archive_receipt.strategy_name
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                strategy_version=(
+                    archive_receipt.strategy_version
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                duration_ms=(
+                    archive_receipt.duration_ms
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                http_status=(
+                    archive_receipt.http_status
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                strategy_bytes=(
+                    archive_receipt.strategy_bytes
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                strategy_sha256=(
+                    archive_receipt.strategy_sha256
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
             )
             if archive_receipt is not None
             else None

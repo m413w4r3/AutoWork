@@ -97,7 +97,12 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
-from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceCollection
+from cti_app.domain.collection import (
+    CollectionState,
+    DetectedMimeType,
+    SourceAcquisitionMethod,
+    SourceCollection,
+)
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.model_runs import ModelRunStatus
@@ -299,6 +304,7 @@ class PlannedExtractionSource:
     computation_representative_source_id: UUID | None = None
     scope: ExtractionScopeV1 | None = None
     position: int = 0
+    acquisition_method: SourceAcquisitionMethod = SourceAcquisitionMethod.DIRECT_HTTP
 
     @property
     def computation_key(self) -> tuple[str, ExtractionProfile]:
@@ -484,6 +490,8 @@ def build_extraction_plan(
             if intent is SourceAdditionExtractionIntent.DESCRIPTIVE_FACTS
             else EXTRACTION_PROFILE_POLICY_VERSION
         )
+        if source.acquisition_method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
+            profile_policy_version = f"{profile_policy_version}:bridge_transcription"
         evidence = (evidence_documents or {}).get(source.source_document_id)
         effective_hash = (
             effective_evidence_sha256(evidence.parsed_text) if evidence is not None else None
@@ -508,6 +516,7 @@ def build_extraction_plan(
                 profile_policy_version=profile_policy_version,
                 title=source.title,
                 collection_state=source.collection_state,
+                acquisition_method=source.acquisition_method,
                 effective_evidence_sha256=effective_hash,
                 scope=evidence.scope if evidence is not None else None,
             )
@@ -532,6 +541,9 @@ def build_extraction_plan(
         }
         for source in sources
         if source.profile_policy_version == SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION
+        or source.profile_policy_version.startswith(
+            f"{SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION}:"
+        )
     )
     return ExtractionPlan(
         subject_id=corpus.subject_id,
@@ -1052,7 +1064,11 @@ def build_canonical_source_extraction(
     """
 
     document_ids = (planned.source_document_id,)
-    basis = ProductionEvidenceBasis.SOURCE_VERIFIED
+    basis = (
+        ProductionEvidenceBasis.UNVERIFIED_MODEL_OUTPUT
+        if planned.acquisition_method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+        else ProductionEvidenceBasis.SOURCE_VERIFIED
+    )
     facts = tuple(
         ExtractionFactV1(
             category=fact.category,
@@ -1086,7 +1102,11 @@ def build_canonical_source_extraction(
         ExtractionIndicatorV1(
             value=artifact.value,
             artifact_type=ArtifactType(artifact.artifact_type),
-            indicator_status=ExtractionIndicatorStatus(artifact.indicator_status),
+            indicator_status=(
+                ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL
+                if planned.acquisition_method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+                else ExtractionIndicatorStatus(artifact.indicator_status)
+            ),
             context=artifact.context,
             evidence_quote=artifact.evidence_quote,
             evidence_basis=basis,
@@ -1134,6 +1154,7 @@ def build_canonical_source_extraction(
         rules=rules,
         uncertainties=tuple(dict.fromkeys(gated.uncertainties)),
         scope=planned.scope,
+        acquisition_method=planned.acquisition_method,
     )
 
 

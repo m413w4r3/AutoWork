@@ -18,7 +18,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
 from cti_app.domain.production import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -202,6 +202,7 @@ class ExtractionIndicatorStatus(StrEnum):
 
     CONFIRMED_IOC = "confirmed_ioc"
     CONTEXTUAL = "contextual"
+    UNVERIFIED_CONTEXTUAL = "unverified_contextual"
 
 
 class ProductionExtractionOmissionReason(StrEnum):
@@ -509,6 +510,7 @@ class ProductionSourceExtractionV1:
     scope: ExtractionScopeV1 | None = None
     editorial_role: ProductionEditorialRole | None = None
     profile_reason_code: ExtractionProfileReasonCode | None = None
+    acquisition_method: SourceAcquisitionMethod = SourceAcquisitionMethod.DIRECT_HTTP
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_document_id, UUID):
@@ -555,6 +557,8 @@ class ProductionSourceExtractionV1:
             object.__setattr__(self, "profile_reason_code", reason_code)
         elif not isinstance(reason_code, ExtractionProfileReasonCode):
             raise ValueError("Extraction source profile reason code is invalid")
+        if not isinstance(self.acquisition_method, SourceAcquisitionMethod):
+            raise ValueError("Extraction source acquisition method is invalid")
         if self.checkpoint_id is not None and not isinstance(self.checkpoint_id, UUID):
             raise ValueError("Extraction checkpoint identity must be a UUID or None")
         if not isinstance(self.reuse_state, ExtractionReuseState):
@@ -791,9 +795,11 @@ _SOURCE_KEYS = frozenset(
         "rules",
         "uncertainties",
         "scope",
+        "acquisition_method",
     }
 )
-_LEGACY_SOURCE_KEYS = _SOURCE_KEYS - {"scope"}
+_SOURCE_KEYS_WITHOUT_ACQUISITION = _SOURCE_KEYS - {"acquisition_method"}
+_LEGACY_SOURCE_KEYS = _SOURCE_KEYS - {"scope", "acquisition_method"}
 _FACT_KEYS = frozenset(
     {
         "category",
@@ -977,6 +983,7 @@ def _source_to_json(source: ProductionSourceExtractionV1) -> dict[str, Any]:
         "rules": [_rule_to_json(rule) for rule in source.rules],
         "uncertainties": list(source.uncertainties),
         "scope": _scope_to_json(source.scope),
+        "acquisition_method": source.acquisition_method.value,
     }
 
 
@@ -1020,7 +1027,7 @@ def production_extraction_to_json(extraction: ProductionExtractionV1) -> dict[st
 
 
 def production_extraction_hashes(extraction: ProductionExtractionV1) -> tuple[str, ...]:
-    """Return current and accepted pre-scope hashes for one extraction.
+    """Return current and accepted historical hashes for one extraction.
 
     The optional per-source ``scope`` field was added after canonical
     extraction artifacts were already persisted. When every scope is absent,
@@ -1039,17 +1046,29 @@ def production_extraction_hashes(extraction: ProductionExtractionV1) -> tuple[st
         return hashlib.sha256(encoded).hexdigest()
 
     current = digest(payload)
-    if not all(source.get("scope") is None for source in payload["sources"]):
+    if any(
+        source.get("acquisition_method") != SourceAcquisitionMethod.DIRECT_HTTP.value
+        for source in payload["sources"]
+    ):
         return (current,)
-    legacy_payload = {
+    prior_payload = {
         **payload,
         "sources": [
-            {key: value for key, value in source.items() if key != "scope"}
+            {key: value for key, value in source.items() if key != "acquisition_method"}
             for source in payload["sources"]
         ],
     }
-    legacy = digest(legacy_payload)
-    return (current, legacy) if legacy != current else (current,)
+    prior = digest(prior_payload)
+    if all(source.get("scope") is None for source in payload["sources"]):
+        pre_scope_payload = {
+            **prior_payload,
+            "sources": [
+                {key: value for key, value in source.items() if key != "scope"}
+                for source in prior_payload["sources"]
+            ],
+        }
+        return tuple(dict.fromkeys((current, prior, digest(pre_scope_payload))))
+    return tuple(dict.fromkeys((current, prior)))
 
 
 def is_production_extraction_hash(extraction: ProductionExtractionV1, value: str) -> bool:
@@ -1119,7 +1138,11 @@ def _rule_from_json(raw: Any) -> ExtractionRuleV1:
 
 
 def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
-    if not isinstance(raw, Mapping) or set(raw) not in {_SOURCE_KEYS, _LEGACY_SOURCE_KEYS}:
+    if not isinstance(raw, Mapping) or set(raw) not in {
+        _SOURCE_KEYS,
+        _SOURCE_KEYS_WITHOUT_ACQUISITION,
+        _LEGACY_SOURCE_KEYS,
+    }:
         raise ValueError("Extraction source payload has an invalid shape")
     payload = raw
     return ProductionSourceExtractionV1(
@@ -1149,6 +1172,15 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
         rules=tuple(_rule_from_json(item) for item in _require_array(payload["rules"], "rules")),
         uncertainties=tuple(_text_list(payload["uncertainties"], "uncertainties")),
         scope=_scope_from_json(payload.get("scope")),
+        acquisition_method=(
+            _enum(
+                SourceAcquisitionMethod,
+                payload["acquisition_method"],
+                "acquisition_method",
+            )
+            if "acquisition_method" in payload
+            else SourceAcquisitionMethod.DIRECT_HTTP
+        ),
     )
 
 

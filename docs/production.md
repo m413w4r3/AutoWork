@@ -135,6 +135,15 @@ exact, hash du contenu et éligibilité à l’extraction. Les sources du snapsh
 comme `CORE`; la recherche web peut ajouter des références `SUPPORTING` ou des ressources
 `TECHNICAL`. Une source inaccessible reste dans le corpus avec son état et n’est pas éligible.
 
+La collecte peut tenter une chaîne de replis bornée avant de figer cet état : profils HTTP
+conformes, représentations annoncées par la publication, puis plusieurs archives publiques
+indépendantes. Chaque stratégie et diagnostic demeure dans `acquisition_attempts`. Une source
+archivée via Bridge reste marquée `bridge_transcription` et n'est pas une preuve primaire; ses IOC
+sont contextualisés/non vérifiés et ne suffisent pas à router une publication comme ARTICLE. Une
+source core ne devient donc pas une source d'IOC confirmés par le seul fait qu'une transcription a
+été archivée. Les règles de collecte, les diagnostics et les limites de diffusion sont détaillés
+dans [`source_collection_and_evidence.md`](source_collection_and_evidence.md#chaîne-dacquisition-de-repli).
+
 Le blob RAW conserve le wire format de recherche historique, notamment
 `editorial-title` et `EVENT`, pour la lecture des anciens imports. Ces champs ne font pas partie du
 corpus canonique. `REFERENCES` appelle `ModelGateway` sans conversation canonique. Le hash

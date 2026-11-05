@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.production_routing import _projection_has_incomplete_coverage
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.legitimate_services import LegitimateServiceRegistry
 from cti_app.domain.production import (
@@ -72,6 +73,7 @@ def _indicator(
     status: ExtractionIndicatorStatus = ExtractionIndicatorStatus.CONFIRMED_IOC,
     *,
     source_id=None,
+    evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
 ) -> ExtractionIndicatorV1:
     source_id = source_id or uuid4()
     return ExtractionIndicatorV1(
@@ -80,7 +82,7 @@ def _indicator(
         indicator_status=status,
         context="Observed as command infrastructure.",
         evidence_quote=f"The report identifies {value}.",
-        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        evidence_basis=evidence_basis,
         source_document_ids=(source_id,),
     )
 
@@ -411,6 +413,33 @@ def test_confirmed_subject_ioc_routes_article_despite_critical_source_omission()
     assert decision.reason_code is RoutingReasonCode.SUBJECT_IOC_CONFIRMED
     assert decision.confirmed_ioc_count == 1
     assert len(decision.critical_source_diagnostics) == 1
+
+
+def test_bridge_transcribed_source_keeps_ioc_contextual_and_routes_brief():
+    extraction = _extraction(
+        indicators=(
+            _indicator(
+                "c2.example",
+                status=ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL,
+                evidence_basis=ProductionEvidenceBasis.UNVERIFIED_MODEL_OUTPUT,
+            ),
+        )
+    )
+    bridge_source = replace(
+        extraction.sources[0],
+        acquisition_method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+    )
+    extraction = replace(extraction, sources=(bridge_source,))
+
+    decision = _inputs(extraction, _projection(extraction))
+
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.BRIEF
+    assert decision.confirmed_ioc_count == 0
+    assert decision.contextual_ioc_count == 1
+    assert extraction.sources[0].indicators[0].evidence_basis is (
+        ProductionEvidenceBasis.UNVERIFIED_MODEL_OUTPUT
+    )
 
 
 def test_unaccounted_source_extraction_failure_needs_review():

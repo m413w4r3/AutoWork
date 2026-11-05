@@ -51,6 +51,9 @@ class CollectionError(RuntimeError):
         self.headers: dict[str, str] = {}
         self.encoded_size: int | None = None
         self.detected_content_type: str | None = None
+        # Kept in memory solely so the application can inspect public
+        # rel=amphtml/alternate/print links. It is never persisted or logged.
+        self.response_body: bytes | None = None
 
     def with_context(
         self,
@@ -61,6 +64,7 @@ class CollectionError(RuntimeError):
         headers: dict[str, str] | None = None,
         encoded_size: int | None = None,
         detected_content_type: str | None = None,
+        response_body: bytes | None = None,
     ) -> CollectionError:
         self.final_url = final_url
         self.redirect_chain = tuple(redirect_chain)
@@ -72,6 +76,8 @@ class CollectionError(RuntimeError):
             self.encoded_size = encoded_size
         if detected_content_type is not None:
             self.detected_content_type = detected_content_type
+        if response_body is not None:
+            self.response_body = response_body
         return self
 
 
@@ -167,6 +173,7 @@ class PinnedHttpRequest:
     timeout_seconds: float
     max_wire_bytes: int
     user_agent: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,11 +236,20 @@ class SafeHttpCollector:
         *,
         cancellation_check: CancellationCheck | None = None,
         allow_images: bool = False,
+        allow_binary: bool = False,
+        request_headers: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> CollectedResponse:
         current = requested_url.strip()
         redirects: list[str] = []
         last_redirect_response: RawHttpResponse | None = None
-        deadline = time.monotonic() + self.policy.timeout_seconds
+        timeout = min(
+            self.policy.timeout_seconds,
+            timeout_seconds if timeout_seconds is not None else self.policy.timeout_seconds,
+        )
+        if timeout <= 0:
+            raise ValueError("Collection timeout must be positive")
+        deadline = time.monotonic() + timeout
         for redirect_count in range(self.policy.max_redirects + 1):
             if cancellation_check is not None:
                 await cancellation_check()
@@ -271,6 +287,7 @@ class SafeHttpCollector:
                         timeout_seconds=remaining,
                         max_wire_bytes=self.policy.max_download_bytes,
                         user_agent=self.policy.user_agent,
+                        headers=_safe_request_headers(request_headers or {}, current),
                     )
                 )
             except CollectionError as exc:
@@ -305,6 +322,12 @@ class SafeHttpCollector:
                 redirects.append(current)
                 continue
             if response.status in {401, 403}:
+                try:
+                    response_body, _content_encoding = _decode_body(
+                        response.encoded_body, response.headers, self.policy
+                    )
+                except CollectionError:
+                    response_body = None
                 raise AccessBlockedError(
                     f"Remote server denied access with HTTP {response.status}"
                 ).with_context(
@@ -314,6 +337,7 @@ class SafeHttpCollector:
                     headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
+                    response_body=response_body,
                 )
             if response.status in {404, 410}:
                 raise ObsoleteUrlError(
@@ -367,7 +391,9 @@ class SafeHttpCollector:
                 decoded_body, content_encoding = _decode_body(
                     response.encoded_body, response.headers, self.policy
                 )
-                detected = _detect_mime(decoded_body, allow_images=allow_images)
+                detected = _detect_mime(
+                    decoded_body, allow_images=allow_images, allow_binary=allow_binary
+                )
             except CollectionError as exc:
                 exc.with_context(
                     final_url=current,
@@ -527,7 +553,9 @@ def _bounded_decompress(body: bytes, limit: int, window_bits: int) -> bytes:
     return expanded
 
 
-def _detect_mime(body: bytes, *, allow_images: bool = False) -> DetectedMimeType:
+def _detect_mime(
+    body: bytes, *, allow_images: bool = False, allow_binary: bool = False
+) -> DetectedMimeType:
     if allow_images:
         image_mime = _sniff_image_mime(body)
         if image_mime is not None:
@@ -543,6 +571,8 @@ def _detect_mime(body: bytes, *, allow_images: bool = False) -> DetectedMimeType
     try:
         decoded = body.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
+        if allow_binary:
+            return DetectedMimeType.BINARY
         raise UnsupportedContentError("Detected content type is not supported") from exc
     try:
         parsed = json.loads(decoded)
@@ -552,6 +582,8 @@ def _detect_mime(body: bytes, *, allow_images: bool = False) -> DetectedMimeType
         return DetectedMimeType.JSON
     if "\x00" not in decoded:
         return DetectedMimeType.TEXT
+    if allow_binary:
+        return DetectedMimeType.BINARY
     raise UnsupportedContentError("Detected content type is not supported")
 
 
@@ -612,5 +644,36 @@ def _allowed_headers(headers: dict[str, str]) -> dict[str, str]:
         "last-modified",
         "etag",
         "cache-control",
+        "link",
+        "retry-after",
+        "content-range",
     }
     return {key.casefold(): value for key, value in headers.items() if key.casefold() in allowed}
+
+
+def _safe_request_headers(headers: dict[str, str], request_url: str) -> dict[str, str]:
+    """Apply a small allowlist without changing DNS pinning or collector identity."""
+    allowed = {"accept", "accept-language", "referer", "range"}
+    selected: dict[str, str] = {}
+    for raw_name, value in headers.items():
+        name = raw_name.casefold()
+        if name not in allowed or "\r" in value or "\n" in value:
+            continue
+        if name == "referer":
+            try:
+                referer = urlsplit(value)
+                target = urlsplit(request_url)
+            except ValueError:
+                continue
+            if (
+                referer.scheme not in {"http", "https"}
+                or referer.hostname is None
+                or referer.hostname.casefold() != (target.hostname or "").casefold()
+                or referer.username is not None
+                or referer.password is not None
+            ):
+                continue
+        if name == "range" and not re.fullmatch(r"bytes=\d+-\d*", value):
+            continue
+        selected[name] = value[:1024]
+    return selected
