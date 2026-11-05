@@ -134,7 +134,7 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     publication_payload = await scenario.artifact_store.read_json(
         publication_artifact.canonical_blob_id
     )
-    assert publication_payload["schema_version"] == "5"
+    assert publication_payload["schema_version"] == "7"
     publication = parse_publication_document(publication_payload)
     assert len(publication.tables) == len(publication.diagrams) == 1
     assert publication.tables[0].rows[0].cells

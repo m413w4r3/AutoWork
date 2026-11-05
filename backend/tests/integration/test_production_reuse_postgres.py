@@ -136,6 +136,7 @@ from cti_app.domain.production_relevance import (
     RelevanceProjectionV1,
     relevance_projection_to_json,
 )
+from cti_app.domain.production_routing import ROUTING_POLICY_VERSION
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
@@ -150,6 +151,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import (
     SelectionAction,
     SelectionDecision,
@@ -1143,6 +1145,9 @@ async def _seed_reusable_article(
             synthesis=synthesis,
             editorial_enrichment=enrichment,
             relevance_projection=first_pass.projection,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            routing_policy_version=ROUTING_POLICY_VERSION,
         )
         publication = assembly.artifact
         await uow.commit()
@@ -1611,6 +1616,9 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             synthesis=synthesis,
             editorial_enrichment=enrichment_a,
             relevance_projection=first_pass.projection,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            routing_policy_version=ROUTING_POLICY_VERSION,
         )
         publication_a = assembly_a.artifact
         await uow.commit()

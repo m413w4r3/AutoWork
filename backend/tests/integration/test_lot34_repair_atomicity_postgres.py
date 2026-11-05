@@ -63,7 +63,9 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
 from cti_app.domain.production_extraction import production_extraction_to_json
+from cti_app.domain.production_routing import ROUTING_POLICY_VERSION
 from cti_app.domain.production_synthesis import production_synthesis_to_json
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
@@ -366,6 +368,9 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
             extraction=extraction_value,
             synthesis=synthesis_value,
             editorial_enrichment=enrichment_value,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            routing_policy_version=ROUTING_POLICY_VERSION,
         )
         publication = assembly.artifact
         await uow.commit()
