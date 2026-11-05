@@ -242,7 +242,7 @@ async def test_w16_interrupt_during_bridge_wait_is_durable_read_only_and_resumab
 
 
 @pytest.mark.asyncio
-async def test_w16_resume_recovers_orphan_after_model_unavailable_and_retries_distinctly(
+async def test_w16_resume_blocks_orphan_with_ambiguous_bridge_submission(
     uow_factory, tmp_path: Path
 ) -> None:
     artifact_store = ProductionArtifactStore(
@@ -343,6 +343,9 @@ async def test_w16_resume_recovers_orphan_after_model_unavailable_and_retries_di
                 evidence_pack_hash="b" * 64,
                 parameters={},
             )
+            # This fixture represents a persisted request whose provider handoff
+            # may have happened before the worker was cancelled.
+            run.begin_submission_attempt()
             orphaned_turn = ModelConversationTurn(
                 conversation_id=conversation.id,
                 sequence=conversation.turn_count,
@@ -404,14 +407,8 @@ async def test_w16_resume_recovers_orphan_after_model_unavailable_and_retries_di
             json={"expected_version": exhausted.version},
             headers={"Idempotency-Key": "w16-model-unavailable-orphan-resume"},
         )
-        assert resumed.status_code == 200, resumed.text
-        await run_http_job(
-            app,
-            uow_factory,
-            registry,
-            dispatcher,
-            UUID(resumed.json()["job_id"]),
-        )
+        assert resumed.status_code == 409, resumed.text
+        assert resumed.json()["detail"]["code"] == "investigation_resume_conflict"
 
     async with uow_factory() as uow:
         stored_turn = await uow.model_conversation_turns.get(orphaned_turn.id)
@@ -426,21 +423,13 @@ async def test_w16_resume_recovers_orphan_after_model_unavailable_and_retries_di
     assert stored_turn.status is ConversationTurnStatus.NEEDS_REVIEW
     assert stored_turn.error_code == "orphaned_running_turn"
     assert final_state is not None and final_envelope is not None
-    assert len(transport.request_keys) == 2
-    assert transport.request_keys[1] != orphan_key
-    assert transport.submission_count == 2  # Initial interrupted call plus one distinct retry.
+    assert transport.request_keys == [orphan_key]
+    assert transport.submission_count == 1  # Ambiguous external work is never resubmitted.
     reservations = {item.operation_key: item for item in final_envelope.budget.reservations}
-    retry_budget_key = bridge_budget_operation_key(
-        investigation_id=investigation_id,
-        turn_index=0,
-        context_sha256=orphan_context_sha256,
-        attempt=1,
-    )
-    assert reservations[old_budget_key].status.value == "released"
-    assert reservations[retry_budget_key].status.value == "committed"
+    assert reservations[old_budget_key].status.value == "committed"
     assert final_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
     assert final_envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
-    assert max(int(job.input_parameters.get("run_generation", 0)) for job in jobs) == 3
+    assert max(int(job.input_parameters.get("run_generation", 0)) for job in jobs) == 2
 
 
 class _WaitingVirusTotal(HashCheckedVirusTotal):

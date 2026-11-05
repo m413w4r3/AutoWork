@@ -275,6 +275,7 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
   await page
     .getByRole("button", { name: "Enquête / Avis de l’analyste" })
     .click();
+  await page.getByRole("button", { name: "Claims / Hypothèses" }).click();
   await expect(
     page.getByText("The VT pivot returned the synthetic sample candidate."),
   ).toBeVisible();
@@ -375,6 +376,9 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
   await opinionSection
     .getByLabel("Raison de la décision")
     .fill("Approuver la version révisée et ses citations affichées.");
+  await opinionSection
+    .getByRole("checkbox", { name: /Je confirme avoir pris connaissance/ })
+    .check();
   const approvalResponsePromise = page.waitForResponse(
     (response) =>
       response.request().method() === "POST" &&
@@ -393,6 +397,9 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
   // Approval appends a new immutable approved version after the reviewed draft v2.
   expect(approvedOpinion.version).toBe(3);
   await expect(opinionSection).toContainText("3 · approved");
+  await opinionSection
+    .getByRole("checkbox", { name: /Je confirme avoir pris connaissance/ })
+    .check();
 
   const publishResponsePromise = page.waitForResponse(
     (response) =>

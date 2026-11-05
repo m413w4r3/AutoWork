@@ -1811,6 +1811,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 revised.id,
                 version=revised.version,
                 sha256=revised.content_sha256,
+                acknowledge_bridge_drafting_gap=True,
             )
             assert approved_opinion.status_code == 200, approved_opinion.text
             approved_payload = approved_opinion.json()["approved"]

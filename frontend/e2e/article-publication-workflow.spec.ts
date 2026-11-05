@@ -11,6 +11,7 @@ import type { PublicationDocumentV4 } from "../src/api/production";
 test("Sujet : sélection, production, revue et publication PDF", async ({
   page,
 }) => {
+  test.setTimeout(30_000);
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const subjectId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const batchId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";

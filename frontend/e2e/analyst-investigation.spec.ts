@@ -25,6 +25,7 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
   await expect(
     page.getByRole("heading", { name: `Enquête ${api.ids.investigation}` }),
   ).toBeVisible();
+  await page.getByRole("button", { name: "Claims / Hypothèses" }).click();
   await expect(
     page.getByText(/Une variante complémentaire est étayée/),
   ).toBeVisible();
@@ -102,9 +103,24 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
   await page
     .getByLabel("Raison de la décision")
     .fill("Les preuves et limites ont été relues.");
+  const bridgeDraftingAcknowledgement = page.getByLabel(
+    /Je confirme avoir pris connaissance de l’absence de rédaction Bridge liée/,
+  );
+  await expect(page.getByText(/sans rédaction Bridge liée/)).toBeVisible();
+  await bridgeDraftingAcknowledgement.check();
   await page
     .getByRole("button", { name: "Approuver cette version précise" })
     .click();
+  await expect(
+    page.getByRole("heading", {
+      name: "Proposer une version augmentée de l’article",
+    }),
+  ).toBeVisible();
+  await expect(bridgeDraftingAcknowledgement).not.toBeChecked();
+  await bridgeDraftingAcknowledgement.check();
+  await expect(
+    page.getByRole("button", { name: "Proposer la version augmentée" }),
+  ).toBeEnabled();
   await page
     .getByRole("button", { name: "Proposer la version augmentée" })
     .click();
@@ -154,8 +170,19 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
     version: 2,
     expected_sha256: "c".repeat(64),
     reason: "Les preuves et limites ont été relues.",
+    bridge_drafting_gap_acknowledged: true,
   });
   expect(approval?.idempotencyKey).toBeTruthy();
+
+  const publication = api.requests.find(
+    (request) => request.path === `/api/opinions/${api.ids.opinion}/publish`,
+  );
+  expect(publication?.body).toMatchObject({
+    version: 3,
+    expected_base_publication_sha256: "b".repeat(64),
+    bridge_drafting_gap_acknowledged: true,
+  });
+  expect(publication?.idempotencyKey).toBeTruthy();
 
   const envelopeApproval = api.requests.find(
     (request) =>

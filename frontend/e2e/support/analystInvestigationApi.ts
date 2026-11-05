@@ -1,4 +1,5 @@
 import type { Page, Route } from "@playwright/test";
+import type { InvestigationActivityPage } from "../../src/api/investigationOperator";
 
 const ids = {
   edition: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -45,6 +46,22 @@ interface OpinionPayload {
     synthesis_sha256: string;
     base_publication_artifact_id: string;
     base_publication_sha256: string;
+  };
+  editorial_review: {
+    status: "warning";
+    bridge_drafting: {
+      status: "incomplete";
+      section_count: number;
+      bridge_authored_section_count: number;
+      unlinked_sections: string[];
+      requires_acknowledgement: boolean;
+      acknowledged: boolean;
+      resume_available: boolean;
+      diagnosis: string | null;
+    };
+    publication_text_markers: string[];
+    missing_annex_references: string[];
+    warnings: string[];
   };
 }
 
@@ -229,6 +246,7 @@ export function createAnalystInvestigationApi() {
     blocks: OpinionPayload["blocks"],
     version: number,
     status: OpinionPayload["status"],
+    acknowledged = false,
   ): OpinionPayload {
     const contentHash = hash(String.fromCharCode(97 + version));
     const provenance = {
@@ -256,6 +274,22 @@ export function createAnalystInvestigationApi() {
       content_sha256: contentHash,
       renderable_blocks: blocks.filter((block) => block.text.trim()),
       provenance,
+      editorial_review: {
+        status: "warning",
+        bridge_drafting: {
+          status: "incomplete",
+          section_count: blocks.length,
+          bridge_authored_section_count: 0,
+          unlinked_sections: blocks.map((block) => block.type),
+          requires_acknowledgement: true,
+          acknowledged,
+          resume_available: false,
+          diagnosis: null,
+        },
+        publication_text_markers: [],
+        missing_annex_references: [],
+        warnings: [],
+      },
     };
   }
 
@@ -403,6 +437,44 @@ export function createAnalystInvestigationApi() {
       method === "GET"
     ) {
       return fulfill(route, toInvestigationView());
+    }
+    if (
+      path === `/api/investigations/${ids.investigation}/activity` &&
+      method === "GET"
+    ) {
+      const activity: InvestigationActivityPage = {
+        schema_version: "investigation-activity.v1",
+        investigation: {
+          id: ids.investigation,
+          subject_id: ids.subject,
+          production_run_id: ids.run,
+          synthesis_artifact_id: ids.synthesis,
+          synthesis_sha256: hash("a"),
+          status: "running",
+          version: 1,
+          stop_reason: null,
+          execution_mode: "operator_led",
+        },
+        operator: {
+          principal: null,
+          model: null,
+          effort: null,
+          active_subagent_count: null,
+          metadata_source: "unavailable_in_autowork",
+        },
+        working_state: null,
+        last_activity_at: null,
+        last_activity_source: null,
+        active_backend_job_count: 0,
+        budget: null,
+        timeline: [],
+        next_cursor: null,
+        has_more: false,
+        blockers: [],
+        counts: { inconclusive_findings: 0 },
+        generated_at: "2026-10-13T10:00:00Z",
+      };
+      return fulfill(route, activity);
     }
     if (
       path === `/api/investigations/${ids.investigation}/envelope` &&
@@ -573,11 +645,16 @@ export function createAnalystInvestigationApi() {
       return fulfill(route, { draft: opinion });
     }
     if (path === `/api/opinions/${ids.opinion}/approve` && method === "POST") {
-      const input = body as { version: number; expected_sha256: string };
+      const input = body as {
+        version: number;
+        expected_sha256: string;
+        bridge_drafting_gap_acknowledged?: boolean;
+      };
       opinion = newOpinion(
         opinion?.blocks ?? [],
         input.version + 1,
         "approved",
+        input.bridge_drafting_gap_acknowledged === true,
       );
       return fulfill(route, {
         approved: opinion,
@@ -586,6 +663,14 @@ export function createAnalystInvestigationApi() {
       });
     }
     if (path === `/api/opinions/${ids.opinion}/publish` && method === "POST") {
+      const input = body as { bridge_drafting_gap_acknowledged?: boolean };
+      if (input.bridge_drafting_gap_acknowledged !== true) {
+        return fulfill(
+          route,
+          { detail: { code: "bridge_drafting_ack_required" } },
+          409,
+        );
+      }
       return fulfill(route, {
         publication: {
           artifact_id: "44444444-4444-4444-8444-444444444444",

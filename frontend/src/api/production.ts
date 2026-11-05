@@ -1245,6 +1245,8 @@ export interface PublicationDocumentV5 extends Omit<
   "schema_version"
 > {
   schema_version: "5";
+  references: PublicationReferenceEntryV1[];
+  original_indicators: PublicationIndicatorGroupV1[];
   rich_text: PublicationSemanticTextV1;
 }
 
@@ -1264,14 +1266,24 @@ export interface PublicationIndicatorGroupV1 {
   }>;
 }
 
-export interface PublicationDocumentV6 extends Omit<
-  PublicationDocumentV4,
-  "schema_version"
-> {
+export interface PublicationDocumentV6 {
   schema_version: "6";
-  references: PublicationReferenceEntryV1[];
-  original_indicators: PublicationIndicatorGroupV1[];
-  rich_text: PublicationSemanticTextV1;
+  base_publication: PublicationDocumentV5;
+  provenance: {
+    base_publication_artifact_id: string;
+    base_publication_sha256: string;
+    base_publication_body_sha256?: string;
+    investigation_id: string | null;
+    opinion_id: string | null;
+    opinion_version: number | null;
+    opinion_content_sha256: string | null;
+    reviewer_id: string | null;
+    approver_id: string | null;
+  };
+  analyst_opinion: Record<string, unknown> | null;
+  rendered_opinion: Record<string, unknown> | null;
+  infrastructure_graph?: Record<string, unknown>;
+  detection?: Record<string, unknown>;
 }
 
 export interface PublicationDocumentV7 {
@@ -1282,10 +1294,9 @@ export interface PublicationDocumentV7 {
   routing_policy_version: string;
 }
 
-export type PublicationDocument =
-  PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6;
+export type PublicationDocument = PublicationDocumentV4 | PublicationDocumentV5;
 export type PublicationDocumentArtifact =
-  PublicationDocument | PublicationDocumentV7;
+  PublicationDocument | PublicationDocumentV6 | PublicationDocumentV7;
 
 export type PublicationPreviewStatus =
   "IN_PROGRESS" | "READY" | "FAILED" | "STALE";

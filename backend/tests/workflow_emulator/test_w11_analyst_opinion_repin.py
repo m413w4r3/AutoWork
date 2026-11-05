@@ -568,6 +568,7 @@ async def test_w11_analyst_opinion_requires_explicit_repin_for_multibatch_editio
                     author_id="w11-author",
                     reviewer_id="w11-reviewer",
                     status=AnalystOpinionStatus.APPROVED,
+                    bridge_drafting_gap_acknowledged=True,
                 )
                 citation_context = OpinionCitationContext(
                     base_publication_artifact_id=base_artifact.id,

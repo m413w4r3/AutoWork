@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from cti_app.application.publication_augmentation import (
     PublicationAugmentationErrorCode,
     augment_publication_with_opinion,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
     PublicationDocumentV5,
@@ -101,6 +103,11 @@ def test_article_augmentation_preserves_v7_routing_and_briefs_reject_it() -> Non
         routing_decision_hash="e" * 64,
         routing_policy_version="routing-policy-v1",
     )
+    artifact_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(article))
+    ).hexdigest()
+    opinion = replace(opinion, base_publication_sha256=artifact_sha256, content_sha256="")
+    context = replace(context, base_publication_sha256=artifact_sha256)
     brief = replace(article, publication_kind=PublicationKind.BRIEF)
 
     augmented = augment_publication_with_opinion(article, opinion, context)
@@ -109,6 +116,12 @@ def test_article_augmentation_preserves_v7_routing_and_briefs_reject_it() -> Non
     assert augmented.publication_kind is PublicationKind.ARTICLE
     assert augmented.routing_decision_hash == article.routing_decision_hash
     assert augmented.base_publication.analyst_opinion == opinion
+    assert augmented.base_publication.provenance.base_publication_sha256 == artifact_sha256
+    assert (
+        augmented.base_publication.provenance.base_publication_body_sha256
+        == publication_document_v5_sha256(base)
+    )
+    assert parse_publication_document(serialize_publication_document(augmented)) == augmented
     with pytest.raises(PublicationAugmentationError) as failure:
         augment_publication_with_opinion(brief, opinion, context)
     assert failure.value.code is PublicationAugmentationErrorCode.PUBLICATION_KIND_INVALID

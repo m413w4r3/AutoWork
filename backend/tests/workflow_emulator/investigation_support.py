@@ -451,6 +451,7 @@ async def seed_verified_article(
     material: SyntheticSampleMaterial | None = None,
     include_seed: bool = True,
     include_seed_observation: bool = True,
+    seed_observation_object_type: str = "sha256",
     article_claim: str | None = None,
 ) -> SeededInvestigation:
     """Persist a verified article, its independent run, and optional seed evidence."""
@@ -567,7 +568,7 @@ async def seed_verified_article(
             source="synthetic-article-seed",
             source_version="1",
             observed_at=datetime.now(UTC),
-            object_type="sha256",
+            object_type=seed_observation_object_type,
             object_id=samples.seed_hash,
             limitations=("Synthetic fixture evidence only.",),
         )

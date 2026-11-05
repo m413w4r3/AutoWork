@@ -566,7 +566,9 @@ class DetectionReviewService:
                     parent_v5 = parent_document
                 else:
                     raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
-                if provenance.base_publication_sha256 != publication_document_v5_sha256(parent_v5):
+                if (
+                    provenance.base_publication_body_sha256 or provenance.base_publication_sha256
+                ) != publication_document_v5_sha256(parent_v5):
                     raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
         digest = hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
         if document.schema_version == "6":

@@ -22,34 +22,57 @@ type PreviewClassification = {
   anchor: string;
 };
 
+function publicationV5(title: string, subjectId: string) {
+  return {
+    schema_version: "5",
+    subject_id: subjectId,
+    publication_language: "fr",
+    title,
+    lead: [],
+    sections: [],
+    timeline: [],
+    indicators: [],
+    sources: [],
+    uncertainties: [],
+    tables: [],
+    diagrams: [],
+    figures: [],
+    references: [],
+    original_indicators: [],
+    rich_text: {
+      schema_version: "1",
+      policy_version: "semantic-policy-v1",
+      paragraphs: [],
+    },
+  };
+}
+
+function publicationV6(title: string, subjectId: string) {
+  return {
+    schema_version: "6",
+    base_publication: publicationV5(title, subjectId),
+    provenance: {
+      base_publication_artifact_id: "33333333-3333-4333-8333-333333333333",
+      base_publication_sha256: HASH,
+      investigation_id: null,
+      opinion_id: null,
+      opinion_version: null,
+      opinion_content_sha256: null,
+      reviewer_id: null,
+      approver_id: null,
+    },
+    analyst_opinion: null,
+    rendered_opinion: null,
+  };
+}
+
 function briefDocument(title: string, subjectId = "subject-brief") {
   return {
     schema_version: "7",
     publication_kind: "brief",
     routing_decision_hash: "b".repeat(64),
     routing_policy_version: "routing-policy-v1",
-    base_publication: {
-      schema_version: "6",
-      subject_id: subjectId,
-      publication_language: "fr",
-      title,
-      lead: [],
-      sections: [],
-      timeline: [],
-      indicators: [],
-      sources: [],
-      uncertainties: [],
-      tables: [],
-      diagrams: [],
-      figures: [],
-      references: [],
-      original_indicators: [],
-      rich_text: {
-        schema_version: "1",
-        policy_version: "semantic-policy-v1",
-        paragraphs: [],
-      },
-    },
+    base_publication: publicationV6(title, subjectId),
   };
 }
 
@@ -57,18 +80,11 @@ function articleDocument(title: string, subjectId = "subject-article") {
   return {
     ...briefDocument(title, subjectId),
     publication_kind: "article",
-    base_publication: {
-      ...briefDocument(title, subjectId).base_publication,
-      subject_id: subjectId,
-    },
   };
 }
 
 function legacyDocument(title: string, subjectId: string) {
-  return {
-    ...briefDocument(title, subjectId).base_publication,
-    schema_version: "6",
-  };
+  return publicationV6(title, subjectId);
 }
 
 function renderPreview(

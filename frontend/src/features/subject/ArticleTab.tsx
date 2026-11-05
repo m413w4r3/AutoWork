@@ -158,8 +158,10 @@ function PublicationContent({ content }: { content: SubjectContentResponse }) {
       : "article";
   const document =
     content.canonical_content.schema_version === "7"
-      ? content.canonical_content.base_publication
-      : content.canonical_content;
+      ? content.canonical_content.base_publication.base_publication
+      : content.canonical_content.schema_version === "6"
+        ? content.canonical_content.base_publication
+        : content.canonical_content;
   return (
     <section
       className="subject-article"

@@ -64,7 +64,9 @@ from cti_app.domain.production import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
+    PublicationDocumentV7,
     publication_document_from_json,
+    publication_document_v5_sha256,
     serialize_publication_document,
 )
 from cti_app.infrastructure.database.models.investigation import InvestigationWorkingStateRow
@@ -695,8 +697,13 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         production.run_id, ProductionStage.SYNTHESIS, force_recompute=False
     )
     assert retry.previous_status.value == "needs_review"
+    assert retry.run.current_stage is ProductionStage.SYNTHESIS
     assert ProductionArtifactStage.EXTRACTION.value not in retry.staled_artifacts
-    assert ProductionArtifactStage.SYNTHESIS.value in retry.staled_artifacts
+    # The malformed attempt did not persist a synthesis artifact. The retry
+    # starts at Synthesis, while staled_artifacts lists only rows actually
+    # transitioned to STALE.
+    assert ProductionArtifactStage.SYNTHESIS.value not in prior_stage_ids
+    assert ProductionArtifactStage.SYNTHESIS.value not in retry.staled_artifacts
     production_chain = ProductionStageChain(ProductionPacingPolicy.zero())
     production_chain.bind(production.jobs, production.runner)
     retried_job = await production_chain.submit(
@@ -782,8 +789,11 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     assert synthesis.canonical_blob_id is not None
     publication_bytes = await production.artifact_store.read_bytes(publication.canonical_blob_id)
     publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
-    document = publication_document_from_json(json.loads(publication_bytes))
+    publication_envelope = publication_document_from_json(json.loads(publication_bytes))
+    assert isinstance(publication_envelope, PublicationDocumentV7)
+    document = publication_envelope.base_publication.base_publication
     assert isinstance(document, PublicationDocumentV5)
+    publication_body_sha256 = publication_document_v5_sha256(document)
     document_payload = serialize_publication_document(document)
     assert str(subject_id) == str(document.document.subject_id)
     assert sample_material.seed_hash in json.dumps(document_payload)
@@ -1408,6 +1418,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         opinion_id,
         version=revised_v3["version"],
         sha256=revised_v3["content_sha256"],
+        acknowledge_bridge_drafting_gap=True,
     )
     assert approved_opinion.status_code == 200, approved_opinion.text
     approved_payload = approved_opinion.json()["approved"]
@@ -1435,10 +1446,16 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     assert composition_before_repin.version == composition_v5_version
     assert manifest_before_repin is not None and manifest_before_repin.id == accepted_v5.manifest.id
     v6_bytes = await production.artifact_store.read_bytes(v6_artifact.canonical_blob_id)
-    v6_document = publication_document_from_json(json.loads(v6_bytes))
+    augmented_envelope = publication_document_from_json(json.loads(v6_bytes))
+    assert isinstance(augmented_envelope, PublicationDocumentV7)
+    assert augmented_envelope.publication_kind is publication_envelope.publication_kind
+    assert augmented_envelope.routing_decision_hash == publication_envelope.routing_decision_hash
+    assert augmented_envelope.routing_policy_version == publication_envelope.routing_policy_version
+    v6_document = augmented_envelope.base_publication
     assert isinstance(v6_document, PublicationDocumentV6)
     assert v6_document.provenance.base_publication_artifact_id == publication.id
     assert v6_document.provenance.base_publication_sha256 == publication_sha256
+    assert v6_document.provenance.base_publication_body_sha256 == publication_body_sha256
     assert v6_document.provenance.opinion_id == opinion_id
     assert v6_document.provenance.opinion_version == approved_payload["version"]
     assert v6_document.provenance.opinion_content_sha256 == approved_payload["content_sha256"]
@@ -1657,6 +1674,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     )
     assert accepted_v5.manifest.content_sha256 != accepted_v6.manifest.content_sha256
     assert publication_sha256 == v6_document.provenance.base_publication_sha256
+    assert publication_body_sha256 == v6_document.provenance.base_publication_body_sha256
     assert len(preview_v1_pages) == len(preview_v3_pages) >= 1
     assert len(final_pdf_pages) >= 1
     assert checkpoint_path.is_file()

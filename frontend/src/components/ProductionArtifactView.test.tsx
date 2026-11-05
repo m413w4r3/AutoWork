@@ -26,6 +26,25 @@ function evidenceRef(documentId: string, kind: string) {
   };
 }
 
+function publicationV6(basePublication: Record<string, unknown>) {
+  return {
+    schema_version: "6",
+    base_publication: basePublication,
+    provenance: {
+      base_publication_artifact_id: "33333333-3333-4333-8333-333333333333",
+      base_publication_sha256: "a".repeat(64),
+      investigation_id: null,
+      opinion_id: null,
+      opinion_version: null,
+      opinion_content_sha256: null,
+      reviewer_id: null,
+      approver_id: null,
+    },
+    analyst_opinion: null,
+    rendered_opinion: null,
+  };
+}
+
 function extractionSource(documentId: string, canonicalUrl: string) {
   return {
     source_document_id: documentId,
@@ -1285,6 +1304,8 @@ it("applique les rôles typographiques sémantiques d’un document V5", async (
           tables: [],
           diagrams: [],
           figures: [],
+          references: [],
+          original_indicators: [],
           rich_text: {
             schema_version: "1",
             policy_version:
@@ -1337,82 +1358,84 @@ it("affiche les références datées et les deux groupes IOC d’une publication
         status: "verified",
         metadata: {},
         canonical_content: {
-          schema_version: "6",
-          subject_id: SYNTHESIS_SUBJECT_ID,
-          publication_language: "fr",
-          title: "[Groupe] Activité documentée",
-          lead: [
-            {
-              text: "Le groupe exploite un accès initial.",
-              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+          ...publicationV6({
+            schema_version: "5",
+            subject_id: SYNTHESIS_SUBJECT_ID,
+            publication_language: "fr",
+            title: "[Groupe] Activité documentée",
+            lead: [
+              {
+                text: "Le groupe exploite un accès initial.",
+                evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+              },
+            ],
+            sections: [],
+            timeline: [],
+            indicators: [
+              {
+                artifact_type: "domain",
+                indicators: [
+                  {
+                    value: "c2.example",
+                    normalized_value: "c2.example",
+                    artifact_type: "domain",
+                    source_document_ids: [VENDOR_DOCUMENT_ID],
+                  },
+                ],
+              },
+            ],
+            sources: [
+              {
+                source_document_id: VENDOR_DOCUMENT_ID,
+                canonical_url: VENDOR_URL,
+                title: "Rapport du fournisseur",
+                publisher: "Vendor Labs",
+                published_at: "2026-09-01T10:00:00Z",
+                tier: "core",
+                kind: "publication",
+                role: "primary",
+              },
+              {
+                source_document_id: IOC_DOCUMENT_ID,
+                canonical_url: IOC_URL,
+                title: "Flux de recherche",
+                publisher: "Research Labs",
+                published_at: null,
+                tier: "supporting",
+                kind: "publication",
+                role: "independent",
+              },
+            ],
+            uncertainties: [],
+            tables: [],
+            diagrams: [],
+            figures: [],
+            references: [
+              {
+                source_document_id: VENDOR_DOCUMENT_ID,
+                text: "Vendor Labs publie le rapport sur cette activité.",
+                evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+              },
+            ],
+            original_indicators: [
+              {
+                artifact_type: "domain",
+                indicators: [
+                  {
+                    value: "observed.example",
+                    normalized_value: "observed.example",
+                    artifact_type: "domain",
+                    source_document_ids: [IOC_DOCUMENT_ID],
+                  },
+                ],
+              },
+            ],
+            rich_text: {
+              schema_version: "1",
+              policy_version: "semantic-annotation-policy-v3",
+              paragraphs: [],
             },
-          ],
-          sections: [],
-          timeline: [],
-          indicators: [
-            {
-              artifact_type: "domain",
-              indicators: [
-                {
-                  value: "c2.example",
-                  normalized_value: "c2.example",
-                  artifact_type: "domain",
-                  source_document_ids: [VENDOR_DOCUMENT_ID],
-                },
-              ],
-            },
-          ],
-          sources: [
-            {
-              source_document_id: VENDOR_DOCUMENT_ID,
-              canonical_url: VENDOR_URL,
-              title: "Rapport du fournisseur",
-              publisher: "Vendor Labs",
-              published_at: "2026-09-01T10:00:00Z",
-              tier: "core",
-              kind: "publication",
-              role: "primary",
-            },
-            {
-              source_document_id: IOC_DOCUMENT_ID,
-              canonical_url: IOC_URL,
-              title: "Flux de recherche",
-              publisher: "Research Labs",
-              published_at: null,
-              tier: "supporting",
-              kind: "publication",
-              role: "independent",
-            },
-          ],
-          uncertainties: [],
-          tables: [],
-          diagrams: [],
-          figures: [],
-          references: [
-            {
-              source_document_id: VENDOR_DOCUMENT_ID,
-              text: "Vendor Labs publie le rapport sur cette activité.",
-              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
-            },
-          ],
-          original_indicators: [
-            {
-              artifact_type: "domain",
-              indicators: [
-                {
-                  value: "observed.example",
-                  normalized_value: "observed.example",
-                  artifact_type: "domain",
-                  source_document_ids: [IOC_DOCUMENT_ID],
-                },
-              ],
-            },
-          ],
-          rich_text: {
-            schema_version: "1",
-            policy_version: "semantic-annotation-policy-v3",
-            paragraphs: [],
-          },
+          }),
         },
       }),
     ),
@@ -1478,8 +1501,8 @@ it("affiche une brève V7 avec chronologie et synthèse sans annexe IOC", async 
             publication_kind: "brief",
             routing_decision_hash: "b".repeat(64),
             routing_policy_version: "subject-publication-routing-v1",
-            base_publication: {
-              schema_version: "6",
+            base_publication: publicationV6({
+              schema_version: "5",
               subject_id: SYNTHESIS_SUBJECT_ID,
               publication_language: "fr",
               title: "Campagne documentée en bref",
@@ -1521,7 +1544,7 @@ it("affiche une brève V7 avec chronologie et synthèse sans annexe IOC", async 
                 policy_version: "semantic-annotation-policy-v3",
                 paragraphs: [],
               },
-            },
+            }),
           },
         }),
       );

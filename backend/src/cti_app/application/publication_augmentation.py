@@ -39,6 +39,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6ProvenanceV1,
     PublicationDocumentV6ValidationError,
     PublicationDocumentV7,
+    publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_v5_sha256,
     serialize_publication_document,
@@ -148,7 +149,16 @@ def augment_publication_with_opinion(
     if citation_context.do_not_submit:
         raise PublicationAugmentationError(PublicationAugmentationErrorCode.DO_NOT_SUBMIT)
 
-    base_sha256 = publication_document_v5_sha256(base_publication_document)
+    base_body_sha256 = publication_document_v5_sha256(base_publication_document)
+    base_sha256 = (
+        hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(
+                serialize_publication_document(routed_base)
+            )
+        ).hexdigest()
+        if routed_base is not None
+        else base_body_sha256
+    )
     if (
         citation_context.base_publication_sha256 != base_sha256
         or opinion.base_publication_artifact_id != citation_context.base_publication_artifact_id
@@ -212,6 +222,7 @@ def augment_publication_with_opinion(
     provenance = PublicationDocumentV6ProvenanceV1(
         base_publication_artifact_id=citation_context.base_publication_artifact_id,
         base_publication_sha256=base_sha256,
+        base_publication_body_sha256=(base_body_sha256 if routed_base is not None else None),
         investigation_id=opinion.investigation_id,
         opinion_id=opinion.id,
         opinion_version=opinion.version,
@@ -391,18 +402,24 @@ class PublicationAugmentationArtifactService:
                 raise PublicationAugmentationError(
                     PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
                 ) from exc
-            if not isinstance(base_document, PublicationDocumentV5):
+            base_document_v5 = publication_document_article_v5_body(base_document)
+            if base_document_v5 is None:
                 raise PublicationAugmentationError(
                     PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
                 )
-            if publication_document_v5_sha256(base_document) != base_blob_sha256:
+            if (
+                self._artifact_store.canonical_json_bytes(
+                    serialize_publication_document(base_document)
+                )
+                != base_bytes
+            ):
                 raise PublicationAugmentationError(
                     PublicationAugmentationErrorCode.BASE_IDENTITY_MISMATCH
                 )
 
             infrastructure_graph = await self._graph_source.project(
                 investigation_id=opinion.investigation_id,
-                publication=base_document,
+                publication=base_document_v5,
                 observations=citation_context.observations,
                 findings=citation_context.findings,
             )
