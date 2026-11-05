@@ -19,6 +19,7 @@ from cti_app.api.production import (
 )
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.collection_errors import CollectionNotAllowedError
+from cti_app.application.edition_classification import classify_edition_publications
 from cti_app.application.edition_preview import (
     EditionPreviewError,
     EditionPreviewRenderError,
@@ -95,6 +96,7 @@ from cti_app.domain.production import (
     RepairDecisionApplicationState,
 )
 from cti_app.domain.production import RepairExecutionPlan as DomainRepairExecutionPlan
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.production_references import (
     ProductionSourceCriticality,
     ProductionSourceCriticalityReason,
@@ -424,6 +426,14 @@ class EditionPreviewArtifactView(BaseModel):
     input_hash: str
 
 
+class EditionPreviewClassificationView(BaseModel):
+    position: int
+    subject_id: UUID
+    kind: PublicationKind
+    number: str
+    anchor: str
+
+
 class EditionPreviewView(BaseModel):
     edition_id: UUID
     edition_version: int
@@ -431,6 +441,7 @@ class EditionPreviewView(BaseModel):
     composition_version: int
     preview_input_hash: str
     artifacts: list[EditionPreviewArtifactView]
+    classifications: list[EditionPreviewClassificationView]
     document: dict[str, Any]
     partial: bool
     missing_subject_ids: list[UUID]
@@ -1567,6 +1578,16 @@ async def get_edition_preview(
                 input_hash=artifact.input_hash,
             )
             for artifact in preview.artifacts
+        ],
+        classifications=[
+            EditionPreviewClassificationView(
+                position=item.publication.position,
+                subject_id=item.publication.subject_id,
+                kind=item.kind,
+                number=item.number,
+                anchor=item.anchor,
+            )
+            for item in classify_edition_publications(preview.document.publications)
         ],
         document=preview.document.to_json(),
         partial=preview.partial,

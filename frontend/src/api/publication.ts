@@ -111,6 +111,14 @@ export interface EditionPreviewArtifact {
   input_hash: string;
 }
 
+export interface EditionPreviewClassification {
+  position: number;
+  subject_id: string;
+  kind: "article" | "brief";
+  number: string;
+  anchor: string;
+}
+
 export interface EditionDocumentV2 {
   schema_version: "2";
   edition: {
@@ -140,6 +148,7 @@ export interface EditionPreviewResponse {
   composition_version: number;
   preview_input_hash: string;
   artifacts: EditionPreviewArtifact[];
+  classifications: EditionPreviewClassification[];
   document: EditionDocumentV2;
   partial: boolean;
   missing_subject_ids: string[];

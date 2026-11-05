@@ -8,7 +8,21 @@ afterEach(() => vi.unstubAllGlobals());
 
 const HASH = "a".repeat(64);
 
-function briefDocument(title: string) {
+type PreviewPublication = {
+  position: number;
+  subject_id: string;
+  document: object;
+};
+
+type PreviewClassification = {
+  position: number;
+  subject_id: string;
+  kind: "article" | "brief";
+  number: string;
+  anchor: string;
+};
+
+function briefDocument(title: string, subjectId = "subject-brief") {
   return {
     schema_version: "7",
     publication_kind: "brief",
@@ -16,7 +30,7 @@ function briefDocument(title: string) {
     routing_policy_version: "routing-policy-v1",
     base_publication: {
       schema_version: "6",
-      subject_id: "subject-brief",
+      subject_id: subjectId,
       publication_language: "fr",
       title,
       lead: [],
@@ -39,20 +53,28 @@ function briefDocument(title: string) {
   };
 }
 
-function articleDocument(title: string) {
+function articleDocument(title: string, subjectId = "subject-article") {
   return {
-    schema_version: "7",
+    ...briefDocument(title, subjectId),
     publication_kind: "article",
-    routing_decision_hash: "c".repeat(64),
-    routing_policy_version: "routing-policy-v1",
     base_publication: {
-      ...briefDocument(title).base_publication,
-      subject_id: "subject-article",
+      ...briefDocument(title, subjectId).base_publication,
+      subject_id: subjectId,
     },
   };
 }
 
-it("groups mixed publications and keeps backend positions continuous", async () => {
+function legacyDocument(title: string, subjectId: string) {
+  return {
+    ...briefDocument(title, subjectId).base_publication,
+    schema_version: "6",
+  };
+}
+
+function renderPreview(
+  publications: PreviewPublication[],
+  classifications: PreviewClassification[],
+) {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
@@ -63,6 +85,7 @@ it("groups mixed publications and keeps backend positions continuous", async () 
         composition_version: 2,
         preview_input_hash: HASH,
         artifacts: [],
+        classifications,
         document: {
           schema_version: "2",
           edition: {
@@ -78,18 +101,7 @@ it("groups mixed publications and keeps backend positions continuous", async () 
             created_at: "2026-10-01T00:00:00Z",
             updated_at: "2026-10-01T00:00:00Z",
           },
-          publications: [
-            {
-              position: 2,
-              subject_id: "subject-brief",
-              document: briefDocument("Chronologie courte"),
-            },
-            {
-              position: 1,
-              subject_id: "subject-article",
-              document: articleDocument("Analyse détaillée"),
-            },
-          ],
+          publications,
         },
         partial: false,
         missing_subject_ids: [],
@@ -107,6 +119,51 @@ it("groups mixed publications and keeps backend positions continuous", async () 
       <EditionPreviewPanel editionId="edition-1" compositionPreview />
     </QueryClientProvider>,
   );
+}
+
+it("uses backend groups, numbers, and anchors for mixed editions", async () => {
+  renderPreview(
+    [
+      {
+        position: 2,
+        subject_id: "subject-brief",
+        document: briefDocument("Chronologie courte"),
+      },
+      {
+        position: 3,
+        subject_id: "subject-article-2",
+        document: articleDocument("Deuxième analyse", "subject-article-2"),
+      },
+      {
+        position: 1,
+        subject_id: "subject-article-1",
+        document: articleDocument("Analyse détaillée", "subject-article-1"),
+      },
+    ],
+    [
+      {
+        position: 1,
+        subject_id: "subject-article-1",
+        kind: "article",
+        number: "01",
+        anchor: "article01",
+      },
+      {
+        position: 3,
+        subject_id: "subject-article-2",
+        kind: "article",
+        number: "02",
+        anchor: "article02",
+      },
+      {
+        position: 2,
+        subject_id: "subject-brief",
+        kind: "brief",
+        number: "03",
+        anchor: "breve03",
+      },
+    ],
+  );
 
   const articleGroup = await screen.findByRole("region", { name: "ARTICLES" });
   const briefGroup = screen.getByRole("region", { name: "BRÈVES" });
@@ -114,10 +171,133 @@ it("groups mixed publications and keeps backend positions continuous", async () 
     within(articleGroup).getByRole("heading", { name: "Article 01" }),
   ).toBeInTheDocument();
   expect(
+    within(articleGroup).getByRole("heading", { name: "Article 02" }),
+  ).toBeInTheDocument();
+  expect(
+    within(briefGroup).getByRole("heading", { name: "Brève 03" }),
+  ).toBeInTheDocument();
+  expect(document.getElementById("article01")).toBeInTheDocument();
+  expect(document.getElementById("article02")).toBeInTheDocument();
+  expect(document.getElementById("breve03")).toBeInTheDocument();
+  expect(within(articleGroup).getAllByText("Format : Article")).toHaveLength(2);
+  expect(within(briefGroup).getByText("Format : Brève")).toBeInTheDocument();
+});
+
+it("numbers articles and briefs from their respective backend groups", async () => {
+  renderPreview(
+    [
+      {
+        position: 2,
+        subject_id: "article-2",
+        document: articleDocument("Article 2", "article-2"),
+      },
+      {
+        position: 1,
+        subject_id: "article-1",
+        document: articleDocument("Article 1", "article-1"),
+      },
+    ],
+    [
+      {
+        position: 1,
+        subject_id: "article-1",
+        kind: "article",
+        number: "01",
+        anchor: "article01",
+      },
+      {
+        position: 2,
+        subject_id: "article-2",
+        kind: "article",
+        number: "02",
+        anchor: "article02",
+      },
+    ],
+  );
+
+  const articleGroup = await screen.findByRole("region", { name: "ARTICLES" });
+  expect(
+    within(articleGroup).getByRole("heading", { name: "Article 01" }),
+  ).toBeInTheDocument();
+  expect(
+    within(articleGroup).getByRole("heading", { name: "Article 02" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "BRÈVES" }),
+  ).not.toBeInTheDocument();
+});
+
+it("numbers a briefs-only edition from the backend classification", async () => {
+  renderPreview(
+    [
+      {
+        position: 2,
+        subject_id: "brief-2",
+        document: briefDocument("Brève 2", "brief-2"),
+      },
+      {
+        position: 1,
+        subject_id: "brief-1",
+        document: briefDocument("Brève 1", "brief-1"),
+      },
+    ],
+    [
+      {
+        position: 1,
+        subject_id: "brief-1",
+        kind: "brief",
+        number: "01",
+        anchor: "breve01",
+      },
+      {
+        position: 2,
+        subject_id: "brief-2",
+        kind: "brief",
+        number: "02",
+        anchor: "breve02",
+      },
+    ],
+  );
+
+  const briefGroup = await screen.findByRole("region", { name: "BRÈVES" });
+  expect(
+    within(briefGroup).getByRole("heading", { name: "Brève 01" }),
+  ).toBeInTheDocument();
+  expect(
     within(briefGroup).getByRole("heading", { name: "Brève 02" }),
   ).toBeInTheDocument();
   expect(
-    within(articleGroup).getByText("Format : Article"),
+    screen.queryByRole("region", { name: "ARTICLES" }),
+  ).not.toBeInTheDocument();
+});
+
+it("uses backend legacy classification for documents without an explicit kind", async () => {
+  renderPreview(
+    [
+      {
+        position: 1,
+        subject_id: "legacy-brief",
+        document: legacyDocument("Brève historique", "legacy-brief"),
+      },
+    ],
+    [
+      {
+        position: 1,
+        subject_id: "legacy-brief",
+        kind: "brief",
+        number: "01",
+        anchor: "breve01",
+      },
+    ],
+  );
+
+  const briefGroup = await screen.findByRole("region", { name: "BRÈVES" });
+  expect(
+    within(briefGroup).getByRole("heading", { name: "Brève 01" }),
   ).toBeInTheDocument();
+  expect(document.getElementById("breve01")).toBeInTheDocument();
   expect(within(briefGroup).getByText("Format : Brève")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "ARTICLES" }),
+  ).not.toBeInTheDocument();
 });

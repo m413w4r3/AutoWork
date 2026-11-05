@@ -571,6 +571,22 @@ async def test_preview_api_serializes_document_and_pdf_route_fences_staleness(
     assert composition_preview_response.json()["partial"] is False
     preview_body = preview_response.json()
     assert "document" in preview_body
+    assert preview_body["classifications"] == [
+        {
+            "position": 1,
+            "subject_id": str(SUBJECT_IDS[0]),
+            "kind": "brief",
+            "number": "01",
+            "anchor": "breve01",
+        },
+        {
+            "position": 2,
+            "subject_id": str(SUBJECT_IDS[1]),
+            "kind": "brief",
+            "number": "02",
+            "anchor": "breve02",
+        },
+    ]
     assert "canonical_markdown" not in preview_body
     assert "sanitized_html" not in preview_body
     assert preview_body["document"]["schema_version"] == "2"

@@ -12,14 +12,12 @@ import {
 import type { PublicationDocumentArtifact } from "../../api/production";
 import { PublicationDocumentView } from "../../components/ProductionArtifactView";
 
-function publicationDisplay(document: PublicationDocumentArtifact) {
-  if (document.schema_version === "7") {
-    return {
-      document: document.base_publication,
-      publicationKind: document.publication_kind,
-    };
-  }
-  return { document, publicationKind: "article" as const };
+function publicationContent(document: PublicationDocumentArtifact) {
+  return document.schema_version === "7" ? document.base_publication : document;
+}
+
+function classificationKey(position: number, subjectId: string) {
+  return `${position}:${subjectId}`;
 }
 
 export function EditionPreviewPanel({
@@ -82,16 +80,34 @@ export function EditionPreviewPanel({
   if (!preview.data) return null;
 
   const current = preview.data;
-  const orderedPublications = current.document.publications
-    .slice()
-    .sort((left, right) => left.position - right.position);
-  const articles = orderedPublications.filter(
-    (publication) =>
-      publicationDisplay(publication.document).publicationKind === "article",
+  const classificationsByPublication = new Map(
+    (current.classifications ?? []).map((classification) => [
+      classificationKey(classification.position, classification.subject_id),
+      classification,
+    ]),
   );
-  const briefs = orderedPublications.filter(
-    (publication) =>
-      publicationDisplay(publication.document).publicationKind === "brief",
+  const classifiedPublications = current.document.publications
+    .slice()
+    .sort((left, right) => left.position - right.position)
+    .flatMap((publication) => {
+      const classification = classificationsByPublication.get(
+        classificationKey(publication.position, publication.subject_id),
+      );
+      return classification ? [{ publication, classification }] : [];
+    });
+  if (classifiedPublications.length !== current.document.publications.length) {
+    return (
+      <p className="error-message" role="alert">
+        La classification des publications est indisponible pour cette
+        prévisualisation.
+      </p>
+    );
+  }
+  const articles = classifiedPublications.filter(
+    ({ classification }) => classification.kind === "article",
+  );
+  const briefs = classifiedPublications.filter(
+    ({ classification }) => classification.kind === "brief",
   );
   return (
     <section
@@ -156,16 +172,13 @@ export function EditionPreviewPanel({
         {articles.length > 0 ? (
           <section aria-label="ARTICLES">
             <h3>ARTICLES</h3>
-            {articles.map((publication) => {
-              const display = publicationDisplay(publication.document);
+            {articles.map(({ publication, classification }) => {
               return (
-                <section key={publication.position}>
-                  <h4>
-                    Article {String(publication.position).padStart(2, "0")}
-                  </h4>
+                <section key={classification.anchor} id={classification.anchor}>
+                  <h4>Article {classification.number}</h4>
                   <PublicationDocumentView
-                    document={display.document}
-                    publicationKind={display.publicationKind}
+                    document={publicationContent(publication.document)}
+                    publicationKind={classification.kind}
                   />
                 </section>
               );
@@ -175,14 +188,13 @@ export function EditionPreviewPanel({
         {briefs.length > 0 ? (
           <section aria-label="BRÈVES">
             <h3>BRÈVES</h3>
-            {briefs.map((publication) => {
-              const display = publicationDisplay(publication.document);
+            {briefs.map(({ publication, classification }) => {
               return (
-                <section key={publication.position}>
-                  <h4>Brève {String(publication.position).padStart(2, "0")}</h4>
+                <section key={classification.anchor} id={classification.anchor}>
+                  <h4>Brève {classification.number}</h4>
                   <PublicationDocumentView
-                    document={display.document}
-                    publicationKind={display.publicationKind}
+                    document={publicationContent(publication.document)}
+                    publicationKind={classification.kind}
                   />
                 </section>
               );
