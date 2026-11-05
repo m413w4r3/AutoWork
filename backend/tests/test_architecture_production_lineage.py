@@ -100,6 +100,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0005_sample_acquisition_dispatch.py",
         "0006_tool_seconds_accounting.py",
         "0007_tool_invocation_vt_retry_trust.py",
+        "0008_production_routing.py",
     ]
 
 
