@@ -447,12 +447,13 @@ async def test_complete_production_pipeline_reaches_ready(
     assert "core-c2.security-lab.io" in str(publication_payload)
     assert "secondary-c2.security-lab.io" in str(publication_payload)
     assert publication_payload["schema_version"] == "7"
-    assert publication_payload["title"] == synthesis_payload["title"]
-    assert publication_payload["lead"] == synthesis_payload["lead"]
-    assert publication_payload["sections"] == synthesis_payload["sections"]
-    assert publication_payload["timeline"] == synthesis_payload["timeline"]
+    publication_document_payload = publication_payload["base_publication"]["base_publication"]
+    assert publication_document_payload["title"] == synthesis_payload["title"]
+    assert publication_document_payload["lead"] == synthesis_payload["lead"]
+    assert publication_document_payload["sections"] == synthesis_payload["sections"]
+    assert publication_document_payload["timeline"] == synthesis_payload["timeline"]
     assert {
-        source["source_document_id"] for source in publication_payload["sources"]
+        source["source_document_id"] for source in publication_document_payload["sources"]
     } == reference_source_ids
     assert "[S1]" not in str(publication_payload)
     extraction_indicator_values = {
@@ -462,7 +463,7 @@ async def test_complete_production_pipeline_reaches_ready(
     }
     publication_indicator_values = {
         value["value"]
-        for group in publication_payload["indicators"]
+        for group in publication_document_payload["indicators"]
         for value in group["indicators"]
     }
     assert publication_indicator_values == extraction_indicator_values

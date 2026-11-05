@@ -565,9 +565,10 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
         publication_artifact.canonical_blob_id
     )
     assert publication_payload["schema_version"] == "7"
+    publication_document_payload = publication_payload["base_publication"]["base_publication"]
     publication_text = json.dumps(publication_payload)
-    assert publication_payload["title"] == synthesis.title
-    assert [item["text"] for item in publication_payload["lead"]] == [
+    assert publication_document_payload["title"] == synthesis.title
+    assert [item["text"] for item in publication_document_payload["lead"]] == [
         item.text for item in synthesis.lead
     ]
     assert "is documented by the selected publications." in publication_text

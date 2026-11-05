@@ -378,6 +378,41 @@ def test_critical_source_omission_needs_review_with_explicit_diagnostic():
     assert decision.critical_source_diagnostics[0].source_url == omission.canonical_url
 
 
+def test_confirmed_subject_ioc_routes_article_despite_critical_source_omission():
+    omission = ProductionExtractionOmissionV1(
+        canonical_url="https://critical.example/report",
+        tier=ProductionReferenceTier.CORE,
+        collection_state=CollectionState.ARCHIVED,
+        reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+        error_code=None,
+    )
+    extraction = _extraction(
+        indicators=(_indicator("c2.example"),),
+        omitted_sources=(omission,),
+    )
+    decision = _inputs(
+        extraction,
+        _projection(
+            extraction,
+            decisions={
+                "c2.example": (
+                    RelevanceClassification.DIRECT,
+                    RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+                )
+            },
+        ),
+    )
+    assert decision.status is RoutingStatus.DECIDED, (
+        decision.reason_code,
+        decision.confirmed_ioc_count,
+        decision.critical_source_diagnostics,
+    )
+    assert decision.publication_kind is PublicationKind.ARTICLE
+    assert decision.reason_code is RoutingReasonCode.SUBJECT_IOC_CONFIRMED
+    assert decision.confirmed_ioc_count == 1
+    assert len(decision.critical_source_diagnostics) == 1
+
+
 def test_unaccounted_source_extraction_failure_needs_review():
     omission = ProductionExtractionOmissionV1(
         canonical_url="https://secondary.example/report",

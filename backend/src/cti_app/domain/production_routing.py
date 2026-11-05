@@ -325,6 +325,7 @@ def decide_publication_routing(
 
     extraction = extraction_input.payload
     projection = relevance_input.payload
+    source_availability_reason: RoutingReasonCode | None = None
     if reason is None:
         assert isinstance(extraction, ProductionExtractionV1)
         assert isinstance(projection, RelevanceProjectionV1)
@@ -401,12 +402,12 @@ def decide_publication_routing(
         )
         if reason is None:
             if missing_diagnostic:
-                reason = RoutingReasonCode.INCOMPLETE_EXTRACTION
+                source_availability_reason = RoutingReasonCode.INCOMPLETE_EXTRACTION
             elif any(
                 diagnostic.criticality is ProductionSourceCriticality.CRITICAL
                 for diagnostic in diagnostics
             ):
-                reason = RoutingReasonCode.CRITICAL_SOURCE_MISSING
+                source_availability_reason = RoutingReasonCode.CRITICAL_SOURCE_MISSING
 
     status = RoutingStatus.NEEDS_REVIEW if reason is not None else RoutingStatus.DECIDED
     publication_kind: PublicationKind | None = None
@@ -490,6 +491,9 @@ def decide_publication_routing(
             if subject_iocs:
                 publication_kind = PublicationKind.ARTICLE
                 reason = RoutingReasonCode.SUBJECT_IOC_CONFIRMED
+            elif source_availability_reason is not None:
+                status = RoutingStatus.NEEDS_REVIEW
+                reason = source_availability_reason
             else:
                 publication_kind = PublicationKind.BRIEF
                 reason = RoutingReasonCode.NO_SUBJECT_IOC
