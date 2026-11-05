@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -40,6 +41,7 @@ async def test_publication_is_idempotent_and_preserves_the_previous_v5_blob() ->
         "editor:one",
         "Citations and reservations checked",
         idempotency_key="approval-1",
+        bridge_drafting_gap_acknowledged=True,
     )
     service = _publication_service(harness)
 
@@ -61,10 +63,44 @@ async def test_publication_is_idempotent_and_preserves_the_previous_v5_blob() ->
     assert artifact.status is ProductionArtifactStatus.VERIFIED
     assert artifact.version == harness.base_artifact.version + 1
     assert artifact.metadata["previous_publication_artifact_id"] == str(harness.base_artifact.id)
+    assert artifact.metadata["publication_augmentation"]["bridge_drafting_gap_acknowledged"] is True
     assert harness.store.blobs[harness.base_artifact.canonical_blob_id] == harness.base_bytes
     assert len(harness.artifacts.appended) == 1
     assert harness.uow.composition_writes == 0
     assert harness.uow.manifest_writes == 0
+
+
+@pytest.mark.asyncio
+async def test_publication_requires_explicit_bridge_gap_ack_for_legacy_approved_opinions() -> None:
+    harness = make_opinion_harness()
+    draft = await harness.service.compose_from_findings(harness.investigation.id)
+    legacy_approved = replace(
+        draft,
+        version=draft.version + 1,
+        status=AnalystOpinionStatus.APPROVED,
+        reviewer_id="editor:one",
+        content_sha256="",
+    )
+    harness.uow.analyst_opinions.items[draft.id].append(legacy_approved)
+    service = _publication_service(harness)
+
+    with pytest.raises(OpinionError) as caught:
+        await service.publish_augmented_article(
+            legacy_approved.id,
+            legacy_approved.version,
+            "editor:one",
+            legacy_approved.base_publication_sha256,
+        )
+    assert caught.value.code is OpinionErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED
+
+    artifact = await service.publish_augmented_article(
+        legacy_approved.id,
+        legacy_approved.version,
+        "editor:one",
+        legacy_approved.base_publication_sha256,
+        bridge_drafting_gap_acknowledged=True,
+    )
+    assert artifact.metadata["publication_augmentation"]["bridge_drafting_gap_acknowledged"] is True
 
 
 @pytest.mark.asyncio
@@ -88,6 +124,7 @@ async def test_publication_refuses_unapproved_stale_base_and_missing_citations()
         draft.content_sha256,
         "editor:one",
         "Reviewed",
+        bridge_drafting_gap_acknowledged=True,
     )
     with pytest.raises(OpinionError) as changed_sha:
         await service.publish_augmented_article(

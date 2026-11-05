@@ -649,6 +649,7 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=1)
+    scenario.model.use_chatgpt_bridge_identity()
     scenario.model.script.q2(
         source_url=urls[0],
         response=BridgeTransportError(
@@ -664,6 +665,10 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     review = await scenario.run_until_terminal()
     assert review.status is ProductionRunStatus.NEEDS_REVIEW
     assert review.reconciliation is not None
+    async with scenario.uow_factory() as uow:
+        ambiguous_model_run = await uow.model_runs.get(review.reconciliation.model_run_id)
+    assert ambiguous_model_run is not None
+    assert ambiguous_model_run.bridge_request_id == f"{ambiguous_model_run.id}:a1"
 
     # The next production generation has a deterministic provider answer. The
     # probe itself only calls GET on the bridge and never invokes the model.

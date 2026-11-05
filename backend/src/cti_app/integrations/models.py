@@ -17,6 +17,7 @@ import httpx
 from pydantic import BaseModel
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.external_effects import (
     Ambiguous,
     Completed,
@@ -150,7 +151,7 @@ class HttpResponsesTransport:
             )
         except BridgeTransportError as exc:
             if idempotency_key:
-                exc.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
+                exc.bridge_request_id = bridge_request_fingerprint(idempotency_key)
             if not idempotency_key or not _should_reconcile_bridge_submission(exc):
                 raise
             return await self._reconcile_ambiguous_submission(
@@ -168,7 +169,7 @@ class HttpResponsesTransport:
         try:
             snapshot = await self.reconcile_bridge_submission(idempotency_key)
         except BridgeTransportError as reconcile_error:
-            reconcile_error.bridge_request_id = _bridge_idempotency_fingerprint(idempotency_key)
+            reconcile_error.bridge_request_id = bridge_request_fingerprint(idempotency_key)
             if (
                 reconcile_error.bridge_status == "failed"
                 and reconcile_error.verified_no_answer
@@ -238,6 +239,12 @@ class HttpResponsesTransport:
             headers["X-Correlation-ID"] = correlation_id
         read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
         timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
+        submission_started = False
+
+        def mark_request_submission_started() -> None:
+            nonlocal submission_started
+            submission_started = True
+            mark_bridge_submission_started()
 
         try:
             if self._client is not None:
@@ -252,11 +259,11 @@ class HttpResponsesTransport:
                         timeout=timeout,
                     )
                     if is_responses_submission:
-                        mark_bridge_submission_started()
+                        mark_request_submission_started()
                     response = await send(request, follow_redirects=False)
                 else:
                     if is_responses_submission:
-                        mark_bridge_submission_started()
+                        mark_request_submission_started()
                     response = await self._client.request(
                         method,
                         f"{self._base_url}{path}",
@@ -278,8 +285,38 @@ class HttpResponsesTransport:
                         timeout=timeout,
                     )
                     if is_responses_submission:
-                        mark_bridge_submission_started()
+                        mark_request_submission_started()
                     response = await client.send(request, follow_redirects=False)
+        except httpx.UnsupportedProtocol as exc:
+            raise BridgeTransportError(
+                "bridge_unsupported_protocol",
+                "Le transport Bridge ne prend pas en charge le protocole de cette URL.",
+                retryable=False,
+                phase=phase,
+                submission_state=(
+                    "pre_submission" if is_responses_submission or phase == "preflight" else None
+                ),
+            ) from exc
+        except (TypeError, ValueError, httpx.InvalidURL) as exc:
+            state = (
+                "submission_attempted"
+                if is_responses_submission and submission_started
+                else "pre_submission"
+                if is_responses_submission or phase == "preflight"
+                else None
+            )
+            raise BridgeTransportError(
+                "bridge_transport_error" if submission_started else "bridge_request_invalid",
+                (
+                    "Le transport Bridge a échoué après le début possible de l'envoi."
+                    if submission_started
+                    else "La requête Bridge n'a pas été créée à cause "
+                    "d'un paramètre local invalide."
+                ),
+                retryable=False,
+                phase=phase,
+                submission_state=state,
+            ) from exc
         except httpx.PoolTimeout as exc:
             raise BridgeTransportError(
                 "bridge_pool_timeout",
@@ -447,6 +484,17 @@ class HttpResponsesTransport:
                     headers=headers,
                     timeout=timeout,
                 )
+                if request.url.scheme not in {"http", "https"}:
+                    # HTTPX would reject this only in send(), after the external
+                    # effect coordinator has durably entered handoff. Reject it
+                    # while the failure is still provably local.
+                    raise BridgeTransportError(
+                        "bridge_unsupported_protocol",
+                        "Le transport Bridge ne prend pas en charge le protocole de cette URL.",
+                        retryable=False,
+                        phase="generation",
+                        submission_state="pre_submission",
+                    )
                 frozen_request = _freeze_httpx_request(request)
                 prepared = PreparedExternalRequest.build(
                     family=binding.family,
@@ -467,6 +515,8 @@ class HttpResponsesTransport:
                     evidence_refs=binding.evidence_refs,
                     credential_parameter_names=binding.credential_parameter_names,
                 )
+            except BridgeTransportError:
+                raise
             except (ExternalEffectValidationError, TypeError, ValueError) as exc:
                 reason = type(exc).__name__
                 raise _bridge_external_effect_refusal(
@@ -607,6 +657,7 @@ class BridgeTransportError(ModelGatewayError):
         retry_after: float | None = None,
         phase: str = "generation",
         status_code: int | None = None,
+        submission_request: bool | None = None,
         bridge_run_id: str | None = None,
         bridge_request_id: str | None = None,
         bridge_status: str | None = None,
@@ -626,6 +677,7 @@ class BridgeTransportError(ModelGatewayError):
         self.retry_after = retry_after
         self.phase = phase
         self.status_code = status_code
+        self.submission_request = submission_request
         self.bridge_run_id = bridge_run_id
         self.bridge_request_id = bridge_request_id
         self.bridge_status = bridge_status
@@ -748,7 +800,14 @@ def _bridge_submission_reconciliation_error(
 
 def _safe_external_effect_reason(value: object) -> str:
     """Keep internal refusal codes while excluding arbitrary exception text."""
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", value):
+    if (
+        isinstance(value, str)
+        and len(value) <= 255
+        and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_.-]{0,95}(?::(?:id|t|s|h|a)=[A-Za-z0-9_.-]{1,64})*",
+            value,
+        )
+    ):
         return value
     return "unclassified_refusal"
 
@@ -1115,6 +1174,7 @@ def _bridge_http_error(
         retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
         phase=phase,
         status_code=status,
+        submission_request=submission_request,
         bridge_run_id=bridge_run_id,
         bridge_status=bridge_status,
         submission_state=submission_state,
@@ -1131,26 +1191,43 @@ def _should_reconcile_bridge_submission(error: BridgeTransportError) -> bool:
         error.bridge_status == "failed" and error.verified_no_answer and error.bridge_run_id
     ):
         return False
-    if error.submission_state == "pre_submission" and error.bridge_status not in {
-        "queued",
-        "running",
-        "in_progress",
-        "completed",
-        "succeeded",
-    }:
-        return False
+    if error.submission_state == "pre_submission":
+        # A Bridge server error after an emitted POST is ambiguous even when
+        # its phase is omitted and the parser defaults it to "generation".
+        # Explicit pre-send failures remain terminal without a GET.
+        if (
+            error.code == "bridge_server_error"
+            and not error.verified_no_answer
+            and (
+                (
+                    error.phase in {"submission", "submission_confirmation"}
+                    and error.submission_request is not False
+                )
+                or (
+                    (error.status_code or 0) >= 500
+                    and (
+                        error.submission_request is True
+                        or (error.submission_request is None and error.phase != "preflight")
+                    )
+                )
+            )
+        ):
+            return True
+        return error.bridge_status in {
+            "queued",
+            "running",
+            "in_progress",
+            "completed",
+            "succeeded",
+        }
     # Generic server failures and UI/wait timeouts can follow a created run.
     # A prose message from an older server is not terminal non-execution proof.
     if error.status_code is not None and error.status_code >= 500:
-        return (
-            error.code
-            not in {
-                "bridge_auth_failed",
-                "bridge_extension_disconnected",
-                "conversation_unavailable",
-            }
-            or error.submission_state != "pre_submission"
-        )
+        return error.code not in {
+            "bridge_auth_failed",
+            "bridge_extension_disconnected",
+            "conversation_unavailable",
+        }
     return error.submission_state != "pre_submission"
 
 
@@ -1164,7 +1241,7 @@ def _ambiguous_bridge_submission_error(
 ) -> BridgeTransportError:
     run_id = bridge_run_id or submit_error.bridge_run_id
     received = confirmed_received or run_id is not None
-    request_fingerprint = _bridge_idempotency_fingerprint(idempotency_key)
+    request_fingerprint = bridge_request_fingerprint(idempotency_key)
     if received:
         message = (
             f"Bridge a reçu la soumission (run {run_id or 'identifiant indisponible'}), "
@@ -1199,10 +1276,6 @@ def _ambiguous_bridge_submission_error(
         conversation_id=submit_error.conversation_id,
         reason=submit_error.reason,
     )
-
-
-def _bridge_idempotency_fingerprint(idempotency_key: str) -> str:
-    return f"sha256:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _safe_bridge_diagnostics(value: dict[str, Any]) -> dict[str, Any]:

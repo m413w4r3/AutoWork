@@ -385,6 +385,7 @@ async def test_w13_d4_ip_only_network_review_and_local_capability_fallback(
                 UUID(revised_opinion["id"]),
                 version=revised_opinion["version"],
                 sha256=revised_opinion["content_sha256"],
+                acknowledge_bridge_drafting_gap=True,
             )
             assert approved.status_code == 200, approved.text
             # Approval appends a new immutable approved version (status/reviewer are
@@ -394,6 +395,7 @@ async def test_w13_d4_ip_only_network_review_and_local_capability_fallback(
                 UUID(revised_opinion["id"]),
                 version=approved.json()["approved"]["version"],
                 base_publication_sha256=revised_opinion["provenance"]["base_publication_sha256"],
+                acknowledge_bridge_drafting_gap=True,
             )
             assert published.status_code == 200, published.text
 
@@ -1049,6 +1051,7 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 UUID(opinion["id"]),
                 version=opinion["version"],
                 sha256=opinion["content_sha256"],
+                acknowledge_bridge_drafting_gap=True,
             )
             assert approved_opinion.status_code == 200, approved_opinion.text
             published = await publish_opinion_http(
@@ -1056,6 +1059,7 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 UUID(opinion["id"]),
                 version=approved_opinion.json()["approved"]["version"],
                 base_publication_sha256=opinion["provenance"]["base_publication_sha256"],
+                acknowledge_bridge_drafting_gap=True,
             )
             assert published.status_code == 200, published.text
             v6_id = UUID(published.json()["publication"]["artifact_id"])

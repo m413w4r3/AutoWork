@@ -1,6 +1,6 @@
 # Bridge advisor preflight and validation catalog
 
-Updated 2026-10-30 against the advisor implementation in this branch. This is
+Updated 2026-11-04 against the advisor implementation in this branch. This is
 a code-path catalog, not an authorization or a substitute for the current G2,
 TLP, provenance, revocation, and external-effect guards. The operator may call
 `advisor.consult` with a consultation type and question alone. Optional source
@@ -36,18 +36,21 @@ capabilities.
 
 ## Requirements by consultation type
 
-| Type | Automatically assembled material | Only content-availability refusal |
-|---|---|---|
-| `plan_investigation` | Relevant claims and passages, observations, findings, associated samples, and active hypotheses | No useful canonical claim, observation, finding, or measured fact for the question. An existing hypothesis is optional context. |
-| `pivot_strategy` | The planning dossier plus verified measurements available for comparison | No useful canonical claim, observation, finding, or measured fact for the question. Existing hypotheses and measurements are included when available; neither is an operator-supplied prerequisite. |
-| `yara_draft` | Verified sample measurements with sample SHA, byte offset, value, and source observation SHA; associated analysis, strings, findings, and candidate rule metadata where available | No verified measurement. The refusal names `sample.analyze` and the associated sample SHA when available. A candidate rule is optional. |
-| `suricata_draft` | Measured network facts from associated capture observations, plus relevant observations/findings | No measured network fact. The refusal names `network.capture.inspect` on the associated PCAP. |
-| `figure_plan` | Relevant article passages, observations, and current findings | No useful canonical claim, observation, finding, or measured fact for the question. `finding_refs` may be omitted to select current findings automatically. |
-| `draft_text` | Relevant article passages, observations, and findings | No canonical claim, observation, or finding body. Draft assertions and proof links are optional advisory annotations. |
-| `review_text` | Relevant article passages, observations, findings, and a selected opinion if one was requested | No useful claim, observation, finding, or review-target body. A general question-only review is valid; an explicitly selected opinion still must resolve to its exact current version and valid target. |
+| Type | Automatically assembled material | Incomplete-context warning | Blocking condition |
+|---|---|---|---|
+| `plan_investigation` | Relevant claims and passages, observations, findings, associated samples, and active hypotheses | Missing or omitted proof is listed in the dossier with the available source and a suggested retrieval action. | No consultation question/task, approved G2 envelope or budget, verified canonical source binding, or usable transport. |
+| `pivot_strategy` | The planning dossier plus verified measurements available for comparison | Missing observations or measurements are listed with an action such as `sample.analyze` when an associated sample is known. | Same technical, G2, and transport blockers as other types. |
+| `yara_draft` | Verified sample measurements with sample SHA, byte offset, value, and source observation SHA; associated analysis, strings, findings, and candidate rule metadata where available | No verified measurement is a warning. Bridge receives available context and a suggested `sample.analyze` action. | Same technical, G2, and transport blockers as other types. |
+| `suricata_draft` | Measured network facts from associated capture observations, plus relevant observations/findings | No measured network fact is a warning; the dossier suggests `network.capture.inspect` when a PCAP is available. | Same technical, G2, and transport blockers as other types. |
+| `figure_plan` | Relevant article passages, observations, and current findings | Missing or invalid optional `finding_refs` are omitted and current findings are selected automatically where possible. | Same technical, G2, and transport blockers as other types. |
+| `draft_text` | Relevant article passages, observations, and findings | Invalid assertions, units, anchors, or proof links are dropped with a warning while available text/context is sent. | A blank explicit question with no text target, or no valid source binding when the contract requires one. |
+| `review_text` | Relevant article passages, observations, findings, and a selected opinion if one was requested | Invalid optional opinion/version/unit/anchor selectors are dropped; the current canonical opinion and its available units are used when present. | A blank explicit question with no reviewable target, unavailable canonical text, or no valid source binding when required. |
 
 An incomplete case is allowed when it contains useful material for the requested
-type. Missing contradiction findings are reported as informational, and do not
+type. The dossier includes a short “Contexte indisponible / omis” section when
+optional inputs or requested proof could not be loaded. The tool result exposes
+the same omissions through `input_warnings`, `omissions`, and
+`next_action_hint`. Missing contradiction findings are informational, and do not
 block a contradiction search. `do_not_submit` is not a Bridge disclosure veto;
 the server enforces the applicable TLP, external-LLM, licence, and G2 rules.
 
@@ -79,29 +82,26 @@ to pre-fill canonical assertions just to receive a consultative answer.
 
 ## Shared refusal and validation surfaces
 
-| Surface | Current outcomes | Meaning and operator action |
+| Surface | Bloquant | Avertissement et action opérateur |
 |---|---|---|
-| Tool arguments (`investigation_advisor_tools.py::execute`) | `consultation_type_required`, `consultation_type_unsupported`, `question_invalid`, `evidence_refs_invalid`, `evidence_ref_invalid`, `sample_hash_invalid`, `editorial_units_not_supported`, `editorial_units_out_of_bounds` | Malformed invocation. Send a supported type, a string question, UUID evidence references, a lowercase 64-character SHA-256 selector, and units only for editorial types. Question and reference fields may be omitted where optional. |
-| Optional sample selector | `sample_hash_not_associated`, `sample_hash_unavailable`, `advisor_disclosure_restricted` | A selected hash must belong to this investigation and have a canonical sample record/blob. The message names sample intake / `sample.analyze` or explains the TLP, external-LLM, or licence restriction. |
-| Explicit evidence reference | `evidence_reference_not_found`, `advisor_evidence_reference_mismatch` | A cited observation must exist in this investigation and match its canonical SHA. Remove or replace an absent/foreign reference, or repair a stale canonical finding link. Automatic context is still assembled when references are omitted. |
-| Figure selection | `figure_finding_refs_invalid`, `figure_finding_not_found` | If supplied, finding IDs must be unique UUIDs and current in this investigation. Omit `finding_refs` to use the latest available findings. |
-| Exact editorial target | `opinion_not_found`, `opinion_reference_invalid`, `opinion_version_invalid`, `opinion_review_targets_unavailable`, `editorial_unit_invalid`, `editorial_unit_target_invalid`, `editorial_unit_target_duplicate`, `opinion_target_invalid` | These checks apply only when an opinion/version/target was explicitly selected. Omit target fields to request general review or prose. Valid review targets are returned with the refusal when available. |
-| Optional selected measurements | `measurements_invalid` (including `measurement_shape_invalid`, `measurement_value_invalid`, `measurement_duplicate`, `measurement_not_verified`, `content_pattern_id_invalid`, `content_pattern_not_verified`) | Any explicitly selected measurements must resolve to unique verified canonical measurements. Omit the `measurements` selector to use automatically assembled verified measurements. |
-| Article claim in question | `article_claim_not_found` or an `article` missing-reference preflight entry | A named claim ID must exist in the current article snapshot. The message reports valid claim IDs; refresh the article snapshot or correct the requested ID. |
-| Evidence dossier preflight | `advisor_preflight_insufficient_evidence`, `advisor_preflight_needs_retrieval`, `advisor_preflight_technical_blocked`; legacy reason text `required_canonical_evidence_not_in_payload` | These statuses now represent only genuinely missing type-relevant material, an explicitly requested canonical source whose body must be retrieved, or failed source verification. When no useful context exists, `next_action` gives the exact local tool to run. If an explicitly cited claim/source is absent, correct or refresh that reference. |
-| Context sizing / reservation | `advisor_context_reservation_mismatch`, `advisor_required_input_truncated` | Exact prompt bytes and tokens must match the approved reservation; changed or truncated required source content is not submitted. There is no per-sample fragment cap. These are accounting/integrity failures, not evidence prerequisites. |
-| G2 / external disclosure | `POLICY_DENIED`, `advisor_disclosure_restricted`, `advisor_admission_revoked`, `advisor_admission_recheck_unavailable` | The investigation must authorize Bridge, satisfy TLP and `external_llm_allowed`, and remain approved at pre-send checks. Selected restricted samples and operational secrets are blocked before transport. A failed current admission check requires a fresh approved investigation envelope. |
-| Secret preflight | `advisor_secret_field_remaining` | Operational credentials, passwords, signed URLs, or other protected secret fields must be redacted before consultation. Clear the operational secret from the canonical source and retry; evidence content is not a secret-handling instruction. |
-| Source/provenance binding | `advisor_evidence_reference_mismatch`, external-effect `source_references_required`, `malformed_source_reference`, `sample_source_missing`, `sample_source_restricted` | The outbound payload must bind to current canonical source IDs, versions, and SHA-256 references. Auto-assembled dossier references supply this binding when available; a missing or changed reference remains a hard provenance refusal. |
-| Unexpected canonical context shape | `advisor_context_invalid`, `advisor_context_unavailable` | Stored source data could not be assembled or validated. The refusal identifies source refresh/repair as the next action; it does not label a valid question as an invalid advisor request. |
-| Bridge and persistence | `advisor_timeout_or_ambiguous`, `advisor_rate_limited`, `advisor_unavailable`, `advisor_output_invalid`, `advisor_prompt_persistence_failed`, `advisor_output_persistence_uncertain`, `advisor_result_persistence_uncertain` | Transport/provider or archival outcomes after local preflight. These do not indicate missing operator assertions. Ambiguous submission outcomes must not be retried as if no request was sent. |
+| Tool arguments (`investigation_advisor_tools.py::execute`) | `consultation_type_required`, `consultation_type_unsupported`, non-string question, or explicitly blank question with no text target | Malformed optional selectors and unresolved references are dropped; a missing question field can use the consultation type's default task. |
+| Optional sample/evidence selectors | G2/TLP/licence restrictions, revoked sample association at the pre-send recheck, or cross-investigation data that would otherwise be disclosed | `sample_hash_not_associated`, `sample_hash_unavailable`, malformed/unknown evidence UUIDs, and unavailable optional references are omitted and reported. Bridge receives the rest of the dossier. |
+| Figure and measurement selections | Canonical source integrity failure when selected material cannot be verified | Invalid, duplicate, stale, or unavailable `finding_refs` and measurement selectors are dropped; current verified material is selected when available. |
+| Editorial assertions and targets | No text remains to process, or canonical text/source identity is corrupt | Invalid draft assertions, review units, versions, forms, anchors, and optional proof links are dropped with warnings. A current opinion or valid text target is used when available. |
+| Article claims and explicit proof | Canonical SHA/ID mismatch or an unverifiable required source identity | `article_claim_not_found`, `NEEDS_RETRIEVAL`, `INSUFFICIENT_EVIDENCE`, and `required_canonical_evidence_not_in_payload` are warnings. The dossier names the missing context and suggested local tool/action. |
+| Evidence preflight statuses | `TECHNICAL_BLOCKED` only when required canonical metadata/source verification fails; `POLICY_BLOCKED` for an active disclosure/admission boundary | `READY` means the preflight has no completeness warning. `NEEDS_RETRIEVAL` and `INSUFFICIENT_EVIDENCE` continue to Bridge with available context, dossier omissions, and `next_action_hint`. |
+| Context sizing / reservation | `advisor_context_reservation_mismatch`, budget exhaustion, `advisor_required_input_truncated` | Exact prompt bytes and tokens must match the approved reservation. There is no per-sample fragment cap. |
+| G2 / external disclosure | `POLICY_DENIED`, `advisor_disclosure_restricted`, `advisor_admission_revoked`, `advisor_admission_recheck_unavailable`, TLP or licence restriction | `do_not_submit` is handled only where its effect contract requires it. Selected restricted samples and operational secrets remain blocked before transport. |
+| Secret preflight | `advisor_secret_field_remaining` | A safe redaction or omission is reported in the dossier and tool warnings; credentials, passwords, and signed URLs never enter the Bridge prompt. |
+| Source/provenance binding | `source_references_required`, malformed canonical identity/SHA, or changed canonical source bytes | `advisor_evidence_reference_mismatch` for an optional source-document link is a warning when the verified article snapshot remains bound and is sent. An unresolved canonical binding remains blocked. |
+| Unexpected canonical context shape | `advisor_context_invalid`, `advisor_context_unavailable`, storage/read verification failure | The affected source is not represented as verified; the tool reports the repair/retrieval action where available. |
+| Bridge and persistence | `advisor_timeout_or_ambiguous`, `advisor_rate_limited`, `advisor_unavailable`, output or archival uncertainty | These are transport/provider or archival outcomes. Ambiguous submission outcomes must not be retried as if no request was sent. |
 
-The input parser also validates claim references embedded in prose, exact source
-identity and SHA joins, uniqueness of selected references, and schema types.
-Malformed optional draft assertions are ignored for consultative prose; a
-well-formed assertion that fails canonical-link validation is likewise not a
-reason to reject the prose request. Invalid top-level invocation shapes still
-fail schema validation.
+The input parser still validates exact source identity and SHA joins, disclosure
+policy, and schema types. When a local check concerns an optional selection,
+the selection is omitted and Bridge receives the question with available context.
+Canonical integrity failures and invalid top-level invocation shapes remain
+blocking.
 
 ## Advisory text and canonical promotion are separate gates
 
@@ -119,7 +119,7 @@ effect contracts have not been weakened by this catalog.
 | Observed code / message | Current interpretation |
 |---|---|
 | `advisor_input_invalid` with `no_verified_measurements` | A YARA no-measurement friction. It is replaced by the type-specific useful-material preflight and actionable `sample.analyze <sha>` guidance. `advisor_input_invalid` remains the wrapper for genuinely malformed invocation/provenance inputs. |
-| `required_canonical_evidence_not_in_payload` | Generic reason text, not a distinct user requirement. It now accompanies only missing required canonical content or provenance. |
+| `required_canonical_evidence_not_in_payload` | Legacy diagnostic text for an incomplete dossier. It is surfaced as an omission warning and does not prevent dispatch when another valid source binding and technical prerequisites are available. |
 | `assertions_required` | Not a consultation prerequisite. Assertion checks are optional advisory annotations; promotion contracts remain strict. |
 | `source_references_required` | External-effect consume guard for a request with no canonical source references. The dossier now supplies references from assembled content; if none can be resolved, this remains a provenance refusal. |
 | `human_qualification_required` | Qualification/promotion endpoint guard, not a Bridge consultation preflight. |

@@ -20,6 +20,8 @@ from cti_app.application.publication_augmentation import (
 )
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
+    opinion_bridge_drafting_summary,
+    opinion_internal_text_markers,
     verify_opinion_citations,
 )
 from cti_app.domain.investigation import TLPLevel
@@ -58,6 +60,8 @@ class AnalystPublicationService:
         version: int,
         actor: str,
         expected_base_publication_sha256: str,
+        *,
+        bridge_drafting_gap_acknowledged: bool = False,
     ) -> ProductionArtifact:
         if not actor.strip():
             raise OpinionError(OpinionErrorCode.INVALID_STATE)
@@ -67,6 +71,19 @@ class AnalystPublicationService:
                 raise OpinionError(OpinionErrorCode.OPINION_NOT_FOUND)
             if opinion.status is not AnalystOpinionStatus.APPROVED:
                 raise OpinionError(OpinionErrorCode.OPINION_NOT_APPROVED)
+            markers = opinion_internal_text_markers(opinion)
+            if markers:
+                raise OpinionError(
+                    OpinionErrorCode.OPINION_TEXT_MARKERS_FOUND,
+                    publication_text_markers=markers,
+                    message="Reader-facing opinion text contains internal markers.",
+                )
+            drafting = opinion_bridge_drafting_summary(opinion)
+            gap_acknowledged = bool(drafting["requires_acknowledgement"]) and (
+                opinion.bridge_drafting_gap_acknowledged or bridge_drafting_gap_acknowledged
+            )
+            if drafting["requires_acknowledgement"] and not gap_acknowledged:
+                raise OpinionError(OpinionErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED)
             if opinion.base_publication_sha256 != expected_base_publication_sha256:
                 raise OpinionError(OpinionErrorCode.STALE_BASE)
             investigation = await uow.analyst_investigations.get(opinion.investigation_id)
@@ -145,8 +162,16 @@ class AnalystPublicationService:
                 base_publication_artifact_id=base.id,
                 opinion=opinion,
                 citation_context=context,
+                bridge_drafting_gap_acknowledged=gap_acknowledged,
             )
         except PublicationAugmentationError as exc:
+            if exc.code is PublicationAugmentationErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED:
+                raise OpinionError(OpinionErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED) from exc
+            if exc.code is PublicationAugmentationErrorCode.OPINION_TEXT_MARKERS_FOUND:
+                raise OpinionError(
+                    OpinionErrorCode.OPINION_TEXT_MARKERS_FOUND,
+                    publication_text_markers=exc.publication_text_markers,
+                ) from exc
             if exc.code is PublicationAugmentationErrorCode.BASE_ARTIFACT_NOT_CURRENT:
                 raise OpinionError(OpinionErrorCode.STALE_BASE) from exc
             if exc.code is PublicationAugmentationErrorCode.DO_NOT_SUBMIT:

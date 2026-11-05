@@ -58,13 +58,22 @@ from cti_app.application.publication_builder import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
+from cti_app.domain.model_runs import (
+    ModelProvider,
+    ModelRole,
+    ModelRun,
+    ModelRunStatus,
+    ModelSubmissionState,
+    ModelUsage,
+)
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionInputSnapshot,
     ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     SynthesisMode,
 )
 from cti_app.domain.production_extraction import (
@@ -990,6 +999,99 @@ async def test_model_classifier_replays_parser_changes_and_invokes_on_prompt_cha
     assert prompt_bump.invocation_hash != first.invocation_hash
     assert len(gateway.calls) == 2
     assert gateway.diagnostics[0]["parser_stage"] == "relevance_classifier"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_declared_lost_uses_a_new_model_run_and_bridge_attempt() -> None:
+    snapshot, extraction, source_ids = _world()
+    access = _access_policy(snapshot, source_ids)
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    target = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    output = _wire_classification(
+        pack._handle_for_ref[target], "CONTEXT", "context_source_without_relation"
+    )
+
+    class _ReconciliationThenSuccessGateway(_FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([output])
+            self.submissions: list[ModelRequest] = []
+
+        async def draft(self, request: ModelRequest, output_schema: object | None = None):
+            del output_schema
+            self.submissions.append(request)
+            existing = self.runs.get(request.run_id)
+            if existing is not None:
+                raise ModelSubmissionReconciliationRequiredError(
+                    details={"model_run_id": str(existing.id)}, model_run_id=existing.id
+                )
+
+            attempt_offset = getattr(request, "submission_attempt_offset", 0)
+            model_run = ModelRun(
+                provider=ModelProvider.FAKE,
+                model_role=ModelRole.DRAFTING,
+                requested_model="fake-relevance-model",
+                prompt_template_id=request.prompt_template_id,
+                prompt_template_version=request.prompt_template_version,
+                authorized_input_hash=hashlib.sha256(request.text.encode()).hexdigest(),
+                evidence_pack_hash=request.evidence_pack_hash,
+                parameters=dict(request.parameters),
+                id=request.run_id or uuid4(),
+                submission_attempt=attempt_offset,
+            )
+            request_key = f"{model_run.id}:a{attempt_offset + 1}"
+            model_run.begin_submission_attempt(bridge_request_id=request_key)
+            self.runs[model_run.id] = model_run
+            if len(self.submissions) == 1:
+                model_run.mark_external_state_unknown()
+                model_run.require_review(
+                    ModelSubmissionReconciliationRequiredError.code,
+                    "The first Bridge attempt is ambiguous.",
+                    details={"bridge_request_id": request_key},
+                )
+                raise ModelSubmissionReconciliationRequiredError(
+                    details={"bridge_request_id": request_key}, model_run_id=model_run.id
+                )
+
+            raw = output.encode()
+            reference = f"model-output://{model_run.id}"
+            model_run.raw_output_reference = reference
+            model_run.raw_output_sha256 = hashlib.sha256(raw).hexdigest()
+            model_run.raw_output_chars = len(output)
+            model_run.succeed(
+                actual_model_version="fake-v1",
+                duration_ms=1,
+                usage=ModelUsage(total_tokens=1),
+                output_references=(reference,),
+                response_id="bridge-second-attempt",
+            )
+            self.outputs[reference] = raw
+            return ModelExecution(run=model_run, output_text=output)
+
+    gateway = _ReconciliationThenSuccessGateway()
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+
+    first = await ModelRelevanceClassifier(gateway).propose(run, snapshot, extraction, access)
+    old_model_run = gateway.runs[first.model_run_id]
+    old_model_run.abandon_uncertain_submission(actor_id="analyst", reason="Bridge déclaré perdu")
+    run.status = ProductionRunStatus.NEEDS_REVIEW
+    run.current_stage = ProductionStage.RELEVANCE_PROJECTION
+    run.retry_from_stage(ProductionStage.RELEVANCE_PROJECTION)
+
+    second = await ModelRelevanceClassifier(gateway).propose(run, snapshot, extraction, access)
+
+    assert first.status is RelevanceProposalStatus.NEEDS_REVIEW
+    assert second.status is RelevanceProposalStatus.SUCCEEDED
+    assert len(gateway.submissions) == 2
+    assert second.model_run_id != first.model_run_id
+    assert old_model_run.status is ModelRunStatus.FAILED
+    assert old_model_run.submission_state is ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+    assert old_model_run.bridge_request_id == f"{first.model_run_id}:a1"
+    assert gateway.runs[second.model_run_id].submission_attempt == 2
+    assert gateway.runs[second.model_run_id].bridge_request_id == (f"{second.model_run_id}:a2")
 
 
 @pytest.mark.asyncio

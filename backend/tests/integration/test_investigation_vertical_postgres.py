@@ -564,6 +564,9 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                 "version": draft["version"],
                 "expected_sha256": draft["content_sha256"],
                 "reason": "Approve the cited article-relative update.",
+                # This synthetic run has no Bridge drafting consultation: the human approver
+                # acknowledges the gap explicitly instead of the opinion claiming Bridge wording.
+                "bridge_drafting_gap_acknowledged": True,
             },
             headers={"Idempotency-Key": f"opinion-approve-{draft['id']}-{draft['version']}"},
         )
@@ -804,6 +807,10 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         "type": "file",
                         "attributes": {
                             "sha256": candidate_hash,
+                            "md5": hashlib.md5(
+                                material.sample_bytes, usedforsecurity=False
+                            ).hexdigest(),
+                            "sha1": hashlib.sha1(material.sample_bytes).hexdigest(),
                             "meaningful_name": "arbitrary-osint-hash.bin",
                             "size": len(material.sample_bytes),
                             "last_analysis_stats": {"malicious": 0},
@@ -822,6 +829,8 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         "type": "file",
                         "attributes": {
                             "sha256": _SEED_HASH,
+                            "md5": "b" * 32,
+                            "sha1": "c" * 40,
                             "meaningful_name": "article-seed.bin",
                             "size": 123,
                             "last_analysis_stats": {"malicious": 1},
@@ -892,16 +901,21 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
     )
 
     bridge_http_calls: list[tuple[str, str]] = []
+    bridge_response_counter = 0
 
     def mock_bridge(request: httpx.Request) -> httpx.Response:
+        nonlocal bridge_response_counter
         bridge_http_calls.append((request.method, request.url.path))
         if request.method == "GET" and request.url.path == "/v1/bridge/capabilities":
             return httpx.Response(200, json={"capabilities": []}, request=request)
         if request.method == "POST" and request.url.path == "/v1/responses":
+            # A real Bridge returns one distinct response id per request (model_runs.response_id
+            # is unique), so a second consultation must not reuse the first one's id.
+            bridge_response_counter += 1
             return httpx.Response(
                 200,
                 json={
-                    "id": "synthetic-bridge-response-1",
+                    "id": f"synthetic-bridge-response-{bridge_response_counter}",
                     "status": "completed",
                     "output_text": (
                         "advisor-wire.v1\n"
@@ -1231,6 +1245,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             analysis_observation_id = analysis_observation.id
             assert str(analysis_observation_id) in analysis_result["invocation"]["response_refs"]
 
+            unknown_advisor_ref = uuid4()
             advisor_result = await invoke_operator_tool(
                 "advisor.consult",
                 "advisor-consult.v1",
@@ -1241,7 +1256,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                         "loader candidate from an arbitrary file? State the observation and the "
                         "remaining uncertainty."
                     ),
-                    "evidence_refs": [str(analysis_observation_id)],
+                    "evidence_refs": [str(analysis_observation_id), str(unknown_advisor_ref)],
                     "assertions": [
                         {
                             "id": "static_analysis_measurement",
@@ -1270,6 +1285,12 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             assert (
                 isinstance(advisor_output, dict)
                 and advisor_output.get("advisor_status") == "succeeded"
+            ), tool_diagnostic("advisor.consult", advisor_result)
+            assert any(
+                item.get("field") == "evidence_refs"
+                and item.get("reference") == str(unknown_advisor_ref)
+                and item.get("reason") == "reference_not_resolvable"
+                for item in advisor_output.get("ignored_inputs", [])
             ), tool_diagnostic("advisor.consult", advisor_result)
             async with uow_factory() as uow:
                 advisor_observation = next(
@@ -1392,7 +1413,11 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             pivot_invocation = invocations_by_name["vt.intelligence_search"]
             download_invocation = invocations_by_name["vt.download_sample"]
             analysis_invocation = invocations_by_name["sample.analyze"]
-            advisor_invocation = invocations_by_name["advisor.consult"]
+            # Several advisor.consult invocations exist (the pre-transport refusal follows the
+            # real consultation): bind to the consultation by its invocation id.
+            advisor_invocation = next(
+                item for item in invocations if str(item.id) == advisor_result["invocation"]["id"]
+            )
             for name, invocation in invocations_by_name.items():
                 assert invocation.status.value == operator_results[name]["invocation"]["status"], (
                     tool_diagnostic(name, operator_results[name])
@@ -1470,8 +1495,11 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 str(pivot_observation.id)
             ]
             assert analysis_observation.id in analysis_invocation.response_refs
+            # The audited parameters keep what the operator asked for (including the unknown
+            # reference that the tool ignored and reported), and nothing the system added.
             assert list(advisor_invocation.normalized_parameters["evidence_refs"]) == [
-                str(analysis_observation.id)
+                str(analysis_observation.id),
+                str(unknown_advisor_ref),
             ]
 
             supported_finding = next(
@@ -1961,60 +1989,60 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 == audit_before_replay
             )
 
-            refusal_key = f"m07.operator.advisor-presend-refusal:{investigation_id}"
-            posts_before_refusal = bridge_http_calls.count(("POST", "/v1/responses"))
-            pretransport_refusal = await invoke_operator_tool(
+            incomplete_key = f"m07.operator.advisor-incomplete-context:{investigation_id}"
+            posts_before_incomplete = bridge_http_calls.count(("POST", "/v1/responses"))
+            incomplete_advisor = await invoke_operator_tool(
                 "advisor.consult",
                 "advisor-consult.v1",
                 {
                     "consultation_type": "plan_investigation",
-                    "evidence_refs": [str(analysis_observation_id), str(uuid4())],
+                    "sample_sha256": hashlib.sha256(
+                        f"pretransport-unassociated:{investigation_id}:{uuid4()}".encode()
+                    ).hexdigest(),
                 },
-                key=refusal_key,
-                purpose="Verify durable budget release after a local pre-transport refusal.",
+                key=incomplete_key,
+                purpose=(
+                    "Verify an unassociated optional sample selector is reported while Bridge "
+                    "receives the available investigation context."
+                ),
             )
-            assert_tool_status("advisor.consult", pretransport_refusal, "failed")
-            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
-            refusal_invocation_id = UUID(pretransport_refusal["invocation"]["id"])
+            assert incomplete_advisor["invocation"]["status"] in {"succeeded", "partial"}
+            incomplete_output = incomplete_advisor["advisor_output"]
+            assert incomplete_output["input_warnings"]
+            assert incomplete_output["omissions"]
+            assert any(
+                item["field"] == "sample_sha256" for item in incomplete_output["input_warnings"]
+            )
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_incomplete + 1
+            incomplete_invocation_id = UUID(incomplete_advisor["invocation"]["id"])
             async with uow_factory() as uow:
-                refusal_invocation = await uow.tool_invocations.get(refusal_invocation_id)
+                incomplete_invocation = await uow.tool_invocations.get(incomplete_invocation_id)
                 latest_envelope = await uow.investigation_envelopes.get(investigation_id)
                 budget_snapshot = await uow.investigation_budgets.get(investigation_id)
-                refusal_observations = tuple(
-                    await uow.evidence_observations.list_for_investigation(investigation_id)
-                )
-            assert refusal_invocation is not None
+            assert incomplete_invocation is not None
             assert latest_envelope is not None and budget_snapshot is not None
-            refusal_reservation = next(
+            incomplete_reservation = next(
                 item
                 for item in latest_envelope.budget.reservations
-                if item.operation_key == refusal_invocation.operation_key
+                if item.operation_key == incomplete_invocation.operation_key
             )
-            assert refusal_reservation.amounts[BudgetDimension.BRIDGE_TURNS] > 0
-            assert refusal_reservation.amounts[BudgetDimension.TOOL_SECONDS] > 0
-            assert refusal_reservation.status is BudgetReservationStatus.RELEASED
-            assert refusal_invocation.consumed_budget == {}
+            assert incomplete_reservation.amounts[BudgetDimension.BRIDGE_TURNS] > 0
+            assert incomplete_reservation.amounts[BudgetDimension.TOOL_SECONDS] > 0
+            assert incomplete_reservation.status is BudgetReservationStatus.COMMITTED
+            assert incomplete_invocation.consumed_budget
             assert budget_snapshot.budget == latest_envelope.budget
-            refusal_proof = next(
-                item
-                for item in refusal_observations
-                if item.invocation_ref == refusal_invocation_id
-                and item.object_type
-                == FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL.value
+            incomplete_request = next(
+                request for name, key, request in operator_requests if key == incomplete_key
             )
-            assert refusal_proof.object_id == refusal_invocation.operation_key
-            refusal_request = next(
-                request for name, key, request in operator_requests if key == refusal_key
-            )
-            replay_refusal = await client.post(
+            replay_incomplete = await client.post(
                 f"/api/investigations/{investigation_id}/operator/tools/advisor.consult",
-                headers={"Idempotency-Key": refusal_key},
-                json=refusal_request,
+                headers={"Idempotency-Key": incomplete_key},
+                json=incomplete_request,
             )
-            assert replay_refusal.status_code == 200, replay_refusal.text
-            assert replay_refusal.json()["idempotent_replay"] is True
-            assert replay_refusal.json()["invocation"]["id"] == str(refusal_invocation_id)
-            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_refusal
+            assert replay_incomplete.status_code == 200, replay_incomplete.text
+            assert replay_incomplete.json()["idempotent_replay"] is True
+            assert replay_incomplete.json()["invocation"]["id"] == str(incomplete_invocation_id)
+            assert bridge_http_calls.count(("POST", "/v1/responses")) == posts_before_incomplete + 1
     finally:
         await vt_adapter._client.aclose()
         await effect_engine.dispose()

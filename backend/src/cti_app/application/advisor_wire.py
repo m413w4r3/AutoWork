@@ -8,6 +8,7 @@ evidence before exposing it to consumers.
 from __future__ import annotations
 
 import re
+from array import array
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -47,11 +48,19 @@ class _RawSourceBlock:
 
 def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> AdvisorWireDocument:
     """Read wire fields and complete, unambiguous YARA rule sources."""
-    text = _sanitize_wire_text(raw if isinstance(raw, str) else "")
+    text, source_text, source_offsets = _sanitize_wire_text_with_offsets(
+        raw if isinstance(raw, str) else ""
+    )
     header = _HEADER.search(text)
-    region = text[header.end() :] if header else text
+    region_start = header.end() if header else 0
+    region = text[region_start:]
     source_blocks = _raw_source_blocks(region)
     source, language, source_count = _source_result(source_blocks)
+    if source is not None and language == "yara" and source_blocks:
+        source_start = text.find(source, region_start + source_blocks[0].start)
+        source = _restore_source_line_endings(
+            source, source_start, text, source_text, source_offsets
+        )
     source_error = source_blocks[0].error if len(source_blocks) == 1 else None
     extraction_notes: list[str] = []
     yara_rules: tuple[tuple[str, str], ...] = ()
@@ -67,11 +76,66 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
             if block_rules is None:
                 unambiguous = False
                 break
-            extracted.extend(block_rules)
+            block_start = text.find(block.source, region_start + block.start)
+            rule_search_start = 0
+            for rule_source, name in block_rules:
+                rule_start_in_block = block.source.find(rule_source, rule_search_start)
+                if block_start < 0 or rule_start_in_block < 0:
+                    unambiguous = False
+                    break
+                normalized_start = block_start + rule_start_in_block
+                extracted.append(
+                    (
+                        _restore_source_line_endings(
+                            rule_source,
+                            normalized_start,
+                            text,
+                            source_text,
+                            source_offsets,
+                        ),
+                        name,
+                    )
+                )
+                rule_search_start = rule_start_in_block + len(rule_source)
+            if not unambiguous:
+                break
         if unambiguous:
             yara_rules = tuple(extracted)
         elif any(len(_yara_declarations(block.source or "")) > 1 for block in source_blocks):
             extraction_notes.append("multiple_yara_rules_split_ambiguous")
+    # Bridge often wraps a usable rule in explanatory prose, omits fences, or
+    # uses more than one fenced block. Scan the full response opportunistically
+    # so these secondary layout choices do not hide exact rule slices.
+    foreign_fence_ranges = _foreign_fence_ranges(region)
+    prose_rules = (
+        ()
+        if source_error == "yara_rule_unclosed"
+        else _extract_yara_rule_slices(
+            region,
+            source_text,
+            source_offsets,
+            excluded_ranges=foreign_fence_ranges,
+        )
+    )
+    if prose_rules:
+        known = {(_normalize_source_whitespace(item), name) for item, name in yara_rules}
+        merged = list(yara_rules)
+        for item, name in prose_rules:
+            normalized = _normalize_source_whitespace(item)
+            if (normalized, name) in known:
+                continue
+            # The fenced source may contain comments or trailing whitespace
+            # beyond the exact rule slice. Keep that original source as the
+            # import unit instead of adding a second, overlapping candidate.
+            if any(
+                existing_name == name and normalized in _normalize_source_whitespace(existing)
+                for existing, existing_name in merged
+            ):
+                continue
+            merged.append((item, name))
+        yara_rules = tuple(merged)
+        if not source_blocks:
+            source_count = len(yara_rules)
     if source_count > 1 and not yara_rules:
         extraction_notes.append("multiple_sources_unassigned_ambiguous")
     sent_sources = {
@@ -343,12 +407,61 @@ def _normalize_source_whitespace(source: str) -> str:
 
 
 def _sanitize_wire_text(text: str) -> str:
-    cleaned = sanitize_bridge_output_text(text).replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join(
-        line
-        for line in cleaned.split("\n")
-        if line.strip().casefold() not in {"copy code", "copier le code"}
-    )
+    return _sanitize_wire_text_with_offsets(text)[0]
+
+
+def _sanitize_wire_text_with_offsets(text: str) -> tuple[str, str, array[int]]:
+    """Normalize line endings for parsing while retaining their source offsets."""
+    source_text = sanitize_bridge_output_text(text)
+    normalized: list[str] = []
+    offsets = array("I")
+    cursor = 0
+    for line in source_text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if content.strip().casefold() in {"copy code", "copier le code"}:
+            cursor += len(line)
+            continue
+        index = 0
+        while index < len(line):
+            character = line[index]
+            if character == "\r" and index + 1 < len(line) and line[index + 1] == "\n":
+                normalized.append("\n")
+                offsets.append(cursor + index)
+                index += 2
+            elif character == "\r":
+                normalized.append("\n")
+                offsets.append(cursor + index)
+                index += 1
+            else:
+                normalized.append(character)
+                offsets.append(cursor + index)
+                index += 1
+        cursor += len(line)
+    return "".join(normalized), source_text, offsets
+
+
+def _restore_source_line_endings(
+    source: str,
+    normalized_start: int,
+    normalized_text: str,
+    source_text: str,
+    source_offsets: array[int],
+) -> str:
+    if not source or normalized_start < 0 or normalized_start + len(source) > len(normalized_text):
+        return source
+    restored: list[str] = []
+    for offset, character in enumerate(source, start=normalized_start):
+        if character != "\n":
+            restored.append(character)
+            continue
+        source_offset = source_offsets[offset]
+        if source_text.startswith("\r\n", source_offset):
+            restored.append("\r\n")
+        elif source_text.startswith("\r", source_offset):
+            restored.append("\r")
+        else:
+            restored.append("\n")
+    return "".join(restored)
 
 
 def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
@@ -547,6 +660,20 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
     return sorted(blocks, key=lambda block: (block.start, block.end))
 
 
+def _foreign_fence_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    opening_pattern = re.compile(r"(?im)^[ \t]*(?P<fence>`{3,})[ \t]*(?P<info>[^\n]*)\n")
+    supported = {"yara", "yar", "yara-rule", "suricata"}
+    for opening in opening_pattern.finditer(text):
+        info = opening.group("info").strip().casefold()
+        if not info or info in supported:
+            continue
+        fence = opening.group("fence")
+        closing = re.compile(rf"(?m)^[ \t]*`{{{len(fence)},}}[ \t]*$").search(text, opening.end())
+        ranges.append((opening.start(), closing.end() if closing is not None else len(text)))
+    return tuple(ranges)
+
+
 def _single_untagged_rule(text: str) -> tuple[str, str] | None:
     """Accept untagged fenced code only when it consists of one complete rule."""
     candidate = text.strip()
@@ -572,7 +699,7 @@ def _single_untagged_rule(text: str) -> tuple[str, str] | None:
 
 
 _YARA_DECLARATION = re.compile(
-    r"(?im)^[ \t]*(?P<decl>(?:(?:private|global)[ \t]+)*rule[ \t]+"
+    r"(?im)(?:^[ \t]*|(?<=})[ \t]*)(?P<decl>(?:(?:private|global)[ \t]+)*rule[ \t]+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
     r"[ \t]*(?::[ \t]*[A-Za-z_][A-Za-z0-9_]*"
     r"(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)?[ \t]*(?:\n[ \t]*)?\{)"
@@ -581,6 +708,37 @@ _YARA_DECLARATION = re.compile(
 
 def _yara_declarations(text: str) -> list[re.Match[str]]:
     return list(_YARA_DECLARATION.finditer(_mask_yara_comments(text)))
+
+
+def _extract_yara_rule_slices(
+    text: str,
+    source_text: str,
+    source_offsets: array[int],
+    *,
+    excluded_ranges: Sequence[tuple[int, int]] = (),
+) -> tuple[tuple[str, str], ...]:
+    extracted: list[tuple[str, str]] = []
+    previous_end = -1
+    for declaration in _yara_declarations(text):
+        start = declaration.start("decl")
+        if start < previous_end:
+            continue
+        if any(range_start <= start < range_end for range_start, range_end in excluded_ranges):
+            continue
+        end = _balanced_yara_rule_end(text, declaration.end("decl") - 1)
+        if end is None:
+            # An unclosed declaration consumes every later apparent rule.
+            # Continuing would rescan the same suffix for each declaration.
+            break
+        source = text[start:end]
+        extracted.append(
+            (
+                _restore_source_line_endings(source, start, text, source_text, source_offsets),
+                declaration.group("name"),
+            )
+        )
+        previous_end = end
+    return tuple(extracted)
 
 
 def split_yara_rule_sources(source: str) -> tuple[tuple[str, str], ...] | None:

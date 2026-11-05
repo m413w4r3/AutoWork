@@ -349,6 +349,13 @@ def _manifest_reference_digest(rows: list[dict[str, object]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _assert_sample_inventory_omission(prompt: str, *, sample_count: int, reason: str) -> None:
+    assert f"omitted_sample_count={sample_count}" in prompt
+    assert f"omission_reason={reason}" in prompt
+    assert "resource=sample inventory and canonical sample associations" in prompt
+    assert "consultation ciblée complémentaire possible si un sample précis devient utile" in prompt
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("consultation_type", CONSULTATION_TYPES)
 async def test_m12_q_reservation_and_execution_characterization(
@@ -426,9 +433,7 @@ async def test_m12_q_reservation_and_execution_characterization(
     execution_builds = list(capture["builds"])
     execution_prompts = list(capture["prompts"])
 
-    manifest_refs = [
-        item for call in (*reservation_builds, *execution_builds) for item in call["manifest_refs"]
-    ]
+    manifest_refs = [item for call in execution_builds for item in call["manifest_refs"]]
 
     def compact_builds(builds: list[dict[str, object]]) -> list[dict[str, object]]:
         return [
@@ -461,33 +466,37 @@ async def test_m12_q_reservation_and_execution_characterization(
     }
     print(json.dumps(report, sort_keys=True))
 
-    assert len(reservation_prompts) == 1
+    assert reservation_prompts == []
     assert len(execution_prompts) == 1
-    assert reservation_prompts == execution_prompts
-    assert len(reservation_builds) == 1
+    assert reservation_builds == []
     assert len(execution_builds) == 1
-    assert reservation_builds == execution_builds
-    assert "content_base64:" not in transport.calls[0]["prompt"]
-    assert (
-        "content_omission_reason=whole_sample_not_needed_for_consultation"
-        in (transport.calls[0]["prompt"])
+    prompt = transport.calls[0]["prompt"]
+    assert "content_base64:" not in prompt
+    _assert_sample_inventory_omission(
+        prompt,
+        sample_count=SAMPLE_COUNT,
+        reason=(
+            "editorial_section_does_not_need_sample_inventory"
+            if consultation_type == "draft_text"
+            else "sample_inventory_not_selected_for_consultation"
+        ),
     )
-    # The final pre-send sample-policy recheck reloads associations after
-    # preparation, response lookup, and pacing.
-    expected_association_reads = 3
+    # The final pre-send sample-policy recheck runs when sample material is
+    # present in the prompt. Editorial drafts omit the inventory entirely.
+    expected_association_reads = 1 if consultation_type == "draft_text" else 3
     assert (
         execution_counts["calls"].get("sample_associations.list_for_investigation")
         == expected_association_reads
     )
     assert execution_counts["calls"].get("samples.list_for_subject") == expected_association_reads
-    assert reservation_counts["calls"].get("sample_associations.list_for_investigation") == 1
+    assert reservation_counts["calls"] == {}
     assert execution_counts["association_sql_queries"] == 3 * expected_association_reads
-    assert reservation_counts["association_sql_queries"] == 3
+    assert reservation_counts["association_sql_queries"] == 0
     assert execution_counts["max_observation_blob_reads"] <= 1
     assert execution_counts["observation_blob_reads"] <= len(counter.observation_blob_ids)
-    assert reservation_counts["blob_reads"] == len(counter.observation_blob_ids)
-    assert reservation_counts["bytes_read"] == execution_counts["bytes_read"]
-    assert result.output["durations_ms"]["reservation_cost_ms"] >= 0
+    assert reservation_counts["blob_reads"] == 0
+    assert reservation_counts["bytes_read"] == 0
+    assert "reservation_cost_ms" not in result.output["durations_ms"]
     diagnostics = result.output["diagnostics"]
     assert diagnostics["repo_calls"] > 0
     assert diagnostics["blob_reads"] == execution_counts["blob_reads"]
@@ -548,9 +557,20 @@ async def test_reservation_estimate_covers_measured_prompt(
     )
     prompt = transport.calls[0]["prompt"]
     assert "content_base64:" not in prompt
-    assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
-    assert reserved_bytes < SAMPLE_BYTES * 2
-    assert reserved_tokens < SAMPLE_BYTES // 2
+    if consultation_type == "plan_investigation":
+        assert "content_omission_reason=whole_sample_not_needed_for_consultation" in prompt
+    else:
+        _assert_sample_inventory_omission(
+            prompt,
+            sample_count=1,
+            reason=(
+                "editorial_section_does_not_need_sample_inventory"
+                if consultation_type == "draft_text"
+                else "sample_inventory_not_selected_for_consultation"
+            ),
+        )
+    assert reserved_bytes == 0
+    assert reserved_tokens == 0
     reservation = next(
         item for item in context.budget.reservations if item.operation_key == operation_key
     )

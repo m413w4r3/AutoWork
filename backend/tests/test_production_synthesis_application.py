@@ -30,6 +30,7 @@ from cti_app.application.production_artifact_reuse import ProductionArtifactReus
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
 )
+from cti_app.application.production_prompts import SYNTHESIS_EDITORIAL_CONTRACT_V5
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_repairs import repair_key_for_source_extraction_failure
@@ -1086,7 +1087,15 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         "synthesis-validator-v7-grounded-section-heading-facts"
     )
     assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
-        "synthesis-draft-v11-adaptive-section-headings"
+        "synthesis-draft-v13-french-coverage-diagnostics"
+    )
+    assert "toujours chaque observation en français" in SYNTHESIS_EDITORIAL_CONTRACT_V5
+    assert "quelle que soit la langue des" in SYNTHESIS_EDITORIAL_CONTRACT_V5
+    assert "MISSING COVERAGE: <thème non documenté dans les sources fournies>." in (
+        SYNTHESIS_EDITORIAL_CONTRACT_V5
+    )
+    assert "TEXT: one plain-text synthesis paragraph in the publication language" in (
+        SYNTHESIS_EDITORIAL_CONTRACT_V5
     )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
         "synthesis-text-parser-v6-heading-warning-recovery"
@@ -3338,7 +3347,7 @@ EVIDENCE: {world.handle}
 TEXT: FooRAT was also examined technically.
 @@END SECTION@@
 @@DIAGNOSTICS@@
-MISSING COVERAGE: the delivery chain is absent from the supplied extraction
+MISSING COVERAGE: la chaîne de livraison n'est pas documentée dans les sources fournies
 @@END DIAGNOSTICS@@"""
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
 
@@ -3346,7 +3355,7 @@ MISSING COVERAGE: the delivery chain is absent from the supplied extraction
 
     assert result.status is SynthesisExecutionStatus.SUCCEEDED
     assert result.details["diagnostics"]["missing_coverage"] == [
-        "the delivery chain is absent from the supplied extraction"
+        "la chaîne de livraison n'est pas documentée dans les sources fournies"
     ]
     assert result.details["diagnostics"]["rejected_blocks"] == [
         {"block_id": "BROKEN", "reason_code": "synthesis_claim_missing_text"}

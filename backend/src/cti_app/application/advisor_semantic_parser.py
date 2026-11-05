@@ -79,6 +79,62 @@ def _looks_like_exploitable_text(value: str) -> bool:
     return True
 
 
+def _unstructured_semantic_result(
+    raw_text: str,
+    safe_raw_text: str,
+    *,
+    consultation_type: str,
+    reason: str,
+) -> dict[str, Any]:
+    encoded = raw_text.encode("utf-8")
+    try:
+        document = parse_advisor_wire(safe_raw_text)
+        extracted: dict[str, Any] = {
+            "fields": {key: list(values) for key, values in document.fields.items()},
+            "records": [list(item) for item in document.records],
+            "yara_rules": [
+                {"source": source, "name": name} for source, name in document.yara_rules
+            ],
+        }
+        if document.source is not None:
+            extracted["source"] = {
+                "language": document.source_language,
+                "text": document.source,
+                "count": document.source_count,
+            }
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        extracted = {}
+    opinion = {
+        "unit_id": "U1",
+        "text": safe_raw_text.strip(),
+        "source_refs": [],
+        "untrusted": True,
+        "validation_status": "unresolved",
+    }
+    return {
+        "schema": ADVISOR_RESPONSE_SCHEMA_V4,
+        "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        "consultation_type": consultation_type,
+        "status": "partial",
+        "parse_status": "partial",
+        "reason": reason,
+        "untrusted": True,
+        "usable": True,
+        "opinions": [opinion],
+        "candidates": [{**opinion, "validated": False}],
+        "incomplete_units": ["U1"],
+        "unresolved_refs": [],
+        "validated_facts": [],
+        "warnings": ["opportunistic_unstructured_parse", reason],
+        "extracted_elements": extracted,
+        "raw_output": safe_raw_text,
+        "raw_output_bytes": len(encoded),
+        "raw_output_sha256": hashlib.sha256(encoded).hexdigest(),
+        "raw_output_retained": True,
+        "raw_output_redacted": safe_raw_text != raw_text,
+    }
+
+
 def parse_advisor_semantic_response(
     raw: str,
     *,
@@ -113,6 +169,7 @@ def parse_advisor_semantic_response(
             "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
             "consultation_type": consultation_type,
             "status": status,
+            "parse_status": status,
             "untrusted": True,
             "usable": False,
             "opinions": [],
@@ -121,6 +178,12 @@ def parse_advisor_semantic_response(
             "unresolved_refs": [],
             "validated_facts": [],
             "warnings": [],
+            "extracted_elements": _unstructured_semantic_result(
+                raw_text,
+                safe_raw_text,
+                consultation_type=consultation_type,
+                reason="terminal_response",
+            ).get("extracted_elements", {}),
             **raw_provenance,
         }
         if reason is not None:
@@ -153,11 +216,14 @@ def parse_advisor_semantic_response(
     try:
         response = _decode_response(safe_raw_text, consultation_type)
     except _DuplicateJSONKey:
-        result = terminal("ambiguous", reason="duplicate_response_key")
-        result["unresolved_refs"] = [
-            {"alias": None, "reason": "ambiguous_response", "unit_id": None}
-        ]
-        return result
+        if _looks_like_exploitable_text(safe_raw_text):
+            return _unstructured_semantic_result(
+                raw_text,
+                safe_raw_text,
+                consultation_type=consultation_type,
+                reason="duplicate_response_key",
+            )
+        return terminal("invalid", reason="duplicate_response_key")
     except (AttributeError, TypeError, ValueError):
         response = None
     if (
@@ -220,13 +286,23 @@ def parse_advisor_semantic_response(
     if status == "refused":
         return terminal("refused", reason="advisor_refused")
     if status == "invalid":
+        if _looks_like_exploitable_text(safe_raw_text):
+            return _unstructured_semantic_result(
+                raw_text,
+                safe_raw_text,
+                consultation_type=consultation_type,
+                reason="advisor_marked_invalid",
+            )
         return terminal("invalid", reason="advisor_marked_invalid")
     if status == "ambiguous":
-        result = terminal("ambiguous", reason="advisor_marked_ambiguous")
-        result["unresolved_refs"] = [
-            {"alias": None, "reason": "advisor_marked_ambiguous", "unit_id": None}
-        ]
-        return result
+        if _looks_like_exploitable_text(safe_raw_text):
+            return _unstructured_semantic_result(
+                raw_text,
+                safe_raw_text,
+                consultation_type=consultation_type,
+                reason="advisor_marked_ambiguous",
+            )
+        return terminal("invalid", reason="advisor_marked_ambiguous")
 
     response_opinions = response.get("opinions")
     if consultation_type == "review_text" and (
@@ -270,7 +346,12 @@ def parse_advisor_semantic_response(
         result["evidence_preflight"] = completeness
         return result
     if _manifest_alias_conflicts(raw_manifest, dossier):
-        result = terminal("ambiguous", reason="source_alias_conflict")
+        result = _unstructured_semantic_result(
+            raw_text,
+            safe_raw_text,
+            consultation_type=consultation_type,
+            reason="source_alias_conflict",
+        )
         result["unresolved_refs"] = [
             {"alias": alias, "reason": "ambiguous_alias", "unit_id": None}
             for alias in _manifest_alias_conflicts(raw_manifest, dossier)
@@ -442,8 +523,7 @@ def parse_advisor_semantic_response(
     if status == "partial" and not incomplete_units and consultation_type != "review_text":
         parse_warnings.append("partial_units_marker_missing")
     if any_ambiguous_alias:
-        status = "ambiguous"
-        opinions = []
+        status = "partial"
     elif incomplete_units or unresolved_refs:
         status = "partial"
 
@@ -497,6 +577,7 @@ def parse_advisor_semantic_response(
         "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
         "consultation_type": consultation_type,
         "status": status,
+        "parse_status": status,
         "untrusted": True,
         "usable": (
             (
@@ -513,6 +594,16 @@ def parse_advisor_semantic_response(
         "unresolved_refs": unresolved_refs,
         "validated_facts": [],
         "warnings": warnings,
+        "extracted_elements": {
+            "opinions": [dict(item) for item in opinions],
+            "candidates": [dict(item) for item in candidates],
+            **_unstructured_semantic_result(
+                raw_text,
+                safe_raw_text,
+                consultation_type=consultation_type,
+                reason="opportunistic_extraction",
+            ).get("extracted_elements", {}),
+        },
         "evidence_preflight": completeness,
         **provenance,
     }

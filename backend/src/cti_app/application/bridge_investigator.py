@@ -65,6 +65,21 @@ MAX_PRE_SUBMISSION_ATTEMPTS = 3
 CONVERSATION_UNAVAILABLE_RETRY_BASE_SECONDS = 5.0
 CONVERSATION_UNAVAILABLE_RETRY_MAX_SECONDS = 20.0
 BRIDGE_PROVIDER_KEY = "openai_chatgpt_bridge"
+_BRIDGE_PRE_SUBMISSION_PROOF_CODES = frozenset(
+    {
+        "bridge_auth_failed",
+        "bridge_pool_timeout",
+        "bridge_rate_limited",
+        "bridge_request_invalid",
+        "bridge_submission_not_started",
+        "bridge_unreachable",
+        "bridge_unsupported_protocol",
+        "conversation_unavailable",
+        "external_effect_authority_required",
+        "model_provider_not_configured",
+        "policy_denied",
+    }
+)
 # Bound shared blocking caused by provider-supplied Retry-After values to avoid
 # an untrusted response stalling this process indefinitely; this is not a provider policy.
 MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS = 300.0
@@ -254,6 +269,7 @@ class TurnSubmission:
     failure_reason: str | None = None
     completed_response: bool = False
     prior_submission_made: bool = False
+    non_submission_proven: bool = False
 
     def __post_init__(self) -> None:
         if self.submission_state is None:
@@ -363,9 +379,13 @@ async def submit_bridge_consultation_once(
 
     submission_started = False
 
-    async def submit(attempt: int, call_timeout_seconds: float | None) -> TurnSubmission | None:
+    def mark_submission_started() -> None:
         nonlocal submission_started
-        submission_started = False
+        submission_started = True
+        if on_submission_started is not None:
+            on_submission_started()
+
+    async def submit(attempt: int, call_timeout_seconds: float | None) -> TurnSubmission | None:
         submission_kwargs: dict[str, Any] = {
             "investigation_id": investigation_id,
             "subject_id": subject_id,
@@ -463,11 +483,9 @@ async def submit_bridge_consultation_once(
                 )
         deferred_submission_marker = isinstance(transport, ModelConversationTurnTransport)
         if not deferred_submission_marker:
-            if on_submission_started is not None:
-                on_submission_started()
-            submission_started = True
+            mark_submission_started()
         if deferred_submission_marker:
-            submission_kwargs["on_submission_started"] = on_submission_started
+            submission_kwargs["on_submission_started"] = mark_submission_started
         if attempt == 0:
             return await transport.submit(
                 **submission_kwargs,
@@ -525,6 +543,14 @@ async def submit_bridge_consultation_once(
             submission_state = _normalize_bridge_submission_state(
                 getattr(exc, "submission_state", None)
             )
+            if submission_started and (
+                submission_state is None
+                or (
+                    submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                    and not _bridge_exception_proves_non_submission(exc)
+                )
+            ):
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
             retry_after = getattr(exc, "retry_after", None)
             retryable = bool(getattr(exc, "retryable", False))
             uncertain = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
@@ -548,6 +574,7 @@ async def submit_bridge_consultation_once(
                     else str(getattr(exc, "phase", "bridge_transport"))[:64]
                 ),
                 failure_reason=code,
+                non_submission_proven=_bridge_exception_proves_non_submission(exc),
             )
         if result is None:
             return TurnSubmission(
@@ -564,6 +591,30 @@ async def submit_bridge_consultation_once(
             # A transport that returns after its advertised deadline is still
             # ambiguous. Never let its late text reach advisor parsing.
             return ambiguous_timeout("Bridge returned after the bounded execution deadline.")
+        if (
+            submission_started
+            and result.status is not TurnSubmissionStatus.SUCCEEDED
+            and not result.completed_response
+            and result.submission_state is BridgeSubmissionState.PRE_SUBMISSION
+            and not result.non_submission_proven
+            and result.error_code == "bridge_server_error"
+            and result.failure_stage in {"submission", "submission_confirmation"}
+        ):
+            reconciliation_detail = _bridge_reconciliation_detail(
+                result.idempotency_key or key,
+                result.bridge_invocation_id,
+            )
+            return replace(
+                result,
+                status=TurnSubmissionStatus.NEEDS_REVIEW,
+                detail=reconciliation_detail,
+                retryable=False,
+                retry_after_seconds=None,
+                submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
+                failure_stage="bridge_submission_outcome_unknown",
+                failure_reason="bridge_server_error_during_submission_without_no_send_proof",
+                prior_submission_made=True,
+            )
         return result
 
     submission = await submit_with_deadline(0, transport_timeout)
@@ -752,6 +803,24 @@ def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | No
         return BridgeSubmissionState(value)
     except (TypeError, ValueError):
         return BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+
+
+def _bridge_exception_proves_non_submission(exc: Exception) -> bool:
+    if _normalize_bridge_submission_state(getattr(exc, "submission_state", None)) is not (
+        BridgeSubmissionState.PRE_SUBMISSION
+    ):
+        return False
+    code = str(getattr(exc, "code", ""))[:64]
+    if code == "bridge_server_error":
+        # This generic server error proves pre-submission only when its phase
+        # also confirms that submission had not begun.
+        phase = getattr(exc, "phase", None) or getattr(exc, "failure_stage", None)
+        return phase is not None and phase not in {"submission", "submission_confirmation"}
+    if getattr(exc, "verified_no_answer", False) is True:
+        return True
+    if code == "bridge_timeout" and getattr(exc, "status_code", None) is None:
+        return True
+    return code in _BRIDGE_PRE_SUBMISSION_PROOF_CODES
 
 
 def _bridge_reconciliation_detail(idempotency_key: str, bridge_run_id: str | None) -> str:
@@ -947,6 +1016,14 @@ class ModelConversationTurnTransport:
             attempt=attempt,
         )
         conversation_id = make_investigation_conversation_id(investigation_id)
+        submission_started = False
+
+        def mark_submission_started() -> None:
+            nonlocal submission_started
+            submission_started = True
+            if on_submission_started is not None:
+                on_submission_started()
+
         if not external_llm_allowed:
             return TurnSubmission(
                 status=TurnSubmissionStatus.BLOCKED,
@@ -1061,7 +1138,7 @@ class ModelConversationTurnTransport:
             # links inside ModelConversationService.
             mode = ConversationMode.FRESH
             failure_stage = "conversation_turn_submit"
-            with bridge_submission_boundary(on_submission_started):
+            with bridge_submission_boundary(mark_submission_started):
                 turn = await self._model_conversations.add_turn(
                     conversation_id,
                     message=prompt,
@@ -1120,14 +1197,28 @@ class ModelConversationTurnTransport:
                 )
                 if captured is not None:
                     return captured
+                if submission_started:
+                    return TurnSubmission(
+                        TurnSubmissionStatus.NEEDS_REVIEW,
+                        idempotency_key=key,
+                        conversation_id=conversation_id,
+                        detail=_bridge_reconciliation_detail(key, None),
+                        error_code=turn.error_code,
+                        submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
+                        failure_stage="bridge_turn_result",
+                        failure_reason=turn.error_code or turn.status.value,
+                        prior_submission_made=True,
+                    )
                 return TurnSubmission(
                     TurnSubmissionStatus.UNAVAILABLE,
                     idempotency_key=key,
                     conversation_id=conversation_id,
                     detail=turn.error_message or "Model conversation turn did not succeed.",
                     error_code=turn.error_code,
+                    submission_state=BridgeSubmissionState.PRE_SUBMISSION,
                     failure_stage="bridge_turn_result",
                     failure_reason=turn.error_code or turn.status.value,
+                    non_submission_proven=True,
                 )
             content = await self._model_conversations.turn_content_by_idempotency_key(
                 conversation_id,
@@ -1141,8 +1232,10 @@ class ModelConversationTurnTransport:
                     idempotency_key=key,
                     conversation_id=conversation_id,
                     detail="Successful Bridge turn has no persisted output text.",
+                    submission_state=BridgeSubmissionState.POST_SUBMISSION,
                     failure_stage="bridge_output_retrieval",
                     failure_reason="successful_turn_output_missing",
+                    prior_submission_made=True,
                 )
             return TurnSubmission(
                 TurnSubmissionStatus.SUCCEEDED,
@@ -1166,6 +1259,11 @@ class ModelConversationTurnTransport:
                 details.get("submission_state", getattr(exc, "submission_state", None))
             )
             if submission_state is None:
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            elif (
+                submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                and not _bridge_exception_proves_non_submission(exc)
+            ):
                 submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
             raw_bridge_run_id = (
                 details.get("bridge_run_id")
@@ -1196,6 +1294,7 @@ class ModelConversationTurnTransport:
                 prior_submission_made=(
                     submission_state is not BridgeSubmissionState.PRE_SUBMISSION
                 ),
+                non_submission_proven=_bridge_exception_proves_non_submission(exc),
             )
         except ConversationTurnFailedError as exc:
             captured = await self._recover_persisted_output(
@@ -1207,9 +1306,17 @@ class ModelConversationTurnTransport:
                 return captured
             submission_state = _normalize_bridge_submission_state(exc.submission_state)
             completed_response = exc.completed_response
-            submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             if submission_state is None:
+                # This exception represents a persisted failed turn. Absence of
+                # a stored boundary is not proof that the earlier attempt never
+                # reached Bridge, even when this replay did not start a request.
                 submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            elif (
+                submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                and not _bridge_exception_proves_non_submission(exc)
+            ):
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             details = getattr(exc, "details", None)
             if not isinstance(details, Mapping):
                 details = {}
@@ -1250,6 +1357,7 @@ class ModelConversationTurnTransport:
                 completed_response=completed_response,
                 bridge_invocation_id=bridge_run_id,
                 prior_submission_made=submitted,
+                non_submission_proven=_bridge_exception_proves_non_submission(exc),
             )
         except ConversationPolicyError as exc:
             return TurnSubmission(
@@ -1275,9 +1383,19 @@ class ModelConversationTurnTransport:
             error_code = str(getattr(exc, "code", ""))[:64] or None
             if error_code == "model_submission_reconciliation_required":
                 submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
-            submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             if submission_state is None:
+                submission_state = (
+                    BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+                    if submission_started
+                    or error_code == "model_submission_reconciliation_required"
+                    else BridgeSubmissionState.PRE_SUBMISSION
+                )
+            elif (
+                submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                and not _bridge_exception_proves_non_submission(exc)
+            ):
                 submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             details = getattr(exc, "details", None)
             if not isinstance(details, Mapping):
                 details = {}
@@ -1341,6 +1459,13 @@ class ModelConversationTurnTransport:
                 completed_response=completed_response,
                 bridge_invocation_id=bridge_run_id,
                 prior_submission_made=submitted,
+                non_submission_proven=(
+                    _bridge_exception_proves_non_submission(exc)
+                    or (
+                        not submission_started
+                        and submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                    )
+                ),
             )
 
     async def submit_with_attempt(
@@ -1475,6 +1600,8 @@ class ScriptedTurnTransport:
                     failure_stage=raw.failure_stage,
                     failure_reason=raw.failure_reason,
                     completed_response=raw.completed_response,
+                    prior_submission_made=raw.prior_submission_made,
+                    non_submission_proven=raw.non_submission_proven,
                 )
             elif isinstance(raw, Mapping):
                 submission = TurnSubmission(

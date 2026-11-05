@@ -77,6 +77,25 @@ def test_wire_dossier_omits_unverified_measurement_bytes_but_keeps_provenance() 
     assert "1" * 64 in rendered
 
 
+def test_wire_opportunistically_extracts_multiple_yara_rules_from_mixed_prose() -> None:
+    raw = (
+        "Bridge proposes two independent candidates.\n\n"
+        "```yara\n"
+        'rule FirstMarker { strings: $a = "first-marker" condition: $a }\n'
+        "```\n\n"
+        "A short explanation separates the rules.\n"
+        'rule SecondMarker { strings: $b = "second-marker" condition: $b }\n'
+        "These are candidates only.\n"
+    )
+
+    document = parse_advisor_wire(raw)
+
+    assert len(document.yara_rules) == 2
+    assert [name for _source, name in document.yara_rules] == ["FirstMarker", "SecondMarker"]
+    assert document.yara_rules[0][0] in raw
+    assert document.yara_rules[1][0] in raw
+
+
 def test_vt_file_observation_cannot_disclose_unverified_measurement_bytes() -> None:
     evidence_id = str(uuid4())
     evidence_sha256 = "a" * 64
@@ -92,6 +111,8 @@ def test_vt_file_observation_cannot_disclose_unverified_measurement_bytes() -> N
                     "sha256": evidence_sha256,
                     "source": "VirusTotal",
                     "object_type": "file",
+                    "blob_read_verified": True,
+                    "sample_sha256": "1" * 64,
                     "content_excerpts": [],
                 }
             ],
@@ -116,6 +137,163 @@ def test_vt_file_observation_cannot_disclose_unverified_measurement_bytes() -> N
     assert evidence_sha256 in dossier.text
     assert "offset=64" in dossier.text
     assert "length=8" in dossier.text
+
+
+def test_canonical_tool_measurement_keeps_value_without_claiming_blob_range_verification() -> None:
+    evidence_id = str(uuid4())
+    evidence_sha256 = "a" * 64
+    sample_sha256 = "b" * 64
+    value = "41424344" * 12  # 48 observed bytes from a canonical analysis result.
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": "yara_draft",
+            "question": "Use the 48-byte marker to draft a YARA rule.",
+            "evidence": [
+                {
+                    "evidence_id": evidence_id,
+                    "sha256": evidence_sha256,
+                    "source": "autowork.floss",
+                    "object_type": "sample_analysis",
+                    "blob_read_verified": True,
+                    "sample_sha256": sample_sha256,
+                    "content_excerpts": [],
+                }
+            ],
+            "measurements": [
+                {
+                    "measurement_id": "measurement:tool-observed-48-bytes",
+                    "evidence_id": evidence_id,
+                    "evidence_sha256": evidence_sha256,
+                    "sample_sha256": sample_sha256,
+                    "offset": 128,
+                    "length": 48,
+                    "kind": "hex",
+                    "encoding": "hex",
+                    "value": value,
+                }
+            ],
+        }
+    )
+
+    measurement = next(row for row in dossier.manifest if row["kind"] == "measurement")
+    assert value in dossier.text
+    assert "canonical tool observation" in dossier.text.casefold()
+    assert "range not reverified against canonical blob" in dossier.text.casefold()
+    assert measurement["range_verified"] is None
+    assert measurement["measurement_value_status"] == "canonical_tool_observation"
+    assert measurement["sample_blob_range_status"] == "not_reverified"
+
+
+@pytest.mark.parametrize("consultation_type", ["draft_text", "review_text"])
+def test_editorial_dossier_summarizes_unselected_historical_sample_inventory(
+    consultation_type: str,
+) -> None:
+    historical_samples = [
+        {
+            "verified": True,
+            "sample_id": f"sample-{index:03d}",
+            "association_id": f"association-{index:03d}",
+            "sha256": f"{index:064x}",
+            "blob_id": f"blob-{index:03d}",
+            "blob_sha256": f"{index:064x}",
+            "byte_length": 4096,
+            "mime_type": "application/octet-stream",
+            "content_status": "not_requested_for_consultation",
+            "content_base64": "",
+            "content_omission_reason": "whole_sample_not_needed_for_consultation",
+            "evidence_ids": [f"observation-{index:03d}"],
+        }
+        for index in range(1, 251)
+    ]
+
+    dossier = build_advisor_dossier(
+        {
+            "consultation_type": consultation_type,
+            "question": "Rédiger le passage éditorial demandé.",
+            "samples": historical_samples,
+            "evidence": [
+                {
+                    "evidence_id": f"observation-{index:03d}",
+                    "sha256": f"{index:064x}",
+                    "source": "investigation.subject_sample_reuse",
+                    "content_excerpts": [],
+                }
+                for index in range(1, 251)
+            ],
+        }
+    )
+
+    assert dossier.byte_size < 5_000
+    assert "omitted_sample_count=250" in dossier.text
+    assert "editorial_section_does_not_need_sample_inventory" in dossier.text
+    assert "consultation ciblée" in dossier.text.casefold()
+    assert "sample-001" not in dossier.text
+    assert not any(row["kind"] == "sample" for row in dossier.manifest)
+
+
+def test_plan_and_pivot_dossiers_select_their_own_consultation_context() -> None:
+    plan = build_advisor_dossier(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Plan the next investigation step.",
+            "article_summary": "A concise canonical synthesis summary.",
+            "open_questions": ["Which loader path is active?"],
+            "tools": [
+                {
+                    "name": "sample.analyze",
+                    "schema_version": "1",
+                    "required_arguments": ["sample_sha256"],
+                }
+            ],
+            "gaps": ["floss.unavailable"],
+            "hypotheses": [
+                {
+                    "id": "H1",
+                    "statement": "A loader resolves its next stage dynamically.",
+                    "status": "open",
+                }
+            ],
+        }
+    )
+    pivot = build_advisor_dossier(
+        {
+            "consultation_type": "pivot_strategy",
+            "question": "Find the next pivot around CreateMutexW.",
+            "article_summary": "This general article summary is not pivot evidence.",
+            "gaps": ["search coverage has no second sample comparison"],
+            "tools": [{"name": "sample.analyze", "schema_version": "1"}],
+            "measurements": [
+                {
+                    "measurement_id": "m-create-mutex",
+                    "sample_sha256": "a" * 64,
+                    "range_verified": True,
+                    "kind": "string",
+                    "offset": 16,
+                    "value": "CreateMutexW",
+                },
+                {
+                    "measurement_id": "m-unrelated",
+                    "sample_sha256": "b" * 64,
+                    "range_verified": True,
+                    "kind": "string",
+                    "offset": 32,
+                    "value": "UnrelatedMarker",
+                },
+            ],
+        }
+    )
+
+    assert "A concise canonical synthesis summary." in plan.text
+    assert "Which loader path is active?" in plan.text
+    assert "sample.analyze" in plan.text
+    assert "required_arguments" not in plan.text
+    assert "floss.unavailable" in plan.text
+    assert any(item["kind"] == "hypothesis" for item in plan.manifest)
+    assert "CreateMutexW" in pivot.text
+    assert "search coverage has no second sample comparison" in pivot.text
+    assert "UnrelatedMarker" not in pivot.text
+    assert "This general article summary is not pivot evidence." not in pivot.text
+    assert "sample.analyze" not in pivot.text
 
 
 def test_advisor_dossier_preserves_large_authorized_evidence_without_a_size_cap() -> None:
@@ -981,6 +1159,29 @@ def test_yara_prose_exposes_each_exact_rule_with_its_own_sha256() -> None:
     assert parsed["canonicalization_eligible"] is False
 
 
+def test_yara_prose_preserves_each_source_line_ending_and_hash() -> None:
+    sources = (
+        'rule First {\r\n    strings:\r\n        $a = "first-marker"\r\n'
+        "    condition:\r\n        $a\r\n}",
+        'rule Second {\n    strings:\r\n        $b = "second-marker"\r'
+        "    condition:\n        $b\r}",
+    )
+    raw = "```yara\r\n" + "\r\n\r\n".join(sources) + "\r\n```\r\n"
+
+    parsed = parse_typed_advisor_response(
+        raw,
+        consultation_type="yara_draft",
+        prompt_data={"consultation_type": "yara_draft", "measurements": [], "transmitted_refs": []},
+        safe_text=_safe_text,
+    )
+
+    assert parsed is not None
+    assert [item["rule_source"] for item in parsed["rules"]] == list(sources)
+    assert [item["rule_source_sha256"] for item in parsed["rules"]] == [
+        hashlib.sha256(source.encode("utf-8")).hexdigest() for source in sources
+    ]
+
+
 def test_yara_prose_keeps_ambiguous_multi_rule_boundaries_noncanonicalizable() -> None:
     raw = (
         "```yara\n"
@@ -998,10 +1199,9 @@ def test_yara_prose_keeps_ambiguous_multi_rule_boundaries_noncanonicalizable() -
     )
 
     assert parsed is not None
-    assert parsed["usable"] is False
     assert parsed["canonicalization_eligible"] is False
     assert "multiple_yara_rules_split_ambiguous" in parsed["warnings"]
-    assert parsed.get("rules", []) == []
+    assert [item["name"] for item in parsed["rules"]] == ["First", "Second"]
 
 
 def test_yara_unfenced_bridge_shape_extracts_and_links_both_measured_strings() -> None:
@@ -1487,7 +1687,7 @@ def test_suricata_prose_reply_keeps_rule_with_or_without_dossier_fact_refs() -> 
     assert "fact_references_missing" in refused["warning_classification"]["blocking"]
 
 
-def test_draft_wire_rejects_unknown_assertion_alias_as_a_unit_blocker() -> None:
+def test_draft_wire_keeps_text_when_assertion_alias_is_unknown() -> None:
     observation_id = str(uuid4())
     assertion = {
         "id": "claim-1",
@@ -1513,8 +1713,9 @@ LIMITATION: none
 
     assert parsed is not None
     assert parsed["status"] == "partial"
-    assert parsed["blocks"] == []
-    assert parsed["usable"] is False
+    assert parsed["usable"] is True
+    assert parsed["blocks"][0]["sentences"][0]["text"] == ("La capture confirme une requête DNS.")
+    assert any(item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"])
     assert "assertion_alias_unknown" in parsed["warnings"]
 
 
@@ -1924,7 +2125,11 @@ LIMITATION: none""",
     )
     assert cross_unit is not None
     assert cross_unit["status"] == "partial"
-    assert [item["unit_id"] for item in cross_unit["blocks"]] == ["U2"]
+    assert [item["unit_id"] for item in cross_unit["blocks"]] == ["U1", "U2"]
+    assert cross_unit["blocks"][0]["sentences"][0]["text"] == (
+        "La mesure confirme le mutex observé."
+    )
+    assert any(item["reason"] == "assertion_wrong_unit" for item in cross_unit["unresolved_refs"])
 
 
 def test_draft_text_keeps_valid_units_and_treats_reference_aliases_as_prose() -> None:
@@ -2076,10 +2281,11 @@ LIMITATION: none
 
     assert parsed is not None
     units = {item["unit_id"]: item for item in parsed["blocks"]}
-    assert units["U1"]["usable"] is False
+    assert units["U1"]["usable"] is True
     assert units["U2"]["usable"] is True
     assert units["U2"]["sentences"][0]["assertion_ids"] == ["assertion_two"]
-    assert "assertion_alias_unknown" in parsed["warning_classification"]["blocking"]
+    assert "assertion_alias_unknown" in parsed["warning_classification"]["informative"]
+    assert any(item["reason"] == "assertion_alias_unknown" for item in parsed["unresolved_refs"])
 
 
 def test_secret_detection_and_incoherent_byte_warning_block_admissibility() -> None:

@@ -11,7 +11,6 @@ import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import fields, replace
 from datetime import UTC, datetime
-from enum import StrEnum
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid5
 
@@ -32,7 +31,11 @@ from cti_app.application.evidence_recorder import (
     _sanitize_json,
     sanitize_evidence_text,
 )
-from cti_app.application.external_effects import external_effect_source_do_not_submit_blocks
+from cti_app.application.external_effects import (
+    advisor_disclosure_policy,
+    external_effect_source_do_not_submit_blocks,
+    external_effect_source_restriction_reason,
+)
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
     InvestigationContextV1,
@@ -104,7 +107,6 @@ from cti_app.domain.analyst_opinion import (
     opinion_blocks_with_observations,
     verify_opinion_citations,
 )
-from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -136,6 +138,7 @@ from cti_app.domain.investigation import (
     InvestigationEnvelope,
     InvestigationExecutionMode,
     InvestigationFinding,
+    InvocationReconciliationOutcome,
     NoveltyClass,
     TLPLevel,
     ToolInvocation,
@@ -185,6 +188,35 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
     }
 )
 _VT_PASSIVE_READ_TOOLS = _VT_COORDINATED_READ_TOOLS - {"vt.download_sample"}
+_VT_RECONCILIATION_OUTCOMES = frozenset(
+    {
+        InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+    }
+)
+_VT_RECONCILIATION_WITHOUT_RESULT = frozenset(
+    {
+        InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+        InvocationReconciliationOutcome.NOT_EXECUTED,
+    }
+)
+_RECONCILIATION_INTERPRETATIONS = {
+    InvocationReconciliationOutcome.EXECUTED_WITH_RESULT: "verified_result",
+    InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE: "verified_empty_response",
+    InvocationReconciliationOutcome.TRANSPORT_ERROR: "transport_error",
+    InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN: "external_result_unknown",
+    InvocationReconciliationOutcome.RESULT_UNAVAILABLE: "result_unavailable",
+    InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT: "reconciled_without_result",
+    InvocationReconciliationOutcome.NOT_EXECUTED: "not_executed",
+    InvocationReconciliationOutcome.ABANDON: "abandoned",
+}
 _VT_HASH_READ_TOOLS = frozenset(
     {"vt.file_report", "vt.relationships", "vt.behaviour", "vt.behaviour_pcap"}
 )
@@ -197,14 +229,38 @@ _VT_HASH_NOT_GROUNDED_CORRECTION = (
 )
 
 
-class InvocationReconciliationOutcome(StrEnum):
-    EXECUTED_WITH_RESULT = "executed_with_result"
-    NOT_EXECUTED = "not_executed"
-    ABANDON = "abandon"
-
-
 class _BudgetSnapshotPersistenceError(RuntimeError):
     """Envelope and normalized budget could not be persisted atomically."""
+
+
+def _reconciled_invocation_status(outcome: InvocationReconciliationOutcome) -> ToolInvocationStatus:
+    if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
+        return ToolInvocationStatus.SUCCEEDED
+    if outcome is InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE:
+        return ToolInvocationStatus.EMPTY
+    if outcome in {
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+    }:
+        return ToolInvocationStatus.NEEDS_REVIEW
+    if outcome in {
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+    }:
+        return ToolInvocationStatus.UNAVAILABLE
+    return ToolInvocationStatus.FAILED
+
+
+def _reconciliation_outcome_may_have_executed(outcome: InvocationReconciliationOutcome) -> bool:
+    return outcome in {
+        InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+        InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+        InvocationReconciliationOutcome.TRANSPORT_ERROR,
+        InvocationReconciliationOutcome.EXTERNAL_RESULT_UNKNOWN,
+        InvocationReconciliationOutcome.RESULT_UNAVAILABLE,
+        InvocationReconciliationOutcome.RECONCILED_WITHOUT_RESULT,
+        InvocationReconciliationOutcome.ABANDON,
+    }
 
 
 class ToolObservationWriter(Protocol):
@@ -375,6 +431,7 @@ class InvestigationService:
         rollback_uow: Callable[[], Awaitable[None]] | None = None,
         audit_decisions: AnalystDecisionRepository | None = None,
         effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
+        disclosure_profile: str | None = None,
     ) -> None:
         if no_progress_limit < 1 or max_turns_per_run < 1:
             raise ValueError("Investigation loop limits must be positive")
@@ -405,6 +462,7 @@ class InvestigationService:
         self._commit_uow = commit_uow
         self._rollback_uow = rollback_uow
         self._effective_policy_for = effective_policy_for
+        self._disclosure_policy = advisor_disclosure_policy(disclosure_profile)
         owner = getattr(commit_uow, "__self__", None)
         self._audit_decisions = audit_decisions or getattr(owner, "analyst_decisions", None)
 
@@ -918,7 +976,11 @@ class InvestigationService:
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
-            allowed = self.bridge_disclosure_allowed(snapshot, envelope)
+            allowed = self._disclosure_policy.allows_disclosure(
+                self.bridge_disclosure_allowed(snapshot, envelope),
+                envelope_exists=envelope is not None,
+                family="bridge.turn",
+            )
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
                 action = self._external_policy_block_action(snapshot, envelope, state.turn_index)
@@ -1482,8 +1544,13 @@ class InvestigationService:
                         # its one real prompt, then resize this provisional amount
                         # to the measured cost before the provider handoff.
                         requested_cost[BudgetDimension.CONTEXT_TOKENS] = token_limit_remaining
+                # An adapter that defers its context estimate to the one real, measured prompt
+                # (the registered Advisor) keeps the full operator request as the durable, audited
+                # parameters; for any other adapter a zero estimate still predicts a refusal and
+                # only non-free-text identity fields are persisted.
                 advisor_preflight_refusal_expected = (
                     tool_name == "advisor.consult"
+                    and not getattr(adapter, "reservation_cost_deferred", False)
                     and dynamic_cost.get(BudgetDimension.CONTEXT_BYTES, 0) == 0
                     and dynamic_cost.get(BudgetDimension.CONTEXT_TOKENS, 0) == 0
                 )
@@ -1772,9 +1839,10 @@ class InvestigationService:
                 expected_envelope_version=envelope.version,
                 approval_decision_id=envelope.approval_decision_id,
                 invocation_arguments_sha256=invocation_arguments_digest(
-                    arguments
-                    if tool_name == "advisor.consult"
-                    else invocation.normalized_parameters,
+                    # The coordinator re-derives this digest from the persisted invocation
+                    # parameters (the operator's request), never from tool-internal rewrites
+                    # such as an ignored unknown optional reference.
+                    invocation.normalized_parameters,
                     passive_read_retry_trusted=(
                         None
                         if tool_name == "advisor.consult"
@@ -1861,7 +1929,11 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.vt_external_disclosure_allowed(snapshot, current_envelope, tool_name):
+                if not self._disclosure_policy.allows_disclosure(
+                    self.vt_external_disclosure_allowed(snapshot, current_envelope, tool_name),
+                    envelope_exists=current_envelope is not None,
+                    family=tool_name,
+                ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 rejection_reason: list[str] = []
                 if await self._vt_source_disclosure_restricted(
@@ -1881,7 +1953,11 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.bridge_disclosure_allowed(snapshot, current_envelope):
+                if not self._disclosure_policy.allows_disclosure(
+                    self.bridge_disclosure_allowed(snapshot, current_envelope),
+                    envelope_exists=current_envelope is not None,
+                    family="advisor.consult",
+                ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
 
@@ -2397,9 +2473,15 @@ class InvestigationService:
                 investigation.subject_id, sample_hash
             )
             if any(
-                sample.tlp is TLP.RED
-                or external_effect_source_do_not_submit_blocks(family, sample.do_not_submit)
-                or bool((sample.license_restriction or "").strip())
+                external_effect_source_restriction_reason(
+                    source_kind="sample",
+                    source=sample,
+                    subject_id=investigation.subject_id,
+                    family=family,
+                    is_model_submission=False,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
+                is not None
                 for sample in samples
             ):
                 return True
@@ -2415,10 +2497,15 @@ class InvestigationService:
                 document = await source_documents.get(document_id)
                 if (
                     document is None
-                    or document.subject_id != investigation.subject_id
-                    or document.tlp is TLP.RED
-                    or external_effect_source_do_not_submit_blocks(family, document.do_not_submit)
-                    or bool((document.license_restriction or "").strip())
+                    or external_effect_source_restriction_reason(
+                        source_kind="source_document",
+                        source=document,
+                        subject_id=investigation.subject_id,
+                        family=family,
+                        is_model_submission=False,
+                        disclosure_profile=self._disclosure_policy.profile,
+                    )
+                    is not None
                 ):
                     return True
         return False
@@ -3075,7 +3162,11 @@ class InvestigationService:
                     invocation is not None
                     and current_envelope is not None
                     and invocation.status is ToolInvocationStatus.POLICY_DENIED
-                    and _tool_allowed_by_envelope(definition, current_envelope)
+                    and _tool_allowed_by_envelope(
+                        definition,
+                        current_envelope,
+                        disclosure_profile=self._disclosure_policy.profile,
+                    )
                 ):
                     # A previously denied operation had no external effect. A new G2
                     # version gets a fresh idempotency identity so explicit approval
@@ -3317,46 +3408,66 @@ class InvestigationService:
         invocation = await self._invocations.get(invocation_id)
         if invocation is None or invocation.investigation_id != investigation_id:
             raise LookupError("Tool invocation does not belong to the investigation")
+        passive_vt_read = invocation.tool_name in VT_PASSIVE_RETRY_TOOL_NAMES
         if actor_provenance is not None and invocation.tool_name not in VT_PASSIVE_RETRY_TOOL_NAMES:
             raise ValueError("Operator-client reconciliation is limited to passive VT reads")
+        if outcome in _VT_RECONCILIATION_OUTCOMES and not passive_vt_read:
+            raise ValueError("This reconciliation outcome is limited to passive VT reads")
         refs = await self._valid_observation_refs(investigation_id, tuple(response_refs))
         if len(refs) != len(set(response_refs)):
             raise ValueError("Reconciliation response references must exist in this investigation")
         if outcome is not InvocationReconciliationOutcome.EXECUTED_WITH_RESULT and refs:
             raise ValueError("Only executed_with_result may attach response references")
+        if passive_vt_read and outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
+            if actor_provenance == "operator_client" and not invocation.response_refs:
+                raise ValueError("Passive VT response has no persisted result to reconcile")
+            if not refs:
+                raise ValueError(
+                    "Passive VT executed_with_result requires persisted result references"
+                )
+            for ref in refs:
+                observation = await self._observations.get(ref)
+                if (
+                    observation is None
+                    or observation.investigation_id != investigation_id
+                    or observation.invocation_ref != invocation.id
+                ):
+                    raise ValueError(
+                        "Passive VT response references must belong to this invocation"
+                    )
+        if (
+            passive_vt_read
+            and outcome in _VT_RECONCILIATION_WITHOUT_RESULT
+            and invocation.response_refs
+        ):
+            if outcome is InvocationReconciliationOutcome.NOT_EXECUTED:
+                raise ValueError(
+                    "A persisted passive VT response cannot be reconciled as not_executed"
+                )
+            raise ValueError(
+                "A persisted passive VT response cannot be reconciled without its data"
+            )
         if actor_provenance == "operator_client":
             if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT:
-                if not invocation.response_refs:
-                    raise ValueError("Passive VT response has no persisted result to reconcile")
                 if not refs or not set(refs).issubset(invocation.response_refs):
                     raise ValueError(
                         "Passive VT reconciliation must use persisted response references"
                     )
-                for ref in refs:
-                    observation = await self._observations.get(ref)
-                    if (
-                        observation is None
-                        or observation.investigation_id != investigation_id
-                        or observation.invocation_ref != invocation.id
-                    ):
-                        raise ValueError(
-                            "Passive VT response references must belong to this invocation"
-                        )
-            elif (
-                outcome is InvocationReconciliationOutcome.NOT_EXECUTED and invocation.response_refs
-            ):
-                raise ValueError(
-                    "A persisted passive VT response cannot be reconciled as not_executed"
-                )
         if self._audit_decisions is None:
             raise RuntimeError("Invocation reconciliation audit repository is unavailable")
 
         details: dict[str, Any] = {
             "outcome": outcome.value,
+            "result_interpretation": _RECONCILIATION_INTERPRETATIONS[outcome],
             "invocation_id": str(invocation.id),
             "operation_key": invocation.operation_key,
             "response_refs": [str(item) for item in refs],
         }
+        if passive_vt_read and outcome in _VT_RECONCILIATION_WITHOUT_RESULT:
+            details["finding_created"] = False
+            details["negative_evidence_created"] = False
+        if _reconciliation_outcome_may_have_executed(outcome):
+            details["budget_settlement"] = "committed_conservatively"
         # An operator abandon keeps the invocation's persisted provider response
         # linked for audit; only attached (executed) references are ever new.
         retained_refs = (
@@ -3394,7 +3505,11 @@ class InvestigationService:
             investigation_id=investigation_id,
             decision_type=(
                 AnalystDecisionType.PIVOT_APPROVE
-                if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
+                if outcome
+                in {
+                    InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
+                    InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
+                }
                 else AnalystDecisionType.PIVOT_REJECT
             ),
             target_type=AnalystDecisionTargetType.TOOL,
@@ -3411,11 +3526,7 @@ class InvestigationService:
         if prior is not None:
             if not _same_reconciliation_decision(prior, decision):
                 raise ValueError("Idempotency-Key already records another reconciliation")
-            expected_status = (
-                ToolInvocationStatus.SUCCEEDED
-                if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
-                else ToolInvocationStatus.FAILED
-            )
+            expected_status = _reconciled_invocation_status(outcome)
             if (
                 invocation.status is not expected_status
                 or invocation.response_refs != retained_refs
@@ -3444,20 +3555,15 @@ class InvestigationService:
             if reservation is not None:
                 # A client-declared "not executed" is not proof: settle the reservation
                 # as consumed so that a later read can never be silently unaccounted.
-                if actor_provenance is not None or outcome in {
-                    InvocationReconciliationOutcome.EXECUTED_WITH_RESULT,
-                    InvocationReconciliationOutcome.ABANDON,
-                }:
+                if actor_provenance is not None or _reconciliation_outcome_may_have_executed(
+                    outcome
+                ):
                     envelope.budget.commit(invocation.operation_key)
                     consumed = dict(invocation.reserved_budget)
                 else:
                     envelope.budget.release(invocation.operation_key)
 
-        status = (
-            ToolInvocationStatus.SUCCEEDED
-            if outcome is InvocationReconciliationOutcome.EXECUTED_WITH_RESULT
-            else ToolInvocationStatus.FAILED
-        )
+        status = _reconciled_invocation_status(outcome)
         resolved = replace(
             invocation,
             status=status,
@@ -3506,7 +3612,12 @@ class InvestigationService:
             if definition.name == exclude_name:
                 continue
             if definition.effect in {ToolEffect.LOCAL_READ, ToolEffect.LOCAL_COMPUTE} or (
-                envelope is not None and _tool_allowed_by_envelope(definition, envelope)
+                envelope is not None
+                and _tool_allowed_by_envelope(
+                    definition,
+                    envelope,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
             ):
                 alternatives.append(definition.name)
         return tuple(sorted(set(alternatives))[:8])
@@ -4731,7 +4842,12 @@ def _envelope_reduced_since(
     )
 
 
-def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope | None) -> bool:
+def _tool_allowed_by_envelope(
+    definition: Any,
+    envelope: InvestigationEnvelope | None,
+    *,
+    disclosure_profile: str | None = None,
+) -> bool:
     if envelope is None or definition.effect is ToolEffect.EXTERNAL_ACTIVE:
         return False
     if definition.effect in {
@@ -4742,7 +4858,13 @@ def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope |
         provider = definition.capability_key.partition(".")[0]
         if (
             provider not in envelope.allowed_providers
-            or (envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red")
+            or (
+                envelope.disclosure.tlp is not None
+                and envelope.disclosure.tlp.value == "red"
+                and not advisor_disclosure_policy(disclosure_profile).ignores_restriction_labels(
+                    definition.name
+                )
+            )
             or (
                 envelope.disclosure.do_not_submit
                 and provider not in {"bridge", "advisor", "vt", "virustotal"}

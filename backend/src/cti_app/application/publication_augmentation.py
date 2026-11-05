@@ -18,6 +18,8 @@ from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
     CitationViolation,
     OpinionBlockType,
+    opinion_bridge_drafting_summary,
+    opinion_internal_text_markers,
     verify_opinion_citations,
 )
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
@@ -47,6 +49,8 @@ class PublicationAugmentationErrorCode(StrEnum):
     BASE_IDENTITY_MISMATCH = "publication_augmentation_base_identity_mismatch"
     INVESTIGATION_IDENTITY_MISMATCH = "publication_augmentation_investigation_identity_mismatch"
     OPINION_NOT_APPROVED = "publication_augmentation_opinion_not_approved"
+    BRIDGE_DRAFTING_ACK_REQUIRED = "publication_augmentation_bridge_drafting_ack_required"
+    OPINION_TEXT_MARKERS_FOUND = "publication_augmentation_opinion_text_markers_found"
     OPINION_EMPTY = "publication_augmentation_opinion_empty"
     CITATIONS_INVALID = "publication_augmentation_citations_invalid"
     TLP_VIOLATION = "publication_augmentation_tlp_violation"
@@ -66,9 +70,11 @@ class PublicationAugmentationError(ValueError):
         code: PublicationAugmentationErrorCode,
         *,
         citation_violations: tuple[CitationViolation, ...] = (),
+        publication_text_markers: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.code = code
         self.citation_violations = citation_violations
+        self.publication_text_markers = publication_text_markers
         super().__init__(code.value)
 
 
@@ -251,7 +257,22 @@ class PublicationAugmentationArtifactService:
         base_publication_artifact_id: UUID,
         opinion: AnalystOpinionV1,
         citation_context: OpinionCitationContext,
+        bridge_drafting_gap_acknowledged: bool = False,
     ) -> ProductionArtifact:
+        markers = opinion_internal_text_markers(opinion)
+        if markers:
+            raise PublicationAugmentationError(
+                PublicationAugmentationErrorCode.OPINION_TEXT_MARKERS_FOUND,
+                publication_text_markers=markers,
+            )
+        drafting = opinion_bridge_drafting_summary(opinion)
+        gap_acknowledged = bool(drafting["requires_acknowledgement"]) and (
+            opinion.bridge_drafting_gap_acknowledged or bridge_drafting_gap_acknowledged
+        )
+        if drafting["requires_acknowledgement"] and not gap_acknowledged:
+            raise PublicationAugmentationError(
+                PublicationAugmentationErrorCode.BRIDGE_DRAFTING_ACK_REQUIRED
+            )
         if citation_context.base_publication_artifact_id != base_publication_artifact_id:
             raise PublicationAugmentationError(
                 PublicationAugmentationErrorCode.BASE_IDENTITY_MISMATCH
@@ -286,7 +307,11 @@ class PublicationAugmentationArtifactService:
             )
             if existing is not None:
                 augmentation_metadata = existing.metadata["publication_augmentation"]
-                if augmentation_metadata.get("approver_id") != citation_context.approver_id:
+                if augmentation_metadata.get("approver_id") != citation_context.approver_id or (
+                    "bridge_drafting_gap_acknowledged" in augmentation_metadata
+                    and bool(augmentation_metadata["bridge_drafting_gap_acknowledged"])
+                    != gap_acknowledged
+                ):
                     raise PublicationAugmentationError(
                         PublicationAugmentationErrorCode.IDEMPOTENCY_CONFLICT
                     )
@@ -408,6 +433,7 @@ class PublicationAugmentationArtifactService:
                         "opinion_content_sha256": opinion.content_sha256,
                         "reviewer_id": opinion.reviewer_id,
                         "approver_id": citation_context.approver_id,
+                        "bridge_drafting_gap_acknowledged": gap_acknowledged,
                     },
                 },
             )

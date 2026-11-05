@@ -7,8 +7,9 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.model_gateway import ModelGateway
+from cti_app.application.model_gateway import ModelGateway, bridge_request_id_for_run
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import EditionStatus
@@ -51,10 +52,19 @@ class ProductionReconciliationResolver:
 
     async def resolve(self, run_id: UUID) -> ReconciliationOutcome:
         run = await self._get_run(run_id)
-        bridge_run_id = _bridge_run_id(run) if run is not None else None
+        bridge_run_id, is_request_key = (
+            _bridge_run_identity(run) if run is not None else (None, False)
+        )
+        if bridge_run_id is None and run is not None and run.reconciliation is not None:
+            bridge_run_id = await self._bridge_lookup_id_from_model_run(run)
+            is_request_key = bridge_run_id is not None
         bridge_status: str | None = None
         outcome = ReconciliationOutcome.UNDECIDED
-        self._last_bridge_run_id = bridge_run_id
+        self._last_bridge_run_id = (
+            bridge_request_fingerprint(bridge_run_id)
+            if bridge_run_id is not None and is_request_key
+            else bridge_run_id
+        )
         self._last_bridge_status = None
         try:
             if run is None or not run.requires_reconciliation:
@@ -68,8 +78,12 @@ class ProductionReconciliationResolver:
                 bridge_status = exc.bridge_status
                 if bridge_status is None and exc.status_code == 404:
                     bridge_status = "not_found"
-                if bridge_status in _FAILED_STATUSES | {"not_found"} and exc.verified_no_answer:
-                    outcome = await self._release(run_id, run)
+                self._last_bridge_status = bridge_status
+                if bridge_status in _FAILED_STATUSES and (exc.verified_no_answer or exc.retryable):
+                    outcome = await self._release(run_id, run, verified_bridge_status=bridge_status)
+                    return outcome
+                if bridge_status == "not_found" and exc.verified_no_answer:
+                    outcome = await self._release(run_id, run, verified_bridge_status=bridge_status)
                     return outcome
                 # A missing lookup or a generic transport failure does not prove
                 # that the exact submission can no longer yield an answer.
@@ -89,14 +103,35 @@ class ProductionReconciliationResolver:
                 return outcome
             if bridge_status in _PENDING_STATUSES:
                 return outcome
-            if bridge_status in _FAILED_STATUSES and _verified_no_answer(payload):
-                outcome = await self._release(run_id, run)
-                return outcome
+            if bridge_status in _FAILED_STATUSES:
+                text = _output_text(payload)
+                if text is not None:
+                    # A response is stronger evidence than a failed/retryable
+                    # marker. Adopt it and keep the exact attempt; never release
+                    # an available answer for a new prompt submission.
+                    outcome = await self._adopt_and_resume(run_id, run, payload, text)
+                    return outcome
+                if _verified_no_answer(payload) or _retryable(payload):
+                    outcome = await self._release(run_id, run, verified_bridge_status=bridge_status)
+                    return outcome
             # Failed without verified_no_answer, missing, and unknown states all
             # remain undecided. They must never authorize a new prompt POST.
             return outcome
         finally:
             self._last_bridge_status = bridge_status
+
+    async def _bridge_lookup_id_from_model_run(self, run: ProductionRun) -> str | None:
+        """Real idempotency key kept on the ModelRun (persisted error details only hold a
+        fingerprint, which Bridge cannot resolve)."""
+        reconciliation = run.reconciliation
+        if reconciliation is None:
+            return None
+        async with self._uow_factory() as uow:
+            model_run = await uow.model_runs.get(reconciliation.model_run_id)
+        if model_run is None:
+            return None
+        found = bridge_request_id_for_run(model_run)
+        return found[:255] if found else None
 
     async def _get_run(self, run_id: UUID) -> ProductionRun | None:
         async with self._uow_factory() as uow:
@@ -115,15 +150,48 @@ class ProductionReconciliationResolver:
         if reconciliation.production_run_id != original.id:
             return ReconciliationOutcome.UNDECIDED
 
-        model = await self._model_gateway.adopt_recovery_output(
-            reconciliation.model_run_id,
-            text.encode("utf-8"),
-            provenance="automatic_bridge_retrieval",
-            actor_id="system:production-reconciliation",
-            external_turn_id=_verified_external_turn_id(payload),
-            bridge_response_id=_verified_bridge_response_id(payload),
-        )
         expected_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        get_model = getattr(self._model_gateway, "get_run", None)
+        existing_model = (
+            await get_model(reconciliation.model_run_id) if callable(get_model) else None
+        )
+        bridge_response_id = _verified_bridge_response_id(payload)
+        if existing_model is not None and (
+            existing_model.raw_output_reference is not None
+            or existing_model.raw_output_sha256 is not None
+        ):
+            if (
+                existing_model.status is not ModelRunStatus.SUCCEEDED
+                or existing_model.raw_output_reference is None
+                or existing_model.raw_output_sha256 != expected_sha256
+                or (
+                    bridge_response_id
+                    and existing_model.response_id
+                    and existing_model.response_id != bridge_response_id
+                )
+            ):
+                return ReconciliationOutcome.UNDECIDED
+            read_output = getattr(self._model_gateway, "read_output", None)
+            if not callable(read_output):
+                return ReconciliationOutcome.UNDECIDED
+            try:
+                archived = await read_output(existing_model.raw_output_reference, max_bytes=None)
+            except Exception:
+                return ReconciliationOutcome.UNDECIDED
+            if hashlib.sha256(archived).hexdigest() != expected_sha256:
+                return ReconciliationOutcome.UNDECIDED
+            # The exact bytes are already archived. Reuse the persisted result
+            # instead of asking the gateway to replace it with a second recovery.
+            model = existing_model
+        else:
+            model = await self._model_gateway.adopt_recovery_output(
+                reconciliation.model_run_id,
+                text.encode("utf-8"),
+                provenance="automatic_bridge_retrieval",
+                actor_id="system:production-reconciliation",
+                external_turn_id=_verified_external_turn_id(payload),
+                bridge_response_id=bridge_response_id,
+            )
         if (
             model.status is not ModelRunStatus.SUCCEEDED
             or model.raw_output_sha256 != expected_sha256
@@ -168,14 +236,53 @@ class ProductionReconciliationResolver:
         reason: str = "bridge_run_unavailable",
         audit_reason: str | None = None,
         actor_id: str | None = None,
+        verified_bridge_status: str | None = None,
     ) -> ReconciliationOutcome:
-        bridge_run_id = _bridge_run_id(original)
+        bridge_run_id, is_request_key = _bridge_run_identity(original)
+        if bridge_run_id is None and original.reconciliation is not None:
+            bridge_run_id = await self._bridge_lookup_id_from_model_run(original)
+            is_request_key = bridge_run_id is not None
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get_for_update(run_id)
             if run is None or not run.requires_reconciliation:
                 return ReconciliationOutcome.UNDECIDED
             if run.reconciliation is None or run.current_stage is not original.current_stage:
                 return ReconciliationOutcome.UNDECIDED
+            model_runs = getattr(uow, "model_runs", None)
+            if model_runs is not None:
+                get_for_update = getattr(model_runs, "get_for_update", None)
+                model_run = await (
+                    get_for_update(run.reconciliation.model_run_id)
+                    if callable(get_for_update)
+                    else model_runs.get(run.reconciliation.model_run_id)
+                )
+                if (
+                    model_run is None
+                    or model_run.status is ModelRunStatus.SUCCEEDED
+                    or model_run.raw_output_reference is not None
+                    or model_run.raw_output_sha256 is not None
+                ):
+                    # A locally archived response wins over a lost declaration
+                    # or a stale Bridge failure marker.
+                    return ReconciliationOutcome.UNDECIDED
+                if audit_reason is not None:
+                    if model_run.status is not ModelRunStatus.NEEDS_REVIEW:
+                        return ReconciliationOutcome.UNDECIDED
+                    model_run.abandon_uncertain_submission(
+                        actor_id=actor_id or "unknown", reason=audit_reason
+                    )
+                else:
+                    if (
+                        model_run.status is not ModelRunStatus.NEEDS_REVIEW
+                        or verified_bridge_status is None
+                    ):
+                        return ReconciliationOutcome.UNDECIDED
+                    model_run.reopen_after_verified_reconciliation_failure(
+                        bridge_status=verified_bridge_status
+                    )
+                save_model = getattr(model_runs, "save", None)
+                if callable(save_model):
+                    await save_model(model_run)
             run.release_reconciliation(expected_stage=run.current_stage, reason=reason)
             await uow.production_runs.save(run)
             await uow.commit()
@@ -185,7 +292,11 @@ class ProductionReconciliationResolver:
                 run_id=run_id,
                 subject_id=original.subject_id,
                 stage=original.current_stage.value,
-                bridge_run_id=bridge_run_id,
+                bridge_run_id=(
+                    bridge_request_fingerprint(bridge_run_id)
+                    if bridge_run_id is not None and is_request_key
+                    else bridge_run_id
+                ),
                 actor_id=actor_id or "unknown",
                 reason=audit_reason,
             )
@@ -228,14 +339,26 @@ def _bridge_id_in(source: dict[str, Any]) -> str | None:
     # timeout may leave only bridge_request_id (`<uuid>:aN`). The bridge route
     # accepts that exact idempotency key as a lookup alias; preserve the suffix
     # instead of guessing a different provider identity.
-    for key in ("bridge_run_id", "bridge_response_id", "bridge_request_id"):
+    identity, _ = _bridge_identity_in(source)
+    return identity
+
+
+def _bridge_identity_in(source: dict[str, Any]) -> tuple[str | None, bool]:
+    for key, is_request_key in (
+        ("bridge_run_id", False),
+        ("bridge_response_id", False),
+        ("bridge_request_id", True),
+    ):
         value = source.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:255]
-    return None
+        # Persisted error details expose only a ``sha256:`` fingerprint of the idempotency key
+        # (never the key); a fingerprint cannot be looked up on Bridge, so keep searching and
+        # fall back to the key stored on the ModelRun/reconciliation record.
+        if isinstance(value, str) and value.strip() and not value.strip().startswith("sha256:"):
+            return value.strip()[:255], is_request_key
+    return None, False
 
 
-def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
+def _bridge_identity_for_model_run(value: object, model_run_id: UUID) -> tuple[str | None, bool]:
     """Find the bridge identity recorded beside one exact ModelRun id.
 
     The identity may sit deeper than the run's own error details.  Anchoring
@@ -244,47 +367,47 @@ def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
     """
     if isinstance(value, list):
         for child in value:
-            found = _bridge_id_for_model_run(child, model_run_id)
-            if found is not None:
+            found = _bridge_identity_for_model_run(child, model_run_id)
+            if found[0] is not None:
                 return found
-        return None
+        return None, False
     if not isinstance(value, dict):
-        return None
+        return None, False
     if str(value.get("model_run_id")) == str(model_run_id):
-        found = _bridge_id_in(value)
+        found = _bridge_identity_in(value)
         nested = value.get("details")
-        if found is None and isinstance(nested, dict):
-            found = _bridge_id_in(nested)
-        if found is not None:
+        if found[0] is None and isinstance(nested, dict):
+            found = _bridge_identity_in(nested)
+        if found[0] is not None:
             return found
     for child in value.values():
-        found = _bridge_id_for_model_run(child, model_run_id)
-        if found is not None:
+        found = _bridge_identity_for_model_run(child, model_run_id)
+        if found[0] is not None:
             return found
-    return None
+    return None, False
 
 
-def _bridge_run_id(run: ProductionRun) -> str | None:
+def _bridge_run_identity(run: ProductionRun) -> tuple[str | None, bool]:
     details = run.error_details if isinstance(run.error_details, dict) else {}
     nested = details.get("details")
     sources = (details, nested) if isinstance(nested, dict) else (details,)
 
     for source in sources:
-        found = _bridge_id_in(source)
-        if found is not None:
+        found = _bridge_identity_in(source)
+        if found[0] is not None:
             return found
     reconciliation = run.reconciliation
     if reconciliation is None:
-        return None
-    anchored = _bridge_id_for_model_run(details, reconciliation.model_run_id)
-    if anchored is not None:
+        return None, False
+    anchored = _bridge_identity_for_model_run(details, reconciliation.model_run_id)
+    if anchored[0] is not None:
         return anchored
     if reconciliation.bridge_response_id:
-        return reconciliation.bridge_response_id[:255]
+        return reconciliation.bridge_response_id[:255], False
     if reconciliation.bridge_request_id:
         # The bridge supports its idempotency key as an exact GET lookup alias.
-        return reconciliation.bridge_request_id[:255]
-    return None
+        return reconciliation.bridge_request_id[:255], True
+    return None, False
 
 
 def _status(payload: dict[str, Any]) -> str | None:
@@ -297,6 +420,13 @@ def _verified_no_answer(payload: dict[str, Any]) -> bool:
         return True
     error = payload.get("error")
     return isinstance(error, dict) and error.get("verified_no_answer") is True
+
+
+def _retryable(payload: dict[str, Any]) -> bool:
+    if payload.get("retryable") is True:
+        return True
+    error = payload.get("error")
+    return isinstance(error, dict) and error.get("retryable") is True
 
 
 def _output_text(payload: dict[str, Any]) -> str | None:

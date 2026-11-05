@@ -6,6 +6,7 @@ import os
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -42,7 +43,8 @@ from cti_app.application.investigation_contracts import (
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "advisor_eval"
-CORPUS_PATH = FIXTURE_DIR / "anti_slop.v1.jsonl"
+# Corpus v2 keeps readable text usable when an optional response reference is unresolved.
+CORPUS_PATH = FIXTURE_DIR / "anti_slop.v2.jsonl"
 MANIFEST_PATH = FIXTURE_DIR / "manifest.v1.json"
 CASE_SCHEMA = "advisor-anti-slop-case.v1"
 FILLER_LIST_VERSION = "generic-phrases.v1"
@@ -125,7 +127,7 @@ def _load_cases() -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     corpus_bytes = CORPUS_PATH.read_bytes()
     corpus_sha256 = hashlib.sha256(corpus_bytes).hexdigest()
     assert manifest["schema"] == "advisor-anti-slop-manifest.v1"
-    assert manifest["corpus_version"] == "anti_slop.v1"
+    assert manifest["corpus_version"] == "anti_slop.v2"
     assert manifest["corpus_sha256"] == corpus_sha256
     assert manifest["case_count"] >= 16
 
@@ -484,6 +486,19 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
     }
+    if labels.get("unknown_optional_reference") is True:
+        observed_metrics["unknown_optional_reference_usable"] = bool(
+            usable and parser_status == "PARTIAL"
+        )
+        unknown_reference_codes = {"assertion_alias_unknown", "reference_alias_unknown"}
+        observed_metrics["unknown_optional_reference_audited"] = bool(
+            isinstance(parsed, Mapping)
+            and any(code in unknown_reference_codes for code in parsed.get("warnings", ()))
+            and any(
+                isinstance(item, Mapping) and item.get("reason") in unknown_reference_codes
+                for item in parsed.get("unresolved_refs", ())
+            )
+        )
     return {
         "case_id": case["case_id"],
         "class": labels["class"],
@@ -529,8 +544,30 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
 
     invalid_cases = [case for case in cases if case["labels"].get("invalid_reference") is True]
     invalid_usable = sum(result_by_id[case["case_id"]]["usable"] for case in invalid_cases)
-    factual_total = sum(item["factual_sentence_count"] for item in results)
-    anchored_total = sum(item["anchored_factual_sentence_count"] for item in results)
+    structural_controls = [
+        case
+        for case in cases
+        if case["labels"].get("class") == "structural_anchor"
+        and case["labels"].get("positive_control") is True
+    ]
+    factual_total = sum(
+        result_by_id[case["case_id"]]["factual_sentence_count"] for case in structural_controls
+    )
+    anchored_total = sum(
+        result_by_id[case["case_id"]]["anchored_factual_sentence_count"]
+        for case in structural_controls
+    )
+    optional_reference_cases = [
+        case for case in cases if case["labels"].get("unknown_optional_reference") is True
+    ]
+    optional_reference_usable = sum(
+        bool(result_by_id[case["case_id"]]["metrics"]["unknown_optional_reference_usable"])
+        for case in optional_reference_cases
+    )
+    optional_reference_audited = sum(
+        bool(result_by_id[case["case_id"]]["metrics"]["unknown_optional_reference_audited"])
+        for case in optional_reference_cases
+    )
     no_proof_cases = [case for case in cases if case["labels"].get("no_proof") is True]
     no_proof_unsafe = sum(
         bool(result_by_id[case["case_id"]]["metrics"]["no_proof_unsafe"]) for case in no_proof_cases
@@ -587,6 +624,18 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
             "rate": _rate(anchored_total, factual_total),
             "threshold": 1.0,
         },
+        "unknown_optional_reference_usefulness": {
+            "numerator": optional_reference_usable,
+            "denominator": len(optional_reference_cases),
+            "rate": _rate(optional_reference_usable, len(optional_reference_cases)),
+            "threshold": 1.0,
+        },
+        "unknown_optional_reference_auditability": {
+            "numerator": optional_reference_audited,
+            "denominator": len(optional_reference_cases),
+            "rate": _rate(optional_reference_audited, len(optional_reference_cases)),
+            "threshold": 1.0,
+        },
         "absence_of_proof": {
             "numerator": no_proof_unsafe,
             "denominator": len(no_proof_cases),
@@ -637,9 +686,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
     per_class_metrics = {}
     for class_name, metric_names in class_metric_names.items():
         if class_name == "structural_anchor":
-            class_case_ids = {
-                case["case_id"] for case in cases if case["labels"]["class"] == class_name
-            }
+            class_case_ids = {case["case_id"] for case in structural_controls}
             class_facts = sum(
                 result_by_id[case_id]["factual_sentence_count"] for case_id in class_case_ids
             )
@@ -661,6 +708,8 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
             }
     assert invalid_usable == 0
     assert factual_total > 0 and anchored_total == factual_total
+    assert optional_reference_usable == len(optional_reference_cases) > 0
+    assert optional_reference_audited == len(optional_reference_cases)
     assert no_proof_unsafe == 0
     assert contradiction_ok == len(contradiction_cases) > 0
     assert duplicate_count == 0

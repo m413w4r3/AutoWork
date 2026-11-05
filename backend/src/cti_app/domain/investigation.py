@@ -27,6 +27,17 @@ class ToolInvocationStatus(StrEnum):
     PARTIAL = "partial"
 
 
+class InvocationReconciliationOutcome(StrEnum):
+    EXECUTED_WITH_RESULT = "executed_with_result"
+    EXECUTED_EMPTY_RESPONSE = "executed_empty_response"
+    TRANSPORT_ERROR = "transport_error"
+    EXTERNAL_RESULT_UNKNOWN = "external_result_unknown"
+    RESULT_UNAVAILABLE = "result_unavailable"
+    RECONCILED_WITHOUT_RESULT = "reconciled_without_result"
+    NOT_EXECUTED = "not_executed"
+    ABANDON = "abandon"
+
+
 class FrameworkPreSubmissionProof(StrEnum):
     """Framework-attested outcomes proving no external submit or handoff occurred."""
 
@@ -721,6 +732,26 @@ class MotifProvenance:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class DetectionCandidateProvenance:
+    """Candidate-level source details that do not belong to any one motif."""
+
+    kind: str
+    metadata: Mapping[str, Any]
+    observation_refs: tuple[UUID, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or not self.kind.strip():
+            raise ValueError("Detection candidate provenance requires a kind")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("Detection candidate provenance metadata must be an object")
+        refs = tuple(self.observation_refs)
+        if any(not isinstance(item, UUID) for item in refs) or len(refs) != len(set(refs)):
+            raise ValueError("Detection candidate provenance references must be unique UUIDs")
+        object.__setattr__(self, "metadata", freeze_json(dict(self.metadata)))
+        object.__setattr__(self, "observation_refs", refs)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DetectionCandidateVersion:
     investigation_id: UUID
     source: str
@@ -731,6 +762,7 @@ class DetectionCandidateVersion:
     version: int = 1
     parent_version_id: UUID | None = None
     test_refs: tuple[UUID, ...] = ()
+    provenance: DetectionCandidateProvenance | None = None
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -746,6 +778,10 @@ class DetectionCandidateVersion:
         _aware(self.created_at, "created_at")
         object.__setattr__(self, "motif_provenance", tuple(self.motif_provenance))
         object.__setattr__(self, "test_refs", tuple(self.test_refs))
+        if self.provenance is not None and not isinstance(
+            self.provenance, DetectionCandidateProvenance
+        ):
+            raise TypeError("Detection candidate provenance has an invalid type")
 
     @property
     def version_label(self) -> str:

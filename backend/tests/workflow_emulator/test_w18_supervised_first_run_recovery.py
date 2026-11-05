@@ -31,7 +31,6 @@ from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_rendering import EditionRenderService
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.investigation_service import InvocationReconciliationOutcome
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
@@ -51,6 +50,7 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
+    InvocationReconciliationOutcome,
     NoveltyClass,
     SampleOrigin,
     ToolInvocationStatus,

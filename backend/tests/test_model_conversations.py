@@ -412,6 +412,44 @@ async def test_model_transport_recovers_persisted_confirmed_pre_submission_failu
 
 
 @pytest.mark.asyncio
+async def test_persisted_submission_phase_error_stays_ambiguous_without_repost(
+    tmp_path: Path,
+) -> None:
+    adapter = _FailOnceBeforeSubmissionAdapter("unused")
+    subject_id = uuid4()
+    service, state = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+    transport = ModelConversationTurnTransport(service)
+    investigation_id = uuid4()
+    args = {
+        "investigation_id": investigation_id,
+        "subject_id": subject_id,
+        "turn_index": 6,
+        "context_sha256": hashlib.sha256(b"persisted submission phase").hexdigest(),
+        "prompt": "A stable synthetic investigation prompt.",
+        "external_llm_allowed": True,
+    }
+
+    first = await transport.submit(**args)
+    assert first.submission_state == "pre_submission"
+
+    turn = next(iter(state.turns.values()))
+    run = state.model_runs[turn.model_run_id]
+    run.error_details = {**(run.error_details or {}), "phase": "submission"}
+    run.submission_state = ModelSubmissionState.NOT_SUBMITTED
+
+    replay = await transport.submit(**args)
+
+    assert replay.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert replay.submission_state == "external_state_unknown"
+    assert replay.prior_submission_made is True
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_completed_rate_limit_replay_preserves_rejection_without_resubmission(
     tmp_path: Path,
 ) -> None:

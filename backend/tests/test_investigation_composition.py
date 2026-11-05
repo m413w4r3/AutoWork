@@ -189,13 +189,30 @@ def test_composition_announces_local_tools_and_only_configured_capabilities() ->
         "network.protocol.render",
         "sample.get_feature_pack",
         "sample.set_qualification",
+        "rule.import_suricata_bridge_candidate",
     }
     assert composition.available_capabilities == frozenset(
         {
             "investigation.local_read",
             "network.protocol.document",
             "network.protocol.render",
+            "rule.import_suricata_bridge_candidate",
         }
+    )
+    import_without_capability = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="composition-without-suricata-import-capability",
+        available_capabilities=(
+            composition.available_capabilities - {"rule.import_suricata_bridge_candidate"}
+        ),
+    )
+    assert (
+        "rule.import_suricata_bridge_candidate"
+        not in project_tool_availability(
+            composition.registry, import_without_capability
+        ).available_names
     )
     assert composition.registry.get("advisor.reparse", ADVISOR_REPARSE_SCHEMA_VERSION) is None
     assert composition.service._no_progress_limit == 7

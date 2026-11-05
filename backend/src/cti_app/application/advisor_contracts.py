@@ -30,12 +30,23 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ANCHOR = re.compile(r"^[a-z][a-z0-9:_-]{0,127}$")
 _REFERENCE_ALIAS_IN_PROSE = re.compile(r"(?<![A-Za-z0-9_])[ER][1-9][0-9]*(?![A-Za-z0-9_])", re.I)
 _INFORMATIVE_ADVISOR_WARNINGS = {
+    "assertion_alias_unknown",
+    "assertion_wrong_unit",
     "block_target_defaulted",
     "bridge_reported_partial",
     "evidence_links_absent",
     "invariants_missing",
     "limitations_missing",
+    "reference_alias_invalid",
+    "reference_alias_unknown",
+    "reference_list_partial",
     "source_alias_in_prose",
+    "sentence_references_missing",
+    "sentence_without_valid_assertion",
+    "draft_sentence_assertion_invalid",
+    "draft_sentence_reference_invalid",
+    "draft_sentence_invalid",
+    "draft_unit_without_valid_sentences",
     "heuristic_unit_assignment",
     "secret_redacted",
     "response_bounded",
@@ -67,6 +78,67 @@ _YARA_RULE_START = re.compile(r"(?m)^\s*(?:(?:private|global)\s+)*rule\s+[A-Za-z
 
 
 def parse_typed_advisor_response(
+    raw: str,
+    *,
+    consultation_type: str,
+    prompt_data: Mapping[str, Any],
+    safe_text: Callable[[str, int], str],
+    measurement_sha256_overrides: Mapping[str, str] | None = None,
+    operational_secret_values: Sequence[str] = (),
+) -> dict[str, Any] | None:
+    result = _parse_typed_advisor_response(
+        raw,
+        consultation_type=consultation_type,
+        prompt_data=prompt_data,
+        safe_text=safe_text,
+        measurement_sha256_overrides=measurement_sha256_overrides,
+        operational_secret_values=operational_secret_values,
+    )
+    raw_text = raw if isinstance(raw, str) else ""
+    redacted_raw, _ = redact_explicit_operational_secrets(
+        raw_text, operational_secret_values=operational_secret_values
+    )
+    safe_raw = safe_text(str(redacted_raw), len(str(redacted_raw)) + 1)
+    v4_response = extract_json_object(safe_raw)
+    if (
+        result is None
+        and not (v4_response is not None and v4_response.get("schema") == "advisor-response.v4")
+        and _text_is_intelligible(safe_raw)
+    ):
+        result = _opportunistic_text_result(
+            safe_raw,
+            consultation_type=consultation_type,
+            raw_text=raw_text,
+        )
+    if result is None:
+        return None
+    result = dict(result)
+    encoded = raw_text.encode("utf-8")
+    result.setdefault("raw_output", safe_raw)
+    result.setdefault("raw_output_bytes", len(encoded))
+    result.setdefault("raw_output_sha256", hashlib.sha256(encoded).hexdigest())
+    result.setdefault("raw_output_retained", True)
+    result.setdefault("raw_output_truncated", False)
+    status = result.get("status")
+    if _text_is_intelligible(safe_raw) and result.get("usable") is False:
+        result["parse_status"] = "refused" if status == "refused" else "partial"
+        if status not in {"refused", "partial"}:
+            result["status"] = "partial"
+    else:
+        result.setdefault(
+            "parse_status",
+            status if status in {"succeeded", "partial", "refused"} else "partial",
+        )
+    extracted = _opportunistic_extractions(safe_raw)
+    if not extracted and _text_is_intelligible(safe_raw):
+        extracted = {"text": safe_raw}
+    result.setdefault("extracted_elements", extracted)
+    if not result["extracted_elements"] and _text_is_intelligible(safe_raw):
+        result["extracted_elements"] = {"text": safe_raw}
+    return result
+
+
+def _parse_typed_advisor_response(
     raw: str,
     *,
     consultation_type: str,
@@ -232,6 +304,63 @@ def parse_typed_advisor_response(
             warnings=(),
         )
     return _classify_advisor_warnings(result)
+
+
+def _text_is_intelligible(value: str) -> bool:
+    text_value = value.strip()
+    if text_value.casefold() in {"json", "empty", "n/a", "none", "null", "{}", "[]"}:
+        return False
+    words = re.findall(r"[\w]+", text_value)
+    return bool(words) and len(text_value) >= 12
+
+
+def _opportunistic_extractions(raw: str) -> dict[str, Any]:
+    try:
+        document = parse_advisor_wire(raw)
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return {}
+    extracted: dict[str, Any] = {}
+    if document.fields:
+        extracted["fields"] = {key: list(values) for key, values in document.fields.items()}
+    if document.records:
+        extracted["records"] = [list(item) for item in document.records]
+    if document.yara_rules:
+        extracted["yara_rules"] = [
+            {"source": source, "name": name} for source, name in document.yara_rules
+        ]
+    if document.source is not None:
+        extracted["source"] = {
+            "language": document.source_language,
+            "text": document.source,
+            "count": document.source_count,
+        }
+    if document.extraction_notes:
+        extracted["parse_notes"] = list(document.extraction_notes)
+    return extracted
+
+
+def _opportunistic_text_result(
+    safe_raw: str, *, consultation_type: str, raw_text: str
+) -> dict[str, Any]:
+    encoded = raw_text.encode("utf-8")
+    return {
+        "schema": ADVISOR_RESPONSE_SCHEMA_V3,
+        "consultation_type": consultation_type,
+        "status": "partial",
+        "parse_status": "partial",
+        "normalization_status": "partial",
+        "untrusted": True,
+        "usable": True,
+        "advisory_text": safe_raw,
+        "raw_output": safe_raw,
+        "raw_output_bytes": len(encoded),
+        "raw_output_sha256": hashlib.sha256(encoded).hexdigest(),
+        "raw_output_retained": True,
+        "raw_output_truncated": False,
+        "extracted_elements": _opportunistic_extractions(safe_raw) or {"text": safe_raw},
+        "warnings": ["opportunistic_unstructured_parse"],
+        "limitations": ["Secondary response formatting could not be fully structured."],
+    }
 
 
 _REVIEW_TEXT_KEYS = frozenset(
@@ -956,6 +1085,7 @@ def _resolve_typed_json_aliases(
     """Accept alias citations in legacy JSON replies while resolving locally."""
     aliases = advisor_wire_aliases(prompt_data)
     warnings: list[str] = []
+    unresolved_refs: list[dict[str, str]] = []
     actual_refs = {
         (str(item.get("kind")), str(item.get("id"))): item for item in aliases["refs"].values()
     }
@@ -1040,6 +1170,7 @@ def _resolve_typed_json_aliases(
                 mapped = aliases["assertions"].get(item.upper()) or actual_assertions.get(item)
                 if mapped is None:
                     warn()
+                    unresolved_refs.append({"reference": item, "reason": "assertion_alias_unknown"})
                 else:
                     resolved.append(str(mapped.get("id")))
                 continue
@@ -1089,6 +1220,8 @@ def _resolve_typed_json_aliases(
             else:
                 blocks.append(block)
         result["blocks"] = blocks
+        if unresolved_refs:
+            result["_unresolved_refs"] = unresolved_refs
     elif consultation_type == "yara_draft" and isinstance(result.get("motifs"), list):
         result["motifs"] = [
             {
@@ -1584,6 +1717,8 @@ def _parse_typed_advisor_wire(
     elif status_match.group(1).casefold() == "partial":
         warn("bridge_reported_partial")
 
+    unresolved_refs: list[dict[str, Any]] = []
+
     def mapped_refs(value: str, prefix: str) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         tokens = [part for part in re.split(r"[,;\s]+", value.strip()) if part]
@@ -1606,6 +1741,9 @@ def _parse_typed_advisor_wire(
                 item = alias_map.get(normalized)
             if item is None:
                 warn("reference_alias_unknown")
+                unresolved_refs.append(
+                    {"reference": normalized, "reason": "reference_alias_unknown"}
+                )
                 continue
             if prefix == "R":
                 identifier = item.get("id")
@@ -1881,19 +2019,32 @@ def _parse_typed_advisor_wire(
                         warn_draft_unit(active_unit, "unit_target_missing")
                         continue
                 match = re.match(r"^(.*?)\s*\[([^\]]*)\]\s*$", value)
-                if match is None:
-                    warn_draft_unit(active_unit, "sentence_references_missing")
-                    continue
-                sentence = text(match.group(1).strip(), 2400, "sentence_invalid")
+                sentence_source = match.group(1).strip() if match is not None else value.strip()
+                sentence = text(sentence_source, 2400, "sentence_invalid")
                 sentence_refs: list[str] = []
-                invalid_refs = False
-                for token in re.split(r"[,;\s]+", match.group(2).strip()):
+                raw_tokens = re.split(r"[,;\s]+", match.group(2).strip()) if match else []
+                if not raw_tokens:
+                    warn_draft_unit(active_unit, "sentence_references_missing")
+                    unresolved_refs.append(
+                        {
+                            "reference": None,
+                            "reason": "sentence_references_missing",
+                            "unit_id": active_unit,
+                        }
+                    )
+                for token in raw_tokens:
                     if not token:
                         continue
                     assertion = assertions.get(token.upper())
                     if assertion is None:
                         warn_draft_unit(active_unit, "assertion_alias_unknown")
-                        invalid_refs = True
+                        unresolved_refs.append(
+                            {
+                                "reference": token,
+                                "reason": "assertion_alias_unknown",
+                                "unit_id": active_unit,
+                            }
+                        )
                         continue
                     assertion_id = assertion.get("id")
                     assertion_unit = assertion.get("unit_id")
@@ -1908,17 +2059,36 @@ def _parse_typed_advisor_wire(
                         sentence_refs.append(assertion_id)
                     elif not allowed_for_unit:
                         warn_draft_unit(active_unit, "assertion_wrong_unit")
-                        invalid_refs = True
-                if not sentence_refs:
+                        unresolved_refs.append(
+                            {
+                                "reference": token,
+                                "reason": "assertion_wrong_unit",
+                                "unit_id": active_unit,
+                            }
+                        )
+                if raw_tokens and not sentence_refs:
                     warn_draft_unit(active_unit, "sentence_without_valid_assertion")
-                    continue
-                if invalid_refs:
-                    continue
                 if sentence is not None and _REFERENCE_ALIAS_IN_PROSE.search(sentence):
                     warn_draft_unit(active_unit, "source_alias_in_prose")
-                if sentence is None or _UUID.search(sentence) or not _is_one_sentence(sentence):
+                if sentence is None:
                     warn_draft_unit(active_unit, "sentence_invalid")
                     continue
+                transmitted_ids = {
+                    str(ref.get("id"))
+                    for item in prompt_data.get("assertions", ())
+                    if isinstance(item, Mapping)
+                    for ref in item.get("refs", ())
+                    if isinstance(ref, Mapping)
+                }
+                for reference in _UUID.findall(sentence):
+                    if reference not in transmitted_ids:
+                        unresolved_refs.append(
+                            {
+                                "reference": reference,
+                                "reason": "source_reference_unresolved",
+                                "unit_id": active_unit,
+                            }
+                        )
                 draft_unit_id = active_unit
                 if draft_unit_id is None:
                     warn_draft_unit(active_unit, "unit_target_missing")
@@ -1953,6 +2123,7 @@ def _parse_typed_advisor_wire(
             "limitations": limits,
             "normalization_status": "partial" if warnings else "complete",
             "warnings": warnings,
+            "unresolved_refs": unresolved_refs,
             "usable": any(item["usable"] for item in blocks),
         }
 
@@ -2467,12 +2638,16 @@ def _parse_draft_text(
         "limitations",
         "warnings",
         "normalization_status",
+        "_unresolved_refs",
     }:
         return None
     if parsed.get("status") not in {"succeeded", "partial"} or parsed.get("language") != "fr":
         return None
     warnings: list[str] = []
     unit_warnings: dict[str, list[str]] = {}
+    unresolved_refs: list[dict[str, Any]] = [
+        dict(item) for item in parsed.get("_unresolved_refs", ()) if isinstance(item, Mapping)
+    ]
 
     def warn(code: str, unit_id: str | None = None) -> None:
         if code not in warnings:
@@ -2590,32 +2765,57 @@ def _parse_draft_text(
             if isinstance(item, Mapping) and (not units_by_id or item.get("unit_id") == unit_id)
         }
         for sentence in sentences:
-            if not isinstance(sentence, Mapping) or set(sentence) != {"text", "assertion_ids"}:
+            if not isinstance(sentence, Mapping) or "text" not in sentence:
                 warn("draft_sentence_invalid", error_unit_id)
                 continue
             text_value = _strict_text(sentence.get("text"), 2400, safe_text)
-            assertion_ids = sentence.get("assertion_ids")
+            raw_assertion_ids = sentence.get("assertion_ids", [])
+            assertion_ids: list[str] = []
+            if not isinstance(raw_assertion_ids, list):
+                warn("draft_sentence_assertion_invalid", error_unit_id)
+                unresolved_refs.append(
+                    {"reference": str(raw_assertion_ids), "reason": "assertion_refs_invalid"}
+                )
+                raw_assertion_ids = []
+            for assertion_id in raw_assertion_ids:
+                if not isinstance(assertion_id, str):
+                    unresolved_refs.append(
+                        {"reference": str(assertion_id), "reason": "assertion_ref_invalid"}
+                    )
+                    warn("draft_sentence_assertion_invalid", error_unit_id)
+                    continue
+                if assertion_id not in allowed_assertions:
+                    unresolved_refs.append(
+                        {"reference": assertion_id, "reason": "assertion_alias_unknown"}
+                    )
+                    warn("assertion_alias_unknown", error_unit_id)
+                    continue
+                if assertion_id not in unit_assertion_ids:
+                    unresolved_refs.append(
+                        {"reference": assertion_id, "reason": "assertion_wrong_unit"}
+                    )
+                    warn("assertion_wrong_unit", error_unit_id)
+                    continue
+                if assertion_id not in assertion_ids:
+                    assertion_ids.append(assertion_id)
             if not text_value and _text_was_redacted(sentence.get("text"), 2400, safe_text):
                 warn("secret_detected", error_unit_id)
-            if (
-                not text_value
-                or not _is_one_sentence(text_value)
-                or not isinstance(assertion_ids, list)
-                or not assertion_ids
-                or not all(isinstance(item, str) for item in assertion_ids)
-                or len(assertion_ids) != len(set(assertion_ids))
-                or any(
-                    item not in allowed_assertions or item not in unit_assertion_ids
-                    for item in assertion_ids
-                )
-            ):
+            if not text_value:
                 warn("draft_sentence_assertion_invalid", error_unit_id)
                 continue
+            if not raw_assertion_ids:
+                warn("sentence_references_missing", error_unit_id)
+                unresolved_refs.append({"reference": None, "reason": "sentence_references_missing"})
+            elif not assertion_ids:
+                warn("sentence_without_valid_assertion", error_unit_id)
             if _REFERENCE_ALIAS_IN_PROSE.search(text_value):
                 warn("source_alias_in_prose", error_unit_id)
-            if any(ref not in transmitted_refs for ref in _UUID.findall(text_value)):
-                warn("draft_sentence_reference_invalid", error_unit_id)
-                continue
+            for ref in _UUID.findall(text_value):
+                if ref not in transmitted_refs:
+                    warn("draft_sentence_reference_invalid", error_unit_id)
+                    unresolved_refs.append(
+                        {"reference": ref, "reason": "source_reference_unresolved"}
+                    )
             clean_sentences.append({"text": text_value, "assertion_ids": assertion_ids})
         if not clean_sentences:
             warn("draft_unit_without_valid_sentences", error_unit_id)
@@ -2671,6 +2871,7 @@ def _parse_draft_text(
         "limitations": limitations,
         "usable": any(item.get("usable") is True for item in clean_blocks),
         "warnings": warnings,
+        "unresolved_refs": unresolved_refs,
         "normalization_status": (
             "partial" if warnings else parsed.get("normalization_status", "complete")
         ),

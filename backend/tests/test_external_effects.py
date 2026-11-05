@@ -41,6 +41,7 @@ from cti_app.application.external_effects import (
     _PermitRegistry,
     bridge_may_cite_provider_report_hash_without_sample,
     external_effect_source_do_not_submit_blocks,
+    external_effect_source_restriction_reason,
     external_observation_hash_policy,
     osint_vt_search_may_cite_unassociated_observation_hash,
     resolve_bridge_vt_file_report_hashes,
@@ -69,6 +70,7 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     SqlAlchemyExternalEffectClaimStore,
     _ConsumeDenied,
     _family_credentials_match,
+    _observation_refusal_detail,
 )
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
     SqlAlchemyVirusTotalPolicyGuard,
@@ -392,6 +394,57 @@ def test_source_do_not_submit_blocks_external_upload_families(family: str) -> No
 def test_source_do_not_submit_does_not_block_vt_or_bridge_effects(family: str) -> None:
     assert not external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize("family", ["advisor.consult", "vt.file_report", "vt.download_sample"])
+@pytest.mark.parametrize(
+    ("profile", "expected_reason"),
+    [("standard", "sample_source_restricted"), ("m14_research_permissive", None)],
+)
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"tlp": "RED", "external_llm_allowed": True, "license_restriction": None},
+        {"tlp": "CLEAR", "external_llm_allowed": False, "license_restriction": None},
+        {"tlp": "CLEAR", "external_llm_allowed": True, "license_restriction": "restricted"},
+    ],
+)
+def test_sample_disclosure_profile_controls_source_labels_only(
+    family: str, profile: str, expected_reason: str | None, labels: dict[str, object]
+) -> None:
+    subject_id = uuid4()
+    sample = SimpleNamespace(subject_id=subject_id, do_not_submit=True, **labels)
+
+    actual_reason = external_effect_source_restriction_reason(
+        source_kind="sample",
+        source=sample,
+        subject_id=subject_id,
+        family=family,
+        is_model_submission=family.startswith("advisor."),
+        disclosure_profile=profile,
+    )
+    standard_reason = expected_reason
+    if (
+        profile == "standard"
+        and not family.startswith("advisor.")
+        and labels["tlp"] != "RED"
+        and labels["license_restriction"] is None
+    ):
+        standard_reason = None
+    assert actual_reason == standard_reason
+
+    mismatched = SimpleNamespace(subject_id=uuid4(), do_not_submit=True, **labels)
+    assert (
+        external_effect_source_restriction_reason(
+            source_kind="sample",
+            source=mismatched,
+            subject_id=subject_id,
+            family=family,
+            is_model_submission=True,
+            disclosure_profile=profile,
+        )
+        == "sample_source_restricted"
+    )
 
 
 @pytest.mark.parametrize(
@@ -2436,6 +2489,7 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             self.resolved_aliases_were_queried = False
             self.report_sample_populate_existing = False
             self.sample_catalog_locked = False
+            self.subject_locked = False
 
         async def execute(self, statement):
             self.sample_catalog_locked = str(statement) == "LOCK TABLE samples IN SHARE MODE"
@@ -2457,7 +2511,8 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
             return []
 
         async def scalar(self, _statement):
-            raise AssertionError("The matching expected_hash already names the report sample")
+            self.subject_locked = True
+            return SimpleNamespace(id=subject_id)
 
     store = SqlAlchemyExternalEffectClaimStore(lambda: None)  # type: ignore[arg-type]
     authority = _authority()
@@ -2492,7 +2547,8 @@ async def test_bridge_md5_report_uses_resolved_sha256_for_owned_sample_controls(
     assert session.resolved_sha256_was_queried
     assert session.resolved_aliases_were_queried
     assert session.report_sample_populate_existing
-    assert session.sample_catalog_locked
+    assert session.subject_locked
+    assert not session.sample_catalog_locked
 
 
 @pytest.mark.asyncio
@@ -3324,7 +3380,36 @@ def test_only_bridge_may_cite_a_provider_report_without_an_acquired_sample(
 ) -> None:
     assert (
         bridge_may_cite_provider_report_hash_without_sample(
-            family=family, observation=SimpleNamespace(source=source)
+            family=family,
+            observation=SimpleNamespace(
+                source=source,
+                object_type="file",
+                kind="vt_file_report",
+            ),
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "object_type", "kind", "expected"),
+    [
+        pytest.param("VirusTotal", "file", "vt_file_report", True, id="file-report"),
+        pytest.param("VirusTotal", "file", "negative_result", False, id="negative-result"),
+        pytest.param("VirusTotal", "sample", "vt_file_report", False, id="wrong-object"),
+        pytest.param("AutoWork local analysis", "file", "vt_file_report", False, id="wrong-source"),
+    ],
+)
+def test_bridge_provider_report_without_sample_requires_exact_file_report_observation(
+    source: str,
+    object_type: str,
+    kind: str,
+    expected: bool,
+) -> None:
+    assert (
+        bridge_may_cite_provider_report_hash_without_sample(
+            family="advisor.consultation.v1",
+            observation=SimpleNamespace(source=source, object_type=object_type, kind=kind),
         )
         is expected
     )
@@ -3363,6 +3448,15 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
     )
     assert resolved is not None
     assert resolved.identifiers == frozenset({md5, sha1, sha256})
+    sha256_resolution = resolve_bridge_vt_file_report_hashes(
+        family="advisor.consultation.v1",
+        source="VirusTotal",
+        object_type="file",
+        object_id=sha256,
+        report_content=report,
+    )
+    assert sha256_resolution is not None
+    assert sha256_resolution.sha256 == sha256
     id_only_payload = json.loads(report)
     del id_only_payload["data"]["attributes"]["sha256"]
     id_only_resolution = resolve_bridge_vt_file_report_hashes(
@@ -3372,8 +3466,31 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
         object_id=md5,
         report_content=json.dumps(id_only_payload).encode(),
     )
-    assert id_only_resolution is not None
-    assert id_only_resolution.sha256 == sha256
+    assert id_only_resolution is None
+    missing_md5_payload = json.loads(report)
+    del missing_md5_payload["data"]["attributes"]["md5"]
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=json.dumps(missing_md5_payload).encode(),
+        )
+        is None
+    )
+    missing_sha1_payload = json.loads(report)
+    del missing_sha1_payload["data"]["attributes"]["sha1"]
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha1,
+            report_content=json.dumps(missing_sha1_payload).encode(),
+        )
+        is None
+    )
     conflicting_id_payload = json.loads(report)
     conflicting_id_payload["data"]["id"] = "d" * 64
     assert (
@@ -3445,6 +3562,81 @@ def test_bridge_vt_md5_report_resolves_to_sha256_only_from_a_coherent_report() -
             object_type="file",
             object_id=md5,
             report_content=b"not-json",
+        )
+        is None
+    )
+
+
+def test_bridge_vt_sha256_report_rejects_incomplete_osint_fixture_shape() -> None:
+    sha256 = "c" * 64
+    report_payload = {
+        "data": {
+            "id": sha256,
+            "type": "file",
+            "attributes": {"sha256": sha256},
+        }
+    }
+    incomplete_report = json.dumps(report_payload).encode()
+
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha256,
+            report_content=incomplete_report,
+        )
+        is None
+    )
+    observation_id = uuid4()
+    refusal_detail = _observation_refusal_detail(
+        SimpleNamespace(
+            id=observation_id,
+            object_type="file",
+            source="VirusTotal",
+            object_id=sha256,
+        )
+    )
+    assert f"id={observation_id.hex}" in refusal_detail
+
+    report_payload["data"]["attributes"].update({"md5": "a" * 32, "sha1": "b" * 40})
+    complete_report = json.dumps(report_payload).encode()
+    assert (
+        resolve_bridge_vt_file_report_sha256(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=sha256,
+            report_content=complete_report,
+        )
+        == sha256
+    )
+
+
+def test_bridge_vt_report_rejects_requested_hash_as_data_id_instead_of_canonical_sha256() -> None:
+    md5 = "a" * 32
+    report_sha256 = "c" * 64
+    report = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": md5,
+                "attributes": {
+                    "md5": md5,
+                    "sha1": "b" * 40,
+                    "sha256": report_sha256,
+                },
+            }
+        }
+    ).encode()
+
+    assert (
+        resolve_bridge_vt_file_report_hashes(
+            family="advisor.consultation.v1",
+            source="VirusTotal",
+            object_type="file",
+            object_id=md5,
+            report_content=report,
         )
         is None
     )

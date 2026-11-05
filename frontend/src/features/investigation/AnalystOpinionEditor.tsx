@@ -7,6 +7,7 @@ import {
   usePublishAnalystOpinion,
   useRequestAnalystOpinionChanges,
   useReviseAnalystOpinion,
+  BRIDGE_DRAFTING_ACK_REQUIRED,
   type PublishOpinionResponse,
   type OpinionBlockEdit,
 } from "../../api/analystOpinion";
@@ -73,6 +74,8 @@ export function AnalystOpinionEditor({
   const [blocks, setBlocks] = useState<OpinionBlockEdit[]>([]);
   const [unresolvedPoints, setUnresolvedPoints] = useState("");
   const [reviewReason, setReviewReason] = useState("");
+  const [bridgeDraftingGapAcknowledged, setBridgeDraftingGapAcknowledged] =
+    useState(false);
   const [dirty, setDirty] = useState(false);
   const [newBlockType, setNewBlockType] = useState<OpinionBlockType | "">("");
   const [protocolBlobId, setProtocolBlobId] = useState("");
@@ -110,6 +113,7 @@ export function AnalystOpinionEditor({
   useEffect(() => {
     setBlocks(draftBlocks);
     setUnresolvedPoints(draft?.unresolved_points.join("\n") ?? "");
+    setBridgeDraftingGapAcknowledged(false);
     setDirty(false);
   }, [
     draftBlocks,
@@ -141,6 +145,17 @@ export function AnalystOpinionEditor({
     requestChanges.error ??
     publish.error;
   const mutationViolations = getCitationViolations(error);
+  const bridgeDraftingSummary = draft?.editorial_review?.bridge_drafting;
+  const hasBridgeDraftingGap = Boolean(
+    bridgeDraftingSummary?.requires_acknowledgement,
+  );
+  const acknowledgementRequiredError =
+    error instanceof InvestigationApiError &&
+    error.code === BRIDGE_DRAFTING_ACK_REQUIRED;
+  const showBridgeDraftingWarning =
+    hasBridgeDraftingGap || acknowledgementRequiredError;
+  const unlinkedSectionCount =
+    bridgeDraftingSummary?.unlinked_sections.length ?? null;
   const isReviewPending = approve.isPending || requestChanges.isPending;
   const canEdit = draft !== null && draft.status !== "approved";
   const canReview = Boolean(
@@ -148,10 +163,17 @@ export function AnalystOpinionEditor({
     draft.status === "draft" &&
     hashMatchesCurrent &&
     citationViolations.length === 0 &&
-    !dirty,
+    !dirty &&
+    ((!hasBridgeDraftingGap && !acknowledgementRequiredError) ||
+      bridgeDraftingGapAcknowledged),
   );
   const canPublish = Boolean(
-    draft && draft.status === "approved" && hashMatchesCurrent && !dirty,
+    draft &&
+    draft.status === "approved" &&
+    hashMatchesCurrent &&
+    !dirty &&
+    ((!hasBridgeDraftingGap && !acknowledgementRequiredError) ||
+      bridgeDraftingGapAcknowledged),
   );
   const selectedProtocolBlobId =
     protocolBlobId || protocolModelsQuery.data?.models[0]?.blob_id || "";
@@ -236,6 +258,26 @@ export function AnalystOpinionEditor({
             ? ` · code : ${error.code}`
             : ""}
         </p>
+      ) : null}
+      {showBridgeDraftingWarning ? (
+        <div className="verification-warning" role="alert">
+          <p>
+            {unlinkedSectionCount !== null
+              ? `${unlinkedSectionCount} section${unlinkedSectionCount === 1 ? "" : "s"} sans rédaction Bridge liée : ce texte n’est pas présenté comme rédigé avec Bridge.`
+              : "La couverture de rédaction Bridge est incomplète : ce texte n’est pas présenté comme rédigé avec Bridge."}
+          </p>
+          <label>
+            <input
+              type="checkbox"
+              checked={bridgeDraftingGapAcknowledged}
+              onChange={(event) =>
+                setBridgeDraftingGapAcknowledged(event.currentTarget.checked)
+              }
+            />{" "}
+            Je confirme avoir pris connaissance de l’absence de rédaction Bridge
+            liée.
+          </label>
+        </div>
       ) : null}
       {mutationViolations.length > 0 ? (
         <CitationViolations
@@ -558,6 +600,9 @@ export function AnalystOpinionEditor({
                     version: draft.version,
                     expected_sha256: draft.content_sha256,
                     reason: reviewReason,
+                    ...(bridgeDraftingGapAcknowledged
+                      ? { bridge_drafting_gap_acknowledged: true }
+                      : {}),
                   })
                 }
               >
@@ -602,6 +647,9 @@ export function AnalystOpinionEditor({
                       version: draft.version,
                       expected_base_publication_sha256:
                         draft.provenance.base_publication_sha256,
+                      ...(bridgeDraftingGapAcknowledged
+                        ? { bridge_drafting_gap_acknowledged: true }
+                        : {}),
                     },
                     {
                       onSuccess: (result) =>

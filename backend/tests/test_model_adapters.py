@@ -714,7 +714,7 @@ async def test_bridge_server_error_without_explicit_non_submission_remains_uncer
     assert error.submission_state is None
 
 
-async def test_typed_pre_submission_502_skips_run_reconciliation_get() -> None:
+async def test_typed_pre_submission_502_after_post_is_ambiguous_and_never_reposted() -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -739,9 +739,13 @@ async def test_typed_pre_submission_502_skips_run_reconciliation_get() -> None:
         with pytest.raises(BridgeTransportError) as caught:
             await transport.create({"input": "synthetic"}, idempotency_key="typed-pre-key")
 
-    assert caught.value.submission_state == "pre_submission"
+    # A bare ``pre_submission`` claim in a 5xx body is not proof of non-execution (production
+    # incident: Bridge had entered its submission phase): the outcome is ambiguous, the run id
+    # is kept for read-only reconciliation, and the POST is never repeated.
+    assert caught.value.submission_state == "submission_attempted"
     assert caught.value.bridge_run_id == "run-pre-submission"
-    assert [request.method for request in requests] == ["POST"]
+    assert [request.method for request in requests].count("POST") == 1
+    assert {request.method for request in requests} <= {"POST", "GET"}
 
 
 @pytest.mark.parametrize(

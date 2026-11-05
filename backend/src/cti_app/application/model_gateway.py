@@ -18,6 +18,10 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
+from cti_app.application.bridge_identity import (
+    bridge_request_fingerprint,
+    safe_bridge_request_fingerprint,
+)
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.external_effects import Reused
 from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
@@ -249,6 +253,10 @@ class ModelRequest:
     # Stateless requests (bulk extraction, drafting) carry no conversation at all.
     conversation: ConversationContext | None = None
     run_id: UUID | None = None
+    # Continue the ordinal for a deliberate new ModelRun that follows an
+    # operator-abandoned attempt. The prior ModelRun keeps its own immutable
+    # Bridge identity; this offset makes the next key end in the next `:aN`.
+    submission_attempt_offset: int = 0
     # A failed request is never retried implicitly.  This escape hatch is only
     # for a caller that has proved no provider submission took place.
     allow_failed_resubmit: bool = False
@@ -273,6 +281,12 @@ class ModelRequest:
             or self.timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be a finite positive number")
+        if (
+            isinstance(self.submission_attempt_offset, bool)
+            or not isinstance(self.submission_attempt_offset, int)
+            or self.submission_attempt_offset < 0
+        ):
+            raise ValueError("submission_attempt_offset must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,6 +985,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             evidence_pack_hash=request.evidence_pack_hash,
             parameters=safe_request.parameters,
             id=request.run_id or uuid4(),
+            submission_attempt=request.submission_attempt_offset,
         )
 
     async def resume(
@@ -1731,6 +1746,25 @@ def _public_error(exc: Exception) -> str:
 def _is_certain_pre_submission_failure(exc: Exception) -> bool:
     submission_state = getattr(exc, "submission_state", None)
     if submission_state == "pre_submission":
+        # A Bridge 5xx can carry a stale pre_submission label after the POST
+        # reached the server, even when the response omits its phase. Other
+        # typed pre-send failures retain their proof and skip reconciliation.
+        phase = getattr(exc, "phase", None)
+        status_code = getattr(exc, "status_code", None) or 0
+        submission_request = getattr(exc, "submission_request", None)
+        if getattr(exc, "code", None) == "bridge_server_error" and (
+            (phase in {"submission", "submission_confirmation"} and submission_request is not False)
+            or (
+                status_code >= 500
+                and (
+                    submission_request is True
+                    or (submission_request is None and phase != "preflight")
+                )
+            )
+        ):
+            return False
+        if getattr(exc, "verified_no_answer", False) is True:
+            return True
         return True
     return submission_state is None and getattr(exc, "code", None) in (
         _CERTAIN_PRE_SUBMISSION_CODES
@@ -1823,6 +1857,11 @@ def _bridge_request_id(run: ModelRun) -> str | None:
     return f"{run.id}:a{run.submission_attempt}"
 
 
+def bridge_request_id_for_run(run: ModelRun) -> str | None:
+    """The real Bridge idempotency key of a ModelRun (lookup alias; never shown to operators)."""
+    return _bridge_request_id(run)
+
+
 def _next_bridge_request_id(run: ModelRun, adapter: ModelAdapter) -> str | None:
     if adapter.backend is not ModelBackend.CHATGPT_BRIDGE:
         return None
@@ -1853,7 +1892,7 @@ def _reconciliation_details(
     details["submission_state"] = details.get("submission_state", run.submission_state.value)
     details["reconciliation_phase"] = "reconciliation"
     if effective_request_id and "bridge_request_id" not in details:
-        details["bridge_request_id"] = _bridge_request_fingerprint(effective_request_id)
+        details["bridge_request_id"] = bridge_request_fingerprint(effective_request_id)
     return details
 
 
@@ -1886,7 +1925,7 @@ def _error_details(
     if isinstance(source_submission_state, str) and source_submission_state:
         details["submission_state"] = source_submission_state[:32]
     if isinstance(bridge_request_id, str) and bridge_request_id:
-        details["bridge_request_id"] = _bridge_request_fingerprint(bridge_request_id)
+        details["bridge_request_id"] = bridge_request_fingerprint(bridge_request_id)
     diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(diagnostics, dict) and diagnostics:
         details["bridge_diagnostics"] = _safe_error_diagnostics(diagnostics)
@@ -1907,7 +1946,7 @@ def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
                     continue
                 if name.casefold() in {"bridge_request_id", "idempotency_key", "request_id"}:
                     if isinstance(child, str) and child:
-                        result[name[:64]] = _safe_bridge_request_fingerprint(child)
+                        result[name[:64]] = safe_bridge_request_fingerprint(child)
                     continue
                 cleaned = clean(child, depth + 1)
                 if cleaned is not None:
@@ -1921,18 +1960,6 @@ def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
 
     result = clean(value)
     return result if isinstance(result, dict) else {}
-
-
-def _bridge_request_fingerprint(request_id: str) -> str:
-    return f"sha256:{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:16]}"
-
-
-def _safe_bridge_request_fingerprint(request_id: str) -> str:
-    if request_id.startswith("sha256:"):
-        digest = request_id.removeprefix("sha256:")
-        if re.fullmatch(r"[0-9a-f]{16,64}", digest):
-            return f"sha256:{digest[:16]}"
-    return _bridge_request_fingerprint(request_id)
 
 
 def _optional_metadata_text(metadata: dict[str, Any], key: str) -> str | None:

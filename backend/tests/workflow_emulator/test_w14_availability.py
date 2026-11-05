@@ -474,6 +474,7 @@ async def test_w14_f_optional_outages_preserve_proof_and_resume_without_replay(
                 UUID(opinion["id"]),
                 version=opinion["version"],
                 sha256=opinion["content_sha256"],
+                acknowledge_bridge_drafting_gap=True,
             )
             assert approved_opinion.status_code == 200, approved_opinion.text
             async with uow_factory() as uow:

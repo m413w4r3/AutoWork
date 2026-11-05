@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -66,6 +67,12 @@ class _Models:
 
     async def get(self, run_id: UUID) -> ModelRun | None:
         return self.items.get(run_id)
+
+    async def get_for_update(self, run_id: UUID) -> ModelRun | None:
+        return self.items.get(run_id)
+
+    async def save(self, model: ModelRun) -> None:
+        self.items[model.id] = model
 
 
 class _BatchItems:
@@ -183,6 +190,9 @@ class _Gateway:
         self.model = model
         self.calls: list[dict[str, object]] = []
 
+    async def get_run(self, run_id: UUID) -> ModelRun | None:
+        return self.model if run_id == self.model.id else None
+
     async def adopt_recovery_output(
         self,
         run_id: UUID,
@@ -237,6 +247,7 @@ def _fixture(
         parameters={},
         status=ModelRunStatus.NEEDS_REVIEW,
         submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        submission_attempt=1,
         bridge_request_id="bridge-request:a1",
         error_code="active_signal_stalled",
     )
@@ -301,6 +312,78 @@ async def test_retryable_bridge_error_stays_undecided() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_retryable_bridge_run_reopens_model_run_for_attempt_two() -> None:
+    resolver, run, model, bridge, _gateway = _fixture(
+        {
+            "id": "resp_123",
+            "status": "failed",
+            "retryable": True,
+            "error": {"code": "bridge_total_timeout"},
+        }
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
+
+    assert bridge.calls == ["bridge-request:a1"]
+    assert run.requires_reconciliation is False
+    assert model.status is ModelRunStatus.RUNNING
+    assert model.submission_state is ModelSubmissionState.NOT_SUBMITTED
+    assert model.submission_attempt == 1
+    assert (
+        model.begin_submission_attempt(
+            bridge_request_id=f"{model.id}:a{model.submission_attempt + 1}"
+        )
+        == 2
+    )
+    assert model.bridge_request_id == f"{model.id}:a2"
+
+
+@pytest.mark.asyncio
+async def test_failed_retryable_status_with_output_adopts_answer_instead_of_releasing() -> None:
+    resolver, run, model, _bridge, gateway = _fixture(
+        {
+            "id": "resp_123",
+            "status": "failed",
+            "retryable": True,
+            "output_text": "# recovered answer",
+        },
+        with_edition=True,
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.RESUMED
+
+    assert run.requires_reconciliation is False
+    assert model.status is ModelRunStatus.SUCCEEDED
+    assert gateway.calls[0]["bridge_response_id"] == "resp_123"
+
+
+@pytest.mark.asyncio
+async def test_failed_retryable_status_does_not_replace_existing_archived_answer() -> None:
+    resolver, run, model, _bridge, gateway = _fixture(
+        {
+            "id": "resp_new",
+            "status": "failed",
+            "retryable": True,
+            "output_text": "different answer",
+        },
+        with_edition=True,
+    )
+    model.status = ModelRunStatus.SUCCEEDED
+    model.raw_output_reference = "blob://existing-answer"
+    model.raw_output_sha256 = hashlib.sha256(b"existing answer").hexdigest()
+    model.response_id = "resp_existing"
+    existing_sha256 = model.raw_output_sha256
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+
+    assert run.requires_reconciliation
+    assert model.raw_output_reference == "blob://existing-answer"
+    assert model.raw_output_sha256 == existing_sha256
+    assert model.response_id == "resp_existing"
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
 async def test_bridge_404_does_not_prove_that_the_submission_cannot_answer() -> None:
     resolver, run, _, bridge, gateway = _fixture(
         BridgeTransportError(
@@ -355,7 +438,7 @@ async def test_archived_edition_keeps_resolver_undecided() -> None:
 
 
 @pytest.mark.asyncio
-async def test_terminal_failure_releases_without_adopting_output() -> None:
+async def test_terminal_failure_reopens_model_run_without_adopting_output() -> None:
     resolver, run, model, _, gateway = _fixture(
         {
             "id": "resp_123",
@@ -367,7 +450,10 @@ async def test_terminal_failure_releases_without_adopting_output() -> None:
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
     assert run.requires_reconciliation is False
-    assert model.status is ModelRunStatus.NEEDS_REVIEW
+    assert model.status is ModelRunStatus.RUNNING
+    assert model.submission_state is ModelSubmissionState.NOT_SUBMITTED
+    assert model.submission_attempt == 1
+    assert model.bridge_request_id == "bridge-request:a1"
     assert gateway.calls == []
     assert not hasattr(run, "synthesis_conversation_id")
 
@@ -397,7 +483,9 @@ async def test_failed_bridge_transport_releases_with_verified_no_answer() -> Non
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
     assert run.requires_reconciliation is False
-    assert model.status is ModelRunStatus.NEEDS_REVIEW
+    assert model.status is ModelRunStatus.RUNNING
+    assert model.submission_state is ModelSubmissionState.NOT_SUBMITTED
+    assert model.submission_attempt == 1
     assert gateway.calls == []
     assert not hasattr(run, "synthesis_conversation_id")
 
@@ -434,7 +522,7 @@ async def test_in_progress_bridge_run_stays_undecided() -> None:
 
 @pytest.mark.asyncio
 async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Path) -> None:
-    resolver, run, _, _, gateway = _fixture(
+    resolver, run, model, _, gateway = _fixture(
         BridgeTransportError("bridge_timeout", "timeout", retryable=True)
     )
     resolver._diagnostics = DiagnosticsLog.from_env(tmp_path)
@@ -447,6 +535,10 @@ async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Pa
     )
     assert run.requires_reconciliation is False
     assert run.error_code == "production_reconciliation_declared_lost"
+    assert model.status is ModelRunStatus.FAILED
+    assert model.error_code == "operator_abandoned"
+    assert model.submission_state is ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+    assert model.bridge_request_id == "bridge-request:a1"
     assert not hasattr(run, "synthesis_conversation_id")
     assert gateway.calls == []
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
@@ -457,10 +549,26 @@ async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Pa
         "pid": event["pid"],
         "subject_id": str(run.subject_id),
         "stage": "references",
-        "bridge_run_id": "bridge-request:a1",
+        "bridge_run_id": "sha256:" + hashlib.sha256(b"bridge-request:a1").hexdigest()[:16],
         "actor_id": "analyst-1",
         "reason": "Chrome a été fermé et la conversation est introuvable",
     }
+
+
+@pytest.mark.asyncio
+async def test_declared_lost_keeps_a_real_bridge_run_id_in_diagnostics(tmp_path: Path) -> None:
+    resolver, run, _, _, _ = _fixture(
+        BridgeTransportError("bridge_timeout", "timeout", retryable=True)
+    )
+    resolver._diagnostics = DiagnosticsLog.from_env(tmp_path)
+    run.error_details = {"bridge_run_id": "resp_bridge_123"}
+
+    assert await resolver.release_declared_lost(run.id, "operator confirmed lost") is (
+        ReconciliationOutcome.RELEASED
+    )
+
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    assert event["bridge_run_id"] == "resp_bridge_123"
 
 
 class _Jobs:
@@ -582,9 +690,16 @@ async def test_probe_resumes_a_run_adopted_by_an_api_probe_without_a_stage_job()
 async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
     tmp_path: Path, attempt: int, next_attempt: int
 ) -> None:
-    resolver, run, _, bridge, gateway = _fixture(
+    resolver, run, model, bridge, gateway = _fixture(
         BridgeTransportError("bridge_timeout", "timeout", retryable=True)
     )
+    request_id = model.bridge_request_id
+    assert request_id is not None
+    run.error_details = {
+        "bridge_request_id": f"sha256:{hashlib.sha256(request_id.encode()).hexdigest()[:16]}"
+    }
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=None)
     jobs = _Jobs()
     dispatcher = _Dispatcher()
     chain = ProductionStageChain()
@@ -614,6 +729,68 @@ async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
     assert event["event"] == "production.reconciliation_probe"
     assert event["run_id"] == str(run.id)
     assert event["subject_id"] == str(run.subject_id)
-    assert event["bridge_run_id"] == "bridge-request:a1"
+    request_fingerprint = hashlib.sha256(request_id.encode()).hexdigest()[:16]
+    assert event["bridge_run_id"] == f"sha256:{request_fingerprint}"
+    assert request_id not in json.dumps(event)
+    assert bridge.calls == [request_id]
     assert event["attempt"] == attempt
     assert event["outcome"] == ReconciliationOutcome.UNDECIDED.value
+
+
+def test_bridge_lookup_id_ignores_the_sha256_fingerprint_of_the_idempotency_key() -> None:
+    from cti_app.application.production_reconciliation_resolver import _bridge_id_in
+
+    assert _bridge_id_in({"bridge_request_id": "sha256:fa4502c0d2eb1b78"}) is None
+    assert (
+        _bridge_id_in({"bridge_request_id": "sha256:fa4502c0d2eb1b78", "bridge_run_id": "run-7"})
+        == "run-7"
+    )
+    assert _bridge_id_in({"bridge_request_id": "11111111-2222-3333-4444-555555555555:a1"}) == (
+        "11111111-2222-3333-4444-555555555555:a1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_persisted_model_key_after_details_are_fingerprinted() -> None:
+    resolver, run, model, bridge, _ = _fixture(
+        BridgeTransportError(
+            "bridge_protocol_error",
+            "not found",
+            retryable=False,
+            status_code=404,
+            verified_no_answer=True,
+        )
+    )
+    request_id = model.bridge_request_id
+    assert request_id is not None
+    run.error_details = {
+        "bridge_request_id": f"sha256:{hashlib.sha256(request_id.encode()).hexdigest()[:16]}"
+    }
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=None)
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
+    assert bridge.calls == [request_id]
+    assert not run.requires_reconciliation
+
+
+@pytest.mark.asyncio
+async def test_probe_stays_undecided_when_no_reliable_bridge_identity_exists() -> None:
+    resolver, run, model, bridge, _ = _fixture(
+        BridgeTransportError(
+            "bridge_protocol_error",
+            "not found",
+            retryable=False,
+            status_code=404,
+            verified_no_answer=True,
+        )
+    )
+    model.bridge_request_id = None
+    model.submission_attempt = 0
+    run.error_details = {"bridge_request_id": "sha256:fa4502c0d2eb1b78"}
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=None)
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+    assert bridge.calls == []
+    assert run.requires_reconciliation

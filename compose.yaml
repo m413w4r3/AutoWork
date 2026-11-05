@@ -93,6 +93,7 @@ services:
       dockerfile: infra/backend.Dockerfile
     environment: &backend-environment
       APP_ENV: ${APP_ENV:-development}
+      ADVISOR_DISCLOSURE_PROFILE: ${ADVISOR_DISCLOSURE_PROFILE:-standard}
       API_BIND_HOST: ${API_BIND_HOST:-0.0.0.0}
       OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:-}
       OPERATOR_CLIENT_API_TOKEN: ${OPERATOR_CLIENT_API_TOKEN:-}

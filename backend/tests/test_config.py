@@ -33,6 +33,31 @@ def test_settings_are_loaded_from_environment(monkeypatch: pytest.MonkeyPatch) -
     assert settings.readiness_timeout_seconds == 1.5
 
 
+def test_advisor_disclosure_profile_defaults_and_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings(_env_file=None).advisor_disclosure_profile == "standard"
+
+    monkeypatch.setenv("ADVISOR_DISCLOSURE_PROFILE", "m14_research_permissive")
+    settings = Settings(_env_file=None)
+    assert settings.advisor_disclosure_profile == "m14_research_permissive"
+
+    monkeypatch.setenv("ADVISOR_DISCLOSURE_PROFILE", "unknown")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_compose_passes_advisor_disclosure_profile_to_backend_workers() -> None:
+    compose_path = Path(__file__).parents[2] / "compose.yaml"
+    compose = yaml.safe_load(compose_path.read_text())
+
+    for service_name in ("backend", "worker", "job-recovery"):
+        environment = compose["services"][service_name]["environment"]
+        assert environment["ADVISOR_DISCLOSURE_PROFILE"] == (
+            "${ADVISOR_DISCLOSURE_PROFILE:-standard}"
+        )
+
+
 def test_model_api_keys_are_secret_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("QWEN_API_KEY", "test-only-secret")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -11,7 +12,6 @@ from uuid import UUID
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -40,6 +40,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservation,
     BudgetReservationStatus,
+    DetectionCandidateProvenance,
     DetectionCandidateStatus,
     DetectionCandidateVersion,
     DisclosureBounds,
@@ -97,6 +98,9 @@ from cti_app.infrastructure.database.models.investigation import (
     SampleAssociationRow as SampleAssociationIdentityRow,
 )
 from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
+
+_CANDIDATE_PROVENANCE_PREFIX = "detection-candidate-provenance.v1:"
+_CANDIDATE_PROVENANCE_MOTIF = "__candidate_provenance__"
 
 
 def _budget_to_payload(budget: InvestigationBudget) -> dict[str, Any]:
@@ -1164,30 +1168,43 @@ class SqlAlchemyDetectionCandidateRepository:
                 return existing, True
             raise VersionConflictError("Detection candidate import identity already exists")
 
-        try:
-            # The savepoint keeps a uniqueness race from poisoning the caller's UoW.
-            # uq_detection_candidate_version is the cross-process CAS for candidate v1.
-            async with self._session.begin_nested():
-                stored = await self.append_version(version, expected_previous_id=None)
-        except (IntegrityError, ValueError, VersionConflictError) as exc:
-            existing_by_id = await self.get(version.id)
-            if existing_by_id is not None and _same_detection_candidate_version(
-                existing_by_id, version
-            ):
-                return existing_by_id, True
-            existing_versions = await self.list_for_candidate(version.candidate_id)
-            if any(_same_detection_candidate_version(item, version) for item in existing_versions):
-                return next(
-                    item
-                    for item in existing_versions
-                    if _same_detection_candidate_version(item, version)
-                ), True
-            if existing_versions:
-                raise VersionConflictError(
-                    "Detection candidate import identity already exists"
-                ) from exc
-            raise
-        return stored, False
+        # The unique v1 constraint arbitrates imports in separate processes.
+        # DO NOTHING is important here: append_version may find an identical row
+        # after this method's preflight read and cannot tell a replay from an insert.
+        async with self._session.begin_nested():
+            inserted_id = await self._session.scalar(
+                insert(DetectionCandidateVersionRow)
+                .values(**_candidate_values(version))
+                .on_conflict_do_nothing()
+                .returning(DetectionCandidateVersionRow.id)
+            )
+            if inserted_id is not None:
+                await self._append_candidate_details(version)
+
+        if inserted_id is not None:
+            return version, False
+
+        # Under READ COMMITTED, this new statement sees the transaction that won
+        # the unique insert after PostgreSQL made DO NOTHING wait for its commit.
+        existing_by_id = await self.get(version.id)
+        if existing_by_id is not None and _same_detection_candidate_version(
+            existing_by_id, version
+        ):
+            return existing_by_id, True
+        existing_versions = await self.list_for_candidate(version.candidate_id)
+        matching = next(
+            (
+                item
+                for item in existing_versions
+                if _same_detection_candidate_version(item, version)
+            ),
+            None,
+        )
+        if matching is not None:
+            return matching, True
+        if existing_by_id is not None or existing_versions:
+            raise VersionConflictError("Detection candidate import identity already exists")
+        raise VersionConflictError("Detection candidate import conflicted without a visible row")
 
     async def append_version(
         self, version: DetectionCandidateVersion, *, expected_previous_id: UUID | None
@@ -1234,6 +1251,11 @@ class SqlAlchemyDetectionCandidateRepository:
 
         self._session.add(DetectionCandidateVersionRow(**_candidate_values(version)))
         await self._session.flush()
+        await self._append_candidate_details(version)
+        return version
+
+    async def _append_candidate_details(self, version: DetectionCandidateVersion) -> None:
+        provenance_position = len(version.motif_provenance)
         motif_rows = [
             DetectionCandidateMotifRow(
                 version_id=version.id,
@@ -1243,6 +1265,27 @@ class SqlAlchemyDetectionCandidateRepository:
             )
             for motif_index, motif in enumerate(version.motif_provenance)
         ]
+        if version.provenance is not None:
+            provenance_payload = {
+                "kind": version.provenance.kind,
+                "metadata": thaw_json(version.provenance.metadata),
+            }
+            motif_rows.append(
+                DetectionCandidateMotifRow(
+                    version_id=version.id,
+                    position=provenance_position,
+                    motif=_CANDIDATE_PROVENANCE_MOTIF,
+                    rationale=(
+                        _CANDIDATE_PROVENANCE_PREFIX
+                        + json.dumps(
+                            provenance_payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    ),
+                )
+            )
         self._session.add_all(motif_rows)
         await self._session.flush()
         for motif_index, motif in enumerate(version.motif_provenance):
@@ -1257,6 +1300,20 @@ class SqlAlchemyDetectionCandidateRepository:
                     for observation_index, observation_id in enumerate(motif.observation_refs)
                 ]
             )
+        if version.provenance is not None:
+            self._session.add_all(
+                [
+                    DetectionCandidateMotifObservationRow(
+                        version_id=version.id,
+                        motif_position=provenance_position,
+                        observation_position=observation_index,
+                        observation_id=observation_id,
+                    )
+                    for observation_index, observation_id in enumerate(
+                        version.provenance.observation_refs
+                    )
+                ]
+            )
         self._session.add_all(
             [
                 DetectionCandidateTestRefRow(
@@ -1266,7 +1323,6 @@ class SqlAlchemyDetectionCandidateRepository:
             ]
         )
         await self._session.flush()
-        return version
 
     async def _candidate_from_row(
         self, row: DetectionCandidateVersionRow
@@ -1277,6 +1333,7 @@ class SqlAlchemyDetectionCandidateRepository:
             .order_by(DetectionCandidateMotifRow.position)
         )
         motifs: list[MotifProvenance] = []
+        provenance: DetectionCandidateProvenance | None = None
         for motif_row in motif_rows:
             refs = await self._session.scalars(
                 select(DetectionCandidateMotifObservationRow.observation_id)
@@ -1286,6 +1343,20 @@ class SqlAlchemyDetectionCandidateRepository:
                 )
                 .order_by(DetectionCandidateMotifObservationRow.observation_position)
             )
+            if motif_row.motif == _CANDIDATE_PROVENANCE_MOTIF and motif_row.rationale.startswith(
+                _CANDIDATE_PROVENANCE_PREFIX
+            ):
+                payload = json.loads(motif_row.rationale[len(_CANDIDATE_PROVENANCE_PREFIX) :])
+                if not isinstance(payload, Mapping) or not isinstance(
+                    payload.get("metadata"), Mapping
+                ):
+                    raise ValueError("Persisted detection candidate provenance is invalid")
+                provenance = DetectionCandidateProvenance(
+                    kind=str(payload.get("kind", "")),
+                    metadata=payload["metadata"],
+                    observation_refs=tuple(refs),
+                )
+                continue
             motifs.append(
                 MotifProvenance(
                     motif=motif_row.motif,
@@ -1309,11 +1380,18 @@ class SqlAlchemyDetectionCandidateRepository:
             version=row.version,
             parent_version_id=row.parent_version_id,
             test_refs=tuple(test_refs),
+            provenance=provenance,
             created_at=row.created_at,
         )
 
 
 def _candidate_values(version: DetectionCandidateVersion) -> dict[str, Any]:
+    if any(
+        motif.motif == _CANDIDATE_PROVENANCE_MOTIF
+        and motif.rationale.startswith(_CANDIDATE_PROVENANCE_PREFIX)
+        for motif in version.motif_provenance
+    ):
+        raise ValueError("Detection candidate motif conflicts with reserved provenance encoding")
     return {
         "id": version.id,
         "candidate_id": version.candidate_id,
@@ -1425,6 +1503,7 @@ def _opinion_from_row(row: AnalystOpinionVersionRow) -> AnalystOpinionV1:
         status=AnalystOpinionStatus(row.status),
         created_at=datetime.fromisoformat(str(content["created_at"])),
         content_sha256=row.content_sha256,
+        bridge_drafting_gap_acknowledged=content.get("bridge_drafting_gap_acknowledged", False),
     )
 
 

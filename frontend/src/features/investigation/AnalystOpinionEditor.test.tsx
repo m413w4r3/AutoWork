@@ -101,12 +101,14 @@ function renderEditor(
   opinion: AnalystOpinionVersion,
   currentDraft: InvestigationOpinionDraft | null = draftSummary(opinion),
   citationViolations: AnalystOpinionResponse["citation_violations"] = [],
+  rejectFirstApprovalForBridgeGap = false,
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   });
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   let currentOpinion = opinion;
+  let approvalCalls = 0;
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === "string"
@@ -163,6 +165,15 @@ function renderEditor(
       url === `/api/opinions/${OPINION_ID}/approve` &&
       init?.method === "POST"
     ) {
+      approvalCalls += 1;
+      if (rejectFirstApprovalForBridgeGap && approvalCalls === 1) {
+        return Promise.resolve(
+          Response.json(
+            { detail: { code: "bridge_drafting_ack_required" } },
+            { status: 422 },
+          ),
+        );
+      }
       currentOpinion = {
         ...currentOpinion,
         version: currentOpinion.version + 1,
@@ -354,6 +365,154 @@ describe("AnalystOpinionEditor", () => {
     expect(
       new Headers(call?.init?.headers).get("Idempotency-Key"),
     ).toBeTruthy();
+  });
+
+  it("demande un accusé explicite avant d’approuver un avis sans rédaction Bridge liée", async () => {
+    const opinion = {
+      ...makeOpinion(),
+      editorial_review: {
+        status: "warning" as const,
+        bridge_drafting: {
+          status: "partial" as const,
+          section_count: 2,
+          bridge_authored_section_count: 1,
+          unlinked_sections: ["key_findings"],
+          requires_acknowledgement: true,
+          acknowledged: false,
+          resume_available: true,
+          diagnosis: "some_sections_have_no_completed_draft_text_reference",
+        },
+        publication_text_markers: [],
+        missing_annex_references: [],
+        warnings: [],
+      },
+    };
+    const { calls } = renderEditor(opinion);
+    const user = userEvent.setup();
+
+    await user.type(
+      await screen.findByLabelText("Raison de la décision"),
+      "Revue humaine terminée.",
+    );
+    expect(
+      await screen.findByText(
+        "1 section sans rédaction Bridge liée : ce texte n’est pas présenté comme rédigé avec Bridge.",
+      ),
+    ).toBeInTheDocument();
+    const approveButton = screen.getByRole("button", {
+      name: "Approuver cette version précise",
+    });
+    expect(approveButton).toBeDisabled();
+    expect(
+      calls.some((call) => call.url === `/api/opinions/${OPINION_ID}/approve`),
+    ).toBe(false);
+
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: /Je confirme avoir pris connaissance/,
+      }),
+    );
+    await user.click(approveButton);
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.url === `/api/opinions/${OPINION_ID}/approve`,
+        ),
+      ).toBe(true),
+    );
+    const call = calls.find(
+      (item) => item.url === `/api/opinions/${OPINION_ID}/approve`,
+    );
+    expect(requestBody(call?.init)).toMatchObject({
+      bridge_drafting_gap_acknowledged: true,
+    });
+  });
+
+  it("affiche la demande d’accusé si le serveur signale l’écart Bridge", async () => {
+    const opinion = makeOpinion();
+    const { calls } = renderEditor(opinion, draftSummary(opinion), [], true);
+    const user = userEvent.setup();
+    await user.type(
+      await screen.findByLabelText("Raison de la décision"),
+      "Revue humaine terminée.",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Approuver cette version précise" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "La couverture de rédaction Bridge est incomplète : ce texte n’est pas présenté comme rédigé avec Bridge.",
+      ),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: /Je confirme avoir pris connaissance/,
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Approuver cette version précise" }),
+    );
+    await waitFor(() =>
+      expect(
+        calls.filter(
+          (call) => call.url === `/api/opinions/${OPINION_ID}/approve`,
+        ),
+      ).toHaveLength(2),
+    );
+    const retry = calls
+      .filter((call) => call.url === `/api/opinions/${OPINION_ID}/approve`)
+      .at(-1);
+    expect(requestBody(retry?.init)).toMatchObject({
+      bridge_drafting_gap_acknowledged: true,
+    });
+  });
+
+  it("demande aussi un accusé explicite avant de publier un avis incomplet", async () => {
+    const opinion = {
+      ...makeOpinion("approved"),
+      editorial_review: {
+        status: "warning" as const,
+        bridge_drafting: {
+          status: "incomplete" as const,
+          section_count: 1,
+          bridge_authored_section_count: 0,
+          unlinked_sections: ["key_findings"],
+          requires_acknowledgement: true,
+          acknowledged: true,
+          resume_available: false,
+          diagnosis: "no_completed_draft_text_reference",
+        },
+        publication_text_markers: [],
+        missing_annex_references: [],
+        warnings: [],
+      },
+    };
+    const { calls } = renderEditor(opinion);
+    const user = userEvent.setup();
+    const publishButton = await screen.findByRole("button", {
+      name: "Proposer la version augmentée",
+    });
+    expect(publishButton).toBeDisabled();
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: /Je confirme avoir pris connaissance/,
+      }),
+    );
+    await user.click(publishButton);
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.url === `/api/opinions/${OPINION_ID}/publish`,
+        ),
+      ).toBe(true),
+    );
+    const call = calls.find(
+      (item) => item.url === `/api/opinions/${OPINION_ID}/publish`,
+    );
+    expect(requestBody(call?.init)).toMatchObject({
+      bridge_drafting_gap_acknowledged: true,
+    });
   });
 
   it("publie l’avis approuvé puis demande explicitement un repin humain", async () => {

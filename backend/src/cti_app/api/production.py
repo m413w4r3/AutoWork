@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -508,7 +509,9 @@ class ProductionReconciliationView(BaseModel):
     production_run_id: str
     model_run_id: str
     bridge_response_id: str | None
-    bridge_request_id: str | None
+    bridge_request_id: str | None = Field(
+        description="Truncated SHA-256 fingerprint of the internal Bridge request key."
+    )
     submission_state: str
     phase: str
     stage: ProductionStage
@@ -1115,7 +1118,11 @@ def reconciliation_view(
         production_run_id=str(run_id),
         model_run_id=str(reconciliation.model_run_id),
         bridge_response_id=reconciliation.bridge_response_id,
-        bridge_request_id=reconciliation.bridge_request_id,
+        bridge_request_id=(
+            bridge_request_fingerprint(reconciliation.bridge_request_id)
+            if reconciliation.bridge_request_id
+            else None
+        ),
         submission_state=reconciliation.submission_state.value,
         phase=reconciliation.phase,
         stage=reconciliation.stage,

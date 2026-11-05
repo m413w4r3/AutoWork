@@ -7,7 +7,6 @@ from copy import deepcopy
 
 from cti_app.application import advisor_consultation, advisor_prompt
 from cti_app.application.advisor_consultation import (
-    PreparationRefusal,
     PreparedConsultation,
     SourceRef,
     prepare,
@@ -247,8 +246,8 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
             1266,
         ),
         "pivot_strategy": (
-            "aa9b10637ac96222dc80369901ec64d3dccb9df63985953665006f09f2004fec",
-            1241,
+            "898b095a07aca885b0eb07300f571599ffabd017beb001da9326a53a0d2a72b1",
+            1182,
         ),
         "yara_draft_base64_hex": (
             "7ccf4d806cf7b0686ab7293aa0e5167eb102bbecc8ff50caca95d66edacbdce2",
@@ -345,7 +344,7 @@ def test_prepare_bytes_match_the_legacy_renderer_on_final_prompt_data(monkeypatc
     assert expected_ref in prepared.source_catalog.refs
 
 
-def test_prepare_refusal_prompt_has_a_golden_digest(monkeypatch) -> None:
+def test_prepare_incomplete_prompt_carries_gap_warning_to_bridge(monkeypatch) -> None:
     original_prompt = advisor_consultation.render_advisor_prompt
     captured: dict[str, str] = {}
 
@@ -355,21 +354,18 @@ def test_prepare_refusal_prompt_has_a_golden_digest(monkeypatch) -> None:
         return rendered
 
     monkeypatch.setattr(advisor_consultation, "render_advisor_prompt", capture_prompt)
-    refusal = prepare(
+    prepared = prepare(
         {
             "consultation_type": "plan_investigation",
             "question": "Compare an intentionally incomplete synthetic plan.",
         }
     )
-    assert isinstance(refusal, PreparationRefusal)
-    assert refusal.reason_code == "evidence_preflight_insufficient_evidence"
-    assert refusal.completeness is not None
-    assert refusal.completeness["status"] == "INSUFFICIENT_EVIDENCE"
+    assert isinstance(prepared, PreparedConsultation)
+    assert prepared.completeness["status"] == "INSUFFICIENT_EVIDENCE"
+    assert "Contexte indisponible / omis" in prepared.dossier_text
     encoded = captured["rendered"].encode("utf-8")
-    assert hashlib.sha256(encoded).hexdigest() == (
-        "348ee5968bacd90471a716c0d74b071dc4b5c7b015c1454b7acf7d8c8308eed6"
-    )
-    assert len(encoded) == 1173
+    assert b"Contexte indisponible / omis" in encoded
+    assert hashlib.sha256(encoded).hexdigest() == prepared.prompt_sha256
 
 
 def test_preparation_completeness_does_not_have_a_partial_state() -> None:

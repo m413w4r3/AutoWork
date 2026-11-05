@@ -505,13 +505,17 @@ class _InvestigationService:
         if actor_provenance is not None:
             reconciliation["actor_provenance"] = actor_provenance
         self.uow._store.reconciliations.append(reconciliation)
+        status_by_outcome = {
+            "executed_with_result": ToolInvocationStatus.SUCCEEDED,
+            "executed_empty_response": ToolInvocationStatus.EMPTY,
+            "transport_error": ToolInvocationStatus.NEEDS_REVIEW,
+            "external_result_unknown": ToolInvocationStatus.NEEDS_REVIEW,
+            "result_unavailable": ToolInvocationStatus.UNAVAILABLE,
+            "reconciled_without_result": ToolInvocationStatus.UNAVAILABLE,
+        }
         return SimpleNamespace(
             id=invocation_id,
-            status=(
-                ToolInvocationStatus.SUCCEEDED
-                if outcome.value == "executed_with_result"
-                else ToolInvocationStatus.FAILED
-            ),
+            status=status_by_outcome.get(outcome.value, ToolInvocationStatus.FAILED),
             version=expected_version + 1,
             response_refs=response_refs,
         )
@@ -1026,6 +1030,7 @@ def test_start_accepts_explicit_operator_led_execution_mode() -> None:
 
 def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
     client, store = _client()
+    request_key = "operator-status-private-key-canary"
     store.investigations[INVESTIGATION_ID].version = 1
     pending_state = replace(
         _working_state(),
@@ -1039,7 +1044,7 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
         id=uuid4(),
         status=SimpleNamespace(value="needs_review"),
         error_code="operator_interrupted",
-        idempotency_key="synthetic-pending-turn-key",
+        idempotency_key=request_key,
     )
 
     response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
@@ -1052,6 +1057,9 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
         "lifecycle": "temporary_chat_per_turn",
     }
     assert body["last_operation"]["conversation_id_scope"] == ("local_autowork_record_only")
+    expected_fingerprint = f"sha256:{hashlib.sha256(request_key.encode()).hexdigest()[:16]}"
+    assert body["last_operation"]["id"] == expected_fingerprint
+    assert request_key not in response.text
     assert body["last_operation"]["decision_expected"] == (
         "reconcile interrupted Bridge turn before resume"
     )
@@ -1259,7 +1267,17 @@ def test_reconciliation_summary_keeps_older_completed_claim_authoritative() -> N
     assert summary.next_action["resubmission_allowed"] is False
 
 
-def test_operator_client_reconciles_passive_vt_read_through_existing_route() -> None:
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [
+        ("not_executed", "failed"),
+        ("executed_empty_response", "empty"),
+        ("result_unavailable", "unavailable"),
+    ],
+)
+def test_operator_client_reconciles_passive_vt_read_through_existing_route(
+    outcome: str, expected_status: str
+) -> None:
     class OperatorIdentityProvider:
         async def current(self):
             return Identity(
@@ -1307,7 +1325,7 @@ def test_operator_client_reconciles_passive_vt_read_through_existing_route() -> 
         path,
         json={
             "expected_version": 3,
-            "outcome": "not_executed",
+            "outcome": outcome,
             "reason": "The read did not produce a persisted provider result.",
             "response_refs": [],
         },
@@ -1317,13 +1335,14 @@ def test_operator_client_reconciles_passive_vt_read_through_existing_route() -> 
     assert response.status_code == 200, response.text
     assert response.json() == {
         "invocation_id": str(invocation_id),
-        "status": "failed",
+        "status": expected_status,
         "version": 4,
+        "outcome": outcome,
         "response_refs": [],
     }
     assert store.reconciliations[0]["actor"] == "operator:agent-client"
     assert store.reconciliations[0]["actor_provenance"] == "operator_client"
-    assert store.reconciliations[0]["outcome"] == "not_executed"
+    assert store.reconciliations[0]["outcome"] == outcome
     assert store.reconciliations[0]["idempotency_key"].startswith(
         f"invocation:{invocation_id}:idem:"
     )
@@ -2090,6 +2109,7 @@ def test_invocation_reconciliation_route_uses_verified_actor_cas_and_idempotency
         "invocation_id": str(invocation_id),
         "status": "succeeded",
         "version": 4,
+        "outcome": "executed_with_result",
         "response_refs": [],
     }
     assert store.reconciliations == [

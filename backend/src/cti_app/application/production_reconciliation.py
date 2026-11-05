@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
+from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
 from cti_app.application.model_gateway import ModelGateway, ModelGatewayError
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
@@ -110,7 +111,11 @@ class ProductionRecoveryPreview:
             "stage": self.stage,
             "pipeline_generation": self.pipeline_generation,
             "bridge_response_id": self.bridge_response_id,
-            "bridge_request_id": self.bridge_request_id,
+            "bridge_request_id": (
+                bridge_request_fingerprint(self.bridge_request_id)
+                if self.bridge_request_id
+                else None
+            ),
             "submission_state": self.submission_state,
             "phase": self.phase,
             "text": self.text,

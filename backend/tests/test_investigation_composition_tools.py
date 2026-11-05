@@ -241,6 +241,7 @@ def test_composition_keeps_built_in_local_capability_without_optional_ports() ->
         "graph.neighbors",
         "network.protocol.document",
         "network.protocol.render",
+        "rule.import_suricata_bridge_candidate",
         "sample.get_feature_pack",
         "sample.set_qualification",
     }
@@ -250,11 +251,10 @@ def test_composition_keeps_built_in_local_capability_without_optional_ports() ->
             "investigation.local_read",
             "network.protocol.document",
             "network.protocol.render",
+            "rule.import_suricata_bridge_candidate",
         }
     )
-    assert all(
-        not name.startswith(("vt.", "shodan.", "rule.")) for name in composition.available_tools
-    )
+    assert all(not name.startswith(("vt.", "shodan.")) for name in composition.available_tools)
 
 
 @pytest.mark.asyncio

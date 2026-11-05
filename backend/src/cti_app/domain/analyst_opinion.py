@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, TypedDict
 from uuid import UUID, uuid4, uuid5
 
 from cti_app.domain.investigation import (
@@ -44,6 +44,18 @@ class ImplantMaterialType(StrEnum):
     XOR_SCHEME = "xor_scheme"
     ATTACKER_GITHUB_C2_TOKEN = "attacker_github_c2_token"
     OTHER = "other"
+
+
+class OpinionBridgeDraftingSummary(TypedDict):
+    status: str
+    section_count: int
+    bridge_authored_section_count: int
+    unlinked_sections: list[str]
+    requires_acknowledgement: bool
+    acknowledged: bool
+    resume_available: bool
+    diagnosis: str | None
+    warnings: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +231,8 @@ def normalize_opinion_text(block_type: OpinionBlockType, text: str) -> str:
 class BridgeDraftReferenceV1:
     invocation_id: str
     text_sha256: str
+    source_text_sha256: str | None = None
+    source_observation_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -228,9 +242,32 @@ class BridgeDraftReferenceV1:
         ):
             raise ValueError("Bridge draft invocation identity is invalid")
         _validate_sha256(self.text_sha256, "Bridge draft text hash")
+        if self.source_text_sha256 is not None:
+            _validate_sha256(self.source_text_sha256, "Bridge source text hash")
+        if self.source_observation_id is not None and not isinstance(
+            self.source_observation_id, UUID
+        ):
+            raise TypeError("Bridge source observation identity must be a UUID")
+
+    @property
+    def original_text_sha256(self) -> str:
+        return self.source_text_sha256 or self.text_sha256
+
+    @property
+    def final_text_sha256(self) -> str:
+        return self.text_sha256
+
+    @property
+    def operator_modified(self) -> bool:
+        return self.original_text_sha256 != self.final_text_sha256
 
     def to_payload(self) -> dict[str, str]:
-        return {"invocation_id": self.invocation_id, "text_sha256": self.text_sha256}
+        payload = {"invocation_id": self.invocation_id, "text_sha256": self.text_sha256}
+        if self.source_text_sha256 is not None:
+            payload["source_text_sha256"] = self.source_text_sha256
+        if self.source_observation_id is not None:
+            payload["source_observation_id"] = str(self.source_observation_id)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +625,7 @@ class AnalystOpinionV1:
     version: int = 1
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     content_sha256: str = ""
+    bridge_drafting_gap_acknowledged: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, AnalystOpinionStatus):
@@ -605,6 +643,8 @@ class AnalystOpinionV1:
             raise ValueError("Reviewed opinions require a reviewer identity")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
+        if not isinstance(self.bridge_drafting_gap_acknowledged, bool):
+            raise TypeError("Bridge drafting gap acknowledgement must be boolean")
         object.__setattr__(self, "blocks", tuple(self.blocks))
         object.__setattr__(self, "unresolved_points", tuple(self.unresolved_points))
         object.__setattr__(self, "protocol_figures", tuple(self.protocol_figures))
@@ -789,6 +829,8 @@ class AnalystOpinionV1:
         }
         if self.protocol_figures:
             payload["protocol_figures"] = [item.to_payload() for item in self.protocol_figures]
+        if self.bridge_drafting_gap_acknowledged:
+            payload["bridge_drafting_gap_acknowledged"] = True
         return payload
 
     def canonical_bytes(self) -> bytes:
@@ -806,11 +848,183 @@ def _validate_sha256(value: str, name: str) -> None:
 def _draft_ref_from_payload(value: object) -> BridgeDraftReferenceV1 | None:
     if value is None:
         return None
-    if not isinstance(value, Mapping) or set(value) != {"invocation_id", "text_sha256"}:
+    expected_fields = {"invocation_id", "text_sha256"}
+    optional_fields = {"source_text_sha256", "source_observation_id"}
+    if (
+        not isinstance(value, Mapping)
+        or not expected_fields.issubset(value)
+        or set(value) - (expected_fields | optional_fields)
+    ):
         raise ValueError("Bridge draft reference has missing or unknown fields")
-    if not isinstance(value["invocation_id"], str) or not isinstance(value["text_sha256"], str):
+    if (
+        not isinstance(value["invocation_id"], str)
+        or not isinstance(value["text_sha256"], str)
+        or ("source_text_sha256" in value and not isinstance(value["source_text_sha256"], str))
+        or (
+            "source_observation_id" in value and not isinstance(value["source_observation_id"], str)
+        )
+    ):
         raise ValueError("Bridge draft reference values are invalid")
-    return BridgeDraftReferenceV1(value["invocation_id"], value["text_sha256"])
+    try:
+        observation_id = (
+            UUID(value["source_observation_id"]) if "source_observation_id" in value else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bridge source observation identity is invalid") from exc
+    return BridgeDraftReferenceV1(
+        value["invocation_id"],
+        value["text_sha256"],
+        value.get("source_text_sha256"),
+        observation_id,
+    )
+
+
+_OPINION_INTERNAL_TEXT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("SUPPORTED", re.compile(r"\bSUPPORTED\b")),
+    ("PARTIAL", re.compile(r"\bPARTIAL\b")),
+    ("bridge_authored", re.compile(r"\bbridge_authored\b", re.IGNORECASE)),
+    ("observation_ref", re.compile(r"\bobservation_refs?\b", re.IGNORECASE)),
+    (
+        "provenance_identifier",
+        re.compile(
+            r"\b(?:finding_refs?|evidence_refs?|bridge_invocation_id|invocation_id|"
+            r"bridge_invocation_id_kind|invocation_id_kind|consultation_type|input_refs|"
+            r"evidence_observation_id|source_observation_id|opinion_id|content_sha256|"
+            r"opinion_version|synthesis_artifact_id|synthesis_sha256|reviewer_id|author_id|"
+            r"bridge_drafting_gap_acknowledged|publication_artifact_id|base_publication_sha256|"
+            r"source_sha256|source_text_sha256|original_text_sha256|"
+            r"final_text_sha256|text_sha256|output_sha256|"
+            r"reviewed_text_sha256|bridge_draft_ref|bridge_review_ref|operator_modified|"
+            r"schema_version)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("confidence=", re.compile(r"\bconfidence\s*=", re.IGNORECASE)),
+    (
+        "workflow_status",
+        re.compile(
+            r"(?:\b(?:advisor_)?status\s*[:=]\s*"
+            r"(?:draft|approved|rejected|partial|succeeded|failed|pending)\b|"
+            r"\busable\s*[:=]\s*(?:true|false)\b)",
+            re.IGNORECASE,
+        ),
+    ),
+)
+_OPINION_ANNEX_REFERENCE = re.compile(r"\b(?i:annexe)\s+([A-Z]|\d{1,3}(?:-[A-Z])?)\b")
+
+
+def opinion_internal_text_markers(opinion: AnalystOpinionV1) -> tuple[dict[str, str], ...]:
+    """Find workflow and provenance tokens that must stay out of reader-facing prose."""
+    sections: list[tuple[str, str]] = [
+        (f"blocks.{index}", block.text) for index, block in enumerate(opinion.renderable_blocks)
+    ]
+    sections.extend((f"observations.{item.anchor}", item.text) for item in opinion.observations)
+    if (materials := opinion.implant_materials_section) is not None:
+        sections.append(("implant_materials", materials.text))
+    sections.extend(
+        (f"unresolved_points.{index}", text) for index, text in enumerate(opinion.unresolved_points)
+    )
+    sections.extend(
+        (f"protocol_figures.{figure.kind.value}.caption", figure.caption)
+        for figure in opinion.protocol_figures
+    )
+    sections.extend(
+        (f"implant_materials.{index}.{field_name}", text)
+        for index, material in enumerate(opinion.implant_materials)
+        for field_name, text in (
+            ("value", material.value),
+            ("role", material.role),
+            ("sample_location", material.sample_location),
+        )
+    )
+
+    violations: list[dict[str, str]] = []
+    for section, text in sections:
+        for marker, pattern in _OPINION_INTERNAL_TEXT_PATTERNS:
+            if pattern.search(text):
+                violations.append({"section": section, "marker": marker})
+    return tuple(violations)
+
+
+def missing_opinion_annex_references(
+    opinion: AnalystOpinionV1,
+    available_annex_ids: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Return named annexes referenced by prose but absent from the supplied annex inventory."""
+    available = {item.strip().upper() for item in available_annex_ids if item.strip()}
+    text_sections = [block.text for block in opinion.renderable_blocks]
+    text_sections.extend(item.text for item in opinion.observations)
+    text_sections.extend(opinion.unresolved_points)
+    text_sections.extend(figure.caption for figure in opinion.protocol_figures)
+    if (materials := opinion.implant_materials_section) is not None:
+        text_sections.append(materials.text)
+    text_sections.extend(
+        text
+        for material in opinion.implant_materials
+        for text in (material.value, material.role, material.sample_location)
+    )
+    referenced = {
+        match.group(1).upper()
+        for text in text_sections
+        for match in _OPINION_ANNEX_REFERENCE.finditer(text)
+    }
+    return tuple(sorted(referenced - available))
+
+
+def opinion_bridge_drafting_summary(opinion: AnalystOpinionV1) -> OpinionBridgeDraftingSummary:
+    """Summarize completed Bridge linkage without inferring permission or availability."""
+    sections: list[tuple[str, bool]] = [
+        (block.block_type.value, block.bridge_authored and block.bridge_draft_ref is not None)
+        for block in opinion.renderable_blocks
+    ]
+    sections.extend(
+        (
+            f"analyst_observation:{item.anchor}",
+            item.bridge_authored and item.bridge_draft_ref is not None,
+        )
+        for item in opinion.observations
+    )
+    if (materials := opinion.implant_materials_section) is not None:
+        sections.append(
+            (
+                OpinionBlockType.IMPLANT_MATERIALS.value,
+                materials.bridge_authored and materials.bridge_draft_ref is not None,
+            )
+        )
+
+    linked_count = sum(1 for _, linked in sections if linked)
+    if sections and linked_count == len(sections):
+        status = "complete"
+        warnings: list[str] = []
+    elif linked_count:
+        status = "partial"
+        warnings = [
+            "Certaines sections analytiques n'ont pas de référence à une consultation "
+            "Bridge de rédaction."
+        ]
+    else:
+        status = "incomplete"
+        warnings = [
+            "Aucune section n'est liée à une consultation Bridge draft_text aboutie; "
+            "cet avis n'est pas indiqué comme rédigé avec Bridge."
+        ]
+    return {
+        "status": status,
+        "section_count": len(sections),
+        "bridge_authored_section_count": linked_count,
+        "unlinked_sections": [name for name, linked in sections if not linked],
+        "requires_acknowledgement": status != "complete",
+        "acknowledged": opinion.bridge_drafting_gap_acknowledged,
+        "resume_available": (status != "complete" and opinion.status is AnalystOpinionStatus.DRAFT),
+        "diagnosis": (
+            "no_completed_draft_text_reference"
+            if status == "incomplete"
+            else "some_sections_have_no_completed_draft_text_reference"
+            if status == "partial"
+            else None
+        ),
+        "warnings": warnings,
+    }
 
 
 def _review_ref_from_payload(value: object) -> BridgeReviewReferenceV1 | None:
@@ -1247,5 +1461,8 @@ __all__ = [
     "OpinionClaimQualification",
     "OpinionProtocolFieldEvidenceV1",
     "OpinionProtocolFigureV1",
+    "missing_opinion_annex_references",
+    "opinion_bridge_drafting_summary",
+    "opinion_internal_text_markers",
     "verify_opinion_citations",
 ]

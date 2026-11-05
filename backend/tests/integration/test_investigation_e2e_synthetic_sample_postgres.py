@@ -842,18 +842,18 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                     key=f"m05c-advisor-veto:{label}:{uuid4()}",
                 )
                 output = result["advisor_output"]
-                assert output["advisor_status"] == "refused", (
-                    f"{label}: observation={observation.id}; "
-                    f"failure_stage={output.get('failure_stage')}; "
-                    f"refs={output.get('disclosure_restricted_refs')}; "
-                    f"samples={output.get('disclosure_restricted_sample_associations')}"
-                )
-                assert output["refusal_code"] == "autowork_credential_or_signed_url_detected"
-                assert output["confirmed_non_execution"] is True
-                assert len(transport.calls) - before == 0
+                # An unknown assertion alias in the reply is informative only (M14): the readable
+                # text is returned with a ``partial`` advisory status and a succeeded tool.
+                assert output["advisor_status"] in {"succeeded", "partial"}, label
+                assert output["usable"] is True, label
+                assert result["invocation"]["status"] == "succeeded"
+                assert len(transport.calls) - before == 1
+                sent_prompt = transport.calls[-1]["prompt"]
+                assert marker not in sent_prompt
+                assert "[redacted-autowork-credential]" in sent_prompt
+                assert marker not in json.dumps(output)
                 if label == "signed-url":
                     assert signed_url_finding.observation_refs == (observation.id,)
-                assert marker not in json.dumps(output)
                 if label == "signed-url":
                     assert signed_url not in json.dumps(output)
 
@@ -874,22 +874,29 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 {
                     "consultation_type": "plan_investigation",
                     "question": "Check evidence completeness before local Advisor dispatch.",
-                    # An explicitly cited reference must resolve to this investigation.
+                    # An unresolvable cited reference is an optional hint: it is ignored and
+                    # reported, and the consultation continues on the canonical context.
                     "evidence_refs": [str(missing_ref)],
                 },
                 key=f"m05c-advisor-veto:missing-ref:{investigation_id}",
             )
-            assert len(transport.calls) == before
-            # The registered Advisor adapter supplies accepted typed pre-submission
-            # proof (pre_transport_validation), so the refusal is a FAILED
-            # non-execution and the reservation is released.
-            assert incomplete["invocation"]["status"] == "failed"
-            assert incomplete["invocation"]["error_code"] == "advisor_input_invalid"
+            assert len(transport.calls) == before + 1
+            assert incomplete["invocation"]["status"] == "succeeded"
             incomplete_output = incomplete["advisor_output"]
-            assert incomplete_output["advisor_status"] == "invalid_input"
-            assert incomplete_output["input_error_code"] == "evidence_reference_not_found"
-            assert incomplete_output["confirmed_non_execution"] is True
-            assert incomplete_output["provider_usage"] == {"status": "not_submitted"}
+            assert incomplete_output["advisor_status"] in {"succeeded", "partial"}
+            sent_prompt = transport.calls[-1]["prompt"]
+            assert credential_marker not in sent_prompt
+            assert signed_url_marker not in sent_prompt
+            assert "Contexte indisponible / omis" in sent_prompt
+            assert incomplete_output["input_warnings"]
+            assert incomplete_output["omissions"]
+            assert incomplete_output["next_action_hint"]
+            manifest_rows = incomplete_output["bridge_provenance"]["dossier_manifest"]
+            omitted_ids = {row.get("id") for row in manifest_rows if row.get("kind") == "omission"}
+            assert omitted_ids, manifest_rows
+            assert str(signed_url_observation.id) in omitted_ids
+            assert "reference_not_resolvable" in json.dumps(incomplete["output"], default=str)
+            assert str(missing_ref) in json.dumps(incomplete["output"], default=str)
 
             async with typed_uow_factory() as uow:
                 current = await uow.investigation_envelopes.get(investigation_id)
@@ -957,6 +964,7 @@ async def test_investigation_e2e_synthetic_sample_postgres(
                 "editor:m05c-reviewer",
                 "The persisted finding and sample-linked observation support this statement.",
                 idempotency_key=f"m05c-opinion-approve:{investigation_id}",
+                bridge_drafting_gap_acknowledged=True,
             )
             assert approved_opinion.reviewer_id == "editor:m05c-reviewer"
             augmentation = PublicationAugmentationArtifactService(
@@ -1249,16 +1257,22 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert advisor_event_ids == Counter(
                 str(item["observation_id"]) for item in audit_snapshot.advisor_call_metadata
             )
-            successful_advisor_metadata = [
+            # Every delivered consultation (succeeded or partial) reached the transport once; the
+            # "allowed" one is identified by its archived prompt.
+            delivered_advisor_metadata = [
                 item
                 for item in audit_snapshot.advisor_call_metadata
-                if item["metadata"]["advisor_status"] == "succeeded"
+                if item["metadata"]["advisor_status"] in {"succeeded", "partial"}
             ]
-            assert len(successful_advisor_metadata) == len(transport.calls) == 1
+            assert len(delivered_advisor_metadata) == len(transport.calls)
+            successful_advisor_metadata = [
+                item
+                for item in delivered_advisor_metadata
+                if item["metadata"]["prompt_blob_id"]
+                == str(allowed["advisor_output"]["prompt_blob_id"])
+            ]
+            assert len(successful_advisor_metadata) == 1
             advisor_observation_id = str(successful_advisor_metadata[0]["observation_id"])
-            assert successful_advisor_metadata[0]["metadata"]["prompt_blob_id"] == str(
-                allowed["advisor_output"]["prompt_blob_id"]
-            )
             assert (
                 successful_advisor_metadata[0]["metadata"]["prompt_sha256"]
                 == allowed["advisor_output"]["prompt_sha256"]
@@ -1303,7 +1317,9 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert credential_marker not in (audit_dir / "RUN_TRACE.md").read_text()
             assert signed_url_marker not in (audit_dir / "RUN_TRACE.md").read_text()
             assert transport.calls[0]["external_llm_allowed"] is True
-            assert len(transport.calls) == 1
+            assert (
+                len(transport.calls) >= 1
+            )  # redaction-path consultations also reach the transport
             assert provider.calls == 1
     finally:
         await engine.dispose()

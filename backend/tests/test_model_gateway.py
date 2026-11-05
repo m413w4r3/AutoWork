@@ -16,6 +16,7 @@ from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     ModelConversationTurnTransport,
 )
+from cti_app.application.external_effects import Ambiguous
 from cti_app.application.jobs import (
     JobExecutor,
     JobService,
@@ -27,6 +28,7 @@ from cti_app.application.model_gateway import (
     AdapterResultStatus,
     BackgroundResponsePendingError,
     BinaryModelInputError,
+    BridgeExternalEffectBinding,
     ExternalModelBlockedError,
     ModelCapabilities,
     ModelCapabilityError,
@@ -39,6 +41,7 @@ from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
     sanitize_model_request,
 )
+from cti_app.domain.external_effects import ExternalEffectAuthority
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -62,6 +65,7 @@ from cti_app.integrations.models import (
     OpenAIStructuredAdapter,
     QwenAdapter,
     ResponsesTransport,
+    create_coordinated_http_responses_transport,
 )
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
@@ -124,6 +128,9 @@ class TerminalFailureThenSuccessTransport:
         verified_no_answer: bool = False,
         code: str = "bridge_server_error",
         submission_state: str = "post_submission",
+        phase: str = "generation",
+        status_code: int | None = None,
+        submission_request: bool | None = None,
     ) -> None:
         self.failures = failures
         self.retryable = retryable
@@ -131,6 +138,9 @@ class TerminalFailureThenSuccessTransport:
         self.verified_no_answer = verified_no_answer
         self.code = code
         self.submission_state = submission_state
+        self.phase = phase
+        self.status_code = status_code
+        self.submission_request = submission_request
         self.idempotency_keys: list[str | None] = []
 
     async def create(
@@ -143,7 +153,9 @@ class TerminalFailureThenSuccessTransport:
                 self.code,
                 "contrat DOM de la réponse non résolu",
                 retryable=self.retryable,
-                phase="generation",
+                phase=self.phase,
+                status_code=self.status_code,
+                submission_request=self.submission_request,
                 submission_state=self.submission_state,
                 bridge_run_id=f"resp_failed_{len(self.idempotency_keys)}",
                 bridge_status=self.bridge_status,
@@ -355,6 +367,207 @@ async def test_typed_bridge_error_details_are_persisted_safely() -> None:
         "retryable": False,
         "attempts": 1,
     }
+
+
+async def test_bridge_rejects_locally_invalid_request_before_emission() -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        return httpx.Response(200, json={})
+
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": object()}, idempotency_key="synthetic-invalid-request")
+
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.code == "bridge_request_invalid"
+    assert emitted == []
+
+
+async def test_bridge_unsupported_protocol_is_proven_pre_submission() -> None:
+    client = ChatGPTBridgeClient("ftp://bridge.invalid")
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": "synthetic"}, idempotency_key="synthetic-unsupported-url")
+
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.code == "bridge_unsupported_protocol"
+
+
+async def test_coordinated_bridge_unsupported_protocol_is_pre_submission() -> None:
+    transport_calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        transport_calls.append(request.method)
+        raise httpx.UnsupportedProtocol("synthetic unsupported protocol", request=request)
+
+    class UnsupportedProtocolCoordinator:
+        calls = 0
+
+        async def send_one(self, _authority: Any, prepared: Any, physical_transport: Any) -> Any:
+            self.calls += 1
+            try:
+                await physical_transport.submit_once(
+                    prepared.application_request,
+                    lambda _request: None,
+                )
+            except httpx.UnsupportedProtocol:
+                return Ambiguous(uuid4())
+            raise AssertionError("unsupported protocol transport unexpectedly returned")
+
+    coordinator = UnsupportedProtocolCoordinator()
+    bridge_turn_id = uuid4()
+    model_run_id = uuid4()
+    authority = ExternalEffectAuthority(
+        investigation_id=uuid4(),
+        invocation_id=None,
+        operation_key="synthetic-unsupported-bridge-url",
+        reservation_amounts={"bridge_turns": 1},
+        expected_envelope_version=1,
+        approval_decision_id=uuid4(),
+        invocation_arguments_sha256=None,
+        bridge_turn_id=bridge_turn_id,
+        model_run_id=model_run_id,
+    )
+    binding = BridgeExternalEffectBinding(
+        authority=authority,
+        family="bridge.investigation_turn.v1",
+        provider_scope="bridge",
+        normalizer_version="bridge.investigation_turn.v1",
+        bridge_turn_id=bridge_turn_id,
+        model_run_id=model_run_id,
+        model_input_sha256="a" * 64,
+        authorized_input_hash="b" * 64,
+    )
+    client = create_coordinated_http_responses_transport(
+        "ftp://bridge.invalid/v1",
+        api_key=None,
+        coordinator=cast(Any, coordinator),
+        http_transport=httpx.MockTransport(handler),
+    )
+    client._last_capabilities_check = asyncio.get_running_loop().time()
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create(
+            {"input": "synthetic"},
+            idempotency_key="synthetic-unsupported-bridge-url",
+            bridge_external_effect_binding=binding,
+        )
+
+    assert caught.value.code == "bridge_unsupported_protocol"
+    assert caught.value.submission_state == "pre_submission"
+    assert coordinator.calls == 0
+    assert transport_calls == []
+
+
+async def test_bridge_transport_error_after_mock_request_emission_is_ambiguous() -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        if request.method == "GET":
+            return httpx.Response(404, json={"detail": "not found"}, request=request)
+        raise httpx.ReadTimeout("synthetic response timeout", request=request)
+
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": "synthetic"}, idempotency_key="synthetic-timeout")
+
+    assert [request.method for request in emitted] == ["POST", "GET"]
+    assert caught.value.submission_state == "external_state_unknown"
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+async def test_submission_phase_pre_submission_claim_is_read_only_reconciled(
+    status_code: int,
+) -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                status_code,
+                json={
+                    "detail": {
+                        "code": "bridge_server_error",
+                        "phase": "submission",
+                        "submission_state": "pre_submission",
+                    }
+                },
+                request=request,
+            )
+        return httpx.Response(404, json={"detail": "not found"}, request=request)
+
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await client.create({"input": "synthetic"}, idempotency_key="synthetic-server-error")
+
+    assert [request.method for request in emitted] == ["POST", "GET"]
+    assert caught.value.code == "bridge_server_error"
+    assert caught.value.submission_state == "external_state_unknown"
+
+
+@pytest.mark.parametrize(
+    "reported_phase",
+    [None, "preflight"],
+    ids=["phase-omitted", "phase-does-not-match-local-request"],
+)
+async def test_bridge_server_error_after_post_is_reconciled(
+    reported_phase: str | None,
+) -> None:
+    emitted: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        if request.method == "POST":
+            detail = {
+                "code": "bridge_server_error",
+                "submission_state": "pre_submission",
+            }
+            if reported_phase is not None:
+                detail["phase"] = reported_phase
+            return httpx.Response(
+                500,
+                json={"detail": detail},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"id": "synthetic-bridge-run", "status": "running"},
+            request=request,
+        )
+
+    run_id = uuid4()
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+    client._last_capabilities_check = asyncio.get_running_loop().time()
+    gateway, model_uow, _ = gateway_with_transport(client)
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(request(external_llm_allowed=True, run_id=run_id))
+
+    run = model_uow.state[run_id]
+    assert [item.method for item in emitted] == ["POST", "GET"]
+    assert sum(item.method == "POST" for item in emitted) == 1
+    assert emitted[1].url.path == (f"/bridge/runs/{emitted[0].headers['x-idempotency-key']}")
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.submission_state.value == "external_state_unknown"
 
 
 async def test_first_submission_uses_attempt_one_bridge_identity() -> None:
@@ -623,6 +836,39 @@ async def test_failed_without_verified_no_answer_reconciles_without_retry() -> N
     assert run.error_details["diagnostic_code"] == "bridge_server_error"
 
 
+@pytest.mark.parametrize(
+    ("phase", "status_code", "submission_request"),
+    [
+        ("submission", None, None),
+        ("generation", 500, None),
+        ("preflight", 500, True),
+    ],
+)
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+async def test_bridge_pre_submission_server_error_from_submission_is_ambiguous(
+    phase: str, status_code: int | None, submission_request: bool | None
+) -> None:
+    transport = TerminalFailureThenSuccessTransport(
+        failures=1,
+        bridge_status="failed",
+        verified_no_answer=False,
+        submission_state="pre_submission",
+        phase=phase,
+        status_code=status_code,
+        submission_request=submission_request,
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert len(transport.idempotency_keys) == 1
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.submission_state.value == "external_state_unknown"
+
+
 @pytest.mark.usefixtures("no_bridge_retry_delay")
 async def test_conversation_unavailable_after_submission_is_not_terminally_replayed() -> None:
     transport = TerminalFailureThenSuccessTransport(
@@ -705,6 +951,32 @@ async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() 
     assert transport.calls == 2
     assert execution.run.submission_attempt == 2
     assert transport.idempotency_keys == [f"{run.id}:a1", f"{run.id}:a2"]
+
+
+async def test_new_model_run_can_continue_the_bridge_attempt_suffix() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {
+                "id": "resp_attempt_two",
+                "status": "completed",
+                "output_text": "answered",
+            }
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_run_id = uuid4()
+    model_request = replace(
+        request(external_llm_allowed=True, run_id=model_run_id),
+        submission_attempt_offset=1,
+    )
+
+    execution = await gateway.research(model_request)
+
+    assert execution.output_text == "answered"
+    assert execution.run.submission_attempt == 2
+    assert execution.run.bridge_request_id == f"{model_run_id}:a2"
+    assert transport.idempotency_keys == [f"{model_run_id}:a2"]
+    assert model_uow.state[model_run_id].submission_attempt == 2
 
 
 async def test_qwen_trusted_gateway_runs_when_external_llm_is_forbidden() -> None:
@@ -1647,6 +1919,39 @@ async def test_bridge_authentication_preflight_fails_terminally_before_post() ->
     assert run.submission_state.value == "not_submitted"
 
 
+async def test_capability_preflight_5xx_remains_pre_submission() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(
+            503,
+            request=request,
+            json={
+                "detail": {
+                    "code": "bridge_server_error",
+                    "submission_state": "pre_submission",
+                }
+            },
+        )
+
+    run_id = uuid4()
+    client = ChatGPTBridgeClient(
+        "https://bridge.invalid",
+        http_transport=httpx.MockTransport(handler),
+    )
+    gateway, model_uow, _ = gateway_with_transport(client)
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await gateway.research(request(external_llm_allowed=True, run_id=run_id))
+
+    run = model_uow.state[run_id]
+    assert caught.value.submission_request is False
+    assert paths == ["/bridge/capabilities"]
+    assert run.status is ModelRunStatus.FAILED
+    assert run.submission_state.value == "not_submitted"
+
+
 async def test_gemini_http_refusals_are_typed_and_only_proven_ones_skip_reconciliation() -> None:
     statuses = iter([401, 400])
     calls: list[int] = []
@@ -2018,3 +2323,19 @@ async def test_chatgpt_textual_draft_keeps_textual_drafting_adapter() -> None:
     assert execution.structured_output is None
     assert execution.run.requested_model == "drafting-model"
     assert "contrat" not in transport.payloads[0]["input"][0]["content"]
+
+
+def test_external_effect_refusal_reason_keeps_key_value_diagnostics_but_not_free_text() -> None:
+    from cti_app.integrations.models import _safe_external_effect_reason
+
+    named = (
+        "unresolvable_evidence_observation_source:id=08f6816fe5945e02bf969d934f5e8731"
+        ":t=file:s=VirusTotal:h=64:a=drop_ref_or_cite_sha256"
+    )
+    assert _safe_external_effect_reason(named) == named
+    assert _safe_external_effect_reason("free text with spaces and a secret") == (
+        "unclassified_refusal"
+    )
+    assert _safe_external_effect_reason("api_key=sk-live-1234") == "unclassified_refusal"
+    assert _safe_external_effect_reason("token=abc") == "unclassified_refusal"
+    assert _safe_external_effect_reason("a" + ("b" * 255)) == "unclassified_refusal"

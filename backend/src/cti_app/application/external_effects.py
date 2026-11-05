@@ -40,6 +40,39 @@ from cti_app.domain.external_effects import (
 )
 
 _BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
+_VT_FAMILY_PREFIXES = ("vt.",)
+
+
+@dataclass(frozen=True, slots=True)
+class AdvisorDisclosurePolicy:
+    """One profile policy for Bridge and VirusTotal disclosure labels."""
+
+    profile: str
+
+    def ignores_restriction_labels(self, family: str | None = None) -> bool:
+        """Whether this profile treats source disclosure labels as audit metadata."""
+        if self.profile != "m14_research_permissive":
+            return False
+        if family is None:
+            return True
+        return family.startswith((*_BRIDGE_FAMILY_PREFIXES, *_VT_FAMILY_PREFIXES))
+
+    def allows_disclosure(
+        self, currently_allowed: bool, *, envelope_exists: bool, family: str
+    ) -> bool:
+        """Relax source labels while retaining the approved G2 envelope requirement."""
+        return envelope_exists and (currently_allowed or self.ignores_restriction_labels(family))
+
+
+def advisor_disclosure_policy(profile: str | None = None) -> AdvisorDisclosurePolicy:
+    """Return the shared advisor/VT disclosure policy for the configured profile."""
+    if profile is None:
+        from cti_app.config import get_settings
+
+        profile = get_settings().advisor_disclosure_profile
+    if profile not in {"standard", "m14_research_permissive"}:
+        raise ValueError("Unsupported advisor disclosure profile")
+    return AdvisorDisclosurePolicy(profile=profile)
 
 
 def external_effect_source_do_not_submit_blocks(family: str, do_not_submit: bool) -> bool:
@@ -58,13 +91,18 @@ def external_effect_source_restriction_reason(
     subject_id: UUID,
     family: str,
     is_model_submission: bool,
+    disclosure_profile: str | None = None,
 ) -> str | None:
     """Return the disclosure-policy refusal for a previously resolved source row."""
     source_subject_id = getattr(source, "subject_id", None)
     tlp = getattr(source, "tlp", None)
-    if (
-        source_subject_id != subject_id
-        or (isinstance(tlp, str) and tlp.casefold() == "red")
+    policy = advisor_disclosure_policy(disclosure_profile)
+    if source_subject_id != subject_id:
+        return (
+            "sample_source_restricted" if source_kind == "sample" else "source_document_restricted"
+        )
+    if not policy.ignores_restriction_labels(family) and (
+        (isinstance(tlp, str) and tlp.casefold() == "red")
         or external_effect_source_do_not_submit_blocks(
             family, bool(getattr(source, "do_not_submit", False))
         )
@@ -73,14 +111,23 @@ def external_effect_source_restriction_reason(
             "sample_source_restricted" if source_kind == "sample" else "source_document_restricted"
         )
     license_restriction = getattr(source, "license_restriction", None)
-    if source_kind == "sample":
+    if source_kind == "sample" and not policy.ignores_restriction_labels(family):
         if bool((license_restriction or "").strip()):
             return "sample_source_restricted"
         if is_model_submission and not bool(getattr(source, "external_llm_allowed", False)):
             return "sample_source_restricted"
-    elif license_restriction:
+    elif (
+        source_kind != "sample"
+        and license_restriction
+        and not policy.ignores_restriction_labels(family)
+    ):
         return "source_document_restricted"
-    elif is_model_submission and not bool(getattr(source, "external_llm_allowed", False)):
+    elif (
+        source_kind != "sample"
+        and is_model_submission
+        and not bool(getattr(source, "external_llm_allowed", False))
+        and not policy.ignores_restriction_labels(family)
+    ):
         return "source_document_external_llm_not_allowed"
     return None
 
@@ -182,7 +229,7 @@ def bridge_provider_report_requires_blob(
         and object_type == "file"
         and observation_kind == "vt_file_report"
         and isinstance(object_id, str)
-        and len(object_id) in {32, 40}
+        and len(object_id) in {32, 40, 64}
     )
 
 
@@ -212,7 +259,7 @@ def resolve_bridge_vt_file_report_hashes(
     object_id: object,
     report_content: bytes | None,
 ) -> BridgeVTFileReportHashes | None:
-    """Resolve short Bridge VT hashes only through their verified raw report."""
+    """Resolve a Bridge VT file hash only through its verified raw report."""
     if not bridge_provider_report_requires_blob(
         family=family,
         source=source,
@@ -221,8 +268,12 @@ def resolve_bridge_vt_file_report_hashes(
         observation_kind=observation_kind,
     ):
         return None
-    assert isinstance(object_id, str)
-    if not object_id.isascii() or not re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40})", object_id):
+    if not isinstance(object_id, str) or not object_id.isascii():
+        return None
+    requested_hash = object_id.casefold() if len(object_id) == 64 else object_id
+    if not re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", requested_hash):
+        return None
+    if len(object_id) in {32, 40} and requested_hash != object_id:
         return None
     if not isinstance(report_content, bytes):
         return None
@@ -257,10 +308,7 @@ def resolve_bridge_vt_file_report_hashes(
         and data_id.isascii()
         and re.fullmatch(r"[0-9a-f]{64}", data_id.casefold()) is not None
     )
-    if sha256 is None and data_id_is_sha256:
-        assert isinstance(data_id, str)
-        resolved_sha256 = data_id.casefold()
-    elif (
+    if (
         isinstance(sha256, str)
         and sha256.isascii()
         and re.fullmatch(r"[0-9a-f]{64}", sha256.casefold())
@@ -269,20 +317,20 @@ def resolve_bridge_vt_file_report_hashes(
     else:
         return None
 
-    if data_id == object_id:
-        pass
-    elif (
-        not data_id_is_sha256
-        or not isinstance(data_id, str)
-        or data_id.casefold() != resolved_sha256
+    # VT file reports identify the file by its canonical SHA-256 in data.id.
+    # The MD5/SHA-1 used to request the report must only match its attributes.
+    if not data_id_is_sha256 or not isinstance(data_id, str):
+        return None
+    if data_id.casefold() != resolved_sha256:
+        return None
+    if (isinstance(sha256, str) and sha256.casefold() != resolved_sha256) or (
+        (len(requested_hash) == 32 and md5 != requested_hash)
+        or (len(requested_hash) == 40 and sha1 != requested_hash)
+        or (len(requested_hash) == 64 and requested_hash != resolved_sha256)
     ):
         return None
-    if isinstance(sha256, str) and sha256.casefold() != resolved_sha256:
-        return None
-    if (len(object_id) == 32 and md5 != object_id) or (len(object_id) == 40 and sha1 != object_id):
-        return None
     return BridgeVTFileReportHashes(
-        requested_hash=object_id,
+        requested_hash=requested_hash,
         md5=md5,
         sha1=sha1,
         sha256=resolved_sha256,
@@ -366,12 +414,17 @@ def bridge_may_cite_provider_report_hash_without_sample(*, family: str, observat
     A VirusTotal report is provider metadata, not bytes of an acquired sample, so a fresh
     investigation holding only reports can still consult Bridge. The hash stays subject to
     the restrictions of any sample the subject already holds under it; observations derived
-    from local analysis keep requiring an associated, resolvable sample. Provenance is the
-    source label the VirusTotal recorders emit, never a tool name an operator could imitate.
+    from local analysis keep requiring an associated, resolvable sample. The exact file-report
+    kind and object type plus the source label the VirusTotal recorders emit establish provenance;
+    a tool name an operator could imitate does not.
     """
     if not family.startswith(_BRIDGE_FAMILY_PREFIXES):
         return False
-    return getattr(observation, "source", None) == VIRUSTOTAL_OBSERVATION_SOURCE
+    return (
+        getattr(observation, "source", None) == VIRUSTOTAL_OBSERVATION_SOURCE
+        and getattr(observation, "object_type", None) == "file"
+        and getattr(observation, "kind", None) == "vt_file_report"
+    )
 
 
 def osint_vt_search_may_cite_unassociated_observation_hash(

@@ -4043,6 +4043,7 @@ async def _seed_bridge_report_case(
     report_content: bytes | None = None,
     blob_store: _MemoryBlobStore | None = None,
     object_type: str = "file",
+    observation_kind: str = "vt_file_report",
 ) -> EvidenceReference:
     """Persist a file observation (and optionally a subject sample) for a Bridge citation.
 
@@ -4103,17 +4104,25 @@ async def _seed_bridge_report_case(
                 blob_sha256 = sample_blob_sha256 or (
                     canonical_sample_sha256 if lineage == "blob" else uuid4().hex + uuid4().hex
                 )
-                sample_blob = BlobRow(
-                    id=uuid4(),
-                    sha256=blob_sha256,
-                    size=1,
-                    mime_type="application/octet-stream",
-                    logical_bucket="samples",
-                    object_key=f"samples/{blob_sha256}",
-                    created_at=datetime.now(UTC),
+                # The database is shared across tests and blobs are content-addressed.
+                sample_blob = await session.scalar(
+                    select(BlobRow).where(
+                        BlobRow.logical_bucket == "samples",
+                        BlobRow.sha256 == blob_sha256,
+                    )
                 )
-                session.add(sample_blob)
-                await session.flush()
+                if sample_blob is None:
+                    sample_blob = BlobRow(
+                        id=uuid4(),
+                        sha256=blob_sha256,
+                        size=1,
+                        mime_type="application/octet-stream",
+                        logical_bucket="samples",
+                        object_key=f"samples/{blob_sha256}",
+                        created_at=datetime.now(UTC),
+                    )
+                    session.add(sample_blob)
+                    await session.flush()
                 session.add(
                     SampleRow(
                         id=uuid4(),
@@ -4161,7 +4170,7 @@ async def _seed_bridge_report_case(
                 EvidenceObservationRow(
                     id=observation_id,
                     investigation_id=investigation_id,
-                    kind="vt_file_report",
+                    kind=observation_kind,
                     blob_id=blob.id,
                     sha256=observation_sha256,
                     source=observation_source,
@@ -4305,15 +4314,20 @@ async def test_bridge_source_restrictions_accept_provider_report_of_unacquired_h
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
     try:
+        report_hash = uuid4().hex + uuid4().hex
         reference = await _seed_bridge_report_case(
             session_factory,
             investigation_id=investigation_id,
             subject_id=subject_id,
-            report_hash=uuid4().hex + uuid4().hex,
+            report_hash=report_hash,
             observation_source=observation_source,
             sample_flags=sample_flags,
             lineage=lineage,
+            canonical_sample_sha256=report_hash,
+            sample_blob_sha256=report_hash,
+            blob_store=blob_store,
         )
         prepared = _bridge_prepared(reference)
         binding = ExternalEffectFamilyBinding(
@@ -4323,12 +4337,18 @@ async def test_bridge_source_restrictions_accept_provider_report_of_unacquired_h
             invocation_tool_binding=None,
             model_submission=True,
         )
-        store = _store(session_factory, model_submission=True)
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        archived_report = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
         async with session_factory() as session:
             async with session.begin():
                 try:
                     await store._check_source_restrictions(
-                        session, authority, prepared, subject_id, binding
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        binding,
+                        report_blob_contents=archived_report,
                     )
                     refused: str | None = None
                 except _ConsumeDenied as exc:
@@ -4388,6 +4408,7 @@ async def test_bridge_source_restrictions_apply_owned_sample_policy_to_vt_md5_re
             sample_flags=sample_flags,
             lineage=lineage,
             canonical_sample_sha256=canonical_sample_sha256,
+            sample_blob_sha256=canonical_sample_sha256,
             blob_store=blob_store,
         )
         observation_id = UUID(reference.id)
@@ -4537,6 +4558,7 @@ async def test_bridge_md5_policy_reloads_sample_tlp_between_consume_checks_and_r
             sample_flags={"external_llm_allowed": True},
             lineage="expected_hash",
             canonical_sample_sha256=canonical_sample_sha256,
+            sample_blob_sha256=canonical_sample_sha256,
             blob_store=blob_store,
         )
         prepared = _bridge_prepared(reference)
@@ -4653,6 +4675,192 @@ async def test_bridge_rejects_malformed_vt_short_file_hash_with_safe_observation
 
 
 @pytest.mark.asyncio
+async def test_bridge_report_consume_does_not_block_another_subject_sample_write(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    other_factory, other_engine, other_investigation_id, other_subject_id, _ = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
+    report_hash = "c" * 32
+    canonical_sample_sha256 = "d" * 64
+    writer_task: asyncio.Task[None] | None = None
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=report_hash,
+            observation_source="VirusTotal",
+            sample_flags={"external_llm_allowed": True},
+            lineage="blob",
+            canonical_sample_sha256=canonical_sample_sha256,
+            blob_store=blob_store,
+        )
+        await _seed_bridge_report_case(
+            other_factory,
+            investigation_id=other_investigation_id,
+            subject_id=other_subject_id,
+            report_hash="e" * 32,
+            observation_source="VirusTotal",
+            sample_flags={"external_llm_allowed": True},
+        )
+        async with session_factory() as session:
+            other_sample_id = await session.scalar(
+                select(SampleRow.id).where(SampleRow.subject_id == other_subject_id)
+            )
+        assert other_sample_id is not None
+
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        archived_report = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        write_started = asyncio.Event()
+
+        async def update_other_subject_sample() -> None:
+            async with session_factory() as writer:
+                async with writer.begin():
+                    await writer.execute(text("SET LOCAL lock_timeout = '1s'"))
+                    write_started.set()
+                    await writer.execute(
+                        update(SampleRow)
+                        .where(SampleRow.id == other_sample_id)
+                        .values(external_llm_allowed=False)
+                    )
+
+        async with session_factory() as consumer:
+            async with consumer.begin():
+                await store._check_source_restrictions(
+                    consumer,
+                    authority,
+                    prepared,
+                    subject_id,
+                    binding,
+                    report_blob_contents=archived_report,
+                )
+                writer_task = asyncio.create_task(update_other_subject_sample())
+                await asyncio.wait_for(write_started.wait(), timeout=5)
+                await asyncio.wait_for(writer_task, timeout=3)
+
+        async with session_factory() as session:
+            other_sample = await session.get(SampleRow, other_sample_id)
+        assert other_sample is not None
+        assert other_sample.external_llm_allowed is False
+    finally:
+        if writer_task is not None and not writer_task.done():
+            writer_task.cancel()
+            await asyncio.gather(writer_task, return_exceptions=True)
+        await engine.dispose()
+        await other_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_sample_restriction_update_waits_for_report_consume(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
+    report_hash = "c" * 32
+    canonical_sample_sha256 = "d" * 64
+    revoke_task: asyncio.Task[None] | None = None
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=report_hash,
+            observation_source="VirusTotal",
+            sample_flags={"external_llm_allowed": True},
+            lineage="blob",
+            canonical_sample_sha256=canonical_sample_sha256,
+            blob_store=blob_store,
+        )
+        async with session_factory() as session:
+            sample_id = await session.scalar(
+                select(SampleRow.id).where(
+                    SampleRow.subject_id == subject_id,
+                    SampleRow.blob_id.in_(
+                        select(BlobRow.id).where(BlobRow.sha256 == canonical_sample_sha256)
+                    ),
+                )
+            )
+        assert sample_id is not None
+
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        archived_report = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        writer_pid: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+
+        async def revoke_sample_disclosure() -> None:
+            async with session_factory() as writer:
+                async with writer.begin():
+                    await writer.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    pid = await writer.scalar(text("SELECT pg_backend_pid()"))
+                    assert isinstance(pid, int)
+                    writer_pid.set_result(pid)
+                    await writer.execute(
+                        update(SampleRow).where(SampleRow.id == sample_id).values(tlp="RED")
+                    )
+
+        async with session_factory() as consumer:
+            async with consumer.begin():
+                await store._check_source_restrictions(
+                    consumer,
+                    authority,
+                    prepared,
+                    subject_id,
+                    binding,
+                    report_blob_contents=archived_report,
+                )
+                revoke_task = asyncio.create_task(revoke_sample_disclosure())
+                pid = await asyncio.wait_for(writer_pid, timeout=5)
+                blocking_pids: list[int] = []
+                for _attempt in range(100):
+                    async with session_factory() as monitor:
+                        blocking_pids = await monitor.scalar(
+                            text("SELECT pg_blocking_pids(:pid)"), {"pid": pid}
+                        )
+                    if blocking_pids:
+                        break
+                    await asyncio.sleep(0.02)
+                assert blocking_pids, "sample disclosure update passed the consume row lock"
+
+        assert revoke_task is not None
+        await asyncio.wait_for(revoke_task, timeout=5)
+        async with session_factory() as session:
+            sample = await session.get(SampleRow, sample_id)
+        assert sample is not None
+        assert sample.tlp == "RED"
+    finally:
+        if revoke_task is not None and not revoke_task.done():
+            revoke_task.cancel()
+            await asyncio.gather(revoke_task, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "report_state",
     [
@@ -4726,6 +4934,210 @@ async def test_bridge_refuses_md5_when_vt_report_cannot_be_verified(
         assert denied.value.detail is not None
         assert UUID(reference.id).hex in denied.value.detail
         assert "t=file" in denied.value.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_hash", "canonical_sha256"),
+    [
+        pytest.param("c" * 32, "d" * 64, id="md5-reference"),
+        pytest.param("b" * 40, "d" * 64, id="sha1-reference"),
+        pytest.param("d" * 64, "d" * 64, id="sha256-reference"),
+    ],
+)
+async def test_bridge_accepts_verified_vt_report_referenced_by_any_file_digest(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    requested_hash: str,
+    canonical_sha256: str,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
+    report_content = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": canonical_sha256,
+                "attributes": {
+                    "md5": "c" * 32,
+                    "sha1": "b" * 40,
+                    "sha256": canonical_sha256,
+                },
+            }
+        }
+    ).encode()
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=requested_hash,
+            observation_source="VirusTotal",
+            sample_flags=None,
+            canonical_sample_sha256=canonical_sha256,
+            report_content=report_content,
+            blob_store=blob_store,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        archived_report = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        assert archived_report[UUID(reference.id)] == report_content
+        async with session_factory() as session:
+            async with session.begin():
+                await store._check_source_restrictions(
+                    session,
+                    authority,
+                    prepared,
+                    subject_id,
+                    binding,
+                    report_blob_contents=archived_report,
+                )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "data_id",
+    [
+        pytest.param("e" * 64, id="data-id-conflicts-with-canonical-sha256"),
+        pytest.param("c" * 32, id="requested-md5-is-not-canonical-data-id"),
+    ],
+)
+async def test_bridge_refuses_md5_report_with_noncanonical_data_id(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    data_id: str,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    md5 = "c" * 32
+    canonical_sha256 = "d" * 64
+    blob_store = _MemoryBlobStore()
+    report_content = json.dumps(
+        {
+            "data": {
+                "type": "file",
+                "id": data_id,
+                "attributes": {
+                    "md5": md5,
+                    "sha1": "b" * 40,
+                    "sha256": canonical_sha256,
+                },
+            }
+        }
+    ).encode()
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=md5,
+            observation_source="VirusTotal",
+            sample_flags=None,
+            canonical_sample_sha256=canonical_sha256,
+            report_content=report_content,
+            blob_store=blob_store,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        archived_report = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        async with session_factory() as session:
+            async with session.begin():
+                with pytest.raises(_ConsumeDenied) as denied:
+                    await store._check_source_restrictions(
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        binding,
+                        report_blob_contents=archived_report,
+                    )
+        assert denied.value.reason == "unresolvable_evidence_observation_source"
+        assert denied.value.detail is not None
+        assert UUID(reference.id).hex in denied.value.detail
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observation_kind", "object_type", "object_id"),
+    [
+        pytest.param("negative_result", "file", "d" * 64, id="negative-file-result"),
+        pytest.param("vt_file_report", "sample", "d" * 64, id="file-report-other-object"),
+    ],
+)
+async def test_bridge_refuses_vt_observation_unless_it_is_a_file_report(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    observation_kind: str,
+    object_type: str,
+    object_id: str,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, _base = authorities[0]
+    blob_store = _MemoryBlobStore()
+    try:
+        reference = await _seed_bridge_report_case(
+            session_factory,
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            report_hash=object_id,
+            observation_source="VirusTotal",
+            sample_flags=None,
+            canonical_sample_sha256="d" * 64,
+            blob_store=blob_store,
+            object_type=object_type,
+            observation_kind=observation_kind,
+        )
+        prepared = _bridge_prepared(reference)
+        binding = ExternalEffectFamilyBinding(
+            provider="bridge",
+            provider_scopes=frozenset({"bridge.responses"}),
+            normalizer_versions=frozenset({"1"}),
+            invocation_tool_binding=None,
+            model_submission=True,
+        )
+        store = _store(session_factory, model_submission=True, blob_store=blob_store)
+        archived_report = await store._read_bridge_vt_report_blobs(prepared, investigation_id)
+        async with session_factory() as session:
+            async with session.begin():
+                with pytest.raises(_ConsumeDenied) as denied:
+                    await store._check_source_restrictions(
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        binding,
+                        report_blob_contents=archived_report,
+                    )
+        assert denied.value.reason == "unresolvable_evidence_observation_source"
+        assert denied.value.detail is not None
+        assert UUID(reference.id).hex in denied.value.detail
     finally:
         await engine.dispose()
 
@@ -4818,6 +5230,7 @@ async def test_bridge_md5_report_consultation_keeps_owned_sample_controls_and_de
             sample_flags=sample_flags,
             lineage="expected_hash",
             canonical_sample_sha256="d" * 64,
+            sample_blob_sha256="d" * 64,
             blob_store=blob_store,
         )
         prepared = replace(base_prepared, evidence_refs=(reference,))

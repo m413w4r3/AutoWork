@@ -19,6 +19,7 @@ from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
     OpinionProtocolFigureV1,
+    opinion_internal_text_markers,
     verify_opinion_citations,
 )
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
@@ -100,6 +101,13 @@ class AnalystOpinionPreviewService:
                 raise OpinionError(OpinionErrorCode.STALE_VERSION)
             if opinion.status is not AnalystOpinionStatus.DRAFT:
                 raise OpinionError(OpinionErrorCode.OPINION_NOT_DRAFT)
+            markers = opinion_internal_text_markers(opinion)
+            if markers:
+                raise OpinionError(
+                    OpinionErrorCode.OPINION_TEXT_MARKERS_FOUND,
+                    publication_text_markers=markers,
+                    message="Reader-facing opinion text contains internal markers.",
+                )
 
             investigation = await uow.analyst_investigations.get(opinion.investigation_id)
             if investigation is None:

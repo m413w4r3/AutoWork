@@ -25,7 +25,9 @@ Pour une simple recherche de hash ou de relation passive VT autorisée, ne pas i
 
 ## Stratégie avant la campagne
 
-Avant de lancer des recherches VT, demander à Bridge (`pivot_strategy`) des pivots exécutables et discriminants à partir des invariants **vérifiés** (distingués des hypothèses), des résultats YARA, des relations déjà consultées et des outils VT réellement exposés ; Bridge ne doit proposer ni commande ni filtre absents du registre. Choisir ensuite soi-même les pivots dont le résultat peut le plus modifier l'évaluation du corpus : un seul peut suffire, mais un résultat vide n'arrête pas la recherche tant qu'une alternative discriminante reste plausible. Le `purpose` de chaque appel VT dit le critère, son origine, pourquoi il pourrait trouver des variantes et sa limite : c'est ce qui rend la campagne auditable.
+Avant un pivot VT important ou après une découverte qui change les candidats, demande à Bridge (`pivot_strategy`) quel test exposé serait le plus discriminant. Résume en une phrase l’invariant vérifié, la relation et ce que tu cherches; le dossier est assemblé automatiquement et les références sont facultatives. Choisis les pivots dont le résultat peut modifier l’évaluation du corpus; un seul peut suffire. Un résultat vide décrit la recherche faite et n’arrête pas une piste différente encore utile.
+
+Lis le texte brut de Bridge avant son état de parsing. Agis sur toute recommandation utile avec les outils autorisés, puis envoie-lui les résultats lorsqu’ils permettent une critique ou une réévaluation. Évite une question identique lorsque sa réponse est déjà disponible; aucune validation de forme ne conditionne l’échange suivant.
 
 ## Pivots par motif et qualification des candidats
 
@@ -36,11 +38,11 @@ Quand `available_tools` offre une recherche VT par contenu (`vt.intelligence_sea
 - Choisir **un** pivot prometteur quand il suffit. Comparer plusieurs options seulement s'il y a une vraie hésitation coût/valeur ; aucun minimum de deux ou trois tests.
 - Vérifier les capacités et autorisations G2/TLP actuelles ; ne pas introduire un veto local sur VT passif ou Bridge lorsque l'enveloppe les autorise. Les acquitions, soumissions actives et Retrohunt suivent leurs contrats spécifiques.
 - Lire les objets renvoyés, conserver provenance et couverture, puis trier les meilleurs candidats. Un hash relié par VT peut justifier une investigation **sans** être déjà un membre confirmé de famille.
-- Lorsqu'un nouvel échantillon est associé/acquis, comparer des invariants (ressources, constantes, fonctions, protocoles) et tester la YARA existante si possible. Les matches et non-matches mesurables guident la révision ; les octets absents ne sont pas un non-match.
+- Lorsqu'un nouvel échantillon est associé/acquis, comparer des invariants et tester la YARA existante si possible. Les matches et non-matches mesurables guident la révision ; les octets absents ne sont pas un non-match.
 - Un motif YARA ou un champ C2 peut devenir pivot vers de nouveaux objets ; une variante nouvellement trouvée peut améliorer YARA/Suricata et la description du protocole.
 - Enregistrer une expérience ou un finding lorsque le résultat le justifie ; ne pas imposer une mutation canonique après chaque lecture passive.
 
-Un candidat qui ne correspond pas peut servir de contre-exemple pour la YARA ; ne pas le promouvoir en positif de famille par défaut. Un match YARA ou une relation VT ne prouve pas à lui seul la parenté. Après un candidat qualifié, retourner vers Bridge (`yara_draft`) avec les différences et les matches mesurés.
+Un candidat qui ne correspond pas peut servir de contre-exemple pour la YARA; ne le promeus pas en positif de famille par défaut. Un match YARA ou une relation VT ne prouve pas à lui seul la parenté. Après un résultat YARA nouveau, demande une critique à Bridge (`yara_draft`) avec une phrase sur les différences et matches mesurés; si sa réponse contient du code, importe-le selon `autowork-yara-bridge-workflow`.
 
 Ne pas fabriquer de corroboration avec une circularité entre rapports. Une relation fournisseur, un import générique ou un imphash ne prouvent pas à eux seuls une chaîne commune ; ils peuvent néanmoins constituer une piste raisonnable.
 

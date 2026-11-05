@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
@@ -331,6 +332,26 @@ async def test_preview_and_hash_mismatch_do_not_mutate(fixture: ReconciliationFi
     assert error.value.code == "production_reconciliation_hash_mismatch"
     assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
     assert bridge.releases == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_preview_fingerprints_internal_bridge_request_id(
+    fixture: ReconciliationFixture,
+) -> None:
+    service, uow, _, _, _ = fixture
+    run = next(iter(uow.production_runs.runs.values()))
+    model = next(iter(uow.model_runs.models.values()))
+    request_id = "synthetic-private-bridge-key"
+    model.bridge_request_id = request_id
+    assert run.reconciliation is not None
+    run.reconciliation = replace(run.reconciliation, bridge_request_id=request_id)
+
+    preview = await service.preview_visible(run.id)
+    projected = preview.as_dict()
+
+    expected = f"sha256:{hashlib.sha256(request_id.encode()).hexdigest()[:16]}"
+    assert projected["bridge_request_id"] == expected
+    assert request_id not in str(projected)
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from typing import Any
 
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
+    advisor_preflight_context_gaps,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
 )
@@ -199,6 +200,24 @@ def _prepare_projection(projection: Mapping[str, Any]) -> PreparedConsultation |
     prompt = render_advisor_prompt(consultation_type, prompt_data)
     prompt_utf8 = prompt.encode("utf-8")
     completeness = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
+    context_gaps = advisor_preflight_context_gaps(completeness)
+    if context_gaps:
+        prompt_data["_context_unavailable"] = [
+            *(
+                item
+                for item in prompt_data.get("_context_unavailable", ())
+                if isinstance(item, Mapping)
+            ),
+            *context_gaps,
+        ]
+        dossier = build_advisor_dossier(prompt_data)
+        prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+        prompt_data["dossier_text"] = dossier.text
+        prompt_data["dossier_sha256"] = dossier.sha256
+        prompt_data["dossier_bytes"] = dossier.byte_size
+        prompt = render_advisor_prompt(consultation_type, prompt_data)
+        prompt_utf8 = prompt.encode("utf-8")
+        completeness = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
     conflicts = _identity_conflicts(prompt_data, dossier, raw_manifest=raw_manifest)
     if conflicts:
         return PreparationRefusal(
@@ -207,7 +226,11 @@ def _prepare_projection(projection: Mapping[str, Any]) -> PreparedConsultation |
             redacted_secret_count=redacted_secret_count,
             conflicts=conflicts,
         )
-    if completeness.get("status") != "READY":
+    if completeness.get("status") not in {
+        "READY",
+        "NEEDS_RETRIEVAL",
+        "INSUFFICIENT_EVIDENCE",
+    }:
         status = str(completeness.get("status", "UNKNOWN")).casefold()
         return PreparationRefusal(
             reason_code=f"evidence_preflight_{status}",
