@@ -31,16 +31,15 @@
 
 #let render-brief(publication) = [
   #pagebreak()
+  #render-target(
+    publication.at("article_title_target_id", default: none),
+    [#text(size: 16pt, weight: "regular", fill: purple)[#publication.title] #label(publication.anchor)],
+  )
   #grid(
     columns: (1fr, auto),
     align: (left, right),
     [#tag("Brève")],
-    [#text(weight: "bold", fill: purple)[#publication.number]],
-  )
-  #v(6pt)
-  #render-target(
-    publication.at("article_title_target_id", default: none),
-    [#heading(level: 2, numbering: none)[#publication.title] #label(publication.anchor)],
+    [#text(size: 11pt, weight: "bold", fill: purple)[#publication.number]],
   )
   #v(2pt)
   #set text(size: 10pt)
