@@ -116,6 +116,8 @@ it("groups mixed publications and keeps backend positions continuous", async () 
   expect(
     within(briefGroup).getByRole("heading", { name: "Brève 02" }),
   ).toBeInTheDocument();
-  expect(within(articleGroup).getByText("Format : Article")).toBeInTheDocument();
+  expect(
+    within(articleGroup).getByText("Format : Article"),
+  ).toBeInTheDocument();
   expect(within(briefGroup).getByText("Format : Brève")).toBeInTheDocument();
 });

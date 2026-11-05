@@ -31,9 +31,7 @@ export function ProductionRoutingDetails({
   const confirmedCount = routing?.confirmed_ioc_count;
   return (
     <section className="production-routing" aria-label="Format de publication">
-      <p>
-        <strong>Format :</strong> {formatLabel(routing ?? undefined)}
-      </p>
+      <p>{`Format : ${formatLabel(routing ?? undefined)}`}</p>
       <details>
         <summary>Détails du format</summary>
         <dl>

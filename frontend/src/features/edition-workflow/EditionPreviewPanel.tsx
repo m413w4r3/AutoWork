@@ -179,9 +179,7 @@ export function EditionPreviewPanel({
               const display = publicationDisplay(publication.document);
               return (
                 <section key={publication.position}>
-                  <h4>
-                    Brève {String(publication.position).padStart(2, "0")}
-                  </h4>
+                  <h4>Brève {String(publication.position).padStart(2, "0")}</h4>
                   <PublicationDocumentView
                     document={display.document}
                     publicationKind={display.publicationKind}

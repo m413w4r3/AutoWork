@@ -129,7 +129,8 @@ function isPublicationDocument(
   if (!isRecord(value)) return false;
   if (value.schema_version === "7") {
     return (
-      (value.publication_kind === "article" || value.publication_kind === "brief") &&
+      (value.publication_kind === "article" ||
+        value.publication_kind === "brief") &&
       typeof value.routing_decision_hash === "string" &&
       typeof value.routing_policy_version === "string" &&
       isPublicationDocument(value.base_publication) &&

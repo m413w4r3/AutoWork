@@ -207,10 +207,7 @@ export interface ProductionReconciliation {
 
 export type ProductionRoutingStatus = "decided" | "needs_review" | "not_yet";
 export type ProductionRoutingExtractionState =
-  | "verified"
-  | "needs_review"
-  | "stale"
-  | "not_yet";
+  "verified" | "needs_review" | "stale" | "not_yet";
 
 export interface ProductionRoutingSource {
   source_id: string | null;
@@ -1287,7 +1284,8 @@ export interface PublicationDocumentV7 {
 
 export type PublicationDocument =
   PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6;
-export type PublicationDocumentArtifact = PublicationDocument | PublicationDocumentV7;
+export type PublicationDocumentArtifact =
+  PublicationDocument | PublicationDocumentV7;
 
 export type PublicationPreviewStatus =
   "IN_PROGRESS" | "READY" | "FAILED" | "STALE";

@@ -1531,9 +1531,9 @@ it("affiche une brève V7 avec chronologie et synthèse sans annexe IOC", async 
   renderArtifact("publication");
 
   expect(await screen.findByText("Format : Brève")).toBeInTheDocument();
-  expect(
-    screen.getByRole("region", { name: "RÉFÉRENCES" }),
-  ).toHaveTextContent("Le 4 octobre, une activité a été observée.");
+  expect(screen.getByRole("region", { name: "RÉFÉRENCES" })).toHaveTextContent(
+    "Le 4 octobre, une activité a été observée.",
+  );
   expect(screen.getByRole("region", { name: "SYNTHÈSE" })).toHaveTextContent(
     "Une campagne a été documentée par deux sources.",
   );

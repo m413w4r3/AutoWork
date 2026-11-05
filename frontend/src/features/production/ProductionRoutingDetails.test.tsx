@@ -34,22 +34,20 @@ describe("ProductionRoutingDetails", () => {
   ] as const)("shows a decided %s format", (publicationKind, label) => {
     render(
       <ProductionRoutingDetails
-        routing={
-          routing({
-            publication_kind: publicationKind,
-            sources: [
-              {
-                source_id: "source-1",
-                source_url: "https://source.example/report",
-                failure_code: "critical_source_incomplete",
-                tier: "core",
-                criticality: "critical",
-                criticality_reason: "required_source_missing",
-                policy_version: "source-policy-v1",
-              },
-            ],
-          })
-        }
+        routing={routing({
+          publication_kind: publicationKind,
+          sources: [
+            {
+              source_id: "source-1",
+              source_url: "https://source.example/report",
+              failure_code: "critical_source_incomplete",
+              tier: "core",
+              criticality: "critical",
+              criticality_reason: "required_source_missing",
+              policy_version: "source-policy-v1",
+            },
+          ],
+        })}
       />,
     );
 
@@ -66,14 +64,12 @@ describe("ProductionRoutingDetails", () => {
   it("marks a route that needs review without predicting a publication kind", () => {
     render(
       <ProductionRoutingDetails
-        routing={
-          routing({
-            status: "needs_review",
-            publication_kind: null,
-            reason_code: "incomplete_extraction",
-            confirmed_ioc_count: 0,
-          })
-        }
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "incomplete_extraction",
+          confirmed_ioc_count: 0,
+        })}
       />,
     );
 
