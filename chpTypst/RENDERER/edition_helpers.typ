@@ -31,10 +31,6 @@
 
 #let render-brief(publication) = [
   #pagebreak()
-  #render-target(
-    publication.at("article_title_target_id", default: none),
-    [#heading(level: 2, numbering: none)[#publication.title] #label(publication.anchor)],
-  )
   #grid(
     columns: (1fr, auto),
     align: (left, right),
@@ -42,6 +38,11 @@
     [#text(weight: "bold", fill: purple)[#publication.number]],
   )
   #v(6pt)
+  #render-target(
+    publication.at("article_title_target_id", default: none),
+    [#heading(level: 2, numbering: none)[#publication.title] #label(publication.anchor)],
+  )
+  #v(2pt)
   #set text(size: 10pt)
   #render-publication-body(
     publication,
@@ -86,12 +87,12 @@
   )
 
   v(16pt)
-  heading(level: 1)[Résumé de l'actualité #tag("Articles")]
+  heading(level: 1)[Résumé de l'actualité #tag("ARTICLES")]
   let articles = edition.publications.filter(publication => publication.kind == "article")
   article-indexing(index-entries(articles))
 
   v(16pt)
-  heading(level: 1)[Autres brèves relevées #tag("Brèves")]
+  heading(level: 1)[Autres brèves relevées #tag("BRÈVES")]
   let briefs = edition.publications.filter(publication => publication.kind == "brief")
   if briefs.len() == 0 {
     text("Aucune brève relevée dans cette édition.")

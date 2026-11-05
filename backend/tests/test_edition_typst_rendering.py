@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import shutil
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,9 +13,18 @@ from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from pypdf import PdfReader
 
-from cti_app.application.edition_classification import classify_edition_publications
-from cti_app.application.edition_ioc_export import project_publication_iocs
+from cti_app.application.edition_classification import (
+    classify_edition_publications,
+    explicit_publication_kind,
+    is_brief,
+    is_legacy_historical_brief,
+)
+from cti_app.application.edition_ioc_export import (
+    build_edition_ioc_archive,
+    project_publication_iocs,
+)
 from cti_app.application.edition_typst_rendering import (
     EditionRenderPublicationSchemaUnsupportedError,
     EditionTypstRenderer,
@@ -19,9 +32,12 @@ from cti_app.application.edition_typst_rendering import (
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.typst_compilation import (
     CompiledTypstDocument,
+    FontBundleInvalidError,
     FontBundleSnapshot,
     TypstCompileRequest,
     TypstOutputInvalidError,
+    load_font_bundle_snapshot,
+    materialize_font_bundle,
 )
 from cti_app.application.typst_render_execution import TypstRenderExecutor
 from cti_app.application.typst_rendering import (
@@ -42,6 +58,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     publication_document_text_anchors,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
     SEMANTIC_ANNOTATION_SCHEMA_VERSION,
@@ -50,6 +67,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextSpanV1,
     SemanticTextV1,
 )
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _frontmatter_v6_case
 from tests.test_publication_document_v6 import _approved_opinion
 from tests.test_typst_rendering import (
@@ -61,6 +79,8 @@ from tests.test_typst_rendering import (
 )
 
 _CHP_TYPST_ROOT = Path(__file__).resolve().parents[2] / "chpTypst"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
 _EDITION_MANIFEST = "edition-renderer-manifest.json"
 _EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
 _EDITION_RENDER_LABEL = (
@@ -89,6 +109,30 @@ def _publication(title: str, subject_id: int) -> PublicationDocumentV4:
         _full_document(),
         title=title,
         subject_id=UUID(int=subject_id),
+    )
+
+
+def _explicit_kind_publication(
+    position: int,
+    title: str,
+    subject_id: int,
+    kind: PublicationKind,
+    word_count: int,
+) -> EditionPublicationV2:
+    document = cast(
+        CanonicalPublicationDocument,
+        SimpleNamespace(
+            publication_kind=kind,
+            title=title,
+            subject_id=UUID(int=subject_id),
+            lead=(SimpleNamespace(text=" ".join(["mot"] * word_count)),),
+            sections=(),
+        ),
+    )
+    return EditionPublicationV2(
+        position=position,
+        subject_id=UUID(int=subject_id),
+        document=document,
     )
 
 
@@ -155,6 +199,231 @@ def _render_data(
     data = json.loads(source.render_data_bytes)
     assert data["document_label"] == _EDITION_RENDER_LABEL
     return source, data
+
+
+def _available_pinned_typst() -> str | None:
+    binary = os.environ.get("TYPST_BINARY")
+    if not binary:
+        pinned_binary = Path.home() / ".local" / "share" / "autowork-tools" / "typst"
+        binary = str(pinned_binary) if pinned_binary.is_file() else None
+    if binary and (shutil.which(binary) is not None or Path(binary).is_file()):
+        return binary
+    return None
+
+
+def _classification_signature(
+    publications: tuple[EditionPublicationV2, ...],
+) -> list[tuple[str, str, str, str]]:
+    return [
+        (
+            item.publication.document.title,
+            item.kind.value,
+            item.number,
+            item.anchor,
+        )
+        for item in classify_edition_publications(publications)
+    ]
+
+
+def test_explicit_kind_mixed_edition_uses_continuous_article_then_brief_numbers() -> None:
+    publications = (
+        _explicit_kind_publication(5, "E", 5, PublicationKind.BRIEF, 800),
+        _explicit_kind_publication(3, "C", 3, PublicationKind.ARTICLE, 80),
+        _explicit_kind_publication(1, "A", 1, PublicationKind.ARTICLE, 80),
+        _explicit_kind_publication(4, "D", 4, PublicationKind.BRIEF, 800),
+        _explicit_kind_publication(2, "B", 2, PublicationKind.BRIEF, 800),
+    )
+    expected = [
+        ("A", "article", "01", "article01"),
+        ("C", "article", "02", "article02"),
+        ("B", "brief", "03", "breve03"),
+        ("D", "brief", "04", "breve04"),
+        ("E", "brief", "05", "breve05"),
+    ]
+
+    assert _classification_signature(publications) == expected
+    assert _classification_signature(tuple(reversed(publications))) == expected
+
+
+def test_explicit_kind_articles_only_briefs_only_and_single_pair() -> None:
+    articles = (
+        _explicit_kind_publication(2, "A2", 12, PublicationKind.ARTICLE, 80),
+        _explicit_kind_publication(1, "A1", 11, PublicationKind.ARTICLE, 80),
+    )
+    briefs = (
+        _explicit_kind_publication(2, "B2", 22, PublicationKind.BRIEF, 800),
+        _explicit_kind_publication(1, "B1", 21, PublicationKind.BRIEF, 800),
+    )
+    one_pair = (
+        _explicit_kind_publication(1, "Brief", 31, PublicationKind.BRIEF, 800),
+        _explicit_kind_publication(2, "Article", 32, PublicationKind.ARTICLE, 80),
+    )
+
+    assert _classification_signature(articles) == [
+        ("A1", "article", "01", "article01"),
+        ("A2", "article", "02", "article02"),
+    ]
+    assert _classification_signature(briefs) == [
+        ("B1", "brief", "01", "breve01"),
+        ("B2", "brief", "02", "breve02"),
+    ]
+    assert _classification_signature(one_pair) == [
+        ("Article", "article", "01", "article01"),
+        ("Brief", "brief", "02", "breve02"),
+    ]
+
+
+def test_legacy_classification_is_only_the_fallback_for_documents_without_kind() -> None:
+    base = _publication("Legacy brief", 41)
+    short_document = replace(
+        base,
+        lead=(replace(base.lead[0], text="Very short."),),
+        sections=(),
+    )
+    assert explicit_publication_kind(short_document) is None
+    assert is_legacy_historical_brief(short_document)
+    assert (
+        explicit_publication_kind(
+            cast(CanonicalPublicationDocument, SimpleNamespace(publication_kind="brief"))
+        )
+        is PublicationKind.BRIEF
+    )
+    assert not is_brief(
+        cast(CanonicalPublicationDocument, SimpleNamespace(publication_kind="article"))
+    )
+
+
+def test_ioc_archive_keeps_empty_brief_entry_and_isolates_subject_exports() -> None:
+    base = _full_document()
+    article = replace(base, title="IOC-bearing article", subject_id=UUID(int=51))
+    brief = replace(
+        base,
+        title="IOC-free brief",
+        subject_id=UUID(int=52),
+        lead=(replace(base.lead[0], text="Une brève sans IOC."),),
+        sections=(),
+        timeline=(),
+        indicators=(),
+    )
+    edition = _edition_document(((1, article), (2, brief)))
+
+    article_rows = project_publication_iocs(article).rows
+    assert article_rows
+    archive = build_edition_ioc_archive(edition, edition_sha256="a" * 64)
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
+        manifest = json.loads(zipped.read("manifest.json"))
+        brief_csv = zipped.read("breves/breve02/article.csv").decode("utf-8")
+
+    brief_entry = manifest["publications"][1]
+    assert brief_entry["subject_id"] == str(UUID(int=52))
+    assert brief_entry["kind"] == "brief"
+    assert brief_entry["file"] == "breves/breve02/article.csv"
+    assert brief_entry["counts"] == {"ip": 0, "domain": 0, "url": 0, "file": 0}
+    assert brief_entry["excluded"] == []
+    assert brief_csv == (
+        "[|IOC-free brief|Example Lab|https://example.test/one]\nisNew,type,value\n"
+    )
+    assert all(row.value not in brief_csv for row in article_rows)
+    assert manifest["totals"] == project_publication_iocs(article).counts
+    assert archive.ioc_count == sum(project_publication_iocs(article).counts.values())
+
+
+@pytest.mark.asyncio
+async def test_real_typst_compiles_mixed_edition_without_empty_annex_or_demo_values(
+    tmp_path: Path,
+) -> None:
+    binary = _available_pinned_typst()
+    if binary is None:
+        pytest.skip("real pinned Typst is unavailable; set TYPST_BINARY")
+
+    base = _full_document()
+    article = replace(
+        base,
+        title="A technical article without IOC annex",
+        subject_id=UUID(int=61),
+        indicators=(),
+    )
+    brief = replace(
+        base,
+        title="A short sourced update",
+        subject_id=UUID(int=62),
+        lead=(replace(base.lead[0], text="A short sourced update."),),
+        sections=(),
+        indicators=(),
+    )
+    edition = _edition_document(((1, article), (2, brief)))
+    bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
+    source = EditionTypstRenderer().render(
+        edition,
+        bundle,
+        document_label=_EDITION_RENDER_LABEL,
+    )
+    render_data = json.loads(source.render_data_bytes)
+    brief_data = next(
+        item for item in render_data["publications"] if item["title"] == "A short sourced update"
+    )
+    assert "overview" not in brief_data
+    assert any(
+        section["type"] == "chronology" and section["timeline"]
+        for section in brief_data["content_sections"]
+    )
+    synthesis = next(
+        section for section in brief_data["content_sections"] if section["type"] == "synthesis"
+    )
+    assert synthesis["blocks"]
+    assert all(block["type"] == "paragraph" for block in synthesis["blocks"])
+
+    workspace_root = tmp_path / "workspace"
+    for file in bundle.files:
+        destination = workspace_root / file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(file.content)
+    render_data_path = workspace_root / source.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(source.render_data_bytes)
+
+    configured_font_root = os.environ.get("FONT_BUNDLE_ROOT")
+    font_root = Path(configured_font_root) if configured_font_root else _CHP_TYPST_ROOT
+    lock_path = Path(os.environ.get("TYPST_FONTS_LOCK_FILE", str(_FONT_BUNDLE_LOCK)))
+    try:
+        font_snapshot = load_font_bundle_snapshot(font_root, lock_path)
+    except FontBundleInvalidError:
+        if configured_font_root:
+            raise
+        pytest.skip("matching Typst font bundle is unavailable; set FONT_BUNDLE_ROOT")
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = await TypstSubprocessCompiler(binary=binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path=source.entrypoint_relative_path,
+            font_paths=font_paths,
+        )
+    )
+
+    assert compiled.media_type == "application/pdf"
+    assert compiled.content.startswith(b"%PDF-")
+    reader = PdfReader(io.BytesIO(compiled.content), strict=True)
+    assert reader.pages
+    text = "\n".join(page.extract_text() or "" for page in reader.pages).replace("\u2019", "'")
+    for expected in (
+        "Résumé de l'actualité",
+        "Autres brèves relevées",
+        "ARTICLES",
+        "BRÈVES",
+        "A short sourced update",
+        "One source event",
+    ):
+        assert expected in text
+    for absent in (
+        "Vue d'ensemble",
+        "ANNEXE TECHNIQUE — inventaire exhaustif des IOC",
+        "[Groupe] Titre",
+        "Void Blizzard",
+        "127.0.0.1",
+        "google.com",
+        "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974",
+    ):
+        assert absent not in text
 
 
 def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_path: Path) -> None:
@@ -647,7 +916,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v25-c8-spacing-compat"
+    assert bundle.template_version == "chp-edition-v26-explicit-kind-brief-layout"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

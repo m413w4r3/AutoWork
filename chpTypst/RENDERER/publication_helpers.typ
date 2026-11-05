@@ -2,6 +2,15 @@
 #import "../UTILS/colors.typ": accent, grey
 
 #let has-text(value) = value != none and value != ""
+#let has-ioc-values(indicators) = {
+  if indicators == none {
+    false
+  } else {
+    ("ips", "domains", "urls", "emails", "hashes").any(
+      key => indicators.at(key, default: ()).len() > 0,
+    )
+  }
+}
 
 #let publication-display-text(item) = {
   if type(item) == str {
@@ -1180,11 +1189,14 @@
         #text(size: 8pt, fill: grey)[#content_section.omitted_invalid_url_count URL non valide(s) omise(s) des listes.]
       ]
     ] else if content_section.type == "technical_annex" [
-      #set page(flipped: true)
       #let ioc_rows = content_section.at("ioc_rows", default: ())
       #let ioc_row_groups = content_section.at("ioc_row_groups", default: ())
       #let legacy_indicators = content_section.at("indicators", default: none)
       #let legacy_original_indicators = content_section.at("original_indicators", default: none)
+      #let has-legacy-iocs = has-ioc-values(legacy_indicators)
+      #let has-original-iocs = has-ioc-values(legacy_original_indicators)
+      #let has-ioc-annex = ioc_rows.len() > 0 or has-legacy-iocs or has-original-iocs
+      #if has-ioc-annex [#set page(flipped: true)]
       #let identity-provenance = content_section.at("publication_identity_provenance", default: none)
       #if has-text(identity-provenance) [
         #section-title[PROVENANCE DE PUBLICATION]
@@ -1195,7 +1207,7 @@
         #v(16pt)
         #section-title[ANNEXE TECHNIQUE — inventaire exhaustif des IOC]
         #render-ioc-table(ioc_row_groups, reference-scope: reference-scope)
-      ] else if legacy_indicators != none [
+      ] else if has-legacy-iocs [
         #ioc-list(
           title: [IOC],
           note: content_section.at("original_indicator_note", default: none),
@@ -1229,7 +1241,7 @@
           ]
         ]
       ]
-      #if ioc_rows.len() == 0 and legacy_indicators != none and legacy_original_indicators != none [
+      #if ioc_rows.len() == 0 and has-original-iocs [
         #v(8pt)
         #ioc-list(
           title: [IOC originaux à lien non démontré],
@@ -1291,7 +1303,7 @@
           ]
         ]
       ]
-      #set page(flipped: false)
+      #if has-ioc-annex [#set page(flipped: false)]
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
     }

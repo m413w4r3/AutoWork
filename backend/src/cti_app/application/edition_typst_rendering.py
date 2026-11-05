@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
-from typing import Any
+from typing import Any, get_args
 from uuid import UUID
 
 from cti_app.application.edition_classification import classify_edition_publications
@@ -25,12 +25,12 @@ from cti_app.application.typst_rendering import (
     project_publication_to_typst_model,
 )
 from cti_app.domain.edition_publication import EditionDocumentV2
-from cti_app.domain.publication_document import (
-    PublicationDocumentV4,
-    PublicationDocumentV5,
-    PublicationDocumentV6,
-)
+from cti_app.domain.publication_document import CanonicalPublicationDocument
 
+# Resolve the runtime PEP 695 alias dynamically so a new canonical version is
+# accepted here when publication_document.py extends the union.
+_CANONICAL_PUBLICATION_DOCUMENT_ALIAS: Any = CanonicalPublicationDocument
+_CANONICAL_PUBLICATION_DOCUMENT_TYPES = get_args(_CANONICAL_PUBLICATION_DOCUMENT_ALIAS.__value__)
 _EDITION_RENDER_DATA_SCHEMA_VERSION = (
     "typst-edition-model-v24-secret-guard-short-continuation-header"
 )
@@ -75,7 +75,7 @@ class EditionRenderPublicationSchemaUnsupportedError(EditionTypstRendererError):
 
 
 class EditionTypstRenderer:
-    """Render an ordered edition using the shared V4/V5/V6 publication projection."""
+    """Render an ordered edition using the shared canonical publication projection."""
 
     def render(
         self,
@@ -120,10 +120,7 @@ class EditionTypstRenderer:
         edition["bulletin_number"] = str(edition.get("version") or 1)
         edition["bulletin_identifier"] = edition_identifier(edition)
         if any(
-            not isinstance(
-                publication.document,
-                (PublicationDocumentV4, PublicationDocumentV5, PublicationDocumentV6),
-            )
+            not isinstance(publication.document, _CANONICAL_PUBLICATION_DOCUMENT_TYPES)
             for publication in document.publications
         ):
             raise EditionRenderPublicationSchemaUnsupportedError(
