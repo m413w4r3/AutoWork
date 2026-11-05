@@ -8,9 +8,9 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
 from cti_app.domain.production_extraction import (
     production_extraction_from_json,
     production_extraction_hashes,
@@ -25,9 +25,28 @@ from cti_app.domain.production_routing import (
     ProductionRoutingDecisionV1,
     RoutingCriticalSourceDiagnosticV1,
     RoutingReasonCode,
+    RoutingStatus,
     decide_publication_routing,
 )
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
+
+
+async def get_adopted_production_routing_decision(
+    *, uow: ProductionUnitOfWork, run: ProductionRun
+) -> ProductionRoutingDecisionV1 | None:
+    """Load the valid decided route currently adopted by this production run."""
+    if run.routing_decision_id is None:
+        return None
+    decision = await uow.production_routing_decisions.get(run.routing_decision_id)
+    if (
+        decision is None
+        or decision.status is not RoutingStatus.DECIDED
+        or decision.publication_kind is None
+        or decision.production_run_id != run.id
+        or decision.pipeline_generation != run.pipeline_generation
+    ):
+        return None
+    return decision
 
 
 async def decide_and_adopt_production_routing(
