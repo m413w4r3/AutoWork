@@ -160,7 +160,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
         title="Short operational update",
         lead=(replace(base.lead[0], text="Brief body without titled sections."),),
         sections=(),
-        timeline=(),
+        timeline=base.timeline,
         indicators=(),
         uncertainties=(),
         tables=(),
@@ -243,7 +243,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
         "Excel",
     ):
         assert expected in text
-    assert "Chronologie" not in text
+    assert "Chronologie" in text
     assert "Vue d'ensemble" not in text
     assert "Note de l'analyste" not in text
     # The reader sees a source note, never the internal provenance string.
@@ -256,11 +256,20 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     page_texts = [page.extract_text() or "" for page in reader.pages]
     first_article_page_text = next(page_text for page_text in page_texts if "SYNTHÈSE" in page_text)
     assert "SYNTHÈSE" in first_article_page_text
+    assert "CHRONOLOGIE" in first_article_page_text
+    assert "Chronologie" not in first_article_page_text
     if "CHRONOLOGIE" in first_article_page_text:
         assert first_article_page_text.index("CHRONOLOGIE") < first_article_page_text.index(
             "SYNTHÈSE"
         )
     assert text.index("Article with titled synthesis") < text.index("Short operational update")
+    brief_page_text = next(
+        page_text
+        for page_text in page_texts
+        if "Short operational update" in page_text and "Chronologie" in page_text
+    )
+    assert brief_page_text.index("Short operational update") < brief_page_text.index("BRÈVE")
+    assert "CHRONOLOGIE" not in brief_page_text
     assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
     for placeholder in (
         "Bulletin-CODE",

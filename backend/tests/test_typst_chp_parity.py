@@ -906,7 +906,7 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
         "ioc-list",
     }
     assert "source-list" not in production_helpers_imports[shared_helpers]
-    assert production_helpers_imports[colors] == {"accent", "grey"}
+    assert production_helpers_imports[colors] == {"accent", "grey", "purple"}
     style_imports = _resolved_imports(document_style)
     assert style_imports[header_footer] == {"report-header", "report-footer"}
     assert style_imports[colors] == {"purple"}

@@ -1,5 +1,5 @@
 #import "../UTILS/helpers.typ": section-title, timeline, ioc-list, semantic-text, semantic-or-plain, code-font-families, noteAnalyste
-#import "../UTILS/colors.typ": accent, grey
+#import "../UTILS/colors.typ": accent, grey, purple
 
 #let has-text(value) = value != none and value != ""
 #let has-ioc-values(indicators) = {
@@ -94,7 +94,7 @@
   if url in result { result } else { result + (url,) }
 })
 
-#let render-publication-timeline(events, ordered: false, reference-scope: "") = {
+#let render-publication-timeline(events, ordered: false, reference-scope: "", date-fill: none) = {
   let all-source-urls = events.fold((), (all, event) => {
     event.at("source_urls", default: ()).fold(all, (result, url) => {
       if url in result { result } else { result + (url,) }
@@ -112,7 +112,11 @@
       ]
       #let display-date = event.at("display_date", default: none)
       #if has-text(display-date) [
-        #text(weight: "bold")[#(display-date + " : ")]
+        #if date-fill == none [
+          #text(weight: "bold")[#(display-date + " : ")]
+        ] else [
+          #text(weight: "bold", fill: date-fill)[#(display-date + " : ")]
+        ]
       ]
       #semantic-or-plain(event.text, event.at("semantic_spans", default: none))
       #if source-refs.len() > 0 [
@@ -963,13 +967,21 @@
         render-body-block(item, reference-scope: reference-scope)
       }
     ] else if content_section.type == "chronology" [
-      #section-title[CHRONOLOGIE]
+      #let brief-chronology = publication.at("kind", default: "article") == "brief"
+      #let timeline-order = not brief-chronology
+      #let chronology-date-fill = if brief-chronology { purple } else { none }
+      #if brief-chronology [
+        #section-title[Chronologie]
+      ] else [
+        #section-title[CHRONOLOGIE]
+      ]
       #let derived-figure = content_section.at("derived_timeline_figure", default: none)
       #if derived-figure == none [
         #render-publication-timeline(
           content_section.timeline,
-          ordered: true,
+          ordered: timeline-order,
           reference-scope: reference-scope,
+          date-fill: chronology-date-fill,
         )
       ] else [
         #render-derived-timeline-figure(derived-figure, reference-scope: reference-scope)
@@ -983,8 +995,9 @@
           #v(8pt)
           #render-publication-timeline(
             undated-entries,
-            ordered: true,
+            ordered: timeline-order,
             reference-scope: reference-scope,
+            date-fill: chronology-date-fill,
           )
         ]
       ]
