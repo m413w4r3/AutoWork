@@ -43,6 +43,7 @@ from cti_app.application.production_prompts import (
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
 from cti_app.application.production_repairs import _effective_decisions_for_reader
+from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
@@ -3022,6 +3023,7 @@ class ProductionEditorialEnrichmentRevisionService:
         from cti_app.application.publication_assembly import PublicationAssemblyService
 
         async with self._enrichment._uow_factory() as uow:
+            routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
             assembly = await PublicationAssemblyService(
                 self._enrichment._artifact_store, uow.production_artifacts
             ).assemble_publication(
@@ -3032,6 +3034,15 @@ class ProductionEditorialEnrichmentRevisionService:
                 relevance_projection=projection,
                 synthesis=synthesis,
                 editorial_enrichment=enrichment,
+                publication_kind=(
+                    routing_decision.publication_kind if routing_decision is not None else None
+                ),
+                routing_decision_hash=(
+                    routing_decision.decision_hash if routing_decision is not None else None
+                ),
+                routing_policy_version=(
+                    routing_decision.policy_version if routing_decision is not None else None
+                ),
                 metadata_extra={
                     "input_artifacts": {
                         "references_artifact_id": str(references_artifact.id),

@@ -38,6 +38,7 @@ from cti_app.application.production_repairs import (
     _source_waiver_has_analyst_reason,
     repair_key_for_source_extraction_failure,
 )
+from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.production_source_additions import (
     SourceAdditionConflictError,
     SourceAdditionError,
@@ -3689,6 +3690,7 @@ class ProductionSynthesisRevisionService:
             raise TargetedSynthesisRevisionValidationError("references_artifact_blob_missing")
         references_payload = await self._synthesis._artifact_store.read_json(references_blob_id)
         references = production_reference_corpus_from_json(references_payload)
+        routing_decision = await get_adopted_production_routing_decision(uow=uow, run=context.run)
         assembly = await PublicationAssemblyService(
             self._synthesis._artifact_store, uow.production_artifacts
         ).assemble_publication(
@@ -3699,6 +3701,15 @@ class ProductionSynthesisRevisionService:
             relevance_projection=projection,
             synthesis=synthesis,
             editorial_enrichment=enrichment,
+            publication_kind=(
+                routing_decision.publication_kind if routing_decision is not None else None
+            ),
+            routing_decision_hash=(
+                routing_decision.decision_hash if routing_decision is not None else None
+            ),
+            routing_policy_version=(
+                routing_decision.policy_version if routing_decision is not None else None
+            ),
             metadata_extra={
                 "input_artifacts": {
                     "references_artifact_id": str(context.references_artifact.id),

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -1470,17 +1471,101 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
         create_session_factory,
     )
     from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
-    from tests.integration.test_osint_open_policy_postgres import _make_investigation
 
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "0002_c2_experiments")
     engine = create_postgres_engine(temporary_postgres_url)
-    session_factory = create_session_factory(engine)
 
     async def _prepare_legacy_envelope() -> Any:
         try:
-            investigation_case = await _make_investigation(session_factory)
+            # This test is deliberately seeded at 0002. Use the historical
+            # production_runs column set here: the current ORM includes
+            # routing_decision_id, which is not added until migration 0008.
+            now = datetime.now(UTC)
+            edition_id = uuid4()
+            subject_id = uuid4()
+            run_id = uuid4()
+            artifact_id = uuid4()
+            investigation_id = uuid4()
             async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO editions "
+                        "(id, country, country_code, period_start, period_end, tlp, languages, "
+                        "state, version, created_at, updated_at) "
+                        "VALUES (:id, 'Legacy migration test', 'ZZ', DATE '2026-10-01', "
+                        "DATE '2026-10-31', 'AMBER', '[\"en\"]'::jsonb, 'open', 1, "
+                        ":created_at, :updated_at)"
+                    ),
+                    {"id": edition_id, "created_at": now, "updated_at": now},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO subjects "
+                        "(id, edition_id, title, slug, tlp, version, created_at, updated_at) "
+                        "VALUES (:id, :edition_id, 'Legacy migration test subject', :slug, "
+                        "'AMBER', 1, :created_at, :updated_at)"
+                    ),
+                    {
+                        "id": subject_id,
+                        "edition_id": edition_id,
+                        "slug": f"legacy-migration-{uuid4().hex}",
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO production_runs "
+                        "(id, subject_id, edition_id, status, current_stage, run_number, "
+                        "pipeline_generation, research_date, created_at, updated_at, version) "
+                        "VALUES (:id, :subject_id, :edition_id, 'queued', 'sources', 1, 0, "
+                        "CURRENT_DATE, :created_at, :updated_at, 1)"
+                    ),
+                    {
+                        "id": run_id,
+                        "subject_id": subject_id,
+                        "edition_id": edition_id,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO production_artifacts "
+                        "(id, production_run_id, subject_id, stage, version, input_hash, "
+                        "status, metadata, created_at) "
+                        "VALUES (:id, :run_id, :subject_id, 'synthesis', 1, :input_hash, "
+                        "'verified', '{}'::jsonb, :created_at)"
+                    ),
+                    {
+                        "id": artifact_id,
+                        "run_id": run_id,
+                        "subject_id": subject_id,
+                        "input_hash": "f" * 64,
+                        "created_at": now,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO analyst_investigations "
+                        "(id, production_run_id, subject_id, synthesis_artifact_id, status, "
+                        "current_stage, cycle_number, max_cycles, max_pivot_runs, "
+                        "max_hits_acquired, max_new_samples, max_vt_read_units, "
+                        "consumed_pivot_runs, consumed_hits_acquired, consumed_new_samples, "
+                        "consumed_vt_read_units, created_at, updated_at, version) "
+                        "VALUES (:id, :run_id, :subject_id, :artifact_id, 'queued', 'seeds', "
+                        "1, 1, 0, 0, 0, 0, 0, 0, 0, 0, :created_at, :updated_at, 1)"
+                    ),
+                    {
+                        "id": investigation_id,
+                        "run_id": run_id,
+                        "subject_id": subject_id,
+                        "artifact_id": artifact_id,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
                 await connection.execute(
                     text(
                         "INSERT INTO investigation_envelopes "
@@ -1493,9 +1578,9 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
                         "false, 'green', false, false, :decision_id, 'legacy-actor', "
                         "now(), now(), 1)"
                     ),
-                    {"investigation_id": investigation_case.id, "decision_id": uuid4()},
+                    {"investigation_id": investigation_id, "decision_id": uuid4()},
                 )
-            return investigation_case.id
+            return investigation_id
         finally:
             await engine.dispose()
 

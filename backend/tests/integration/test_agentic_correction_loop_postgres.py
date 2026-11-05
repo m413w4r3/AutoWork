@@ -185,7 +185,9 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
     canonical_document_before = await scenario.artifact_store.read_json(
         publication_before.canonical_blob_id  # type: ignore[arg-type]
     )
-    assert canonical_document_before["subject_id"] == str(run.subject_id)
+    assert canonical_document_before["base_publication"]["base_publication"]["subject_id"] == str(
+        run.subject_id
+    )
     assert diagram_key in json.dumps(canonical_document_before)
     table_before = next(
         item
