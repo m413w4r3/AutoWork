@@ -11,6 +11,7 @@ from dataclasses import replace
 from io import BytesIO
 from itertools import pairwise
 from pathlib import Path
+from typing import TypedDict
 from uuid import UUID
 
 import anyio
@@ -59,6 +60,20 @@ _EDITION_RENDER_LABEL = (
     "Édition publiée 00000000-0000-4000-8000-000000000020 "
     "— release 00000000-0000-4000-8000-000000000099"
 )
+
+
+class _BBoxWord(TypedDict):
+    text: str
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+
+
+class _BBoxPage(TypedDict):
+    index: int
+    height: float
+    words: list[_BBoxWord]
 
 
 def _edition_document() -> EditionDocumentV2:
@@ -527,26 +542,23 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
         check=True,
     )
     bbox_root = ET.fromstring(bbox_result.stdout.decode("utf-8", errors="replace"))
-    bbox_pages = []
+    bbox_pages: list[_BBoxPage] = []
     for page_index, page_element in enumerate(
         element for element in bbox_root.iter() if element.tag.rsplit("}", 1)[-1] == "page"
     ):
-        bbox_pages.append(
+        words: list[_BBoxWord] = [
             {
-                "index": page_index,
-                "height": float(page_element.attrib["height"]),
-                "words": [
-                    {
-                        "text": word.text or "",
-                        "x_min": float(word.attrib["xMin"]),
-                        "y_min": float(word.attrib["yMin"]),
-                        "x_max": float(word.attrib["xMax"]),
-                        "y_max": float(word.attrib["yMax"]),
-                    }
-                    for word in page_element.iter()
-                    if word.tag.rsplit("}", 1)[-1] == "word"
-                ],
+                "text": word.text or "",
+                "x_min": float(word.attrib["xMin"]),
+                "y_min": float(word.attrib["yMin"]),
+                "x_max": float(word.attrib["xMax"]),
+                "y_max": float(word.attrib["yMax"]),
             }
+            for word in page_element.iter()
+            if word.tag.rsplit("}", 1)[-1] == "word"
+        ]
+        bbox_pages.append(
+            {"index": page_index, "height": float(page_element.attrib["height"]), "words": words}
         )
 
     def pages_containing(token: str) -> list[int]:
@@ -573,11 +585,11 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     network_page_indexes = pages_containing("NET_CONTEXT_")
     assert len(network_page_indexes) >= 2
     for page_index in network_page_indexes:
-        page = bbox_pages[page_index]
-        page_words = page["words"]
+        bbox_page = bbox_pages[page_index]
+        page_words = bbox_page["words"]
         page_text = " ".join(word["text"] for word in page_words)
         assert all(header in page_text for header in ("Type", "Valeur", "Statut", "Contexte"))
-        footer_zone = [word for word in page_words if word["y_min"] >= page["height"] - 55]
+        footer_zone = [word for word in page_words if word["y_min"] >= bbox_page["height"] - 55]
         row_boxes = [
             word for word in page_words if word["text"].startswith(("NET_CONTEXT_", "netrow"))
         ]
@@ -598,16 +610,16 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     assert first_network_row_page in {group_page, group_page + 1}
     assert pages_containing("PIPE_ROW_45") == pages_containing("Synthetic table note marker")
 
-    for page in bbox_pages:
+    for bbox_page in bbox_pages:
         body_words = [
             word["text"]
-            for word in page["words"]
+            for word in bbox_page["words"]
             if word["text"]
             and not word["text"].startswith("Bulletin")
             and word["text"] not in {"Chaps", "Vision", "/"}
             and not word["text"].isdigit()
         ]
-        assert body_words, f"PDF page {page['index'] + 1} contains only headers or footers"
+        assert body_words, f"PDF page {bbox_page['index'] + 1} contains only headers or footers"
 
 
 @pytest.mark.asyncio

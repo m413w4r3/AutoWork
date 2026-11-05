@@ -1412,6 +1412,7 @@ async def test_ambiguous_transport_failure_preserves_run_identity_and_blocks_rep
     assert first.bridge_invocation_id == bridge_run_id
     assert first.idempotency_key == idempotency_key
     assert "reconcile_orphaned_turn" in first.detail
+    assert first.failure_reason is not None
     assert "bridge_server_error" in first.failure_reason
     assert "resp_ambiguous" in first.failure_reason
     assert "model-run:attempt-1" not in first.failure_reason

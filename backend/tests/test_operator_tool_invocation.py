@@ -95,7 +95,7 @@ from cti_app.domain.investigation_experiment import (
     EXPERIMENT_TOOL_SCHEMA_VERSION,
     HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
 )
-from cti_app.domain.investigation_state import Hypothesis
+from cti_app.domain.investigation_state import Hypothesis, InvestigationWorkingState
 from tests.test_investigation_service import _Fixture
 
 
@@ -135,7 +135,7 @@ def _service(
 
 async def _fixture(
     *, external_allowed: bool = True
-) -> tuple[_Fixture, object, OperatorToolInvocationService]:
+) -> tuple[_Fixture, InvestigationWorkingState, OperatorToolInvocationService]:
     fixture = _Fixture(
         responses=[],
         external_allowed=external_allowed,
@@ -1003,6 +1003,8 @@ async def test_hypothesis_declare_uses_one_cas_and_is_idempotent() -> None:
         "expected_version": state.version,
         "idempotency_key": "hypothesis-s3p2-declare-1",
     }
+    request_arguments = request["arguments"]
+    assert isinstance(request_arguments, dict)
 
     first = await service.invoke(**request)
     after_first = await fixture.states.get(fixture.investigation_id)
@@ -1040,7 +1042,7 @@ async def test_hypothesis_declare_uses_one_cas_and_is_idempotent() -> None:
         tool_name=HYPOTHESIS_DECLARE_TOOL,
         schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
         arguments={
-            **request["arguments"],
+            **request_arguments,
             "statement": "A conflicting statement must not replace the declaration.",
         },
         purpose=request["purpose"],

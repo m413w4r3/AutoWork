@@ -939,7 +939,9 @@ async def test_untrusted_v1_review_has_no_retry_when_only_v2_is_trusted(monkeypa
     )
 
     fixture, state, registry, _summaries, service, tools, _identifiers = await _seeded_fixture()
-    file_definition, _v1_adapter = registry.get("vt.file_report", "1")
+    registered_file_tool = registry.get("vt.file_report", "1")
+    assert registered_file_tool is not None
+    file_definition, _v1_adapter = registered_file_tool
     v2_adapter = _RecordingTool("vt.file_report")
     registry.register(replace(file_definition, schema_version="2"), v2_adapter)
     monkeypatch.setattr(
@@ -1074,7 +1076,9 @@ async def test_passive_retry_readiness_is_bound_to_exact_schema_version(monkeypa
     from cti_app.application import investigation_vt_tools
 
     fixture, state, registry, _summaries, _service, _tools, identifiers = await _seeded_fixture()
-    trusted_definition, trusted_adapter = registry.get("vt.behaviour", "1")
+    registered_behaviour_tool = registry.get("vt.behaviour", "1")
+    assert registered_behaviour_tool is not None
+    trusted_definition, trusted_adapter = registered_behaviour_tool
     registry.register(
         replace(trusted_definition, schema_version="2"),
         _RecordingTool("vt.behaviour"),
@@ -1390,7 +1394,9 @@ async def test_passive_retry_uses_current_trusted_schema_after_version_change(mo
     from cti_app.application import investigation_vt_tools
 
     fixture, state, registry, _summaries, _service, _tools, identifiers = await _seeded_fixture()
-    old_definition, _ = registry.get("vt.file_report", "1")
+    registered_file_tool = registry.get("vt.file_report", "1")
+    assert registered_file_tool is not None
+    old_definition, _ = registered_file_tool
     registry.unregister("vt.file_report", "1")
     current_adapter = _RecordingTool("vt.file_report")
     registry.register(replace(old_definition, schema_version="2"), current_adapter)

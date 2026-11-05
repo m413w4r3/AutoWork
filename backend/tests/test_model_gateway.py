@@ -629,6 +629,7 @@ async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnos
         "bridge_diagnostics": {"user_turns_before": 1},
     }
     assert request_key not in str(run.error_details)
+    assert run.error_message is not None
     assert request_key not in run.error_message
     assert request_key not in caplog.text
     assert fingerprint in str(run.error_details)

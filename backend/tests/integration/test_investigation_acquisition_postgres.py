@@ -1262,7 +1262,9 @@ async def test_archive_member_ingestion_is_idempotent_and_resolves_from_postgres
             qualifications=SampleQualificationService(uow_factory),
             archive_extractor=extractor,
         )
-        definition, _ = registry.get("archive.extract_member", "1")
+        registered_tool = registry.get("archive.extract_member", "1")
+        assert registered_tool is not None
+        definition, _ = registered_tool
         assert definition.schema_version == "1"
         assert "member_path" in definition.input_schema["properties"]
         context = ToolExecutionContext(

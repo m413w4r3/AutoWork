@@ -482,7 +482,9 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
         analyzer=analyzer,
         archive_extractor=extractor,
     )
-    definition, _ = registry.get("archive.extract_member", "1")
+    registered_tool = registry.get("archive.extract_member", "1")
+    assert registered_tool is not None
+    definition, _ = registered_tool
     assert definition.schema_version == "1"
     assert definition.capability_key == ARCHIVE_EXTRACT_MEMBER_CAPABILITY
     assert definition.effect is ToolEffect.LOCAL_COMPUTE

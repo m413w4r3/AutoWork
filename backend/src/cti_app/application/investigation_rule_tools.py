@@ -1865,7 +1865,8 @@ class _RuleTools:
                     reason_code="bridge_yara_source_truncated",
                 ),
             )
-        source = output.get("rule_source")
+        raw_source = output.get("rule_source")
+        source = raw_source if isinstance(raw_source, str) else None
         observed_sha256 = output.get("rule_source_sha256")
         selected_rule: Mapping[str, Any] | None = None
         raw_rules = output.get("rules")
@@ -1901,14 +1902,14 @@ class _RuleTools:
             ):
                 candidate_texts.append(raw_output)
             seen_rule_hashes = {rule_sha for rule_sha, _item in rule_sources}
-            for candidate_text in candidate_texts:
-                document = parse_advisor_wire(candidate_text)
+            for candidate_reply_text in candidate_texts:
+                document = parse_advisor_wire(candidate_reply_text)
                 extracted = list(document.yara_rules)
                 if not extracted and document.source_language == "yara" and document.source:
                     extracted = [(document.source, _yara_rule_name(document.source) or "")]
                 if (
                     isinstance(source, str)
-                    and candidate_text == source
+                    and candidate_reply_text == source
                     and observed_sha256 == hashlib.sha256(source.encode("utf-8")).hexdigest()
                     and len(extracted) == 1
                 ):
@@ -1925,8 +1926,13 @@ class _RuleTools:
                         rule_sources.append((computed_sha256, item))
                         seen_rule_hashes.add(computed_sha256)
                 elif not rule_sources:
-                    computed_sha256 = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
-                    if _yara_rule_name(candidate_text) and computed_sha256 not in seen_rule_hashes:
+                    computed_sha256 = hashlib.sha256(
+                        candidate_reply_text.encode("utf-8")
+                    ).hexdigest()
+                    if (
+                        _yara_rule_name(candidate_reply_text)
+                        and computed_sha256 not in seen_rule_hashes
+                    ):
                         rule_sources.append((computed_sha256, None))
                         seen_rule_hashes.add(computed_sha256)
 
@@ -2088,8 +2094,10 @@ class _RuleTools:
                 )
             if len(matching_rules) == 1:
                 selected_rule = matching_rules[0]
-                source = selected_rule.get("rule_source")
-                observed_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                selected_source = selected_rule.get("rule_source")
+                if isinstance(selected_source, str):
+                    source = selected_source
+                    observed_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         if not isinstance(source, str) or not source.strip():
             raise _ToolFailed(
                 "bridge_yara_source_missing_or_truncated",
@@ -2100,22 +2108,22 @@ class _RuleTools:
                 ),
             )
         if requested_sha256 != observed_sha256:
-            candidate_text = source if isinstance(source, str) else None
-            if not isinstance(candidate_text, str) or not candidate_text.strip():
+            source_candidate_text: str | None = source
+            if not isinstance(source_candidate_text, str) or not source_candidate_text.strip():
                 raw_output = output.get("raw_output")
-                candidate_text = raw_output if isinstance(raw_output, str) else None
-            if isinstance(candidate_text, str) and candidate_text.strip():
-                document = parse_advisor_wire(candidate_text)
+                source_candidate_text = raw_output if isinstance(raw_output, str) else None
+            if isinstance(source_candidate_text, str) and source_candidate_text.strip():
+                document = parse_advisor_wire(source_candidate_text)
                 extracted_rules = list(document.yara_rules)
                 if not extracted_rules and document.source_language == "yara" and document.source:
                     extracted_rules = [(document.source, _yara_rule_name(document.source) or "")]
-                matching_rules = [
+                matching_sources = [
                     rule_source
                     for rule_source, _name in extracted_rules
                     if hashlib.sha256(rule_source.encode("utf-8")).hexdigest() == requested_sha256
                 ]
-                if len(matching_rules) == 1:
-                    source = matching_rules[0]
+                if len(matching_sources) == 1:
+                    source = matching_sources[0]
                     observed_sha256 = requested_sha256
         computed_source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         if observed_sha256 != requested_sha256 or computed_source_sha256 != observed_sha256:
