@@ -38,10 +38,12 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6ErrorCode,
     PublicationDocumentV6ProvenanceV1,
     PublicationDocumentV6ValidationError,
+    PublicationDocumentV7,
     publication_document_from_json,
     publication_document_v5_sha256,
     serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class PublicationAugmentationErrorCode(StrEnum):
@@ -60,6 +62,7 @@ class PublicationAugmentationErrorCode(StrEnum):
     INVESTIGATION_NOT_FOUND = "publication_augmentation_investigation_not_found"
     SYNTHESIS_IDENTITY_MISMATCH = "publication_augmentation_synthesis_identity_mismatch"
     IDEMPOTENCY_CONFLICT = "publication_augmentation_idempotency_conflict"
+    PUBLICATION_KIND_INVALID = "publication_augmentation_publication_kind_invalid"
 
 
 class PublicationAugmentationError(ValueError):
@@ -113,14 +116,25 @@ _BLOCK_ORDER = {kind: index for index, kind in enumerate(OpinionBlockType)}
 
 
 def augment_publication_with_opinion(
-    base_publication_document: PublicationDocumentV5,
+    base_publication_document: PublicationDocumentV5 | PublicationDocumentV7,
     opinion: AnalystOpinionV1,
     citation_context: OpinionCitationContext,
     *,
     infrastructure_graph: InvestigationGraph | None = None,
     detection: PublicationDetectionV1 | None = None,
-) -> PublicationDocumentV6:
-    """Return a V6 wrapper without changing either immutable input."""
+) -> PublicationDocumentV6 | PublicationDocumentV7:
+    """Return a V6 wrapper, preserving explicit V7 routing when present."""
+    routed_base = (
+        base_publication_document
+        if isinstance(base_publication_document, PublicationDocumentV7)
+        else None
+    )
+    if routed_base is not None:
+        if routed_base.publication_kind is not PublicationKind.ARTICLE:
+            raise PublicationAugmentationError(
+                PublicationAugmentationErrorCode.PUBLICATION_KIND_INVALID
+            )
+        base_publication_document = routed_base.base_publication.base_publication
     if not isinstance(base_publication_document, PublicationDocumentV5):
         raise PublicationAugmentationError(PublicationAugmentationErrorCode.BASE_DOCUMENT_REQUIRED)
     if opinion.status is not AnalystOpinionStatus.APPROVED:
@@ -206,13 +220,21 @@ def augment_publication_with_opinion(
         approver_id=citation_context.approver_id,
     )
     try:
-        return PublicationDocumentV6(
+        augmented = PublicationDocumentV6(
             base_publication=base_publication_document,
             provenance=provenance,
             analyst_opinion=opinion,
             rendered_opinion=section,
             infrastructure_graph=infrastructure_graph,
             detection=detection,
+        )
+        if routed_base is None:
+            return augmented
+        return PublicationDocumentV7(
+            base_publication=augmented,
+            publication_kind=routed_base.publication_kind,
+            routing_decision_hash=routed_base.routing_decision_hash,
+            routing_policy_version=routed_base.routing_policy_version,
         )
     except PublicationDocumentV6ValidationError as exc:
         code = {

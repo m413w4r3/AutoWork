@@ -69,6 +69,7 @@ from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
+    PublicationDocumentV7,
     publication_document_from_json,
     serialize_publication_document,
 )
@@ -736,14 +737,25 @@ class PublicationRenderService:
                 "Publication artifact does not contain a valid canonical publication document"
             ) from exc
 
-        if isinstance(document, PublicationDocumentV6) and not base_publication_artifact_matches:
+        publication_v6 = (
+            document.base_publication
+            if isinstance(document, PublicationDocumentV7)
+            else document
+            if isinstance(document, PublicationDocumentV6)
+            else None
+        )
+        is_augmented_publication = (
+            publication_v6 is not None and publication_v6.analyst_opinion is not None
+        )
+        if is_augmented_publication and not base_publication_artifact_matches:
             raise PublicationRenderArtifactInvalidError(
                 "V6 publication base artifact cannot be resolved to a matching publication artifact"
             )
 
         reviewer_approval_decision: Any | None = None
-        if isinstance(document, PublicationDocumentV6):
-            provenance = document.provenance
+        if is_augmented_publication:
+            assert publication_v6 is not None
+            provenance = publication_v6.provenance
             async with self._uow_factory() as uow:
                 analyst_decisions = getattr(uow, "analyst_decisions", None)
                 list_for_investigation = getattr(analyst_decisions, "list_for_investigation", None)
@@ -770,9 +782,9 @@ class PublicationRenderService:
             ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(document))
         ).hexdigest()
         graph_media_ref: TypstMediaRef | None = None
-        if isinstance(document, PublicationDocumentV6):
+        if publication_v6 is not None:
             graph_media_ref = await self._compile_infrastructure_graph(
-                document.base_publication, document.infrastructure_graph
+                publication_v6.base_publication, publication_v6.infrastructure_graph
             )
         try:
             template_bundle = load_template_bundle(self._chp_typst_root)
@@ -825,12 +837,13 @@ class PublicationRenderService:
         )
 
         augmentation = artifact.metadata.get("publication_augmentation")
-        if isinstance(document, PublicationDocumentV6):
+        if is_augmented_publication:
             if not isinstance(augmentation, dict):
                 raise PublicationRenderArtifactInvalidError(
-                    "A V6 publication requires its pinned augmentation metadata"
+                    "An augmented publication requires its pinned augmentation metadata"
                 )
-            provenance = document.provenance
+            assert publication_v6 is not None
+            provenance = publication_v6.provenance
             if (
                 str(provenance.base_publication_artifact_id)
                 != str(
@@ -845,7 +858,7 @@ class PublicationRenderService:
                 or provenance.opinion_content_sha256 != augmentation.get("opinion_content_sha256")
             ):
                 raise PublicationRenderArtifactInvalidError(
-                    "V6 publication metadata does not match its document provenance"
+                    "Publication augmentation metadata does not match its document provenance"
                 )
             nature = "augmented_publication"
             opinion_identity: dict[str, Any] | None = {
@@ -893,8 +906,9 @@ class PublicationRenderService:
             },
             "rendered_at": now.isoformat(),
         }
-        if isinstance(document, PublicationDocumentV6):
-            provenance = document.provenance
+        if is_augmented_publication:
+            assert publication_v6 is not None
+            provenance = publication_v6.provenance
             lineage["actors"] = {
                 "reviewer": {
                     "actor_id": provenance.reviewer_id,

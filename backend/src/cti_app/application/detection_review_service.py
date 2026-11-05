@@ -30,7 +30,14 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
 )
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.publication_document import parse_publication_document
+from cti_app.domain.publication_document import (
+    PublicationDocumentV5,
+    PublicationDocumentV6,
+    PublicationDocumentV7,
+    parse_publication_document,
+    publication_document_v5_sha256,
+)
+from cti_app.domain.publication_kind import PublicationKind
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DETECTION_REVIEW_NAMESPACE = UUID("3bdc0363-2ff8-4c0f-a842-98f9359f8e2c")
@@ -506,8 +513,61 @@ class DetectionReviewService:
             document = parse_publication_document(payload)
         except (KeyError, TypeError, ValueError):
             raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE) from None
-        if document.schema_version not in {"4", "5", "6"}:
+        if document.schema_version not in {"4", "5", "6", "7"}:
             raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
+        if isinstance(document, PublicationDocumentV7):
+            if document.publication_kind is not PublicationKind.ARTICLE:
+                raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
+            v6 = document.base_publication
+            if v6.analyst_opinion is not None:
+                provenance = v6.provenance
+                augmentation = base.metadata.get("publication_augmentation")
+                previous_id = base.metadata.get("previous_publication_artifact_id")
+                if (
+                    not isinstance(augmentation, Mapping)
+                    or str(augmentation.get("investigation_id")) != str(investigation.id)
+                    or previous_id is None
+                    or str(provenance.base_publication_artifact_id) != str(previous_id)
+                ):
+                    raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
+                try:
+                    parent_id = UUID(str(previous_id))
+                except ValueError:
+                    raise DetectionReviewError(
+                        DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE
+                    ) from None
+                parent = await uow.production_artifacts.get(parent_id)
+                if (
+                    parent is None
+                    or parent.stage is not ProductionArtifactStage.PUBLICATION
+                    or parent.status is not ProductionArtifactStatus.VERIFIED
+                    or parent.production_run_id != investigation.production_run_id
+                    or parent.subject_id != investigation.subject_id
+                    or parent.canonical_blob_id is None
+                ):
+                    raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
+                try:
+                    parent_document = parse_publication_document(
+                        await self._artifact_store.read_json(parent.canonical_blob_id)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    raise DetectionReviewError(
+                        DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE
+                    ) from None
+                if isinstance(parent_document, PublicationDocumentV7):
+                    if parent_document.publication_kind is not PublicationKind.ARTICLE:
+                        raise DetectionReviewError(
+                            DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE
+                        )
+                    parent_v5 = parent_document.base_publication.base_publication
+                elif isinstance(parent_document, PublicationDocumentV6):
+                    parent_v5 = parent_document.base_publication
+                elif isinstance(parent_document, PublicationDocumentV5):
+                    parent_v5 = parent_document
+                else:
+                    raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
+                if provenance.base_publication_sha256 != publication_document_v5_sha256(parent_v5):
+                    raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
         digest = hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
         if document.schema_version == "6":
             provenance = payload.get("provenance")
