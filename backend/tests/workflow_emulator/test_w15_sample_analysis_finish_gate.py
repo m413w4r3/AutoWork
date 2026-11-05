@@ -59,8 +59,7 @@ class _G1Transport(ScriptedInvestigationTransport):
         )
         if self._phase > 0:
             assert association is not None, [
-                (item.tool_name, item.status.value, item.response_refs)
-                for item in invocations
+                (item.tool_name, item.status.value, item.response_refs) for item in invocations
             ]
         if self._phase == 0:
             response = decision(
