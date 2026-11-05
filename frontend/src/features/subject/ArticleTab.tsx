@@ -152,13 +152,23 @@ function LegacyWorkbenchFallback({
 }
 
 function PublicationContent({ content }: { content: SubjectContentResponse }) {
+  const publicationKind =
+    content.canonical_content.schema_version === "7"
+      ? content.canonical_content.publication_kind
+      : "article";
+  const document =
+    content.canonical_content.schema_version === "7"
+      ? content.canonical_content.base_publication
+      : content.canonical_content;
   return (
     <section
       className="subject-article"
       aria-labelledby="subject-article-heading"
     >
       <div className="subject-article__meta">
-        <p className="eyebrow">Article</p>
+        <p className="eyebrow">
+          {publicationKind === "brief" ? "Brève" : "Article"}
+        </p>
         <p id="subject-article-heading">Version {content.artifact_version}</p>
         {content.status === "verified" ? (
           <a href={subjectPublicationPdfUrl(content.subject_id)}>
@@ -166,7 +176,10 @@ function PublicationContent({ content }: { content: SubjectContentResponse }) {
           </a>
         ) : null}
       </div>
-      <PublicationDocumentView document={content.canonical_content} />
+      <PublicationDocumentView
+        document={document}
+        publicationKind={publicationKind}
+      />
     </section>
   );
 }

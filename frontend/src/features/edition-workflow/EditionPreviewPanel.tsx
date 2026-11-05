@@ -9,7 +9,18 @@ import {
   pdfInspectionUrl,
   renderInputInspectionUrl,
 } from "../../api/publication";
+import type { PublicationDocumentArtifact } from "../../api/production";
 import { PublicationDocumentView } from "../../components/ProductionArtifactView";
+
+function publicationDisplay(document: PublicationDocumentArtifact) {
+  if (document.schema_version === "7") {
+    return {
+      document: document.base_publication,
+      publicationKind: document.publication_kind,
+    };
+  }
+  return { document, publicationKind: "article" as const };
+}
 
 export function EditionPreviewPanel({
   editionId,
@@ -71,6 +82,17 @@ export function EditionPreviewPanel({
   if (!preview.data) return null;
 
   const current = preview.data;
+  const orderedPublications = current.document.publications
+    .slice()
+    .sort((left, right) => left.position - right.position);
+  const articles = orderedPublications.filter(
+    (publication) =>
+      publicationDisplay(publication.document).publicationKind === "article",
+  );
+  const briefs = orderedPublications.filter(
+    (publication) =>
+      publicationDisplay(publication.document).publicationKind === "brief",
+  );
   return (
     <section
       className="edition-preview"
@@ -131,15 +153,44 @@ export function EditionPreviewPanel({
             </div>
           </dl>
         </section>
-        {current.document.publications
-          .slice()
-          .sort((left, right) => left.position - right.position)
-          .map((publication) => (
-            <section key={publication.position}>
-              <h3>Article {String(publication.position).padStart(2, "0")}</h3>
-              <PublicationDocumentView document={publication.document} />
-            </section>
-          ))}
+        {articles.length > 0 ? (
+          <section aria-label="ARTICLES">
+            <h3>ARTICLES</h3>
+            {articles.map((publication) => {
+              const display = publicationDisplay(publication.document);
+              return (
+                <section key={publication.position}>
+                  <h4>
+                    Article {String(publication.position).padStart(2, "0")}
+                  </h4>
+                  <PublicationDocumentView
+                    document={display.document}
+                    publicationKind={display.publicationKind}
+                  />
+                </section>
+              );
+            })}
+          </section>
+        ) : null}
+        {briefs.length > 0 ? (
+          <section aria-label="BRÈVES">
+            <h3>BRÈVES</h3>
+            {briefs.map((publication) => {
+              const display = publicationDisplay(publication.document);
+              return (
+                <section key={publication.position}>
+                  <h4>
+                    Brève {String(publication.position).padStart(2, "0")}
+                  </h4>
+                  <PublicationDocumentView
+                    document={display.document}
+                    publicationKind={display.publicationKind}
+                  />
+                </section>
+              );
+            })}
+          </section>
+        ) : null}
       </div>
       <p>
         {current.stale ? (
@@ -203,7 +254,7 @@ export function EditionPreviewPanel({
       ) : null}
       <p className="edition-preview__provenance">
         Hash d’entrée : <code>{current.preview_input_hash.slice(0, 12)}…</code>{" "}
-        · {current.artifacts.length} article
+        · {current.artifacts.length} publication
         {current.artifacts.length > 1 ? "s" : ""}
       </p>
     </section>

@@ -13,6 +13,7 @@ import {
   type ProductionSubject,
 } from "../../api/production";
 import { ExtractionProgressView } from "../../components/ExtractionProgress";
+import { ProductionRoutingDetails } from "../production/ProductionRoutingDetails";
 import { Link } from "../../routing";
 import { productionBatchPollingInterval } from "../production/productionPolling";
 import {
@@ -302,6 +303,7 @@ function ProductionItem({
           </span>
         ) : null}
       </div>
+      <ProductionRoutingDetails routing={item.routing} />
       <ActivityDetails item={item} />
       {isActive &&
       item.current_stage === "extraction" &&

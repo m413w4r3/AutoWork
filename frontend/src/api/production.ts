@@ -172,6 +172,7 @@ export interface ProductionStatus {
   error_message: string | null;
   error_details: Record<string, unknown> | null;
   recovery_disposition: ProductionRecoveryDisposition;
+  routing?: ProductionRoutingProjection;
   extraction_progress?: ExtractionProgress | null;
   extraction_rejections?: ExtractionRejections | null;
   reconciliation?: ProductionReconciliation | null;
@@ -202,6 +203,35 @@ export interface ProductionReconciliation {
   provenance: string | null;
   visible_available: boolean;
   batch_id: string | null;
+}
+
+export type ProductionRoutingStatus = "decided" | "needs_review" | "not_yet";
+export type ProductionRoutingExtractionState =
+  | "verified"
+  | "needs_review"
+  | "stale"
+  | "not_yet";
+
+export interface ProductionRoutingSource {
+  source_id: string | null;
+  source_url: string;
+  failure_code: string;
+  tier: string;
+  criticality: string;
+  criticality_reason: string;
+  policy_version: string;
+}
+
+export interface ProductionRoutingProjection {
+  status: ProductionRoutingStatus;
+  publication_kind: "article" | "brief" | null;
+  reason_code: string | null;
+  policy_version: string | null;
+  confirmed_ioc_count: number | null;
+  contextual_ioc_count: number | null;
+  ambiguous_ioc_count: number | null;
+  extraction_verification_state: ProductionRoutingExtractionState;
+  sources: ProductionRoutingSource[];
 }
 
 export interface ProductionRecoveryPreview {
@@ -249,6 +279,7 @@ export interface BatchItemDetail {
   extraction_progress?: ExtractionProgress | null;
   reconciliation?: ProductionReconciliation | null;
   activity?: ProductionActivity | null;
+  routing?: ProductionRoutingProjection;
 }
 
 export interface ProductionSubject {
@@ -263,6 +294,7 @@ export interface ProductionSubject {
   can_start: boolean;
   blocking_reason: string | null;
   activity?: ProductionActivity | null;
+  routing?: ProductionRoutingProjection;
 }
 
 export interface ProductionRunSummary {
@@ -279,6 +311,7 @@ export interface ProductionRunSummary {
   finished_at: string | null;
   error_code: string | null;
   error_message: string | null;
+  routing?: ProductionRoutingProjection;
 }
 
 export interface ProductionBatch {
@@ -350,6 +383,7 @@ export interface ArtifactResponse {
     | PublicationDocumentV4
     | PublicationDocumentV5
     | PublicationDocumentV6
+    | PublicationDocumentV7
     | ProductionExtractionV1
     | ProductionSynthesisV1
     | ExtractionDocumentV2
@@ -1243,8 +1277,17 @@ export interface PublicationDocumentV6 extends Omit<
   rich_text: PublicationSemanticTextV1;
 }
 
+export interface PublicationDocumentV7 {
+  schema_version: "7";
+  base_publication: PublicationDocumentV6;
+  publication_kind: "article" | "brief";
+  routing_decision_hash: string;
+  routing_policy_version: string;
+}
+
 export type PublicationDocument =
   PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6;
+export type PublicationDocumentArtifact = PublicationDocument | PublicationDocumentV7;
 
 export type PublicationPreviewStatus =
   "IN_PROGRESS" | "READY" | "FAILED" | "STALE";

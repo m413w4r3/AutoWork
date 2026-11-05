@@ -1,5 +1,5 @@
 import { ApiError, type EditionStatus } from "./editions";
-import type { PublicationDocument } from "./production";
+import type { PublicationDocumentArtifact } from "./production";
 import type { ProductionReconciliation, ProductionStage } from "./production";
 
 export type { ProductionReconciliation };
@@ -129,7 +129,7 @@ export interface EditionDocumentV2 {
   publications: Array<{
     position: number;
     subject_id: string;
-    document: PublicationDocument;
+    document: PublicationDocumentArtifact;
   }>;
 }
 

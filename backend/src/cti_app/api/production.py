@@ -121,6 +121,7 @@ from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionBatchCancellationConflictError,
     ProductionBatchPauseConflictError,
     ProductionBatchStatus,
@@ -135,6 +136,8 @@ from cti_app.domain.production import (
     ProductionSubmissionReconciliation,
     SourceAdditionExtractionIntent,
 )
+from cti_app.domain.production_routing import RoutingReasonCode, RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
@@ -472,6 +475,7 @@ class ProductionStatus(BaseModel):
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
     recovery_disposition: ProductionRecoveryDisposition
+    routing: "ProductionRoutingView"
     extraction_progress: dict[str, Any] | None = None
     extraction_rejections: ExtractionRejections = Field(default_factory=ExtractionRejections)
     reconciliation: ProductionReconciliationView | None = None
@@ -503,6 +507,36 @@ class BatchItemDetail(BaseModel):
     extraction_progress: dict[str, Any] | None = None
     reconciliation: ProductionReconciliationView | None = None
     activity: ProductionActivityView | None = None
+    routing: "ProductionRoutingView"
+
+
+class ProductionRoutingSourceView(BaseModel):
+    source_id: str | None
+    source_url: str
+    failure_code: str
+    tier: str
+    criticality: str
+    criticality_reason: str
+    policy_version: str
+
+
+ProductionRoutingExtractionState = Literal[
+    "verified", "needs_review", "stale", "not_yet"
+]
+
+
+class ProductionRoutingView(BaseModel):
+    """The current persisted route and its verification inputs for one run."""
+
+    status: Literal["decided", "needs_review", "not_yet"]
+    publication_kind: PublicationKind | None
+    reason_code: RoutingReasonCode | None
+    policy_version: str | None
+    confirmed_ioc_count: int | None
+    contextual_ioc_count: int | None
+    ambiguous_ioc_count: int | None
+    extraction_verification_state: ProductionRoutingExtractionState
+    sources: list[ProductionRoutingSourceView] = Field(default_factory=list)
 
 
 class ProductionReconciliationView(BaseModel):
@@ -577,6 +611,7 @@ class ProductionSubject(BaseModel):
     can_start: bool
     blocking_reason: str | None = None
     activity: ProductionActivityView | None = None
+    routing: ProductionRoutingView
 
 
 class ProductionBoard(BaseModel):
@@ -1105,6 +1140,73 @@ def _run_view(run: ProductionRun, edition_id: UUID, *, job_id: UUID | None) -> d
     }
 
 
+def _not_yet_production_routing_view(
+    extraction_state: ProductionRoutingExtractionState = "not_yet",
+) -> ProductionRoutingView:
+    return ProductionRoutingView(
+        status="not_yet",
+        publication_kind=None,
+        reason_code=None,
+        policy_version=None,
+        confirmed_ioc_count=None,
+        contextual_ioc_count=None,
+        ambiguous_ioc_count=None,
+        extraction_verification_state=extraction_state,
+    )
+
+
+async def _production_routing_view(uow: Any, run: ProductionRun) -> ProductionRoutingView:
+    """Project only the routing decision currently adopted by this run."""
+    extraction_artifact = await uow.production_artifacts.get_current(
+        run.id, ProductionArtifactStage.EXTRACTION.value
+    )
+    if extraction_artifact is None:
+        extraction_state: ProductionRoutingExtractionState = "not_yet"
+    elif extraction_artifact.status is ProductionArtifactStatus.VERIFIED:
+        extraction_state = "verified"
+    elif extraction_artifact.status is ProductionArtifactStatus.NEEDS_REVIEW:
+        extraction_state = "needs_review"
+    else:
+        extraction_state = "stale"
+
+    decision = None
+    if run.routing_decision_id is not None:
+        repository = getattr(uow, "production_routing_decisions", None)
+        get_decision = getattr(repository, "get", None)
+        if callable(get_decision):
+            decision = await get_decision(run.routing_decision_id)
+
+    if decision is None:
+        return _not_yet_production_routing_view(extraction_state)
+
+    return ProductionRoutingView(
+        status=(
+            "decided"
+            if decision.status is RoutingStatus.DECIDED
+            else "needs_review"
+        ),
+        publication_kind=decision.publication_kind,
+        reason_code=decision.reason_code,
+        policy_version=decision.policy_version,
+        confirmed_ioc_count=decision.confirmed_ioc_count,
+        contextual_ioc_count=decision.contextual_ioc_count,
+        ambiguous_ioc_count=decision.ambiguous_ioc_count,
+        extraction_verification_state=extraction_state,
+        sources=[
+            ProductionRoutingSourceView(
+                source_id=diagnostic.source_id,
+                source_url=diagnostic.source_url,
+                failure_code=diagnostic.failure_code,
+                tier=diagnostic.tier,
+                criticality=diagnostic.criticality.value,
+                criticality_reason=diagnostic.criticality_reason,
+                policy_version=diagnostic.policy_version,
+            )
+            for diagnostic in decision.critical_source_diagnostics
+        ],
+    )
+
+
 def reconciliation_view(
     run_id: UUID,
     reconciliation: ProductionSubmissionReconciliation | None,
@@ -1189,6 +1291,11 @@ async def _batch_status_view(
                     )
                 ),
                 activity=(activity_by_subject or {}).get(item.subject_id),
+                routing=(
+                    await _production_routing_view(uow, run)
+                    if (run := await uow.production_runs.get(item.run_id)) is not None
+                    else _not_yet_production_routing_view()
+                ),
             )
         )
     reactivated_by_retry = (
@@ -2094,6 +2201,7 @@ async def get_subject_production(
             recovery_disposition=ProductionRecoveryPolicyV1.disposition_for_run(run),
             extraction_progress=run.extraction_progress,
             extraction_rejections=_extraction_rejections(extraction_artifact),
+            routing=await _production_routing_view(uow, run),
             reconciliation=(
                 reconciliation_view(
                     run.id,
@@ -2111,7 +2219,7 @@ async def get_subject_production(
         )
 
 
-def _production_run_summary(run: ProductionRun) -> dict[str, Any]:
+async def _production_run_summary(uow: Any, run: ProductionRun) -> dict[str, Any]:
     summary = ProductionRunSummary(
         run_id=run.id,
         edition_id=run.edition_id,
@@ -2141,6 +2249,7 @@ def _production_run_summary(run: ProductionRun) -> dict[str, Any]:
         "finished_at": summary.finished_at.isoformat() if summary.finished_at else None,
         "error_code": summary.error_code,
         "error_message": summary.error_message,
+        "routing": await _production_routing_view(uow, run),
     }
 
 
@@ -2152,7 +2261,7 @@ async def get_production_run(run_id: UUID, request: Request) -> dict[str, Any]:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Production run not found"
             )
-        return _production_run_summary(run)
+        return await _production_run_summary(uow, run)
 
 
 @router.get("/subjects/{subject_id}/production/runs")
@@ -2169,7 +2278,7 @@ async def list_production_runs_for_subject(
             key=lambda run: run.run_number,
             reverse=True,
         )
-        return [_production_run_summary(run) for run in runs]
+        return [await _production_run_summary(uow, run) for run in runs]
 
 
 @router.get("/subjects/{subject_id}/investigation")
@@ -3701,6 +3810,11 @@ async def get_edition_production(
                     activity=activity_by_subject.get(subject.id)
                     or ProductionActivityView(
                         kind="idle", stage=latest.current_stage if latest else None
+                    ),
+                    routing=(
+                        await _production_routing_view(uow, latest)
+                        if latest is not None
+                        else _not_yet_production_routing_view()
                     ),
                 )
             )

@@ -63,6 +63,8 @@ from cti_app.domain.production_pipeline import (
     downstream_artifacts_from_artifact_stage,
     downstream_artifacts_from_pipeline_stage,
 )
+from cti_app.domain.production_routing import RoutingReasonCode, RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.integrations.models import BridgeTransportError
 from cti_app.logging import CorrelationIdMiddleware
@@ -483,6 +485,14 @@ class _Artifacts:
         return affected_values
 
 
+class _RoutingDecisions:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Any] = {}
+
+    async def get(self, decision_id: UUID) -> Any | None:
+        return self.items.get(decision_id)
+
+
 class _SourceCollections:
     async def list_for_subject(self, subject_id: UUID) -> Sequence[SimpleNamespace]:
         del subject_id
@@ -555,6 +565,7 @@ class _Uow:
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.production_artifacts = _Artifacts()
+        self.production_routing_decisions = _RoutingDecisions()
         self.edition_audit = _Audit()
         self.batch_status_read_model = _BatchStatusReadModel(self)
         self.source_collections = _SourceCollections()
@@ -1383,6 +1394,93 @@ async def test_subject_and_batch_status_expose_extraction_progress(
     assert (
         batch_response.json()["active_batch"]["item_details"][0]["extraction_progress"] == progress
     )
+
+
+async def test_routing_projection_is_additive_and_uses_the_run_decision_pointer(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Format must not come from this title", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
+    assert started.status_code == 200, started.text
+    run = next(iter(uow.production_runs.items.values()))
+
+    not_yet = started.json()["item_details"][0]["routing"]
+    assert not_yet["status"] == "not_yet"
+    assert not_yet["publication_kind"] is None
+    assert not_yet["confirmed_ioc_count"] is None
+    assert not_yet["extraction_verification_state"] == "not_yet"
+
+    decision_id = uuid4()
+    run.routing_decision_id = decision_id
+    uow.production_routing_decisions.items[decision_id] = SimpleNamespace(
+        status=RoutingStatus.DECIDED,
+        publication_kind=PublicationKind.BRIEF,
+        reason_code=RoutingReasonCode.NO_SUBJECT_IOC,
+        policy_version="subject-publication-routing-test-v1",
+        confirmed_ioc_count=0,
+        contextual_ioc_count=2,
+        ambiguous_ioc_count=1,
+        critical_source_diagnostics=(
+            SimpleNamespace(
+                source_id="source-1",
+                source_url="https://source.example/brief",
+                failure_code="source_not_represented",
+                tier="core",
+                criticality=SimpleNamespace(value="critical"),
+                criticality_reason="source_required",
+                policy_version="source-criticality-test-v1",
+            ),
+        ),
+    )
+    await uow.production_artifacts.append(
+        ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=1,
+            input_hash="a" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+        )
+    )
+
+    subject_response = await api.get(f"/api/subjects/{subject_id}/production")
+    board_response = await api.get(f"/api/editions/{edition_id}/production")
+    history_response = await api.get(f"/api/subjects/{subject_id}/production/runs")
+    run_response = await api.get(f"/api/production/runs/{run.id}")
+
+    assert subject_response.status_code == 200, subject_response.text
+    assert board_response.status_code == 200, board_response.text
+    assert history_response.status_code == 200, history_response.text
+    assert run_response.status_code == 200, run_response.text
+    projections = [
+        subject_response.json()["routing"],
+        board_response.json()["subjects"][0]["routing"],
+        board_response.json()["active_batch"]["item_details"][0]["routing"],
+        history_response.json()[0]["routing"],
+        run_response.json()["routing"],
+    ]
+    for projection in projections:
+        assert projection["status"] == "decided"
+        assert projection["publication_kind"] == "brief"
+        assert projection["reason_code"] == "no_subject_ioc"
+        assert projection["policy_version"] == "subject-publication-routing-test-v1"
+        assert projection["confirmed_ioc_count"] == 0
+        assert projection["contextual_ioc_count"] == 2
+        assert projection["ambiguous_ioc_count"] == 1
+        assert projection["extraction_verification_state"] == "verified"
+        assert projection["sources"][0]["source_url"] == "https://source.example/brief"
+
+    decision = uow.production_routing_decisions.items[decision_id]
+    decision.status = RoutingStatus.NEEDS_REVIEW
+    decision.publication_kind = None
+    decision.reason_code = RoutingReasonCode.INCOMPLETE_EXTRACTION
+    review_response = await api.get(f"/api/production/runs/{run.id}")
+    assert review_response.status_code == 200, review_response.text
+    review_projection = review_response.json()["routing"]
+    assert review_projection["status"] == "needs_review"
+    assert review_projection["publication_kind"] is None
+    assert review_projection["reason_code"] == "incomplete_extraction"
 
 
 async def test_subject_status_exposes_extraction_rejections_with_a_200_entry_limit(
