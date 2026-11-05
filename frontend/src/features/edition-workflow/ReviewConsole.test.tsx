@@ -60,6 +60,22 @@ function editionPreview(stale = false): EditionPreviewResponse {
         input_hash: HASH,
       },
     ],
+    classifications: [
+      {
+        position: 1,
+        subject_id: "subject-1",
+        kind: "article",
+        number: "01",
+        anchor: "article01",
+      },
+      {
+        position: 2,
+        subject_id: "subject-2",
+        kind: "article",
+        number: "02",
+        anchor: "article02",
+      },
+    ],
     document: {
       schema_version: "2",
       edition: {
