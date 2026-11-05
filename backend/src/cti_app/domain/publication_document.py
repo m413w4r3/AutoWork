@@ -83,6 +83,7 @@ from cti_app.domain.publication import (
     PublicationUncertaintyV1,
     indicator_source_ids,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.rule_workbench import RuleValidationStatus
 from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
@@ -93,6 +94,7 @@ from cti_app.domain.semantic_annotation import (
 PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION = "4"
 PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
 PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION = "6"
+PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION = "7"
 _PUBLICATION_SOURCE_REQUIRED_FIELDS = frozenset(
     {
         "source_document_id",
@@ -2210,6 +2212,76 @@ class PublicationDocumentV6:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV7:
+    """Publication routing metadata around the exact immutable V6 document."""
+
+    base_publication: PublicationDocumentV6
+    publication_kind: PublicationKind
+    routing_decision_hash: str
+    routing_policy_version: str
+
+    @property
+    def schema_version(self) -> str:
+        return PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_publication, name)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_publication, PublicationDocumentV6):
+            raise ValueError("PublicationDocumentV7 requires a validated V6 base document")
+        if not isinstance(self.publication_kind, PublicationKind):
+            raise ValueError("PublicationDocumentV7 requires an explicit publication kind")
+        validate_sha256(self.routing_decision_hash, "V7 routing decision SHA-256")
+        validate_text(self.routing_policy_version, "V7 routing policy version", semantic=True)
+
+    def _to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "base_publication": self.base_publication._to_json(),
+            "publication_kind": self.publication_kind.value,
+            "routing_decision_hash": self.routing_decision_hash,
+            "routing_policy_version": self.routing_policy_version,
+        }
+
+    @classmethod
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV7:
+        document = json_object(
+            payload,
+            frozenset(
+                {
+                    "schema_version",
+                    "base_publication",
+                    "publication_kind",
+                    "routing_decision_hash",
+                    "routing_policy_version",
+                }
+            ),
+            "PublicationDocumentV7",
+        )
+        if document["schema_version"] != PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION:
+            raise ValueError("PublicationDocumentV7 schema version is unsupported")
+        raw_base = document["base_publication"]
+        if (
+            not isinstance(raw_base, Mapping)
+            or raw_base.get("schema_version") != PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION
+        ):
+            raise ValueError("PublicationDocumentV7 base must be a V6 publication")
+        return cls(
+            base_publication=publication_document_v6_from_json(raw_base),
+            publication_kind=json_enum(
+                PublicationKind, document["publication_kind"], "V7 publication kind"
+            ),
+            routing_decision_hash=json_sha256(
+                document["routing_decision_hash"], "V7 routing decision SHA-256"
+            ),
+            routing_policy_version=json_text(
+                document["routing_policy_version"], "V7 routing policy version"
+            ),
+        )
+
+
 _OPINION_BLOCK_ORDER = {item: index for index, item in enumerate(OpinionBlockType)}
 _OPINION_BLOCK_HEADINGS = {
     OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
@@ -2497,7 +2569,7 @@ def _rendered_opinion_from_json(raw: Any) -> PublicationAnalystOpinionSectionV1:
 
 
 type CanonicalPublicationDocument = (
-    PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6
+    PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6 | PublicationDocumentV7
 )
 
 
@@ -2525,6 +2597,16 @@ def publication_document_v6_from_json(payload: Mapping[str, Any]) -> Publication
     return PublicationDocumentV6._from_json(payload)
 
 
+def publication_document_v7_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV7:
+    return PublicationDocumentV7._from_json(payload)
+
+
+def publication_document_v7_to_json(document: PublicationDocumentV7) -> dict[str, Any]:
+    if not isinstance(document, PublicationDocumentV7):
+        raise ValueError("Expected a PublicationDocumentV7")
+    return document._to_json()
+
+
 def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
     version = payload.get("schema_version")
     if version == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
@@ -2533,6 +2615,8 @@ def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPubli
         return publication_document_v5_from_json(payload)
     if version == PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION:
         return publication_document_v6_from_json(payload)
+    if version == PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION:
+        return publication_document_v7_from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={version!r}")
 
 
@@ -2540,11 +2624,20 @@ def validate_publication_document(
     value: Mapping[str, Any] | CanonicalPublicationDocument,
 ) -> CanonicalPublicationDocument:
     """Validate one parsed model or canonical JSON payload."""
-    if isinstance(value, (PublicationDocumentV4, PublicationDocumentV5, PublicationDocumentV6)):
+    if isinstance(
+        value,
+        (
+            PublicationDocumentV4,
+            PublicationDocumentV5,
+            PublicationDocumentV6,
+            PublicationDocumentV7,
+        ),
+    ):
         if value.schema_version not in {
             PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
         }:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
@@ -2567,6 +2660,8 @@ def serialize_publication_document(
     validated = validate_publication_document(document)
     if isinstance(validated, PublicationDocumentV6):
         return validated._to_json()
+    if isinstance(validated, PublicationDocumentV7):
+        return validated._to_json()
     if isinstance(validated, PublicationDocumentV5):
         return publication_document_v5_to_json(validated)
     return publication_document_v4_to_json(validated)
@@ -2576,6 +2671,7 @@ __all__ = [
     "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION",
+    "PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION",
     "CanonicalPublicationDocument",
     "PublicationAnalystOpinionBlockV1",
     "PublicationAnalystOpinionSectionV1",
@@ -2588,6 +2684,7 @@ __all__ = [
     "PublicationDocumentV6ErrorCode",
     "PublicationDocumentV6ProvenanceV1",
     "PublicationDocumentV6ValidationError",
+    "PublicationDocumentV7",
     "PublicationSourceFigureV1",
     "PublicationTableColumnV1",
     "PublicationTableRowV1",
@@ -2602,6 +2699,8 @@ __all__ = [
     "publication_document_v5_sha256",
     "publication_document_v5_to_json",
     "publication_document_v6_from_json",
+    "publication_document_v7_from_json",
+    "publication_document_v7_to_json",
     "serialize_publication_document",
     "validate_publication_document",
 ]

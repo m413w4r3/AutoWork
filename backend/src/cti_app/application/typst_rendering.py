@@ -64,6 +64,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
     PublicationDocumentV6,
+    PublicationDocumentV7,
     PublicationIOCDisposition,
     PublicationSourceFigureV1,
     PublicationTableV1,
@@ -306,7 +307,14 @@ def publication_content_section_types(
 ) -> tuple[str, ...]:
     """Return the ordered sections projected from canonical publication data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
-    publication_v6 = value if isinstance(value, PublicationDocumentV6) else None
+    publication_v7 = value if isinstance(value, PublicationDocumentV7) else None
+    publication_v6 = (
+        publication_v7.base_publication
+        if publication_v7 is not None
+        else value
+        if isinstance(value, PublicationDocumentV6)
+        else None
+    )
     publication_v5 = (
         publication_v6.base_publication
         if publication_v6 is not None
@@ -1024,6 +1032,8 @@ def _publication_document_header(
 ) -> str:
     if isinstance(document, TypstDraftPreviewDocument):
         return f"Avis — aperçu non approuvé v{document.analyst_opinion.version}"
+    if isinstance(document, PublicationDocumentV7):
+        document = document.base_publication
     if isinstance(document, PublicationDocumentV6) and document.analyst_opinion is not None:
         return f"Avis — publication approuvée v{document.analyst_opinion.version}"
     return "Publication"
@@ -1126,7 +1136,14 @@ def project_publication_to_typst_model(
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
-    publication_v6 = value if isinstance(value, PublicationDocumentV6) else None
+    publication_v7 = value if isinstance(value, PublicationDocumentV7) else None
+    publication_v6 = (
+        publication_v7.base_publication
+        if publication_v7 is not None
+        else value
+        if isinstance(value, PublicationDocumentV6)
+        else None
+    )
     publication_v5 = (
         publication_v6.base_publication
         if publication_v6 is not None

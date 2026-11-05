@@ -3,10 +3,12 @@ from dataclasses import replace
 from datetime import date
 from inspect import signature
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import pytest
 
+from cti_app.application.brief_publication_builder import wrap_publication_document_v7
 from cti_app.application.diagram_compilation import (
     DIAGRAM_COMPILATION_POLICY_VERSION,
     CompiledDiagram,
@@ -14,20 +16,23 @@ from cti_app.application.diagram_compilation import (
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
     _EditorialEnrichmentRebuildRequired,
 )
 from cti_app.application.production_synthesis import canonical_extraction_hash
-from cti_app.application.publication_assembly import PublicationAssemblyService
+from cti_app.application.publication_assembly import (
+    PublicationAssemblyResult,
+    PublicationAssemblyService,
+)
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
     build_publication_document_v4,
     build_publication_document_v5,
-    compute_assembly_input_hash,
 )
-from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v5
+from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v7
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -95,9 +100,11 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import ArtifactType, PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
+    PublicationDocumentV7,
     parse_publication_document,
     serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 
@@ -280,6 +287,22 @@ def _service() -> tuple[PublicationAssemblyService, _MemoryBlobCatalog, _Recordi
     return service, catalog, artifacts
 
 
+async def _assemble(
+    service: PublicationAssemblyService,
+    *,
+    publication_kind: PublicationKind = PublicationKind.ARTICLE,
+    routing_decision_hash: str = "a" * 64,
+    routing_policy_version: str = "routing-policy-v1",
+    **kwargs: Any,
+) -> PublicationAssemblyResult:
+    return await service.assemble_publication(
+        publication_kind=publication_kind,
+        routing_decision_hash=routing_decision_hash,
+        routing_policy_version=routing_policy_version,
+        **kwargs,
+    )
+
+
 def _run(snapshot: ProductionInputSnapshot) -> ProductionRun:
     return ProductionRun(
         subject_id=snapshot.subject_id,
@@ -399,7 +422,8 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
         diagrams=(diagram,),
     )
 
-    assembly = await service.assemble_publication(
+    assembly = await _assemble(
+        service,
         run=run,
         snapshot=snapshot,
         references=references,
@@ -426,9 +450,10 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
         "snapshot": snapshot,
         "references": references,
         "extraction": extraction,
+        "relevance_projection": None,
         "synthesis": synthesis,
     }
-    stale_qa = qa_publication_v5(
+    stale_qa = qa_publication_v7(
         **qa_inputs,
         editorial_enrichment=enrichment,
         publication=stored_document,
@@ -438,7 +463,7 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
     assert all(value for key, value in stale_qa["checks"].items() if key != "exact_projection")
     assert stale_qa["errors"] == ["Publication differs from canonical Assembly projection"]
 
-    refreshed_qa = qa_publication_v5(
+    refreshed_qa = qa_publication_v7(
         **qa_inputs,
         editorial_enrichment=assembly.editorial_enrichment,
         publication=stored_document,
@@ -448,7 +473,7 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
 
 
 @pytest.mark.asyncio
-async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() -> None:
+async def test_assembly_persists_exact_v7_body_and_one_publication_artifact() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     run = _run(snapshot)
     service, catalog, artifacts = _service()
@@ -461,7 +486,8 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
         editorial_enrichment=enrichment,
     )
 
-    artifact, _ = await service.assemble_publication(
+    artifact, _ = await _assemble(
+        service,
         run=run,
         snapshot=snapshot,
         references=references,
@@ -470,8 +496,15 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
         editorial_enrichment=enrichment,
     )
 
+    expected_document = wrap_publication_document_v7(
+        document,
+        base_publication_artifact_id=artifact.id,
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
     expected_bytes = ProductionArtifactStore.canonical_json_bytes(
-        serialize_publication_document(document)
+        serialize_publication_document(expected_document)
     )
     assert catalog.writes == [
         (expected_bytes, "production-artifacts-canonical", "application/json")
@@ -482,12 +515,16 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
     assert artifact.version == 1
     assert artifact.production_run_id == run.id
     assert artifact.subject_id == run.subject_id
-    assert artifact.input_hash == compute_assembly_input_hash(
+    assert artifact.input_hash == service._assembly_input_hash(
+        publication_kind=PublicationKind.ARTICLE,
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
         editorial_enrichment=enrichment,
+        relevance_projection=None,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
     )
     assert artifact.canonical_blob_id == UUID(int=50)
     assert artifact.raw_blob_id is None
@@ -495,25 +532,14 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
     assert artifact.metadata == {
         "diagnostics": _expected_diagnostics(references, extraction, synthesis, enrichment)
     }
-    document_json = serialize_publication_document(document)
-    assert document_json["schema_version"] == "5"
+    document_json = serialize_publication_document(expected_document)
+    assert document_json["schema_version"] == "7"
     assert set(document_json) == {
         "schema_version",
-        "subject_id",
-        "publication_language",
-        "title",
-        "lead",
-        "sections",
-        "timeline",
-        "indicators",
-        "sources",
-        "uncertainties",
-        "tables",
-        "diagrams",
-        "figures",
-        "references",
-        "original_indicators",
-        "rich_text",
+        "base_publication",
+        "publication_kind",
+        "routing_decision_hash",
+        "routing_policy_version",
     }
 
 
@@ -525,7 +551,8 @@ async def test_assembly_persists_editorial_enrichment_in_the_canonical_body() ->
     service, catalog, _artifacts = _service()
     store = ProductionArtifactStore(catalog)
 
-    artifact, _ = await service.assemble_publication(
+    artifact, _ = await _assemble(
+        service,
         run=_run(snapshot),
         snapshot=snapshot,
         references=references,
@@ -539,6 +566,53 @@ async def test_assembly_persists_editorial_enrichment_in_the_canonical_body() ->
     document = parse_publication_document(await store.read_json(artifact.canonical_blob_id))
     assert document.tables[0].key == "observations"
     assert document.tables[0].rows[0].cells == ("Observed", "Reported by the source")
+
+
+@pytest.mark.asyncio
+async def test_brief_assembly_persists_v7_without_editorial_enrichment() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    relevance = build_relevance_projection(snapshot, extraction)
+    service, catalog, artifacts = _service()
+
+    result = await _assemble(
+        service,
+        run=_run(snapshot),
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        relevance_projection=relevance,
+        editorial_enrichment=None,
+        publication_kind=PublicationKind.BRIEF,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+
+    assert result.editorial_enrichment is None
+    assert len(artifacts.appended) == 1
+    assert artifacts.appended[0].stage is ProductionArtifactStage.PUBLICATION
+    assert result.artifact.canonical_blob_id is not None
+    publication = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(result.artifact.canonical_blob_id)
+    )
+    assert isinstance(publication, PublicationDocumentV7)
+    assert publication.publication_kind is PublicationKind.BRIEF
+    assert publication.indicators == ()
+    assert (
+        "editorial_enrichment" not in result.artifact.metadata["diagnostics"]["warnings_by_stage"]
+    )
+    assert (
+        qa_publication_v7(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            relevance_projection=relevance,
+            synthesis=synthesis,
+            editorial_enrichment=None,
+            publication=publication,
+        )["passed"]
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -556,8 +630,8 @@ async def test_identical_inputs_in_the_same_run_return_the_current_publication()
         ),
     }
 
-    first, _ = await service.assemble_publication(**inputs)
-    second, _ = await service.assemble_publication(**inputs)
+    first, _ = await _assemble(service, **inputs)
+    second, _ = await _assemble(service, **inputs)
 
     assert second is first
     assert len(catalog.writes) == 1
@@ -570,7 +644,8 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
     service, catalog, artifacts = _service()
     source_run = _run(snapshot)
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
-    source, _ = await service.assemble_publication(
+    source, _ = await _assemble(
+        service,
         run=source_run,
         snapshot=snapshot,
         references=references,
@@ -582,7 +657,8 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
     target_snapshot = replace(snapshot, production_run_id=UUID(int=30))
     target_run = _run(target_snapshot)
 
-    reused, _ = await service.assemble_publication(
+    reused, _ = await _assemble(
+        service,
         run=target_run,
         snapshot=target_snapshot,
         references=references,
@@ -629,7 +705,8 @@ async def test_publication_warnings_are_artifact_diagnostics_not_document_conten
     service, catalog, _artifacts = _service()
     store = ProductionArtifactStore(catalog)
 
-    artifact, _ = await service.assemble_publication(
+    artifact, _ = await _assemble(
+        service,
         run=_run(snapshot),
         snapshot=snapshot,
         references=references,
@@ -651,7 +728,8 @@ async def test_unreadable_reuse_candidate_falls_back_to_fresh_persistence() -> N
     snapshot, references, extraction, synthesis = _canonical_inputs()
     service, catalog, artifacts = _service()
     source_run = _run(snapshot)
-    source, _ = await service.assemble_publication(
+    source, _ = await _assemble(
+        service,
         run=source_run,
         snapshot=snapshot,
         references=references,
@@ -665,7 +743,8 @@ async def test_unreadable_reuse_candidate_falls_back_to_fresh_persistence() -> N
     catalog.blobs.clear()
     target_snapshot = replace(snapshot, production_run_id=UUID(int=30))
 
-    fresh, _ = await service.assemble_publication(
+    fresh, _ = await _assemble(
+        service,
         run=_run(target_snapshot),
         snapshot=target_snapshot,
         references=references,
@@ -687,7 +766,8 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
     service, catalog, artifacts = _service()
     run = _run(snapshot)
     artifacts.terminal_runs[run.id] = run.edition_id
-    first, _ = await service.assemble_publication(
+    first, _ = await _assemble(
+        service,
         run=run,
         snapshot=snapshot,
         references=references,
@@ -699,7 +779,8 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
     )
     changed_synthesis = replace(synthesis, title="[Example actor] Revised synthesis")
 
-    second, _ = await service.assemble_publication(
+    second, _ = await _assemble(
+        service,
         run=run,
         snapshot=snapshot,
         references=references,
@@ -720,13 +801,20 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
         synthesis=changed_synthesis,
         editorial_enrichment=changed_enrichment,
     )
+    expected_v7 = wrap_publication_document_v7(
+        expected,
+        base_publication_artifact_id=second.id,
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
     assert (first.version, second.version) == (1, 2)
     assert second.input_hash != first.input_hash
     assert second.reused_from_artifact_id is None
     assert second.canonical_blob_id != first.canonical_blob_id
     assert len(catalog.writes) == 2
     assert catalog.writes[1][0] == ProductionArtifactStore.canonical_json_bytes(
-        serialize_publication_document(expected)
+        serialize_publication_document(expected_v7)
     )
     assert artifacts.appended == [first, second]
 
@@ -880,7 +968,8 @@ async def test_publication_v5_review_projection_retains_figure_provenance_and_or
     assert published_figure["provenance"] == "Archived figure from the primary source, page 2"
 
     service, _catalog, _artifacts = _service()
-    artifact, _ = await service.assemble_publication(
+    artifact, _ = await _assemble(
+        service,
         run=_run(snapshot),
         snapshot=snapshot,
         references=references,
@@ -957,7 +1046,8 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_public
         1,
         editorial_enrichment_to_json(enrichment_a),
     )
-    publication_a, _ = await service.assemble_publication(
+    publication_a, _ = await _assemble(
+        service,
         run=run,
         snapshot=snapshot,
         references=references,
@@ -1164,7 +1254,8 @@ async def test_invalid_lineage_fails_before_body_or_artifact_persistence(
 
     service, catalog, artifacts = _service()
     with pytest.raises(PublicationAssemblyValidationError) as failure:
-        await service.assemble_publication(
+        await _assemble(
+            service,
             run=run,
             snapshot=snapshot,
             references=references,

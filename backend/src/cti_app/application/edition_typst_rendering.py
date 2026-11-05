@@ -29,6 +29,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
     PublicationDocumentV6,
+    PublicationDocumentV7,
 )
 
 _EDITION_RENDER_DATA_SCHEMA_VERSION = (
@@ -122,7 +123,12 @@ class EditionTypstRenderer:
         if any(
             not isinstance(
                 publication.document,
-                (PublicationDocumentV4, PublicationDocumentV5, PublicationDocumentV6),
+                (
+                    PublicationDocumentV4,
+                    PublicationDocumentV5,
+                    PublicationDocumentV6,
+                    PublicationDocumentV7,
+                ),
             )
             for publication in document.publications
         ):

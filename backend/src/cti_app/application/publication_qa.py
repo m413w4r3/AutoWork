@@ -7,6 +7,7 @@ import unicodedata
 from enum import StrEnum
 from typing import Any
 
+from cti_app.application.brief_publication_builder import build_brief_publication_document_v5
 from cti_app.application.publication_builder import (
     build_publication_document_v4,
     build_publication_document_v5,
@@ -33,8 +34,10 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV6ValidationError,
+    PublicationDocumentV7,
     serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
     exact_word_occurrences,
     semantic_policy_requires_full_occurrence_coverage,
@@ -65,6 +68,11 @@ _PIPELINE_VOCABULARY_TERMS = (
 
 
 class PublicationQaErrorCode(StrEnum):
+    DOCUMENT_NOT_V7 = "publication_qa_document_not_v7"
+    KIND_INPUTS_INVALID = "publication_qa_kind_inputs_invalid"
+    EDITORIAL_ENRICHMENT_FORBIDDEN = "publication_qa_editorial_enrichment_forbidden"
+    BRIEF_PROJECTION_MISMATCH = "publication_qa_brief_projection_mismatch"
+    BRIEF_CONTENT_INVALID = "publication_qa_brief_content_invalid"
     DOCUMENT_NOT_V6 = "publication_qa_document_not_v6"
     V6_INVARIANT_INVALID = "publication_qa_v6_invariant_invalid"
     BASE_PROJECTION_MISMATCH = "publication_qa_v6_base_projection_mismatch"
@@ -479,6 +487,243 @@ def qa_publication_v6(**kwargs: Any) -> dict[str, Any]:
     return result
 
 
+_BRIEF_PLACEHOLDER_MARKER = re.compile(
+    r"\b(?:TODO|TBD|PLACEHOLDER|Lorem\s+ipsum|insert\s+(?:text|here))\b",
+    re.IGNORECASE,
+)
+
+
+def qa_publication_v7(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    relevance_projection: RelevanceProjectionV1 | None,
+    synthesis: ProductionSynthesisV1,
+    editorial_enrichment: EditorialEnrichmentV1 | None,
+    publication: CanonicalPublicationDocument,
+) -> dict[str, Any]:
+    """Apply input requirements selected by the explicit V7 publication kind."""
+    if not isinstance(publication, PublicationDocumentV7):
+        raise PublicationQaValidationError(PublicationQaErrorCode.DOCUMENT_NOT_V7)
+
+    if publication.publication_kind is PublicationKind.ARTICLE:
+        if editorial_enrichment is None:
+            return {
+                "passed": False,
+                "checks": {"required_editorial_enrichment": False},
+                "errors": ["Article publication requires editorial enrichment"],
+                "warnings": [],
+                "error_codes": [PublicationQaErrorCode.KIND_INPUTS_INVALID.value],
+            }
+        result = qa_publication_v6(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            relevance_projection=relevance_projection,
+            synthesis=synthesis,
+            editorial_enrichment=editorial_enrichment,
+            publication=publication.base_publication,
+        )
+        result["checks"]["publication_kind_explicit"] = True
+        result["checks"]["routing_metadata_valid"] = bool(
+            publication.routing_decision_hash and publication.routing_policy_version
+        )
+        return result
+
+    if editorial_enrichment is not None:
+        return {
+            "passed": False,
+            "checks": {"editorial_enrichment_absent": False},
+            "errors": ["Brief publication must not claim editorial enrichment"],
+            "warnings": [],
+            "error_codes": [PublicationQaErrorCode.EDITORIAL_ENRICHMENT_FORBIDDEN.value],
+        }
+    if relevance_projection is None:
+        return {
+            "passed": False,
+            "checks": {"required_relevance_projection": False},
+            "errors": ["Brief publication requires a relevance projection"],
+            "warnings": [],
+            "error_codes": [PublicationQaErrorCode.KIND_INPUTS_INVALID.value],
+        }
+
+    base = publication.base_publication.base_publication
+    checks: dict[str, bool] = {
+        "publication_kind_explicit": publication.publication_kind is PublicationKind.BRIEF,
+        "routing_metadata_valid": bool(
+            publication.routing_decision_hash and publication.routing_policy_version
+        ),
+        "subject_lineage": publication.subject_id == snapshot.subject_id,
+        "publication_language": publication.publication_language == snapshot.publication_language,
+        "title_format": is_valid_editorial_title(base.title),
+    }
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not checks["subject_lineage"]:
+        errors.append("Publication subject differs from the frozen snapshot")
+    if not checks["publication_language"]:
+        errors.append("Publication language differs from the frozen snapshot")
+    if not checks["title_format"]:
+        errors.append("Publication title does not match the [Groupe] Titre format")
+
+    try:
+        expected = build_brief_publication_document_v5(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            relevance_projection=relevance_projection,
+            synthesis=synthesis,
+        )
+    except ValueError as exc:
+        checks["canonical_inputs_valid"] = False
+        errors.append(str(exc))
+    else:
+        checks["canonical_inputs_valid"] = True
+        checks["exact_projection"] = serialize_publication_document(base) == (
+            serialize_publication_document(expected)
+        )
+        if not checks["exact_projection"]:
+            errors.append("Brief differs from its canonical references, relevance, and synthesis")
+
+    document = base.document
+    normalized_headings = {
+        " ".join(section.heading.casefold().replace("\u2019", "'").split())
+        for section in document.sections
+    }
+    checks["no_overview_section"] = not normalized_headings.intersection(
+        {"vue d'ensemble", "overview"}
+    )
+    checks["no_empty_sections"] = all(
+        section.paragraphs and all(paragraph.text.strip() for paragraph in section.paragraphs)
+        for section in document.sections
+    )
+    checks["empty_indicators_valid"] = (
+        not document.indicators and not base.original_indicators and not base.ioc_details
+    )
+    checks["no_article_augmentation"] = (
+        publication.base_publication.analyst_opinion is None
+        and publication.base_publication.detection is None
+        and publication.base_publication.infrastructure_graph is None
+    )
+    checks["dated_sourced_timeline"] = all(
+        entry.event_date is not None
+        and entry.evidence_refs
+        and all(
+            ref.source_document_id in {source.source_document_id for source in document.sources}
+            for ref in entry.evidence_refs
+        )
+        for entry in document.timeline
+    )
+    if not checks["no_overview_section"]:
+        errors.append("Brief must not contain a Vue d'ensemble section")
+    if not checks["no_empty_sections"]:
+        errors.append("Brief must not contain empty synthesis sections")
+    if not checks["empty_indicators_valid"]:
+        errors.append("Brief must not contain an IOC annex")
+    if not checks["no_article_augmentation"]:
+        errors.append("Brief must not contain article-only analyst augmentation")
+    if not checks["dated_sourced_timeline"]:
+        errors.append("Brief timeline entries must have a sourced explicit date")
+
+    editorial_text = (
+        document.title,
+        *(paragraph.text for paragraph in document.lead),
+        *(section.heading for section in document.sections),
+        *(paragraph.text for section in document.sections for paragraph in section.paragraphs),
+        *(entry.text for entry in document.timeline),
+        *(item.text for item in base.references),
+    )
+    checks["no_placeholder_markers"] = not any(
+        _BRIEF_PLACEHOLDER_MARKER.search(text) for text in editorial_text
+    )
+    if not checks["no_placeholder_markers"]:
+        errors.append("Brief contains a placeholder marker")
+
+    checks["no_legacy_citation"] = not any(_LEGACY_CITATION.search(text) for text in editorial_text)
+    checks["no_diagnostic_code_leaks"] = not any(
+        _INTERNAL_DIAGNOSTIC.search(text) for text in editorial_text
+    )
+    checks["no_pipeline_vocabulary_leaks"] = not any(
+        _PIPELINE_VOCABULARY.search(_fold_accents(text)) for text in editorial_text
+    )
+    checks["no_uncertainty_list"] = not document.uncertainties
+    for key, error_text in (
+        ("no_legacy_citation", "Brief contains a legacy source marker"),
+        ("no_diagnostic_code_leaks", "Brief contains an internal diagnostic code"),
+        ("no_pipeline_vocabulary_leaks", "Brief contains internal production vocabulary"),
+        ("no_uncertainty_list", "Brief contains a separate uncertainty list"),
+    ):
+        if not checks[key]:
+            errors.append(error_text)
+
+    try:
+        render_model = project_publication_to_typst_model(publication)
+    except ValueError:
+        checks["brief_render_sections"] = False
+        errors.append("Brief cannot be projected into the publication renderer")
+    else:
+        content_types = tuple(section["type"] for section in render_model.content_sections)
+        expected_types = (
+            ("references", "chronology", "synthesis")
+            if document.timeline
+            else ("references", "synthesis")
+        )
+        checks["brief_render_sections"] = content_types == expected_types
+        checks["no_ioc_annex"] = not any(
+            section_type in {"ioc", "technical_annex"} for section_type in content_types
+        )
+        if not checks["brief_render_sections"]:
+            errors.append("Brief renderer sections are not references, chronology, and synthesis")
+        if not checks["no_ioc_annex"]:
+            errors.append("Brief renderer contains an IOC annex")
+        synthesis_section = next(
+            (item for item in render_model.content_sections if item["type"] == "synthesis"),
+            None,
+        )
+        lead_fingerprints = [" ".join(item.text.casefold().split()) for item in document.lead]
+        synthesis_paragraphs = (
+            [
+                " ".join(str(block["text"]).casefold().split())
+                for block in synthesis_section["blocks"]
+                if block["type"] == "paragraph"
+            ]
+            if synthesis_section is not None
+            else []
+        )
+        checks["lead_is_first_and_not_duplicated"] = synthesis_paragraphs[
+            : len(lead_fingerprints)
+        ] == lead_fingerprints and all(
+            synthesis_paragraphs.count(text) == 1 for text in lead_fingerprints
+        )
+        if not checks["lead_is_first_and_not_duplicated"]:
+            errors.append("Brief lead is not first in the synthesis")
+
+    try:
+        serialize_publication_document(publication)
+    except PublicationDocumentV6ValidationError:
+        checks["v6_invariants"] = False
+        errors.append("PublicationDocumentV7 V6 base invariants are invalid")
+    else:
+        checks["v6_invariants"] = True
+
+    errors_by_check = {key for key, passed in checks.items() if not passed}
+    result = {
+        "passed": not errors,
+        "checks": checks,
+        "errors": errors,
+        "warnings": warnings,
+        "error_codes": (
+            [PublicationQaErrorCode.BRIEF_PROJECTION_MISMATCH.value]
+            if "exact_projection" in errors_by_check
+            else [PublicationQaErrorCode.BRIEF_CONTENT_INVALID.value]
+            if errors
+            else []
+        ),
+    }
+    return result
+
+
 # Keep the old consumer name for frozen V4 documents. The validation function
 # selects the matching strict contract from the supplied canonical document.
 qa_publication_v4 = qa_publication_v5
@@ -495,10 +740,10 @@ class ProductionQAService:
         extraction: ProductionExtractionV1,
         relevance_projection: RelevanceProjectionV1 | None = None,
         synthesis: ProductionSynthesisV1,
-        editorial_enrichment: EditorialEnrichmentV1,
+        editorial_enrichment: EditorialEnrichmentV1 | None,
         publication: CanonicalPublicationDocument,
     ) -> dict[str, Any]:
-        return qa_publication_v5(
+        return qa_publication_v7(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
