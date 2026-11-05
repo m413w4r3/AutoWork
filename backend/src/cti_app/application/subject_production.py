@@ -41,10 +41,13 @@ from cti_app.domain.production import (
     source_role_rank,
 )
 from cti_app.domain.production_pipeline import (
+    downstream_artifacts_from_pipeline_stage,
     prerequisite_artifact_for,
     production_artifact_stages,
     production_stages,
 )
+from cti_app.domain.production_routing import RoutingStatus
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class ProductionRunNotFoundError(LookupError):
@@ -425,8 +428,21 @@ class SubjectProductionService:
             run = await uow.production_runs.get_for_update(run_id)
             if not run:
                 raise ValueError(f"Production run {run_id} not found")
-
-            run.advance_stage(now=datetime.now(UTC))
+            route = (
+                await uow.production_routing_decisions.get(run.routing_decision_id)
+                if run.routing_decision_id is not None
+                and getattr(uow, "production_routing_decisions", None) is not None
+                else None
+            )
+            publication_kind = (
+                route.publication_kind
+                if route is not None and route.status is RoutingStatus.DECIDED
+                else None
+            )
+            run.advance_stage(
+                publication_kind=publication_kind,
+                now=datetime.now(UTC),
+            )
             await uow.production_runs.save(run)
             await uow.commit()
             return run
@@ -552,10 +568,23 @@ class SubjectProductionService:
             if run.status is not ProductionRunStatus.CANCELLED:
                 raise ValueError("production_run_not_resumable")
 
+            route = (
+                await uow.production_routing_decisions.get(run.routing_decision_id)
+                if run.routing_decision_id is not None
+                and getattr(uow, "production_routing_decisions", None) is not None
+                else None
+            )
+            publication_kind = (
+                route.publication_kind
+                if route is not None and route.status is RoutingStatus.DECIDED
+                else None
+            )
+
             plan = plan_production_resume(
                 run,
                 artifacts=await self._current_artifacts(uow, run_id),
                 archived_source_count=await self._archived_source_count(uow, run.subject_id),
+                publication_kind=publication_kind,
             )
             old_generation = run.pipeline_generation
             run.resume_after_cancellation(plan.resume_from_stage, now=datetime.now(UTC))
@@ -733,7 +762,18 @@ class SubjectProductionService:
             raise ValueError("production_run_cancelled")
         if run.status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
             raise ValueError("retry_not_allowed_while_running")
-        if stage not in production_stages():
+        route = (
+            await uow.production_routing_decisions.get(run.routing_decision_id)
+            if run.routing_decision_id is not None
+            and getattr(uow, "production_routing_decisions", None) is not None
+            else None
+        )
+        publication_kind = (
+            route.publication_kind
+            if route is not None and route.status is RoutingStatus.DECIDED
+            else None
+        )
+        if stage not in production_stages(publication_kind):
             raise ValueError("retry_stage_not_in_pipeline")
         if stage is ProductionStage.REFERENCES:
             sources = await uow.source_collections.list_for_subject(run.subject_id)
@@ -746,7 +786,7 @@ class SubjectProductionService:
                     missing_artifact=None,
                     runnable_stage=ProductionStage.SOURCES,
                 )
-        prerequisite = prerequisite_artifact_for(stage)
+        prerequisite = prerequisite_artifact_for(stage, publication_kind=publication_kind)
         if prerequisite is not None:
             artifacts = getattr(uow, "production_artifacts", None)
             artifact = (
@@ -770,7 +810,9 @@ class SubjectProductionService:
                 raise RetryPrerequisiteMissingError(
                     requested_stage=stage,
                     missing_artifact=prerequisite.value,
-                    runnable_stage=resolve_retry_stage(live, current_stage=stage),
+                    runnable_stage=resolve_retry_stage(
+                        live, current_stage=stage, publication_kind=publication_kind
+                    ),
                 )
 
         previous_status = run.status
@@ -782,11 +824,31 @@ class SubjectProductionService:
             force_recompute=force_recompute,
         )
         artifacts = getattr(uow, "production_artifacts", None)
-        staled = (
-            await artifacts.mark_from_stage_stale(run_id, stage.value)
-            if artifacts is not None
-            else []
+        stale_stages = {stage.value}
+        stale_stages.update(
+            item.value
+            for item in downstream_artifacts_from_pipeline_stage(
+                stage, publication_kind=publication_kind
+            )
         )
+        if artifacts is None:
+            staled = []
+        else:
+            mark_stages_stale = getattr(artifacts, "mark_stages_stale", None)
+            if callable(mark_stages_stale):
+                staled = await mark_stages_stale(run_id, stale_stages)
+            else:
+                # Older in-memory repository adapters expose only the
+                # contiguous article-path operation. It is equivalent only
+                # before routing or for ARTICLE; a brief must retain the
+                # route-specific set above.
+                mark_from_stage_stale = getattr(artifacts, "mark_from_stage_stale", None)
+                if not callable(mark_from_stage_stale) or publication_kind not in (
+                    None,
+                    PublicationKind.ARTICLE,
+                ):
+                    raise AttributeError("production_artifacts.mark_stages_stale is required")
+                staled = await mark_from_stage_stale(run_id, stage.value)
 
         await uow.production_runs.save(run)
         return SubjectProductionRetryResult(

@@ -68,6 +68,7 @@ from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
 )
+from cti_app.application.production_routing import _source_loss_diagnostics
 from cti_app.application.production_source_evidence import (
     SourceEvidenceDocument,
     SourceEvidenceSpan,
@@ -147,6 +148,11 @@ from cti_app.domain.production_relevance import (
     RelevanceClassification,
     RelevanceProjectionV1,
 )
+from cti_app.domain.production_routing import (
+    ProductionRoutingArtifactInputV1,
+    RoutingStatus,
+    decide_publication_routing,
+)
 from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
@@ -160,6 +166,8 @@ from cti_app.domain.publication import (
     is_publication_ioc_artifact_type,
 )
 from cti_app.domain.publication_document import parse_publication_document
+from cti_app.domain.publication_kind import PublicationKind
+from cti_app.infrastructure.legitimate_services import load_legitimate_services
 
 REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
 REPAIR_PLANNER_VERSION = "33.1"
@@ -468,7 +476,30 @@ class _EditorialEnrichmentRebuildRequired(RuntimeError):
 
     def __init__(self, code: str) -> None:
         self.code = code
-        super().__init__(code)
+
+
+class _PublicationRouteRebuildRequired(RuntimeError):
+    """A repair changed kind or routing policy, so synthesis owes new work."""
+
+    def __init__(
+        self,
+        *,
+        previous_kind: PublicationKind | None,
+        publication_kind: PublicationKind | None,
+        policy_changed: bool,
+    ) -> None:
+        self.previous_kind = previous_kind
+        self.publication_kind = publication_kind
+        self.policy_changed = policy_changed
+
+
+class _PublicationRouteReviewRequired(RuntimeError):
+    """The repaired canonical artifacts do not support an automatic route."""
+
+    def __init__(self, decision_id: UUID, reason_code: str) -> None:
+        self.decision_id = decision_id
+        self.reason_code = reason_code
+        super().__init__(reason_code)
 
 
 class ProductionReferenceRepairError(ValueError):
@@ -4335,16 +4366,19 @@ class ProductionRepairMaterializationService:
                 )
 
             if impact.kind is ProductionRepairImpactKind.SOURCE_CORPUS:
+                route_kind = await self._current_publication_kind(uow, run)
+                dependent_stages = {
+                    ProductionArtifactStage.REFERENCES.value,
+                    ProductionArtifactStage.EXTRACTION.value,
+                    ProductionArtifactStage.SYNTHESIS.value,
+                    ProductionArtifactStage.PUBLICATION.value,
+                }
+                if route_kind is not PublicationKind.BRIEF:
+                    dependent_stages.add(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value)
                 await self._mark_stages_stale(
                     uow,
                     run.id,
-                    {
-                        ProductionArtifactStage.REFERENCES.value,
-                        ProductionArtifactStage.EXTRACTION.value,
-                        ProductionArtifactStage.SYNTHESIS.value,
-                        ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
-                        ProductionArtifactStage.PUBLICATION.value,
-                    },
+                    dependent_stages,
                 )
                 self._record_repair_diagnostic(
                     event="production.repair.model_retry_requested",
@@ -4368,6 +4402,8 @@ class ProductionRepairMaterializationService:
             publication: ProductionArtifact | None = None
             qa_result: dict[str, Any] | None = None
             enrichment_rebuild: _EditorialEnrichmentRebuildRequired | None = None
+            route_rebuild: _PublicationRouteRebuildRequired | None = None
+            route_review: _PublicationRouteReviewRequired | None = None
             if impact.kind is ProductionRepairImpactKind.PUBLICATION_ONLY:
                 try:
                     publication, qa_result = await self._materialize_publication_in_uow(
@@ -4378,6 +4414,10 @@ class ProductionRepairMaterializationService:
                     )
                 except _EditorialEnrichmentRebuildRequired as exc:
                     enrichment_rebuild = exc
+                except _PublicationRouteRebuildRequired as exc:
+                    route_rebuild = exc
+                except _PublicationRouteReviewRequired as exc:
+                    route_review = exc
                 else:
                     repair_audit["result_publication_artifact_id"] = str(publication.id)
                 self._record_repair_diagnostic(
@@ -4399,17 +4439,24 @@ class ProductionRepairMaterializationService:
                     )
                 except _EditorialEnrichmentRebuildRequired as exc:
                     enrichment_rebuild = exc
+                except _PublicationRouteRebuildRequired as exc:
+                    route_rebuild = exc
+                except _PublicationRouteReviewRequired as exc:
+                    route_review = exc
                 else:
                     repair_audit["result_publication_artifact_id"] = str(publication.id)
             else:
+                route_kind = await self._current_publication_kind(uow, run)
+                dependent_stages = {
+                    ProductionArtifactStage.SYNTHESIS.value,
+                    ProductionArtifactStage.PUBLICATION.value,
+                }
+                if route_kind is not PublicationKind.BRIEF:
+                    dependent_stages.add(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value)
                 await self._mark_stages_stale(
                     uow,
                     run.id,
-                    {
-                        ProductionArtifactStage.SYNTHESIS.value,
-                        ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
-                        ProductionArtifactStage.PUBLICATION.value,
-                    },
+                    dependent_stages,
                 )
                 self._record_repair_diagnostic(
                     event="production.repair.model_retry_requested",
@@ -4426,6 +4473,60 @@ class ProductionRepairMaterializationService:
                 )
                 # The stale is committed with the new Extraction, so no reader
                 # ever sees the repaired content beside the old narrative.
+                await uow.commit()
+                return ProductionRepairMaterializationResult(
+                    projection=projection,
+                    action="retry_required",
+                    retry_stage=ProductionStage.SYNTHESIS.value,
+                    repair_materialization=repair_audit,
+                )
+
+            if route_review is not None:
+                await self._mark_stages_stale(
+                    uow,
+                    run.id,
+                    {
+                        ProductionArtifactStage.SYNTHESIS.value,
+                        ProductionArtifactStage.PUBLICATION.value,
+                    },
+                )
+                run.mark_needs_review(
+                    code="publication_routing_needs_review",
+                    message="La réparation rend le routage de publication indéterminé.",
+                    details={
+                        "routing_decision_id": str(route_review.decision_id),
+                        "reason_code": route_review.reason_code,
+                    },
+                )
+                await uow.production_runs.save(run)
+                await uow.commit()
+                return ProductionRepairMaterializationResult(
+                    projection=projection,
+                    action="needs_review",
+                    repair_materialization=repair_audit,
+                )
+
+            if route_rebuild is not None:
+                dependent_stages = {
+                    ProductionArtifactStage.SYNTHESIS.value,
+                    ProductionArtifactStage.PUBLICATION.value,
+                }
+                if (
+                    route_rebuild.previous_kind is PublicationKind.ARTICLE
+                    or route_rebuild.publication_kind is PublicationKind.ARTICLE
+                ):
+                    dependent_stages.add(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value)
+                await self._mark_stages_stale(uow, run.id, dependent_stages)
+                self._record_repair_diagnostic(
+                    event="production.repair.routing_rebuild_requested",
+                    run=run,
+                    projection=projection,
+                    started=started,
+                    reused_synthesis=False,
+                )
+                await _require_publication_rebuild(
+                    uow, run, retry_stage=ProductionStage.SYNTHESIS.value
+                )
                 await uow.commit()
                 return ProductionRepairMaterializationResult(
                     projection=projection,
@@ -4694,6 +4795,62 @@ class ProductionRepairMaterializationService:
             relevance_projection_artifact = projection_execution.artifact
             if relevance_projection_artifact is None:
                 raise ProductionRepairProjectionError("relevance_projection_unavailable")
+            routing_repository = getattr(uow, "production_routing_decisions", None)
+            if routing_repository is None:
+                raise ProductionRepairProjectionError("publication_routing_repository_unavailable")
+            previous_decision = (
+                await routing_repository.get(run.routing_decision_id)
+                if run.routing_decision_id is not None
+                else None
+            )
+            source_diagnostics, source_diagnostics_error = _source_loss_diagnostics(extraction)
+            route_decision = decide_publication_routing(
+                production_run_id=run.id,
+                subject_id=run.subject_id,
+                pipeline_generation=run.pipeline_generation,
+                extraction_input=ProductionRoutingArtifactInputV1(
+                    artifact=extraction,
+                    artifact_hash=canonical_extraction_hash(canonical_extraction),
+                    payload=canonical_extraction,
+                    validation_error=source_diagnostics_error,
+                ),
+                relevance_input=ProductionRoutingArtifactInputV1(
+                    artifact=relevance_projection_artifact,
+                    artifact_hash=relevance_projection.projection_hash,
+                    payload=relevance_projection,
+                ),
+                legitimate_services=load_legitimate_services(),
+                decided_at=datetime.now(UTC),
+                critical_source_diagnostics=source_diagnostics,
+            )
+            previous_decision_id = run.routing_decision_id
+            route_decision = await routing_repository.append_and_adopt(
+                route_decision,
+                expected_version=run.version,
+            )
+            run.routing_decision_id = route_decision.decision_id
+            if previous_decision_id != route_decision.decision_id:
+                run.version += 1
+            if route_decision.status is RoutingStatus.NEEDS_REVIEW:
+                raise _PublicationRouteReviewRequired(
+                    route_decision.decision_id,
+                    route_decision.reason_code.value,
+                )
+            previous_kind = (
+                previous_decision.publication_kind if previous_decision is not None else None
+            )
+            policy_changed = (
+                previous_decision is not None
+                and previous_decision.policy_version != route_decision.policy_version
+            )
+            if previous_decision is not None and (
+                previous_kind is not route_decision.publication_kind or policy_changed
+            ):
+                raise _PublicationRouteRebuildRequired(
+                    previous_kind=previous_kind,
+                    publication_kind=route_decision.publication_kind,
+                    policy_changed=policy_changed,
+                )
             synthesis = production_synthesis_from_json(
                 await store.read_json(synthesis_artifact.canonical_blob_id)
             )
@@ -4776,19 +4933,22 @@ class ProductionRepairMaterializationService:
                 await uow.production_artifacts.append(rebased)
                 synthesis_artifact = rebased
 
-            (
-                editorial_enrichment,
-                editorial_enrichment_artifact,
-            ) = await self._materialize_editorial_enrichment_in_uow(
-                uow,
-                run=run,
-                extraction_artifact=extraction,
-                extraction=canonical_extraction,
-                synthesis_artifact=synthesis_artifact,
-                synthesis=synthesis,
-                relevance_projection=relevance_projection,
-                relevance_projection_artifact=relevance_projection_artifact,
-            )
+            editorial_enrichment = None
+            editorial_enrichment_artifact = None
+            if route_decision.publication_kind is PublicationKind.ARTICLE:
+                (
+                    editorial_enrichment,
+                    editorial_enrichment_artifact,
+                ) = await self._materialize_editorial_enrichment_in_uow(
+                    uow,
+                    run=run,
+                    extraction_artifact=extraction,
+                    extraction=canonical_extraction,
+                    synthesis_artifact=synthesis_artifact,
+                    synthesis=synthesis,
+                    relevance_projection=relevance_projection,
+                    relevance_projection_artifact=relevance_projection_artifact,
+                )
             publication = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.PUBLICATION.value
             )
@@ -4802,7 +4962,11 @@ class ProductionRepairMaterializationService:
                     "extraction_artifact_id": str(extraction.id),
                     "relevance_projection_artifact_id": str(relevance_projection_artifact.id),
                     "synthesis_artifact_id": str(synthesis_artifact.id),
-                    "editorial_enrichment_artifact_id": str(editorial_enrichment_artifact.id),
+                    **(
+                        {"editorial_enrichment_artifact_id": str(editorial_enrichment_artifact.id)}
+                        if editorial_enrichment_artifact is not None
+                        else {}
+                    ),
                 }
             }
             metadata["diagnostics"] = {
@@ -4812,7 +4976,11 @@ class ProductionRepairMaterializationService:
                     ("extraction", extraction),
                     ("relevance_projection", relevance_projection_artifact),
                     ("synthesis", synthesis_artifact),
-                    ("editorial_enrichment", editorial_enrichment_artifact),
+                    *(
+                        (("editorial_enrichment", editorial_enrichment_artifact),)
+                        if editorial_enrichment_artifact is not None
+                        else ()
+                    ),
                 )
             }
             if repair_materialization is not None:
@@ -4827,6 +4995,9 @@ class ProductionRepairMaterializationService:
                 relevance_projection=relevance_projection,
                 synthesis=synthesis,
                 editorial_enrichment=editorial_enrichment,
+                publication_kind=route_decision.publication_kind,
+                routing_decision_hash=route_decision.decision_hash,
+                routing_policy_version=route_decision.policy_version,
                 metadata_extra=metadata,
             )
             new_publication = assembly.artifact
@@ -5001,6 +5172,16 @@ class ProductionRepairMaterializationService:
         if not callable(marker):
             raise ProductionRepairProjectionError("production_artifact_stale_port_unavailable")
         return cast(list[str], await marker(run_id, stages))
+
+    @staticmethod
+    async def _current_publication_kind(uow: Any, run: Any) -> PublicationKind | None:
+        repository = getattr(uow, "production_routing_decisions", None)
+        if repository is None or run.routing_decision_id is None:
+            return None
+        decision = await repository.get(run.routing_decision_id)
+        if decision is None or decision.status is not RoutingStatus.DECIDED:
+            return None
+        return decision.publication_kind
 
     @staticmethod
     async def _ensure_qa_passed(qa_result: dict[str, Any]) -> None:

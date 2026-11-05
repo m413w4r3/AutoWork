@@ -30,6 +30,7 @@ from cti_app.domain.production_pipeline import (
     artifact_stage_for,
     production_stages,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 # A Q2 source entry only counts as done under these two statuses; every other
 # status (pending, running, failed, skipped) may still cost a model call.
@@ -106,6 +107,7 @@ def resolve_retry_stage(
     live_artifact_stages: Collection[str],
     *,
     current_stage: ProductionStage,
+    publication_kind: PublicationKind | None = None,
 ) -> ProductionStage:
     """The stage a retry must actually start from.
 
@@ -127,7 +129,7 @@ def resolve_retry_stage(
     the artifacts that are not STALE.
     """
     live = set(live_artifact_stages)
-    for stage in production_stages():
+    for stage in production_stages(publication_kind):
         artifact_stage = artifact_stage_for(stage)
         if artifact_stage is None:
             continue
@@ -141,6 +143,7 @@ def plan_production_resume(
     *,
     artifacts: Mapping[str, ProductionArtifact | None],
     archived_source_count: int,
+    publication_kind: PublicationKind | None = None,
 ) -> ProductionResumePlan:
     """Derive the resume plan from the artifacts that really exist.
 
@@ -148,7 +151,7 @@ def plan_production_resume(
     returned ``model_calls_expected`` is an upper bound: a stage that has to run
     may still find a reusable checkpoint for a source, which costs nothing.
     """
-    stages = production_stages()
+    stages = production_stages(publication_kind)
     completed: list[ProductionStage] = []
     reused: list[str] = []
     resume_from: ProductionStage | None = None

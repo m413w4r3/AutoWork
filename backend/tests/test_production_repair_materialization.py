@@ -37,16 +37,21 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
 from cti_app.domain.production_extraction import (
     ExtractionFactV1,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
     production_extraction_from_json,
     production_extraction_hashes,
     production_extraction_to_json,
 )
 from cti_app.domain.production_pipeline import production_artifact_stages
+from cti_app.domain.production_routing import ROUTING_POLICY_VERSION, RoutingStatus
 from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
+from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import serialize_publication_document
+from cti_app.domain.publication_kind import PublicationKind
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_publication_builder_v4 import _canonical_inputs
 
@@ -175,6 +180,19 @@ class _Uow:
             get_current_for_subject=self._run,
         )
         self.production_artifacts = artifacts
+        decision_id = UUID(int=15)
+        self.run.routing_decision_id = decision_id
+        self.production_routing_decisions = SimpleNamespace(
+            decisions={
+                decision_id: SimpleNamespace(
+                    status=RoutingStatus.DECIDED,
+                    publication_kind=PublicationKind.BRIEF,
+                    policy_version=ROUTING_POLICY_VERSION,
+                )
+            },
+            get=self._routing_decision,
+            append_and_adopt=self._adopt_routing_decision,
+        )
         self.editions = SimpleNamespace(
             get_for_update=lambda _edition_id: self._edition(edition_state)
         )
@@ -183,6 +201,16 @@ class _Uow:
         )
         self.commits = 0
         self.rolled_back = False
+
+    async def _routing_decision(self, decision_id: UUID) -> object | None:
+        return self.production_routing_decisions.decisions.get(decision_id)
+
+    async def _adopt_routing_decision(self, decision, *, expected_version: int):
+        assert expected_version == self.run.version
+        self.production_routing_decisions.decisions[decision.decision_id] = decision
+        self.run.routing_decision_id = decision.decision_id
+        self.run.version += 1
+        return decision
 
     async def _run(self, _run_id: UUID) -> ProductionRun:
         return self.run
@@ -317,7 +345,7 @@ async def test_canonical_rule_bundle_repair_reassembles_and_materializes_sidecar
     assert uow.commits == 1
     assert uow.artifacts.stale_calls == [
         (RUN_ID, ("synthesis",)),
-        (RUN_ID, ("editorial_enrichment", "publication")),
+        (RUN_ID, ("publication",)),
     ]
 
 
@@ -373,9 +401,7 @@ async def test_narrative_repair_stales_outputs_without_materializing() -> None:
     assert result.action == "retry_required"
     assert result.retry_stage == "synthesis"
     assert checkpoint.calls == []
-    assert uow.artifacts.stale_calls == [
-        (RUN_ID, ("synthesis", "editorial_enrichment", "publication"))
-    ]
+    assert uow.artifacts.stale_calls == [(RUN_ID, ("synthesis", "publication"))]
 
 
 @pytest.mark.asyncio
@@ -454,7 +480,7 @@ async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> N
 
 
 @pytest.mark.asyncio
-async def test_repair_rebases_enrichment_lineage_but_keeps_its_admitted_pack_hash() -> None:
+async def test_brief_repair_preserves_unused_enrichment_artifact() -> None:
     service, uow, projection_service, store, _checkpoint = _service(
         ProductionRepairImpactKind.PUBLICATION_ONLY
     )
@@ -523,39 +549,80 @@ async def test_repair_rebases_enrichment_lineage_but_keeps_its_admitted_pack_has
     )
 
     assert result.action == "publication_reassembled"
-    rebased = await uow.artifacts.get_current(
+    current_enrichment = await uow.artifacts.get_current(
         RUN_ID, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
     )
-    assert rebased is not None
-    assert rebased.metadata["lineage_rebased"] is True
-    assert rebased.metadata["evidence_pack_hash"] == original_pack_hash
-    current_extraction_artifact = await uow.artifacts.get_current(
-        RUN_ID, ProductionArtifactStage.EXTRACTION.value
-    )
-    current_synthesis_artifact = await uow.artifacts.get_current(
-        RUN_ID, ProductionArtifactStage.SYNTHESIS.value
-    )
-    current_projection_artifact = await uow.artifacts.get_current(
-        RUN_ID, ProductionArtifactStage.RELEVANCE_PROJECTION.value
-    )
-    assert current_extraction_artifact is not None
-    assert current_synthesis_artifact is not None
-    assert current_projection_artifact is not None
-    assert rebased.metadata["input_artifacts"] == {
-        "extraction_artifact_id": str(current_extraction_artifact.id),
-        "relevance_projection_artifact_id": str(current_projection_artifact.id),
-        "synthesis_artifact_id": str(current_synthesis_artifact.id),
-    }
-    current_extraction = production_extraction_from_json(
-        store.payloads[current_extraction_artifact.canonical_blob_id]
-    )
-    current_synthesis = production_synthesis_from_json(
-        store.payloads[current_synthesis_artifact.canonical_blob_id]
-    )
-    current_projection = build_relevance_projection(snapshot, current_extraction)
-    current_pack_hash = editorial_enrichment_evidence_pack_hash(
-        build_editorial_enrichment_evidence_pack(
-            snapshot, current_extraction, current_synthesis, current_projection
+    assert current_enrichment is original_enrichment_artifact
+    assert current_enrichment is not None
+    assert current_enrichment.metadata["evidence_pack_hash"] == original_pack_hash
+    assert "lineage_rebased" not in current_enrichment.metadata
+    assert (
+        sum(
+            item.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+            for item in uow.artifacts.items
         )
+        == 1
     )
-    assert current_pack_hash != rebased.metadata["evidence_pack_hash"]
+
+
+@pytest.mark.asyncio
+async def test_repair_route_change_brief_to_article_invalidates_dependent_artifacts() -> None:
+    service, uow, projection_service, store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY
+    )
+    previous_route_id = uow.run.routing_decision_id
+    assert previous_route_id is not None
+    extraction = production_extraction_from_json(store.payloads[UUID(int=11)])
+    source = extraction.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value="ioc.example",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="Le serveur de commande est utilisé par l'acteur.",
+        evidence_quote="ioc.example est le serveur de commande.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    repaired_extraction = replace(
+        extraction,
+        sources=(replace(source, indicators=(indicator,)), *extraction.sources[1:]),
+    )
+    repaired_blob_id = UUID(int=16)
+    store.payloads[repaired_blob_id] = production_extraction_to_json(repaired_extraction)
+    original_artifact = next(
+        item for item in uow.artifacts.items if item.stage is ProductionArtifactStage.EXTRACTION
+    )
+    projection_service.result = replace(
+        projection_service.result,
+        artifact=replace(
+            original_artifact,
+            id=UUID(int=116),
+            version=2,
+            input_hash=canonical_extraction_hash(repaired_extraction),
+            canonical_blob_id=repaired_blob_id,
+        ),
+    )
+
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+
+    assert result.action == "retry_required"
+    assert result.retry_stage == "synthesis"
+    decisions = uow.production_routing_decisions.decisions
+    assert len(decisions) == 2
+    assert decisions[previous_route_id].publication_kind is PublicationKind.BRIEF
+    new_decision = decisions[uow.run.routing_decision_id]
+    assert new_decision.publication_kind is PublicationKind.ARTICLE
+    assert uow.artifacts.stale_calls[-1] == (
+        RUN_ID,
+        ("synthesis", "editorial_enrichment", "publication"),
+    )
+    assert all(
+        artifact.status is ProductionArtifactStatus.STALE
+        for artifact in uow.artifacts.items
+        if artifact.stage
+        in {
+            ProductionArtifactStage.SYNTHESIS,
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            ProductionArtifactStage.PUBLICATION,
+        }
+    )

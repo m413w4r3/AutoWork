@@ -20,7 +20,7 @@ from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
-    _EditorialEnrichmentRebuildRequired,
+    _PublicationRouteRebuildRequired,
 )
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_assembly import (
@@ -1063,9 +1063,22 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_public
         async def get_by_run(self, run_id: UUID) -> ProductionInputSnapshot | None:
             return snapshot if run_id == run.id else None
 
+    class RoutingDecisions:
+        def __init__(self) -> None:
+            self.decisions = {}
+
+        async def get(self, decision_id: UUID):
+            return self.decisions.get(decision_id)
+
+        async def append_and_adopt(self, decision, *, expected_version: int):
+            assert expected_version == run.version
+            self.decisions[decision.decision_id] = decision
+            return decision
+
     uow = SimpleNamespace(
         production_artifacts=artifacts,
         production_input_snapshots=Snapshots(),
+        production_routing_decisions=RoutingDecisions(),
     )
     repair = ProductionRepairMaterializationService(
         lambda: None,  # type: ignore[arg-type]
@@ -1134,7 +1147,7 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_public
 
 
 @pytest.mark.asyncio
-async def test_ioc_repair_requires_enrichment_rebuild_when_cited_evidence_disappears() -> None:
+async def test_ioc_repair_route_change_requires_synthesis_rebuild() -> None:
     snapshot, references, extraction_a, synthesis_a = _canonical_inputs()
     source = extraction_a.sources[0]
     indicator = ExtractionIndicatorV1(
@@ -1156,6 +1169,8 @@ async def test_ioc_repair_requires_enrichment_rebuild_when_cited_evidence_disapp
     _service_unused, catalog, artifacts = _service()
     store = ProductionArtifactStore(catalog)
     run = _run(snapshot)
+    previous_route_id = UUID(int=20)
+    run.routing_decision_id = previous_route_id
 
     async def artifact(
         stage: ProductionArtifactStage, version: int, payload: dict[str, object]
@@ -1194,23 +1209,42 @@ async def test_ioc_repair_requires_enrichment_rebuild_when_cited_evidence_disapp
         async def get_by_run(self, run_id: UUID) -> ProductionInputSnapshot | None:
             return snapshot if run_id == run.id else None
 
+    class RoutingDecisions:
+        def __init__(self) -> None:
+            self.decisions = {
+                previous_route_id: SimpleNamespace(
+                    publication_kind=PublicationKind.ARTICLE,
+                    policy_version="previous-routing-policy",
+                )
+            }
+
+        async def get(self, decision_id: UUID):
+            return self.decisions.get(decision_id)
+
+        async def append_and_adopt(self, decision, *, expected_version: int):
+            assert expected_version == run.version
+            self.decisions[decision.decision_id] = decision
+            return decision
+
     uow = SimpleNamespace(
         production_artifacts=artifacts,
         production_input_snapshots=Snapshots(),
+        production_routing_decisions=RoutingDecisions(),
     )
     repair = ProductionRepairMaterializationService(
         lambda: None,  # type: ignore[arg-type]
         projection_service=object(),  # type: ignore[arg-type]
         artifact_store=store,
     )
-    with pytest.raises(_EditorialEnrichmentRebuildRequired) as raised:
+    with pytest.raises(_PublicationRouteRebuildRequired) as raised:
         await repair._materialize_canonical_publication_in_uow(
             uow,
             run=run,
             extraction=extraction_c_artifact,
             repair_materialization=None,
         )
-    assert raised.value.code == "editorial_enrichment_evidence_missing"
+    assert raised.value.previous_kind is PublicationKind.ARTICLE
+    assert raised.value.publication_kind is PublicationKind.BRIEF
     assert [
         row.version
         for row in artifacts.appended

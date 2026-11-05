@@ -40,6 +40,12 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_SYNTHESIS_PROMPT_VERSION,
+    brief_timeline_from_extraction,
+    build_brief_synthesis_prompt,
+    validate_brief_narrative,
+)
 from cti_app.application.production_parsers import sanitize_bridge_output_text
 from cti_app.application.production_prompts import (
     SYNTHESIS_EDITORIAL_CONTRACT_V5,
@@ -82,6 +88,7 @@ from cti_app.domain.production_relevance import (
     relevance_projection_from_json,
     validate_relevance_projection_lineage,
 )
+from cti_app.domain.production_routing import ProductionRoutingDecisionV1, RoutingStatus
 from cti_app.domain.production_synthesis import (
     _MONTH_NUMBERS,
     EDITORIAL_TITLE_MAX_LENGTH,
@@ -110,6 +117,7 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_section_heading,
     validate_synthesis_section_headings,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
@@ -1167,6 +1175,9 @@ def _synthesis_identity_payload(
     validator_version: str | None = None,
     model_policy_version: str | None = None,
     routing_policy_version: str | None = None,
+    publication_kind: PublicationKind | None = None,
+    routing_decision_hash: str | None = None,
+    publication_routing_policy_version: str | None = None,
 ) -> dict[str, Any]:
     """Return stable request inputs, excluding parser-only implementation state."""
     if not re.fullmatch(r"[0-9a-f]{64}", access_policy_hash):
@@ -1175,6 +1186,27 @@ def _synthesis_identity_payload(
         raise ValueError("Synthesis snapshot and extraction subjects differ")
     if evidence_pack.publication_language != snapshot.publication_language:
         raise ValueError("Synthesis evidence pack language differs from its snapshot")
+    if publication_kind is not None and not isinstance(publication_kind, PublicationKind):
+        raise ValueError("Publication kind is invalid")
+    route_values = (
+        publication_kind,
+        routing_decision_hash,
+        publication_routing_policy_version,
+    )
+    if any(value is not None for value in route_values):
+        if (
+            publication_kind is None
+            or not isinstance(routing_decision_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", routing_decision_hash)
+            or not isinstance(publication_routing_policy_version, str)
+            or not publication_routing_policy_version.strip()
+        ):
+            raise ValueError("Complete publication routing identity is required")
+    prompt_default = (
+        BRIEF_SYNTHESIS_PROMPT_VERSION
+        if publication_kind is PublicationKind.BRIEF
+        else SYNTHESIS_PROMPT_VERSION
+    )
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
         "extraction_hash": canonical_extraction_hash(extraction),
@@ -1187,7 +1219,7 @@ def _synthesis_identity_payload(
         "timeline_policy_version": SYNTHESIS_TIMELINE_POLICY_VERSION,
         "proposal_contract_version": SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
         "canonical_schema_version": PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
-        "prompt_version": prompt_version or SYNTHESIS_PROMPT_VERSION,
+        "prompt_version": prompt_version or prompt_default,
         "validator_version": validator_version or SYNTHESIS_VALIDATOR_VERSION,
         "evidence_ref_algorithm_version": SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION,
         "synthesis_policy_version": SYNTHESIS_POLICY_VERSION,
@@ -1195,6 +1227,14 @@ def _synthesis_identity_payload(
         "model_policy_version": model_policy_version or SYNTHESIS_MODEL_POLICY_VERSION,
         "routing_policy_version": routing_policy_version or SYNTHESIS_ROUTING_POLICY_VERSION,
     }
+    if publication_kind is not None:
+        payload.update(
+            {
+                "publication_kind": publication_kind.value,
+                "routing_decision_hash": routing_decision_hash,
+                "publication_routing_policy_version": publication_routing_policy_version,
+            }
+        )
     return payload
 
 
@@ -1208,6 +1248,9 @@ def synthesis_invocation_hash(
     validator_version: str | None = None,
     model_policy_version: str | None = None,
     routing_policy_version: str | None = None,
+    publication_kind: PublicationKind | None = None,
+    routing_decision_hash: str | None = None,
+    publication_routing_policy_version: str | None = None,
 ) -> str:
     """Identity of the request that may cause a provider submission."""
     payload = _synthesis_identity_payload(
@@ -1219,6 +1262,9 @@ def synthesis_invocation_hash(
         validator_version=validator_version,
         model_policy_version=model_policy_version,
         routing_policy_version=routing_policy_version,
+        publication_kind=publication_kind,
+        routing_decision_hash=routing_decision_hash,
+        publication_routing_policy_version=publication_routing_policy_version,
     )
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
@@ -1233,6 +1279,9 @@ def synthesis_input_hash(
     validator_version: str | None = None,
     model_policy_version: str | None = None,
     routing_policy_version: str | None = None,
+    publication_kind: PublicationKind | None = None,
+    routing_decision_hash: str | None = None,
+    publication_routing_policy_version: str | None = None,
     parser_version: str | None = None,
 ) -> str:
     """Identity of a parsed canonical synthesis, including parser behavior."""
@@ -1245,6 +1294,9 @@ def synthesis_input_hash(
         validator_version=validator_version,
         model_policy_version=model_policy_version,
         routing_policy_version=routing_policy_version,
+        publication_kind=publication_kind,
+        routing_decision_hash=routing_decision_hash,
+        publication_routing_policy_version=publication_routing_policy_version,
     )
     payload["parser_version"] = parser_version or SYNTHESIS_WIRE_PARSER_VERSION
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
@@ -1794,6 +1846,9 @@ def build_synthesis_model_request(
     mode: SynthesisMode,
     *,
     revision: SynthesisRevisionContextV1 | None = None,
+    publication_kind: PublicationKind | None = None,
+    routing_decision_hash: str | None = None,
+    publication_routing_policy_version: str | None = None,
 ) -> ModelRequest:
     """Build a complete stateless, web-disabled Synthesis drafting request."""
     if not isinstance(mode, SynthesisMode):
@@ -1831,9 +1886,77 @@ def build_synthesis_model_request(
         raise ValueError("Synthesis evidence pack differs from its frozen snapshot")
 
     policy_hash = synthesis_access_policy_hash(access_policy)
-    functional_hash = synthesis_input_hash(snapshot, extraction, evidence_pack, policy_hash)
-    invocation_hash = synthesis_invocation_hash(snapshot, extraction, evidence_pack, policy_hash)
+    functional_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        evidence_pack,
+        policy_hash,
+        publication_kind=publication_kind,
+        routing_decision_hash=routing_decision_hash,
+        publication_routing_policy_version=publication_routing_policy_version,
+    )
+    invocation_hash = synthesis_invocation_hash(
+        snapshot,
+        extraction,
+        evidence_pack,
+        policy_hash,
+        publication_kind=publication_kind,
+        routing_decision_hash=routing_decision_hash,
+        publication_routing_policy_version=publication_routing_policy_version,
+    )
     pack_hash = synthesis_evidence_pack_hash(evidence_pack)
+    if publication_kind is PublicationKind.BRIEF:
+        evidence_blocks = tuple(
+            tuple(_render_evidence_record(record))
+            for record in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence)
+            if record.get("kind") != EvidenceKind.UNCERTAINTY.value
+        )
+        reserve_blocks = tuple(
+            tuple(_render_evidence_record(record)) for record in evidence_pack.reserve_evidence
+        )
+        prompt = build_brief_synthesis_prompt(
+            subject_title=snapshot.subject_title,
+            publication_language=snapshot.publication_language,
+            tlp=snapshot.subject_tlp.value,
+            discovery_summary=snapshot.discovery_summary,
+            actor_or_campaign=snapshot.actor_or_campaign,
+            period_start=snapshot.period_start.isoformat(),
+            period_end=snapshot.period_end.isoformat(),
+            evidence_blocks=evidence_blocks,
+            reserve_blocks=reserve_blocks,
+            prompt_version=BRIEF_SYNTHESIS_PROMPT_VERSION,
+        )
+        if any(str(record.source_document_id) in prompt for record in access_policy.sources):
+            raise ValueError("Source document identities cannot appear in the Synthesis prompt")
+        return ModelRequest(
+            text=prompt,
+            prompt_template_id="production-brief-synthesis",
+            prompt_template_version=BRIEF_SYNTHESIS_PROMPT_VERSION,
+            evidence_pack_hash=pack_hash,
+            external_llm_allowed=access_policy.external_llm_allowed,
+            routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
+            sensitivity=access_policy.effective_tlp.value,
+            metadata={
+                "synthesis_input_hash": functional_hash,
+                "synthesis_invocation_hash": invocation_hash,
+                "synthesis_mode": mode.value,
+                "synthesis_access_policy_hash": policy_hash,
+                "effective_tlp": access_policy.effective_tlp.value,
+                "external_llm_allowed": access_policy.external_llm_allowed,
+                "do_not_submit": access_policy.do_not_submit,
+                "model_policy_version": SYNTHESIS_MODEL_POLICY_VERSION,
+                "routing_policy_version": SYNTHESIS_ROUTING_POLICY_VERSION,
+                "synthesis_policy_version": SYNTHESIS_POLICY_VERSION,
+                "publication_kind": PublicationKind.BRIEF.value,
+                "routing_decision_hash": routing_decision_hash,
+                "publication_routing_policy_version": publication_routing_policy_version,
+            },
+            web_search=False,
+            background=False,
+            conversation=None,
+            run_id=synthesis_model_run_id(run, invocation_hash, mode),
+            allow_failed_resubmit=True,
+        )
     prompt_lines = [
         "SYNTHESIS DRAFT REQUEST",
         f"Prompt version: {SYNTHESIS_PROMPT_VERSION}",
@@ -1929,7 +2052,11 @@ def build_synthesis_model_request(
     return ModelRequest(
         text=prompt,
         prompt_template_id="production-synthesis",
-        prompt_template_version=SYNTHESIS_PROMPT_VERSION,
+        prompt_template_version=(
+            BRIEF_SYNTHESIS_PROMPT_VERSION
+            if publication_kind is PublicationKind.BRIEF
+            else SYNTHESIS_PROMPT_VERSION
+        ),
         evidence_pack_hash=pack_hash,
         external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
@@ -1945,6 +2072,15 @@ def build_synthesis_model_request(
             "model_policy_version": SYNTHESIS_MODEL_POLICY_VERSION,
             "routing_policy_version": SYNTHESIS_ROUTING_POLICY_VERSION,
             "synthesis_policy_version": SYNTHESIS_POLICY_VERSION,
+            **(
+                {
+                    "publication_kind": publication_kind.value,
+                    "routing_decision_hash": routing_decision_hash,
+                    "publication_routing_policy_version": publication_routing_policy_version,
+                }
+                if publication_kind is not None
+                else {}
+            ),
         },
         web_search=False,
         background=False,
@@ -3332,8 +3468,38 @@ class ProductionSynthesisService:
         snapshot: ProductionInputSnapshot,
         extraction_artifact: ProductionArtifact,
         projection_artifact: ProductionArtifact | None = None,
+        *,
+        routing_decision: ProductionRoutingDecisionV1 | None = None,
     ) -> ProductionSynthesisExecution:
         """Run at most one durable drafting submission for this generation."""
+        if routing_decision is not None and (
+            routing_decision.status is not RoutingStatus.DECIDED
+            or routing_decision.pipeline_generation != run.pipeline_generation
+            or routing_decision.production_run_id != run.id
+            or routing_decision.publication_kind is None
+        ):
+            return ProductionSynthesisExecution(
+                status=SynthesisExecutionStatus.NEEDS_REVIEW,
+                mode=SynthesisMode.FRESH,
+                model_calls=0,
+                error_code="publication_routing_decision_invalid",
+                error="A current decided publication route is required before synthesis.",
+                details={
+                    "routing_decision_id": str(routing_decision.decision_id),
+                    "routing_status": routing_decision.status.value,
+                },
+            )
+        publication_kind = (
+            routing_decision.publication_kind
+            if routing_decision is not None
+            else PublicationKind.ARTICLE
+        )
+        routing_decision_hash = (
+            routing_decision.decision_hash if routing_decision is not None else None
+        )
+        publication_routing_policy_version = (
+            routing_decision.policy_version if routing_decision is not None else None
+        )
         try:
             extraction, extraction_hash = await self._load_extraction(
                 run, snapshot, extraction_artifact
@@ -3352,12 +3518,40 @@ class ProductionSynthesisService:
             policy = await self._load_access_policy(snapshot, extraction)
             evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
             access_policy_hash = synthesis_access_policy_hash(policy)
+            identity_options = {
+                "publication_kind": publication_kind if routing_decision is not None else None,
+                "routing_decision_hash": routing_decision_hash,
+                "publication_routing_policy_version": publication_routing_policy_version,
+            }
             input_hash = synthesis_input_hash(
-                snapshot, extraction, evidence_pack, access_policy_hash
+                snapshot, extraction, evidence_pack, access_policy_hash, **identity_options
             )
             invocation_hash = synthesis_invocation_hash(
-                snapshot, extraction, evidence_pack, access_policy_hash
+                snapshot, extraction, evidence_pack, access_policy_hash, **identity_options
             )
+            brief_timeline = None
+            if publication_kind is PublicationKind.BRIEF:
+                timeline_warnings: list[str] = []
+                projected_timeline = build_synthesis_timeline(
+                    extraction, projection=projection, warnings=timeline_warnings
+                )
+                brief_timeline = brief_timeline_from_extraction(extraction, projected_timeline)
+                if brief_timeline is None:
+                    return ProductionSynthesisExecution(
+                        status=SynthesisExecutionStatus.NEEDS_REVIEW,
+                        mode=SynthesisMode.FRESH,
+                        input_hash=input_hash,
+                        extraction_hash=extraction_hash,
+                        model_calls=0,
+                        error_code="brief_chronology_unavailable",
+                        error="A source-grounded dated chronology could not be established.",
+                        details={
+                            "publication_kind": PublicationKind.BRIEF.value,
+                            "routing_decision_hash": routing_decision_hash,
+                            "dated_timeline_entry_count": 0,
+                            "diagnostic": "brief_timeline_requires_1_to_4_source_dated_entries",
+                        },
+                    )
             reused = await self._reuse_exact(
                 run=run,
                 snapshot=snapshot,
@@ -3384,8 +3578,12 @@ class ProductionSynthesisService:
                     "synthesis_access_policy_hash": synthesis_access_policy_hash(policy),
                 },
             )
-        revision = await self._find_revision_context(
-            run, snapshot, extraction, input_hash, invocation_hash
+        revision = (
+            None
+            if publication_kind is PublicationKind.BRIEF
+            else await self._find_revision_context(
+                run, snapshot, extraction, input_hash, invocation_hash
+            )
         )
         return await self._draft(
             run=run,
@@ -3397,6 +3595,10 @@ class ProductionSynthesisService:
             extraction_hash=extraction_hash,
             input_hash=input_hash,
             revision=revision,
+            publication_kind=publication_kind,
+            routing_decision_hash=routing_decision_hash,
+            publication_routing_policy_version=publication_routing_policy_version,
+            brief_timeline=brief_timeline,
         )
 
     async def _load_extraction(
@@ -3826,10 +4028,13 @@ class ProductionSynthesisService:
         parsed: SynthesisWireParseResult,
         *,
         validation_error: str | None = None,
+        prompt_version: str | None = None,
     ) -> str:
         """Persist parser identity and normalized strict proposal beside raw output."""
         assert run.raw_output_sha256 is not None
-        identity = synthesis_parse_identity(run.raw_output_sha256, evidence_pack)
+        identity = synthesis_parse_identity(
+            run.raw_output_sha256, evidence_pack, prompt_version=prompt_version
+        )
         validation_errors: list[dict[str, Any]] = [
             {
                 "path": ["blocks", item.block_id],
@@ -3852,7 +4057,7 @@ class ProductionSynthesisService:
             *(("synthesis_missing_coverage_diagnostics",) if parsed.diagnostics else ()),
             f"synthesis_parser:{SYNTHESIS_WIRE_PARSER_VERSION}",
             f"synthesis_contract:{SYNTHESIS_PROPOSAL_CONTRACT_VERSION}",
-            f"synthesis_prompt:{SYNTHESIS_PROMPT_VERSION}",
+            f"synthesis_prompt:{prompt_version or SYNTHESIS_PROMPT_VERSION}",
         ]
         normalized = None
         if parsed.proposal is not None:
@@ -3880,11 +4085,29 @@ class ProductionSynthesisService:
         extraction_hash: str,
         input_hash: str,
         revision: SynthesisRevisionContextV1 | None,
+        publication_kind: PublicationKind,
+        routing_decision_hash: str | None,
+        publication_routing_policy_version: str | None,
+        brief_timeline: tuple[SynthesisTimelineEntryV1, ...] | None,
     ) -> ProductionSynthesisExecution:
         """Submit once, validate deterministically, then persist the canonical result."""
         mode = SynthesisMode.REVISE_PREVIOUS if revision is not None else SynthesisMode.FRESH
+        prompt_version = (
+            BRIEF_SYNTHESIS_PROMPT_VERSION
+            if publication_kind is PublicationKind.BRIEF
+            else SYNTHESIS_PROMPT_VERSION
+        )
         request = build_synthesis_model_request(
-            run, snapshot, extraction, evidence_pack, policy, mode, revision=revision
+            run,
+            snapshot,
+            extraction,
+            evidence_pack,
+            policy,
+            mode,
+            revision=revision,
+            publication_kind=(publication_kind if routing_decision_hash is not None else None),
+            routing_decision_hash=routing_decision_hash,
+            publication_routing_policy_version=publication_routing_policy_version,
         )
         if request.metadata.get("synthesis_input_hash") != input_hash:
             raise ValueError("Synthesis request identity is inconsistent with its inputs")
@@ -3994,7 +4217,9 @@ class ProductionSynthesisService:
                 details={**self._model_evidence(model_run), **(raw_error or {})},
             )
         parsed = parse_synthesis_proposal_wire(raw_text)
-        parse_identity = synthesis_parse_identity(model_run.raw_output_sha256 or "", evidence_pack)
+        parse_identity = synthesis_parse_identity(
+            model_run.raw_output_sha256 or "", evidence_pack, prompt_version=prompt_version
+        )
         rejection_details = [
             {"block_id": item.block_id, "reason_code": item.reason_code}
             for item in parsed.rejections
@@ -4008,7 +4233,9 @@ class ProductionSynthesisService:
             "missing_coverage": list(_bounded_synthesis_diagnostics(parsed.diagnostics)),
         }
         if parsed.proposal is None:
-            await self._record_wire_parse(model_run, evidence_pack, parsed)
+            await self._record_wire_parse(
+                model_run, evidence_pack, parsed, prompt_version=prompt_version
+            )
             return reviewed(
                 SynthesisProposalErrorCode.OUTPUT_INVALID.value,
                 "The synthesis response contains no usable proposal blocks.",
@@ -4021,6 +4248,30 @@ class ProductionSynthesisService:
                     "diagnostics": wire_diagnostics,
                 },
             )
+        if publication_kind is PublicationKind.BRIEF:
+            brief_structure_error = validate_brief_narrative(
+                title=parsed.proposal.title or "",
+                paragraphs=(claim.text for claim in parsed.proposal.lead),
+                section_count=len(parsed.proposal.sections),
+            )
+            if brief_structure_error is not None:
+                await self._record_wire_parse(
+                    model_run,
+                    evidence_pack,
+                    parsed,
+                    validation_error=brief_structure_error,
+                    prompt_version=prompt_version,
+                )
+                return reviewed(
+                    brief_structure_error,
+                    "The brief synthesis did not meet the required narrative format.",
+                    run_id=model_run.id,
+                    details={
+                        **self._model_evidence(model_run),
+                        "publication_kind": PublicationKind.BRIEF.value,
+                        "routing_decision_hash": routing_decision_hash,
+                    },
+                )
         try:
             lead, sections = validate_synthesis_proposal(
                 parsed.proposal,
@@ -4034,6 +4285,7 @@ class ProductionSynthesisService:
                 evidence_pack,
                 parsed,
                 validation_error=exc.code.value,
+                prompt_version=prompt_version,
             )
             return reviewed(
                 exc.code.value,
@@ -4051,7 +4303,9 @@ class ProductionSynthesisService:
                     "diagnostics": wire_diagnostics,
                 },
             )
-        await self._record_wire_parse(model_run, evidence_pack, parsed)
+        await self._record_wire_parse(
+            model_run, evidence_pack, parsed, prompt_version=prompt_version
+        )
 
         model_title = parsed.proposal.title
         title_is_valid = is_valid_editorial_title(model_title)
@@ -4071,9 +4325,25 @@ class ProductionSynthesisService:
             parsed.proposal, evidence_pack
         )
         timeline_warnings: list[str] = []
-        timeline = build_synthesis_timeline(
+        projected_timeline = build_synthesis_timeline(
             extraction, projection=projection, warnings=timeline_warnings
         )
+        timeline = (
+            brief_timeline if publication_kind is PublicationKind.BRIEF else projected_timeline
+        )
+        if publication_kind is PublicationKind.BRIEF and timeline is None:
+            return reviewed(
+                "brief_chronology_unavailable",
+                "A source-grounded dated chronology could not be established.",
+                run_id=model_run.id,
+                details={
+                    "publication_kind": PublicationKind.BRIEF.value,
+                    "routing_decision_hash": routing_decision_hash,
+                    "dated_timeline_entry_count": 0,
+                    "diagnostic": "brief_timeline_requires_1_to_4_source_dated_entries",
+                },
+            )
+        assert timeline is not None
         synthesis = ProductionSynthesisV1(
             schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
             subject_id=snapshot.subject_id,
@@ -4115,6 +4385,16 @@ class ProductionSynthesisService:
             routing_policy_version=SYNTHESIS_ROUTING_POLICY_VERSION,
             projection_hash=projection.projection_hash if projection is not None else None,
             diagnostics=diagnostics,
+            metadata_extra=(
+                {
+                    "publication_kind": publication_kind.value,
+                    "routing_decision_hash": routing_decision_hash,
+                    "publication_routing_policy_version": publication_routing_policy_version,
+                    "synthesis_prompt_version": prompt_version,
+                }
+                if routing_decision_hash is not None
+                else {}
+            ),
         )
         return ProductionSynthesisExecution(
             status=SynthesisExecutionStatus.SUCCEEDED,

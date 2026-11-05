@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 
-from cti_app.domain.production import ProductionArtifactStage, ProductionStage
+from cti_app.domain.production import ProductionArtifactStage, ProductionRun, ProductionStage
 from cti_app.domain.production_pipeline import (
     PRODUCTION_PIPELINE,
     ProductionStageSpec,
@@ -16,6 +18,7 @@ from cti_app.domain.production_pipeline import (
     production_stages,
     stage_spec,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 def test_production_stage_order_and_stage_artifact_mapping() -> None:
@@ -94,6 +97,81 @@ def test_prerequisite_artifacts_follow_the_pipeline() -> None:
 )
 def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -> None:
     assert next_stage(stage) is successor
+
+
+def test_brief_route_skips_enrichment_and_its_artifact() -> None:
+    brief_stages = production_stages(PublicationKind.BRIEF)
+    assert ProductionStage.EDITORIAL_ENRICHMENT not in brief_stages
+    assert production_artifact_stages(PublicationKind.BRIEF) == (
+        ProductionArtifactStage.REFERENCES,
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
+        ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.PUBLICATION,
+    )
+    assert next_stage(ProductionStage.SYNTHESIS, publication_kind=PublicationKind.BRIEF) is (
+        ProductionStage.ASSEMBLY
+    )
+    assert downstream_artifacts_from_pipeline_stage(
+        ProductionStage.SYNTHESIS, publication_kind=PublicationKind.BRIEF
+    ) == (ProductionArtifactStage.PUBLICATION,)
+
+
+@pytest.mark.parametrize(
+    ("publication_kind", "expected_stage"),
+    [
+        (PublicationKind.ARTICLE, ProductionStage.EDITORIAL_ENRICHMENT),
+        (PublicationKind.BRIEF, ProductionStage.ASSEMBLY),
+    ],
+)
+def test_run_transition_uses_adopted_publication_route(
+    publication_kind: PublicationKind,
+    expected_stage: ProductionStage,
+) -> None:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    run.start_running()
+    run.current_stage = ProductionStage.SYNTHESIS
+
+    run.advance_stage(publication_kind=publication_kind)
+
+    assert run.current_stage is expected_stage
+
+
+def test_mixed_batch_routes_each_subject_independently() -> None:
+    kinds = (
+        PublicationKind.ARTICLE,
+        PublicationKind.BRIEF,
+        PublicationKind.ARTICLE,
+        PublicationKind.BRIEF,
+        PublicationKind.BRIEF,
+    )
+    runs = [ProductionRun(subject_id=uuid4(), edition_id=uuid4()) for _ in kinds]
+    for run in runs:
+        run.start_running()
+        run.current_stage = ProductionStage.SYNTHESIS
+
+    for run, publication_kind in zip(runs, kinds, strict=True):
+        run.advance_stage(publication_kind=publication_kind)
+
+    runs[1].mark_needs_review(
+        code="brief_chronology_unavailable",
+        message="A source-grounded dated chronology could not be established.",
+    )
+
+    assert tuple(run.current_stage for run in runs) == (
+        ProductionStage.EDITORIAL_ENRICHMENT,
+        ProductionStage.ASSEMBLY,
+        ProductionStage.EDITORIAL_ENRICHMENT,
+        ProductionStage.ASSEMBLY,
+        ProductionStage.ASSEMBLY,
+    )
+    assert tuple(run.status.value for run in runs) == (
+        "running",
+        "needs_review",
+        "running",
+        "running",
+        "running",
+    )
 
 
 @pytest.mark.parametrize(

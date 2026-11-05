@@ -55,6 +55,7 @@ from cti_app.domain.production import (
     model_run_awaits_reconciliation,
 )
 from cti_app.domain.production_pipeline import production_stages
+from cti_app.domain.production_routing import RoutingStatus
 
 # Every automatic production stage job — SOURCES from the API, and every
 # chained stage submitted by ProductionStageChain — shares this retry policy.
@@ -665,6 +666,18 @@ def register_production_jobs(
         await context.check_cancelled()
         async with uow_factory() as uow:
             current = await uow.production_runs.get(parameters.run_id)
+            route = (
+                await uow.production_routing_decisions.get(current.routing_decision_id)
+                if current is not None
+                and current.routing_decision_id is not None
+                and getattr(uow, "production_routing_decisions", None) is not None
+                else None
+            )
+        publication_kind = (
+            route.publication_kind
+            if route is not None and route.status is RoutingStatus.DECIDED
+            else None
+        )
         if current is None or current.pipeline_generation != parameters.pipeline_generation:
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         if current.status is ProductionRunStatus.CANCELLED:
@@ -692,11 +705,18 @@ def register_production_jobs(
         if current.current_stage is not stage:
             if (
                 current.status is ProductionRunStatus.RUNNING
-                and current.current_stage in production_stages()
+                and current.current_stage in production_stages(publication_kind)
             ):
                 await context.check_cancelled()
                 async with uow_factory() as uow:
                     current = await uow.production_runs.get(parameters.run_id)
+                    route = (
+                        await uow.production_routing_decisions.get(current.routing_decision_id)
+                        if current is not None
+                        and current.routing_decision_id is not None
+                        and getattr(uow, "production_routing_decisions", None) is not None
+                        else None
+                    )
                 if current is None or current.status is ProductionRunStatus.CANCELLED:
                     return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
                 try:
@@ -739,7 +759,21 @@ def register_production_jobs(
 
         await context.check_cancelled()
 
-        stages = list(production_stages())
+        async with uow_factory() as uow:
+            latest_for_progress = await uow.production_runs.get(parameters.run_id)
+            route = (
+                await uow.production_routing_decisions.get(latest_for_progress.routing_decision_id)
+                if latest_for_progress is not None
+                and latest_for_progress.routing_decision_id is not None
+                and getattr(uow, "production_routing_decisions", None) is not None
+                else None
+            )
+        publication_kind = (
+            route.publication_kind
+            if route is not None and route.status is RoutingStatus.DECIDED
+            else None
+        )
+        stages = list(production_stages(publication_kind))
         stage_index = stages.index(stage)
         await context.report_progress(
             stage_index + 1,
@@ -755,6 +789,8 @@ def register_production_jobs(
                 public_message="Le run de production est introuvable.",
                 transient=False,
             )
+        if run.pipeline_generation != parameters.pipeline_generation:
+            return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         if run.status is ProductionRunStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         outcome = str(result.get("status", "success"))
@@ -843,7 +879,30 @@ def register_production_jobs(
             advancing = await uow.production_runs.get_for_update(parameters.run_id)
             if advancing is None or advancing.status is not ProductionRunStatus.RUNNING:
                 return f"production-stage://{parameters.run_id}/{stage.value}"
-            advancing.advance_stage()
+            route = (
+                await uow.production_routing_decisions.get(advancing.routing_decision_id)
+                if advancing.routing_decision_id is not None
+                and getattr(uow, "production_routing_decisions", None) is not None
+                else None
+            )
+            if stage is ProductionStage.SYNTHESIS and (
+                route is None or route.status is not RoutingStatus.DECIDED
+            ):
+                advancing.mark_needs_review(
+                    code="publication_routing_decision_missing",
+                    message="The production route was not adopted before synthesis completed.",
+                )
+                await uow.production_runs.save(advancing)
+                await uow.commit()
+                await advance_batch(parameters.run_id, correlation_id, context)
+                return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
+            advancing.advance_stage(
+                publication_kind=(
+                    route.publication_kind
+                    if route is not None and route.status is RoutingStatus.DECIDED
+                    else None
+                )
+            )
             await uow.production_runs.save(advancing)
             await uow.commit()
             next_stage = advancing.current_stage
