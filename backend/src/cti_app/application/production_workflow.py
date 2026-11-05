@@ -27,6 +27,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.persistence import (
     PRODUCTION_ROUTING_DECISION_STALE_CODE,
+    ProductionRoutingDecisionRepository,
     UnitOfWork,
     UnitOfWorkFactory,
 )
@@ -777,7 +778,9 @@ class ProductionWorkflowOrchestrator:
         if run.routing_decision_id is None:
             return None
         async with self._uow_factory() as uow:
-            repository = getattr(uow, "production_routing_decisions", None)
+            repository: ProductionRoutingDecisionRepository | None = getattr(
+                uow, "production_routing_decisions", None
+            )
             if repository is None:
                 return None
             return await repository.get(run.routing_decision_id)
@@ -1854,6 +1857,7 @@ class ProductionWorkflowOrchestrator:
                 }
             if decision.status is RoutingStatus.NEEDS_REVIEW:
                 return await self._mark_route_review(decision)
+            assert decision.publication_kind is not None
             result.update(
                 {
                     "publication_kind": decision.publication_kind.value,

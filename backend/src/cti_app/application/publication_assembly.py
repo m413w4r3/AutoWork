@@ -331,12 +331,15 @@ class PublicationAssemblyService:
         version = max(prior_versions, default=0) + 1
 
         if reusable_base is not None and reusable_base.id != (current.id if current else None):
-            try:
-                stored_candidate = await self._artifact_store.read_bytes(
-                    reusable_base.canonical_blob_id
-                )
-            except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError):
+            if reusable_base.canonical_blob_id is None:
                 stored_candidate = b""
+            else:
+                try:
+                    stored_candidate = await self._artifact_store.read_bytes(
+                        reusable_base.canonical_blob_id
+                    )
+                except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError):
+                    stored_candidate = b""
             if stored_candidate != canonical_bytes:
                 reusable_base = None
                 publication_artifact_id = uuid4()

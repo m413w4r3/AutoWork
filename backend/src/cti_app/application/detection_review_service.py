@@ -570,15 +570,15 @@ class DetectionReviewService:
                     raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
         digest = hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
         if document.schema_version == "6":
-            provenance = payload.get("provenance")
+            provenance_payload = payload.get("provenance")
             augmentation = base.metadata.get("publication_augmentation")
             previous_id = base.metadata.get("previous_publication_artifact_id")
             if (
-                not isinstance(provenance, Mapping)
+                not isinstance(provenance_payload, Mapping)
                 or not isinstance(augmentation, Mapping)
                 or str(augmentation.get("investigation_id")) != str(investigation.id)
                 or previous_id is None
-                or str(provenance.get("base_publication_artifact_id")) != str(previous_id)
+                or str(provenance_payload.get("base_publication_artifact_id")) != str(previous_id)
             ):
                 raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
             try:
@@ -606,7 +606,7 @@ class DetectionReviewService:
                 raise DetectionReviewError(
                     DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE
                 ) from None
-            if provenance.get("base_publication_sha256") != parent_sha256:
+            if provenance_payload.get("base_publication_sha256") != parent_sha256:
                 raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
         return base, digest
 

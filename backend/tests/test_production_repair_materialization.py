@@ -203,7 +203,8 @@ class _Uow:
         self.rolled_back = False
 
     async def _routing_decision(self, decision_id: UUID) -> object | None:
-        return self.production_routing_decisions.decisions.get(decision_id)
+        decision: object | None = self.production_routing_decisions.decisions.get(decision_id)
+        return decision
 
     async def _adopt_routing_decision(self, decision, *, expected_version: int):
         assert expected_version == self.run.version

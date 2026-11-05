@@ -2052,11 +2052,7 @@ def build_synthesis_model_request(
     return ModelRequest(
         text=prompt,
         prompt_template_id="production-synthesis",
-        prompt_template_version=(
-            BRIEF_SYNTHESIS_PROMPT_VERSION
-            if publication_kind is PublicationKind.BRIEF
-            else SYNTHESIS_PROMPT_VERSION
-        ),
+        prompt_template_version=SYNTHESIS_PROMPT_VERSION,
         evidence_pack_hash=pack_hash,
         external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
@@ -3490,11 +3486,11 @@ class ProductionSynthesisService:
                     "routing_status": routing_decision.status.value,
                 },
             )
-        publication_kind = (
-            routing_decision.publication_kind
-            if routing_decision is not None
-            else PublicationKind.ARTICLE
-        )
+        if routing_decision is None:
+            publication_kind = PublicationKind.ARTICLE
+        else:
+            assert routing_decision.publication_kind is not None
+            publication_kind = routing_decision.publication_kind
         routing_decision_hash = (
             routing_decision.decision_hash if routing_decision is not None else None
         )
@@ -3520,16 +3516,24 @@ class ProductionSynthesisService:
             policy = await self._load_access_policy(snapshot, extraction)
             evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
             access_policy_hash = synthesis_access_policy_hash(policy)
-            identity_options = {
-                "publication_kind": publication_kind if routing_decision is not None else None,
-                "routing_decision_hash": routing_decision_hash,
-                "publication_routing_policy_version": publication_routing_policy_version,
-            }
+            identity_publication_kind = publication_kind if routing_decision is not None else None
             input_hash = synthesis_input_hash(
-                snapshot, extraction, evidence_pack, access_policy_hash, **identity_options
+                snapshot,
+                extraction,
+                evidence_pack,
+                access_policy_hash,
+                publication_kind=identity_publication_kind,
+                routing_decision_hash=routing_decision_hash,
+                publication_routing_policy_version=publication_routing_policy_version,
             )
             invocation_hash = synthesis_invocation_hash(
-                snapshot, extraction, evidence_pack, access_policy_hash, **identity_options
+                snapshot,
+                extraction,
+                evidence_pack,
+                access_policy_hash,
+                publication_kind=identity_publication_kind,
+                routing_decision_hash=routing_decision_hash,
+                publication_routing_policy_version=publication_routing_policy_version,
             )
             brief_timeline = None
             if publication_kind is PublicationKind.BRIEF:

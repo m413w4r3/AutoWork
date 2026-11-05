@@ -947,6 +947,7 @@ class UnitOfWork(Protocol):
     investigation_states: InvestigationStateRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
+    production_routing_decisions: ProductionRoutingDecisionRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository
