@@ -137,6 +137,15 @@ function isPublicationDocument(
       value.base_publication.schema_version === "6"
     );
   }
+  if (value.schema_version === "6") {
+    return (
+      isRecord(value.provenance) &&
+      typeof value.provenance.base_publication_artifact_id === "string" &&
+      typeof value.provenance.base_publication_sha256 === "string" &&
+      isPublicationDocument(value.base_publication) &&
+      value.base_publication.schema_version === "5"
+    );
+  }
   const common =
     typeof value.title === "string" &&
     typeof value.subject_id === "string" &&
@@ -152,19 +161,28 @@ function isPublicationDocument(
   if (!common) return false;
   return (
     value.schema_version === "4" ||
-    ((value.schema_version === "5" || value.schema_version === "6") &&
+    (value.schema_version === "5" &&
       isSemanticText(value.rich_text) &&
-      (value.schema_version !== "6" ||
-        (Array.isArray(value.references) &&
-          value.references.every(
-            (reference) =>
-              isRecord(reference) &&
-              typeof reference.source_document_id === "string" &&
-              typeof reference.text === "string" &&
-              Array.isArray(reference.evidence_refs),
-          ) &&
-          Array.isArray(value.original_indicators))))
+      Array.isArray(value.references) &&
+      value.references.every(
+        (reference) =>
+          isRecord(reference) &&
+          typeof reference.source_document_id === "string" &&
+          typeof reference.text === "string" &&
+          Array.isArray(reference.evidence_refs),
+      ) &&
+      Array.isArray(value.original_indicators))
   );
+}
+
+function publicationDocumentBody(
+  document: PublicationDocumentArtifact,
+): PublicationDocument {
+  if (document.schema_version === "7") {
+    return document.base_publication.base_publication;
+  }
+  if (document.schema_version === "6") return document.base_publication;
+  return document;
 }
 
 function isExtractionDocument(value: unknown): value is ExtractionDocumentV2 {
@@ -1248,12 +1266,7 @@ function semanticContent(
   text: string,
   anchor: string,
 ) {
-  if (
-    document.schema_version === "4" ||
-    (document.schema_version === "6" && anchor === "title")
-  ) {
-    return text;
-  }
+  if (document.schema_version === "4") return text;
   const paragraph = document.rich_text.paragraphs.find(
     (item) => item.anchor === anchor,
   );
@@ -1343,9 +1356,9 @@ export function PublicationDocumentView({
     ...document.figures,
   ].some((item) => item.placement.kind === "after_timeline");
   const publicationReferences =
-    document.schema_version === "6" ? document.references : [];
+    document.schema_version === "5" ? document.references : [];
   const originalIndicators =
-    document.schema_version === "6" ? document.original_indicators : [];
+    document.schema_version === "5" ? document.original_indicators : [];
   const hasReferences =
     publicationReferences.length > 0 ||
     document.timeline.length > 0 ||
@@ -1543,13 +1556,13 @@ export function PublicationDocumentView({
         (document.indicators.length > 0 || originalIndicators.length > 0) ? (
           <section
             aria-label={
-              document.schema_version === "6"
+              document.schema_version === "5"
                 ? `ANNEXE TECHNIQUE — IOC (${document.indicators.reduce((count, group) => count + group.indicators.length, 0)})`
                 : "ANNEXE TECHNIQUE — INDICATEURS"
             }
           >
             <h4>
-              {document.schema_version === "6"
+              {document.schema_version === "5"
                 ? `ANNEXE TECHNIQUE — IOC (${document.indicators.reduce((count, group) => count + group.indicators.length, 0)})`
                 : "ANNEXE TECHNIQUE — INDICATEURS"}
             </h4>
@@ -1557,7 +1570,7 @@ export function PublicationDocumentView({
               <div key={group.artifact_type}>
                 <h5>
                   {IOC_LABELS[group.artifact_type] || group.artifact_type}
-                  {document.schema_version === "6"
+                  {document.schema_version === "5"
                     ? ` (${group.indicators.length})`
                     : ""}
                 </h5>
@@ -2059,10 +2072,9 @@ export function ProductionArtifactView({
     isPublicationDocument(artifact.canonical_content)
       ? artifact.canonical_content
       : null;
-  const publicationDocument =
-    publicationEnvelope?.schema_version === "7"
-      ? publicationEnvelope.base_publication
-      : publicationEnvelope;
+  const publicationDocument = publicationEnvelope
+    ? publicationDocumentBody(publicationEnvelope)
+    : null;
   const publicationKind =
     publicationEnvelope?.schema_version === "7"
       ? publicationEnvelope.publication_kind

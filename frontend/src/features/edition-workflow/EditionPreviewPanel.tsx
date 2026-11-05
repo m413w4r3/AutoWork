@@ -9,11 +9,20 @@ import {
   pdfInspectionUrl,
   renderInputInspectionUrl,
 } from "../../api/publication";
-import type { PublicationDocumentArtifact } from "../../api/production";
+import type {
+  PublicationDocument,
+  PublicationDocumentArtifact,
+} from "../../api/production";
 import { PublicationDocumentView } from "../../components/ProductionArtifactView";
 
-function publicationContent(document: PublicationDocumentArtifact) {
-  return document.schema_version === "7" ? document.base_publication : document;
+function publicationContent(
+  document: PublicationDocumentArtifact,
+): PublicationDocument {
+  if (document.schema_version === "7") {
+    return document.base_publication.base_publication;
+  }
+  if (document.schema_version === "6") return document.base_publication;
+  return document;
 }
 
 function classificationKey(position: number, subjectId: string) {

@@ -50,10 +50,18 @@ class _G1Transport(ScriptedInvestigationTransport):
             observations = tuple(
                 await uow.evidence_observations.list_for_investigation(self._investigation_id)
             )
+            invocations = tuple(
+                await uow.tool_invocations.list_for_investigation(self._investigation_id)
+            )
         association = next(
             (item for item in associations if item.sample_sha256 == self._material.sample_hash),
             None,
         )
+        if self._phase > 0:
+            assert association is not None, [
+                (item.tool_name, item.status.value, item.response_refs)
+                for item in invocations
+            ]
         if self._phase == 0:
             response = decision(
                 "Download the exact synthetic VT sample.",
@@ -131,6 +139,7 @@ async def test_w15_download_finish_refusal_analysis_then_finish(
             driver.artifact_store,
             suffix=f"w15-g1-{uuid4().hex[:8]}",
             material=material,
+            seed_observation_object_type="sample",
             article_claim=f"The report documents sample SHA-256 {sample_hash}.",
         )
         vt = HashCheckedVirusTotal(material=material)
@@ -192,7 +201,13 @@ async def test_w15_download_finish_refusal_analysis_then_finish(
             )
             state = await uow.investigation_states.get(seeded.investigation.id)
 
-        association = next(item for item in associations if item.sample_sha256 == sample_hash)
+        association = next(
+            (item for item in associations if item.sample_sha256 == sample_hash),
+            None,
+        )
+        assert association is not None, [
+            (item.tool_name, item.status.value, item.response_refs) for item in invocations
+        ]
         download = next(item for item in invocations if item.tool_name == "vt.download_sample")
         analysis = next(item for item in invocations if item.tool_name == "sample.analyze")
         assert download.status is ToolInvocationStatus.SUCCEEDED

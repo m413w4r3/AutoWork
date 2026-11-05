@@ -1636,6 +1636,7 @@ class PublicationDocumentV6BaseMismatchError(PublicationDocumentV6ValidationErro
 class PublicationDocumentV6ProvenanceV1:
     base_publication_artifact_id: UUID
     base_publication_sha256: str
+    base_publication_body_sha256: str | None = None
     investigation_id: UUID | None = None
     opinion_id: UUID | None = None
     opinion_version: int | None = None
@@ -1647,6 +1648,11 @@ class PublicationDocumentV6ProvenanceV1:
         if not isinstance(self.base_publication_artifact_id, UUID):
             raise PublicationDocumentV6BaseMismatchError()
         validate_sha256(self.base_publication_sha256, "V6 base publication SHA-256")
+        if self.base_publication_body_sha256 is not None:
+            validate_sha256(
+                self.base_publication_body_sha256,
+                "V6 base publication body SHA-256",
+            )
         values = (
             self.investigation_id,
             self.opinion_id,
@@ -2029,9 +2035,10 @@ class PublicationDocumentV6:
             raise PublicationDocumentV6BaseMismatchError()
         if not isinstance(self.provenance, PublicationDocumentV6ProvenanceV1):
             raise PublicationDocumentV6BaseMismatchError()
-        if publication_document_v5_sha256(self.base_publication) != (
-            self.provenance.base_publication_sha256
-        ):
+        expected_body_sha256 = (
+            self.provenance.base_publication_body_sha256 or self.provenance.base_publication_sha256
+        )
+        if publication_document_v5_sha256(self.base_publication) != expected_body_sha256:
             raise PublicationDocumentV6BaseMismatchError()
 
         opinion = self.analyst_opinion
@@ -2113,7 +2120,7 @@ class PublicationDocumentV6:
             raise PublicationDocumentV6ValidationError(code)
         if graph is not None and (
             graph.investigation_id != opinion.investigation_id
-            or graph.publication_sha256 != provenance.base_publication_sha256
+            or graph.publication_sha256 != expected_body_sha256
         ):
             raise PublicationDocumentV6ValidationError(
                 PublicationDocumentV6ErrorCode.OPINION_INVALID
@@ -2309,7 +2316,7 @@ def publication_document_v5_sha256(document: PublicationDocumentV5) -> str:
 def _publication_v6_provenance_to_json(
     value: PublicationDocumentV6ProvenanceV1,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "base_publication_artifact_id": str(value.base_publication_artifact_id),
         "base_publication_sha256": value.base_publication_sha256,
         "investigation_id": str(value.investigation_id) if value.investigation_id else None,
@@ -2319,31 +2326,40 @@ def _publication_v6_provenance_to_json(
         "reviewer_id": value.reviewer_id,
         "approver_id": value.approver_id,
     }
+    if value.base_publication_body_sha256 is not None:
+        payload["base_publication_body_sha256"] = value.base_publication_body_sha256
+    return payload
 
 
 def _publication_v6_provenance_from_json(raw: Any) -> PublicationDocumentV6ProvenanceV1:
-    item = json_object(
-        raw,
-        frozenset(
-            {
-                "base_publication_artifact_id",
-                "base_publication_sha256",
-                "investigation_id",
-                "opinion_id",
-                "opinion_version",
-                "opinion_content_sha256",
-                "reviewer_id",
-                "approver_id",
-            }
-        ),
-        "PublicationDocumentV6 provenance",
+    fields = frozenset(
+        {
+            "base_publication_artifact_id",
+            "base_publication_sha256",
+            "investigation_id",
+            "opinion_id",
+            "opinion_version",
+            "opinion_content_sha256",
+            "reviewer_id",
+            "approver_id",
+        }
     )
+    optional_body_hash = "base_publication_body_sha256"
+    if isinstance(raw, Mapping) and set(raw) == fields | {optional_body_hash}:
+        item = raw
+    else:
+        item = json_object(raw, fields, "PublicationDocumentV6 provenance")
     return PublicationDocumentV6ProvenanceV1(
         base_publication_artifact_id=json_uuid(
             item["base_publication_artifact_id"], "V6 base publication artifact ID"
         ),
         base_publication_sha256=json_sha256(
             item["base_publication_sha256"], "V6 base publication SHA-256"
+        ),
+        base_publication_body_sha256=(
+            json_sha256(item[optional_body_hash], "V6 base publication body SHA-256")
+            if optional_body_hash in item
+            else None
         ),
         investigation_id=json_uuid(item["investigation_id"], "V6 investigation ID")
         if item["investigation_id"] is not None
@@ -2573,6 +2589,20 @@ type CanonicalPublicationDocument = (
 )
 
 
+def publication_document_article_v5_body(
+    document: CanonicalPublicationDocument,
+) -> PublicationDocumentV5 | None:
+    """Return an article's V5 content from its canonical document envelope."""
+    if isinstance(document, PublicationDocumentV5):
+        return document
+    if (
+        isinstance(document, PublicationDocumentV7)
+        and document.publication_kind is PublicationKind.ARTICLE
+    ):
+        return document.base_publication.base_publication
+    return None
+
+
 def publication_document_v4_to_json(document: PublicationDocumentV4) -> dict[str, Any]:
     if not isinstance(document, PublicationDocumentV4):
         raise ValueError("Expected a PublicationDocumentV4")
@@ -2691,6 +2721,7 @@ __all__ = [
     "PublicationTableV1",
     "order_publication_references",
     "parse_publication_document",
+    "publication_document_article_v5_body",
     "publication_document_from_json",
     "publication_document_text_anchors",
     "publication_document_v4_from_json",

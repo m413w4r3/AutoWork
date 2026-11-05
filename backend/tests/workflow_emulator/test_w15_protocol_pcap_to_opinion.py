@@ -1352,6 +1352,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                     revised.id,
                     version=revised.version,
                     sha256=revised.content_sha256,
+                    acknowledge_bridge_drafting_gap=True,
                 )
                 assert approved.status_code == 200, approved.text
                 approved_body = approved.json()["approved"]

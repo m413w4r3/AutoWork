@@ -537,6 +537,7 @@ class TypstDraftPreviewDocument:
     infrastructure_graph: InvestigationGraph | None = None
     findings: tuple[InvestigationFinding, ...] = ()
     evidence_observations: tuple[EvidenceObservation, ...] = ()
+    base_publication_body_sha256: str | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_publication, name)
@@ -563,15 +564,15 @@ class TypstDraftPreviewDocument:
             or self.synthesis.publication_language != self.base_publication.publication_language
         ):
             raise ValueError("Draft preview synthesis does not match the pinned publication")
+        expected_body_sha256 = (
+            self.base_publication_body_sha256 or self.analyst_opinion.base_publication_sha256
+        )
         if self.infrastructure_graph is not None and (
             self.infrastructure_graph.investigation_id != self.analyst_opinion.investigation_id
-            or self.infrastructure_graph.publication_sha256
-            != self.analyst_opinion.base_publication_sha256
+            or self.infrastructure_graph.publication_sha256 != expected_body_sha256
         ):
             raise ValueError("Draft preview infrastructure graph is not pinned to its V5 opinion")
-        if publication_document_v5_sha256(self.base_publication) != (
-            self.analyst_opinion.base_publication_sha256
-        ):
+        if publication_document_v5_sha256(self.base_publication) != expected_body_sha256:
             raise ValueError("Draft opinion does not identify this exact V5 publication")
         anchors = publication_document_text_anchors(
             self.base_publication.document,

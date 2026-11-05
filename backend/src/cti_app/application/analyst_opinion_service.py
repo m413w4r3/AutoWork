@@ -75,10 +75,10 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication_document import (
-    PublicationDocumentV5,
+    publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_text_anchors,
-    publication_document_v5_sha256,
+    serialize_publication_document,
 )
 
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
@@ -1004,11 +1004,12 @@ class AnalystOpinionService:
                 base_document = publication_document_from_json(json.loads(base_bytes))
             except Exception as exc:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
-            if not isinstance(base_document, PublicationDocumentV5):
+            base_document_v5 = publication_document_article_v5_body(base_document)
+            if base_document_v5 is None:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
             anchors = publication_document_text_anchors(
-                base_document.document,
-                references=base_document.references,
+                base_document_v5.document,
+                references=base_document_v5.references,
             )
             if any(
                 note.anchor not in anchors or not note.anchor.startswith(("lead:", "section:"))
@@ -1456,10 +1457,12 @@ class AnalystOpinionService:
             document = publication_document_from_json(json.loads(base_bytes))
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
-        if (
-            not isinstance(document, PublicationDocumentV5)
-            or publication_document_v5_sha256(document) != base_sha256
-        ):
+        if publication_document_article_v5_body(document) is None:
+            raise OpinionError(OpinionErrorCode.BASE_INVALID)
+        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(
+            serialize_publication_document(document)
+        )
+        if canonical_bytes != base_bytes:
             raise OpinionError(OpinionErrorCode.BASE_INVALID)
         return base, base_sha256, synthesis_sha256
 

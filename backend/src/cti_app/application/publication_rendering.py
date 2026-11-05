@@ -298,6 +298,7 @@ class PublicationRenderService:
         opinion: AnalystOpinionV1,
         synthesis: ProductionSynthesisV1 | None = None,
         *,
+        base_publication_body_sha256: str | None = None,
         base_publication_identity: dict[str, Any] | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
@@ -313,6 +314,7 @@ class PublicationRenderService:
                 None,
                 findings,
                 evidence_observations,
+                base_publication_body_sha256,
             )
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc

@@ -31,9 +31,9 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.publication_document import (
-    PublicationDocumentV5,
+    publication_document_article_v5_body,
     publication_document_from_json,
-    publication_document_v5_sha256,
+    serialize_publication_document,
 )
 
 
@@ -107,9 +107,14 @@ class AnalystPublicationService:
                 document = publication_document_from_json(json.loads(base_bytes))
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
+            base_document_v5 = publication_document_article_v5_body(document)
+            if base_document_v5 is None:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID)
             if (
-                not isinstance(document, PublicationDocumentV5)
-                or publication_document_v5_sha256(document) != base_sha256
+                ProductionArtifactStore.canonical_json_bytes(
+                    serialize_publication_document(document)
+                )
+                != base_bytes
             ):
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
             if base_sha256 != expected_base_publication_sha256:

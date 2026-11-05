@@ -744,6 +744,7 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                         UUID(revised_body["id"]),
                         version=revised_body["version"],
                         sha256=revised_body["content_sha256"],
+                        acknowledge_bridge_drafting_gap=True,
                     ),
                     via="http",
                     action_name="approve the exact revised opinion version and content hash",

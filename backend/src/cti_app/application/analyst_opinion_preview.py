@@ -31,8 +31,10 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
+    publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_v5_sha256,
+    serialize_publication_document,
 )
 
 
@@ -43,6 +45,7 @@ class DraftOpinionPdfRenderer(Protocol):
         opinion: AnalystOpinionV1,
         synthesis: ProductionSynthesisV1,
         *,
+        base_publication_body_sha256: str | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
@@ -62,7 +65,7 @@ class AnalystOpinionDraftPdf:
 
 
 class AnalystOpinionPreviewService:
-    """Verify the current V5/opinion pins, then render to a private temp workspace."""
+    """Verify current publication/opinion pins, then render to a private temp workspace."""
 
     def __init__(
         self,
@@ -167,15 +170,19 @@ class AnalystOpinionPreviewService:
 
         base_sha256 = hashlib.sha256(base_bytes).hexdigest()
         synthesis_sha256 = hashlib.sha256(synthesis_bytes).hexdigest()
+        base_document_v5 = publication_document_article_v5_body(document)
+        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(
+            serialize_publication_document(document)
+        )
         if (
-            not isinstance(document, PublicationDocumentV5)
-            or publication_document_v5_sha256(document) != base_sha256
+            base_document_v5 is None
+            or canonical_bytes != base_bytes
             or base_sha256 != opinion.base_publication_sha256
             or base_sha256 != expected_base_publication_sha256
             or synthesis_sha256 != opinion.synthesis_sha256
-            or parsed_synthesis.subject_id != document.subject_id
-            or parsed_synthesis.title != document.title
-            or parsed_synthesis.publication_language != document.publication_language
+            or parsed_synthesis.subject_id != base_document_v5.subject_id
+            or parsed_synthesis.title != base_document_v5.title
+            or parsed_synthesis.publication_language != base_document_v5.publication_language
         ):
             raise OpinionError(OpinionErrorCode.STALE_BASE)
 
@@ -194,17 +201,23 @@ class AnalystOpinionPreviewService:
                 content_sha256="",
             )
 
+        renderer_kwargs: dict[str, Any] = {}
+        if document is not base_document_v5:
+            renderer_kwargs["base_publication_body_sha256"] = publication_document_v5_sha256(
+                base_document_v5
+            )
         infrastructure_graph = await self._graph_source.project(
             investigation_id=opinion.investigation_id,
-            publication=document,
+            publication=base_document_v5,
             observations=observations,
             findings=findings,
         )
         if infrastructure_graph is None:
             compiled = await self._renderer.render_draft_preview(
-                document,
+                base_document_v5,
                 render_opinion,
                 parsed_synthesis,
+                **renderer_kwargs,
                 findings=findings,
                 evidence_observations=observations,
                 base_publication_identity={
@@ -220,9 +233,10 @@ class AnalystOpinionPreviewService:
             )
         else:
             compiled = await self._renderer.render_draft_preview(
-                document,
+                base_document_v5,
                 render_opinion,
                 parsed_synthesis,
+                **renderer_kwargs,
                 infrastructure_graph=infrastructure_graph,
                 findings=findings,
                 evidence_observations=observations,
