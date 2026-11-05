@@ -8,6 +8,7 @@ import json
 import struct
 import time
 import zipfile
+from typing import cast
 
 import pytest
 
@@ -36,7 +37,7 @@ def _zip_fixture(
 
 
 def _read_result(result: dict[str, object]) -> dict[str, object]:
-    return json.loads(str(result["stdout"]))
+    return cast(dict[str, object], json.loads(str(result["stdout"])))
 
 
 def _redirect_archive_tempdir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> list[str | None]:
@@ -52,12 +53,18 @@ def _redirect_archive_tempdir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> list
     return requested_dirs
 
 
-async def _run_zip(payload: bytes, **options: object) -> dict[str, object]:
+async def _run_zip(
+    payload: bytes,
+    *,
+    member_prefix: str | None = None,
+    max_members: int = 2000,
+    max_output_bytes: int = 512 * 1024,
+) -> dict[str, object]:
     return await run_zip_members(
         payload,
-        member_prefix=options.get("member_prefix"),  # type: ignore[arg-type]
-        max_members=int(options.get("max_members", 2000)),
-        max_output_bytes=int(options.get("max_output_bytes", 512 * 1024)),
+        member_prefix=member_prefix,
+        max_members=max_members,
+        max_output_bytes=max_output_bytes,
         tool_version="autowork-zip-members-v1",
     )
 

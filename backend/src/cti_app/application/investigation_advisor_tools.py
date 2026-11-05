@@ -5240,15 +5240,19 @@ class InvestigationAdvisorTool:
             context.envelope,
             include_content=False,
         )
-        covered_sample_blob_ids = {
-            _safe_text(item.get("blob_id"), 64)
-            for item in base.get("measurements", ())
-            if isinstance(item, Mapping)
-            and item.get("range_verified") is True
-            and item.get("covers_whole_sample") is True
-        }
+        covered_sample_blob_ids: set[str] = set()
+        for item in base.get("measurements", ()):
+            if (
+                isinstance(item, Mapping)
+                and item.get("range_verified") is True
+                and item.get("covers_whole_sample") is True
+            ):
+                blob_id = item.get("blob_id")
+                if isinstance(blob_id, str):
+                    covered_sample_blob_ids.add(_safe_text(blob_id, 64))
         for sample_row in sample_rows:
-            if _safe_text(sample_row.get("blob_id"), 64) in covered_sample_blob_ids:
+            blob_id = sample_row.get("blob_id")
+            if isinstance(blob_id, str) and _safe_text(blob_id, 64) in covered_sample_blob_ids:
                 sample_row["covers_whole_sample"] = True
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
@@ -10347,12 +10351,11 @@ def _combine_editorial_batch_results(results: list[ToolResult]) -> ToolResult:
             output={"advisor_status": "output_invalid", "usable": False},
         )
     statuses = [item.status for item in results]
-    readable_outputs = [
-        (index, item, item.output.get("raw_output"))
-        for index, item in enumerate(results, start=1)
-        if isinstance(item.output.get("raw_output"), str)
-        and _advisor_reply_is_readable(item.output["raw_output"])
-    ]
+    readable_outputs: list[tuple[int, ToolResult, str]] = []
+    for index, item in enumerate(results, start=1):
+        raw_output = item.output.get("raw_output")
+        if isinstance(raw_output, str) and _advisor_reply_is_readable(raw_output):
+            readable_outputs.append((index, item, raw_output))
     has_usable_content = any(
         item.output.get("usable") is True
         or any(
@@ -12900,7 +12903,9 @@ def _drop_findings_linked_to_restricted_evidence(
     return tuple(dropped)
 
 
-def _safe_text(value: str, max_chars: int) -> str:
+def _safe_text(value: object, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return ""
     return value.strip()
 
 

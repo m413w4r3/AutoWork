@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import pytest
 
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
+from cti_app.application.investigation_advisor_tools import _safe_text
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -46,6 +47,13 @@ RESERVATION_PROPERTY_TYPES = (
     "draft_text",
     "plan_investigation",
 )
+
+
+def test_safe_text_handles_missing_optional_values() -> None:
+    assert _safe_text(None, 64) == ""
+    assert _safe_text(" sample ", 64) == "sample"
+
+
 # The first build is the dossier actually used for the prompt. Later base-code
 # builds came from redundant alias generation and are not the consultation dossier.
 BASELINE_EXECUTION = {

@@ -6,7 +6,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -88,7 +88,7 @@ _bridge_submission_boundary_state: ContextVar[list[bool] | None] = ContextVar(
 
 
 @contextmanager
-def bridge_submission_boundary(callback: Callable[[], None] | None):
+def bridge_submission_boundary(callback: Callable[[], None] | None) -> Iterator[None]:
     """Carry the consultation's send marker to the HTTP boundary in this task."""
     callback_token = _bridge_submission_started_callback.set(callback)
     state_token = _bridge_submission_boundary_state.set([False])
