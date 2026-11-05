@@ -260,7 +260,7 @@ def _render(release_id: UUID, **overrides: object) -> EditionRender:
         "compiler": "typst",
         "compiler_version": "0.15.1",
         "font_bundle_version": "test-font-bundle-v1",
-        "render_policy_version": "typst-edition-v3-v1",
+        "render_policy_version": "typst-edition-v4-brief-layout-footnotes",
         "format": TypstRenderFormat.PDF,
         "input_hash": sha256(uuid4().bytes).hexdigest(),
         "source_blob_id": None,

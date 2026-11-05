@@ -94,7 +94,13 @@
   if url in result { result } else { result + (url,) }
 })
 
-#let render-publication-timeline(events, ordered: false, reference-scope: "", date-fill: none) = {
+#let render-publication-timeline(
+  events,
+  ordered: false,
+  reference-scope: "",
+  date-fill: none,
+  footnotes: false,
+) = {
   let all-source-urls = events.fold((), (all, event) => {
     event.at("source_urls", default: ()).fold(all, (result, url) => {
       if url in result { result } else { result + (url,) }
@@ -119,7 +125,14 @@
         ]
       ]
       #semantic-or-plain(event.text, event.at("semantic_spans", default: none))
-      #if source-refs.len() > 0 [
+      #if footnotes [
+        #for (index, source-url) in source-urls.enumerate() [
+          #if index > 0 [, ]
+          #footnote[
+            #text(size: 7pt, fill: grey)[#link(source-url)[#source-url]]
+          ]
+        ]
+      ] else if source-refs.len() > 0 [
         #for (index, source-ref) in source-refs.enumerate() [
           #if index > 0 [, ]
           #let source-number = source-ref.at("number", default: index + 1)
@@ -147,7 +160,7 @@
     }
   }
   let uses-internal-refs = events.any(event => event.at("source_refs", default: ()).len() > 0)
-  if not ordered and all-source-urls.len() > 0 and not uses-internal-refs {
+  if not footnotes and not ordered and all-source-urls.len() > 0 and not uses-internal-refs {
     block(above: 2pt, below: 0pt)[
       #for (index, url) in all-source-urls.enumerate() [
         #if index > 0 [#linebreak()]
@@ -928,6 +941,7 @@
 }
 
 #let render-publication-body(publication, reference-scope: "") = {
+  let brief-publication = publication.at("kind", default: "article") == "brief"
   for content_section in publication.content_sections {
     if content_section.type == "references" {
       let legacy-timeline = content_section.at("timeline", default: ())
@@ -948,7 +962,11 @@
         legacy-timeline
       }
       let blocks = content_section.at("blocks", default: ())
-      if entries.len() > 0 or has-legacy-chronology or blocks.len() > 0 [
+      if brief-publication {
+        for item in blocks {
+          render-body-block(item, reference-scope: reference-scope)
+        }
+      } else if entries.len() > 0 or has-legacy-chronology or blocks.len() > 0 [
         #if content_section.at("show_heading", default: true) [
           #section-title[RÉFÉRENCES]
         ]
@@ -962,10 +980,20 @@
         }
       ]
     } else if content_section.type == "synthesis" [
-      #section-title[SYNTHÈSE]
-      #for item in content_section.at("blocks", default: ()) {
-        render-body-block(item, reference-scope: reference-scope)
-      }
+      #if brief-publication [
+        #section-title[Synthèse]
+        #block[
+          #set par(spacing: 1em)
+          #for item in content_section.at("blocks", default: ()) {
+            render-body-block(item, reference-scope: reference-scope)
+          }
+        ]
+      ] else [
+        #section-title[SYNTHÈSE]
+        #for item in content_section.at("blocks", default: ()) {
+          render-body-block(item, reference-scope: reference-scope)
+        }
+      ]
     ] else if content_section.type == "chronology" [
       #let brief-chronology = publication.at("kind", default: "article") == "brief"
       #let timeline-order = not brief-chronology
@@ -976,12 +1004,13 @@
         #section-title[CHRONOLOGIE]
       ]
       #let derived-figure = content_section.at("derived_timeline_figure", default: none)
-      #if derived-figure == none [
+      #if brief-chronology or derived-figure == none [
         #render-publication-timeline(
           content_section.timeline,
           ordered: timeline-order,
           reference-scope: reference-scope,
           date-fill: chronology-date-fill,
+          footnotes: brief-chronology,
         )
       ] else [
         #render-derived-timeline-figure(derived-figure, reference-scope: reference-scope)

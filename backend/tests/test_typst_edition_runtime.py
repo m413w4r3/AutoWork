@@ -76,6 +76,18 @@ class _BBoxPage(TypedDict):
     words: list[_BBoxWord]
 
 
+def _pdf_fragment_baselines(page, fragments: tuple[str, ...]) -> dict[str, tuple[float, ...]]:
+    positions: dict[str, list[float]] = {fragment: [] for fragment in fragments}
+
+    def collect(text, _cm, tm, _font_dictionary, _font_size) -> None:
+        for fragment in fragments:
+            if fragment in text:
+                positions[fragment].append(float(tm[5]))
+
+    page.extract_text(visitor_text=collect)
+    return {fragment: tuple(values) for fragment, values in positions.items()}
+
+
 def _edition_document() -> EditionDocumentV2:
     base = _full_document(
         tables=(
@@ -173,7 +185,10 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
         base,
         subject_id=UUID(int=3),
         title="Short operational update",
-        lead=(replace(base.lead[0], text="Brief body without titled sections."),),
+        lead=(
+            replace(base.lead[0], text="Brief body first paragraph."),
+            replace(base.lead[1], text="Brief body second paragraph."),
+        ),
         sections=(),
         timeline=base.timeline,
         indicators=(),
@@ -284,7 +299,29 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
         if "Short operational update" in page_text and "Chronologie" in page_text
     )
     assert brief_page_text.index("Short operational update") < brief_page_text.index("BRÈVE")
+    assert "RÉFÉRENCES" not in brief_page_text
+    assert brief_page_text.index("Chronologie") < brief_page_text.index("Synthèse")
+    assert "SYNTHÈSE" not in brief_page_text
+    assert "https://example.test/one" in brief_page_text
+    assert "https://example.test/two" in brief_page_text
     assert "CHRONOLOGIE" not in brief_page_text
+    baselines = _pdf_fragment_baselines(
+        next(
+            page
+            for page in reader.pages
+            if "Short operational update" in (page.extract_text() or "")
+        ),
+        (
+            "Brief body first paragraph.",
+            "Brief body second paragraph.",
+            "https://example.test/one",
+        ),
+    )
+    assert all(baselines.values())
+    first_y = max(baselines["Brief body first paragraph."])
+    second_y = max(baselines["Brief body second paragraph."])
+    assert first_y - second_y >= 16
+    assert max(baselines["https://example.test/one"]) < second_y
     assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
     for placeholder in (
         "Bulletin-CODE",

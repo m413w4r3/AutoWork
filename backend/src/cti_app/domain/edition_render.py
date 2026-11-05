@@ -17,8 +17,8 @@ from cti_app.domain.typst_render import (
 )
 
 EDITION_RENDERER = "typst"
-EDITION_RENDERER_VERSION = "edition-v4-typst-v4-analyst-opinion"
-EDITION_RENDER_POLICY_VERSION = "typst-edition-v3-v1"
+EDITION_RENDERER_VERSION = "edition-v5-typst-v5-brief-layout-footnotes"
+EDITION_RENDER_POLICY_VERSION = "typst-edition-v4-brief-layout-footnotes"
 
 
 class EditionRenderDisplayStatus(StrEnum):

@@ -1027,7 +1027,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
             ),
         ),
         sections=(),
-        timeline=(),
+        timeline=chp_parity_document.timeline,
         indicators=(),
         tables=(),
         diagrams=(),
@@ -1049,19 +1049,22 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     brief_compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(brief_request)
     brief_text, _ = _normalized_pdf_text(PdfReader(BytesIO(brief_compiled.content), strict=True))
     assert "GTG-30004 brief" in brief_text
-    assert "SYNTHÈSE" in brief_text
+    assert "Synthèse" in brief_text
+    assert "SYNTHÈSE" not in brief_text
+    assert "Chronologie" in brief_text
+    assert "RÉFÉRENCES" not in brief_text
     assert all(title not in brief_text for title in ("Accès initial", "Persistance", "Détection"))
     assert "extraction_source_skipped" not in text
     assert "synthesis_output_invalid" not in text
     assert "Attribution remains unresolved" not in text
     assert text.count("RÉFÉRENCES") == 1
-    assert "Chronologie" not in text
+    assert "CHRONOLOGIE" not in brief_text
     assert "Sources complémentaires" not in text
-    assert text.count("https://example.test/one") == 1
-    assert text.count("https://example.test/two") == 1
-    assert re.search(r"No display date\s*1", text)
-    assert re.search(r"Several source event\s*1\s*,\s*2", text)
-    assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
+    assert "https://example.test/one" in brief_text
+    assert "https://example.test/two" in brief_text
+    assert re.search(r"No display date\s*\d+", brief_text)
+    assert re.search(r"Several source event\s*\d+\s*,?\s*\d+", brief_text)
+    assert brief_text.index("Chronologie") < brief_text.index("Synthèse")
     assert text.count("Synthesis lead paragraph for parity coverage.") == 1
     assert text.count("A second lead paragraph.") == 1
     assert "Primary source" not in text
@@ -1800,7 +1803,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v31-editorial-layout-metadata",
+        "schema_version": "typst-publication-model-v32-brief-kind",
         "section_types": [
             "references",
             "chronology",

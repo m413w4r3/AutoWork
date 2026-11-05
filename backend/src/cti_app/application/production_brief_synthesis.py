@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import date
+from difflib import SequenceMatcher
 
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import (
@@ -25,6 +27,10 @@ _BRIEF_RECOMMENDATION_LANGUAGE = re.compile(
     r"il\s+faudrait|doit\s+être\s+mis\s+en\s+place)\b"
 )
 _BRIEF_LIST_PREFIX = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+")
+_TIMELINE_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_TIMELINE_ARTICLES = frozenset({"le", "la", "les", "un", "une", "l", "the", "an"})
+_TIMELINE_DEDUPE_MIN_WORDS = 7
+_TIMELINE_DEDUPE_SEQUENCE_OVERLAP = 0.88
 
 
 def build_brief_synthesis_prompt(
@@ -147,7 +153,53 @@ def brief_timeline_from_extraction(
             grounded.append(entry)
     if not grounded:
         return None
-    return tuple(grounded[:4])
+
+    deduplicated: list[SynthesisTimelineEntryV1] = []
+    for entry in grounded:
+        matches = [
+            index
+            for index, existing in enumerate(deduplicated)
+            if _same_brief_timeline_event(existing, entry)
+        ]
+        if len(matches) != 1:
+            deduplicated.append(entry)
+            continue
+        index = matches[0]
+        existing = deduplicated[index]
+        evidence_refs = tuple(dict.fromkeys((*existing.evidence_refs, *entry.evidence_refs)))
+        deduplicated[index] = replace(existing, evidence_refs=evidence_refs)
+    return tuple(deduplicated[:4])
+
+
+def _same_brief_timeline_event(
+    left: SynthesisTimelineEntryV1,
+    right: SynthesisTimelineEntryV1,
+) -> bool:
+    """Match same-date entries only when their content words are unchanged."""
+    if left.event_date is None or left.event_date != right.event_date:
+        return False
+    left_words = tuple(
+        word.casefold()
+        for word in _TIMELINE_WORD.findall(left.text)
+        if word.casefold() not in _TIMELINE_ARTICLES
+    )
+    right_words = tuple(
+        word.casefold()
+        for word in _TIMELINE_WORD.findall(right.text)
+        if word.casefold() not in _TIMELINE_ARTICLES
+    )
+    if left_words == right_words:
+        return True
+    if min(len(left_words), len(right_words)) < _TIMELINE_DEDUPE_MIN_WORDS:
+        return False
+    left_tokens = set(left_words)
+    right_tokens = set(right_words)
+    # Different content words may carry a different actor, action, or detail.
+    # Keep those entries separate even when their overall wording is similar.
+    if left_tokens != right_tokens:
+        return False
+    sequence_overlap = SequenceMatcher(None, left_words, right_words, autojunk=False).ratio()
+    return sequence_overlap >= _TIMELINE_DEDUPE_SEQUENCE_OVERLAP
 
 
 def validate_brief_narrative(

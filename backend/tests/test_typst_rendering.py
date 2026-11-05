@@ -289,7 +289,8 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v31-editorial-layout-metadata"
+    assert data["schema_version"] == "typst-publication-model-v32-brief-kind"
+    assert data["kind"] == "brief"
     assert data["document_label"] == "Libellé de fixture"
     assert data["document_header"] == "Publication"
     assert data["overview"] == {"status_label": "Publication", "source_count": 1}
@@ -331,6 +332,26 @@ def test_renderer_preserves_sample_cryptographic_material_in_clear(tmp_path: Pat
 
     rendered = _render(renderer, document, bundle)
     assert sample_value in rendered.render_data_bytes.decode("utf-8")
+
+
+def test_standalone_render_input_uses_explicit_v7_publication_kind(tmp_path: Path) -> None:
+    from cti_app.domain.publication_document import PublicationDocumentV7
+    from cti_app.domain.publication_kind import PublicationKind
+    from tests.test_publication_document_v6 import _base_v5
+    from tests.test_publication_document_v7 import _v6
+
+    renderer, bundle = _renderer(tmp_path)
+    base = _base_v5()
+    document = PublicationDocumentV7(
+        base_publication=_v6(base),
+        publication_kind=PublicationKind.BRIEF,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
+
+    assert data["kind"] == "brief"
 
 
 def test_opinion_github_tokens_and_typed_rc4_material_reach_publication_render_data(
@@ -857,7 +878,8 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v31-editorial-layout-metadata"
+    assert data["schema_version"] == "typst-publication-model-v32-brief-kind"
+    assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text

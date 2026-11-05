@@ -90,6 +90,7 @@ from cti_app.domain.production_references import (
 from cti_app.domain.production_relevance import relevance_projection_to_json
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
+    ExtractionEvidenceRefV1,
     SynthesisTimelineEntryV1,
     extraction_evidence_refs_v1,
     production_synthesis_from_json,
@@ -1992,13 +1993,81 @@ def test_brief_timeline_requires_source_date_and_caps_at_four_entries() -> None:
         evidence_refs=(event_ref,),
     )
     fabricated = replace(grounded, event_date=date(2026, 7, 3))
+    other_entries = (
+        replace(grounded, text="A separate diplomatic meeting took place."),
+        replace(grounded, text="A technical report identified another operation."),
+        replace(grounded, text="Researchers published additional campaign details."),
+        replace(grounded, text="Officials issued a distinct public statement."),
+        replace(grounded, text="A separate advisory documented another event."),
+    )
 
     assert brief_timeline_from_extraction(world.extraction, (grounded,)) == (grounded,)
     assert brief_timeline_from_extraction(world.extraction, (fabricated,)) is None
-    assert brief_timeline_from_extraction(
+    assert (
+        brief_timeline_from_extraction(
+            world.extraction,
+            other_entries,
+        )
+        == other_entries[:4]
+    )
+
+
+def _brief_extraction_with_timeline_texts(
+    *texts: str,
+) -> tuple[ProductionExtractionV1, tuple[ExtractionEvidenceRefV1, ...]]:
+    world = _brief_synthesis_world()
+    source = world.extraction.sources[0]
+    events = tuple(replace(source.events[0], text=text) for text in texts)
+    extraction = replace(
         world.extraction,
-        (grounded, replace(grounded, text="Second event."), grounded, grounded, grounded),
-    ) == (grounded, replace(grounded, text="Second event."), grounded, grounded)
+        sources=(replace(source, events=events),),
+    )
+    event_refs = tuple(
+        ref for ref in extraction_evidence_refs_v1(extraction) if ref.kind is EvidenceKind.EVENT
+    )
+    return extraction, event_refs
+
+
+def test_brief_timeline_merges_near_duplicate_text_and_keeps_both_evidence_refs() -> None:
+    first_text = (
+        "Le gouvernement français convoque l'ambassadeur chinois à Paris après la publication "
+        "officielle du rapport détaillé sur les activités diplomatiques le 2 juillet 2026."
+    )
+    second_text = first_text.replace("après la publication", "après publication")
+    extraction, event_refs = _brief_extraction_with_timeline_texts(first_text, second_text)
+    entries = tuple(
+        SynthesisTimelineEntryV1(
+            event_date=date(2026, 7, 2),
+            date_text=None,
+            text=text,
+            evidence_refs=(event_ref,),
+        )
+        for text, event_ref in zip((first_text, second_text), event_refs, strict=True)
+    )
+
+    timeline = brief_timeline_from_extraction(extraction, entries)
+
+    assert timeline == (replace(entries[0], evidence_refs=event_refs),)
+
+
+def test_brief_timeline_keeps_distinct_same_date_events_separate() -> None:
+    first_text = (
+        "Le gouvernement français convoque l'ambassadeur chinois à Paris après la publication "
+        "officielle du rapport détaillé sur les activités diplomatiques le 2 juillet 2026."
+    )
+    second_text = first_text.replace("convoque", "rappelle")
+    extraction, event_refs = _brief_extraction_with_timeline_texts(first_text, second_text)
+    entries = tuple(
+        SynthesisTimelineEntryV1(
+            event_date=date(2026, 7, 2),
+            date_text=None,
+            text=text,
+            evidence_refs=(event_ref,),
+        )
+        for text, event_ref in zip((first_text, second_text), event_refs, strict=True)
+    )
+
+    assert brief_timeline_from_extraction(extraction, entries) == entries
 
 
 @pytest.mark.parametrize(

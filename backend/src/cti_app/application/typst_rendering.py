@@ -14,6 +14,7 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from cti_app.application.edition_classification import is_brief
 from cti_app.application.investigation_figures import (
     build_investigation_chain_figure,
     build_investigation_graph_figure,
@@ -78,9 +79,9 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-# v31 adds template-driven editorial layout metadata and opinion pipe tables.
-# Canonical V5/V6 publication data remains unchanged.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v31-editorial-layout-metadata"
+# v32 adds publication kind for the standalone brief renderer.
+# Canonical publication document schemas and hashes remain unchanged.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v32-brief-kind"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -984,8 +985,14 @@ class TypstRenderer:
             )
 
         normalized_document_label = document_label.strip()
+        classification_document = (
+            document.base_publication
+            if isinstance(document, TypstDraftPreviewDocument)
+            else document
+        )
         render_data: dict[str, Any] = {
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
+            "kind": "brief" if is_brief(classification_document) else "article",
             "document_label": normalized_document_label,
             "document_label_display": _breakable_typst_display_text(
                 normalized_document_label,

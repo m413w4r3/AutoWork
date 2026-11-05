@@ -16,7 +16,7 @@ from cti_app.domain.typst_render import (
     validate_typst_render_record,
 )
 
-PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v7-chapsvision-cited-context"
+PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v8-brief-layout-footnotes"
 
 
 class PublicationPreviewStatus(StrEnum):
