@@ -203,8 +203,8 @@ class AnalystOpinionPreviewService:
 
         renderer_kwargs: dict[str, Any] = {}
         if document is not base_document_v5:
-            renderer_kwargs["base_publication_body_sha256"] = (
-                publication_document_v5_sha256(base_document_v5)
+            renderer_kwargs["base_publication_body_sha256"] = publication_document_v5_sha256(
+                base_document_v5
             )
         infrastructure_graph = await self._graph_source.project(
             investigation_id=opinion.investigation_id,

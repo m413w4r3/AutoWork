@@ -402,6 +402,10 @@ class PublicationAugmentationArtifactService:
                 raise PublicationAugmentationError(
                     PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
                 ) from exc
+            if not isinstance(base_document, (PublicationDocumentV5, PublicationDocumentV7)):
+                raise PublicationAugmentationError(
+                    PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
+                )
             base_document_v5 = publication_document_article_v5_body(base_document)
             if base_document_v5 is None:
                 raise PublicationAugmentationError(

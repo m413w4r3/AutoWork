@@ -2036,8 +2036,7 @@ class PublicationDocumentV6:
         if not isinstance(self.provenance, PublicationDocumentV6ProvenanceV1):
             raise PublicationDocumentV6BaseMismatchError()
         expected_body_sha256 = (
-            self.provenance.base_publication_body_sha256
-            or self.provenance.base_publication_sha256
+            self.provenance.base_publication_body_sha256 or self.provenance.base_publication_sha256
         )
         if publication_document_v5_sha256(self.base_publication) != expected_body_sha256:
             raise PublicationDocumentV6BaseMismatchError()
@@ -2722,8 +2721,8 @@ __all__ = [
     "PublicationTableV1",
     "order_publication_references",
     "parse_publication_document",
-    "publication_document_from_json",
     "publication_document_article_v5_body",
+    "publication_document_from_json",
     "publication_document_text_anchors",
     "publication_document_v4_from_json",
     "publication_document_v4_to_json",

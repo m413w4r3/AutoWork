@@ -6,12 +6,12 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_augmentation import (
     PublicationAugmentationError,
     PublicationAugmentationErrorCode,
     augment_publication_with_opinion,
 )
-from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
     PublicationDocumentV5,
