@@ -123,6 +123,14 @@ class ProductionRunRow(Base):
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False)
     run_number: Mapped[int] = mapped_column(nullable=False)
     pipeline_generation: Mapped[int] = mapped_column(nullable=False, server_default="0")
+    routing_decision_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "production_routing_decisions.id",
+            name="fk_production_runs_routing_decision",
+            ondelete="RESTRICT",
+        ),
+    )
     research_date: Mapped[date] = mapped_column(Date, nullable=False)
     force_recompute_from_stage: Mapped[str | None] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(64))

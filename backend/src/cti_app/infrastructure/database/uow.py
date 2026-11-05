@@ -194,6 +194,9 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemySampleAcquisitionAttemptRepository,
     SqlAlchemySourceExtractionRepository,
 )
+from cti_app.infrastructure.database.repositories.production_routing import (
+    SqlAlchemyProductionRoutingDecisionRepository,
+)
 from cti_app.infrastructure.database.repositories.production_source_additions import (
     SqlAlchemyProductionSourceAdditionRepository,
 )
@@ -374,6 +377,9 @@ class SqlAlchemyUnitOfWork:
         self.investigation_budgets = SqlAlchemyInvestigationBudgetRepository(self._session)
         self.investigation_states = SqlAlchemyInvestigationStateRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
+        self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
+            self._session
+        )
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
         self.production_source_additions = SqlAlchemyProductionSourceAdditionRepository(

@@ -22,6 +22,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     model_execution,
     osint_open_policy,
     production,
+    production_routing,
     publication_render,
     publication_review,
     retrohunt,
@@ -60,10 +61,12 @@ _OSINT_ENVELOPE_COLUMNS = frozenset(
     }
 )
 _SAMPLE_ACQUISITION_DISPATCH_COLUMNS = frozenset({"dispatch_attempt_id"})
+_ROUTING_DECISION_TABLES = frozenset({"production_routing_decisions"})
+_ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 
 
 def _metadata_for_frozen_baseline() -> MetaData:
-    """Keep post-baseline OSINT and external-effect objects out of 0001.
+    """Keep post-baseline additive objects out of the frozen 0001 shape.
 
     The baseline intentionally predates these additive features, but its
     frozen migration derives its table list from ``Base.metadata``. Present
@@ -75,6 +78,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
         if (
             source_table.name in _OSINT_POLICY_TABLES
             or source_table.name in _EXTERNAL_EFFECT_TABLES
+            or source_table.name in _ROUTING_DECISION_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)
@@ -115,6 +119,21 @@ def _metadata_for_frozen_baseline() -> MetaData:
                 ):
                     table.indexes.discard(index)
             for column_name in _SAMPLE_ACQUISITION_DISPATCH_COLUMNS:
+                if column_name in table.c:
+                    table._columns.remove(table.c[column_name])
+        if table.name == "production_runs":
+            for constraint in tuple(table.constraints):
+                if constraint.name == "fk_production_runs_routing_decision":
+                    table.constraints.discard(constraint)
+            for foreign_key in tuple(table.foreign_keys):
+                if (
+                    foreign_key.parent is not None
+                    and foreign_key.parent.name in _ROUTING_RUN_COLUMNS
+                ):
+                    table.foreign_keys.discard(foreign_key)
+                    if foreign_key.constraint is not None:
+                        table.constraints.discard(foreign_key.constraint)
+            for column_name in _ROUTING_RUN_COLUMNS:
                 if column_name in table.c:
                     table._columns.remove(table.c[column_name])
     return metadata

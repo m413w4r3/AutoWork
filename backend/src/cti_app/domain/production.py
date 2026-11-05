@@ -832,6 +832,7 @@ class ProductionRun:
     # A manual retry is a new pipeline generation, distinct from a worker's
     # technical attempts.  It scopes every side effect identity in the chain.
     pipeline_generation: int = 0
+    routing_decision_id: UUID | None = None
     # Frozen when the run starts: a retry after midnight must not shift the
     # boundary used to reject impossible publication dates.
     research_date: date | None = None

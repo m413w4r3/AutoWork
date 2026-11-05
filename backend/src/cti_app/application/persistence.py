@@ -96,6 +96,7 @@ from cti_app.domain.production import (
     SampleAcquisitionDispatchState,
     SourceExtraction,
 )
+from cti_app.domain.production_routing import ProductionRoutingDecisionV1
 from cti_app.domain.production_source_additions import SourceAdditionJournalEntryV1
 from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.publication_review import PublicationReviewDecision
@@ -113,6 +114,18 @@ from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
 class ActiveSubjectProductionRunConflictError(RuntimeError):
     """The database rejected a second active run for one subject."""
+
+
+class ProductionRoutingDecisionConflictError(RuntimeError):
+    """One routing input identity produced contradictory immutable decisions."""
+
+
+class StaleProductionRoutingGenerationError(RuntimeError):
+    """A routing decision no longer targets the run's current generation."""
+
+
+class StaleProductionRunVersionError(RuntimeError):
+    """A production run write used an obsolete optimistic-lock version."""
 
 
 if TYPE_CHECKING:
@@ -1105,6 +1118,19 @@ class ProductionRunRepository(Protocol):
     async def allocate_next_run_number(self, subject_id: UUID) -> int: ...
 
 
+class ProductionRoutingDecisionRepository(Protocol):
+    async def append_and_adopt(
+        self,
+        decision: ProductionRoutingDecisionV1,
+        *,
+        expected_version: int,
+    ) -> ProductionRoutingDecisionV1: ...
+
+    async def get(self, decision_id: UUID) -> ProductionRoutingDecisionV1 | None: ...
+
+    async def list_for_run(self, run_id: UUID) -> Sequence[ProductionRoutingDecisionV1]: ...
+
+
 class ProductionArtifactRepository(Protocol):
     async def append(self, artifact: ProductionArtifact) -> None: ...
 
@@ -1282,6 +1308,7 @@ class ProductionUnitOfWork(Protocol):
     discovery_candidates: DiscoveryCandidateRepository
     edition_audit: EditionAuditRepository
     production_runs: ProductionRunRepository
+    production_routing_decisions: ProductionRoutingDecisionRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository
