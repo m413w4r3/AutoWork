@@ -206,10 +206,23 @@ def _source_contains_date(value: str, event_date: date) -> bool:
     )[event_date.month - 1]
     day = str(event_date.day)
     year = str(event_date.year)
+    if 10 <= event_date.day % 100 <= 13:
+        ordinal_suffix = "th"
+    else:
+        ordinal_suffix = {1: "st", 2: "nd", 3: "rd"}.get(event_date.day % 10, "th")
+    suffixes = (ordinal_suffix, "er") if event_date.day == 1 else (ordinal_suffix,)
+    day_pattern = rf"{day}(?:{'|'.join(suffixes)})?"
+    month_pattern = (
+        "(?:"
+        + "|".join(re.escape(month) for month in sorted(month_names, key=len, reverse=True))
+        + ")"
+    )
     return any(
-        contains_literal(form)
-        for month in month_names
-        for form in (f"{day} {month} {year}", f"{month} {day} {year}")
+        re.search(pattern, normalized) is not None
+        for pattern in (
+            rf"(?<!\w){month_pattern}\s+{day_pattern},?\s+{year}(?!\w)",
+            rf"(?<!\w){day_pattern}(?:\s+of)?\s+{month_pattern}\s+{year}(?!\w)",
+        )
     )
 
 

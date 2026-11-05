@@ -27,6 +27,7 @@ from cti_app.application.production_artifact_store import (
 )
 from cti_app.application.production_brief_synthesis import (
     BRIEF_SYNTHESIS_PROMPT_VERSION,
+    _source_contains_date,
     brief_timeline_from_extraction,
     build_brief_synthesis_prompt,
 )
@@ -1931,6 +1932,52 @@ def test_brief_prompt_is_french_and_treats_word_count_as_a_target() -> None:
     assert BRIEF_SYNTHESIS_PROMPT_VERSION in prompt
 
 
+@pytest.mark.parametrize(
+    ("event_date", "value"),
+    (
+        (date(2026, 10, 7), "Wednesday, October 7, 2026, in protest"),
+        (date(2026, 10, 7), "October 7 2026"),
+        (date(2026, 10, 7), "7 October 2026"),
+        (date(2026, 10, 7), "7th October 2026"),
+        (date(2026, 10, 7), "7th of October 2026"),
+        (date(2026, 10, 7), "October 7th, 2026"),
+        (date(2026, 10, 7), "7 octobre 2026"),
+        (date(2026, 10, 1), "October 1st, 2026"),
+        (date(2026, 10, 2), "October 2nd, 2026"),
+        (date(2026, 10, 3), "October 3rd, 2026"),
+        (date(2026, 10, 4), "October 4th, 2026"),
+        (date(2026, 10, 11), "October 11th, 2026"),
+        (date(2026, 10, 21), "October 21st, 2026"),
+        (date(2026, 10, 1), "1er octobre 2026"),
+        (date(2026, 10, 17), "Saturday, October 17, 2026"),
+        (date(2026, 10, 7), "2026-10-07"),
+        (date(2026, 10, 7), "07/10/2026"),
+        (date(2026, 10, 7), "7/10/2026"),
+        (date(2026, 10, 7), "07-10-2026"),
+    ),
+)
+def test_source_contains_date_matches_calendar_date_forms(event_date: date, value: str) -> None:
+    assert _source_contains_date(value, event_date)
+
+
+@pytest.mark.parametrize(
+    ("event_date", "value"),
+    (
+        (date(2026, 10, 7), "October 8, 2026"),
+        (date(2026, 10, 7), "November 7, 2026"),
+        (date(2026, 10, 7), "October 7, 2025"),
+        (date(2026, 10, 7), "17 October 2026"),
+        (date(2026, 10, 7), "17th October 2026"),
+        (date(2026, 10, 7), "October 17th, 2026"),
+        (date(2026, 10, 7), "2026"),
+    ),
+)
+def test_source_contains_date_rejects_partial_or_different_dates(
+    event_date: date, value: str
+) -> None:
+    assert not _source_contains_date(value, event_date)
+
+
 def test_brief_timeline_requires_source_date_and_caps_at_four_entries() -> None:
     world = _brief_synthesis_world()
     event_ref = next(
@@ -1952,6 +1999,64 @@ def test_brief_timeline_requires_source_date_and_caps_at_four_entries() -> None:
         world.extraction,
         (grounded, replace(grounded, text="Second event."), grounded, grounded, grounded),
     ) == (grounded, replace(grounded, text="Second event."), grounded, grounded)
+
+
+@pytest.mark.parametrize(
+    ("source_date_text", "source_quote"),
+    (
+        ("July 2, 2026", "July 3, 2026"),
+        ("July 3, 2026", "July 2, 2026"),
+    ),
+)
+def test_brief_timeline_requires_quote_and_date_text_to_match_independently(
+    source_date_text: str, source_quote: str
+) -> None:
+    world = _brief_synthesis_world(
+        source_date_text=source_date_text,
+        source_quote=source_quote,
+    )
+    event_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(world.extraction)
+        if ref.kind is EvidenceKind.EVENT
+    )
+    entry = SynthesisTimelineEntryV1(
+        event_date=date(2026, 7, 2),
+        date_text=None,
+        text="La campagne commence.",
+        evidence_refs=(event_ref,),
+    )
+
+    assert brief_timeline_from_extraction(world.extraction, (entry,)) is None
+
+
+@pytest.mark.parametrize(
+    ("source_date_text", "source_quote"),
+    (
+        ("July 2, 2026", "Thursday, July 2, 2026, in protest"),
+        ("2 juillet 2026", "Le 2 juillet 2026"),
+    ),
+)
+def test_brief_timeline_accepts_calendar_dates_in_quote_and_date_text(
+    source_date_text: str, source_quote: str
+) -> None:
+    world = _brief_synthesis_world(
+        source_date_text=source_date_text,
+        source_quote=source_quote,
+    )
+    event_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(world.extraction)
+        if ref.kind is EvidenceKind.EVENT
+    )
+    entry = SynthesisTimelineEntryV1(
+        event_date=date(2026, 7, 2),
+        date_text=None,
+        text="La campagne commence.",
+        evidence_refs=(event_ref,),
+    )
+
+    assert brief_timeline_from_extraction(world.extraction, (entry,)) == (entry,)
 
 
 @pytest.mark.asyncio
