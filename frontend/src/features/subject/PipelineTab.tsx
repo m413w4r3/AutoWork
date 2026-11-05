@@ -20,6 +20,7 @@ import {
 } from "../../api/collection";
 import { SubjectProduction } from "../../components/SubjectProduction";
 import { ArchiveReceiptSummary } from "../../components/ArchiveReceiptSummary";
+import { ProductionRoutingDetails } from "../production/ProductionRoutingDetails";
 
 const MANUAL_SOURCE_STATES = new Set([
   "blocked",
@@ -49,6 +50,7 @@ export function PipelineTab({
   return (
     <>
       <SubjectProduction subjectId={subjectId} editionId={editionId} />
+      <ProductionRoutingDetails routing={production.data?.routing} />
       {sourceFailure ? (
         <SourceContentPanel
           subjectId={subjectId}

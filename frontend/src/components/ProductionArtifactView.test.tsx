@@ -1442,6 +1442,107 @@ it("affiche les références datées et les deux groupes IOC d’une publication
   expect(screen.getByText("c2.example")).toBeInTheDocument();
 });
 
+it("affiche une brève V7 avec chronologie et synthèse sans annexe IOC", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = urlOf(input);
+      if (url.includes("/publication/preview?")) {
+        return Promise.resolve(
+          Response.json({
+            status: "FAILED",
+            artifact_id: "publication-v7-brief",
+            artifact_version: 7,
+            artifact_input_hash: "a".repeat(64),
+            current_artifact_id: "publication-v7-brief",
+            current_artifact_version: 7,
+            render_id: null,
+            render_identity: null,
+            render_disposition: "EXPLICIT_RENDER",
+            published_edition_version: null,
+            error_code: "preview_not_requested",
+            error_message: null,
+            pdf_url: null,
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          artifact_id: "publication-v7-brief",
+          stage: "publication",
+          version: 7,
+          status: "verified",
+          metadata: {},
+          canonical_content: {
+            schema_version: "7",
+            publication_kind: "brief",
+            routing_decision_hash: "b".repeat(64),
+            routing_policy_version: "subject-publication-routing-v1",
+            base_publication: {
+              schema_version: "6",
+              subject_id: SYNTHESIS_SUBJECT_ID,
+              publication_language: "fr",
+              title: "Campagne documentée en bref",
+              lead: [
+                {
+                  text: "Une campagne a été documentée par deux sources.",
+                  evidence_refs: [],
+                },
+              ],
+              sections: [],
+              timeline: [
+                {
+                  text: "Le 4 octobre, une activité a été observée.",
+                  evidence_refs: [],
+                },
+              ],
+              indicators: [],
+              sources: [],
+              uncertainties: [],
+              tables: [],
+              diagrams: [],
+              figures: [],
+              references: [],
+              original_indicators: [
+                {
+                  artifact_type: "domain",
+                  indicators: [
+                    {
+                      value: "observed.example",
+                      normalized_value: "observed.example",
+                      artifact_type: "domain",
+                      source_document_ids: [],
+                    },
+                  ],
+                },
+              ],
+              rich_text: {
+                schema_version: "1",
+                policy_version: "semantic-annotation-policy-v3",
+                paragraphs: [],
+              },
+            },
+          },
+        }),
+      );
+    }),
+  );
+
+  renderArtifact("publication");
+
+  expect(await screen.findByText("Format : Brève")).toBeInTheDocument();
+  expect(
+    screen.getByRole("region", { name: "RÉFÉRENCES" }),
+  ).toHaveTextContent("Le 4 octobre, une activité a été observée.");
+  expect(screen.getByRole("region", { name: "SYNTHÈSE" })).toHaveTextContent(
+    "Une campagne a été documentée par deux sources.",
+  );
+  expect(
+    screen.queryByRole("heading", { name: /ANNEXE TECHNIQUE|IOC originaux/ }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText("observed.example")).not.toBeInTheDocument();
+});
+
 it("affiche une publication V4 sans enrichissement comme une publication narrative", async () => {
   vi.stubGlobal(
     "fetch",

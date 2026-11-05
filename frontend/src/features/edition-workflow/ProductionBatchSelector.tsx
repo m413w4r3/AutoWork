@@ -1,6 +1,7 @@
 import type { EligibleSubject } from "./productionBatchSelection";
 import { blockingReasonLabel } from "../production/productionLabels";
 import { Link } from "../../routing";
+import { ProductionRoutingDetails } from "../production/ProductionRoutingDetails";
 
 /**
  * Lets the operator hand-pick which already-materialized Subjects go into
@@ -94,6 +95,7 @@ export function ProductionBatchSelector({
                   {blockingReasonLabel(subject.blocking_reason)}
                 </span>
               ) : null}
+              <ProductionRoutingDetails routing={subject.routing} />
               <Link to={`/subjects/${subject.subject_id}`}>
                 Ouvrir le sujet
               </Link>

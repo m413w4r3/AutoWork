@@ -24,6 +24,7 @@ import {
   type ProductionSynthesisTimelineEntryV1,
   type ProductionSynthesisV1,
   type PublicationDocument,
+  type PublicationDocumentArtifact,
   type PublicationDiagramV1,
   type PublicationEvidenceRefV1,
   type PublicationSemanticRoleV1,
@@ -122,8 +123,19 @@ function isSemanticText(value: unknown): boolean {
   );
 }
 
-function isPublicationDocument(value: unknown): value is PublicationDocument {
+function isPublicationDocument(
+  value: unknown,
+): value is PublicationDocumentArtifact {
   if (!isRecord(value)) return false;
+  if (value.schema_version === "7") {
+    return (
+      (value.publication_kind === "article" || value.publication_kind === "brief") &&
+      typeof value.routing_decision_hash === "string" &&
+      typeof value.routing_policy_version === "string" &&
+      isPublicationDocument(value.base_publication) &&
+      value.base_publication.schema_version === "6"
+    );
+  }
   const common =
     typeof value.title === "string" &&
     typeof value.subject_id === "string" &&
@@ -1309,8 +1321,10 @@ function semanticContent(
 
 export function PublicationDocumentView({
   document,
+  publicationKind,
 }: {
   document: PublicationDocument;
+  publicationKind?: "article" | "brief";
 }) {
   const [selectedPassage, setSelectedPassage] = useState<{
     text: string;
@@ -1407,6 +1421,11 @@ export function PublicationDocumentView({
   return (
     <div className="publication-preview__layout">
       <article className="publication-preview">
+        {publicationKind ? (
+          <p className="publication-preview__kind">
+            Format : {publicationKind === "brief" ? "Brève" : "Article"}
+          </p>
+        ) : null}
         <h3>{semanticContent(document, document.title, "title")}</h3>
         {hasReferences ? (
           <section aria-label="RÉFÉRENCES">
@@ -1519,7 +1538,8 @@ export function PublicationDocumentView({
           ))}
           {enrichmentsAt("end", null)}
         </section>
-        {(document.indicators.length > 0 || originalIndicators.length > 0) && (
+        {publicationKind !== "brief" &&
+        (document.indicators.length > 0 || originalIndicators.length > 0) ? (
           <section
             aria-label={
               document.schema_version === "6"
@@ -1601,7 +1621,7 @@ export function PublicationDocumentView({
               </div>
             ) : null}
           </section>
-        )}
+        ) : null}
       </article>
       {selectedPassage ? (
         <aside
@@ -2032,12 +2052,20 @@ export function ProductionArtifactView({
     refetchInterval: stage === "publication" ? 2500 : false,
   });
 
-  const publicationDocument =
+  const publicationEnvelope =
     stage === "publication" &&
     artifact &&
     isPublicationDocument(artifact.canonical_content)
       ? artifact.canonical_content
       : null;
+  const publicationDocument =
+    publicationEnvelope?.schema_version === "7"
+      ? publicationEnvelope.base_publication
+      : publicationEnvelope;
+  const publicationKind =
+    publicationEnvelope?.schema_version === "7"
+      ? publicationEnvelope.publication_kind
+      : undefined;
   const publicationInputArtifacts = recordValue(
     artifact?.metadata.input_artifacts,
   );
@@ -2211,7 +2239,10 @@ export function ProductionArtifactView({
             document={publicationDocument}
             editorialEnrichment={editorialEnrichmentArtifact}
           />
-          <PublicationDocumentView document={publicationDocument} />
+          <PublicationDocumentView
+            document={publicationDocument}
+            publicationKind={publicationKind}
+          />
         </>
       )}
 

@@ -29,9 +29,11 @@ import {
   getSubjectProductionRuns,
   type ArtifactResponse,
   type ProductionBoard,
+  type ProductionRoutingProjection,
   type ProductionRunSummary,
 } from "../../api/production";
 import { EditionPreviewPanel } from "./EditionPreviewPanel";
+import { ProductionRoutingDetails } from "../production/ProductionRoutingDetails";
 
 interface CompositionEdit {
   entries: EditionCompositionEntryInput[];
@@ -47,6 +49,7 @@ interface CompositionCandidate {
   verifiedArtifactReady: boolean;
   latestBatchId: string | null;
   artifactBatchId: string | null;
+  routing?: ProductionRoutingProjection;
 }
 
 function hashLabel(value: string | null): string {
@@ -266,6 +269,7 @@ export function CompositionConsole({
           board,
           artifact?.production_run_id ?? null,
         ),
+        routing: productionSubject?.routing,
       };
     });
   }, [
@@ -639,6 +643,7 @@ export function CompositionConsole({
                     </span>
                   )}
                 </div>
+                <ProductionRoutingDetails routing={candidate.routing} />
 
                 {entry?.disposition === "included" ? (
                   <dl className="composition-console__pin">
