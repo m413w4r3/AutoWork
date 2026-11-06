@@ -6,25 +6,32 @@ import html
 import json
 import re
 import xml.etree.ElementTree as ET
-from collections import Counter
-from dataclasses import dataclass, field
+from collections import Counter, deque
+from collections.abc import Iterator
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import StrEnum
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from pypdf import PdfReader
-
+from cti_app.application.extraction import DocumentParsingError, PdfParsingPolicy, parse_document
 from cti_app.domain.acquisition import AcquisitionQuality
+from cti_app.domain.collection import DetectedMimeType
 
 _MAX_INPUT_BYTES = 25 * 1024 * 1024
 _MAX_HTML_CHARS = 8_000_000
 _MAX_JSON_CHARS = 2_000_000
 _MAX_JSON_NODES = 20_000
+_MAX_JSON_DEPTH = 64
+_MAX_OBJECT_NODES = 256
 _MAX_HTML_NODES = 100_000
 _MAX_DEPTH = 128
 _MAX_PDF_TEXT_CHARS = 2_000_000
+_MAX_STATE_ASSIGNMENTS = 8
+_MAX_STATE_JSON_CHARS = 2 * 1024 * 1024
+_MIN_BODY_TITLE_COHERENCE = 0.30
+_STRONG_BODY_TITLE_COHERENCE = 0.66
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _TAG_RE = re.compile(r"(?s)<[^>]*>")
 _HTML_TAG_RE = re.compile(
@@ -38,6 +45,13 @@ _CHALLENGE_RE = re.compile(
 _PAYWALL_RE = re.compile(
     r"(?i)\b(?:paywall|subscription required|subscribe to continue|subscribe to read|"
     r"subscribe now to continue|to read the full article.{0,50}subscribe)\b"
+)
+_ERROR_PAGE_RE = re.compile(
+    r"(?i)\b(?:region[ -]?(?:block(?:ed|ing)?)|blocked in (?:your )?(?:country|region)|"
+    r"(?:not |un)available[ -]in[ -](?:your[ -])?(?:country|region)|"
+    r"maintenance(?: mode| page)?|service[ -](?:is[ -])?(?:temporarily[ -])?unavailable|error page|"
+    r"access[ -]?denied|access (?:is|has been) denied|"
+    r"access to (?:this|the) (?:page|content) (?:(?:is|has been) )?denied)\b"
 )
 _TRUNCATION_RE = re.compile(r"(?i)(?:\.\.\.|…|\[\s*truncated\s*\]|\[\.\.\.\])\s*$")
 _DANGLING_ENDINGS = {
@@ -117,12 +131,27 @@ _BLOCK_TAGS = frozenset(
     }
 )
 _SKIP_TAGS = frozenset(
-    {"script", "style", "noscript", "template", "nav", "header", "footer", "aside", "form", "svg"}
+    {
+        "aside",
+        "form",
+        "footer",
+        "head",
+        "header",
+        "nav",
+        "noscript",
+        "script",
+        "style",
+        "svg",
+        "template",
+    }
 )
 _ARTICLE_TYPES = frozenset({"article", "newsarticle", "blogposting", "reportagenewsarticle"})
 _BODY_KEYS = frozenset({"articlebody", "content", "body", "text", "html"})
 _TITLE_KEYS = ("headline", "title", "name")
 _URL_KEYS = ("canonicalurl", "mainentityofpage", "url", "link", "@id")
+_STATE_ASSIGNMENT_RE = re.compile(
+    r"(?is)(?:window\s*\.\s*)?__(?:NUXT|INITIAL_STATE|APOLLO_STATE)__\s*="
+)
 
 
 class ExtractionMethod(StrEnum):
@@ -135,6 +164,7 @@ class ExtractionMethod(StrEnum):
     CMS_JSON = "cms_json"
     OEMBED = "oembed"
     PDF_TEXT = "pdf_text"
+    PLAIN_TEXT = "plain_text"
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +204,8 @@ class _SafeHTMLParser(HTMLParser):
         self._script_length = 0
         self._node_count = 1
         self._stopped = False
+        self._embedded_script_count = 0
+        self._embedded_script_chars = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self._stopped:
@@ -236,8 +268,17 @@ class _SafeHTMLParser(HTMLParser):
         if tag == "script" and self._script_attrs is not None:
             kind = self._script_attrs.get("type", "").split(";", 1)[0].strip().casefold()
             script_id = self._script_attrs.get("id", "")
-            if kind == "application/ld+json" or script_id == "__NEXT_DATA__":
+            if kind == "application/ld+json":
                 self.scripts.append((" ".join(self._script_parts), self._script_attrs))
+            elif script_id == "__NEXT_DATA__":
+                script_text = " ".join(self._script_parts)
+                if (
+                    self._embedded_script_count < _MAX_STATE_ASSIGNMENTS
+                    and self._embedded_script_chars + len(script_text) <= _MAX_STATE_JSON_CHARS
+                ):
+                    self.scripts.append((script_text, self._script_attrs))
+                    self._embedded_script_count += 1
+                    self._embedded_script_chars += len(script_text)
             self._script_attrs = None
             self._script_parts = []
             self._script_length = 0
@@ -314,6 +355,14 @@ def extract_candidates(
     if len(decoded) > _MAX_HTML_CHARS:
         return ()
     stripped = decoded.lstrip()
+    if mime == "text/plain":
+        return _plain_text_candidate(
+            decoded,
+            url=url,
+            expected_title=expected_title,
+            expected_languages=expected_languages,
+            min_text_chars=min_text_chars,
+        )
     if mime in {"application/json", "text/json"} or stripped.startswith(("{", "[")):
         return _extract_json(decoded, url, expected_title, expected_languages, min_text_chars)
     if mime in {"application/xml", "text/xml"} or (
@@ -336,6 +385,8 @@ def select_best_candidate(
     *,
     expected_title: str | None,
     min_score: float = 0.55,
+    expected_url: str | None = None,
+    allow_cross_domain: bool = False,
 ) -> ExtractionCandidate | None:
     if not 0.0 <= min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
@@ -346,8 +397,39 @@ def select_best_candidate(
         and candidate.quality.text_chars >= 200
         and not candidate.quality.challenge_detected
         and not candidate.quality.paywall_detected
+        and "error_page_detected" not in candidate.reasons
+        and "body_title_mismatch" not in candidate.reasons
+        and "canonical_url_mismatch" not in candidate.reasons
+        and (
+            "canonical_host_mismatch" not in candidate.reasons
+            or (allow_cross_domain and expected_url is not None)
+        )
         and _title_similarity(expected_title, candidate.title) >= (0.25 if expected_title else 0.0)
-        and candidate.quality.score >= min_score
+        and _body_title_coherence(expected_title, candidate.text)
+        >= _MIN_BODY_TITLE_COHERENCE
+        and (
+            candidate.canonical_url is not None
+            or (
+                expected_title is not None
+                and _body_title_coherence(expected_title, candidate.text)
+                >= _STRONG_BODY_TITLE_COHERENCE
+            )
+        )
+        and (
+            expected_url is None
+            or allow_cross_domain
+            or candidate.canonical_url is None
+            or _url_host(candidate.canonical_url) == _url_host(expected_url)
+        )
+        and (
+            candidate.quality.score >= min_score
+            or (
+                allow_cross_domain
+                and expected_url is not None
+                and "canonical_host_mismatch" in candidate.reasons
+                and candidate.quality.score / 0.15 >= min_score
+            )
+        )
     ]
     if not eligible:
         return None
@@ -397,24 +479,23 @@ def _extract_pdf_candidates(
     ):
         return ()
     try:
-        from io import BytesIO
-
-        reader = PdfReader(BytesIO(body), strict=False)
-        if reader.is_encrypted or len(reader.pages) > max_pages:
+        parsed = parse_document(
+            body,
+            DetectedMimeType.PDF,
+            PdfParsingPolicy(
+                max_document_bytes=_MAX_INPUT_BYTES,
+                max_pages=max_pages,
+                max_text_chars=_MAX_PDF_TEXT_CHARS,
+            ),
+        )
+        raw_text = parsed.text
+        if len(raw_text) > _MAX_PDF_TEXT_CHARS:
             return ()
-        parts: list[str] = []
-        total = 0
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            total += len(page_text)
-            if total > _MAX_PDF_TEXT_CHARS:
-                return ()
-            parts.append(page_text)
-        raw_text = "\n\n".join(parts)
-        metadata: Any = reader.metadata or {}
-        title = _metadata_value(metadata, "/Title")
-        author = _metadata_value(metadata, "/Author")
-        published = _pdf_date(_metadata_value(metadata, "/CreationDate"))
+        title = _metadata_value(parsed.metadata, "title")
+        author = _metadata_value(parsed.metadata, "author")
+        published = _pdf_date(_metadata_value(parsed.metadata, "creationdate"))
+    except DocumentParsingError:
+        return ()
     except Exception:
         return ()
     text = _normalize_text(raw_text)
@@ -486,14 +567,7 @@ def _extract_feed_candidates(
         publisher = _child_text(root, "title")
         for entry in entries:
             title = _child_text(entry, "title")
-            link_node = next(
-                (
-                    child
-                    for child in entry
-                    if _local_name(child.tag).casefold() == "link" and child.attrib.get("href")
-                ),
-                None,
-            )
+            link_node = _atom_alternate_link(entry)
             canonical = urljoin(url, link_node.attrib["href"]) if link_node is not None else None
             body_node = next(
                 (
@@ -585,6 +659,13 @@ def _extract_html(
         canonical = urljoin(url, canonical)
     publisher = parser.meta.get("og:site_name") or None
     candidates: list[ExtractionCandidate] = []
+    article_structure = any(
+        node.tag in {"article", "main"} and not node.excluded
+        for node in _descendant_nodes(parser.root)
+    ) or any(
+        attrs.get("type", "").split(";", 1)[0].strip().casefold() == "application/ld+json"
+        for _, attrs in parser.scripts
+    )
     preferred = _preferred_nodes(parser.root)
     seen_texts: set[tuple[str, ExtractionMethod]] = set()
     for node, method in preferred:
@@ -606,6 +687,7 @@ def _extract_html(
             min_text_chars=min_text_chars,
             boilerplate_ratio=link_ratio,
             paragraph_texts=paragraphs,
+            has_article_structure=article_structure,
         )
         candidates.append(candidate)
     for script_text, attrs in parser.scripts:
@@ -663,6 +745,34 @@ def _extract_json(
     return _deduplicate_candidates(candidates)
 
 
+def _plain_text_candidate(
+    source: str,
+    *,
+    url: str,
+    expected_title: str | None,
+    expected_languages: tuple[str, ...],
+    min_text_chars: int,
+) -> tuple[ExtractionCandidate, ...]:
+    text = _normalize_text(source)
+    if len(text) < min_text_chars:
+        return ()
+    first_line = next((line.strip() for line in source.splitlines() if line.strip()), None)
+    title = first_line if first_line and len(first_line) <= 512 else None
+    return (
+        _candidate(
+            text=text,
+            title=title,
+            publisher=None,
+            published_at=None,
+            canonical_url=url,
+            method=ExtractionMethod.PLAIN_TEXT,
+            expected_title=expected_title,
+            expected_languages=expected_languages,
+            min_text_chars=min_text_chars,
+        ),
+    )
+
+
 def _json_ld_candidates(
     source: str,
     base_url: str,
@@ -689,7 +799,6 @@ def _json_ld_candidates(
             _object_url(article.get("mainEntityOfPage"))
             or _string_value(article.get("url"))
             or _object_url(article.get("isBasedOn"))
-            or base_url
         )
         publisher = _object_name(article.get("publisher"))
         author = _object_name(article.get("author"))
@@ -701,12 +810,13 @@ def _json_ld_candidates(
                 title=title,
                 publisher=publisher,
                 published_at=published,
-                canonical_url=urljoin(base_url, canonical),
+                canonical_url=urljoin(base_url, canonical) if canonical else None,
                 method=ExtractionMethod.JSON_LD,
                 expected_title=expected_title,
                 expected_languages=expected_languages,
                 min_text_chars=min_text_chars,
                 metadata=metadata,
+                expected_url=base_url,
             )
         )
     return output
@@ -729,15 +839,15 @@ def _embedded_state_candidates(
     except (json.JSONDecodeError, RecursionError, ValueError):
         return []
     found: list[tuple[int, ExtractionCandidate]] = []
+    pending: deque[tuple[Any, int, str | None, str | None]] = deque(
+        [(value, 0, None, None)]
+    )
     visited = 0
-
-    def visit(
-        node: Any, depth: int, inherited_title: str | None, inherited_url: str | None
-    ) -> None:
-        nonlocal visited
-        if depth > 20 or visited >= _MAX_JSON_NODES:
-            return
+    while pending and visited < _MAX_JSON_NODES:
+        node, depth, inherited_title, inherited_url = pending.popleft()
         visited += 1
+        if depth > _MAX_JSON_DEPTH:
+            continue
         if isinstance(node, dict):
             title = next(
                 (
@@ -748,7 +858,11 @@ def _embedded_state_candidates(
                 inherited_title,
             )
             canonical = next(
-                (_object_url(node.get(key)) for key in _URL_KEYS if _object_url(node.get(key))),
+                (
+                    parsed_url
+                    for key in _URL_KEYS
+                    if (parsed_url := _object_url(node.get(key)))
+                ),
                 inherited_url,
             )
             for key, content in node.items():
@@ -758,38 +872,48 @@ def _embedded_state_candidates(
                     and len(content) >= min_text_chars
                 ):
                     text = _plain_or_html(content)
-                    candidate_title = title
-                    candidate_url = urljoin(base_url, canonical) if canonical else None
                     if len(text) >= min_text_chars and _state_is_coherent(
-                        candidate_title, candidate_url, expected_title, base_url
+                        title, text, canonical, expected_title, base_url
                     ):
+                        candidate_url = urljoin(base_url, canonical) if canonical else None
                         found.append(
                             (
                                 len(text),
                                 _candidate(
                                     text=text,
-                                    title=candidate_title,
+                                    title=title,
                                     publisher=_object_name(node.get("publisher")),
                                     published_at=_parse_date(
                                         _string_value(node.get("datePublished") or node.get("date"))
                                     ),
-                                    canonical_url=candidate_url or base_url,
+                                    canonical_url=candidate_url,
                                     method=ExtractionMethod.EMBEDDED_STATE,
                                     expected_title=expected_title,
                                     expected_languages=expected_languages,
                                     min_text_chars=min_text_chars,
+                                    expected_url=base_url,
                                 ),
                             )
                         )
-                elif isinstance(content, (dict, list)):
-                    visit(content, depth + 1, title, canonical)
+                        found.sort(
+                            key=lambda pair: (
+                                -pair[1].quality.score,
+                                -pair[0],
+                                pair[1].canonical_url or "",
+                            )
+                        )
+                        del found[3:]
+                elif (
+                    isinstance(content, (dict, list))
+                    and visited + len(pending) < _MAX_JSON_NODES
+                ):
+                    pending.append((content, depth + 1, title, canonical))
         elif isinstance(node, list):
-            for item in node[:_MAX_JSON_NODES]:
-                visit(item, depth + 1, inherited_title, inherited_url)
-
-    visit(value, 0, None, None)
-    found.sort(key=lambda pair: (-pair[1].quality.score, -pair[0], pair[1].canonical_url or ""))
-    return [candidate for _, candidate in found[:3]]
+            for item in node:
+                if visited + len(pending) >= _MAX_JSON_NODES:
+                    break
+                pending.append((item, depth + 1, inherited_title, inherited_url))
+    return [candidate for _, candidate in found]
 
 
 def _cms_json_candidates(
@@ -823,11 +947,12 @@ def _cms_json_candidates(
                         title=title,
                         publisher=None,
                         published_at=published,
-                        canonical_url=urljoin(url, canonical or url),
+                        canonical_url=urljoin(url, canonical) if canonical else None,
                         method=ExtractionMethod.CMS_JSON,
                         expected_title=expected_title,
                         expected_languages=expected_languages,
                         min_text_chars=min_text_chars,
+                        expected_url=url,
                     )
                 )
             continue
@@ -882,13 +1007,13 @@ def _generic_json_candidates(
     min_text_chars: int,
 ) -> list[ExtractionCandidate]:
     result: list[ExtractionCandidate] = []
+    pending: deque[tuple[Any, int]] = deque([(value, 0)])
     visited = 0
-
-    def visit(node: Any, depth: int) -> None:
-        nonlocal visited
-        if depth > 10 or visited >= 2_000:
-            return
+    while pending and visited < _MAX_JSON_NODES:
+        node, depth = pending.popleft()
         visited += 1
+        if depth > _MAX_JSON_DEPTH:
+            continue
         if isinstance(node, dict):
             title = _string_value(node.get("headline") or node.get("title"))
             canonical = _object_url(
@@ -909,22 +1034,26 @@ def _generic_json_candidates(
                                 published_at=_parse_date(
                                     _string_value(node.get("datePublished") or node.get("date"))
                                 ),
-                                canonical_url=urljoin(url, canonical or url),
+                                canonical_url=urljoin(url, canonical) if canonical else None,
                                 method=ExtractionMethod.CMS_JSON,
                                 expected_title=expected_title,
                                 expected_languages=expected_languages,
                                 min_text_chars=min_text_chars,
+                                expected_url=url,
                             )
                         )
                         break
             for child in node.values():
-                if isinstance(child, (dict, list)):
-                    visit(child, depth + 1)
+                if (
+                    isinstance(child, (dict, list))
+                    and visited + len(pending) < _MAX_JSON_NODES
+                ):
+                    pending.append((child, depth + 1))
         elif isinstance(node, list):
-            for child in node[:100]:
-                visit(child, depth + 1)
-
-    visit(value, 0)
+            for child in node:
+                if visited + len(pending) >= _MAX_JSON_NODES:
+                    break
+                pending.append((child, depth + 1))
     return result
 
 
@@ -1007,6 +1136,8 @@ def _candidate(
     boilerplate_ratio: float = 0.0,
     paragraph_texts: list[str] | None = None,
     metadata: tuple[tuple[str, str], ...] = (),
+    expected_url: str | None = None,
+    has_article_structure: bool = True,
 ) -> ExtractionCandidate:
     raw_text = text
     normalized = _normalize_text(raw_text)
@@ -1019,6 +1150,35 @@ def _candidate(
         boilerplate_ratio=boilerplate_ratio,
         paragraph_texts=paragraph_texts or _paragraphs(raw_text),
     )
+    if (
+        method
+        in {ExtractionMethod.JSON_LD, ExtractionMethod.EMBEDDED_STATE, ExtractionMethod.CMS_JSON}
+        and expected_url
+        and canonical_url
+        and _normalized_url(canonical_url) != _normalized_url(expected_url)
+    ):
+        mismatch_reason = (
+            "canonical_host_mismatch"
+            if _url_host(canonical_url) != _url_host(expected_url)
+            else "canonical_url_mismatch"
+        )
+        quality = replace(
+            quality,
+            score=_unit(quality.score * 0.15),
+            reasons=(*quality.reasons, mismatch_reason),
+        )
+    if _is_error_page(
+        normalized,
+        title,
+        has_article_structure=has_article_structure,
+        duplicate_ratio=quality.duplicate_ratio,
+    ):
+        quality = replace(
+            quality,
+            challenge_detected=True,
+            score=_unit(quality.score * 0.15),
+            reasons=(*quality.reasons, "error_page_detected"),
+        )
     reasons = quality.reasons
     return ExtractionCandidate(
         normalized,
@@ -1051,6 +1211,7 @@ def _quality(
     }
     language_mismatch = bool(language and expected and language not in expected)
     duplicate_ratio = _duplicate_ratio(paragraph_texts)
+    body_title_coherence = _body_title_coherence(expected_title, text)
     challenge = bool(_CHALLENGE_RE.search(text))
     paywall = bool(_PAYWALL_RE.search(text))
     truncated = _is_truncated(text)
@@ -1070,6 +1231,8 @@ def _quality(
         score *= 0.15
     if similarity < 0.25 and expected_title:
         score *= 0.35
+    if expected_title and body_title_coherence < _MIN_BODY_TITLE_COHERENCE:
+        score *= 0.15
     if boilerplate_ratio > 0.6 or duplicate_ratio > 0.4:
         score *= 0.45
     reasons: list[str] = []
@@ -1083,6 +1246,8 @@ def _quality(
         reasons.append("possibly_truncated")
     if expected_title and similarity < 0.25:
         reasons.append("title_mismatch")
+    if expected_title and body_title_coherence < _MIN_BODY_TITLE_COHERENCE:
+        reasons.append("body_title_mismatch")
     if boilerplate_ratio > 0.6:
         reasons.append("excessive_boilerplate")
     if duplicate_ratio > 0.4:
@@ -1127,6 +1292,32 @@ def _meaningful_title_words(value: str) -> set[str]:
         for word in _WORD_RE.findall(value[:512])
         if len(word) >= 3 and word.casefold() not in (_EN_STOPWORDS | _FR_STOPWORDS)
     }
+
+
+def _body_title_coherence(expected_title: str | None, body: str) -> float:
+    if not expected_title:
+        return 1.0
+    expected = _meaningful_title_words(expected_title)
+    if not expected:
+        return 0.0
+    normalized_title = _normalize_text(expected_title[:512])
+    content = re.sub(re.escape(normalized_title), " ", body, count=1, flags=re.IGNORECASE)
+    body_words = {word.casefold() for word in _WORD_RE.findall(content)}
+    return len(expected & body_words) / len(expected)
+
+
+def _is_error_page(
+    text: str,
+    title: str | None,
+    *,
+    has_article_structure: bool,
+    duplicate_ratio: float,
+) -> bool:
+    if has_article_structure or not (
+        _ERROR_PAGE_RE.search(text) or _ERROR_PAGE_RE.search(title or "")
+    ):
+        return False
+    return len(text) < 1_200 or duplicate_ratio >= 0.35
 
 
 def _detect_language(words: list[str]) -> str | None:
@@ -1271,28 +1462,46 @@ def _canonical_link(root: _Node, base_url: str) -> str | None:
     return None
 
 
-def _state_assignments(source: str) -> list[str]:
-    results: list[str] = []
-    for match in re.finditer(
-        r"(?is)(?:window\s*\.\s*)?__(?:NUXT|INITIAL_STATE|APOLLO_STATE)__\s*=", source
-    ):
+def _state_assignments(source: str) -> Iterator[str]:
+    used_chars = 0
+    matches = 0
+    for match in _STATE_ASSIGNMENT_RE.finditer(source):
+        matches += 1
+        if matches > _MAX_STATE_ASSIGNMENTS or used_chars >= _MAX_STATE_JSON_CHARS:
+            break
         start = match.end()
-        while start < len(source) and source[start].isspace():
+        skipped = 0
+        while (
+            start < len(source)
+            and source[start].isspace()
+            and skipped < _MAX_STATE_JSON_CHARS
+        ):
             start += 1
-        end = _json_value_end(source, start)
-        if end is not None and end - start <= _MAX_JSON_CHARS:
-            results.append(source[start:end])
-    return results
+            skipped += 1
+        if skipped >= _MAX_STATE_JSON_CHARS:
+            break
+        remaining = _MAX_STATE_JSON_CHARS - used_chars
+        end = _json_value_end(source, start, max_chars=remaining)
+        if end is None:
+            if len(source) - start >= remaining:
+                break
+            continue
+        used_chars += end - start
+        yield source[start:end]
 
 
-def _json_value_end(source: str, start: int) -> int | None:
+def _json_value_end(
+    source: str, start: int, *, max_chars: int = _MAX_JSON_CHARS
+) -> int | None:
     if start >= len(source) or source[start] not in "[{":
+        return None
+    if max_chars < 1:
         return None
     opens = {"{": "}", "[": "]"}
     stack = [opens[source[start]]]
     in_string = False
     escaped = False
-    for index in range(start + 1, min(len(source), start + _MAX_JSON_CHARS + 1)):
+    for index in range(start + 1, min(len(source), start + max_chars)):
         char = source[index]
         if in_string:
             if escaped:
@@ -1306,6 +1515,8 @@ def _json_value_end(source: str, start: int) -> int | None:
             in_string = True
         elif char in "[{":
             stack.append(opens[char])
+            if len(stack) > _MAX_JSON_DEPTH:
+                return None
         elif char in "]}":
             if not stack or stack.pop() != char:
                 return None
@@ -1324,16 +1535,14 @@ def _unwrap_json_assignment(source: str) -> str | None:
 
 def _walk_jsonld(value: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    stack: list[tuple[Any, int]] = [(value, 0)]
+    pending: deque[tuple[Any, int]] = deque([(value, 0)])
     count = 0
-    while stack and count < _MAX_JSON_NODES:
-        node, depth = stack.pop()
+    while pending and count < _MAX_JSON_NODES:
+        node, depth = pending.popleft()
         count += 1
-        if depth > 20:
+        if depth > _MAX_JSON_DEPTH:
             continue
-        if isinstance(node, list):
-            stack.extend((item, depth + 1) for item in reversed(node[:_MAX_JSON_NODES]))
-        elif isinstance(node, dict):
+        if isinstance(node, dict):
             types = node.get("@type", [])
             if isinstance(types, str):
                 types = [types]
@@ -1342,9 +1551,17 @@ def _walk_jsonld(value: Any) -> list[dict[str, Any]]:
                 for item in types
             ):
                 result.append(node)
-            graph = node.get("@graph")
-            if isinstance(graph, (list, dict)):
-                stack.append((graph, depth + 1))
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        for child in children:
+            if not isinstance(child, (dict, list)):
+                continue
+            if count + len(pending) >= _MAX_JSON_NODES:
+                break
+            pending.append((child, depth + 1))
     return result
 
 
@@ -1362,15 +1579,17 @@ def _feed_entry_matches(
 
 
 def _state_is_coherent(
-    title: str | None, canonical: str | None, expected_title: str | None, requested_url: str
+    title: str | None,
+    text: str,
+    canonical: str | None,
+    expected_title: str | None,
+    requested_url: str,
 ) -> bool:
-    if canonical and _normalized_url(canonical) == _normalized_url(requested_url):
-        return True
-    if not title or not expected_title:
+    if expected_title is None:
+        return bool(canonical and _normalized_url(canonical) == _normalized_url(requested_url))
+    if not title or _title_similarity(expected_title, title) < 0.25:
         return False
-    words = _meaningful_title_words(expected_title)
-    actual = _meaningful_title_words(title)
-    return bool(words & actual) and _title_similarity(expected_title, title) >= 0.25
+    return _body_title_coherence(expected_title, text) >= _MIN_BODY_TITLE_COHERENCE
 
 
 def _cms_is_coherent(
@@ -1383,13 +1602,13 @@ def _cms_is_coherent(
 ) -> bool:
     if len(text) < minimum:
         return False
-    if canonical and _normalized_url(canonical) == _normalized_url(requested_url):
-        return True
-    if title and expected_title:
-        expected = _meaningful_title_words(expected_title)
-        actual = _meaningful_title_words(title)
-        return bool(expected & actual) and _title_similarity(expected_title, title) >= 0.25
-    return False
+    if expected_title is None:
+        return bool(canonical and _normalized_url(canonical) == _normalized_url(requested_url))
+    return bool(
+        title
+        and _title_similarity(expected_title, title) >= 0.25
+        and _body_title_coherence(expected_title, text) >= _MIN_BODY_TITLE_COHERENCE
+    )
 
 
 def _normalized_url(value: str) -> str:
@@ -1409,6 +1628,14 @@ def _normalized_url(value: str) -> str:
         return urlunsplit((scheme, netloc, path, "", ""))
     except ValueError:
         return ""
+
+
+def _url_host(value: str) -> str | None:
+    try:
+        hostname = urlsplit(value).hostname
+        return hostname.casefold() if hostname else None
+    except ValueError:
+        return None
 
 
 class _TextOnlyParser(HTMLParser):
@@ -1479,29 +1706,54 @@ def _child_text(parent: ET.Element, name: str) -> str | None:
     return None
 
 
+def _atom_alternate_link(entry: ET.Element) -> ET.Element | None:
+    ranked: list[tuple[tuple[int, int], ET.Element]] = []
+    html_types = {"text/html", "application/xhtml+xml"}
+    for child in entry:
+        if _local_name(child.tag).casefold() != "link" or not child.attrib.get("href"):
+            continue
+        relation = child.attrib.get("rel", "").strip().casefold()
+        media_type = child.attrib.get("type", "").split(";", 1)[0].strip().casefold()
+        if relation not in {"", "alternate"} or media_type not in {"", *html_types}:
+            continue
+        ranked.append(((int(relation == "alternate"), int(media_type in html_types)), child))
+    return max(ranked, key=lambda item: item[0])[1] if ranked else None
+
+
 def _object_url(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, dict):
-        return _string_value(value.get("@id") or value.get("url"))
-    if isinstance(value, list):
-        for item in value:
-            result = _object_url(item)
-            if result:
-                return result
-    return None
+    return _bounded_object_string(value, ("@id", "url"))
 
 
 def _object_name(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, dict):
-        return _string_value(value.get("name") or value.get("@id"))
-    if isinstance(value, list):
-        for item in value:
-            result = _object_name(item)
-            if result:
-                return result
+    return _bounded_object_string(value, ("name", "@id"))
+
+
+def _bounded_object_string(value: Any, preferred_keys: tuple[str, ...]) -> str | None:
+    pending: deque[tuple[Any, int]] = deque([(value, 0)])
+    visited = 0
+    while pending and visited < _MAX_OBJECT_NODES:
+        node, depth = pending.popleft()
+        visited += 1
+        if depth > _MAX_JSON_DEPTH:
+            continue
+        if isinstance(node, str):
+            return node.strip() or None
+        if isinstance(node, dict):
+            for key in preferred_keys:
+                result = _string_value(node.get(key))
+                if result:
+                    return result
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        for child in children:
+            if not isinstance(child, (dict, list)):
+                continue
+            if visited + len(pending) >= _MAX_OBJECT_NODES:
+                break
+            pending.append((child, depth + 1))
     return None
 
 
