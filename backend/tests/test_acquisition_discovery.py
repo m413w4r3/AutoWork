@@ -17,6 +17,7 @@ from cti_app.application.acquisition_discovery import (
     PublisherPdfStrategy,
     ThirdPartyExtractionStrategy,
     VisualOcrStrategy,
+    _same_publisher,
     classify_equivalence,
     external_payload_is_allowed,
     safe_external_url,
@@ -51,12 +52,13 @@ def _policy(
     third_party_provider_allowed: bool = False,
     provider_configured: bool = False,
     do_not_submit: bool = False,
+    external_llm_allowed: bool = True,
     tlp: str = "CLEAR",
 ) -> AcquisitionPolicyContext:
     return AcquisitionPolicyContext(
         allowed_domains=allowed_domains,
         blocked_domains=frozenset(),
-        external_llm_allowed=True,
+        external_llm_allowed=external_llm_allowed,
         tlp=tlp,
         do_not_submit=do_not_submit,
         expected_languages=(),
@@ -218,6 +220,32 @@ async def test_search_wrong_title_false_positive_is_rejected_without_fetch() -> 
 
 
 @pytest.mark.asyncio
+async def test_titleless_search_result_cannot_borrow_search_title_for_unrelated_page() -> None:
+    unrelated = "https://publisher.example.test/articles/unrelated-weather-report"
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        if "search.example.test" in url:
+            return _response(
+                url,
+                json.dumps({"results": [{"url": unrelated, "title": TITLE}]}).encode(),
+                content_type="application/json",
+            )
+        body = (
+            b"<html><body>"
+            + b"This unrelated weather report covers a local forecast and weekend temperatures. "
+            * 8
+            + b"</body></html>"
+        )
+        return _response(url, body)
+
+    probes = await ExactTitleSearchStrategy("https://search.example.test/query").acquire(
+        _request(fetch)
+    )
+    assert any(probe.reason_code == "title_mismatch" for probe in probes)
+    assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
+
+
+@pytest.mark.asyncio
 async def test_search_disabled_without_explicit_endpoint() -> None:
     calls = 0
 
@@ -292,6 +320,14 @@ def test_equivalence_keeps_different_publisher_as_independent_corroboration() ->
     )
 
 
+def test_same_publisher_uses_exact_host_with_only_leading_www_normalized() -> None:
+    assert not _same_publisher(
+        "https://alice.github.io/article", "https://bob.github.io/article"
+    )
+    assert _same_publisher("https://www.example.com/article", "https://example.com/article")
+    assert not _same_publisher("https://sub.example.com/article", "https://example.com/article")
+
+
 @pytest.mark.asyncio
 async def test_publisher_pdf_preserves_observed_bytes_and_uses_injected_extractor() -> None:
     pdf = b"%PDF-1.7\nsynthetic PDF bytes\n%%EOF"
@@ -333,6 +369,24 @@ async def test_publisher_pdf_rejects_bad_magic_before_extraction() -> None:
     )
     assert calls == 0
     assert probes[0].reason_code == "invalid_pdf_magic_or_trailer"
+
+
+@pytest.mark.asyncio
+async def test_publisher_pdf_rejects_derived_text_above_character_limit() -> None:
+    pdf = b"%PDF-1.7\nsynthetic PDF bytes\n%%EOF"
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        return _response(url, pdf, content_type="application/pdf")
+
+    def extractor(raw: bytes) -> str:
+        assert raw == pdf
+        return "x" * 2_000_001
+
+    probes = await PublisherPdfStrategy(extractor=extractor).acquire(
+        _request(fetch, body=b'<a href="/files/report.pdf">PDF</a>')
+    )
+    assert probes[0].outcome is AcquisitionOutcome.REJECTED
+    assert probes[0].reason_code == "derived_text_exceeds_limit"
 
 
 @pytest.mark.asyncio
@@ -381,6 +435,55 @@ async def test_ocr_preserves_artifact_hash_and_marks_ocr_provenance() -> None:
     assert success.response.encoded_sha256 == artifact.sha256
 
 
+@pytest.mark.asyncio
+async def test_ocr_rejects_credentialed_source_url_without_running_engine() -> None:
+    artifact_bytes = b"%PDF-1.7 already captured"
+    called = False
+
+    class FakeOcr:
+        async def recognize(self, artifact):
+            nonlocal called
+            called = True
+            return TITLE + "\n" + ARTICLE_TEXT
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        raise AssertionError("OCR does not fetch")
+
+    artifact = CapturedArtifact(
+        artifact_bytes,
+        "application/pdf",
+        "https://publisher.example.test/articles/report?X-Amz-Signature=signed-secret",
+    )
+    probe = (
+        await VisualOcrStrategy(artifact=artifact, engine=FakeOcr()).acquire(_request(fetch))
+    )[0]
+    assert probe.outcome is AcquisitionOutcome.POLICY_SKIPPED
+    assert probe.reason_code == "ocr_artifact_source_url_has_credentials_or_is_invalid"
+    assert probe.requested_url == "https://publisher.example.test/articles/report"
+    assert "signed-secret" not in probe.requested_url
+    assert not called
+
+
+@pytest.mark.asyncio
+async def test_ocr_rejects_derived_text_above_byte_limit() -> None:
+    artifact_bytes = b"%PDF-1.7 already captured"
+
+    class FakeOcr:
+        async def recognize(self, artifact):
+            # Under the character cap, but over the UTF-8 byte cap.
+            return "🙂" * 1_400_000
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        raise AssertionError("OCR does not fetch")
+
+    artifact = CapturedArtifact(artifact_bytes, "application/pdf", URL)
+    probe = (
+        await VisualOcrStrategy(artifact=artifact, engine=FakeOcr()).acquire(_request(fetch))
+    )[0]
+    assert probe.outcome is AcquisitionOutcome.REJECTED
+    assert probe.reason_code == "derived_text_exceeds_limit"
+
+
 def test_safe_external_url_drops_credentials_and_query_values() -> None:
     safe = safe_external_url(
         "https://user:pass@provider.example.test/path?token=secret&x=123#fragment"
@@ -395,9 +498,15 @@ def test_external_provider_payload_policy_gate() -> None:
         third_party_provider_allowed=True, provider_configured=True, do_not_submit=True
     )
     red = _policy(third_party_provider_allowed=True, provider_configured=True, tlp="RED")
+    denied_external = _policy(
+        third_party_provider_allowed=True,
+        provider_configured=True,
+        external_llm_allowed=False,
+    )
     assert external_payload_is_allowed(allowed, URL)
     assert not external_payload_is_allowed(denied_submit, URL)
     assert not external_payload_is_allowed(red, URL)
+    assert not external_payload_is_allowed(denied_external, URL)
     assert not external_payload_is_allowed(allowed, "https://user:pass@publisher.example.test/path")
 
 
@@ -417,6 +526,26 @@ async def test_provider_disabled_by_default_and_no_request_sent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_token_is_blocked_when_auth_transport_is_not_supported() -> None:
+    calls = 0
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unsupported auth transport must block the provider")
+
+    strategy = ThirdPartyExtractionStrategy(
+        provider_url="https://provider.example.test/extract", provider_token="synthetic-token"
+    )
+    probe = (await strategy.acquire(_request(fetch)))[0]
+    assert probe.outcome is AcquisitionOutcome.NOT_CONFIGURED
+    assert probe.reason_code == "provider_auth_transport_unavailable"
+    assert probe.capability_state is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+    assert "synthetic-token" not in probe.requested_url
+    assert calls == 0
+
+
+@pytest.mark.asyncio
 async def test_provider_policy_denial_sends_no_external_disclosure() -> None:
     calls = 0
 
@@ -426,7 +555,9 @@ async def test_provider_policy_denial_sends_no_external_disclosure() -> None:
         raise AssertionError("policy denied provider request")
 
     strategy = ThirdPartyExtractionStrategy(
-        provider_url="https://provider.example.test/extract", provider_token="synthetic-token"
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
     )
     request = _request(
         fetch,
@@ -441,6 +572,58 @@ async def test_provider_policy_denial_sends_no_external_disclosure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_external_llm_denial_sends_no_disclosure() -> None:
+    calls = 0
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("external LLM policy denied provider request")
+
+    strategy = ThirdPartyExtractionStrategy(
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
+    )
+    request = _request(
+        fetch,
+        policy=_policy(
+            third_party_provider_allowed=True,
+            provider_configured=True,
+            external_llm_allowed=False,
+        ),
+    )
+    probe = (await strategy.acquire(request))[0]
+    assert probe.outcome is AcquisitionOutcome.POLICY_SKIPPED
+    assert probe.policy_decision.value == "denied_external_llm"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_tlp_red_denial_sends_no_disclosure() -> None:
+    calls = 0
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("TLP RED denied provider request")
+
+    strategy = ThirdPartyExtractionStrategy(
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
+    )
+    request = _request(
+        fetch,
+        policy=_policy(third_party_provider_allowed=True, provider_configured=True, tlp="RED"),
+    )
+    probe = (await strategy.acquire(request))[0]
+    assert probe.outcome is AcquisitionOutcome.POLICY_SKIPPED
+    assert probe.policy_decision.value == "denied_tlp"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
 async def test_provider_timeout_is_typed_and_does_not_retry() -> None:
     calls = 0
 
@@ -451,7 +634,9 @@ async def test_provider_timeout_is_typed_and_does_not_retry() -> None:
         raise TimeoutError
 
     strategy = ThirdPartyExtractionStrategy(
-        provider_url="https://provider.example.test/extract", provider_token="synthetic-token"
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
     )
     request = _request(
         fetch, policy=_policy(third_party_provider_allowed=True, provider_configured=True)
@@ -473,7 +658,9 @@ async def test_provider_prior_attempt_prevents_duplicate_disclosure() -> None:
         raise AssertionError("attempted provider request must not be sent again")
 
     strategy = ThirdPartyExtractionStrategy(
-        provider_url="https://provider.example.test/extract", provider_token="synthetic-token"
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
     )
     request = _request(
         fetch,
@@ -494,7 +681,9 @@ async def test_provider_ambiguous_response_is_typed_failure() -> None:
         return _response(url, b"not-json", content_type="application/json")
 
     strategy = ThirdPartyExtractionStrategy(
-        provider_url="https://provider.example.test/extract", provider_token="synthetic-token"
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
     )
     request = _request(
         fetch, policy=_policy(third_party_provider_allowed=True, provider_configured=True)
@@ -502,6 +691,35 @@ async def test_provider_ambiguous_response_is_typed_failure() -> None:
     probe = (await strategy.acquire(request))[0]
     assert probe.outcome is AcquisitionOutcome.FAILED
     assert probe.reason_code == "provider_ambiguous_failure"
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_derived_text_above_character_limit() -> None:
+    payload = {
+        "url": URL,
+        "title": TITLE,
+        "text": TITLE + "\n" + "x" * 2_000_001,
+    }
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        return _response(
+            url,
+            json.dumps(payload).encode(),
+            content_type="application/json",
+        )
+
+    strategy = ThirdPartyExtractionStrategy(
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
+    )
+    request = _request(
+        fetch,
+        policy=_policy(third_party_provider_allowed=True, provider_configured=True),
+    )
+    probe = (await strategy.acquire(request))[0]
+    assert probe.outcome is AcquisitionOutcome.REJECTED
+    assert probe.reason_code == "derived_text_exceeds_limit"
 
 
 @pytest.mark.asyncio
@@ -516,13 +734,16 @@ async def test_provider_sends_only_url_and_title_and_keeps_evidence_unknown() ->
     }
 
     async def fetch(url, headers, timeout_seconds, allow_binary):
+        # This fake preserves Authorization; the strategy blocks the real collector by default.
         calls.append((url, headers))
         assert set(parse_qs(urlsplit(url).query)) == {"url", "title"}
         assert ARTICLE_TEXT not in url
         return _response(url, json.dumps(payload).encode(), content_type="application/json")
 
     strategy = ThirdPartyExtractionStrategy(
-        provider_url="https://provider.example.test/extract", provider_token="synthetic-token"
+        provider_url="https://provider.example.test/extract",
+        provider_token="synthetic-token",
+        auth_transport_supported=True,
     )
     request = _request(
         fetch, policy=_policy(third_party_provider_allowed=True, provider_configured=True)

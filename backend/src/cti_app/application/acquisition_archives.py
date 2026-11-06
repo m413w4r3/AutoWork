@@ -340,20 +340,20 @@ def _wayback_rows(
 ) -> list[tuple[str, str]]:
     try:
         decoded = body.decode("utf-8-sig")
-    except (UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
         return []
     try:
         rows = json.loads(decoded)
         if not isinstance(rows, list):
             rows = []
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         rows = []
     if not rows:
         rows = []
         for line in decoded.splitlines():
             try:
                 row = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             if isinstance(row, list):
                 rows.append(row)
@@ -543,7 +543,7 @@ class WaybackSnapshotStrategy:
 def _latest_index(body: bytes) -> str | None:
     try:
         rows = json.loads(body)
-    except (UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
         return None
     if not isinstance(rows, list):
         return None
@@ -562,7 +562,7 @@ def _cdx_rows(body: bytes, expected_urls: tuple[str, ...]) -> list[dict[str, Any
     for line in body.splitlines():
         try:
             row = json.loads(line)
-        except (UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(row, dict) or str(row.get("status", row.get("statuscode", ""))) != "200":
             continue
@@ -596,8 +596,38 @@ def _parse_warc(
     response: CollectedResponse,
     expected_urls: tuple[str, ...],
     expected_range_length: int,
+    expected_range_start: int,
 ) -> tuple[CollectedResponse, datetime | None] | None:
     if response.status != 206 or response.encoded_size != expected_range_length:
+        return None
+    expected_range_end = expected_range_start + expected_range_length - 1
+    content_range = next(
+        (value for key, value in response.headers.items() if key.casefold() == "content-range"),
+        "",
+    )
+    if len(content_range) > 128:
+        return None
+    range_match = re.fullmatch(
+        r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range.strip(), flags=re.IGNORECASE
+    )
+    if range_match is None:
+        return None
+    start_text, end_text, total_text = range_match.groups()
+    if start_text is None or end_text is None or total_text is None:
+        return None
+    if max(len(start_text), len(end_text), len(total_text)) > 20:
+        return None
+    try:
+        range_start = int(start_text)
+        range_end = int(end_text)
+        total = None if total_text == "*" else int(total_text)
+    except ValueError:
+        return None
+    if (
+        range_start != expected_range_start
+        or range_end != expected_range_end
+        or (total is not None and total <= expected_range_end)
+    ):
         return None
     body = response.decoded_body
     try:
@@ -840,7 +870,12 @@ class CommonCrawlWarcStrategy:
                     probes.append(error)
                     continue
                 assert ranged is not None
-                parsed = _parse_warc(ranged, expected, record["length"])
+                parsed = _parse_warc(
+                    ranged,
+                    expected,
+                    record["length"],
+                    record["offset"],
+                )
                 if parsed is None:
                     probes.append(
                         _make_probe(
@@ -902,11 +937,12 @@ class CommonCrawlWarcStrategy:
 def _memento_entries(body: bytes) -> list[tuple[str, datetime | None]]:
     try:
         document = json.loads(body)
-    except (UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
         return []
     found: list[tuple[str, datetime | None]] = []
-
-    def visit(value: object) -> None:
+    pending = [document]
+    while pending:
+        value = pending.pop()
         if isinstance(value, dict):
             rel = value.get("rel", "")
             rel_values = rel if isinstance(rel, list) else str(rel).split()
@@ -919,14 +955,36 @@ def _memento_entries(body: bytes) -> list[tuple[str, datetime | None]]:
                         or value.get("timestamp")
                     )
                     found.append((url, _timestamp(stamp)))
-            for nested in value.values():
-                visit(nested)
+            pending.extend(reversed(list(value.values())))
         elif isinstance(value, list):
-            for nested in value:
-                visit(nested)
-
-    visit(document)
+            pending.extend(reversed(value))
     return found
+
+
+def _memento_final_url_matches(
+    snapshot_url: str,
+    final_url: str,
+    original_url: str,
+) -> bool:
+    """Keep a Memento fetch on the advertised archive host and snapshot path."""
+    try:
+        snapshot = urlsplit(snapshot_url)
+        final = urlsplit(final_url)
+        snapshot_hostname = snapshot.hostname
+        final_hostname = final.hostname
+        if snapshot_hostname is None or final_hostname is None:
+            return False
+        snapshot_host = snapshot_hostname.encode("idna").decode("ascii").casefold().rstrip(".")
+        final_host = final_hostname.encode("idna").decode("ascii").casefold().rstrip(".")
+        return (
+            final.scheme.casefold() in {"http", "https"}
+            and snapshot_host == final_host
+            and snapshot.path == final.path
+            and is_credential_free_url(final_url)
+            and _canonical(final_url) != _canonical(original_url)
+        )
+    except (AttributeError, UnicodeError, TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,11 +1053,13 @@ class MementoArchiveStrategy:
                 response=lookup,
             )
         ]
-        entries = [
+        raw_entries = _memento_entries(lookup.decoded_body)
+        safe_entries = [
             (url, stamp)
-            for url, stamp in _memento_entries(lookup.decoded_body)
+            for url, stamp in raw_entries
             if _canonical(url) is not None and is_credential_free_url(url)
         ]
+        entries = [(url, stamp) for url, stamp in safe_entries if stamp is not None]
         if not entries:
             probes.append(
                 _make_probe(
@@ -1008,7 +1068,11 @@ class MementoArchiveStrategy:
                     method=self.method,
                     url=lookup_url,
                     outcome=AcquisitionOutcome.REJECTED,
-                    reason="no_valid_memento_relation",
+                    reason=(
+                        "memento_timestamp_missing"
+                        if safe_entries
+                        else "no_valid_memento_relation"
+                    ),
                 )
             )
             return tuple(probes)
@@ -1025,6 +1089,21 @@ class MementoArchiveStrategy:
                 probes.append(error)
                 continue
             assert snapshot is not None
+            if not _memento_final_url_matches(
+                snapshot_url, snapshot.final_url, request.requested_url
+            ):
+                probes.append(
+                    _make_probe(
+                        strategy_name=self.name,
+                        strategy_version=self.version,
+                        method=self.method,
+                        url=snapshot_url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="memento_final_url_mismatch",
+                        response=snapshot,
+                    )
+                )
+                continue
             reason = _validated_article(snapshot, request)
             if reason is not None:
                 probes.append(

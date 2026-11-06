@@ -213,7 +213,11 @@ def _warc(
     return header + http + b"\r\n\r\n"
 
 
-async def _commoncrawl_request(warc_body: bytes):
+async def _commoncrawl_request(
+    warc_body: bytes,
+    *,
+    range_content: str | None = None,
+):
     range_calls: list[tuple[str, dict[str, str], bool]] = []
 
     async def fetch(url, headers, timeout_seconds, allow_binary):
@@ -234,7 +238,9 @@ async def _commoncrawl_request(warc_body: bytes):
                 content_type="application/x-ndjson",
             )
         range_calls.append((url, headers, allow_binary))
-        return _response(url, warc_body, content_type="application/warc", status=206)
+        response = _response(url, warc_body, content_type="application/warc", status=206)
+        content_range = range_content or f"bytes 0-{len(warc_body) - 1}/{len(warc_body)}"
+        return replace(response, headers={**response.headers, "content-range": content_range})
 
     return _request(fetch), range_calls
 
@@ -247,13 +253,68 @@ async def test_commoncrawl_extracts_warc_article_and_timestamp() -> None:
     assert success.response is not None and success.response.decoded_body == ARTICLE
     assert success.archive_snapshot_time == datetime(2024, 5, 8, 12, tzinfo=UTC)
     assert success.equivalence_class is SourceEquivalenceClass.HISTORICAL_ORIGINAL
-    assert range_calls[0][1]["range"].startswith("bytes=0-")
+    expected_range_end = len(gzip.compress(_warc(URL))) - 1
+    assert range_calls[0][1] == {"range": f"bytes=0-{expected_range_end}"}
     assert range_calls[0][2] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_at", ["collinfo", "cdx"])
+async def test_commoncrawl_rejects_malformed_deep_json_without_range_fetch(
+    malformed_at: str,
+) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+    deeply_nested = b"[" * 1500 + b"]" * 1500
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        calls.append((url, headers))
+        if url.endswith("collinfo.json"):
+            body = (
+                deeply_nested
+                if malformed_at == "collinfo"
+                else b'[{"id":"CC-MAIN-2025-04"}]'
+            )
+            return _response(url, body, content_type="application/json")
+        if "-index?" in url:
+            body = deeply_nested if malformed_at == "cdx" else b""
+            return _response(url, body, content_type="application/x-ndjson")
+        raise AssertionError("malformed lookup data must not trigger a WARC range fetch")
+
+    probes = await CommonCrawlWarcStrategy().acquire(_request(fetch))
+    assert calls
+    assert all("data.commoncrawl.org" not in url for url, _headers in calls)
+    assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
 
 
 @pytest.mark.asyncio
 async def test_commoncrawl_rejects_corrupt_warc_without_success() -> None:
     request, _range_calls = await _commoncrawl_request(b"not a WARC record")
+    probes = await CommonCrawlWarcStrategy().acquire(request)
+    assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
+    assert any(probe.reason_code == "invalid_or_mismatched_warc_record" for probe in probes)
+
+
+@pytest.mark.asyncio
+async def test_commoncrawl_rejects_valid_record_with_mismatched_content_range() -> None:
+    encoded_warc = gzip.compress(_warc(URL))
+    wrong_range = f"bytes 1-{len(encoded_warc)}/{len(encoded_warc) + 1}"
+    request, _range_calls = await _commoncrawl_request(
+        encoded_warc,
+        range_content=wrong_range,
+    )
+    probes = await CommonCrawlWarcStrategy().acquire(request)
+    assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
+    assert any(probe.reason_code == "invalid_or_mismatched_warc_record" for probe in probes)
+
+
+@pytest.mark.asyncio
+async def test_commoncrawl_rejects_oversized_malformed_content_range() -> None:
+    encoded_warc = gzip.compress(_warc(URL))
+    malformed_range = f"bytes {'9' * 5000}-0/0"
+    request, _range_calls = await _commoncrawl_request(
+        encoded_warc,
+        range_content=malformed_range,
+    )
     probes = await CommonCrawlWarcStrategy().acquire(request)
     assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
     assert any(probe.reason_code == "invalid_or_mismatched_warc_record" for probe in probes)
@@ -328,6 +389,50 @@ async def test_memento_rejects_invalid_snapshot_url() -> None:
 
     probes = await MementoArchiveStrategy().acquire(_request(fetch))
     assert len(calls) == 1
+    assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
+
+
+@pytest.mark.asyncio
+async def test_memento_rejects_snapshot_redirect_to_live_publisher_page() -> None:
+    memento_url = "https://archive.example.test/20240508/news/original-report"
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        if "/api/json/" in url:
+            return _response(
+                url,
+                (
+                    f'{{"rel":"memento","uri":"{memento_url}",'
+                    '"datetime":"2024-05-08T10:00:00Z"}'
+                ).encode(),
+                content_type="application/json",
+            )
+        return replace(_response(url, ARTICLE), final_url=URL)
+
+    probes = await MementoArchiveStrategy().acquire(_request(fetch))
+    rejected = next(probe for probe in probes if probe.reason_code == "memento_final_url_mismatch")
+    assert rejected.outcome is AcquisitionOutcome.REJECTED
+    assert rejected.archive_snapshot_time is None
+    assert rejected.equivalence_class is None
+    assert rejected.evidence_class is None
+    assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
+
+
+@pytest.mark.asyncio
+async def test_memento_without_snapshot_timestamp_is_not_fetched_or_promoted() -> None:
+    memento_url = "https://archive.example.test/20240508/news/original-report"
+    calls: list[str] = []
+
+    async def fetch(url, headers, timeout_seconds, allow_binary):
+        calls.append(url)
+        return _response(
+            url,
+            f'{{"rel":"memento","uri":"{memento_url}"}}'.encode(),
+            content_type="application/json",
+        )
+
+    probes = await MementoArchiveStrategy().acquire(_request(fetch))
+    assert len(calls) == 1
+    assert probes[-1].reason_code == "memento_timestamp_missing"
     assert not any(probe.outcome is AcquisitionOutcome.SUCCEEDED for probe in probes)
 
 

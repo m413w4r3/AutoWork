@@ -40,39 +40,38 @@ from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 from cti_app.domain.discovery import canonicalize_http_url
 
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
-_MULTI_LABEL_PUBLIC_SUFFIXES = frozenset(
-    {
-        "co.uk",
-        "org.uk",
-        "ac.uk",
-        "gov.uk",
-        "com.au",
-        "net.au",
-        "org.au",
-        "co.jp",
-        "ne.jp",
-        "co.nz",
-        "com.br",
-        "com.cn",
-        "com.sg",
-        "co.in",
-        "co.za",
-        "com.mx",
-        "com.tr",
-        "com.tw",
-        "com.hk",
-        "com.ar",
-    }
-)
 _MAX_PAGE_BYTES = 20 * 1024 * 1024
+_MAX_DERIVED_TEXT_CHARS = 2_000_000
+_MAX_DERIVED_TEXT_BYTES = 5 * 1024 * 1024
 _TITLE_MATCH_THRESHOLD = 0.76
 _STRONG_EQUIVALENCE_THRESHOLD = 0.86
+_TITLE_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
 
 
 class _PageParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.title: list[str] = []
+        self.metadata_titles: list[str] = []
         self.links: list[tuple[str, frozenset[str], str | None]] = []
         self.anchors: list[tuple[str, str]] = []
         self.json_ld: list[str] = []
@@ -88,6 +87,10 @@ class _PageParser(HTMLParser):
         lowered = tag.casefold()
         if lowered == "title":
             self._in_title = True
+        elif lowered == "meta":
+            meta_name = (values.get("property") or values.get("name") or "").casefold()
+            if meta_name in {"og:title", "twitter:title", "title"} and values.get("content"):
+                self.metadata_titles.append(values["content"])
         elif lowered == "link":
             rel = frozenset(values.get("rel", "").casefold().split())
             href = values.get("href", "").strip()
@@ -221,21 +224,14 @@ def _host(url: str) -> str | None:
         return None
 
 
-def _registrable_domain(url: str) -> str | None:
+def _publisher_host(url: str) -> str | None:
     hostname = _host(url)
-    if hostname is None:
-        return None
-    labels = hostname.split(".")
-    if len(labels) < 2:
-        return hostname
-    suffix2 = ".".join(labels[-2:])
-    count = 3 if suffix2 in _MULTI_LABEL_PUBLIC_SUFFIXES and len(labels) >= 3 else 2
-    return ".".join(labels[-count:])
+    return hostname.removeprefix("www.") if hostname else None
 
 
 def _same_publisher(left: str, right: str) -> bool:
-    left_domain, right_domain = _registrable_domain(left), _registrable_domain(right)
-    return left_domain is not None and left_domain == right_domain
+    left_host, right_host = _publisher_host(left), _publisher_host(right)
+    return left_host is not None and left_host == right_host
 
 
 def classify_equivalence(
@@ -309,7 +305,7 @@ def external_payload_is_allowed(policy: AcquisitionPolicyContext, target: str) -
     if not _safe_http_url(target):
         return False
     return (
-        policy.check_destination(target, third_party_provider=True)
+        policy.check_destination(target, external_llm=True, third_party_provider=True)
         is AcquisitionPolicyDecision.ALLOWED
     )
 
@@ -419,14 +415,51 @@ async def _fetch(
 
 
 def _page_title(body: bytes) -> str:
-    return " ".join(" ".join(_parse_page(body).title).split())
+    parser = _parse_page(body)
+    title = " ".join(" ".join(parser.title).split())
+    return title or next(
+        (" ".join(value.split()) for value in parser.metadata_titles if value.strip()), ""
+    )
+
+
+def _meaningful_title_words(value: str | None) -> set[str]:
+    return {
+        word
+        for word in _normalized_title(value).split()
+        if len(word) > 2 and word not in _TITLE_STOP_WORDS
+    }
+
+
+def _url_slug_words(url: str) -> str:
+    try:
+        slug = _slug(urlsplit(url).path)
+    except (TypeError, ValueError):
+        return ""
+    return _normalized_title(slug.replace("-", " ").replace("_", " "))
+
+
+def _body_matches_expected_title(response: CollectedResponse, request: AcquisitionRequest) -> bool:
+    expected_words = _meaningful_title_words(request.title)
+    body_words = set(_normalized_title(_visible_text(response.decoded_body)).split())
+    if len(expected_words & body_words) >= 2:
+        return True
+    expected_slug = " ".join(sorted(expected_words))
+    requested_slug = " ".join(
+        sorted(_meaningful_title_words(_url_slug_words(request.requested_url)))
+    )
+    fetched_slug = " ".join(
+        sorted(_meaningful_title_words(_url_slug_words(response.final_url)))
+    )
+    return bool(
+        (requested_slug and fetched_slug and requested_slug == fetched_slug)
+        or (expected_slug and (requested_slug == expected_slug or fetched_slug == expected_slug))
+    )
 
 
 def _validate_page(
     response: CollectedResponse,
     request: AcquisitionRequest,
     *,
-    expected_candidate_title: str | None = None,
     min_text_chars: int | None = None,
 ) -> tuple[str | None, float]:
     if response.status != 200:
@@ -443,11 +476,14 @@ def _validate_page(
         headers=response.headers,
         expected_languages=request.expected_languages,
     )
-    title = _page_title(response.decoded_body) or expected_candidate_title
+    # Search-result metadata is only a lead. Validation uses fetched-page metadata.
+    title = _page_title(response.decoded_body)
     similarity = _title_similarity(request.title, title)
     if reason is not None:
         return reason, similarity
-    if request.title and not _strong_title_match(request.title, title):
+    if request.title and title and similarity < 0.6:
+        return "title_mismatch", similarity
+    if request.title and not title and not _body_matches_expected_title(response, request):
         return "title_mismatch", similarity
     return None, similarity
 
@@ -551,9 +587,9 @@ class PublisherAlternativeUrlStrategy:
                 ),
             )
         origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-        root_domain = _registrable_domain(request.requested_url)
+        root_domain = _publisher_host(request.requested_url)
         origins = [origin]
-        if root_domain and root_domain != parsed.hostname.casefold():
+        if root_domain and root_domain != _host(request.requested_url):
             origins.append(urlunsplit((parsed.scheme, root_domain, "", "", "")))
         sitemap_urls = tuple(
             f"{sitemap_origin}/{path}"
@@ -859,7 +895,7 @@ class ExactTitleSearchStrategy:
                 probes.append(error)
                 continue
             assert page is not None
-            reason, similarity = _validate_page(page, request, expected_candidate_title=title)
+            reason, similarity = _validate_page(page, request)
             if reason is not None:
                 probes.append(
                     _probe(
@@ -1146,6 +1182,17 @@ def _derived_response(
     )
 
 
+def _bounded_derived_text(text: str) -> bytes | None:
+    """Encode derived text only while both explicit output bounds are respected."""
+    if len(text) > _MAX_DERIVED_TEXT_CHARS:
+        return None
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return encoded if len(encoded) <= _MAX_DERIVED_TEXT_BYTES else None
+
+
 @dataclass(frozen=True, slots=True)
 class PublisherPdfStrategy:
     extractor: PdfTextExtractor | None = None
@@ -1274,7 +1321,20 @@ class PublisherPdfStrategy:
                     )
                 )
                 continue
-            text = extracted.encode("utf-8")
+            text = _bounded_derived_text(extracted)
+            if text is None:
+                probes.append(
+                    _probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=candidate,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="derived_text_exceeds_limit",
+                        response=response,
+                    )
+                )
+                continue
             derived = _derived_response(
                 response,
                 encoded=raw_pdf,
@@ -1377,6 +1437,21 @@ class VisualOcrStrategy:
                     reason="ocr_artifact_not_supplied",
                 ),
             )
+        source_url = safe_external_url(self.artifact.source_url)
+        if not _safe_http_url(self.artifact.source_url) or not is_credential_free_url(
+            self.artifact.source_url
+        ):
+            return (
+                _probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=source_url,
+                    outcome=AcquisitionOutcome.POLICY_SKIPPED,
+                    reason="ocr_artifact_source_url_has_credentials_or_is_invalid",
+                    capability=AcquisitionCapabilityState.BLOCKED_BY_POLICY,
+                ),
+            )
         media_type = self.artifact.content_type.casefold().split(";", 1)[0].strip()
         if media_type not in {
             "application/pdf",
@@ -1390,7 +1465,7 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.REJECTED,
                     reason="unsupported_ocr_artifact_type",
                 ),
@@ -1403,7 +1478,7 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.REJECTED,
                     reason="artifact_hash_mismatch",
                 ),
@@ -1414,7 +1489,7 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.REJECTED,
                     reason="ocr_artifact_exceeds_limit",
                 ),
@@ -1429,7 +1504,7 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.FAILED,
                     reason="ocr_timeout",
                 ),
@@ -1440,7 +1515,7 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.FAILED,
                     reason="ocr_failed",
                 ),
@@ -1451,16 +1526,27 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.REJECTED,
                     reason="ocr_text_empty",
                 ),
             )
-        decoded = text.encode("utf-8")
+        decoded = _bounded_derived_text(text)
+        if decoded is None:
+            return (
+                _probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=source_url,
+                    outcome=AcquisitionOutcome.REJECTED,
+                    reason="derived_text_exceeds_limit",
+                ),
+            )
         acquired_at = datetime.now(UTC)
         response = CollectedResponse(
-            requested_url=self.artifact.source_url,
-            final_url=self.artifact.source_url,
+            requested_url=source_url,
+            final_url=source_url,
             redirect_chain=(),
             status=200,
             headers={"content-type": self.artifact.content_type},
@@ -1490,7 +1576,7 @@ class VisualOcrStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.artifact.source_url,
+                    url=source_url,
                     outcome=AcquisitionOutcome.REJECTED,
                     reason=reason or "ocr_title_mismatch",
                     response=response,
@@ -1503,13 +1589,13 @@ class VisualOcrStrategy:
                 name=self.name,
                 version=self.version,
                 method=self.method,
-                url=self.artifact.source_url,
+                url=source_url,
                 outcome=AcquisitionOutcome.SUCCEEDED,
                 response=response,
                 equivalence=classify_equivalence(
                     request.requested_url,
-                    self.artifact.source_url,
-                    same_publisher=_same_publisher_candidate(request, self.artifact.source_url),
+                    source_url,
+                    same_publisher=_same_publisher_candidate(request, source_url),
                     title_similarity=similarity,
                 ),
                 evidence=EvidenceClass.OCR_DERIVED,
@@ -1657,6 +1743,9 @@ class OfficialNewsletterArchiveStrategy:
 class ThirdPartyExtractionStrategy:
     provider_url: str | None = None
     provider_token: str | None = None
+    # SafeHttpCollector strips Authorization today. Set True only if the
+    # configured transport is verified to preserve this header to the provider.
+    auth_transport_supported: bool = False
     name: str = "third_party_extraction"
     version: str = "1"
     method: SourceAcquisitionMethod = SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION
@@ -1668,11 +1757,11 @@ class ThirdPartyExtractionStrategy:
 
     @property
     def capability_state(self) -> AcquisitionCapabilityState:
-        return (
-            AcquisitionCapabilityState.IMPLEMENTED
-            if self.enabled
-            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
-        )
+        if not self.enabled:
+            return AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        if not self.auth_transport_supported:
+            return AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+        return AcquisitionCapabilityState.IMPLEMENTED
 
     def _policy_probe(
         self, request: AcquisitionRequest, url: str, decision: AcquisitionPolicyDecision
@@ -1708,6 +1797,18 @@ class ThirdPartyExtractionStrategy:
                 ),
             )
         assert self.provider_url is not None and self.provider_token is not None
+        if not self.auth_transport_supported:
+            return (
+                _probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=safe_external_url(self.provider_url),
+                    outcome=AcquisitionOutcome.NOT_CONFIGURED,
+                    reason="provider_auth_transport_unavailable",
+                    capability=AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+                ),
+            )
         if not _safe_http_url(self.provider_url):
             return (
                 _probe(
@@ -1732,12 +1833,12 @@ class ThirdPartyExtractionStrategy:
                 ),
             )
         source_decision = request.policy.check_destination(
-            request.requested_url, third_party_provider=True
+            request.requested_url, external_llm=True, third_party_provider=True
         )
         if source_decision is not AcquisitionPolicyDecision.ALLOWED:
             return (self._policy_probe(request, request.requested_url, source_decision),)
         provider_decision = request.policy.check_destination(
-            self.provider_url, third_party_provider=True
+            self.provider_url, external_llm=True, third_party_provider=True
         )
         if provider_decision is not AcquisitionPolicyDecision.ALLOWED:
             return (self._policy_probe(request, self.provider_url, provider_decision),)
@@ -1850,6 +1951,19 @@ class ThirdPartyExtractionStrategy:
                     response=response,
                 ),
             )
+        text_bytes = _bounded_derived_text(text)
+        if text_bytes is None:
+            return (
+                _probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=safe_external_url(target),
+                    outcome=AcquisitionOutcome.REJECTED,
+                    reason="derived_text_exceeds_limit",
+                    response=response,
+                ),
+            )
         if not (
             canonicalize_http_url(result_url) == canonical or _same_publisher(result_url, canonical)
         ) or not _strong_title_match(request.title, title):
@@ -1865,7 +1979,6 @@ class ThirdPartyExtractionStrategy:
                 ),
             )
         supplied_hash = payload.get("sha256")
-        text_bytes = text.encode("utf-8")
         text_hash = hashlib.sha256(text_bytes).hexdigest()
         if supplied_hash is not None and str(supplied_hash).casefold() != text_hash:
             return (
