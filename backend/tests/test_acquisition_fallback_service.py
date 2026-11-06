@@ -582,7 +582,7 @@ async def test_postgres_fallback_archive_serializes_pointer_check(tmp_path):
         database_url = (
             make_url(admin_url).set(database=database_name).render_as_string(hide_password=False)
         )
-        command.upgrade(_alembic_config(database_url), "head")
+        await asyncio.to_thread(command.upgrade, _alembic_config(database_url), "head")
         engine = create_postgres_engine(database_url)
         try:
             session_factory = create_session_factory(engine)
