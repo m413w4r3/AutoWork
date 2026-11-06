@@ -8,7 +8,13 @@ from dataclasses import replace
 from datetime import date
 from difflib import SequenceMatcher
 
+from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_extraction import ProductionExtractionV1
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+)
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -18,6 +24,10 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.wire_markers import contains_wire_marker_line
 
 BRIEF_SYNTHESIS_PROMPT_VERSION = "brief-synthesis-v1-french-grounded-chronology"
+BRIEF_TIMELINE_POLICY_VERSION = "brief-timeline-v1-core-primary-publication-fallback"
+BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING = (
+    "brief_chronology_source_publication_fallback"
+)
 
 _BRIEF_FORBIDDEN_OUTPUT = re.compile(
     r"(?i)\b(?:recommandation(?:s)?|note\s+d['\u2019]analyste|liste\s+d['\u2019]ioc|"
@@ -28,6 +38,10 @@ _BRIEF_RECOMMENDATION_LANGUAGE = re.compile(
     r"il\s+faudrait|doit\s+être\s+mis\s+en\s+place)\b"
 )
 _BRIEF_LIST_PREFIX = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+")
+_PUBLICATION_EVENT_TEXT = re.compile(
+    r"(?i)\b(?:publication|parution|publi(?:é|ée|és|ées)|published|release(?:d)?|"
+    r"mise en ligne|mis en ligne)\b"
+)
 _TIMELINE_WORD = re.compile(r"[^\W_]+", re.UNICODE)
 _TIMELINE_ARTICLES = frozenset({"le", "la", "les", "un", "une", "l", "the", "an"})
 _TIMELINE_DEDUPE_MIN_WORDS = 7
@@ -116,6 +130,8 @@ def build_brief_synthesis_prompt(
 def brief_timeline_from_extraction(
     extraction: ProductionExtractionV1,
     entries: Iterable[SynthesisTimelineEntryV1],
+    *,
+    warnings: list[str] | None = None,
 ) -> tuple[SynthesisTimelineEntryV1, ...] | None:
     """Keep at most four dated events whose date text is present in source evidence.
 
@@ -153,7 +169,12 @@ def brief_timeline_from_extraction(
         if source_support:
             grounded.append(entry)
     if not grounded:
-        return None
+        fallback = _core_primary_publication_timeline_entry(extraction, payload_by_ref)
+        if fallback is None:
+            return None
+        if warnings is not None:
+            warnings.append(BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING)
+        return (fallback,)
 
     deduplicated: list[SynthesisTimelineEntryV1] = []
     for entry in grounded:
@@ -170,6 +191,53 @@ def brief_timeline_from_extraction(
         evidence_refs = tuple(dict.fromkeys((*existing.evidence_refs, *entry.evidence_refs)))
         deduplicated[index] = replace(existing, evidence_refs=evidence_refs)
     return tuple(deduplicated[:4])
+
+
+def _core_primary_publication_timeline_entry(
+    extraction: ProductionExtractionV1,
+    payload_by_ref: Mapping[ExtractionEvidenceRefV1, Mapping[str, object]],
+) -> SynthesisTimelineEntryV1 | None:
+    """Return one source-verified publication event from the CORE primary source."""
+    sources_by_id = {source.source_document_id: source for source in extraction.sources}
+    for ref, payload in payload_by_ref.items():
+        if ref.kind is not EvidenceKind.EVENT:
+            continue
+        source = sources_by_id[ref.source_document_id]
+        if (
+            source.tier is not ProductionReferenceTier.CORE
+            or source.editorial_role is not ProductionEditorialRole.PRIMARY
+            or source.kind is not ProductionReferenceKind.PUBLICATION
+        ):
+            continue
+        raw_date = payload.get("event_date")
+        evidence_quote = payload.get("evidence_quote")
+        text = payload.get("text")
+        date_text = payload.get("date_text")
+        if (
+            not isinstance(raw_date, str)
+            or payload.get("evidence_basis") != ProductionEvidenceBasis.SOURCE_VERIFIED.value
+            or not isinstance(evidence_quote, str)
+            or not isinstance(text, str)
+            or _PUBLICATION_EVENT_TEXT.search(text) is None
+        ):
+            continue
+        event_date = date.fromisoformat(raw_date)
+        if not _source_contains_date(evidence_quote, event_date):
+            continue
+        display_date_text = (
+            date_text
+            if isinstance(date_text, str)
+            and date_text.strip()
+            and _source_contains_date(date_text, event_date)
+            else None
+        )
+        return SynthesisTimelineEntryV1(
+            event_date=event_date,
+            date_text=display_date_text,
+            text=text,
+            evidence_refs=(ref,),
+        )
+    return None
 
 
 def _same_brief_timeline_event(
@@ -282,7 +350,9 @@ def _source_contains_date(value: str, event_date: date) -> bool:
 
 
 __all__ = [
+    "BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING",
     "BRIEF_SYNTHESIS_PROMPT_VERSION",
+    "BRIEF_TIMELINE_POLICY_VERSION",
     "brief_timeline_from_extraction",
     "build_brief_synthesis_prompt",
     "validate_brief_narrative",

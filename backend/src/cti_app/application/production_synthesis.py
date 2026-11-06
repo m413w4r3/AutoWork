@@ -44,6 +44,7 @@ from cti_app.application.production_artifact_store import (
 )
 from cti_app.application.production_brief_synthesis import (
     BRIEF_SYNTHESIS_PROMPT_VERSION,
+    BRIEF_TIMELINE_POLICY_VERSION,
     brief_timeline_from_extraction,
     build_brief_synthesis_prompt,
     validate_brief_narrative,
@@ -1311,6 +1312,8 @@ def _synthesis_identity_payload(
                 "publication_kind": publication_kind.value,
             }
         )
+        if publication_kind is PublicationKind.BRIEF:
+            payload["brief_timeline_policy_version"] = BRIEF_TIMELINE_POLICY_VERSION
     return payload
 
 
@@ -3613,12 +3616,19 @@ class ProductionSynthesisService:
                 publication_routing_policy_version=publication_routing_policy_version,
             )
             brief_timeline = None
+            brief_timeline_warnings: tuple[str, ...] = ()
             if publication_kind is PublicationKind.BRIEF:
                 timeline_warnings: list[str] = []
                 projected_timeline = build_synthesis_timeline(
                     extraction, projection=projection, warnings=timeline_warnings
                 )
-                brief_timeline = brief_timeline_from_extraction(extraction, projected_timeline)
+                brief_timeline_warnings_list: list[str] = []
+                brief_timeline = brief_timeline_from_extraction(
+                    extraction,
+                    projected_timeline,
+                    warnings=brief_timeline_warnings_list,
+                )
+                brief_timeline_warnings = tuple(brief_timeline_warnings_list)
                 if brief_timeline is None:
                     return ProductionSynthesisExecution(
                         status=SynthesisExecutionStatus.NEEDS_REVIEW,
@@ -3683,6 +3693,7 @@ class ProductionSynthesisService:
             routing_decision_hash=routing_decision_hash,
             publication_routing_policy_version=publication_routing_policy_version,
             brief_timeline=brief_timeline,
+            brief_timeline_warnings=brief_timeline_warnings,
         )
 
     async def _load_extraction(
@@ -4174,6 +4185,7 @@ class ProductionSynthesisService:
         routing_decision_hash: str | None,
         publication_routing_policy_version: str | None,
         brief_timeline: tuple[SynthesisTimelineEntryV1, ...] | None,
+        brief_timeline_warnings: tuple[str, ...],
     ) -> ProductionSynthesisExecution:
         """Submit once, validate deterministically, then persist the canonical result."""
         mode = SynthesisMode.REVISE_PREVIOUS if revision is not None else SynthesisMode.FRESH
@@ -4445,6 +4457,7 @@ class ProductionSynthesisService:
             warnings=_bounded_synthesis_warnings(
                 extraction,
                 additional_warnings=(
+                    *brief_timeline_warnings,
                     *timeline_warnings,
                     *(("synthesis_title_invalid",) if not title_is_valid else ()),
                     *source_note_warnings,

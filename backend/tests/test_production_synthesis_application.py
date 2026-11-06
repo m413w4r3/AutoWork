@@ -27,6 +27,12 @@ from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
 )
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING,
+    BRIEF_TIMELINE_POLICY_VERSION,
+    _source_contains_date,
+    brief_timeline_from_extraction,
+)
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
 )
@@ -133,8 +139,16 @@ from cti_app.domain.production_references import (
 )
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
+    RelevanceProjectionV1,
+    RelevanceReasonCode,
     RelevanceSourcePairRelation,
     RelevanceSourcePairRelationV1,
+    relevance_projection_to_json,
+)
+from cti_app.domain.production_routing import (
+    ProductionRoutingDecisionV1,
+    RoutingReasonCode,
+    RoutingStatus,
 )
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
@@ -151,6 +165,7 @@ from cti_app.domain.production_synthesis import (
     resolve_timeline_date_text,
 )
 from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication_kind import PublicationKind
 
 
 def make_snapshot(subject_id: UUID) -> ProductionInputSnapshot:
@@ -312,6 +327,33 @@ def make_extraction(
         omitted_sources=(),
         warnings=(),
     )
+
+
+def _projection_with_publication_event_as_context(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+) -> RelevanceProjectionV1:
+    projection = build_relevance_projection(snapshot, extraction)
+    payload_by_ref = dict(extraction_evidence_elements(extraction))
+    classifications = tuple(
+        replace(
+            item,
+            classification=(
+                RelevanceClassification.CONTEXT
+                if str(payload_by_ref[item.evidence_ref]["text"]).startswith("Publication")
+                else RelevanceClassification.DIRECT
+            ),
+            reason_code=(
+                RelevanceReasonCode.CONTEXT_SOURCE_WITHOUT_RELATION
+                if str(payload_by_ref[item.evidence_ref]["text"]).startswith("Publication")
+                else RelevanceReasonCode.SUBJECT_MATCHED_PRIMARY
+            ),
+        )
+        if item.evidence_ref.kind is EvidenceKind.EVENT
+        else item
+        for item in projection.classifications
+    )
+    return replace(projection, classifications=classifications)
 
 
 def make_proposal(
@@ -544,6 +586,282 @@ def test_technical_pack_is_contextual_body_free_deterministic_and_bounded():
         "evidence",
     }
     assert body not in str(rule_pack.technical_evidence)
+
+
+def test_brief_publication_date_fallback_when_projection_omits_publication_event():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    event_date = date(2026, 10, 28)
+    publication_event = make_event(
+        source_id,
+        (
+            "Publication par ESET Research du rapport consacré aux activités APT "
+            "des deuxième et troisième trimestres 2026 (28 Oct 2026)."
+        ),
+        event_date,
+    )
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(source_id, events=(publication_event,), url_suffix="publication-event"),
+    )
+    projection = _projection_with_publication_event_as_context(snapshot, extraction)
+
+    projected_timeline = build_synthesis_timeline(extraction, projection=projection)
+    source_timeline = build_synthesis_timeline(extraction)
+    fallback_warnings: list[str] = []
+
+    assert projected_timeline == ()
+    assert _source_contains_date(publication_event.evidence_quote, event_date)
+    assert brief_timeline_from_extraction(extraction, source_timeline) == source_timeline
+    fallback_timeline = brief_timeline_from_extraction(
+        extraction,
+        projected_timeline,
+        warnings=fallback_warnings,
+    )
+
+    assert fallback_timeline is not None
+    assert len(fallback_timeline) == 1
+    assert fallback_timeline[0].event_date == event_date
+    assert fallback_timeline[0].date_text == publication_event.date_text
+    assert fallback_timeline[0].text == publication_event.text
+    assert fallback_warnings == [BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING]
+
+
+def test_brief_publication_fallback_recovers_event_with_period_date_text():
+    subject_id, source_id = uuid4(), uuid4()
+    event_date = date(2026, 10, 28)
+    publication_event = make_event(
+        source_id,
+        "Publication par ESET Research du rapport le 28 Oct 2026.",
+        event_date,
+        date_text="avril-septembre 2026",
+    )
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, events=(publication_event,), url_suffix="period-date-text"),),
+    )
+    unprojected_timeline = build_synthesis_timeline(extraction)
+    warnings: list[str] = []
+
+    assert len(unprojected_timeline) == 1
+    assert unprojected_timeline[0].event_date is None
+    assert _source_contains_date(publication_event.evidence_quote, event_date)
+    fallback_timeline = brief_timeline_from_extraction(
+        extraction,
+        unprojected_timeline,
+        warnings=warnings,
+    )
+
+    assert fallback_timeline is not None
+    assert fallback_timeline[0].event_date == event_date
+    assert fallback_timeline[0].date_text is None
+    assert fallback_timeline[0].text == publication_event.text
+    assert warnings == [BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING]
+
+
+@pytest.mark.asyncio
+async def test_brief_publication_fallback_warning_is_persisted_in_diagnostics():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    event_date = date(2026, 10, 28)
+    publication_event = make_event(
+        source_id,
+        "Publication par ESET Research du rapport le 28 Oct 2026.",
+        event_date,
+        date_text="28 October 2026",
+    )
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            facts=(make_fact(source_id, "FooRAT"),),
+            events=(publication_event,),
+            url_suffix="brief-fallback-diagnostics",
+        ),
+    )
+    projection = _projection_with_publication_event_as_context(snapshot, extraction)
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
+    handle = str(evidence_pack.narrative_evidence[0]["handle"])
+    proposal = SynthesisProposalV1(
+        title="[ESET] Décrit FooRAT",
+        lead=(
+            SynthesisClaimProposalV1(
+                text="Le rapport identifie FooRAT.",
+                evidence_handles=(handle,),
+            ),
+        ),
+        sections=(),
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, proposal))
+    projection_blob_id = uuid4()
+    world = _service_world(
+        snapshot,
+        extraction,
+        (make_document(subject_id, source_id),),
+        gateway,
+        extra_payloads={projection_blob_id: relevance_projection_to_json(projection)},
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash=projection.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=projection_blob_id,
+    )
+    routing_decision = ProductionRoutingDecisionV1(
+        decision_id=uuid4(),
+        production_run_id=world.run.id,
+        pipeline_generation=world.run.pipeline_generation,
+        extraction_artifact_id=world.artifact.id,
+        extraction_artifact_hash=canonical_extraction_hash(extraction),
+        relevance_artifact_id=projection_artifact.id,
+        relevance_artifact_hash=projection.projection_hash,
+        input_hash="d" * 64,
+        policy_version="test-publication-routing-v1",
+        status=RoutingStatus.DECIDED,
+        publication_kind=PublicationKind.BRIEF,
+        reason_code=RoutingReasonCode.NO_SUBJECT_IOC,
+        confirmed_ioc_count=0,
+        contextual_ioc_count=0,
+        ambiguous_ioc_count=0,
+        critical_source_diagnostics=(),
+        decided_at=datetime.now(UTC),
+        decision_hash="e" * 64,
+    )
+
+    result = await world.service.execute(
+        world.run,
+        snapshot,
+        world.artifact,
+        projection_artifact,
+        routing_decision=routing_decision,
+    )
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert len(synthesis.timeline) == 1
+    assert synthesis.timeline[0].event_date == event_date
+    assert synthesis.timeline[0].text == publication_event.text
+    assert BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING in synthesis.warnings
+    diagnostics = world.writer.calls[0]["diagnostics"]
+    assert isinstance(diagnostics, dict)
+    assert BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING in diagnostics["warnings"]
+
+
+def test_brief_publication_date_fallback_requires_a_verifying_quote():
+    subject_id, source_id = uuid4(), uuid4()
+    event_date = date(2026, 10, 28)
+    publication_event = replace(
+        make_event(
+            source_id,
+            "Publication par ESET Research du rapport consacré aux activités APT.",
+            event_date,
+            date_text="28 October 2026",
+        ),
+        evidence_quote="The source discusses the report without stating its publication date.",
+    )
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, events=(publication_event,), url_suffix="unverified-date"),),
+    )
+
+    warnings: list[str] = []
+    assert brief_timeline_from_extraction(extraction, (), warnings=warnings) is None
+    assert warnings == []
+
+
+def test_subject_linked_brief_chronology_takes_precedence_over_publication_fallback():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    publication_event = make_event(
+        source_id,
+        "Publication par ESET Research du rapport le 28 Oct 2026.",
+        date(2026, 10, 28),
+        date_text="28 October 2026",
+    )
+    subject_event = make_event(
+        source_id,
+        "MuddyWater activity began on 3 March 2026.",
+        date(2026, 3, 3),
+        date_text="3 March 2026",
+    )
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            events=(publication_event, subject_event),
+            url_suffix="subject-event-precedence",
+        ),
+    )
+    projection = _projection_with_publication_event_as_context(snapshot, extraction)
+    timeline = build_synthesis_timeline(extraction, projection=projection)
+
+    warnings: list[str] = []
+    brief_timeline = brief_timeline_from_extraction(extraction, timeline, warnings=warnings)
+
+    assert len(timeline) == 1
+    assert brief_timeline == timeline
+    assert brief_timeline[0].text == subject_event.text
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_article_synthesis_does_not_apply_brief_publication_date_fallback():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    event = make_event(
+        source_id,
+        "Publication par ESET Research du rapport le 28 Oct 2026.",
+        date(2026, 10, 28),
+        date_text="28 October 2026",
+    )
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT"),),
+        events=(event,),
+        url_suffix="article-no-brief-fallback",
+    )
+    extraction = _matched_extraction(snapshot, source)
+    projection = _projection_with_publication_event_as_context(snapshot, extraction)
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
+    handle = str(evidence_pack.narrative_evidence[0]["handle"])
+    proposal = SynthesisProposalV1.model_validate(
+        make_proposal("FooRAT was identified in the report.", handle)
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, proposal))
+    projection_blob_id = uuid4()
+    world = _service_world(
+        snapshot,
+        extraction,
+        (make_document(subject_id, source_id),),
+        gateway,
+        extra_payloads={projection_blob_id: relevance_projection_to_json(projection)},
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash=projection.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=projection_blob_id,
+    )
+
+    result = await world.service.execute(
+        world.run,
+        snapshot,
+        world.artifact,
+        projection_artifact,
+    )
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 1
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert synthesis.timeline == ()
 
 
 def test_timeline_deduplicates_events_and_sorts_dated_before_undated():
@@ -2229,6 +2547,48 @@ async def test_synthesis_input_hash_changes_with_policy_but_ignores_run_ids_and_
         )
         assert original_hash != synthesis_input_hash(
             snapshot, extraction, pack, synthesis_access_policy_hash(permissive)
+        )
+
+    routing_identity = {
+        "routing_decision_hash": "c" * 64,
+        "publication_routing_policy_version": "publication-routing-test-v1",
+    }
+    brief_identity = {"publication_kind": PublicationKind.BRIEF, **routing_identity}
+    article_identity = {"publication_kind": PublicationKind.ARTICLE, **routing_identity}
+    brief_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        pack,
+        synthesis_access_policy_hash(permissive),
+        **brief_identity,
+    )
+    article_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        pack,
+        synthesis_access_policy_hash(permissive),
+        **article_identity,
+    )
+    assert synthesis_module.BRIEF_TIMELINE_POLICY_VERSION == BRIEF_TIMELINE_POLICY_VERSION
+    with monkeypatch.context() as changed_policy:
+        changed_policy.setattr(
+            synthesis_module,
+            "BRIEF_TIMELINE_POLICY_VERSION",
+            "brief-timeline-v3-test-policy",
+        )
+        assert brief_hash != synthesis_input_hash(
+            snapshot,
+            extraction,
+            pack,
+            synthesis_access_policy_hash(permissive),
+            **brief_identity,
+        )
+        assert article_hash == synthesis_input_hash(
+            snapshot,
+            extraction,
+            pack,
+            synthesis_access_policy_hash(permissive),
+            **article_identity,
         )
 
 
