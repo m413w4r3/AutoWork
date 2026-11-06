@@ -13,7 +13,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from cti_app.application.extraction import DocumentParsingError, PdfParsingPolicy, parse_document
 from cti_app.domain.acquisition import AcquisitionQuality
@@ -39,7 +39,7 @@ _HTML_TAG_RE = re.compile(
 )
 _CHALLENGE_RE = re.compile(
     r"(?i)\b(?:captcha|verify you are human|prove you are human|checking your browser|"
-    r"unusual traffic|access denied|enable javascript and cookies|log in to continue|"
+    r"unusual traffic|enable javascript and cookies|log in to continue|"
     r"sign in to continue)\b"
 )
 _PAYWALL_RE = re.compile(
@@ -384,12 +384,14 @@ def select_best_candidate(
     candidates: tuple[ExtractionCandidate, ...] | list[ExtractionCandidate],
     *,
     expected_title: str | None,
+    expected_url: str,
     min_score: float = 0.55,
-    expected_url: str | None = None,
     allow_cross_domain: bool = False,
 ) -> ExtractionCandidate | None:
     if not 0.0 <= min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
+    if _url_host(expected_url) is None or _url_path(expected_url) is None:
+        return None
     eligible = [
         candidate
         for candidate in candidates
@@ -402,11 +404,17 @@ def select_best_candidate(
         and "canonical_url_mismatch" not in candidate.reasons
         and (
             "canonical_host_mismatch" not in candidate.reasons
-            or (allow_cross_domain and expected_url is not None)
+            or allow_cross_domain
         )
         and _title_similarity(expected_title, candidate.title) >= (0.25 if expected_title else 0.0)
         and _body_title_coherence(expected_title, candidate.text)
         >= _MIN_BODY_TITLE_COHERENCE
+        and _canonical_url_matches(
+            candidate,
+            expected_title=expected_title,
+            expected_url=expected_url,
+            allow_cross_domain=allow_cross_domain,
+        )
         and (
             candidate.canonical_url is not None
             or (
@@ -416,16 +424,9 @@ def select_best_candidate(
             )
         )
         and (
-            expected_url is None
-            or allow_cross_domain
-            or candidate.canonical_url is None
-            or _url_host(candidate.canonical_url) == _url_host(expected_url)
-        )
-        and (
             candidate.quality.score >= min_score
             or (
                 allow_cross_domain
-                and expected_url is not None
                 and "canonical_host_mismatch" in candidate.reasons
                 and candidate.quality.score / 0.15 >= min_score
             )
@@ -441,6 +442,39 @@ def select_best_candidate(
             method_order[candidate.method],
             candidate.canonical_url or "",
         ),
+    )
+
+
+def _canonical_url_matches(
+    candidate: ExtractionCandidate,
+    *,
+    expected_title: str | None,
+    expected_url: str,
+    allow_cross_domain: bool,
+) -> bool:
+    canonical_url = candidate.canonical_url
+    if canonical_url is None:
+        return True
+
+    same_host = _url_host(canonical_url) == _url_host(expected_url)
+    if not same_host and not allow_cross_domain:
+        return False
+    if _url_path(canonical_url) == _url_path(expected_url):
+        return True
+    return _paths_share_article_slug(expected_url, canonical_url) and (
+        _strong_title_body_match(candidate, expected_title)
+    )
+
+
+def _strong_title_body_match(
+    candidate: ExtractionCandidate,
+    expected_title: str | None,
+) -> bool:
+    return bool(
+        expected_title
+        and _title_similarity(expected_title, candidate.title) >= _STRONG_BODY_TITLE_COHERENCE
+        and _body_title_coherence(expected_title, candidate.text)
+        >= _STRONG_BODY_TITLE_COHERENCE
     )
 
 
@@ -688,6 +722,18 @@ def _extract_html(
             boilerplate_ratio=link_ratio,
             paragraph_texts=paragraphs,
             has_article_structure=article_structure,
+            error_context=" ".join(
+                value
+                for key, value in parser.meta.items()
+                if key
+                in {
+                    "description",
+                    "og:description",
+                    "og:title",
+                    "twitter:description",
+                    "twitter:title",
+                }
+            ),
         )
         candidates.append(candidate)
     for script_text, attrs in parser.scripts:
@@ -1138,6 +1184,7 @@ def _candidate(
     metadata: tuple[tuple[str, str], ...] = (),
     expected_url: str | None = None,
     has_article_structure: bool = True,
+    error_context: str = "",
 ) -> ExtractionCandidate:
     raw_text = text
     normalized = _normalize_text(raw_text)
@@ -1150,16 +1197,30 @@ def _candidate(
         boilerplate_ratio=boilerplate_ratio,
         paragraph_texts=paragraph_texts or _paragraphs(raw_text),
     )
+    same_host = bool(
+        canonical_url and expected_url and _url_host(canonical_url) == _url_host(expected_url)
+    )
+    same_path = bool(
+        canonical_url and expected_url and _url_path(canonical_url) == _url_path(expected_url)
+    )
+    same_article_variant = bool(
+        canonical_url
+        and expected_url
+        and _paths_share_article_slug(expected_url, canonical_url)
+        and expected_title
+        and _title_similarity(expected_title, title) >= _STRONG_BODY_TITLE_COHERENCE
+        and _body_title_coherence(expected_title, normalized) >= _STRONG_BODY_TITLE_COHERENCE
+    )
     if (
         method
         in {ExtractionMethod.JSON_LD, ExtractionMethod.EMBEDDED_STATE, ExtractionMethod.CMS_JSON}
         and expected_url
         and canonical_url
-        and _normalized_url(canonical_url) != _normalized_url(expected_url)
+        and (not same_host or (not same_path and not same_article_variant))
     ):
         mismatch_reason = (
             "canonical_host_mismatch"
-            if _url_host(canonical_url) != _url_host(expected_url)
+            if not same_host
             else "canonical_url_mismatch"
         )
         quality = replace(
@@ -1171,7 +1232,8 @@ def _candidate(
         normalized,
         title,
         has_article_structure=has_article_structure,
-        duplicate_ratio=quality.duplicate_ratio,
+        paragraph_texts=paragraph_texts or _paragraphs(raw_text),
+        error_context=error_context,
     ):
         quality = replace(
             quality,
@@ -1311,13 +1373,23 @@ def _is_error_page(
     title: str | None,
     *,
     has_article_structure: bool,
-    duplicate_ratio: float,
+    paragraph_texts: list[str],
+    error_context: str = "",
 ) -> bool:
-    if has_article_structure or not (
-        _ERROR_PAGE_RE.search(text) or _ERROR_PAGE_RE.search(title or "")
-    ):
+    title_or_meta_error = bool(
+        _ERROR_PAGE_RE.search(title or "") or _ERROR_PAGE_RE.search(error_context)
+    )
+    if not title_or_meta_error and not _ERROR_PAGE_RE.search(text):
         return False
-    return len(text) < 1_200 or duplicate_ratio >= 0.35
+
+    paragraphs = [_normalize_text(item) for item in paragraph_texts if _normalize_text(item)]
+    lead = paragraphs[0] if paragraphs else text[:500]
+    lead_error = bool(_ERROR_PAGE_RE.search(lead))
+    error_paragraphs = sum(bool(_ERROR_PAGE_RE.search(item)) for item in paragraphs)
+    error_dominates = bool(paragraphs) and error_paragraphs * 2 > len(paragraphs)
+    if has_article_structure and len(paragraphs) >= 2:
+        return error_dominates
+    return title_or_meta_error or lead_error or error_dominates
 
 
 def _detect_language(words: list[str]) -> str | None:
@@ -1612,30 +1684,45 @@ def _cms_is_coherent(
 
 
 def _normalized_url(value: str) -> str:
-    try:
-        parsed = urlsplit(value)
-        if not parsed.scheme or not parsed.hostname:
-            return ""
-        scheme = parsed.scheme.casefold()
-        host = parsed.hostname.casefold()
-        port = parsed.port
-        netloc = (
-            host
-            if port is None or (scheme, port) in {("http", 80), ("https", 443)}
-            else f"{host}:{port}"
-        )
-        path = parsed.path.rstrip("/") or "/"
-        return urlunsplit((scheme, netloc, path, "", ""))
-    except ValueError:
-        return ""
+    host = _url_host(value)
+    path = _url_path(value)
+    return f"{host}{path}" if host and path else ""
 
 
 def _url_host(value: str) -> str | None:
     try:
         hostname = urlsplit(value).hostname
-        return hostname.casefold() if hostname else None
+        if not hostname:
+            return None
+        normalized = hostname.casefold()
+        return normalized.removeprefix("www.")
     except ValueError:
         return None
+
+
+def _url_path(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value)
+        if not parsed.scheme or not parsed.hostname:
+            return None
+        segments = [
+            unquote(segment).casefold()
+            for segment in parsed.path.split("/")
+            if segment
+        ]
+        return "/" + "/".join(segments) if segments else "/"
+    except ValueError:
+        return None
+
+
+def _paths_share_article_slug(expected_url: str, candidate_url: str) -> bool:
+    expected_path = _url_path(expected_url)
+    candidate_path = _url_path(candidate_url)
+    if not expected_path or not candidate_path:
+        return False
+    expected_segments = [segment for segment in expected_path.split("/") if segment]
+    candidate_segments = {segment for segment in candidate_path.split("/") if segment}
+    return bool(expected_segments and expected_segments[-1] in candidate_segments)
 
 
 class _TextOnlyParser(HTMLParser):

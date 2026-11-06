@@ -503,6 +503,45 @@ def test_same_host_but_different_structured_canonical_is_low_quality() -> None:
     )
 
 
+def test_same_host_different_path_canonical_is_rejected_despite_matching_article() -> None:
+    candidates = _extract(
+        _html("<article><h1>" + ARTICLE_TITLE + "</h1>" + _paragraph_markup() + "</article>")
+    )
+    wrong_path = tuple(
+        replace(item, canonical_url="https://publisher.example/reports/another-incident")
+        for item in candidates
+    )
+
+    assert all(item.title == ARTICLE_TITLE for item in wrong_path)
+    assert all(item.quality.text_chars >= 200 for item in wrong_path)
+    assert (
+        select_best_candidate(
+            wrong_path, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is None
+    )
+
+
+def test_same_article_slug_path_variant_requires_strong_coherence() -> None:
+    payload = {
+        "@type": "NewsArticle",
+        "headline": ARTICLE_TITLE,
+        "articleBody": ARTICLE_TEXT,
+        "url": "https://publisher.example/articles/sample-incident",
+    }
+    candidates = _extract(
+        f'<script type="application/ld+json">{json.dumps(payload)}</script>'.encode()
+    )
+    candidate = next(item for item in candidates if item.method is ExtractionMethod.JSON_LD)
+
+    assert (
+        select_best_candidate(
+            (candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is candidate
+    )
+
+
 def test_unrelated_generic_json_payload_is_rejected() -> None:
     response = {
         "headline": "Unrelated local story",
@@ -521,7 +560,12 @@ def test_wrong_title_candidate_is_not_selected() -> None:
     )
 
     assert candidates
-    assert select_best_candidate(candidates, expected_title=ARTICLE_TITLE) is None
+    assert (
+        select_best_candidate(
+            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is None
+    )
 
 
 def test_matching_metadata_title_with_unrelated_body_is_not_selected() -> None:
@@ -532,7 +576,12 @@ def test_matching_metadata_title_with_unrelated_body_is_not_selected() -> None:
 
     assert candidates
     assert all(item.title == ARTICLE_TITLE for item in candidates)
-    assert select_best_candidate(candidates, expected_title=ARTICLE_TITLE) is None
+    assert (
+        select_best_candidate(
+            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is None
+    )
 
 
 def test_expected_url_rejects_same_title_from_another_host() -> None:
@@ -590,6 +639,36 @@ def test_expected_url_accepts_same_host_canonical_candidate() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "canonical_url",
+    [
+        "https://www.publisher.example/reports/sample-incident/?source=feed",
+        "https://publisher.example/reports/sample-incident?source=feed",
+    ],
+)
+def test_expected_url_accepts_www_trailing_slash_and_query_variants(canonical_url: str) -> None:
+    candidates = _extract(
+        _html("<article><h1>" + ARTICLE_TITLE + "</h1>" + _paragraph_markup() + "</article>")
+    )
+    equivalent = tuple(replace(item, canonical_url=canonical_url) for item in candidates)
+
+    assert (
+        select_best_candidate(
+            equivalent, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is not None
+    )
+
+
+def test_expected_url_is_required_to_select_candidates() -> None:
+    candidates = _extract(
+        _html("<article><h1>" + ARTICLE_TITLE + "</h1>" + _paragraph_markup() + "</article>")
+    )
+
+    with pytest.raises(TypeError):
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE)  # type: ignore[call-arg]
+
+
 def test_repeated_state_assignments_are_bounded() -> None:
     state = {
         "article": {"title": ARTICLE_TITLE, "url": ARTICLE_URL, "content": ARTICLE_TEXT}
@@ -605,6 +684,61 @@ def test_repeated_state_assignments_are_bounded() -> None:
     assert sum(map(len, found)) <= 2 * 1024 * 1024
     candidates = _extract(_html(f"<script>{source}</script>"))
     assert len([item for item in candidates if item.method is ExtractionMethod.EMBEDDED_STATE]) <= 3
+
+
+def test_aggregate_embedded_state_character_cap_is_observable() -> None:
+    state = {
+        "article": {"title": ARTICLE_TITLE, "url": ARTICLE_URL, "content": ARTICLE_TEXT},
+        "padding": "x" * 300_000,
+    }
+    script = f'<script id="__NEXT_DATA__">{json.dumps(state)}</script>'
+    source = _html(script * 8).decode()
+    parser = article_extraction_module._SafeHTMLParser(ARTICLE_URL)
+    parser.feed(source)
+    parser.close()
+    accepted = [
+        text
+        for text, attrs in parser.scripts
+        if attrs.get("id") == "__NEXT_DATA__"
+    ]
+    accepted_chars = sum(map(len, accepted))
+
+    assert len(accepted) < 8
+    assert accepted_chars <= article_extraction_module._MAX_STATE_JSON_CHARS
+    assert accepted_chars < len(script) * 8
+
+    candidates = _extract(source.encode())
+    state_candidates = [
+        item for item in candidates if item.method is ExtractionMethod.EMBEDDED_STATE
+    ]
+    assert len(state_candidates) <= 3
+
+
+@pytest.mark.parametrize(
+    ("cap_name", "cap_value", "payload"),
+    [
+        (
+            "_MAX_JSON_NODES",
+            4,
+            {"items": [{"noise": index} for index in range(8)] + [{"headline": ARTICLE_TITLE}]},
+        ),
+        (
+            "_MAX_JSON_DEPTH",
+            1,
+            {"items": [{"item": {"headline": ARTICLE_TITLE, "articleBody": ARTICLE_TEXT}}]},
+        ),
+    ],
+)
+def test_generic_json_node_and_depth_caps_bound_traversal(
+    monkeypatch, cap_name: str, cap_value: int, payload: object
+) -> None:
+    monkeypatch.setattr(article_extraction_module, cap_name, cap_value)
+
+    candidates = article_extraction_module._generic_json_candidates(
+        payload, ARTICLE_URL, ARTICLE_TITLE, (), 200
+    )
+
+    assert candidates == []
 
 
 def test_duplicate_json_ld_candidates_are_deduplicated() -> None:
@@ -660,7 +794,12 @@ def test_challenge_and_paywall_candidates_are_rejected(marker: str, quality_flag
 
     assert candidates
     assert getattr(candidates[0].quality, quality_flag)
-    assert select_best_candidate(candidates, expected_title=ARTICLE_TITLE) is None
+    assert (
+        select_best_candidate(
+            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is None
+    )
 
 
 def test_duplicate_paragraphs_are_penalized_and_rejected() -> None:
@@ -855,7 +994,75 @@ def test_long_repetitive_region_block_page_is_rejected() -> None:
 
     assert candidates
     assert any("error_page_detected" in item.reasons for item in candidates)
-    assert select_best_candidate(candidates, expected_title=ARTICLE_TITLE) is None
+    assert (
+        select_best_candidate(
+            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is None
+    )
+
+
+def test_long_varied_region_block_notice_is_rejected() -> None:
+    details = [
+        "Readers in the northern district receive this notice under the publisher's "
+        "licensing rules.",
+        "The regional catalog does not include this report for accounts registered overseas.",
+        "Local access settings were updated after the distribution agreement changed "
+        "this morning.",
+        "The publisher directs visitors to the regional edition for material available "
+        "in that area.",
+        "This restriction applies to browser requests and cached copies served from the "
+        "same market.",
+        "Support staff can explain which editions are available under each territory's "
+        "current terms.",
+        "The notice remains visible while the publisher reviews its distribution configuration.",
+        "Visitors can return later to check whether the regional publication settings "
+        "have changed.",
+    ]
+    paragraphs = [
+        f"This content is unavailable in your country. {detail} "
+        f"Request reference region {index} is included for support follow-up."
+        for index, detail in enumerate(details)
+    ]
+    candidates = _extract(_html("".join(f"<p>{item}</p>" for item in paragraphs)))
+
+    assert candidates
+    assert all(item.title == ARTICLE_TITLE for item in candidates)
+    assert all(item.quality.text_chars > 1_200 for item in candidates)
+    assert all(item.quality.duplicate_ratio < 0.35 for item in candidates)
+    assert any("error_page_detected" in item.reasons for item in candidates)
+    assert (
+        select_best_candidate(
+            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is None
+    )
+
+
+def test_genuine_article_is_not_rejected_for_mentioning_access_denied() -> None:
+    paragraphs = (
+        ARTICLE_TEXT,
+        "The appendix describes access denied notices used by regional filters.",
+    )
+    candidates = _extract(
+        _html(
+            "<article><h1>"
+            + ARTICLE_TITLE
+            + "</h1>"
+            + _paragraph_markup(paragraphs)
+            + "</article>"
+        )
+    )
+    article = next(item for item in candidates if item.method is ExtractionMethod.HTML_ARTICLE)
+
+    assert "error_page_detected" not in article.reasons
+    assert not article.quality.challenge_detected
+    assert (
+        select_best_candidate(
+            (article,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is article
+    )
 
 
 def test_plain_text_ocr_candidate_is_supported() -> None:
@@ -866,7 +1073,12 @@ def test_plain_text_ocr_candidate_is_supported() -> None:
     assert len(candidates) == 1
     assert candidates[0].method is ExtractionMethod.PLAIN_TEXT
     assert candidates[0].title == ARTICLE_TITLE
-    assert select_best_candidate(candidates, expected_title=ARTICLE_TITLE) is candidates[0]
+    assert (
+        select_best_candidate(
+            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is candidates[0]
+    )
 
 
 def test_tie_break_uses_stable_method_order() -> None:
@@ -881,4 +1093,9 @@ def test_tie_break_uses_stable_method_order() -> None:
         quality=generic.quality,
     )
 
-    assert select_best_candidate((article, generic), expected_title=ARTICLE_TITLE) is generic
+    assert (
+        select_best_candidate(
+            (article, generic), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
+        )
+        is generic
+    )
