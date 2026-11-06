@@ -491,6 +491,7 @@ def test_global_timeout_keeps_probes_from_earlier_strategies() -> None:
             _request: AcquisitionRequest,
         ) -> Sequence[AcquisitionProbe]:
             await asyncio.Event().wait()
+            raise AssertionError("deadline strategy must be cancelled")
 
         result = await ArticleAcquisitionOrchestrator(
             (

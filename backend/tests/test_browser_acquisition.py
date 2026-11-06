@@ -8,7 +8,7 @@ import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -77,7 +77,7 @@ class FakeAsyncTransport(httpx.AsyncBaseTransport):
         if inspect.isawaitable(response):
             response = await response
         response.request = request
-        return response
+        return cast(httpx.Response, response)
 
 
 def _transport_for(handler) -> FakeAsyncTransport:

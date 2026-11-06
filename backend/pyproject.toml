@@ -103,6 +103,12 @@ plugins = ["pydantic.mypy"]
 module = "minio.*"
 ignore_missing_imports = true
 
+# Standalone acquisition sidecars are not part of the backend package; tests
+# import their pure helpers. They are linted/compiled separately.
+[[tool.mypy.overrides]]
+module = "sidecars.*"
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = [
   "tests",
