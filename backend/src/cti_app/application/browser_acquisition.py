@@ -9,12 +9,12 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
 MAX_HTML_BYTES = 10 * 1024 * 1024
-MAX_CONTROL_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_CONTROL_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_CAPTURE_JSON_COUNT = 10
 MAX_CAPTURE_JSON_BODY_BYTES = 512 * 1024
 MAX_CAPTURE_JSON_TOTAL_BYTES = 2 * 1024 * 1024
@@ -27,8 +27,13 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
         "auth",
         "authorization",
         "bearer",
+        "code",
         "client_secret",
         "cookie",
+        "credential",
+        "credentials",
+        "id_token",
+        "jwt",
         "key",
         "password",
         "refresh_token",
@@ -40,6 +45,12 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
         "token",
     }
 )
+_NORMALIZED_CREDENTIAL_QUERY_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_QUERY_KEYS
+)
+_JWT_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
+_OPAQUE_TOKEN_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{24,}$")
+_REDACTED_PATH_SEGMENT = "%5BREDACTED%5D"
 
 
 class BrowserControlReason(StrEnum):
@@ -306,7 +317,10 @@ async def _read_bounded(response: httpx.Response) -> bytes:
     content_length = response.headers.get("content-length")
     if content_length is not None:
         try:
-            if int(content_length) > MAX_CONTROL_RESPONSE_BYTES:
+            declared_size = int(content_length)
+            if declared_size < 0:
+                raise ValueError
+            if declared_size > MAX_CONTROL_RESPONSE_BYTES:
                 raise BrowserSizeLimitError()
         except ValueError as exc:
             raise BrowserInvalidResponseError() from exc
@@ -365,6 +379,8 @@ def _parse_captured_json(value: Any) -> tuple[CapturedJson, ...]:
         if not _is_http_url(safe_url):
             raise BrowserInvalidResponseError()
         if size > MAX_CAPTURE_JSON_BODY_BYTES:
+            raise BrowserSizeLimitError()
+        if total + size > MAX_CAPTURE_JSON_TOTAL_BYTES:
             raise BrowserSizeLimitError()
         try:
             body = base64.b64decode(encoded, validate=True)
@@ -429,26 +445,39 @@ def _credential_free_url(value: str) -> str:
         raise BrowserInvalidResponseError() from exc
     if port is not None and port not in ({80} if parsed.scheme.casefold() == "http" else {443}):
         netloc += f":{port}"
-    query = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if _safe_query_key(key)
-    ]
     return urlunsplit(
-        (parsed.scheme.casefold(), netloc, parsed.path, urlencode(query, doseq=True), "")
+        (parsed.scheme.casefold(), netloc, _redact_credential_path(parsed.path), "", "")
     )
 
 
-def _safe_query_key(value: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
-    if normalized in {
-        re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_QUERY_KEYS
-    }:
-        return False
-    return not any(
-        marker in normalized
-        for marker in ("token", "secret", "password", "authorization", "signature", "credential")
-    ) and not normalized.startswith("xamz") and not normalized.startswith("xgoog")
+def _redact_credential_path(path: str) -> str:
+    safe_segments: list[str] = []
+    redact_next = False
+    for segment in path.split("/"):
+        decoded = unquote(segment)
+        normalized = re.sub(r"[^a-z0-9]", "", decoded.casefold())
+        marker = any(
+            normalized == key or normalized.startswith(key)
+            for key in _NORMALIZED_CREDENTIAL_QUERY_KEYS
+        )
+        if redact_next:
+            safe_segments.append(_REDACTED_PATH_SEGMENT)
+            redact_next = marker
+        elif marker:
+            safe_segments.append(_REDACTED_PATH_SEGMENT)
+            redact_next = True
+        elif _looks_like_credential_path_segment(decoded):
+            safe_segments.append(_REDACTED_PATH_SEGMENT)
+        else:
+            safe_segments.append(segment)
+    return "/".join(safe_segments)
+
+
+def _looks_like_credential_path_segment(value: str) -> bool:
+    return bool(
+        _JWT_PATH_SEGMENT.fullmatch(value)
+        or _OPAQUE_TOKEN_PATH_SEGMENT.fullmatch(value)
+    )
 
 
 def _is_json_content_type(value: str) -> bool:

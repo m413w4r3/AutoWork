@@ -619,8 +619,9 @@ services:
     environment:
       BROWSER_EGRESS_BIND: 0.0.0.0
       BROWSER_EGRESS_PORT: 8791
-      BROWSER_EGRESS_ALLOWED_DOMAINS: ${BROWSER_EGRESS_ALLOWED_DOMAINS:-}
-      BROWSER_EGRESS_BLOCKED_DOMAINS: ${BROWSER_EGRESS_BLOCKED_DOMAINS:-}
+      # Browser egress inherits collection policy so both acquisition paths share one domain policy.
+      BROWSER_EGRESS_ALLOWED_DOMAINS: ${COLLECTION_ALLOWED_DOMAINS:-}
+      BROWSER_EGRESS_BLOCKED_DOMAINS: ${COLLECTION_BLOCKED_DOMAINS:-}
       BROWSER_EGRESS_PROXY_TOKEN: ${BROWSER_EGRESS_PROXY_TOKEN:-}
     expose: ["8791"]
     networks: [acquisition-browser, default]

@@ -11,10 +11,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 MAX_HTML_BYTES = int(os.environ.get("PLAYWRIGHT_ACQUIRER_MAX_HTML_BYTES", "10485760"))
 MAX_REQUEST_BYTES = MAX_HTML_BYTES * 2 + 1024 * 1024
+MAX_RENDER_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_TIMEOUT_MS = 45_000
 MAX_SETTLE_MS = 500
 MAX_CAPTURE_JSON_COUNT = 10
@@ -31,8 +32,13 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
         "auth",
         "authorization",
         "bearer",
+        "code",
         "client_secret",
         "cookie",
+        "credential",
+        "credentials",
+        "id_token",
+        "jwt",
         "key",
         "password",
         "refresh_token",
@@ -44,6 +50,16 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
         "token",
     }
 )
+_NORMALIZED_CREDENTIAL_QUERY_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_QUERY_KEYS
+)
+_JWT_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
+_OPAQUE_TOKEN_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{24,}$")
+_REDACTED_PATH_SEGMENT = "%5BREDACTED%5D"
+
+
+class RenderSizeLimitError(Exception):
+    pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -117,6 +133,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = _render_offline(html, url, timeout_ms)
             else:
                 result = _render_navigation(url, timeout_ms)
+        except RenderSizeLimitError:
+            self._write_json(413, {"error": "render_size_limit"})
+            return
         except TimeoutError:
             self._write_json(504, {"error": "navigation_timeout"})
             return
@@ -141,7 +160,10 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(200, result)
 
     def _write_json(self, status: int, payload: dict[str, Any]) -> None:
-        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(encoded) > MAX_RENDER_RESPONSE_BYTES:
+            status = 413
+            encoded = b'{"error":"render_response_size_limit"}'
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
@@ -209,6 +231,7 @@ def _render_offline(html: str, url: str, timeout_ms: int) -> dict[str, Any]:
                     raise TimeoutError from exc
                 page.wait_for_timeout(min(timeout_ms, MAX_SETTLE_MS))
                 rendered = page.content()
+                _check_rendered_html_size(rendered)
                 return {
                     "rendered_html": rendered,
                     "final_url": _credential_free_url(url),
@@ -276,6 +299,7 @@ def _render_navigation(url: str, timeout_ms: int) -> dict[str, Any]:
                     raise TimeoutError from exc
                 page.wait_for_timeout(min(timeout_ms, MAX_SETTLE_MS))
                 rendered = page.content()
+                _check_rendered_html_size(rendered)
                 final_url = _credential_free_url(page.url)
                 status = response.status if response is not None else None
                 captured = _capture_json_responses(responses)
@@ -306,6 +330,11 @@ def _route_http_only(route: Any) -> None:
         route.abort()
 
 
+def _check_rendered_html_size(rendered_html: str) -> None:
+    if len(rendered_html.encode("utf-8")) > MAX_HTML_BYTES:
+        raise RenderSizeLimitError
+
+
 def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     total = 0
@@ -328,6 +357,8 @@ def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
                 continue
             declared_size_bytes = int(declared_size)
             if not 0 <= declared_size_bytes <= MAX_CAPTURE_JSON_BODY_BYTES:
+                continue
+            if total + declared_size_bytes > MAX_CAPTURE_JSON_TOTAL_BYTES:
                 continue
             body = response.body()
             if len(body) > MAX_CAPTURE_JSON_BODY_BYTES or len(body) > declared_size_bytes:
@@ -412,26 +443,39 @@ def _credential_free_url(value: str) -> str:
         port = None
     if port is not None and port not in ({80} if parsed.scheme.casefold() == "http" else {443}):
         netloc += f":{port}"
-    safe_query = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if _safe_query_key(key)
-    ]
     return urlunsplit(
-        (parsed.scheme.casefold(), netloc, parsed.path, urlencode(safe_query, doseq=True), "")
+        (parsed.scheme.casefold(), netloc, _redact_credential_path(parsed.path), "", "")
     )
 
 
-def _safe_query_key(value: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
-    if normalized in {
-        re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_QUERY_KEYS
-    }:
-        return False
-    return not any(
-        marker in normalized
-        for marker in ("token", "secret", "password", "authorization", "signature", "credential")
-    ) and not normalized.startswith("xamz") and not normalized.startswith("xgoog")
+def _redact_credential_path(path: str) -> str:
+    safe_segments: list[str] = []
+    redact_next = False
+    for segment in path.split("/"):
+        decoded = unquote(segment)
+        normalized = re.sub(r"[^a-z0-9]", "", decoded.casefold())
+        marker = any(
+            normalized == key or normalized.startswith(key)
+            for key in _NORMALIZED_CREDENTIAL_QUERY_KEYS
+        )
+        if redact_next:
+            safe_segments.append(_REDACTED_PATH_SEGMENT)
+            redact_next = marker
+        elif marker:
+            safe_segments.append(_REDACTED_PATH_SEGMENT)
+            redact_next = True
+        elif _looks_like_credential_path_segment(decoded):
+            safe_segments.append(_REDACTED_PATH_SEGMENT)
+        else:
+            safe_segments.append(segment)
+    return "/".join(safe_segments)
+
+
+def _looks_like_credential_path_segment(value: str) -> bool:
+    return bool(
+        _JWT_PATH_SEGMENT.fullmatch(value)
+        or _OPAQUE_TOKEN_PATH_SEGMENT.fullmatch(value)
+    )
 
 
 def _proxy_configuration() -> tuple[str, str | None] | None:

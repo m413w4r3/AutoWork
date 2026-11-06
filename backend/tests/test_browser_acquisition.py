@@ -5,13 +5,26 @@ import base64
 import hashlib
 import inspect
 import json
+import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from cti_app.application.browser_acquisition import (
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from sidecars.playwright_acquirer.server import (  # noqa: E402
+    MAX_CAPTURE_JSON_BODY_BYTES,
+    _capture_json_responses,
+)
+from sidecars.playwright_acquirer.server import (  # noqa: E402
+    _credential_free_url as _renderer_credential_free_url,
+)
+
+from cti_app.application.browser_acquisition import (  # noqa: E402
     BrowserControlReason,
     BrowserInvalidResponseError,
     BrowserSizeLimitError,
@@ -165,8 +178,39 @@ async def test_non_json_captured_body_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_captured_json_total_body_budget_is_enforced_across_page() -> None:
+    body = b'{"v":"' + b"a" * (450 * 1024 - 9) + b'"}'
+    entries = [
+        _captured_json(body, url=f"https://example.com/data/{index}")
+        for index in range(5)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(
+                200,
+                json={"status": "ready", "browser": "chromium", "navigation": True},
+            )
+        return httpx.Response(200, json=_observation(captured_json=entries))
+
+    adapter = SidecarBrowserAdapter(
+        service_url="http://fake-renderer",
+        timeout_seconds=2,
+        transport=_transport_for(handler),
+    )
+    try:
+        with pytest.raises(BrowserSizeLimitError):
+            await adapter.navigate("https://example.com/article")
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
 async def test_credential_like_query_values_are_removed_from_returned_urls() -> None:
     body = b'{"items":[1]}'
+    token_path_segment = (
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -176,7 +220,23 @@ async def test_credential_like_query_values_are_removed_from_returned_urls() -> 
             )
         return httpx.Response(
             200,
-            json=_observation(captured_json=[_captured_json(body)]),
+            json=_observation(
+                final_url=(
+                    "https://example.com/article/"
+                    f"{token_path_segment}?jwt=jwt-secret&code=code-secret"
+                    "&access_token=access-secret&edition=monthly"
+                ),
+                captured_json=[
+                    _captured_json(
+                        body,
+                        url=(
+                            "https://example.com/data/"
+                            f"{token_path_segment}?jwt=jwt-secret&code=code-secret"
+                            "&access_token=access-secret&kind=public"
+                        ),
+                    )
+                ],
+            ),
         )
 
     adapter = SidecarBrowserAdapter(
@@ -190,12 +250,97 @@ async def test_credential_like_query_values_are_removed_from_returned_urls() -> 
         )
     finally:
         await adapter.aclose()
-    assert observation.final_url == "https://example.com/article?section=public"
-    assert observation.captured_json[0].url == "https://example.com/data?kind=public"
-    assert "secret" not in observation.final_url
-    assert "secret" not in observation.captured_json[0].url
+    assert observation.final_url == "https://example.com/article/%5BREDACTED%5D"
+    assert observation.captured_json[0].url == "https://example.com/data/%5BREDACTED%5D"
+    assert all(
+        secret not in observation.final_url
+        for secret in ("jwt-secret", "code-secret", "access-secret", token_path_segment)
+    )
+    assert all(
+        secret not in observation.captured_json[0].url
+        for secret in ("jwt-secret", "code-secret", "access-secret", token_path_segment)
+    )
+    assert "?" not in observation.final_url
+    assert "?" not in observation.captured_json[0].url
     assert observation.captured_json[0].body == body
     assert observation.captured_json[0].sha256 == hashlib.sha256(body).hexdigest()
+
+
+def test_renderer_url_sanitization_removes_queries_and_token_path_segments() -> None:
+    token_path_segment = (
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
+    )
+    sanitized = _renderer_credential_free_url(
+        "https://example.com/article/"
+        f"{token_path_segment}?jwt=jwt-secret&code=code-secret"
+        "&access_token=access-secret&edition=monthly"
+    )
+    assert sanitized == "https://example.com/article/%5BREDACTED%5D"
+    assert all(
+        secret not in sanitized
+        for secret in ("jwt-secret", "code-secret", "access-secret", token_path_segment)
+    )
+
+
+def test_renderer_skips_response_with_oversized_content_length_before_body() -> None:
+    class FakeRequest:
+        resource_type = "xhr"
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.url = "https://example.com/data"
+            self.headers = {
+                "content-type": "application/json",
+                "content-length": str(MAX_CAPTURE_JSON_BODY_BYTES + 1),
+            }
+            self.request = FakeRequest()
+            self.body_called = False
+
+        def body(self) -> bytes:
+            self.body_called = True
+            raise AssertionError("oversized response body must not be materialized")
+
+    response = FakeResponse()
+    assert _capture_json_responses([response]) == []
+    assert response.body_called is False
+
+
+def test_renderer_prechecks_captured_json_total_before_materializing_body(monkeypatch) -> None:
+    class FakeRequest:
+        resource_type = "xhr"
+
+    class FakeResponse:
+        def __init__(self, index: int, body: bytes) -> None:
+            self.url = f"https://example.com/data/{index}"
+            self.headers = {
+                "content-type": "application/json",
+                "content-length": str(len(body)),
+            }
+            self.request = FakeRequest()
+            self._body = body
+            self.body_called = False
+
+        def body(self) -> bytes:
+            self.body_called = True
+            return self._body
+
+    def padded_json(size: int) -> bytes:
+        prefix, suffix = b'{"v":"', b'"}'
+        return prefix + b"a" * (size - len(prefix) - len(suffix)) + suffix
+
+    monkeypatch.setattr(
+        "sidecars.playwright_acquirer.server.MAX_CAPTURE_JSON_TOTAL_BYTES", 1024 * 1024
+    )
+    bodies = [padded_json(300 * 1024) for _ in range(3)]
+    bodies.extend([padded_json(200 * 1024), padded_json(50 * 1024)])
+    responses = [FakeResponse(index, body) for index, body in enumerate(bodies)]
+
+    captured = _capture_json_responses(responses)
+
+    assert len(captured) == 4
+    assert all(response.body_called for response in responses[:3])
+    assert responses[3].body_called is False
+    assert responses[4].body_called is True
 
 
 @pytest.mark.asyncio

@@ -11,9 +11,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from sidecars.browser_egress_proxy.server import (  # noqa: E402
+    MAX_CONNECTION_BYTES,
+    MAX_CONNECTIONS,
+    MAX_TOTAL_CONNECTION_BYTES,
     AsyncForwardProxy,
     ProxyConfig,
     ProxyError,
+    _ByteBudget,
+    _GlobalByteBudget,
     _parse_authority,
 )
 
@@ -117,6 +122,71 @@ def test_domain_allow_block_and_docker_hostname_policy() -> None:
     ):
         with pytest.raises(ProxyError):
             proxy._check_domain(hostname)
+
+
+def test_empty_allow_list_allows_public_domains_while_block_list_wins() -> None:
+    proxy = AsyncForwardProxy(
+        ProxyConfig(blocked_domains=frozenset({"blocked.example.com"}))
+    )
+    proxy._check_domain("example.com")
+    with pytest.raises(ProxyError, match="blocked"):
+        proxy._check_domain("blocked.example.com")
+
+
+def test_proxy_connection_and_aggregate_byte_budgets_are_bounded() -> None:
+    assert MAX_CONNECTIONS == 16
+    assert MAX_CONNECTION_BYTES == 16 * 1024 * 1024
+    assert MAX_TOTAL_CONNECTION_BYTES == 64 * 1024 * 1024
+
+    total = _GlobalByteBudget(100)
+    first = _ByteBudget(100, total)
+    second = _ByteBudget(100, total)
+    first.add(60)
+    with pytest.raises(ProxyError, match="aggregate active byte limit"):
+        second.add(41)
+    assert total.used == 60
+    first.release()
+    assert total.used == 0
+    second.add(41)
+    assert total.used == 41
+    second.release()
+    assert total.used == 0
+
+
+@pytest.mark.asyncio
+async def test_connect_closes_upstream_when_setup_fails_before_relay() -> None:
+    class FakeUpstreamWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return
+
+    upstream_writer = FakeUpstreamWriter()
+
+    async def connector(_ip: str, _port: int):
+        return asyncio.StreamReader(), upstream_writer
+
+    proxy = AsyncForwardProxy(
+        ProxyConfig(listen_host="127.0.0.1", listen_port=0),
+        resolver=lambda _url: ["93.184.216.34"],
+        connector=connector,
+    )
+    try:
+        with pytest.raises(ProxyError, match="connection byte limit"):
+            await proxy._handle_connect(
+                "example.com:443",
+                asyncio.StreamReader(),
+                object(),
+                [],
+                _ByteBudget(1),
+            )
+        assert upstream_writer.closed is True
+    finally:
+        await proxy.close()
 
 
 def test_ports_userinfo_and_schemes_are_rejected() -> None:

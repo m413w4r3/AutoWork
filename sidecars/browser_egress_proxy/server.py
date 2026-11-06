@@ -18,8 +18,9 @@ from urllib.parse import urlsplit
 POLICY_VERSION = "browser-egress-v1"
 DEFAULT_ALLOWED_PORTS = frozenset({80, 443})
 MAX_HEADER_BYTES = 64 * 1024
-MAX_CONNECTION_BYTES = 32 * 1024 * 1024
-MAX_CONNECTIONS = 64
+MAX_CONNECTION_BYTES = 16 * 1024 * 1024
+MAX_CONNECTIONS = 16
+MAX_TOTAL_CONNECTION_BYTES = 64 * 1024 * 1024
 IDLE_TIMEOUT_SECONDS = 15.0
 READ_CHUNK_BYTES = 64 * 1024
 _METADATA_HOSTS = frozenset(
@@ -56,6 +57,7 @@ class ProxyConfig:
     allowed_ports: frozenset[int] = DEFAULT_ALLOWED_PORTS
     max_connections: int = MAX_CONNECTIONS
     max_connection_bytes: int = MAX_CONNECTION_BYTES
+    max_total_connection_bytes: int = MAX_TOTAL_CONNECTION_BYTES
     max_header_bytes: int = MAX_HEADER_BYTES
     idle_timeout_seconds: float = IDLE_TIMEOUT_SECONDS
     listen_host: str = "0.0.0.0"
@@ -65,7 +67,11 @@ class ProxyConfig:
     def __post_init__(self) -> None:
         if self.max_connections < 1:
             raise ValueError("max_connections must be positive")
-        if self.max_connection_bytes < 1 or self.max_header_bytes < 128:
+        if (
+            self.max_connection_bytes < 1
+            or self.max_total_connection_bytes < 1
+            or self.max_header_bytes < 128
+        ):
             raise ValueError("proxy byte limits must be positive")
         if self.idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
@@ -73,15 +79,37 @@ class ProxyConfig:
             raise ValueError("allowed_ports must contain valid TCP ports")
 
 
-class _ByteBudget:
+class _GlobalByteBudget:
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self.used = 0
 
     def add(self, size: int) -> None:
+        if size < 0 or self.used + size > self.limit:
+            raise ProxyError(413, "proxy aggregate active byte limit exceeded")
         self.used += size
-        if self.used > self.limit:
+
+    def release(self, size: int) -> None:
+        self.used = max(0, self.used - size)
+
+
+class _ByteBudget:
+    def __init__(self, limit: int, global_budget: _GlobalByteBudget | None = None) -> None:
+        self.limit = limit
+        self.global_budget = global_budget
+        self.used = 0
+
+    def add(self, size: int) -> None:
+        if size < 0 or self.used + size > self.limit:
             raise ProxyError(413, "connection byte limit exceeded")
+        if self.global_budget is not None:
+            self.global_budget.add(size)
+        self.used += size
+
+    def release(self) -> None:
+        if self.global_budget is not None:
+            self.global_budget.release(self.used)
+        self.used = 0
 
 
 class AsyncForwardProxy:
@@ -101,6 +129,9 @@ class AsyncForwardProxy:
         self._bound_ports = {self.config.listen_port}
         self._active = 0
         self._active_lock = asyncio.Lock()
+        self._total_byte_budget = _GlobalByteBudget(
+            self.config.max_total_connection_bytes
+        )
 
     async def start(self) -> int:
         if self._server is not None:
@@ -141,7 +172,9 @@ class AsyncForwardProxy:
                 await writer.wait_closed()
                 return
             self._active += 1
-        budget = _ByteBudget(self.config.max_connection_bytes)
+        budget = _ByteBudget(
+            self.config.max_connection_bytes, self._total_byte_budget
+        )
         try:
             raw_header = await self._read_header(reader)
             budget.add(len(raw_header))
@@ -173,6 +206,7 @@ class AsyncForwardProxy:
                 await writer.wait_closed()
             except OSError:
                 pass
+            budget.release()
             async with self._active_lock:
                 self._active -= 1
 
@@ -222,13 +256,25 @@ class AsyncForwardProxy:
         url = _authority_url(host, port, "https" if port == 443 else "http")
         ip = await self._resolve_and_validate(url, host, port)
         upstream_reader, upstream_writer = await self._open_upstream(ip, port)
-        response = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: AutoWork\r\n\r\n"
-        budget.add(len(response))
-        client_writer.write(response)
-        await asyncio.wait_for(client_writer.drain(), self.config.idle_timeout_seconds)
-        await self._relay(
-            client_reader, client_writer, upstream_reader, upstream_writer, budget
-        )
+        try:
+            response = (
+                b"HTTP/1.1 200 Connection Established\r\n"
+                b"Proxy-Agent: AutoWork\r\n\r\n"
+            )
+            budget.add(len(response))
+            client_writer.write(response)
+            await asyncio.wait_for(
+                client_writer.drain(), self.config.idle_timeout_seconds
+            )
+            await self._relay(
+                client_reader, client_writer, upstream_reader, upstream_writer, budget
+            )
+        finally:
+            upstream_writer.close()
+            try:
+                await upstream_writer.wait_closed()
+            except OSError:
+                pass
 
     async def _handle_http(
         self,
