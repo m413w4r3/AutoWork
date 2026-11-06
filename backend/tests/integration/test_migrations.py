@@ -580,6 +580,23 @@ async def _alembic_version(database_url: str) -> str | None:
         await engine.dispose()
 
 
+async def _alembic_version_column_length(database_url: str) -> int | None:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return (
+                await connection.execute(
+                    text(
+                        "SELECT character_maximum_length FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'alembic_version' AND column_name = 'version_num'"
+                    )
+                )
+            ).scalar_one_or_none()
+    finally:
+        await engine.dispose()
+
+
 def _sqlstate(exc: DBAPIError) -> str:
     """Extract the PostgreSQL SQLSTATE code from a raised `DBAPIError`."""
     return str(getattr(exc.orig, "sqlstate", ""))
@@ -1112,6 +1129,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert _head_revision() == "0010_acquisition_provenance"
+    assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
         _column_names(temporary_postgres_url, "collection_attempts")
@@ -1186,6 +1204,23 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
     assert asyncio.run(_database_snapshot(temporary_postgres_url)) == schema_definitions
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
+
+
+def test_fresh_upgrade_stamps_acquisition_revisions_without_truncation(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+
+    command.upgrade(config, "0009_acquisition_strategy_attempts")
+    assert (
+        asyncio.run(_alembic_version(temporary_postgres_url))
+        == "0009_acquisition_strategy_attempts"
+    )
+    assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
+
+    command.upgrade(config, "0010_acquisition_provenance")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0010_acquisition_provenance"
+    assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
 
 def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
