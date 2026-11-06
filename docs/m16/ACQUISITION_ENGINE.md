@@ -123,6 +123,16 @@ privée, locale, link-local ou de métadonnées.
   les contrôles de destination. Provider tiers et Bridge exigent la permission de divulgation
   (`external_llm_allowed`) et un TLP admissible ; TLP RED est refusé. L’absence de permission
   produit une tentative de policy refusée, pas un envoi.
+- Les gates d’URL (collector, stratégies, renderer et proxy navigateur) refusent aussi les clés de
+  signature cloud normalisées (`X-Amz-Credential`, `X-Amz-Signature`, `X-Amz-Security-Token`,
+  `X-Goog-Credential`, `X-Goog-Signature`, `AWSAccessKeyId`, jetons OAuth et paramètres
+  `signature`/`credential`/`token`/`key`) en plus des credentials classiques. Une page ne peut pas
+  faire sortir un débit signé par le proxy.
+- Une copie trouvée par Bridge discovery sur un autre éditeur est archivée avec
+  `acquisition_method=independent_corroboration`, `evidence_class=independent_corroboration`,
+  `primary_source_verified=false`. Elle reste contextuelle dans EXTRACTION et force
+  `NEEDS_REVIEW`/`CRITICAL_SOURCE_MISSING` pour une source CORE ; elle ne peut pas usurper
+  l’identité primaire de la publication demandée.
 - Bridge source discovery et transcription utilisent des parseurs de réponse tolérants et gardent
   les identifiants du run/de consultation et les hashes. Le résultat de découverte modèle lui-même
   est `model_generated=true`, `primary_source_verified=false`, `ioc_primary_verified=false`,

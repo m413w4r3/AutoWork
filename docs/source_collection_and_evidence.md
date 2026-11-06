@@ -86,8 +86,11 @@ porte `model_generated=true`, `primary_source_verified=false`, `ioc_primary_veri
 `evidence_class=model_contextual_unverified`. OCR porte `evidence_class=ocr_derived`; une extraction
 tierce ou une corroboration ne deviennent pas primaires sans vérification indépendante. Un CORE
 qui n'est disponible que sous forme Bridge/OCR/tierce impose `NEEDS_REVIEW` avec
-`CRITICAL_SOURCE_MISSING`, même si des IOC confirmés existent ailleurs. Une réponse modèle ambiguë
-n'est jamais soumise de nouveau avant réconciliation. L'endpoint HTTP `content` permet à un humain
+`CRITICAL_SOURCE_MISSING`, même si des IOC confirmés existent ailleurs. Une copie indépendante
+trouvée par Bridge discovery est archivée comme `independent_corroboration`, reste contextuelle et
+ne peut jamais usurper l'identité primaire de la publication demandée. Une réponse modèle ambiguë
+n'est jamais soumise de nouveau avant réconciliation ; seule une exécution `FAILED` avec
+soumission vérifiée `not_submitted` peut être resoumise. L'endpoint HTTP `content` permet à un humain
 de remplacer un fallback archivé par une archive vérifiée ; le CAS du service conserve l'ancien
 document et ses blobs immuables. Les archives directes et les archives humaines déjà attachées ne
 peuvent pas être remplacées et renvoient `409 source_already_archived`.
