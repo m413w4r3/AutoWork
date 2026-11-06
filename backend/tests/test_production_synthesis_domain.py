@@ -22,6 +22,7 @@ from cti_app.domain.production_synthesis import (
     is_valid_editorial_title,
     production_synthesis_from_json,
     production_synthesis_to_json,
+    source_metadata_evidence_ref_v1,
     validate_synthesis_lineage,
     validate_synthesis_section_heading,
 )
@@ -104,6 +105,34 @@ def test_production_synthesis_round_trip_and_deterministic_collections() -> None
     assert production_synthesis_from_json(payload) == synthesis
     assert production_synthesis_to_json(production_synthesis_from_json(payload)) == payload
     assert production_synthesis_to_json(synthesis) == production_synthesis_to_json(synthesis)
+
+
+def test_source_metadata_timeline_reference_round_trips_as_a_typed_reference() -> None:
+    source_id = uuid4()
+    ref = source_metadata_evidence_ref_v1(
+        source_document_id=source_id,
+        canonical_url="https://example.com/report",
+        title="Example report",
+        publisher="Example publisher",
+        published_at=date(2026, 1, 10),
+    )
+    synthesis = replace(
+        _synthesis(),
+        timeline=(
+            SynthesisTimelineEntryV1(
+                event_date=date(2026, 1, 10),
+                date_text=None,
+                text="Publication par Example publisher de « Example report ».",
+                evidence_refs=(ref,),
+            ),
+        ),
+    )
+
+    payload = production_synthesis_to_json(synthesis)
+    restored = production_synthesis_from_json(payload)
+
+    assert payload["timeline"][0]["evidence_refs"][0]["kind"] == "source_metadata"
+    assert restored.timeline[0].evidence_refs == (ref,)
 
 
 def test_legacy_synthesis_without_heading_field_remains_readable() -> None:

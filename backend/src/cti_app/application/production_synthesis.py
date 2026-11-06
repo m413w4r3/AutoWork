@@ -43,6 +43,7 @@ from cti_app.application.production_artifact_store import (
     ProductionReuseStorageUnavailableError,
 )
 from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
     BRIEF_SYNTHESIS_PROMPT_VERSION,
     BRIEF_TIMELINE_POLICY_VERSION,
     brief_timeline_from_extraction,
@@ -3467,15 +3468,17 @@ def _bounded_synthesis_warnings(
     extraction: ProductionExtractionV1,
     *,
     additional_warnings: Iterable[str] = (),
+    required_warnings: Iterable[str] = (),
 ) -> tuple[str, ...]:
     """Project extraction warnings deterministically, with an explicit bound."""
-    warnings = sorted(
-        {
-            warning.strip()
-            for warning in (*extraction.warnings, *additional_warnings)
-            if warning.strip()
-        }
-    )
+    all_warnings = {
+        warning.strip()
+        for warning in (*extraction.warnings, *additional_warnings, *required_warnings)
+        if warning.strip()
+    }
+    required = sorted({warning.strip() for warning in required_warnings if warning.strip()})
+    optional = sorted(all_warnings - set(required))
+    warnings = [*required, *optional]
     bounded = [
         warning
         if len(warning) <= MAX_SYNTHESIS_WARNING_CHARS
@@ -3626,6 +3629,7 @@ class ProductionSynthesisService:
                 brief_timeline = brief_timeline_from_extraction(
                     extraction,
                     projected_timeline,
+                    snapshot=snapshot,
                     warnings=brief_timeline_warnings_list,
                 )
                 brief_timeline_warnings = tuple(brief_timeline_warnings_list)
@@ -4463,6 +4467,12 @@ class ProductionSynthesisService:
                     *source_note_warnings,
                     *(f"{item.warning_code}:{item.block_id}" for item in parsed.warnings),
                 ),
+                required_warnings=(
+                    (BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,)
+                    if BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING
+                    in brief_timeline_warnings
+                    else ()
+                ),
             ),
         )
         validate_synthesis_lineage(synthesis, snapshot, extraction_hash)
@@ -4477,6 +4487,8 @@ class ProductionSynthesisService:
                 input_hash=input_hash,
                 synthesis=synthesis,
                 extraction=extraction,
+                snapshot=snapshot,
+                publication_kind=publication_kind,
                 raw_result=raw_text,
                 model_run_id=model_run.id,
                 mode=mode,

@@ -82,6 +82,7 @@ type RichText = tuple[RichSpan, ...]
 class PublicationEvidenceKind(StrEnum):
     FACT = "fact"
     EVENT = "event"
+    SOURCE_METADATA = "source_metadata"
     INDICATOR = "indicator"
     RULE = "rule"
     UNCERTAINTY = "uncertainty"

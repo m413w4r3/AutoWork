@@ -228,6 +228,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 class EvidenceKind(StrEnum):
     FACT = "fact"
     EVENT = "event"
+    SOURCE_METADATA = "source_metadata"
     INDICATOR = "indicator"
     RULE = "rule"
     UNCERTAINTY = "uncertainty"
@@ -724,6 +725,36 @@ def extraction_evidence_ref(
         source_document_id=source_document_id,
         kind=kind,
         evidence_key=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def source_metadata_evidence_ref_v1(
+    *,
+    source_document_id: UUID,
+    canonical_url: str,
+    title: str,
+    publisher: str,
+    published_at: date,
+) -> ExtractionEvidenceRefV1:
+    """Identify frozen collection metadata without treating it as extracted content."""
+    if not isinstance(source_document_id, UUID):
+        raise ValueError("Source metadata identity requires a source document UUID")
+    if not all(
+        isinstance(value, str) and value.strip() for value in (canonical_url, title, publisher)
+    ):
+        raise ValueError("Source metadata reference requires URL, title, and publisher")
+    if type(published_at) is not date:
+        raise ValueError("Source metadata publication date must be a day-precision date")
+    return extraction_evidence_ref(
+        source_document_id,
+        EvidenceKind.SOURCE_METADATA,
+        {
+            "metadata_schema": "production-source-metadata-v1",
+            "canonical_url": canonical_url,
+            "title": title,
+            "publisher": publisher,
+            "published_at": published_at.isoformat(),
+        },
     )
 
 

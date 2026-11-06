@@ -144,9 +144,14 @@ def _project_synthesis_publication(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
     include_timeline: bool = True,
+    allowed_source_metadata_refs: frozenset[ExtractionEvidenceRefV1] = frozenset(),
 ) -> _PublicationNarrativeProjection:
     """Project validated canonical synthesis narrative without changing editorial order."""
-    _validate_synthesis_evidence_refs(extraction=extraction, synthesis=synthesis)
+    _validate_synthesis_evidence_refs(
+        extraction=extraction,
+        synthesis=synthesis,
+        allowed_source_metadata_refs=allowed_source_metadata_refs,
+    )
     used_source_document_ids: set[UUID] = set()
 
     def evidence_refs(
@@ -634,13 +639,24 @@ def compute_assembly_input_hash(
 
 
 def _validate_synthesis_evidence_refs(
-    *, extraction: ProductionExtractionV1, synthesis: ProductionSynthesisV1
+    *,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    allowed_source_metadata_refs: frozenset[ExtractionEvidenceRefV1] = frozenset(),
 ) -> None:
     """Require each synthesis citation to identify current extraction evidence."""
     current_identities = {
         (ref.source_document_id, ref.kind.value, ref.evidence_key)
         for ref in extraction_evidence_refs_v1(extraction)
     }
+    source_ids = {source.source_document_id for source in extraction.sources}
+    for ref in allowed_source_metadata_refs:
+        if ref.kind is not EvidenceKind.SOURCE_METADATA or ref.source_document_id not in source_ids:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.EVIDENCE_MISSING,
+                "Source metadata reference is not valid for the current extraction",
+            )
+        current_identities.add((ref.source_document_id, ref.kind.value, ref.evidence_key))
     for ref in synthesis_evidence_refs(synthesis):
         identity = (ref.source_document_id, ref.kind.value, ref.evidence_key)
         if identity not in current_identities:

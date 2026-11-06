@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
+    brief_timeline_from_extraction,
+)
+from cti_app.application.production_synthesis import build_synthesis_timeline
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
     _project_publication_references,
@@ -19,7 +24,12 @@ from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_relevance import RelevanceProjectionV1
-from cti_app.domain.production_synthesis import ProductionSynthesisV1
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
+    synthesis_evidence_refs,
+)
 from cti_app.domain.publication import (
     PublicationAssemblyErrorCode,
     PublicationSectionKind,
@@ -68,10 +78,55 @@ def build_brief_publication_document_v5(
         synthesis=synthesis,
         relevance_projection=relevance_projection,
     )
+    metadata_refs = frozenset(
+        ref
+        for ref in synthesis_evidence_refs(synthesis)
+        if ref.kind is EvidenceKind.SOURCE_METADATA
+    )
+    allowed_metadata_refs: frozenset[ExtractionEvidenceRefV1] = frozenset()
+    if metadata_refs:
+        expected_timeline = brief_timeline_from_extraction(
+            extraction,
+            build_synthesis_timeline(extraction, projection=relevance_projection),
+            snapshot=snapshot,
+        )
+        expected_metadata_refs = frozenset(
+            ref
+            for entry in expected_timeline or ()
+            for ref in entry.evidence_refs
+            if ref.kind is EvidenceKind.SOURCE_METADATA
+        )
+        non_timeline_metadata_refs = {
+            ref
+            for paragraph in (
+                *synthesis.lead,
+                *(paragraph for section in synthesis.sections for paragraph in section.paragraphs),
+            )
+            for ref in paragraph.evidence_refs
+            if ref.kind is EvidenceKind.SOURCE_METADATA
+        } | {
+            ref
+            for note in synthesis.source_notes
+            for ref in note.evidence_refs
+            if ref.kind is EvidenceKind.SOURCE_METADATA
+        }
+        if (
+            not expected_metadata_refs
+            or metadata_refs != expected_metadata_refs
+            or non_timeline_metadata_refs
+            or synthesis.timeline != expected_timeline
+            or BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING not in synthesis.warnings
+        ):
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.EVIDENCE_MISSING,
+                "Brief source metadata citation does not match its deterministic fallback",
+            )
+        allowed_metadata_refs = expected_metadata_refs
     narrative = _project_synthesis_publication(
         extraction=extraction,
         synthesis=synthesis,
         include_timeline=False,
+        allowed_source_metadata_refs=allowed_metadata_refs,
     )
     reference_entries = _project_publication_references(
         references=references,
@@ -111,6 +166,7 @@ def build_brief_publication_document_v5(
         extraction=extraction,
         synthesis=synthesis,
         include_timeline=True,
+        allowed_source_metadata_refs=allowed_metadata_refs,
     )
     timeline = tuple(
         PublicationTimelineEntryV1(

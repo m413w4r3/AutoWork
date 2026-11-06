@@ -28,6 +28,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
 from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
     BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING,
     BRIEF_TIMELINE_POLICY_VERSION,
     _source_contains_date,
@@ -190,6 +191,29 @@ def make_snapshot(subject_id: UUID) -> ProductionInputSnapshot:
         publication_language="fr",
         research_date=date(2026, 3, 1),
     )
+
+
+def snapshot_with_core_source_metadata(
+    snapshot: ProductionInputSnapshot,
+    *,
+    canonical_url: str,
+    published_at: date | None,
+    title: str = "Titre du rapport",
+    publisher: str = "Éditeur source",
+) -> ProductionInputSnapshot:
+    source = ProductionInputSource(
+        discovery_candidate_id=snapshot.member_candidate_ids[0],
+        source_candidate_id=uuid4(),
+        canonical_url=canonical_url,
+        role=SourceRole.PRIMARY,
+        title=title,
+        publisher=publisher,
+        published_at=published_at,
+        tlp=TLP.CLEAR,
+        sensitivity="clear",
+        external_llm_allowed=True,
+    )
+    return replace(snapshot, core_sources=(source,), input_hash="", reuse_basis_hash="")
 
 
 def make_document(
@@ -590,7 +614,12 @@ def test_technical_pack_is_contextual_body_free_deterministic_and_bounded():
 
 def test_brief_publication_date_fallback_when_projection_omits_publication_event():
     subject_id, source_id = uuid4(), uuid4()
-    snapshot = make_snapshot(subject_id)
+    source_url = "https://example.com/publication-event"
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=date(2026, 2, 15),
+    )
     event_date = date(2026, 10, 28)
     publication_event = make_event(
         source_id,
@@ -602,7 +631,7 @@ def test_brief_publication_date_fallback_when_projection_omits_publication_event
     )
     extraction = _matched_extraction(
         snapshot,
-        make_source(source_id, events=(publication_event,), url_suffix="publication-event"),
+        make_source(source_id, events=(publication_event,), canonical_url=source_url),
     )
     projection = _projection_with_publication_event_as_context(snapshot, extraction)
 
@@ -616,6 +645,7 @@ def test_brief_publication_date_fallback_when_projection_omits_publication_event
     fallback_timeline = brief_timeline_from_extraction(
         extraction,
         projected_timeline,
+        snapshot=snapshot,
         warnings=fallback_warnings,
     )
 
@@ -659,27 +689,208 @@ def test_brief_publication_fallback_recovers_event_with_period_date_text():
     assert warnings == [BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING]
 
 
+def test_brief_metadata_publication_fallback_uses_hashed_core_source_metadata():
+    subject_id, source_id = uuid4(), uuid4()
+    source_url = "https://example.com/metadata-only-brief"
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=date(2026, 2, 15),
+    )
+    changed_date_snapshot = replace(
+        snapshot,
+        core_sources=(replace(snapshot.core_sources[0], published_at=date(2026, 2, 16)),),
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    assert changed_date_snapshot.input_hash != snapshot.input_hash
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(source_id, facts=(make_fact(source_id, "FooRAT"),), canonical_url=source_url),
+    )
+    warnings: list[str] = []
+
+    timeline = brief_timeline_from_extraction(
+        extraction,
+        (),
+        snapshot=snapshot,
+        warnings=warnings,
+    )
+
+    assert timeline is not None
+    assert len(timeline) == 1
+    assert timeline[0].event_date == date(2026, 2, 15)
+    assert timeline[0].date_text is None
+    assert timeline[0].text == "Publication par Éditeur source de « Titre du rapport »."
+    assert timeline[0].evidence_refs[0].source_document_id == source_id
+    assert timeline[0].evidence_refs[0].kind is EvidenceKind.SOURCE_METADATA
+    assert warnings == [BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING]
+
+
+@pytest.mark.parametrize(
+    ("published_at", "tier", "kind", "editorial_role"),
+    (
+        (
+            date(2026, 3, 2),
+            ProductionReferenceTier.CORE,
+            ProductionReferenceKind.PUBLICATION,
+            ProductionEditorialRole.PRIMARY,
+        ),
+        (
+            date(2024, 12, 31),
+            ProductionReferenceTier.CORE,
+            ProductionReferenceKind.PUBLICATION,
+            ProductionEditorialRole.PRIMARY,
+        ),
+        (
+            None,
+            ProductionReferenceTier.CORE,
+            ProductionReferenceKind.PUBLICATION,
+            ProductionEditorialRole.PRIMARY,
+        ),
+        (
+            date(2026, 2, 15),
+            ProductionReferenceTier.SUPPORTING,
+            ProductionReferenceKind.PUBLICATION,
+            ProductionEditorialRole.CORROBORATION,
+        ),
+        (
+            date(2026, 2, 15),
+            ProductionReferenceTier.CORE,
+            ProductionReferenceKind.PUBLICATION,
+            ProductionEditorialRole.CORROBORATION,
+        ),
+        (
+            date(2026, 2, 15),
+            ProductionReferenceTier.CORE,
+            ProductionReferenceKind.TECHNICAL_RESOURCE,
+            ProductionEditorialRole.PRIMARY,
+        ),
+    ),
+)
+def test_brief_metadata_publication_fallback_rejects_ineligible_source_metadata(
+    published_at: date | None,
+    tier: ProductionReferenceTier,
+    kind: ProductionReferenceKind,
+    editorial_role: ProductionEditorialRole,
+) -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    source_url = "https://example.com/ineligible-metadata"
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=published_at,
+    )
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            tier=tier,
+            kind=kind,
+            editorial_role=editorial_role,
+            canonical_url=source_url,
+        ),
+    )
+    warnings: list[str] = []
+
+    assert (
+        brief_timeline_from_extraction(extraction, (), snapshot=snapshot, warnings=warnings) is None
+    )
+    assert warnings == []
+
+
+def test_brief_metadata_publication_fallback_selects_earliest_then_url():
+    subject_id = uuid4()
+    snapshot = make_snapshot(subject_id)
+    candidate_ids = (uuid4(), uuid4(), uuid4())
+    metadata_rows = (
+        (candidate_ids[0], "https://example.com/z-report", "Z report", date(2026, 2, 10)),
+        (candidate_ids[1], "https://example.com/a-report", "A report", date(2026, 2, 10)),
+        (candidate_ids[2], "https://example.com/next-day", "Next day", date(2026, 2, 11)),
+    )
+    sources = tuple(
+        ProductionInputSource(
+            discovery_candidate_id=candidate_id,
+            source_candidate_id=uuid4(),
+            canonical_url=source_url,
+            role=SourceRole.PRIMARY,
+            title=title,
+            publisher="Example publisher",
+            published_at=published_at,
+            tlp=TLP.CLEAR,
+            sensitivity="clear",
+            external_llm_allowed=True,
+        )
+        for candidate_id, source_url, title, published_at in metadata_rows
+    )
+    snapshot = replace(
+        snapshot,
+        member_candidate_ids=candidate_ids,
+        core_sources=sources,
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    document_ids = tuple(uuid4() for _ in metadata_rows)
+    extraction = _matched_extraction(
+        snapshot,
+        *(
+            make_source(source_id, canonical_url=source_url)
+            for source_id, (_, source_url, _, _) in zip(document_ids, metadata_rows, strict=True)
+        ),
+    )
+
+    timeline = brief_timeline_from_extraction(extraction, (), snapshot=snapshot)
+
+    assert timeline is not None
+    assert timeline[0].event_date == date(2026, 2, 10)
+    assert timeline[0].text == "Publication par Example publisher de « A report »."
+    assert timeline[0].evidence_refs[0].source_document_id == document_ids[1]
+
+
+def test_brief_metadata_publication_fallback_bounds_and_normalizes_source_text():
+    subject_id, source_id = uuid4(), uuid4()
+    source_url = "https://example.com/long-source-metadata"
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=date(2026, 2, 15),
+        title="Rapport détaillé " * 40 + "\nComplément",
+        publisher="Éditeur principal\n" * 20,
+    )
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(source_id, canonical_url=source_url),
+    )
+
+    timeline = brief_timeline_from_extraction(extraction, (), snapshot=snapshot)
+
+    assert timeline is not None
+    assert "\n" not in timeline[0].text
+    assert len(timeline[0].text) < 400
+    assert timeline[0].text.startswith("Publication par Éditeur principal")
+
+
 @pytest.mark.asyncio
 async def test_brief_publication_fallback_warning_is_persisted_in_diagnostics():
     subject_id, source_id = uuid4(), uuid4()
-    snapshot = make_snapshot(subject_id)
-    event_date = date(2026, 10, 28)
-    publication_event = make_event(
-        source_id,
-        "Publication par ESET Research du rapport le 28 Oct 2026.",
-        event_date,
-        date_text="28 October 2026",
+    source_url = "https://example.com/brief-fallback-diagnostics"
+    event_date = date(2026, 2, 15)
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=event_date,
+        title="Rapport de test",
+        publisher="ESET Research",
     )
     extraction = _matched_extraction(
         snapshot,
         make_source(
             source_id,
             facts=(make_fact(source_id, "FooRAT"),),
-            events=(publication_event,),
-            url_suffix="brief-fallback-diagnostics",
+            canonical_url=source_url,
         ),
     )
-    projection = _projection_with_publication_event_as_context(snapshot, extraction)
+    projection = build_relevance_projection(snapshot, extraction)
     evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
     handle = str(evidence_pack.narrative_evidence[0]["handle"])
     proposal = SynthesisProposalV1(
@@ -744,11 +955,13 @@ async def test_brief_publication_fallback_warning_is_persisted_in_diagnostics():
     assert isinstance(synthesis, ProductionSynthesisV1)
     assert len(synthesis.timeline) == 1
     assert synthesis.timeline[0].event_date == event_date
-    assert synthesis.timeline[0].text == publication_event.text
-    assert BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING in synthesis.warnings
+    assert synthesis.timeline[0].text == "Publication par ESET Research de « Rapport de test »."
+    assert synthesis.timeline[0].evidence_refs[0].kind is EvidenceKind.SOURCE_METADATA
+    assert BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING in synthesis.warnings
+    assert world.writer.calls[0]["snapshot"] == snapshot
     diagnostics = world.writer.calls[0]["diagnostics"]
     assert isinstance(diagnostics, dict)
-    assert BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING in diagnostics["warnings"]
+    assert BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING in diagnostics["warnings"]
 
 
 def test_brief_publication_date_fallback_requires_a_verifying_quote():
@@ -775,7 +988,12 @@ def test_brief_publication_date_fallback_requires_a_verifying_quote():
 
 def test_subject_linked_brief_chronology_takes_precedence_over_publication_fallback():
     subject_id, source_id = uuid4(), uuid4()
-    snapshot = make_snapshot(subject_id)
+    source_url = "https://example.com/subject-event-precedence"
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=date(2026, 2, 15),
+    )
     publication_event = make_event(
         source_id,
         "Publication par ESET Research du rapport le 28 Oct 2026.",
@@ -793,14 +1011,19 @@ def test_subject_linked_brief_chronology_takes_precedence_over_publication_fallb
         make_source(
             source_id,
             events=(publication_event, subject_event),
-            url_suffix="subject-event-precedence",
+            canonical_url=source_url,
         ),
     )
     projection = _projection_with_publication_event_as_context(snapshot, extraction)
     timeline = build_synthesis_timeline(extraction, projection=projection)
 
     warnings: list[str] = []
-    brief_timeline = brief_timeline_from_extraction(extraction, timeline, warnings=warnings)
+    brief_timeline = brief_timeline_from_extraction(
+        extraction,
+        timeline,
+        snapshot=snapshot,
+        warnings=warnings,
+    )
 
     assert len(timeline) == 1
     assert brief_timeline == timeline
@@ -811,21 +1034,19 @@ def test_subject_linked_brief_chronology_takes_precedence_over_publication_fallb
 @pytest.mark.asyncio
 async def test_article_synthesis_does_not_apply_brief_publication_date_fallback():
     subject_id, source_id = uuid4(), uuid4()
-    snapshot = make_snapshot(subject_id)
-    event = make_event(
-        source_id,
-        "Publication par ESET Research du rapport le 28 Oct 2026.",
-        date(2026, 10, 28),
-        date_text="28 October 2026",
+    source_url = "https://example.com/article-no-brief-fallback"
+    snapshot = snapshot_with_core_source_metadata(
+        make_snapshot(subject_id),
+        canonical_url=source_url,
+        published_at=date(2026, 2, 15),
     )
     source = make_source(
         source_id,
         facts=(make_fact(source_id, "FooRAT"),),
-        events=(event,),
-        url_suffix="article-no-brief-fallback",
+        canonical_url=source_url,
     )
     extraction = _matched_extraction(snapshot, source)
-    projection = _projection_with_publication_event_as_context(snapshot, extraction)
+    projection = build_relevance_projection(snapshot, extraction)
     evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
     handle = str(evidence_pack.narrative_evidence[0]["handle"])
     proposal = SynthesisProposalV1.model_validate(
@@ -6452,6 +6673,7 @@ class _FailOnceSynthesisWriter:
         extraction: ProductionExtractionV1,
         raw_result: str | None,
         model_run_id: UUID | None,
+        snapshot: ProductionInputSnapshot | None = None,
         mode: SynthesisMode = SynthesisMode.FRESH,
         model_policy_version: str = "",
         routing_policy_version: str = "",
@@ -6476,6 +6698,7 @@ class _FailOnceSynthesisWriter:
             input_hash=input_hash,
             synthesis=synthesis,
             extraction=extraction,
+            snapshot=snapshot,
             raw_result=raw_result,
             model_run_id=model_run_id,
             mode=mode,
@@ -6506,6 +6729,7 @@ class _SynthesisResultWriter(Protocol):
         extraction: ProductionExtractionV1,
         raw_result: str | None,
         model_run_id: UUID | None,
+        snapshot: ProductionInputSnapshot | None = None,
         mode: SynthesisMode = SynthesisMode.FRESH,
         model_policy_version: str = "",
         routing_policy_version: str = "",

@@ -2820,6 +2820,7 @@ class ProductionSynthesisRevisionService:
             input_hash=revision_input_hash,
             synthesis=revised,
             extraction=extraction,
+            snapshot=context.snapshot,
             raw_result=raw_text,
             model_run_id=execution.run.id,
             mode=SynthesisMode.FRESH,

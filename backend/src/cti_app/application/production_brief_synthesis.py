@@ -5,10 +5,10 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from difflib import SequenceMatcher
 
-from cti_app.domain.production import ProductionEvidenceBasis
+from cti_app.domain.production import ProductionEvidenceBasis, ProductionInputSnapshot
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
@@ -20,13 +20,17 @@ from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     SynthesisTimelineEntryV1,
     extraction_evidence_elements,
+    source_metadata_evidence_ref_v1,
 )
 from cti_app.domain.wire_markers import contains_wire_marker_line
 
 BRIEF_SYNTHESIS_PROMPT_VERSION = "brief-synthesis-v1-french-grounded-chronology"
-BRIEF_TIMELINE_POLICY_VERSION = "brief-timeline-v1-core-primary-publication-fallback"
+BRIEF_TIMELINE_POLICY_VERSION = "brief-timeline-v2-core-primary-metadata-publication-fallback"
 BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING = (
     "brief_chronology_source_publication_fallback"
+)
+BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING = (
+    "brief_chronology_metadata_publication_fallback"
 )
 
 _BRIEF_FORBIDDEN_OUTPUT = re.compile(
@@ -131,12 +135,13 @@ def brief_timeline_from_extraction(
     extraction: ProductionExtractionV1,
     entries: Iterable[SynthesisTimelineEntryV1],
     *,
+    snapshot: ProductionInputSnapshot | None = None,
     warnings: list[str] | None = None,
 ) -> tuple[SynthesisTimelineEntryV1, ...] | None:
     """Keep at most four dated events whose date text is present in source evidence.
 
     ``None`` means no defensible chronology exists and the brief must be sent
-    to review.  The function never fills dates or event wording from metadata.
+    to review. Metadata supplies only the final, explicitly marked fallback.
     """
     payload_by_ref: dict[ExtractionEvidenceRefV1, Mapping[str, object]] = {
         ref: payload for ref, payload in extraction_evidence_elements(extraction)
@@ -170,11 +175,20 @@ def brief_timeline_from_extraction(
             grounded.append(entry)
     if not grounded:
         fallback = _core_primary_publication_timeline_entry(extraction, payload_by_ref)
-        if fallback is None:
+        if fallback is not None:
+            if warnings is not None:
+                warnings.append(BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING)
+            return (fallback,)
+        metadata_fallback = (
+            brief_metadata_publication_fallback_entry(snapshot, extraction)
+            if snapshot is not None
+            else None
+        )
+        if metadata_fallback is None:
             return None
         if warnings is not None:
-            warnings.append(BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING)
-        return (fallback,)
+            warnings.append(BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING)
+        return (metadata_fallback,)
 
     deduplicated: list[SynthesisTimelineEntryV1] = []
     for entry in grounded:
@@ -191,6 +205,68 @@ def brief_timeline_from_extraction(
         evidence_refs = tuple(dict.fromkeys((*existing.evidence_refs, *entry.evidence_refs)))
         deduplicated[index] = replace(existing, evidence_refs=evidence_refs)
     return tuple(deduplicated[:4])
+
+
+def brief_metadata_publication_fallback_entry(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+) -> SynthesisTimelineEntryV1 | None:
+    """Build a dated, source-linked entry from the earliest eligible frozen source metadata."""
+    if (
+        snapshot.subject_id != extraction.subject_id
+        or snapshot.input_hash != extraction.production_input_hash
+    ):
+        return None
+    extraction_sources_by_url = {source.canonical_url: source for source in extraction.sources}
+    earliest: tuple[date, str, SynthesisTimelineEntryV1] | None = None
+    earliest_allowed = snapshot.period_start - timedelta(days=365)
+    for metadata in snapshot.core_sources:
+        source = extraction_sources_by_url.get(metadata.canonical_url)
+        published_at = metadata.published_at
+        if (
+            source is None
+            or source.tier is not ProductionReferenceTier.CORE
+            or source.editorial_role is not ProductionEditorialRole.PRIMARY
+            or source.kind is not ProductionReferenceKind.PUBLICATION
+            or type(published_at) is not date
+            or published_at > snapshot.research_date
+            or published_at < earliest_allowed
+        ):
+            continue
+        publisher = _bounded_metadata_component(metadata.publisher, 120)
+        title = _bounded_metadata_component(metadata.title, 240)
+        if publisher is None or title is None:
+            continue
+        ref = source_metadata_evidence_ref_v1(
+            source_document_id=source.source_document_id,
+            canonical_url=metadata.canonical_url,
+            title=metadata.title,
+            publisher=metadata.publisher,
+            published_at=published_at,
+        )
+        entry = SynthesisTimelineEntryV1(
+            event_date=published_at,
+            date_text=None,
+            text=f"Publication par {publisher} de « {title} ».",
+            evidence_refs=(ref,),
+        )
+        candidate = (published_at, metadata.canonical_url, entry)
+        if earliest is None or candidate[:2] < earliest[:2]:
+            earliest = candidate
+    return earliest[2] if earliest is not None else None
+
+
+def _bounded_metadata_component(value: str, max_chars: int) -> str | None:
+    printable = "".join(char if char.isprintable() else " " for char in value)
+    normalized = " ".join(printable.split())
+    if not normalized:
+        return None
+    if len(normalized) <= max_chars:
+        return normalized
+    shortened = normalized[: max_chars - 1].rsplit(" ", 1)[0].rstrip()
+    if not shortened:
+        shortened = normalized[: max_chars - 1]
+    return shortened + "…"
 
 
 def _core_primary_publication_timeline_entry(
@@ -350,9 +426,11 @@ def _source_contains_date(value: str, event_date: date) -> bool:
 
 
 __all__ = [
+    "BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING",
     "BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING",
     "BRIEF_SYNTHESIS_PROMPT_VERSION",
     "BRIEF_TIMELINE_POLICY_VERSION",
+    "brief_metadata_publication_fallback_entry",
     "brief_timeline_from_extraction",
     "build_brief_synthesis_prompt",
     "validate_brief_narrative",

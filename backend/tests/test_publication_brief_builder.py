@@ -10,10 +10,20 @@ from cti_app.application.brief_publication_builder import (
     build_brief_publication_document_v5,
     wrap_publication_document_v7,
 )
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
+    brief_timeline_from_extraction,
+)
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_relevance import build_relevance_projection
+from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_qa import qa_publication_v7
 from cti_app.application.typst_rendering import project_publication_to_typst_model
+from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import SourceRole
+from cti_app.domain.production import ProductionInputSource
 from cti_app.domain.production_synthesis import (
+    EvidenceKind,
     SynthesisParagraphV1,
     SynthesisTimelineEntryV1,
     extraction_evidence_refs_v1,
@@ -128,3 +138,94 @@ def test_brief_qa_rejects_claimed_enrichment_and_requires_relevance_projection()
     assert rejected_enrichment["error_codes"] == ["publication_qa_editorial_enrichment_forbidden"]
     assert missing_relevance["passed"] is False
     assert missing_relevance["error_codes"] == ["publication_qa_kind_inputs_invalid"]
+
+
+def test_metadata_derived_brief_timeline_keeps_source_footnote_and_typst_chronology() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    published_at = date(2025, 1, 10)
+    source_url = extraction.sources[0].canonical_url
+    discovery_candidate_id = UUID(int=5100)
+    input_source = ProductionInputSource(
+        discovery_candidate_id=discovery_candidate_id,
+        source_candidate_id=UUID(int=5101),
+        canonical_url=source_url,
+        role=SourceRole.PRIMARY,
+        title="Example report",
+        publisher="Example publisher",
+        published_at=published_at,
+        tlp=TLP.CLEAR,
+        sensitivity="clear",
+        external_llm_allowed=True,
+    )
+    snapshot = replace(
+        snapshot,
+        member_candidate_ids=(discovery_candidate_id,),
+        core_sources=(input_source,),
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    references = replace(
+        references,
+        production_input_hash=snapshot.input_hash,
+        sources=(
+            replace(
+                references.sources[0],
+                title=input_source.title,
+                publisher=input_source.publisher,
+                published_at=published_at,
+            ),
+        ),
+    )
+    extraction = replace(
+        extraction,
+        production_input_hash=snapshot.input_hash,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=(replace(extraction.sources[0], events=()),),
+    )
+    expected_timeline = brief_timeline_from_extraction(
+        extraction,
+        (),
+        snapshot=snapshot,
+    )
+    assert expected_timeline is not None
+    assert expected_timeline[0].evidence_refs[0].kind is EvidenceKind.SOURCE_METADATA
+    synthesis = replace(
+        synthesis,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        timeline=expected_timeline,
+        warnings=(BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,),
+    )
+    relevance = build_relevance_projection(snapshot, extraction)
+
+    brief = build_brief_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance,
+        synthesis=synthesis,
+    )
+    publication = wrap_publication_document_v7(
+        brief,
+        base_publication_artifact_id=UUID(int=5102),
+        publication_kind=PublicationKind.BRIEF,
+        routing_decision_hash="e" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    qa = qa_publication_v7(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance,
+        synthesis=synthesis,
+        editorial_enrichment=None,
+        publication=publication,
+    )
+    render_model = project_publication_to_typst_model(publication)
+    chronology = {item["type"]: item for item in render_model.content_sections}["chronology"]
+
+    assert publication.timeline[0].event_date == published_at
+    assert publication.timeline[0].evidence_refs[0].kind.value == "source_metadata"
+    assert chronology["timeline"][0]["source_urls"] == [source_url]
+    assert publication.indicators == ()
+    assert qa["passed"] is True

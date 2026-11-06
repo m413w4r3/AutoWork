@@ -5,17 +5,22 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import date
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
+)
 from cti_app.application.production_stages import SynthesisService
 from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
     render_synthesis_markdown,
 )
+from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ExtractionProfile,
@@ -23,6 +28,8 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
+    ProductionInputSnapshot,
+    ProductionInputSource,
     ProductionRun,
     SynthesisMode,
 )
@@ -37,12 +44,16 @@ from cti_app.domain.production_references import ProductionReferenceKind, Produc
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
+    EvidenceKind,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
     SynthesisSectionKind,
     SynthesisSectionV1,
+    SynthesisTimelineEntryV1,
     extraction_evidence_refs_v1,
+    source_metadata_evidence_ref_v1,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class MemoryStore:
@@ -230,6 +241,100 @@ async def test_canonical_storage_preview_metadata_versions_and_stale():
         assert artifact.metadata["model_policy_version"] == "model-v1"
         assert "FooRAT" not in str(artifact.metadata)
     assert uow.production_artifacts.staled == [(run_id, "synthesis")] * 2
+
+
+@pytest.mark.asyncio
+async def test_source_metadata_reference_requires_matching_frozen_snapshot_at_storage():
+    uow, store = MemoryUow(), MemoryStore()
+    run_id, subject_id = uuid4(), uuid4()
+    synthesis, extraction = canonical_pair(subject_id)
+    source = extraction.sources[0]
+    discovery_candidate_id = uuid4()
+    published_at = date(2026, 1, 10)
+    snapshot = ProductionInputSnapshot(
+        production_run_id=run_id,
+        edition_id=uuid4(),
+        subject_id=subject_id,
+        subject_version=1,
+        subject_title="Example subject",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(discovery_candidate_id,),
+        discovery_summary="A bounded summary.",
+        actor_or_campaign="Example campaign",
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 1, 31),
+        publication_language="en",
+        research_date=date(2026, 2, 1),
+        core_sources=(
+            ProductionInputSource(
+                discovery_candidate_id=discovery_candidate_id,
+                source_candidate_id=uuid4(),
+                canonical_url=source.canonical_url,
+                role=SourceRole.PRIMARY,
+                title="Example report",
+                publisher="Example publisher",
+                published_at=published_at,
+                tlp=TLP.CLEAR,
+                sensitivity="clear",
+                external_llm_allowed=True,
+            ),
+        ),
+    )
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    synthesis = replace(
+        synthesis,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        warnings=(BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,),
+    )
+    metadata_ref = source_metadata_evidence_ref_v1(
+        source_document_id=source.source_document_id,
+        canonical_url=source.canonical_url,
+        title="Example report",
+        publisher="Example publisher",
+        published_at=published_at,
+    )
+    synthesis = replace(
+        synthesis,
+        timeline=(
+            SynthesisTimelineEntryV1(
+                event_date=date(2026, 1, 10),
+                date_text=None,
+                text="Publication par Example publisher de « Example report ».",
+                evidence_refs=(metadata_ref,),
+            ),
+        ),
+    )
+    service = SynthesisService(uow_factory(uow), store)
+    common = {
+        "run_id": run_id,
+        "subject_id": subject_id,
+        "input_hash": "d" * 64,
+        "synthesis": synthesis,
+        "extraction": extraction,
+        "snapshot": snapshot,
+        "publication_kind": PublicationKind.BRIEF,
+        "raw_result": None,
+        "model_run_id": None,
+    }
+
+    missing_snapshot = dict(common)
+    missing_snapshot.pop("snapshot")
+    with pytest.raises(ValueError, match="metadata citation"):
+        await service.store_synthesis_result(**missing_snapshot)
+    artifact = await service.store_synthesis_result(**common)
+
+    article = {**common, "publication_kind": PublicationKind.ARTICLE}
+    with pytest.raises(ValueError, match="metadata citation"):
+        await service.store_synthesis_result(**article)
+
+    assert artifact.canonical_blob_id is not None
+    assert metadata_ref.kind is EvidenceKind.SOURCE_METADATA
 
 
 @pytest.mark.asyncio

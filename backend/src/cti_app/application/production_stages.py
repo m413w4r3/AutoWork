@@ -16,6 +16,10 @@ from cti_app.application.persistence import (
     StaleProductionRoutingDecisionError,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_brief_synthesis import (
+    BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
+    brief_metadata_publication_fallback_entry,
+)
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
@@ -38,6 +42,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionInputSnapshot,
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_enrichment import (
@@ -56,11 +61,13 @@ from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
 )
 from cti_app.domain.production_synthesis import (
+    EvidenceKind,
     ProductionSynthesisV1,
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
     synthesis_evidence_refs,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 @asynccontextmanager
@@ -537,6 +544,8 @@ class SynthesisService(_ArtifactPayloadMixin):
         extraction: ProductionExtractionV1,
         raw_result: str | None,
         model_run_id: UUID | None,
+        snapshot: ProductionInputSnapshot | None = None,
+        publication_kind: PublicationKind = PublicationKind.ARTICLE,
         mode: SynthesisMode = SynthesisMode.FRESH,
         model_policy_version: str = "",
         routing_policy_version: str = "",
@@ -559,9 +568,53 @@ class SynthesisService(_ArtifactPayloadMixin):
         if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
             raise ValueError("Synthesis extraction hash does not match canonical extraction")
         cited_refs = synthesis_evidence_refs(synthesis)
-        if not cited_refs <= set(extraction_evidence_refs_v1(extraction)):
+        metadata_refs = {ref for ref in cited_refs if ref.kind is EvidenceKind.SOURCE_METADATA}
+        extraction_source_ids = {source.source_document_id for source in extraction.sources}
+        expected_metadata_entry = (
+            brief_metadata_publication_fallback_entry(snapshot, extraction)
+            if snapshot is not None
+            else None
+        )
+        expected_metadata_refs = (
+            set(expected_metadata_entry.evidence_refs)
+            if expected_metadata_entry is not None
+            else set()
+        )
+        metadata_timeline = tuple(
+            entry
+            for entry in synthesis.timeline
+            if any(ref.kind is EvidenceKind.SOURCE_METADATA for ref in entry.evidence_refs)
+        )
+        non_timeline_metadata_refs = {
+            ref
+            for paragraph in (
+                *synthesis.lead,
+                *(paragraph for section in synthesis.sections for paragraph in section.paragraphs),
+            )
+            for ref in paragraph.evidence_refs
+            if ref.kind is EvidenceKind.SOURCE_METADATA
+        } | {
+            ref
+            for note in synthesis.source_notes
+            for ref in note.evidence_refs
+            if ref.kind is EvidenceKind.SOURCE_METADATA
+        }
+        if metadata_refs and (
+            publication_kind is not PublicationKind.BRIEF
+            or snapshot is None
+            or snapshot.subject_id != subject_id
+            or snapshot.input_hash != extraction.production_input_hash
+            or snapshot.input_hash != synthesis.production_input_hash
+            or metadata_refs != expected_metadata_refs
+            or non_timeline_metadata_refs
+            or metadata_timeline != (expected_metadata_entry,)
+            or synthesis.timeline != (expected_metadata_entry,)
+            or BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING not in synthesis.warnings
+        ):
+            raise ValueError("Synthesis source metadata citation does not match frozen inputs")
+        if not (cited_refs - metadata_refs) <= set(extraction_evidence_refs_v1(extraction)):
             raise ValueError("Synthesis cites evidence absent from extraction")
-        source_ids = {source.source_document_id for source in extraction.sources}
+        source_ids = extraction_source_ids
         if any(not set(item.source_document_ids) <= source_ids for item in synthesis.uncertainties):
             raise ValueError("Synthesis uncertainty cites an absent source")
         canonical_payload = production_synthesis_to_json(synthesis)
