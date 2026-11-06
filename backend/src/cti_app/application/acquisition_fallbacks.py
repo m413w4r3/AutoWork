@@ -405,13 +405,20 @@ class AcquisitionRequest:
 class AcquisitionStrategy(Protocol):
     """An ordered, pluggable acquisition port. Implementations never bypass safe fetch."""
 
-    name: str
-    version: str
-    method: SourceAcquisitionMethod
-    enabled: bool
-    timeout_seconds: float
-    capability_state: AcquisitionCapabilityState | None
-    description: str | None
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def method(self) -> SourceAcquisitionMethod: ...
+
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def timeout_seconds(self) -> float: ...
 
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]: ...
 
@@ -1382,7 +1389,7 @@ def archive_url_variants(original_url: str) -> tuple[str, ...]:
 
 
 def retry_after_seconds(value: str | None, *, retry: int) -> float:
-    fallback = min(0.25 * (2**retry), MAX_RETRY_AFTER_SECONDS)
+    fallback: float = min(0.25 * (2**retry), MAX_RETRY_AFTER_SECONDS)
     if not value:
         return fallback
     try:
