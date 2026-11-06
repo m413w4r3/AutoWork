@@ -143,9 +143,7 @@ class ArticleAcquisitionOrchestrator:
         # A SubjectCollectionService can inject a longer-lived limiter when it
         # owns multiple orchestrator instances; the default is shared by every
         # run made through this orchestrator.
-        self._domain_limiter = domain_limiter or DomainConcurrencyLimiter(
-            per_domain_concurrency
-        )
+        self._domain_limiter = domain_limiter or DomainConcurrencyLimiter(per_domain_concurrency)
 
     async def run(
         self,
@@ -193,9 +191,7 @@ class ArticleAcquisitionOrchestrator:
                     budget.start_fetch()
                     reserved = False
                     active_fetches += 1
-                    response = await request.fetch(
-                        url, headers, timeout_seconds, allow_binary
-                    )
+                    response = await request.fetch(url, headers, timeout_seconds, allow_binary)
                     await check_cancellation()
                     return response
             finally:

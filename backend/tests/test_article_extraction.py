@@ -221,9 +221,7 @@ def test_embedded_state_with_wrong_canonical_url_is_marked_low_quality() -> None
     assert "canonical_host_mismatch" in candidate.reasons
     assert candidate.quality.score < 0.55
     assert (
-        select_best_candidate(
-            (candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate((candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
     assert (
@@ -439,9 +437,7 @@ def test_structured_candidate_with_wrong_canonical_url_is_low_quality(method, bo
     assert "canonical_host_mismatch" in candidate.reasons
     assert candidate.quality.score < 0.55
     assert (
-        select_best_candidate(
-            (candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate((candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -459,9 +455,7 @@ def test_json_ld_without_canonical_requires_strong_body_coherence() -> None:
 
     assert candidate.canonical_url is None
     assert (
-        select_best_candidate(
-            (candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate((candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is candidate
     )
 
@@ -496,9 +490,7 @@ def test_same_host_but_different_structured_canonical_is_low_quality() -> None:
     assert "canonical_url_mismatch" in candidate.reasons
     assert candidate.quality.score < 0.55
     assert (
-        select_best_candidate(
-            (candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate((candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -515,9 +507,7 @@ def test_same_host_different_path_canonical_is_rejected_despite_matching_article
     assert all(item.title == ARTICLE_TITLE for item in wrong_path)
     assert all(item.quality.text_chars >= 200 for item in wrong_path)
     assert (
-        select_best_candidate(
-            wrong_path, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(wrong_path, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -535,9 +525,7 @@ def test_same_article_slug_path_variant_requires_strong_coherence() -> None:
     candidate = next(item for item in candidates if item.method is ExtractionMethod.JSON_LD)
 
     assert (
-        select_best_candidate(
-            (candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate((candidate,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is candidate
     )
 
@@ -561,25 +549,19 @@ def test_wrong_title_candidate_is_not_selected() -> None:
 
     assert candidates
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
 
 def test_matching_metadata_title_with_unrelated_body_is_not_selected() -> None:
     unrelated = "The unrelated local report reviews a different event and its findings. " * 40
-    candidates = _extract(
-        _html(f"<article><h1>{ARTICLE_TITLE}</h1><p>{unrelated}</p></article>")
-    )
+    candidates = _extract(_html(f"<article><h1>{ARTICLE_TITLE}</h1><p>{unrelated}</p></article>"))
 
     assert candidates
     assert all(item.title == ARTICLE_TITLE for item in candidates)
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -594,9 +576,7 @@ def test_expected_url_rejects_same_title_from_another_host() -> None:
     )
 
     assert (
-        select_best_candidate(
-            cross_domain, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(cross_domain, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
     assert (
@@ -619,9 +599,7 @@ def test_same_title_other_host_with_long_unrelated_body_is_not_selected() -> Non
     )
 
     assert (
-        select_best_candidate(
-            cross_domain, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(cross_domain, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -632,9 +610,7 @@ def test_expected_url_accepts_same_host_canonical_candidate() -> None:
     )
 
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is not None
     )
 
@@ -653,9 +629,7 @@ def test_expected_url_accepts_www_trailing_slash_and_query_variants(canonical_ur
     equivalent = tuple(replace(item, canonical_url=canonical_url) for item in candidates)
 
     assert (
-        select_best_candidate(
-            equivalent, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(equivalent, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is not None
     )
 
@@ -670,9 +644,7 @@ def test_expected_url_is_required_to_select_candidates() -> None:
 
 
 def test_repeated_state_assignments_are_bounded() -> None:
-    state = {
-        "article": {"title": ARTICLE_TITLE, "url": ARTICLE_URL, "content": ARTICLE_TEXT}
-    }
+    state = {"article": {"title": ARTICLE_TITLE, "url": ARTICLE_URL, "content": ARTICLE_TEXT}}
     assignment = f"window.__NUXT__ = {json.dumps(state)};"
     source = assignment * 1_000
 
@@ -696,11 +668,7 @@ def test_aggregate_embedded_state_character_cap_is_observable() -> None:
     parser = article_extraction_module._SafeHTMLParser(ARTICLE_URL)
     parser.feed(source)
     parser.close()
-    accepted = [
-        text
-        for text, attrs in parser.scripts
-        if attrs.get("id") == "__NEXT_DATA__"
-    ]
+    accepted = [text for text, attrs in parser.scripts if attrs.get("id") == "__NEXT_DATA__"]
     accepted_chars = sum(map(len, accepted))
 
     assert len(accepted) < 8
@@ -795,9 +763,7 @@ def test_challenge_and_paywall_candidates_are_rejected(marker: str, quality_flag
     assert candidates
     assert getattr(candidates[0].quality, quality_flag)
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -952,9 +918,7 @@ def test_encrypted_pdf_returns_no_candidate() -> None:
     writer.write(output)
 
     assert (
-        extract_pdf_candidates(
-            output.getvalue(), url=ARTICLE_URL, expected_title=ARTICLE_TITLE
-        )
+        extract_pdf_candidates(output.getvalue(), url=ARTICLE_URL, expected_title=ARTICLE_TITLE)
         == ()
     )
 
@@ -995,9 +959,7 @@ def test_long_repetitive_region_block_page_is_rejected() -> None:
     assert candidates
     assert any("error_page_detected" in item.reasons for item in candidates)
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -1007,8 +969,7 @@ def test_long_varied_region_block_notice_is_rejected() -> None:
         "Readers in the northern district receive this notice under the publisher's "
         "licensing rules.",
         "The regional catalog does not include this report for accounts registered overseas.",
-        "Local access settings were updated after the distribution agreement changed "
-        "this morning.",
+        "Local access settings were updated after the distribution agreement changed this morning.",
         "The publisher directs visitors to the regional edition for material available "
         "in that area.",
         "This restriction applies to browser requests and cached copies served from the "
@@ -1032,9 +993,7 @@ def test_long_varied_region_block_notice_is_rejected() -> None:
     assert all(item.quality.duplicate_ratio < 0.35 for item in candidates)
     assert any("error_page_detected" in item.reasons for item in candidates)
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is None
     )
 
@@ -1046,11 +1005,7 @@ def test_genuine_article_is_not_rejected_for_mentioning_access_denied() -> None:
     )
     candidates = _extract(
         _html(
-            "<article><h1>"
-            + ARTICLE_TITLE
-            + "</h1>"
-            + _paragraph_markup(paragraphs)
-            + "</article>"
+            "<article><h1>" + ARTICLE_TITLE + "</h1>" + _paragraph_markup(paragraphs) + "</article>"
         )
     )
     article = next(item for item in candidates if item.method is ExtractionMethod.HTML_ARTICLE)
@@ -1058,9 +1013,7 @@ def test_genuine_article_is_not_rejected_for_mentioning_access_denied() -> None:
     assert "error_page_detected" not in article.reasons
     assert not article.quality.challenge_detected
     assert (
-        select_best_candidate(
-            (article,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate((article,), expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is article
     )
 
@@ -1074,9 +1027,7 @@ def test_plain_text_ocr_candidate_is_supported() -> None:
     assert candidates[0].method is ExtractionMethod.PLAIN_TEXT
     assert candidates[0].title == ARTICLE_TITLE
     assert (
-        select_best_candidate(
-            candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL
-        )
+        select_best_candidate(candidates, expected_title=ARTICLE_TITLE, expected_url=ARTICLE_URL)
         is candidates[0]
     )
 

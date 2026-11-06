@@ -1069,9 +1069,7 @@ class MementoArchiveStrategy:
                     url=lookup_url,
                     outcome=AcquisitionOutcome.REJECTED,
                     reason=(
-                        "memento_timestamp_missing"
-                        if safe_entries
-                        else "no_valid_memento_relation"
+                        "memento_timestamp_missing" if safe_entries else "no_valid_memento_relation"
                     ),
                 )
             )

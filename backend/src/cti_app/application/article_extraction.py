@@ -402,13 +402,9 @@ def select_best_candidate(
         and "error_page_detected" not in candidate.reasons
         and "body_title_mismatch" not in candidate.reasons
         and "canonical_url_mismatch" not in candidate.reasons
-        and (
-            "canonical_host_mismatch" not in candidate.reasons
-            or allow_cross_domain
-        )
+        and ("canonical_host_mismatch" not in candidate.reasons or allow_cross_domain)
         and _title_similarity(expected_title, candidate.title) >= (0.25 if expected_title else 0.0)
-        and _body_title_coherence(expected_title, candidate.text)
-        >= _MIN_BODY_TITLE_COHERENCE
+        and _body_title_coherence(expected_title, candidate.text) >= _MIN_BODY_TITLE_COHERENCE
         and _canonical_url_matches(
             candidate,
             expected_title=expected_title,
@@ -473,8 +469,7 @@ def _strong_title_body_match(
     return bool(
         expected_title
         and _title_similarity(expected_title, candidate.title) >= _STRONG_BODY_TITLE_COHERENCE
-        and _body_title_coherence(expected_title, candidate.text)
-        >= _STRONG_BODY_TITLE_COHERENCE
+        and _body_title_coherence(expected_title, candidate.text) >= _STRONG_BODY_TITLE_COHERENCE
     )
 
 
@@ -885,9 +880,7 @@ def _embedded_state_candidates(
     except (json.JSONDecodeError, RecursionError, ValueError):
         return []
     found: list[tuple[int, ExtractionCandidate]] = []
-    pending: deque[tuple[Any, int, str | None, str | None]] = deque(
-        [(value, 0, None, None)]
-    )
+    pending: deque[tuple[Any, int, str | None, str | None]] = deque([(value, 0, None, None)])
     visited = 0
     while pending and visited < _MAX_JSON_NODES:
         node, depth, inherited_title, inherited_url = pending.popleft()
@@ -904,11 +897,7 @@ def _embedded_state_candidates(
                 inherited_title,
             )
             canonical = next(
-                (
-                    parsed_url
-                    for key in _URL_KEYS
-                    if (parsed_url := _object_url(node.get(key)))
-                ),
+                (parsed_url for key in _URL_KEYS if (parsed_url := _object_url(node.get(key)))),
                 inherited_url,
             )
             for key, content in node.items():
@@ -949,10 +938,7 @@ def _embedded_state_candidates(
                             )
                         )
                         del found[3:]
-                elif (
-                    isinstance(content, (dict, list))
-                    and visited + len(pending) < _MAX_JSON_NODES
-                ):
+                elif isinstance(content, (dict, list)) and visited + len(pending) < _MAX_JSON_NODES:
                     pending.append((content, depth + 1, title, canonical))
         elif isinstance(node, list):
             for item in node:
@@ -1090,10 +1076,7 @@ def _generic_json_candidates(
                         )
                         break
             for child in node.values():
-                if (
-                    isinstance(child, (dict, list))
-                    and visited + len(pending) < _MAX_JSON_NODES
-                ):
+                if isinstance(child, (dict, list)) and visited + len(pending) < _MAX_JSON_NODES:
                     pending.append((child, depth + 1))
         elif isinstance(node, list):
             for child in node:
@@ -1218,11 +1201,7 @@ def _candidate(
         and canonical_url
         and (not same_host or (not same_path and not same_article_variant))
     ):
-        mismatch_reason = (
-            "canonical_host_mismatch"
-            if not same_host
-            else "canonical_url_mismatch"
-        )
+        mismatch_reason = "canonical_host_mismatch" if not same_host else "canonical_url_mismatch"
         quality = replace(
             quality,
             score=_unit(quality.score * 0.15),
@@ -1543,11 +1522,7 @@ def _state_assignments(source: str) -> Iterator[str]:
             break
         start = match.end()
         skipped = 0
-        while (
-            start < len(source)
-            and source[start].isspace()
-            and skipped < _MAX_STATE_JSON_CHARS
-        ):
+        while start < len(source) and source[start].isspace() and skipped < _MAX_STATE_JSON_CHARS:
             start += 1
             skipped += 1
         if skipped >= _MAX_STATE_JSON_CHARS:
@@ -1562,9 +1537,7 @@ def _state_assignments(source: str) -> Iterator[str]:
         yield source[start:end]
 
 
-def _json_value_end(
-    source: str, start: int, *, max_chars: int = _MAX_JSON_CHARS
-) -> int | None:
+def _json_value_end(source: str, start: int, *, max_chars: int = _MAX_JSON_CHARS) -> int | None:
     if start >= len(source) or source[start] not in "[{":
         return None
     if max_chars < 1:
@@ -1705,11 +1678,7 @@ def _url_path(value: str) -> str | None:
         parsed = urlsplit(value)
         if not parsed.scheme or not parsed.hostname:
             return None
-        segments = [
-            unquote(segment).casefold()
-            for segment in parsed.path.split("/")
-            if segment
-        ]
+        segments = [unquote(segment).casefold() for segment in parsed.path.split("/") if segment]
         return "/" + "/".join(segments) if segments else "/"
     except ValueError:
         return None

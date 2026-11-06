@@ -21,8 +21,7 @@ def _version_column_length() -> int:
         raise RuntimeError("refusing to alter a missing alembic_version table")
 
     columns = {
-        column["name"]: column["type"]
-        for column in inspector.get_columns("alembic_version")
+        column["name"]: column["type"] for column in inspector.get_columns("alembic_version")
     }
     version_type = columns.get("version_num")
     if not isinstance(version_type, sa.VARCHAR) or version_type.length not in {32, 64}:
@@ -47,8 +46,7 @@ def downgrade() -> None:
         bind = op.get_bind()
         has_long_version = bind.execute(
             sa.text(
-                "SELECT EXISTS (SELECT 1 FROM alembic_version "
-                "WHERE char_length(version_num) > 32)"
+                "SELECT EXISTS (SELECT 1 FROM alembic_version WHERE char_length(version_num) > 32)"
             )
         ).scalar_one()
         if has_long_version:

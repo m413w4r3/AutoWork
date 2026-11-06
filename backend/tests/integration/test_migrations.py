@@ -493,9 +493,7 @@ async def _column_names(database_url: str, table_name: str) -> list[str]:
     try:
         async with engine.connect() as connection:
             return await connection.run_sync(
-                lambda sync: [
-                    column["name"] for column in inspect(sync).get_columns(table_name)
-                ]
+                lambda sync: [column["name"] for column in inspect(sync).get_columns(table_name)]
             )
     finally:
         await engine.dispose()
@@ -1229,12 +1227,8 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "0008_production_routing")
 
-    baseline_schema = asyncio.run(_database_snapshot(temporary_postgres_url))[
-        "collection_attempts"
-    ]
-    assert not (
-        _COLLECTION_ATTEMPT_ACQUISITION_COLUMNS & set(baseline_schema["columns"])
-    )
+    baseline_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
+    assert not (_COLLECTION_ATTEMPT_ACQUISITION_COLUMNS & set(baseline_schema["columns"]))
     assert not (_COLLECTION_ATTEMPT_ADDITION_CHECKS & baseline_schema["checks"])
     outcome_checks = asyncio.run(
         _check_constraint_definitions(temporary_postgres_url, "collection_attempts")
@@ -1244,9 +1238,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert _head_revision() == "0010_acquisition_provenance"
-    final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))[
-        "collection_attempts"
-    ]
+    final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
     assert final_schema["checks"] == _expected_check_constraint_names(table)

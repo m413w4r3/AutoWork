@@ -321,9 +321,7 @@ def test_equivalence_keeps_different_publisher_as_independent_corroboration() ->
 
 
 def test_same_publisher_uses_exact_host_with_only_leading_www_normalized() -> None:
-    assert not _same_publisher(
-        "https://alice.github.io/article", "https://bob.github.io/article"
-    )
+    assert not _same_publisher("https://alice.github.io/article", "https://bob.github.io/article")
     assert _same_publisher("https://www.example.com/article", "https://example.com/article")
     assert not _same_publisher("https://sub.example.com/article", "https://example.com/article")
 
@@ -454,9 +452,9 @@ async def test_ocr_rejects_credentialed_source_url_without_running_engine() -> N
         "application/pdf",
         "https://publisher.example.test/articles/report?X-Amz-Signature=signed-secret",
     )
-    probe = (
-        await VisualOcrStrategy(artifact=artifact, engine=FakeOcr()).acquire(_request(fetch))
-    )[0]
+    probe = (await VisualOcrStrategy(artifact=artifact, engine=FakeOcr()).acquire(_request(fetch)))[
+        0
+    ]
     assert probe.outcome is AcquisitionOutcome.POLICY_SKIPPED
     assert probe.reason_code == "ocr_artifact_source_url_has_credentials_or_is_invalid"
     assert probe.requested_url == "https://publisher.example.test/articles/report"
@@ -477,9 +475,9 @@ async def test_ocr_rejects_derived_text_above_byte_limit() -> None:
         raise AssertionError("OCR does not fetch")
 
     artifact = CapturedArtifact(artifact_bytes, "application/pdf", URL)
-    probe = (
-        await VisualOcrStrategy(artifact=artifact, engine=FakeOcr()).acquire(_request(fetch))
-    )[0]
+    probe = (await VisualOcrStrategy(artifact=artifact, engine=FakeOcr()).acquire(_request(fetch)))[
+        0
+    ]
     assert probe.outcome is AcquisitionOutcome.REJECTED
     assert probe.reason_code == "derived_text_exceeds_limit"
 

@@ -269,11 +269,7 @@ async def test_commoncrawl_rejects_malformed_deep_json_without_range_fetch(
     async def fetch(url, headers, timeout_seconds, allow_binary):
         calls.append((url, headers))
         if url.endswith("collinfo.json"):
-            body = (
-                deeply_nested
-                if malformed_at == "collinfo"
-                else b'[{"id":"CC-MAIN-2025-04"}]'
-            )
+            body = deeply_nested if malformed_at == "collinfo" else b'[{"id":"CC-MAIN-2025-04"}]'
             return _response(url, body, content_type="application/json")
         if "-index?" in url:
             body = deeply_nested if malformed_at == "cdx" else b""
@@ -401,8 +397,7 @@ async def test_memento_rejects_snapshot_redirect_to_live_publisher_page() -> Non
             return _response(
                 url,
                 (
-                    f'{{"rel":"memento","uri":"{memento_url}",'
-                    '"datetime":"2024-05-08T10:00:00Z"}'
+                    f'{{"rel":"memento","uri":"{memento_url}","datetime":"2024-05-08T10:00:00Z"}}'
                 ).encode(),
                 content_type="application/json",
             )

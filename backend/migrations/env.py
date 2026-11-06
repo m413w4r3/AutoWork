@@ -173,8 +173,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
                     continue
                 constraint_columns = getattr(constraint, "columns", ())
                 if constraint.name in _COLLECTION_ATTEMPT_ADDITION_CHECKS or any(
-                    column.name in _COLLECTION_ATTEMPT_ADDITIONS
-                    for column in constraint_columns
+                    column.name in _COLLECTION_ATTEMPT_ADDITIONS for column in constraint_columns
                 ):
                     table.constraints.discard(constraint)
             if baseline_outcome_constraint is not None:
@@ -188,9 +187,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
                     if foreign_key.constraint is not None:
                         table.constraints.discard(foreign_key.constraint)
             for index in tuple(table.indexes):
-                if any(
-                    column.name in _COLLECTION_ATTEMPT_ADDITIONS for column in index.columns
-                ):
+                if any(column.name in _COLLECTION_ATTEMPT_ADDITIONS for column in index.columns):
                     table.indexes.discard(index)
             for column_name in _COLLECTION_ATTEMPT_ADDITIONS:
                 if column_name in table.c:

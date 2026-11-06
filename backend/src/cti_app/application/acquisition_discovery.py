@@ -447,9 +447,7 @@ def _body_matches_expected_title(response: CollectedResponse, request: Acquisiti
     requested_slug = " ".join(
         sorted(_meaningful_title_words(_url_slug_words(request.requested_url)))
     )
-    fetched_slug = " ".join(
-        sorted(_meaningful_title_words(_url_slug_words(response.final_url)))
-    )
+    fetched_slug = " ".join(sorted(_meaningful_title_words(_url_slug_words(response.final_url))))
     return bool(
         (requested_slug and fetched_slug and requested_slug == fetched_slug)
         or (expected_slug and (requested_slug == expected_slug or fetched_slug == expected_slug))

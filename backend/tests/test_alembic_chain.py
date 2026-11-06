@@ -30,9 +30,9 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     assert scripts.get_heads() == [scripts.get_current_head()]
     assert scripts.get_current_head() == "0010_acquisition_provenance"
     assert all(revision_id for revision_id in revision_ids)
-    assert {
-        revision_id for revision_id in revision_ids if len(revision_id) > 32
-    } == {"0009_acquisition_strategy_attempts"}
+    assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
+        "0009_acquisition_strategy_attempts"
+    }
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
     assert set(revision_ids) == set(EXPECTED_CHAIN)
     assert {script.revision: script.down_revision for script in revisions} == {
