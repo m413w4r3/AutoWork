@@ -36,6 +36,17 @@
   }
 }
 
+#let render-breakable-token(value, chunk-size: 16) = {
+  let clusters = value.clusters()
+  let start = 0
+  while start < clusters.len() {
+    let end = calc.min(start + chunk-size, clusters.len())
+    text(clusters.slice(start, end).join(""))
+    if end < clusters.len() { h(0.01pt) }
+    start = end
+  }
+}
+
 #let publication-detection-code-line(item) = {
   let chunks = item.at("break_chunks", default: ())
   let break-after = item.at("break_after", default: ())
@@ -182,6 +193,7 @@
   )
   let entry-text = entry.at("text", default: "")
   block(above: 4pt, below: 5pt)[
+    #set par(justify: false)
     #text(size: 8pt, fill: grey)[#number. #display-date]
     #if entry.at("role_label", default: none) != none [
       #h(0.5em)
@@ -471,7 +483,9 @@
     let body-cells = if hash-only {
       group.rows.map(row => (
         [
-          #box[#text(font: code-font-families, size: 9pt, hyphenate: false)[#row.value]]
+          #text(font: code-font-families, size: 9pt, hyphenate: false)[
+            #render-breakable-token(row.value)
+          ]
         ],
         [
           #text(size: 8.5pt, weight: "bold")[Ind. #row.at("indicator_status_short_label", default: row.at("indicator_status_label", default: "")) · Rel. #row.at("relationship_status_short_label", default: row.at("relationship_status_label", default: row.status_label))]
@@ -1219,17 +1233,29 @@
           reference-scope: reference-scope,
         )
       ]
+      #let omitted-url-count = content_section.at("omitted_invalid_url_count", default: 0)
       #if content_section.candidate_indicators.len() > 0 [
         #v(8pt)
+        #let candidate-description = if omitted-url-count > 0 {
+          (
+            "Éléments à examiner, sans promotion au statut d'IOC confirmé. "
+            + str(omitted-url-count)
+            + " URL non valide(s) omise(s) des listes."
+          )
+        } else {
+          "Éléments à examiner, sans promotion au statut d'IOC confirmé."
+        }
         #render-ioc-section(
           "Pistes non confirmées",
-          "Éléments à examiner, sans promotion au statut d'IOC confirmé.",
+          candidate-description,
           content_section.candidate_indicators,
           reference-scope: reference-scope,
         )
       ]
-      #if content_section.omitted_invalid_url_count > 0 [
-        #text(size: 8pt, fill: grey)[#content_section.omitted_invalid_url_count URL non valide(s) omise(s) des listes.]
+      #if content_section.candidate_indicators.len() == 0 and omitted-url-count > 0 [
+        #block(sticky: true)[
+          #text(size: 8pt, fill: grey)[#omitted-url-count URL non valide(s) omise(s) des listes.]
+        ]
       ]
     ] else if content_section.type == "technical_annex" [
       #let ioc_rows = content_section.at("ioc_rows", default: ())

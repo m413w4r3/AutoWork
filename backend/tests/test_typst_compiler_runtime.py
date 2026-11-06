@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import replace
 from datetime import date
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -857,6 +858,199 @@ async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cel
         ("Fonction:", "Composant"),
     ):
         assert_card_field_does_not_overlap(label, value)
+
+
+@pytest.mark.asyncio
+async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    sha512 = "a" * 128
+    ssdeep = f"3:{'A' * 64}:{'B' * 64}"
+    reference_digest = "7bdd7d62" + "c" * 48 + "628f27"
+    rows = [
+        {
+            "type": "hash",
+            "value": value,
+            "status_label": "documenté",
+            "indicator_status_short_label": "Article",
+            "relationship_status_short_label": "documenté",
+            "hash_context_summary": "Source : rapport public",
+        }
+        for value in (sha512, ssdeep)
+    ]
+    render_data = {
+        "schema_version": "typst-publication-model-annex-long-hash-fixture",
+        "document_label": _PUBLICATION_RENDER_LABEL,
+        "language": "fr",
+        "title": "Long hash rendering fixture",
+        "content_sections": [
+            {
+                "type": "references",
+                "entries": [
+                    {
+                        "number": 1,
+                        "display_date": "2026-10-30",
+                        "text": f"Hatching Triage — Rapport de l'échantillon {reference_digest}",
+                        "source_urls": [],
+                        "target_id": "long-hash-reference",
+                    }
+                ],
+                "blocks": [],
+            },
+            {
+                "type": "technical_annex",
+                "ioc_rows": rows,
+                "ioc_row_groups": [
+                    {"heading": "Fichiers — empreintes cryptographiques", "rows": rows}
+                ],
+            },
+        ],
+    }
+
+    workspace_root = tmp_path / "long-hash-annex-workspace"
+    _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "long-hash-annex-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted = _assert_exact_copyable_pdf_text(
+        reader,
+        (sha512, ssdeep, reference_digest),
+    )
+    assert "Hatching Triage" in extracted
+
+    pdftotext = shutil.which("pdftotext")
+    assert pdftotext is not None, "pdftotext is required to check rendered word coordinates"
+    pdf_path = tmp_path / "long-hash-annex.pdf"
+    pdf_path.write_bytes(compiled.content)
+    bbox = await anyio.run_process(
+        (pdftotext, "-bbox", str(pdf_path), "-"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    root = ET.fromstring(bbox.stdout.decode("utf-8", errors="replace"))
+    pages = [element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "page"]
+    page_words = [
+        (
+            page_index,
+            element.text or "",
+            float(element.attrib["xMin"]),
+            float(element.attrib["yMin"]),
+            float(element.attrib["xMax"]),
+            float(element.attrib["yMax"]),
+        )
+        for page_index, page in enumerate(pages)
+        for element in page.iter()
+        if element.tag.rsplit("}", 1)[-1] == "word"
+    ]
+
+    status_header = next(word for word in page_words if word[1] == "Statut,")
+    annex_page = status_header[0]
+    adjacent_column_words = [
+        word for word in page_words if word[0] == annex_page and word[2] >= status_header[2]
+    ]
+    token_fragments = [
+        word
+        for word in page_words
+        if word[0] == annex_page
+        and len(word[1]) >= 4
+        and any(word[1] in value for value in (sha512, ssdeep))
+    ]
+    assert token_fragments, "the annex page is missing the rendered SHA-512/ssdeep values"
+    collisions = [
+        (fragment[1], adjacent[1], fragment[2:6], adjacent[2:6])
+        for fragment in token_fragments
+        for adjacent in adjacent_column_words
+        if min(fragment[5], adjacent[5]) > max(fragment[3], adjacent[3])
+        and min(fragment[4], adjacent[4]) > max(fragment[2], adjacent[2])
+    ]
+    reference_anchor = next(
+        (word for word in page_words if word[1] == "Hatching"),
+        None,
+    )
+    assert reference_anchor is not None, "the long reference title is missing from pdftotext -bbox"
+    reference_line = [
+        word
+        for word in page_words
+        if word[0] == reference_anchor[0] and abs(word[3] - reference_anchor[3]) <= 0.5
+    ]
+    reference_gaps = [right[2] - left[4] for left, right in pairwise(reference_line)]
+    assert not collisions and max(reference_gaps, default=0) <= 12, (
+        f"annex hash overlaps={collisions!r}; long reference line gaps={reference_gaps!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_typst_keeps_invalid_url_note_with_candidate_heading(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    candidates = [{"value": f"candidate-{index:03d}.example"} for index in range(80)]
+    row = {
+        "type": "hash",
+        "value": "a" * 64,
+        "status_label": "documenté",
+        "indicator_status_short_label": "Article",
+        "relationship_status_short_label": "documenté",
+    }
+    render_data = {
+        "schema_version": "typst-publication-model-orphan-note-fixture",
+        "document_label": _PUBLICATION_RENDER_LABEL,
+        "language": "fr",
+        "title": "Invalid URL note pagination fixture",
+        "content_sections": [
+            {
+                "type": "ioc",
+                "source_indicators": [],
+                "original_indicators": [],
+                "candidate_indicators": [{"heading": "Valeurs à vérifier", "items": candidates}],
+                "omitted_invalid_url_count": 1,
+            },
+            {
+                "type": "technical_annex",
+                "ioc_rows": [row],
+                "ioc_row_groups": [
+                    {"heading": "Fichiers — empreintes cryptographiques", "rows": [row]}
+                ],
+            },
+        ],
+    }
+    workspace_root = tmp_path / "invalid-url-note-workspace"
+    _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "invalid-url-note-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    page_texts = [page.extract_text() or "" for page in reader.pages]
+    heading_page = next(
+        index for index, text in enumerate(page_texts) if "Pistes non confirmées" in text
+    )
+    note_page = next(
+        index
+        for index, text in enumerate(page_texts)
+        if "1 URL non valide(s) omise(s) des listes." in text
+    )
+    assert heading_page == note_page, (
+        f"candidate heading is on page {heading_page + 1}, invalid-URL note on page {note_page + 1}"
+    )
 
 
 @pytest.mark.asyncio
