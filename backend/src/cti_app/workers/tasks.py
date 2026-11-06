@@ -348,6 +348,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             third_party_provider_token=settings.collection_third_party_provider_token,
             third_party_provider_enabled=settings.collection_third_party_provider_enabled,
             ocr_command=settings.collection_ocr_command,
+            newsletter_archive_endpoint=settings.collection_official_newsletter_archive_endpoint,
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.

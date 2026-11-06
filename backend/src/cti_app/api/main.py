@@ -376,6 +376,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         third_party_provider_token=settings.collection_third_party_provider_token,
         third_party_provider_enabled=settings.collection_third_party_provider_enabled,
         ocr_command=settings.collection_ocr_command,
+        newsletter_archive_endpoint=settings.collection_official_newsletter_archive_endpoint,
     )
     collection_review_service = CollectionReviewService(
         uow_factory,

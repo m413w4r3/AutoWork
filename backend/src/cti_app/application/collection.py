@@ -18,7 +18,6 @@ from cti_app.application.acquisition_fallbacks import (
     AcquisitionProbe,
     AcquisitionRequest,
     AcquisitionStrategy,
-    SidecarPlaywrightAdapter,
     _typed_probe_outcome,
     article_rejection_reason,
     bridge_transcription_prompt,
@@ -498,6 +497,7 @@ class SubjectCollectionService:
         third_party_provider_token: str = "",
         third_party_provider_enabled: bool = False,
         ocr_command: str = "",
+        newsletter_archive_endpoint: str = "",
     ) -> None:
         self._uow_factory = uow_factory
         self._collector = collector
@@ -524,6 +524,7 @@ class SubjectCollectionService:
         self._third_party_provider_token = third_party_provider_token
         self._third_party_provider_enabled = third_party_provider_enabled
         self._ocr_command = ocr_command
+        self._newsletter_archive_endpoint = newsletter_archive_endpoint
         if acquisition_deadline_seconds <= 0:
             raise ValueError("acquisition_deadline_seconds must be positive")
         if acquisition_max_attempts < 1:
@@ -559,34 +560,65 @@ class SubjectCollectionService:
                     "http2",
                     "curl",
                     "representations",
-                    "wayback",
+                    "rss_atom_jsonfeed",
+                    "publisher_public_api",
+                    "embedded_structured_data",
+                    "playwright_chromium_dom",
+                    "playwright_network_response",
+                    "playwright_embedded_state",
+                    "wayback_snapshot",
                     "archive_ph",
-                    "common_crawl",
-                    "memento",
-                    "search_cache",
-                    "playwright",
+                    "commoncrawl_warc",
+                    "memento_archive",
+                    "exact_title_search",
+                    "publisher_alternative_url",
+                    "authorized_syndication",
+                    "publisher_pdf",
+                    "visual_ocr",
+                    "official_newsletter_archive",
+                    "third_party_extraction",
+                    "bridge_source_discovery",
                     "bridge_transcription",
                 )
             }
         strategy_flags["representations"] = (
             strategy_flags.get("representations", True) and fallback_variants_enabled
         )
-        for name in ("wayback", "archive_ph", "common_crawl", "memento", "search_cache"):
-            strategy_flags[name] = strategy_flags.get(name, True) and fallback_archive_enabled
+        for names in (
+            ("wayback_snapshot", "wayback"),
+            ("archive_ph",),
+            ("commoncrawl_warc", "common_crawl"),
+            ("memento_archive", "memento"),
+        ):
+            primary = names[0]
+            legacy = names[1] if len(names) > 1 else primary
+            strategy_flags[primary] = (
+                strategy_flags.get(primary, strategy_flags.get(legacy, True))
+                and fallback_archive_enabled
+            )
         strategy_flags["bridge_transcription"] = (
             strategy_flags.get("bridge_transcription", True) and fallback_bridge_enabled
         )
-        self._fallback_strategies = tuple(
-            fallback_strategies
-            or default_acquisition_strategies(
-                flags=strategy_flags,
-                timeouts=fallback_strategy_timeouts,
-                max_candidates=fallback_max_variants,
-                playwright_adapter=(
-                    SidecarPlaywrightAdapter(fallback_playwright_sidecar_url)
-                    if fallback_playwright_sidecar_url
-                    else None
-                ),
+        self._fallback_strategies = (
+            tuple(fallback_strategies)
+            if fallback_strategies is not None
+            else tuple(
+                default_acquisition_strategies(
+                    flags=strategy_flags,
+                    timeouts=fallback_strategy_timeouts,
+                    max_candidates=fallback_max_variants,
+                    browser_service_url=fallback_playwright_sidecar_url,
+                    browser_control_socket=browser_control_socket,
+                    browser_navigation_enabled=browser_navigation_enabled,
+                    exact_title_search_endpoint=exact_title_search_endpoint,
+                    syndication_domains=self._allowed_syndication_domains,
+                    third_party_provider_url=third_party_provider_url,
+                    third_party_provider_token=third_party_provider_token,
+                    third_party_provider_enabled=third_party_provider_enabled,
+                    newsletter_archive_endpoint=newsletter_archive_endpoint,
+                    ocr_command=ocr_command,
+                    min_text_chars=fallback_min_text_chars,
+                )
             )
         )
         self._fetch_lease = timedelta(
@@ -1505,6 +1537,9 @@ class SubjectCollectionService:
         size: int | None = None,
         error: CollectionError | None = None,
     ) -> None:
+        requested_url = collection.requested_url
+        if not is_credential_free_url(requested_url):
+            requested_url = credential_free_url(requested_url)
         logger.info(
             "source_collection_result",
             extra={
@@ -1513,11 +1548,7 @@ class SubjectCollectionService:
                 "subject_id": str(collection.subject_id),
                 "source_collection_id": str(collection.id),
                 "source_candidate_id": str(collection.source_candidate_id),
-                "requested_url": (
-                    collection.requested_url
-                    if is_credential_free_url(collection.requested_url)
-                    else credential_free_url(collection.requested_url)
-                ),
+                "requested_url": requested_url,
                 "phase": "persisted",
                 "state": state.value,
                 "duration_ms": round((time.monotonic() - started) * 1000),
@@ -1926,13 +1957,40 @@ class SubjectCollectionService:
         completed_at = datetime.now(UTC)
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
+            credential_like_rejection = (
+                error.reason_code is CollectionFailureReason.UNSAFE_DESTINATION
+                and not bridge_url_is_credential_free(collection.requested_url)
+            )
+            persisted_requested_url = (
+                safe_fallback_url(collection.requested_url)
+                if credential_like_rejection
+                else collection.requested_url
+            )
+            persisted_final_url = (
+                safe_fallback_url(error.final_url)
+                if credential_like_rejection and error.final_url
+                else error.final_url
+            )
+            persisted_redirect_chain = (
+                tuple(safe_fallback_url(url) for url in error.redirect_chain)
+                if credential_like_rejection
+                else error.redirect_chain
+            )
+            failure_reason = (
+                "credential-like URL rejected" if credential_like_rejection else str(error)
+            )
+            candidate_resolution_url = _same_site_redirect_candidate(
+                collection.requested_url, error.final_url, error.redirect_chain
+            )
+            if credential_like_rejection and candidate_resolution_url is not None:
+                candidate_resolution_url = safe_fallback_url(candidate_resolution_url)
             attempt = CollectionAttempt(
                 collection_id=collection.id,
                 job_id=job_id,
                 policy_snapshot_id=self._policy_snapshot.id,
-                requested_url=collection.requested_url,
-                final_url=error.final_url,
-                redirect_chain=error.redirect_chain,
+                requested_url=persisted_requested_url,
+                final_url=persisted_final_url,
+                redirect_chain=persisted_redirect_chain,
                 attempted_at=started_at,
                 completed_at=completed_at,
                 http_status=error.http_status,
@@ -1947,12 +2005,10 @@ class SubjectCollectionService:
                 content_encoding=None,
                 allowed_headers=error.headers,
                 outcome=error.outcome,
-                failure_reason=str(error),
+                failure_reason=failure_reason,
                 reason_code=error.reason_code,
                 transport_classification=error.transport_classification,
-                candidate_resolution_url=_same_site_redirect_candidate(
-                    collection.requested_url, error.final_url, error.redirect_chain
-                ),
+                candidate_resolution_url=candidate_resolution_url,
                 candidate_resolution_provenance=(
                     CollectionResolutionProvenance.SAME_SITE_HTTP_REDIRECT
                     if _same_site_redirect_candidate(
@@ -1974,7 +2030,7 @@ class SubjectCollectionService:
             collection.fail(
                 state,
                 attempt_id=attempt.id,
-                reason=str(error),
+                reason=failure_reason,
                 reason_code=error.reason_code,
             )
             await uow.source_collections.save(collection)
@@ -2234,20 +2290,28 @@ class SubjectCollectionService:
                 strategy = self.inner
                 probes: tuple[AcquisitionProbe, ...]
                 if not strategy.enabled:
+                    disabled_capability = getattr(
+                        strategy,
+                        "capability_state",
+                        AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION,
+                    )
+                    disabled_outcome = getattr(
+                        strategy, "capability_outcome", AcquisitionOutcome.SKIPPED
+                    )
                     probes = (
                         AcquisitionProbe(
                             strategy_name=strategy.name,
                             strategy_version=strategy.version,
                             method=strategy.method,
                             requested_url=fallback_requested_url,
-                            outcome=AcquisitionOutcome.SKIPPED,
-                            reason_code="strategy_disabled",
+                            outcome=disabled_outcome,
+                            reason_code=getattr(strategy, "capability_reason", "strategy_disabled"),
                             response=None,
                             http_status=None,
                             encoded_size=None,
                             encoded_sha256=None,
                             duration_ms=0,
-                            capability_state=AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION,
+                            capability_state=disabled_capability,
                         ),
                     )
                 else:
@@ -2259,6 +2323,7 @@ class SubjectCollectionService:
                             AcquisitionCapabilityState.BLOCKED_BY_POLICY,
                             AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
                         }
+                        configured_outcome = getattr(strategy, "capability_outcome", None)
                         probes = (
                             AcquisitionProbe(
                                 strategy_name=strategy.name,
@@ -2266,18 +2331,26 @@ class SubjectCollectionService:
                                 method=strategy.method,
                                 requested_url=fallback_requested_url,
                                 outcome=(
-                                    AcquisitionOutcome.POLICY_SKIPPED
+                                    configured_outcome
+                                    if isinstance(configured_outcome, AcquisitionOutcome)
+                                    else AcquisitionOutcome.POLICY_SKIPPED
                                     if is_policy_block
                                     else AcquisitionOutcome.NOT_CONFIGURED
                                 ),
-                                reason_code=capability.value,
+                                reason_code=getattr(
+                                    strategy, "capability_reason", capability.value
+                                ),
                                 response=None,
                                 http_status=None,
                                 encoded_size=None,
                                 encoded_sha256=None,
                                 duration_ms=0,
                                 policy_decision=(
-                                    AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
+                                    getattr(
+                                        strategy,
+                                        "capability_policy_decision",
+                                        AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION,
+                                    )
                                     if capability is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
                                     else AcquisitionPolicyDecision.DENIED_DOMAIN_POLICY
                                     if is_policy_block
@@ -3013,7 +3086,7 @@ class SubjectCollectionService:
                 failures.append(
                     {
                         "collection_id": str(source.id),
-                        "requested_url": source.requested_url,
+                        "requested_url": (latest.requested_url if latest else source.requested_url),
                         "state": current.state.value,
                         "reason_code": (
                             current.failure_reason_code.value

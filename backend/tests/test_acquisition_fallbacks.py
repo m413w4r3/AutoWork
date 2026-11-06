@@ -471,18 +471,24 @@ async def test_playwright_rendered_dom_archives_with_distinct_provenance(tmp_pat
 
 
 def test_playwright_registry_requires_a_configured_adapter():
-    strategies = default_acquisition_strategies(flags={"playwright": True})
+    strategies = default_acquisition_strategies(flags={"playwright_chromium_dom": True})
 
-    browser = next(strategy for strategy in strategies if strategy.name == "playwright")
-    assert browser.enabled is False
+    browser = next(
+        strategy for strategy in strategies if strategy.name == "playwright_chromium_dom"
+    )
+    assert browser.enabled is True
+    assert browser.capability_state.value == "blocked_by_security"
 
     configured = default_acquisition_strategies(
-        flags={"playwright": True},
-        playwright_adapter=FakeBrowserAdapter(_ARTICLE.decode("utf-8")),
+        flags={"playwright_chromium_dom": True},
+        browser_adapter=object(),
+        browser_navigation_enabled=True,
     )
     names = [strategy.name for strategy in configured]
-    assert configured[names.index("playwright")].enabled is True
-    assert names.index("playwright") < names.index("bridge_transcription")
+    assert (
+        configured[names.index("playwright_chromium_dom")].capability_state.value == "implemented"
+    )
+    assert names.index("playwright_chromium_dom") < names.index("bridge_transcription")
 
 
 @pytest.mark.asyncio
@@ -576,8 +582,8 @@ async def test_http2_curl_and_search_cache_report_explicit_offline_skips():
     assert curl[0].reason_code == "curl_adapter_not_available_with_same_dns_pinning"
     assert search[0].reason_code == "no_supported_public_search_cache_endpoint"
     registry_names = [strategy.name for strategy in default_acquisition_strategies()]
-    assert registry_names.index("representations") < registry_names.index("wayback")
-    assert registry_names.index("memento") < registry_names.index("bridge_transcription")
+    assert registry_names.index("representations") < registry_names.index("wayback_snapshot")
+    assert registry_names.index("memento_archive") < registry_names.index("bridge_transcription")
 
 
 def test_article_acceptance_rejects_language_mismatch_and_interstitial_pages():

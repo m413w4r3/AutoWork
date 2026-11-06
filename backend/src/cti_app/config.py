@@ -217,6 +217,7 @@ class Settings(BaseSettings):
     collection_browser_control_socket: str = ""
     collection_syndication_domains: str = ""
     collection_exact_title_search_endpoint: str = ""
+    collection_official_newsletter_archive_endpoint: str = ""
     collection_third_party_provider_url: str = ""
     collection_third_party_provider_token: str = ""
     collection_third_party_provider_enabled: bool = False
@@ -230,13 +231,27 @@ class Settings(BaseSettings):
             "http2": True,
             "curl": True,
             "representations": True,
-            "wayback": True,
+            "rss_atom_jsonfeed": True,
+            "publisher_public_api": True,
+            "embedded_structured_data": True,
+            "playwright_chromium_dom": True,
+            "playwright_network_response": True,
+            "playwright_embedded_state": True,
+            "playwright_firefox": False,
+            "playwright_webkit": False,
+            "wayback_snapshot": True,
             "archive_ph": True,
-            "common_crawl": True,
-            "memento": True,
-            "search_cache": True,
+            "commoncrawl_warc": True,
+            "memento_archive": True,
+            "exact_title_search": True,
+            "publisher_alternative_url": True,
+            "authorized_syndication": True,
+            "publisher_pdf": True,
+            "visual_ocr": False,
+            "official_newsletter_archive": False,
+            "third_party_extraction": False,
+            "bridge_source_discovery": False,
             "bridge_transcription": True,
-            "playwright": True,
         }
     )
     collection_acquisition_strategy_timeout_seconds: dict[str, float] = Field(
@@ -248,13 +263,27 @@ class Settings(BaseSettings):
             "http2": 1.0,
             "curl": 1.0,
             "representations": 20.0,
-            "wayback": 20.0,
+            "rss_atom_jsonfeed": 15.0,
+            "publisher_public_api": 15.0,
+            "embedded_structured_data": 15.0,
+            "playwright_chromium_dom": 45.0,
+            "playwright_network_response": 45.0,
+            "playwright_embedded_state": 45.0,
+            "playwright_firefox": 45.0,
+            "playwright_webkit": 45.0,
+            "wayback_snapshot": 20.0,
             "archive_ph": 15.0,
-            "common_crawl": 25.0,
-            "memento": 15.0,
-            "search_cache": 10.0,
+            "commoncrawl_warc": 25.0,
+            "memento_archive": 15.0,
+            "exact_title_search": 15.0,
+            "publisher_alternative_url": 15.0,
+            "authorized_syndication": 15.0,
+            "publisher_pdf": 20.0,
+            "visual_ocr": 20.0,
+            "official_newsletter_archive": 15.0,
+            "third_party_extraction": 20.0,
+            "bridge_source_discovery": 1.0,
             "bridge_transcription": 90.0,
-            "playwright": 45.0,
         }
     )
     collection_playwright_sidecar_url: str = ""
