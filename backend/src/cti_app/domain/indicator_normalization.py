@@ -11,6 +11,8 @@ from cti_app.domain.publication import ArtifactType
 _DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
 _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
+_SSDEEP_HASH = re.compile(r"[1-9][0-9]*:[A-Za-z0-9+/]{1,64}:[A-Za-z0-9+/]{1,64}")
+_TLSH_HASH = re.compile(r"T1[0-9a-f]{70}", re.IGNORECASE)
 _INVISIBLE = str.maketrans(dict.fromkeys("\u00ad\u200b\u200c\u200d\u2060\ufeff"))
 
 
@@ -67,19 +69,39 @@ def normalize_indicator_value(raw: str, artifact_type: ArtifactType) -> str:
 
 
 def normalize_publication_indicator_value(raw: str, artifact_type: ArtifactType) -> str:
-    """Normalize a publication IOC, accepting a valid IP endpoint as its host IP.
+    """Normalize a publication IOC without changing extraction identities.
 
     Extraction keeps the source-verified original value and uses the stricter
     ``normalize_indicator_value`` for its deduplication key. This publication
     projection accepts endpoint-shaped values without changing that
     extraction identity or discarding the original value from IOC detail rows.
+    Case-sensitive fuzzy hashes keep their digest alphabet, while TLSH uses its
+    canonical uppercase spelling. Other hash values keep the existing lowercase
+    normalization. URL whitespace is retained so publication rendering can omit
+    and count malformed values instead of silently trimming them into a URL.
     """
+    if artifact_type is ArtifactType.URL and any(character.isspace() for character in raw):
+        return raw
+    if artifact_type is ArtifactType.HASH:
+        value = refang(raw)
+        if _SSDEEP_HASH.fullmatch(value):
+            return value
+        if _TLSH_HASH.fullmatch(value):
+            return value.upper()
+        return normalize_indicator_value(value, artifact_type)
     try:
         return normalize_indicator_value(raw, artifact_type)
     except ValueError:
         if artifact_type is not ArtifactType.IP:
             raise
     return _normalize_ip_endpoint(raw)
+
+
+def publication_indicator_identity_key(normalized_value: str, artifact_type: ArtifactType) -> str:
+    """Return a publication dedup key, retaining ssdeep's case-sensitive alphabet."""
+    if artifact_type is ArtifactType.HASH and _SSDEEP_HASH.fullmatch(normalized_value):
+        return normalized_value
+    return normalized_value.casefold()
 
 
 def _normalize_ip_endpoint(raw: str) -> str:
@@ -138,12 +160,28 @@ def canonical_indicator_key(raw: str, artifact_type: ArtifactType) -> str:
 def display_indicator_value(value: str, artifact_type: ArtifactType, *, defanged: bool) -> str:
     """Render a canonical indicator for prose (defanged) or the IOC inventory."""
     canonical = normalize_indicator_value(value, artifact_type)
+    return _display_normalized_indicator_value(canonical, artifact_type, defanged=defanged)
+
+
+def display_publication_indicator_value(
+    value: str, artifact_type: ArtifactType, *, defanged: bool
+) -> str:
+    """Render a publication IOC using its publication-specific canonical form."""
+    canonical = normalize_publication_indicator_value(value, artifact_type)
+    return _display_normalized_indicator_value(canonical, artifact_type, defanged=defanged)
+
+
+def _display_normalized_indicator_value(
+    canonical: str, artifact_type: ArtifactType, *, defanged: bool
+) -> str:
     if not defanged:
         return canonical
     if artifact_type is ArtifactType.URL:
         canonical = re.sub(r"^https://", "hxxps://", canonical, flags=re.IGNORECASE)
         canonical = re.sub(r"^http://", "hxxp://", canonical, flags=re.IGNORECASE)
         scheme, separator, remainder = canonical.partition("://")
+        if not separator:
+            return canonical.replace(".", "[.]")
         return f"{scheme}{separator}{remainder.replace('.', '[.]')}"
     if artifact_type in {ArtifactType.DOMAIN, ArtifactType.IP}:
         return canonical.replace(".", "[.]")

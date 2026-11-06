@@ -20,6 +20,8 @@ _MAIN_IOC_REASONS = frozenset(
     }
 )
 _HASH_VALUE = re.compile(r"[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}")
+_SSDEEP_HASH_VALUE = re.compile(r"[1-9][0-9]*:[A-Za-z0-9+/]{1,64}:[A-Za-z0-9+/]{1,64}")
+_TLSH_HASH_VALUE = re.compile(r"T1[0-9a-f]{70}", re.IGNORECASE)
 
 
 def is_subject_ioc_eligible(
@@ -70,8 +72,18 @@ def is_subject_ioc_eligible(
 
 
 def is_supported_subject_ioc_hash(artifact_type: ArtifactType, normalized_value: str) -> bool:
-    """Keep the publication hash formats in the shared IOC eligibility policy."""
+    """Keep the existing routing eligibility rule for conventional file hashes."""
     return (
         artifact_type is not ArtifactType.HASH
         or _HASH_VALUE.fullmatch(normalized_value) is not None
+    )
+
+
+def is_supported_publication_ioc_hash(artifact_type: ArtifactType, normalized_value: str) -> bool:
+    """Accept the hash formats rendered by publication while keeping routing stable."""
+    return (
+        artifact_type is not ArtifactType.HASH
+        or is_supported_subject_ioc_hash(artifact_type, normalized_value)
+        or _SSDEEP_HASH_VALUE.fullmatch(normalized_value) is not None
+        or _TLSH_HASH_VALUE.fullmatch(normalized_value) is not None
     )

@@ -36,6 +36,7 @@ from cti_app.application.publication_builder import (
     build_publication_document_v5,
     compute_assembly_input_hash,
 )
+from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -1249,7 +1250,7 @@ def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_o
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    assert publication_builder.ASSEMBLY_POLICY_VERSION == "14-ip-endpoint-normalization"
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == "15-publication-fuzzy-hash-normalization"
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
@@ -2094,6 +2095,7 @@ def test_assembly_normalizes_ip_endpoint_deduplicates_and_keeps_evidence_hashes_
         evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
         source_document_ids=(source.source_document_id,),
     )
+
     bare_ip = ExtractionIndicatorV1(
         value="153.75.247.94",
         artifact_type=ArtifactType.IP,
@@ -2159,6 +2161,56 @@ def test_assembly_normalizes_ip_endpoint_deduplicates_and_keeps_evidence_hashes_
         )
         == assembly_hash
     )
+
+
+def test_assembly_preserves_ssdeep_identity_and_canonicalizes_tlsh_case() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    ssdeep = "6144:g0Z+78Ca04xjScVc//JYox7d/CfmvXecgn90RRf19F7731Pn:xcgS2G/jreFmMTk/P731P"
+    ssdeep_case_variant = ssdeep.swapcase()
+    tlsh = "T1" + "aB" * 35
+
+    indicators = tuple(
+        ExtractionIndicatorV1(
+            value=value,
+            artifact_type=ArtifactType.HASH,
+            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+            context="C2 infrastructure",
+            evidence_quote=f"The source identifies {value}.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+        )
+        for value in (ssdeep, ssdeep_case_variant, tlsh.lower())
+    )
+    extraction = replace(extraction, sources=(replace(source, indicators=indicators),))
+    extraction_hash = canonical_extraction_hash(extraction)
+    synthesis = replace(synthesis, extraction_hash=extraction_hash)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=_enrichment_with(extraction=extraction, synthesis=synthesis),
+    )
+
+    hash_group = next(
+        group for group in publication.indicators if group.artifact_type is ArtifactType.HASH
+    )
+    assert {item.normalized_value for item in hash_group.indicators} == {
+        ssdeep,
+        ssdeep_case_variant,
+        tlsh.upper(),
+    }
+    model = project_publication_to_typst_model(publication)
+    ioc_section = next(section for section in model.content_sections if section["type"] == "ioc")
+    rendered_hashes = {
+        item["value"]["text"] if isinstance(item["value"], dict) else str(item["value"])
+        for group in ioc_section["source_indicators"]
+        for item in group["items"]
+        if item["artifact_type"] == ArtifactType.HASH.value
+    }
+    assert rendered_hashes == {ssdeep, ssdeep_case_variant, tlsh.upper()}
+    assert canonical_extraction_hash(extraction) == extraction_hash
 
 
 def test_publication_ioc_projection_removes_generic_services_only() -> None:

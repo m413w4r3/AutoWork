@@ -8,6 +8,8 @@ from cti_app.application.production_normalization import (
     canonical_indicator_key,
     display_indicator_value,
     normalize_indicator_value,
+    normalize_publication_indicator_value,
+    publication_indicator_identity_key,
 )
 from cti_app.application.production_parsers import (
     DisplayPolicy,
@@ -147,6 +149,22 @@ def test_indicator_normalization_and_collection_are_explicit() -> None:
         "216.126.237.197",
         HASH,
     ]
+
+
+def test_publication_hash_normalization_preserves_fuzzy_hash_case() -> None:
+    ssdeep = "6144:g0Z+78Ca04xjScVc//JYox7d/CfmvXecgn90RRf19F7731Pn:xcgS2G/jreFmMTk/P731P"
+    tlsh = "T1" + "aB" * 35
+
+    assert normalize_publication_indicator_value(ssdeep, ArtifactType.HASH) == ssdeep
+    assert normalize_indicator_value(ssdeep, ArtifactType.HASH) == ssdeep.lower()
+    assert canonical_indicator_key(ssdeep, ArtifactType.HASH) == ssdeep.lower()
+    assert publication_indicator_identity_key(
+        ssdeep, ArtifactType.HASH
+    ) != publication_indicator_identity_key(ssdeep.swapcase(), ArtifactType.HASH)
+    assert normalize_publication_indicator_value(tlsh.lower(), ArtifactType.HASH) == tlsh.upper()
+    assert normalize_indicator_value(tlsh, ArtifactType.HASH) == tlsh.lower()
+    for value in ("A" * 32, "B" * 40, "C" * 64, "D" * 128):
+        assert normalize_publication_indicator_value(value, ArtifactType.HASH) == value.lower()
 
 
 def test_v1_extraction_is_readable_but_never_promoted_to_ioc() -> None:
