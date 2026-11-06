@@ -4,7 +4,7 @@ This module validates, against a real (temporary) PostgreSQL database:
 
 1. the exact set of application tables produced by ``alembic upgrade head``;
 2. that this set matches ``Base.metadata.tables`` (module-level ORM models),
-   exactly, with no exceptions;
+    exactly, with migration-owned additive check constraints included;
 3. for every ORM-mapped table: columns (name, type family, nullability,
    varchar length), primary key, foreign keys (incl. ``ON DELETE``), unique
    constraints, check constraints and indexes (incl. partial indexes) —
@@ -15,7 +15,7 @@ This module validates, against a real (temporary) PostgreSQL database:
 5. the *behaviour* of the two guard families (TLP-downgrade prevention and
    append-only enforcement), not just their catalog presence;
 6. that a database with no tables and no Alembic history upgrades directly
-   to the current Alembic head, and that repeating ``upgrade head``
+    to the current Alembic head, and that repeating ``upgrade head``
    leaves the schema and trigger definitions unchanged;
 7. a full ``upgrade head`` -> ``downgrade base`` -> ``upgrade head`` cycle,
    asserting tables/functions/triggers are completely gone after the full
@@ -86,8 +86,9 @@ def _head_revision() -> str:
     """Read the chain head instead of pinning one migration by name.
 
     The rest of this module compares the full migrated schema against
-    ``Base.metadata``. The current head includes additive migrations through
-    ``0008_production_routing``.
+    ``Base.metadata`` plus explicitly migration-owned additive constraints.
+    The current head includes acquisition provenance through
+    ``0010_acquisition_provenance``.
     """
     from alembic.script import ScriptDirectory
 
@@ -108,6 +109,30 @@ pytestmark = pytest.mark.integration
 ALEMBIC_TABLE = "alembic_version"
 _REPAIR_TABLE = "production_repair_decisions"
 _REPAIR_TRIGGER = "trg_production_repair_decisions_append_only"
+_COLLECTION_ATTEMPT_ACQUISITION_COLUMNS = frozenset(
+    {
+        "strategy_name",
+        "strategy_version",
+        "duration_ms",
+        "acquisition_method",
+        "source_equivalence_class",
+        "evidence_class",
+        "observation_kind",
+        "quality_score",
+        "quality_assessment",
+        "archive_snapshot_time",
+        "model_run_id",
+        "model_generated",
+        "primary_source_verified",
+    }
+)
+_COLLECTION_ATTEMPT_ADDITION_CHECKS = frozenset(
+    {
+        "ck_collection_attempts_strategy_metadata",
+        "ck_collection_attempts_duration_ms",
+        "ck_collection_attempts_quality_score",
+    }
+)
 INVESTIGATION_TABLES = frozenset(
     {
         "tool_invocations",
@@ -354,11 +379,20 @@ def _expected_unique_constraints(table: Table) -> set[frozenset[str]]:
 
 
 def _expected_check_constraint_names(table: Table) -> set[str]:
-    return {
+    names = {
         str(constraint.name)
         for constraint in table.constraints
         if isinstance(constraint, CheckConstraint) and constraint.name
     }
+    if table.name == "collection_attempts":
+        # Migration 0009 owns these guards outside the declarative ORM table.
+        names.update(
+            {
+                "ck_collection_attempts_strategy_metadata",
+                "ck_collection_attempts_duration_ms",
+            }
+        )
+    return names
 
 
 def _expected_indexes(table: Table) -> set[IndexShape]:
@@ -450,6 +484,19 @@ async def _table_names(database_url: str) -> set[str]:
     try:
         async with engine.connect() as connection:
             return set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
+    finally:
+        await engine.dispose()
+
+
+async def _column_names(database_url: str, table_name: str) -> list[str]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(
+                lambda sync: [
+                    column["name"] for column in inspect(sync).get_columns(table_name)
+                ]
+            )
     finally:
         await engine.dispose()
 
@@ -1064,7 +1111,17 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0008_production_routing"
+    assert _head_revision() == "0010_acquisition_provenance"
+
+    collection_attempt_columns = asyncio.run(
+        _column_names(temporary_postgres_url, "collection_attempts")
+    )
+    assert _COLLECTION_ATTEMPT_ACQUISITION_COLUMNS <= set(collection_attempt_columns)
+    assert len(collection_attempt_columns) == len(set(collection_attempt_columns))
+    assert all(
+        collection_attempt_columns.count(name) == 1
+        for name in _COLLECTION_ATTEMPT_ACQUISITION_COLUMNS
+    )
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -1116,6 +1173,11 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
         index[0] for index in publication_manifest_schema["indexes"]
     }
     trigger_definitions = asyncio.run(_trigger_definitions(temporary_postgres_url))
+    attempt_schema = schema_definitions["collection_attempts"]
+    assert attempt_schema["checks"] == _expected_check_constraint_names(
+        Base.metadata.tables["collection_attempts"]
+    )
+    assert _COLLECTION_ATTEMPT_ADDITION_CHECKS <= attempt_schema["checks"]
 
     # The migration chain is idempotent: repeating the upgrade is a no-op for
     # the schema and trigger definitions.
@@ -1124,6 +1186,35 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
     assert asyncio.run(_database_snapshot(temporary_postgres_url)) == schema_definitions
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
+
+
+def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0008_production_routing")
+
+    baseline_schema = asyncio.run(_database_snapshot(temporary_postgres_url))[
+        "collection_attempts"
+    ]
+    assert not (
+        _COLLECTION_ATTEMPT_ACQUISITION_COLUMNS & set(baseline_schema["columns"])
+    )
+    assert not (_COLLECTION_ATTEMPT_ADDITION_CHECKS & baseline_schema["checks"])
+    outcome_checks = asyncio.run(
+        _check_constraint_definitions(temporary_postgres_url, "collection_attempts")
+    )
+    assert "'skipped'" not in outcome_checks["ck_collection_attempts_outcome"].lower()
+
+    command.upgrade(config, "head")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert _head_revision() == "0010_acquisition_provenance"
+    final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))[
+        "collection_attempts"
+    ]
+    table = Base.metadata.tables["collection_attempts"]
+    assert final_schema["columns"] == _expected_columns(table)
+    assert final_schema["checks"] == _expected_check_constraint_names(table)
 
 
 def test_tool_seconds_migration_updates_the_existing_reservation_check(
@@ -1206,7 +1297,7 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
         "authority_kind",
@@ -1248,7 +1339,7 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
@@ -1346,7 +1437,7 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     )
 
     command.upgrade(config, "head")
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
 
     command.downgrade(config, "base")
@@ -1370,7 +1461,7 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
     with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
         command.downgrade(config, "0001_baseline")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
 
     async def _experiment_count() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -1458,7 +1549,7 @@ def test_osint_policy_downgrade_refuses_policy_and_inherited_lineage_rows(
     with pytest.raises(RuntimeError, match="Cannot downgrade populated OSINT_OPEN policy storage"):
         command.downgrade(config, "0002_c2_experiments")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_state_counts()) == (1, 1, 1, 1, 1, 1)
 
 
@@ -1610,4 +1701,4 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
     raw_authority, interpreted_authority = asyncio.run(_read_legacy_envelope())
     assert raw_authority is None
     assert interpreted_authority is EnvelopeAuthorityKind.HUMAN_G2
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0008_production_routing"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()

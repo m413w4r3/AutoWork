@@ -36,10 +36,13 @@ from cti_app.application.jobs import JobRegistry, JobService
 from cti_app.domain.acquisition import (
     AcquisitionObservationKind,
     AcquisitionOutcome,
+    AcquisitionPolicyContext,
+    AcquisitionPolicyDecision,
     AcquisitionQuality,
     EvidenceClass,
     SourceEquivalenceClass,
 )
+from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
     CollectionState,
     DetectedMimeType,
@@ -184,6 +187,40 @@ class NoopStrategy:
         )
 
 
+class FailedProbeStrategy:
+    name = "test_failed_probe"
+    version = "1"
+    method = SourceAcquisitionMethod.EXACT_TITLE_SEARCH
+    enabled = True
+    timeout_seconds = 1.0
+
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        return (
+            AcquisitionProbe(
+                strategy_name=self.name,
+                strategy_version=self.version,
+                method=self.method,
+                requested_url=request.requested_url,
+                outcome=AcquisitionOutcome.FAILED,
+                reason_code="synthetic_probe_failure",
+                response=None,
+                http_status=None,
+                encoded_size=None,
+                encoded_sha256=None,
+                duration_ms=4,
+            ),
+        )
+
+
+class PolicyCaptureStrategy(NoopStrategy):
+    def __init__(self) -> None:
+        self.policy: AcquisitionPolicyContext | None = None
+
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        self.policy = request.policy
+        return await super().acquire(request)
+
+
 class JobContext:
     def __init__(self) -> None:
         self.diagnostics: list[dict[str, object]] = []
@@ -207,6 +244,9 @@ async def _service(
     strategies: tuple[AcquisitionStrategy, ...],
     source_url: str = "https://discovery.example/report",
     endpoint_enabled: bool = True,
+    third_party_provider_enabled: bool = False,
+    third_party_provider_url: str = "",
+    third_party_provider_token: str = "",
 ):
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, (source_url,))
@@ -217,6 +257,9 @@ async def _service(
         blob_store,
         fallback_strategies=strategies,
         fallback_endpoint_enabled=endpoint_enabled,
+        third_party_provider_enabled=third_party_provider_enabled,
+        third_party_provider_url=third_party_provider_url,
+        third_party_provider_token=third_party_provider_token,
     )
     source = (await service.initialize(subject.id))[0]
     factory.collections[source.id].state = CollectionState.BLOCKED
@@ -280,6 +323,70 @@ async def test_operator_fallback_uses_only_orchestrator_and_round_trips_provenan
     assert receipt.quality_reasons == ("title_match",)
     assert receipt.primary_source_verified is True
     assert receipt.ioc_primary_verified is True
+
+
+@pytest.mark.asyncio
+async def test_failed_probe_is_persisted_by_recording_wrapper(tmp_path):
+    factory, service, subject, source, _blob_store = await _service(
+        tmp_path,
+        transport=Transport(),
+        strategies=(FailedProbeStrategy(),),
+    )
+
+    state = await service.fallback_acquire(
+        subject.id,
+        source.id,
+        uuid4(),
+        JobContext(),  # type: ignore[arg-type]
+    )
+
+    assert state is CollectionState.BLOCKED
+    attempts = await service.attempts(source.id)
+    failed_attempts = [item for item in attempts if item.strategy_name == "test_failed_probe"]
+    assert len(failed_attempts) == 1
+    assert failed_attempts[0].outcome.value == "error"
+    assert failed_attempts[0].failure_reason == "Acquisition strategy synthetic_probe_failure"
+    event = next(
+        event
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_attempted"
+        and event.payload.get("strategy_name") == "test_failed_probe"
+    )
+    assert event.payload["outcome"] == AcquisitionOutcome.FAILED.value
+    assert event.payload["reason_code"] == "synthetic_probe_failure"
+
+
+@pytest.mark.asyncio
+async def test_fallback_policy_uses_typed_tlp_and_provider_setting(tmp_path):
+    strategy = PolicyCaptureStrategy()
+    _factory, service, subject, source, _blob_store = await _service(
+        tmp_path,
+        transport=Transport(),
+        strategies=(strategy,),
+        third_party_provider_enabled=True,
+        third_party_provider_url="https://provider.example/extract",
+        third_party_provider_token="synthetic-test-token",
+    )
+    source.do_not_submit = True
+    source.external_llm_allowed = False
+
+    await service.fallback_acquire(
+        subject.id,
+        source.id,
+        uuid4(),
+        JobContext(),  # type: ignore[arg-type]
+    )
+
+    policy = strategy.policy
+    assert policy is not None
+    assert isinstance(policy.tlp, TLP)
+    assert policy.external_llm_allowed is False
+    assert policy.third_party_provider_allowed is True
+    assert policy.provider_configured is True
+    assert (
+        policy.check_destination(source.canonical_url, third_party_provider=True)
+        is AcquisitionPolicyDecision.DENIED_PROVIDER_DISCLOSURE
+    )
 
 
 @pytest.mark.asyncio

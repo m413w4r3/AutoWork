@@ -2,7 +2,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import MetaData, pool
+from sqlalchemy import CheckConstraint, MetaData, pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -63,6 +63,30 @@ _OSINT_ENVELOPE_COLUMNS = frozenset(
 _SAMPLE_ACQUISITION_DISPATCH_COLUMNS = frozenset({"dispatch_attempt_id"})
 _ROUTING_DECISION_TABLES = frozenset({"production_routing_decisions"})
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
+_COLLECTION_ATTEMPT_ADDITIONS = frozenset(
+    {
+        "strategy_name",
+        "strategy_version",
+        "duration_ms",
+        "acquisition_method",
+        "source_equivalence_class",
+        "evidence_class",
+        "observation_kind",
+        "quality_score",
+        "quality_assessment",
+        "archive_snapshot_time",
+        "model_run_id",
+        "model_generated",
+        "primary_source_verified",
+    }
+)
+_COLLECTION_ATTEMPT_ADDITION_CHECKS = frozenset(
+    {
+        "ck_collection_attempts_strategy_metadata",
+        "ck_collection_attempts_duration_ms",
+        "ck_collection_attempts_quality_score",
+    }
+)
 
 
 def _metadata_for_frozen_baseline() -> MetaData:
@@ -134,6 +158,41 @@ def _metadata_for_frozen_baseline() -> MetaData:
                     if foreign_key.constraint is not None:
                         table.constraints.discard(foreign_key.constraint)
             for column_name in _ROUTING_RUN_COLUMNS:
+                if column_name in table.c:
+                    table._columns.remove(table.c[column_name])
+        if table.name == "collection_attempts":
+            baseline_outcome_constraint: CheckConstraint | None = None
+            for constraint in tuple(table.constraints):
+                if constraint.name == "ck_collection_attempts_outcome":
+                    table.constraints.discard(constraint)
+                    baseline_outcome_constraint = CheckConstraint(
+                        "outcome IN ('succeeded', 'unavailable', 'blocked', 'too_large', "
+                        "'error', 'interrupted')",
+                        name="ck_collection_attempts_outcome",
+                    )
+                    continue
+                constraint_columns = getattr(constraint, "columns", ())
+                if constraint.name in _COLLECTION_ATTEMPT_ADDITION_CHECKS or any(
+                    column.name in _COLLECTION_ATTEMPT_ADDITIONS
+                    for column in constraint_columns
+                ):
+                    table.constraints.discard(constraint)
+            if baseline_outcome_constraint is not None:
+                table.append_constraint(baseline_outcome_constraint)
+            for foreign_key in tuple(table.foreign_keys):
+                if (
+                    foreign_key.parent is not None
+                    and foreign_key.parent.name in _COLLECTION_ATTEMPT_ADDITIONS
+                ):
+                    table.foreign_keys.discard(foreign_key)
+                    if foreign_key.constraint is not None:
+                        table.constraints.discard(foreign_key.constraint)
+            for index in tuple(table.indexes):
+                if any(
+                    column.name in _COLLECTION_ATTEMPT_ADDITIONS for column in index.columns
+                ):
+                    table.indexes.discard(index)
+            for column_name in _COLLECTION_ATTEMPT_ADDITIONS:
                 if column_name in table.c:
                     table._columns.remove(table.c[column_name])
     return metadata

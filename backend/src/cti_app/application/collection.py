@@ -19,6 +19,7 @@ from cti_app.application.acquisition_fallbacks import (
     AcquisitionRequest,
     AcquisitionStrategy,
     SidecarPlaywrightAdapter,
+    _typed_probe_outcome,
     article_rejection_reason,
     bridge_transcription_prompt,
     bridge_url_is_credential_free,
@@ -295,6 +296,7 @@ class SourceArchiveReceipt:
             quality = payload.get("quality_assessment")
             quality = quality if isinstance(quality, dict) else {}
             archive_snapshot_time = payload.get("archive_snapshot_time")
+            size_value = payload.get("size", payload.get("decoded_size", 0))
             return cls(
                 subject_id=event.subject_id,
                 collection_id=event.aggregate_id,
@@ -303,7 +305,7 @@ class SourceArchiveReceipt:
                 decoded_blob_id=UUID(str(payload["decoded_blob_id"])),
                 encoded_sha256=str(payload["encoded_sha256"]),
                 decoded_sha256=str(payload["decoded_sha256"]),
-                bytes=int(payload.get("size", payload.get("decoded_size", 0))),
+                bytes=int(size_value) if size_value is not None else 0,
                 declared_mime_type=str(
                     payload.get("declared_mime_type") or "application/octet-stream"
                 ),
@@ -1696,15 +1698,17 @@ class SubjectCollectionService:
                     event_type = "source.archived_fallback"
                     actor = "system:acquisition_fallback"
                     acquisition_method = fallback.method.value
+                    payload_job_id = fallback.job_id
                 else:
                     assert collector is not None
                     event_type = "source.archived"
                     actor = "system:collector"
                     acquisition_method = SourceAcquisitionMethod.DIRECT_HTTP.value
+                    payload_job_id = collector.job_id
                 payload = {
                     **evidence,
                     "acquisition_method": acquisition_method,
-                    "job_id": str(collector.job_id if collector else fallback.job_id),
+                    "job_id": str(payload_job_id),
                     "requested_url": (
                         safe_fallback_url(collection.requested_url)
                         if fallback is not None
@@ -1729,6 +1733,9 @@ class SubjectCollectionService:
                     ),
                 }
                 if fallback is not None:
+                    fallback_publication_date = (
+                        fallback.publication_date or meta_published_at
+                    )
                     payload.update(
                         {
                             "strategy_name": fallback.strategy_name,
@@ -1746,10 +1753,10 @@ class SubjectCollectionService:
                             "publisher": fallback.publisher or meta_publisher,
                             "article_title": fallback.article_title or meta_title,
                             "publication_date_if_known": (
-                                fallback.publication_date or meta_published_at
-                            ).isoformat()
-                            if (fallback.publication_date or meta_published_at) is not None
-                            else None,
+                                fallback_publication_date.isoformat()
+                                if fallback_publication_date is not None
+                                else None
+                            ),
                             "archive_snapshot_time": (
                                 fallback.archive_snapshot_time.isoformat()
                                 if fallback.archive_snapshot_time is not None
@@ -2028,11 +2035,11 @@ class SubjectCollectionService:
             allowed_domains=frozenset(self._policy.allowed_domains),
             blocked_domains=frozenset(self._policy.blocked_domains),
             external_llm_allowed=external_llm_allowed,
-            tlp=effective_tlp.value,
+            tlp=effective_tlp,
             do_not_submit=collection.do_not_submit,
             expected_languages=edition.languages if edition is not None else (),
             allowed_syndication_domains=self._allowed_syndication_domains,
-            third_party_provider_allowed=external_llm_allowed,
+            third_party_provider_allowed=self._third_party_provider_enabled,
             provider_configured=bool(
                 self._third_party_provider_enabled
                 and self._third_party_provider_url
@@ -2091,6 +2098,12 @@ class SubjectCollectionService:
 
         bridge_status = self._bridge_fallback_status(bridge_events)
 
+        fallback_collection_id = collection.id
+        fallback_requested_url = collection.canonical_url
+
+        async def record_fallback_probe(probe: AcquisitionProbe) -> None:
+            await self._record_fallback_probe(fallback_collection_id, job_id, probe)
+
         async def bridge_attempt() -> AcquisitionProbe:
             if bridge_status in {"response_unparseable", "failed", "skipped"}:
                 return AcquisitionProbe(
@@ -2120,7 +2133,9 @@ class SubjectCollectionService:
                 strategy_version="1",
                 method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
                 requested_url=collection.canonical_url,
-                outcome="archived" if result == "archived" else result,
+                outcome=_typed_probe_outcome(
+                    AcquisitionOutcome.ARCHIVED if result == "archived" else result
+                ),
                 reason_code=(
                     CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED.value
                     if result in {"failed", "response_unparseable"}
@@ -2178,8 +2193,6 @@ class SubjectCollectionService:
         deferred_success_probes: dict[int, AcquisitionProbe] = {}
         attempted_count = 0
         attempt_limit = self._acquisition_max_attempts
-        collection_service = self
-
         class RecordingStrategy:
             """Persist non-winning diagnostics before a later callback can archive."""
 
@@ -2197,13 +2210,14 @@ class SubjectCollectionService:
             ) -> tuple[AcquisitionProbe, ...]:
                 nonlocal attempted_count
                 strategy = self.inner
+                probes: tuple[AcquisitionProbe, ...]
                 if not strategy.enabled:
                     probes = (
                         AcquisitionProbe(
                             strategy_name=strategy.name,
                             strategy_version=strategy.version,
                             method=strategy.method,
-                            requested_url=collection.canonical_url,
+                            requested_url=fallback_requested_url,
                             outcome=AcquisitionOutcome.SKIPPED,
                             reason_code="strategy_disabled",
                             response=None,
@@ -2228,7 +2242,7 @@ class SubjectCollectionService:
                                 strategy_name=strategy.name,
                                 strategy_version=strategy.version,
                                 method=strategy.method,
-                                requested_url=collection.canonical_url,
+                                requested_url=fallback_requested_url,
                                 outcome=(
                                     AcquisitionOutcome.POLICY_SKIPPED
                                     if is_policy_block
@@ -2263,7 +2277,7 @@ class SubjectCollectionService:
                                     strategy_name=strategy.name,
                                     strategy_version=strategy.version,
                                     method=strategy.method,
-                                    requested_url=collection.canonical_url,
+                                    requested_url=fallback_requested_url,
                                     outcome=AcquisitionOutcome.FAILED,
                                     reason_code="strategy_timeout",
                                     response=None,
@@ -2279,7 +2293,7 @@ class SubjectCollectionService:
                                     strategy_name=strategy.name,
                                     strategy_version=strategy.version,
                                     method=strategy.method,
-                                    requested_url=collection.canonical_url,
+                                    requested_url=fallback_requested_url,
                                     outcome=AcquisitionOutcome.FAILED,
                                     reason_code=f"strategy_error:{type(error).__name__}",
                                     response=None,
@@ -2308,9 +2322,7 @@ class SubjectCollectionService:
                     bounded_probes.append(probe)
                     if probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
                         if probe.reason_code == "prior_bridge_attempt_not_replayable":
-                            await collection_service._record_fallback_probe(
-                                collection.id, job_id, probe
-                            )
+                            await record_fallback_probe(probe)
                         handled_probe_ids.add(id(probe))
                     elif (
                         probe.outcome == AcquisitionOutcome.SUCCEEDED
@@ -2319,7 +2331,7 @@ class SubjectCollectionService:
                     ):
                         deferred_success_probes[id(probe)] = probe
                     else:
-                        await self._record_fallback_probe(collection.id, job_id, probe)
+                        await record_fallback_probe(probe)
                         handled_probe_ids.add(id(probe))
                 return tuple(bounded_probes)
 
@@ -2890,7 +2902,7 @@ class SubjectCollectionService:
         job_id: UUID,
         method: SourceAcquisitionMethod,
         reason_code: str,
-        outcome: str = "skipped",
+        outcome: AcquisitionOutcome | str = AcquisitionOutcome.SKIPPED,
         requested_url: str | None = None,
         model_run_id: UUID | None = None,
         consultation_id: str | None = None,
@@ -2906,7 +2918,7 @@ class SubjectCollectionService:
                 strategy_version="1",
                 method=method,
                 requested_url=requested_url or collection.canonical_url,
-                outcome=outcome,
+                outcome=_typed_probe_outcome(outcome),
                 reason_code=reason_code,
                 response=None,
                 http_status=None,
