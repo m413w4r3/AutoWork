@@ -626,10 +626,9 @@
   let natural-size = measure(natural-image)
   let max-image-height = calc.max(1pt, size.height * max-height-fraction)
   let scale = calc.min(
-    1,
     calc.min(size.width / natural-size.width, max-image-height / natural-size.height),
   )
-  let rendered-image = if scale < 1 {
+  let rendered-image = if scale != 1 {
     image(media-path, width: natural-size.width * scale)
   } else {
     natural-image
@@ -705,8 +704,10 @@
   ]
 }
 
-// Preserve intrinsic dimensions and scale down to the printable frame before
-// laying out the image with its caption and source note.
+// Fit vector art to the frame. Raster art can enlarge by at most 2.5x because
+// Typst exposes DPI-derived physical size but not source pixel dimensions. Do
+// not enlarge raster assets with an intrinsic width under 100pt, which keeps
+// small icons and logos from becoming large figures.
 #let render-publication-image(media-path, caption, annotation: [], max-height-fraction: 0.82) = block(
   breakable: false,
   width: 100%,
@@ -723,11 +724,21 @@
       #annotation
     ]
     let max-image-height = calc.max(1pt, size.height * max-height-fraction)
-    let scale = calc.min(
-      1,
-      calc.min(size.width / natural-size.width, max-image-height / natural-size.height),
+    let frame-scale = calc.min(
+      size.width / natural-size.width,
+      max-image-height / natural-size.height,
     )
-    let rendered-image = if scale < 1 {
+    let scale = if media-path.ends-with(".svg") or frame-scale <= 1 {
+      frame-scale
+    } else {
+      let max-upscale = if natural-size.width < 100pt {
+        1
+      } else {
+        2.5
+      }
+      calc.min(frame-scale, max-upscale)
+    }
+    let rendered-image = if scale != 1 {
       image(media-path, width: natural-size.width * scale)
     } else {
       natural-image

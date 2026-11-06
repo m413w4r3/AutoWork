@@ -168,14 +168,27 @@ def d2_binary() -> str:
 
 
 def _small_png_fixture(width: int = 64, height: int = 48) -> bytes:
+    return _png_fixture(width, height)
+
+
+def _png_fixture(width: int, height: int, *, dpi: int | None = None) -> bytes:
     def chunk(kind: bytes, payload: bytes) -> bytes:
         body = kind + payload
         return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body))
 
     pixels = b"".join(b"\x00" + b"\x20\x70\x90\xff" * width for _ in range(height))
+    physical_size = (
+        chunk(
+            b"pHYs",
+            struct.pack(">IIB", round(dpi / 0.0254), round(dpi / 0.0254), 1),
+        )
+        if dpi is not None
+        else b""
+    )
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + physical_size
         + chunk(b"IDAT", zlib.compress(pixels, level=9))
         + chunk(b"IEND", b"")
     )
@@ -1960,6 +1973,124 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     assert all(0 <= page_number < len(reader.pages) for page_number in internal_destination_pages)
     assert any("https://" in uri for uri in external_uris)
     assert any("autowork://investigations/" in uri for uri in external_uris)
+
+
+@pytest.mark.asyncio
+async def test_real_typst_scales_raster_figures_to_the_available_frame(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    pdfimages = shutil.which("pdfimages")
+    if pdfimages is None:
+        pytest.skip("Poppler pdfimages is required for rendered-image width assertions")
+
+    page_width_pt = 21 * 72 / 2.54
+    margin_pt = 1.5 * 72 / 2.54
+    text_width_pt = page_width_pt - 2 * margin_pt
+    source_png = _png_fixture(1744, 924, dpi=623)
+    high_resolution_png = _png_fixture(2400, 1200, dpi=300)
+    tiny_png = _png_fixture(64, 64, dpi=72)
+    entrypoint = """
+#import "publication_helpers.typ": render-publication-image
+#set page(width: 21cm, height: 29.7cm, margin: 1.5cm)
+#set text(font: "Hanken Grotesk", size: 10pt)
+#render-publication-image(
+  "media/source-figure.png",
+  [Archived source figure],
+  max-height-fraction: 0.82,
+)
+#pagebreak()
+#render-publication-image(
+  "media/high-resolution.png",
+  [High-resolution figure],
+  max-height-fraction: 0.82,
+)
+#pagebreak()
+#render-publication-image("media/tiny.png", [Tiny figure], max-height-fraction: 0.82)
+"""
+    helper_shim = """
+#let code-font-families = ("Cascadia Mono", "Cascadia Code", "Cascadia Mono PL", "Cascadia Code PL")
+#let section-title(body) = body
+#let timeline(events) = events
+#let styled-table(item) = item
+#let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
+#let semantic-text(role, body) = body
+#let semantic-or-plain(text, semantic-spans) = text
+#let noteAnalyste(content) = block(
+  fill: rgb("#F1F1EF"),
+  radius: 4pt,
+  width: 100%,
+  inset: 8pt,
+  breakable: true,
+)[#content]
+"""
+    production_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    template_bundle = TypstTemplateBundle(
+        template_version="raster-figure-sizing-harness-v1",
+        sha256="b" * 64,
+        files=tuple(
+            TemplateFile(
+                file.relative_path,
+                entrypoint.encode()
+                if file.relative_path == "RENDERER/publication.typ"
+                else helper_shim.encode()
+                if file.relative_path == "UTILS/helpers.typ"
+                else file.content,
+            )
+            for file in production_bundle.files
+        ),
+    )
+    workspace_root = tmp_path / "workspace"
+    for template_file in template_bundle.files:
+        destination = workspace_root / template_file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(template_file.content)
+    media_root = workspace_root / "RENDERER" / "media"
+    media_root.mkdir(parents=True, exist_ok=True)
+    (media_root / "source-figure.png").write_bytes(source_png)
+    (media_root / "high-resolution.png").write_bytes(high_resolution_png)
+    (media_root / "tiny.png").write_bytes(tiny_png)
+
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=font_paths,
+        )
+    )
+    pdf_path = tmp_path / "raster-figure-sizing.pdf"
+    pdf_path.write_bytes(compiled.content)
+    with anyio.fail_after(10):
+        image_result = await anyio.run_process(
+            (pdfimages, "-list", str(pdf_path)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    image_listing = image_result.stdout.decode("utf-8", errors="replace")
+    image_rows = [
+        line.split()
+        for line in image_listing.splitlines()
+        if re.match(r"^\s*\d+\s+\d+\s+image\s+\d+", line)
+    ]
+    assert len(image_rows) == 3, image_listing
+    rendered_widths_pt = {
+        int(row[0]): int(row[3]) * 72 / float(row[12]) for row in image_rows
+    }
+
+    assert rendered_widths_pt[1] >= 0.85 * text_width_pt
+    assert float(image_rows[0][12]) >= 110
+    assert rendered_widths_pt[2] <= text_width_pt + 1
+    assert rendered_widths_pt[3] <= 64 + 1
+    assert float(image_rows[2][12]) >= 72
+    pages = PdfReader(BytesIO(compiled.content)).pages
+    text = "\n".join(page.extract_text() or "" for page in pages)
+    assert "Archived source figure" in text
+    assert "High-resolution figure" in text
+    assert "Tiny figure" in text
 
 
 @pytest.mark.asyncio
