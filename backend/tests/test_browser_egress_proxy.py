@@ -18,6 +18,7 @@ from sidecars.browser_egress_proxy.server import (  # noqa: E402
     ProxyConfig,
     ProxyError,
     _ByteBudget,
+    _credential_free_http_url,
     _GlobalByteBudget,
     _parse_authority,
 )
@@ -125,9 +126,7 @@ def test_domain_allow_block_and_docker_hostname_policy() -> None:
 
 
 def test_empty_allow_list_allows_public_domains_while_block_list_wins() -> None:
-    proxy = AsyncForwardProxy(
-        ProxyConfig(blocked_domains=frozenset({"blocked.example.com"}))
-    )
+    proxy = AsyncForwardProxy(ProxyConfig(blocked_domains=frozenset({"blocked.example.com"})))
     proxy._check_domain("example.com")
     with pytest.raises(ProxyError, match="blocked"):
         proxy._check_domain("blocked.example.com")
@@ -195,6 +194,49 @@ def test_ports_userinfo_and_schemes_are_rejected() -> None:
     assert _parse_authority("example.com:8080", frozenset({8080})) == ("example.com", 8080)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com/data?api_key=secret",
+        "http://example.com/data?%61ccess_token=secret",
+        "http://example.com/token/secret",
+        "http://example.com/data?next=https%3A%2F%2Fother.example%2F%3Fjwt%3Dsecret",
+        "http://user:pass@example.com/data",
+    ],
+)
+def test_proxy_credential_free_url_gate_rejects_sensitive_keys(url: str) -> None:
+    assert _credential_free_http_url(url) is False
+
+
+def test_proxy_credential_free_url_gate_allows_public_url() -> None:
+    assert _credential_free_http_url("http://example.com/article?section=public")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "token",
+        "secret",
+        "signature",
+        "sig",
+        "auth",
+        "apikey",
+        "api_key",
+        "password",
+        "credential",
+        "jwt",
+        "code",
+        "id_token",
+        "access_token",
+        "refresh_token",
+        "session",
+        "key",
+    ],
+)
+def test_proxy_credential_free_url_gate_rejects_each_sensitive_query_key(key: str) -> None:
+    assert _credential_free_http_url(f"http://example.com/data?{key}=secret") is False
+
+
 @pytest.mark.asyncio
 async def test_rejected_http_targets_never_connect_upstream() -> None:
     connections = 0
@@ -204,9 +246,7 @@ async def test_rejected_http_targets_never_connect_upstream() -> None:
         connections += 1
         raise AssertionError("rejected targets must not connect upstream")
 
-    proxy, port = await _start_proxy(
-        resolver=lambda _url: ["93.184.216.34"], connector=connector
-    )
+    proxy, port = await _start_proxy(resolver=lambda _url: ["93.184.216.34"], connector=connector)
     try:
         responses = [
             await _request(port, _request_bytes("/origin-form")),
@@ -224,6 +264,45 @@ async def test_rejected_http_targets_never_connect_upstream() -> None:
         b"400",
         b"403",
     ]
+    assert connections == 0
+
+
+@pytest.mark.asyncio
+async def test_credential_bearing_absolute_http_targets_are_rejected_before_resolution() -> None:
+    resolutions = 0
+    connections = 0
+
+    def resolver(_url: str):
+        nonlocal resolutions
+        resolutions += 1
+        return ["93.184.216.34"]
+
+    async def connector(_ip: str, _port: int):
+        nonlocal connections
+        connections += 1
+        raise AssertionError("credential-bearing targets must not connect upstream")
+
+    targets = [
+        "http://example.com/data?api_key=secret",
+        "http://example.com/data?%61ccess_token=secret",
+        "http://example.com/api_key/secret",
+        "http://example.com/data?next=https%3A%2F%2Fother.example%2F%3Ftoken%3Dsecret",
+    ]
+    proxy = AsyncForwardProxy(ProxyConfig(), resolver=resolver, connector=connector)
+    for target in targets:
+        with pytest.raises(ProxyError, match="credential-like destination URL") as error:
+            await proxy._handle_http(
+                "GET",
+                target,
+                "HTTP/1.1",
+                asyncio.StreamReader(),
+                object(),
+                [("Host", "example.com")],
+                _ByteBudget(4096),
+            )
+        assert error.value.status == 403
+
+    assert resolutions == 0
     assert connections == 0
 
 
@@ -279,9 +358,7 @@ async def test_connect_tunnels_to_injected_fake_upstream() -> None:
         connected.append((ip, port))
         return await asyncio.open_connection("127.0.0.1", upstream_port)
 
-    proxy, port = await _start_proxy(
-        resolver=lambda _url: ["93.184.216.34"], connector=connector
-    )
+    proxy, port = await _start_proxy(resolver=lambda _url: ["93.184.216.34"], connector=connector)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
@@ -305,14 +382,10 @@ async def test_connect_tunnels_to_injected_fake_upstream() -> None:
 async def test_absolute_http_request_is_forwarded_without_proxy_credentials() -> None:
     received: list[bytes] = []
 
-    async def upstream_handler(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def upstream_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         received.append(await reader.readuntil(b"\r\n\r\n"))
         body = b"offline upstream"
-        writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n" + body
-        )
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n" + body)
         await writer.drain()
         writer.close()
         await writer.wait_closed()
@@ -323,9 +396,7 @@ async def test_absolute_http_request_is_forwarded_without_proxy_credentials() ->
     async def connector(_ip: str, _port: int):
         return await asyncio.open_connection("127.0.0.1", upstream_port)
 
-    proxy, port = await _start_proxy(
-        resolver=lambda _url: ["93.184.216.34"], connector=connector
-    )
+    proxy, port = await _start_proxy(resolver=lambda _url: ["93.184.216.34"], connector=connector)
     try:
         response = await _request(
             port,
@@ -344,13 +415,9 @@ async def test_absolute_http_request_is_forwarded_without_proxy_credentials() ->
 
 @pytest.mark.asyncio
 async def test_connection_byte_cap_closes_before_forwarding_large_response() -> None:
-    async def upstream_handler(
-        _reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def upstream_handler(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         body = b"x" * 2000
-        writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2000\r\nConnection: close\r\n\r\n" + body
-        )
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2000\r\nConnection: close\r\n\r\n" + body)
         await writer.drain()
         writer.close()
         await writer.wait_closed()
@@ -384,9 +451,7 @@ async def test_connection_byte_cap_closes_before_forwarding_large_response() -> 
 
 @pytest.mark.asyncio
 async def test_idle_timeout_closes_connect_tunnel() -> None:
-    async def idle_upstream(
-        _reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def idle_upstream(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             await asyncio.sleep(1)
         finally:
@@ -464,9 +529,7 @@ async def test_proxy_auth_rejects_missing_or_invalid_token(authorization: str | 
 
 @pytest.mark.asyncio
 async def test_proxy_auth_accepts_basic_and_bearer_tokens() -> None:
-    async def upstream_handler(
-        _reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def upstream_handler(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
         await writer.drain()
         writer.close()

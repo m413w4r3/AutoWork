@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
@@ -21,6 +23,7 @@ from cti_app.application.acquisition_fallbacks import (
     SearchCacheStrategy,
     UnavailableTransportStrategy,
     WaybackStrategy,
+    _CommandOcrEngine,
     article_rejection_reason,
     default_acquisition_strategies,
 )
@@ -720,3 +723,129 @@ async def test_manual_archive_supersedes_fallback_but_replay_does_not_overwrite(
         and event.payload["source_document_id"] == str(manual.source_document_id)
         for event in factory.provenance
     )
+
+
+class _FakeOcrStdout:
+    def __init__(self, chunks: list[bytes], *, blocked: asyncio.Event | None = None) -> None:
+        self.chunks = list(chunks)
+        self.blocked = blocked
+        self.read_count = 0
+
+    async def read(self, size: int) -> bytes:
+        self.read_count += 1
+        if self.blocked is not None:
+            await self.blocked.wait()
+            return b""
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if len(chunk) > size:
+            self.chunks.insert(0, chunk[size:])
+            return chunk[:size]
+        return chunk
+
+
+class _FakeOcrStdin:
+    def __init__(self) -> None:
+        self.body = bytearray()
+        self.closed = False
+
+    def write(self, body: bytes) -> None:
+        self.body.extend(body)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class _FakeOcrProcess:
+    def __init__(self, chunks: list[bytes], *, blocked: asyncio.Event | None = None) -> None:
+        self.stdout = _FakeOcrStdout(chunks, blocked=blocked)
+        self.stdin = _FakeOcrStdin()
+        self.returncode = 0
+        self.killed = False
+        self.waited = False
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.waited = True
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_command_ocr_uses_minimal_environment(monkeypatch) -> None:
+    process = _FakeOcrProcess([b"recognized article text"])
+    captured: dict[str, object] = {}
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs.get("env")
+        return process
+
+    monkeypatch.setenv("AUTOWORK_PROVIDER_SECRET", "not-for-child")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await _CommandOcrEngine(("fake-ocr",)).recognize(
+        SimpleNamespace(encoded_body=b"image bytes")
+    )
+
+    env = captured["env"]
+    assert result == "recognized article text"
+    assert captured["command"] == ("fake-ocr",)
+    assert isinstance(env, dict)
+    assert set(env) == {"PATH", "LANG", "HOME"}
+    assert env["PATH"] == os.environ["PATH"]
+    assert env["HOME"] == "/tmp"
+    assert "AUTOWORK_PROVIDER_SECRET" not in env
+    assert process.stdin.closed is True
+
+
+@pytest.mark.asyncio
+async def test_command_ocr_kills_child_when_streamed_output_exceeds_cap(monkeypatch) -> None:
+    process = _FakeOcrProcess([b"12345678", b"9", b"unused output"])
+    monkeypatch.setattr("cti_app.application.acquisition_fallbacks._MAX_DERIVED_BODY_BYTES", 8)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *a, **kw: _return_process(process)
+    )
+
+    with pytest.raises(RuntimeError, match="ocr_output_exceeds_limit"):
+        await _CommandOcrEngine(("fake-ocr",)).recognize(
+            SimpleNamespace(encoded_body=b"image bytes")
+        )
+
+    assert process.killed is True
+    assert process.waited is True
+    assert process.stdout.chunks == [b"unused output"]
+
+
+async def _return_process(process: _FakeOcrProcess) -> _FakeOcrProcess:
+    return process
+
+
+@pytest.mark.asyncio
+async def test_command_ocr_kills_and_waits_for_child_on_cancellation(monkeypatch) -> None:
+    process = _FakeOcrProcess([], blocked=asyncio.Event())
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *a, **kw: _return_process(process)
+    )
+    task = asyncio.create_task(
+        _CommandOcrEngine(("fake-ocr",), timeout_seconds=30).recognize(
+            SimpleNamespace(encoded_body=b"image bytes")
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.killed is True
+    assert process.waited is True

@@ -103,11 +103,14 @@ _COLLECTED_STATES = {
     CollectionState.EXTRACTED,
     CollectionState.COMPLETED,
 }
+_CREDENTIAL_LIKE_URL_REJECTION = "credential-like URL rejected"
 
 
 def _snapshot_source_urls(snapshot: ProductionInputSnapshot) -> frozenset[str]:
     """Return the frozen source URL set in deterministic order-independent form."""
-    return frozenset(source.canonical_url for source in snapshot.core_sources)
+    return frozenset(
+        _safe_collection_url(source.canonical_url)[0] for source in snapshot.core_sources
+    )
 
 
 class ManualContentTypeError(CollectionNotAllowedError):
@@ -607,6 +610,7 @@ class SubjectCollectionService:
                     flags=strategy_flags,
                     timeouts=fallback_strategy_timeouts,
                     max_candidates=fallback_max_variants,
+                    domain_limiter=self._acquisition_domain_limiter,
                     browser_service_url=fallback_playwright_sidecar_url,
                     browser_control_socket=browser_control_socket,
                     browser_navigation_enabled=browser_navigation_enabled,
@@ -643,19 +647,20 @@ class SubjectCollectionService:
             # étant (subject_id, source_candidate_id), il faut dédupliquer sur
             # l'URL canonique face à ce qui est déjà collecté ou archivé (§28).
             seen_urls: set[str] = {
-                canonicalize_http_url(collection.requested_url)
+                _safe_collection_url(canonicalize_http_url(collection.requested_url))[0]
                 for collection in await uow.source_collections.list_for_subject(subject_id)
             }
             seen_urls.update(
-                canonicalize_http_url(document.origin)
+                _safe_collection_url(canonicalize_http_url(document.origin))[0]
                 for document in await uow.source_documents.list_for_subject(subject_id)
                 if document.origin
             )
             for candidate in lineage.members:
                 for source in candidate.evidence.sources:
-                    if source.canonical_url in seen_urls:
+                    stored_url, _credential_like = _safe_collection_url(source.canonical_url)
+                    if stored_url in seen_urls:
                         continue
-                    seen_urls.add(source.canonical_url)
+                    seen_urls.add(stored_url)
                     await uow.source_collections.add_if_absent(
                         _new_collection(
                             subject.edition_id,
@@ -679,12 +684,13 @@ class SubjectCollectionService:
             current = list(await uow.source_collections.list_for_subject(subject_id))
             seen_urls = {item.canonical_url for item in current}
             for source in snapshot.core_sources:
-                if source.canonical_url in seen_urls:
+                stored_url, _credential_like = _safe_collection_url(source.canonical_url)
+                if stored_url in seen_urls:
                     continue
                 await uow.source_collections.add_if_absent(
                     _new_snapshot_collection(snapshot, subject_id, source)
                 )
-                seen_urls.add(source.canonical_url)
+                seen_urls.add(stored_url)
             await uow.commit()
             current = list(await uow.source_collections.list_for_subject(subject_id))
 
@@ -713,19 +719,21 @@ class SubjectCollectionService:
                     canonical = canonicalize_http_url(candidate.url)
                 except ValueError:
                     continue
-                existing = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+                stored_url, credential_like = _safe_collection_url(canonical)
+                existing = await uow.source_collections.get_by_canonical_url(subject_id, stored_url)
                 if existing is not None:
                     continue
                 collection = SourceCollection(
                     subject_id=subject_id,
                     edition_id=subject.edition_id,
-                    requested_url=canonical,
-                    canonical_url=canonical,
+                    requested_url=stored_url,
+                    canonical_url=stored_url,
                     origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
                     proposed_role=candidate.role,
                     title=candidate.title,
                     publisher=candidate.publisher,
                     published_at=candidate.published_at,
+                    error_reason=(_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None),
                 )
                 if await uow.source_collections.add_if_absent(collection):
                     added.append(collection)
@@ -749,15 +757,16 @@ class SubjectCollectionService:
         except ValueError as exc:
             raise CollectionNotAllowedError("Source URL cannot be canonicalized") from exc
 
+        stored_url, _credential_like = _safe_collection_url(canonical)
         async with self._uow_factory() as uow:
-            existing = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+            existing = await uow.source_collections.get_by_canonical_url(subject_id, stored_url)
         if existing is not None:
             return existing
 
         await self.add_supplemental_sources(subject_id, [replace(source, url=canonical)])
 
         async with self._uow_factory() as uow:
-            created = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+            created = await uow.source_collections.get_by_canonical_url(subject_id, stored_url)
         if created is None:
             raise CollectionNotAllowedError("The proposed source could not be attached")
         return created
@@ -799,13 +808,14 @@ class SubjectCollectionService:
                     canonical = canonicalize_http_url(resource.url)
                 except ValueError:
                     continue
-                if await uow.source_collections.get_by_canonical_url(subject_id, canonical):
+                stored_url, credential_like = _safe_collection_url(canonical)
+                if await uow.source_collections.get_by_canonical_url(subject_id, stored_url):
                     continue
                 child = SourceCollection(
                     subject_id=parent.subject_id,
                     edition_id=parent.edition_id,
-                    requested_url=canonical,
-                    canonical_url=canonical,
+                    requested_url=stored_url,
+                    canonical_url=stored_url,
                     origin_kind=SourceOriginKind.REFERENCED_EVIDENCE,
                     parent_source_collection_id=parent.id,
                     proposed_role=SourceRole.UNKNOWN,
@@ -815,6 +825,7 @@ class SubjectCollectionService:
                     external_llm_allowed=parent.external_llm_allowed,
                     do_not_submit=parent.do_not_submit,
                     relationship_evidence="deterministic:referenced_evidence_link",
+                    error_reason=(_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None),
                 )
                 if await uow.source_collections.add_if_absent(child):
                     added.append(child)
@@ -1014,7 +1025,7 @@ class SubjectCollectionService:
                     "total": len(sources),
                     "title": candidate.title if candidate else None,
                     "publisher": candidate.publisher if candidate else None,
-                    "url": source.requested_url,
+                    "url": safe_fallback_url(source.requested_url),
                     "phase": "preparing",
                     "correlation_id": get_correlation_id(),
                 }
@@ -1075,7 +1086,7 @@ class SubjectCollectionService:
                     "total": len(sources),
                     "title": candidate.title if candidate else None,
                     "publisher": candidate.publisher if candidate else None,
-                    "url": source.requested_url,
+                    "url": safe_fallback_url(source.requested_url),
                     "phase": "persisted",
                     "state": state.value,
                     "correlation_id": get_correlation_id(),
@@ -1140,6 +1151,15 @@ class SubjectCollectionService:
                         fallback_policy_snapshot_id=self._policy_snapshot.id,
                     )
                 )
+            credential_like_source = (
+                collection.error_reason == _CREDENTIAL_LIKE_URL_REJECTION
+                or not is_credential_free_url(collection.requested_url)
+            )
+            if credential_like_source:
+                safe_url = credential_free_url(collection.requested_url)
+                collection.requested_url = safe_url
+                collection.canonical_url = safe_url
+                collection.error_reason = _CREDENTIAL_LIKE_URL_REJECTION
             claimed = collection.claim_fetch(
                 job_id,
                 lease_duration=self._fetch_lease,
@@ -1152,9 +1172,15 @@ class SubjectCollectionService:
             await uow.commit()
 
         started_at = collection.fetch_started_at or datetime.now(UTC)
-        if not is_credential_free_url(collection.requested_url):
+        if credential_like_source or not is_credential_free_url(collection.requested_url):
             error = UnsafeAddressError("Credential-like URL is not eligible for collection")
-            state = await self._record_failure(collection.id, job_id, started_at, error)
+            state = await self._record_failure(
+                collection.id,
+                job_id,
+                started_at,
+                error,
+                credential_like_rejection=True,
+            )
             self._log_source_result(
                 collection,
                 job_id,
@@ -1953,14 +1979,19 @@ class SubjectCollectionService:
         job_id: UUID,
         started_at: datetime,
         error: CollectionError,
+        *,
+        credential_like_rejection: bool = False,
     ) -> CollectionState:
         completed_at = datetime.now(UTC)
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
-            credential_like_rejection = (
+            credential_like_rejection = credential_like_rejection or (
                 error.reason_code is CollectionFailureReason.UNSAFE_DESTINATION
                 and not bridge_url_is_credential_free(collection.requested_url)
             )
+            if credential_like_rejection:
+                collection.requested_url = credential_free_url(collection.requested_url)
+                collection.canonical_url = credential_free_url(collection.canonical_url)
             persisted_requested_url = (
                 safe_fallback_url(collection.requested_url)
                 if credential_like_rejection
@@ -3086,7 +3117,9 @@ class SubjectCollectionService:
                 failures.append(
                     {
                         "collection_id": str(source.id),
-                        "requested_url": (latest.requested_url if latest else source.requested_url),
+                        "requested_url": safe_fallback_url(
+                            latest.requested_url if latest else source.requested_url
+                        ),
                         "state": current.state.value,
                         "reason_code": (
                             current.failure_reason_code.value
@@ -3097,8 +3130,12 @@ class SubjectCollectionService:
                         ),
                         "failure_reason": current.error_reason,
                         "http_status": latest.http_status if latest else None,
-                        "final_url": latest.final_url if latest else None,
-                        "redirect_chain": list(latest.redirect_chain) if latest else [],
+                        "final_url": safe_fallback_url(latest.final_url)
+                        if latest and latest.final_url
+                        else None,
+                        "redirect_chain": [safe_fallback_url(url) for url in latest.redirect_chain]
+                        if latest
+                        else [],
                         "declared_content_type": (latest.declared_content_type if latest else None),
                         "detected_content_type": (latest.detected_content_type if latest else None),
                         "encoded_size": latest.encoded_size if latest else None,
@@ -3162,13 +3199,14 @@ def _new_collection(
     candidate: DiscoveryCandidate,
     source: SourceCandidate,
 ) -> SourceCollection:
+    stored_url, credential_like = _safe_collection_url(source.canonical_url)
     return SourceCollection(
         subject_id=subject_id,
         edition_id=edition_id,
         batch_id=candidate.discovery_batch_id,
         source_candidate_id=source.id,
-        requested_url=source.canonical_url,
-        canonical_url=source.canonical_url,
+        requested_url=stored_url,
+        canonical_url=stored_url,
         origin_kind=SourceOriginKind.DISCOVERY,
         proposed_role=source.role,
         title=source.title,
@@ -3177,6 +3215,7 @@ def _new_collection(
         source_tlp=source.tlp,
         sensitivity=source.sensitivity,
         external_llm_allowed=source.external_llm_allowed,
+        error_reason=_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None,
     )
 
 
@@ -3185,13 +3224,14 @@ def _new_snapshot_collection(
     subject_id: UUID,
     source: ProductionInputSource,
 ) -> SourceCollection:
+    stored_url, credential_like = _safe_collection_url(source.canonical_url)
     return SourceCollection(
         subject_id=subject_id,
         edition_id=snapshot.edition_id,
         batch_id=source.discovery_batch_id,
         source_candidate_id=source.source_candidate_id,
-        requested_url=source.canonical_url,
-        canonical_url=source.canonical_url,
+        requested_url=stored_url,
+        canonical_url=stored_url,
         origin_kind=SourceOriginKind.DISCOVERY,
         proposed_role=source.role,
         title=source.title,
@@ -3200,7 +3240,15 @@ def _new_snapshot_collection(
         source_tlp=source.tlp,
         sensitivity=source.sensitivity,
         external_llm_allowed=source.external_llm_allowed,
+        error_reason=_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None,
     )
+
+
+def _safe_collection_url(url: str) -> tuple[str, bool]:
+    """Store only a safe origin when the source URL contains credentials."""
+    if is_credential_free_url(url):
+        return url, False
+    return credential_free_url(url), True
 
 
 def _successful_attempt(

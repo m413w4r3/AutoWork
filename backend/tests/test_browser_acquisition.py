@@ -19,6 +19,10 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 from sidecars.playwright_acquirer.server import (  # noqa: E402
     MAX_CAPTURE_JSON_BODY_BYTES,
     _capture_json_responses,
+    _route_http_only,
+)
+from sidecars.playwright_acquirer.server import (  # noqa: E402
+    _credential_free_http_url as _renderer_credential_free_http_url,
 )
 from sidecars.playwright_acquirer.server import (  # noqa: E402
     _credential_free_url as _renderer_credential_free_url,
@@ -42,6 +46,7 @@ def _captured_json(
     return {
         "url": url,
         "content_type": "application/json; charset=utf-8",
+        "status": 200,
         "body_base64": base64.b64encode(body).decode("ascii"),
         "sha256": hashlib.sha256(body).hexdigest(),
         "size": len(body),
@@ -180,10 +185,7 @@ async def test_non_json_captured_body_is_rejected() -> None:
 @pytest.mark.asyncio
 async def test_captured_json_total_body_budget_is_enforced_across_page() -> None:
     body = b'{"v":"' + b"a" * (450 * 1024 - 9) + b'"}'
-    entries = [
-        _captured_json(body, url=f"https://example.com/data/{index}")
-        for index in range(5)
-    ]
+    entries = [_captured_json(body, url=f"https://example.com/data/{index}") for index in range(5)]
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -208,9 +210,7 @@ async def test_captured_json_total_body_budget_is_enforced_across_page() -> None
 @pytest.mark.asyncio
 async def test_credential_like_query_values_are_removed_from_returned_urls() -> None:
     body = b'{"items":[1]}'
-    token_path_segment = (
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
-    )
+    token_path_segment = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -264,12 +264,80 @@ async def test_credential_like_query_values_are_removed_from_returned_urls() -> 
     assert "?" not in observation.captured_json[0].url
     assert observation.captured_json[0].body == body
     assert observation.captured_json[0].sha256 == hashlib.sha256(body).hexdigest()
+    assert observation.captured_json[0].status == 200
+    assert observation.captured_json[0].headers == {"content-type": "application/json"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/data?api_key=secret",
+        "https://example.com/data?%61ccess_token=secret",
+        "https://example.com/api_key/secret",
+        "https://example.com/data?next=https%3A%2F%2Fother.example%2F%3Ftoken%3Dsecret",
+        "https://user:pass@example.com/data",
+    ],
+)
+def test_renderer_credential_url_gate_rejects_sensitive_query_and_path_keys(url: str) -> None:
+    assert _renderer_credential_free_http_url(url) is False
+
+
+def test_renderer_credential_url_gate_allows_public_url() -> None:
+    assert _renderer_credential_free_http_url("https://example.com/article?section=public")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "token",
+        "secret",
+        "signature",
+        "sig",
+        "auth",
+        "apikey",
+        "api_key",
+        "password",
+        "credential",
+        "jwt",
+        "code",
+        "id_token",
+        "access_token",
+        "refresh_token",
+        "session",
+        "key",
+    ],
+)
+def test_renderer_credential_url_gate_rejects_each_sensitive_query_key(key: str) -> None:
+    assert _renderer_credential_free_http_url(f"https://example.com/data?{key}=secret") is False
+
+
+def test_browser_route_aborts_credential_bearing_subrequest() -> None:
+    class Route:
+        request = type(
+            "Request",
+            (),
+            {"url": "https://cdn.example.com/data?access_token=private-value"},
+        )()
+
+        def __init__(self) -> None:
+            self.aborted = False
+            self.continued = False
+
+        def abort(self) -> None:
+            self.aborted = True
+
+        def continue_(self) -> None:
+            self.continued = True
+
+    route = Route()
+    _route_http_only(route)
+
+    assert route.aborted is True
+    assert route.continued is False
 
 
 def test_renderer_url_sanitization_removes_queries_and_token_path_segments() -> None:
-    token_path_segment = (
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
-    )
+    token_path_segment = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
     sanitized = _renderer_credential_free_url(
         "https://example.com/article/"
         f"{token_path_segment}?jwt=jwt-secret&code=code-secret"
@@ -289,6 +357,7 @@ def test_renderer_skips_response_with_oversized_content_length_before_body() -> 
     class FakeResponse:
         def __init__(self) -> None:
             self.url = "https://example.com/data"
+            self.status = 200
             self.headers = {
                 "content-type": "application/json",
                 "content-length": str(MAX_CAPTURE_JSON_BODY_BYTES + 1),
@@ -312,6 +381,7 @@ def test_renderer_prechecks_captured_json_total_before_materializing_body(monkey
     class FakeResponse:
         def __init__(self, index: int, body: bytes) -> None:
             self.url = f"https://example.com/data/{index}"
+            self.status = 200
             self.headers = {
                 "content-type": "application/json",
                 "content-length": str(len(body)),
@@ -402,9 +472,7 @@ async def test_unix_socket_control_uses_local_fake_server(tmp_path) -> None:
     received_paths: list[str] = []
     render_payloads: list[dict] = []
 
-    async def fake_renderer(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def fake_renderer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request_line = await reader.readline()
         path = request_line.decode("ascii").split(" ")[1]
         received_paths.append(path)

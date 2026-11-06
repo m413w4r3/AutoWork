@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import replace
@@ -22,6 +23,10 @@ from cti_app.application.acquisition_fallbacks import (
     default_acquisition_strategies,
     derived_collected_response,
 )
+from cti_app.application.acquisition_orchestrator import (
+    ArticleAcquisitionOrchestrator,
+    DomainConcurrencyLimiter,
+)
 from cti_app.application.browser_acquisition import BrowserObservation, CapturedJson
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.http_collection import (
@@ -40,7 +45,12 @@ from cti_app.domain.acquisition import (
     AcquisitionPolicyDecision,
     SourceEquivalenceClass,
 )
-from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceAcquisitionMethod
+from cti_app.domain.collection import (
+    CollectionFailureReason,
+    CollectionState,
+    DetectedMimeType,
+    SourceAcquisitionMethod,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 from tests.test_acquisition_fallbacks import _ARTICLE, _BLOCKED, Resolver, Transport
@@ -169,7 +179,8 @@ class FakeBrowser:
 
 
 def test_registry_order_and_capability_states_are_explicit() -> None:
-    strategies = default_acquisition_strategies()
+    limiter = DomainConcurrencyLimiter(2)
+    strategies = default_acquisition_strategies(domain_limiter=limiter)
     names = [strategy.name for strategy in strategies]
 
     assert names == [
@@ -203,6 +214,14 @@ def test_registry_order_and_capability_states_are_explicit() -> None:
         "bridge_transcription",
     ]
     by_name = {strategy.name: strategy for strategy in strategies}
+    assert all(
+        by_name[name].domain_limiter is limiter
+        for name in (
+            "playwright_chromium_dom",
+            "playwright_network_response",
+            "playwright_embedded_state",
+        )
+    )
     assert (
         by_name["playwright_chromium_dom"].capability_state
         is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
@@ -444,10 +463,20 @@ async def test_browser_dom_success_keeps_initial_bytes_and_browser_observation_k
 
 @pytest.mark.asyncio
 async def test_browser_network_json_succeeds_after_dom_candidate_rejection() -> None:
-    captured_body = _article_html()
+    captured_body = json.dumps(
+        {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": ARTICLE_TITLE,
+            "articleBody": ARTICLE_TEXT,
+            "mainEntityOfPage": {"@id": ARTICLE_URL},
+            "datePublished": "2026-03-01T10:00:00Z",
+        }
+    ).encode()
     captured = CapturedJson(
-        url=ARTICLE_URL,
-        content_type="text/html",
+        url="https://publisher.example/api/article/42",
+        content_type="application/json",
+        status=200,
         body=captured_body,
         sha256=hashlib.sha256(captured_body).hexdigest(),
         size=len(captured_body),
@@ -457,7 +486,7 @@ async def test_browser_network_json_succeeds_after_dom_candidate_rejection() -> 
             "<html><head><title>Access denied</title></head><body>Access denied</body></html>"
         ),
         final_url=ARTICLE_URL,
-        status=200,
+        status=403,
         captured_json=(captured,),
         challenge_detected=False,
         paywall_detected=False,
@@ -469,6 +498,8 @@ async def test_browser_network_json_succeeds_after_dom_candidate_rejection() -> 
         lambda *_args: pytest.fail("browser uses only the configured sidecar"),
         response_body=b"<html>blocked</html>",
         response_content_type="text/html",
+        response_status=401,
+        response_headers={"content-type": "text/html", "x-direct-response": "interstitial"},
     )
     dom = await BrowserDomStrategy(adapter=adapter, navigation_enabled=True).acquire(request)
     network = await BrowserNetworkStrategy(adapter=adapter, navigation_enabled=True).acquire(
@@ -479,6 +510,55 @@ async def test_browser_network_json_succeeds_after_dom_candidate_rejection() -> 
     winner = next(probe for probe in network if probe.outcome is AcquisitionOutcome.SUCCEEDED)
     assert winner.response is not None
     assert winner.observation_kind is AcquisitionObservationKind.BROWSER_NETWORK_JSON
+    captured_sha = hashlib.sha256(captured_body).hexdigest()
+    assert winner.response.encoded_body == captured_body
+    assert winner.response.encoded_sha256 == captured_sha
+    assert winner.encoded_sha256 == captured_sha
+    assert winner.response.declared_content_type == "application/json"
+    assert winner.response.status == 200
+    assert winner.response.headers == {"content-type": "application/json"}
+    assert ARTICLE_TEXT.strip().encode() in winner.response.decoded_body
+
+
+@pytest.mark.asyncio
+async def test_browser_network_json_respects_capture_url_domain_policy() -> None:
+    captured_body = json.dumps(
+        {
+            "@type": "NewsArticle",
+            "headline": ARTICLE_TITLE,
+            "articleBody": ARTICLE_TEXT,
+            "mainEntityOfPage": {"@id": ARTICLE_URL},
+        }
+    ).encode()
+    captured = CapturedJson(
+        url="https://unapproved.example/article.json",
+        content_type="application/json",
+        status=200,
+        body=captured_body,
+        sha256=hashlib.sha256(captured_body).hexdigest(),
+        size=len(captured_body),
+    )
+    observation = BrowserObservation(
+        rendered_html="<html><body>interstitial</body></html>",
+        final_url=ARTICLE_URL,
+        status=200,
+        captured_json=(captured,),
+        challenge_detected=False,
+        paywall_detected=False,
+        engine="chromium",
+        duration_ms=2,
+    )
+    strategy = BrowserNetworkStrategy(adapter=FakeBrowser(observation), navigation_enabled=True)
+    request = _request(
+        lambda *_args: pytest.fail("browser uses only the configured sidecar"),
+        policy=_policy(allowed_domains=frozenset({"publisher.example"})),
+    )
+
+    probes = await strategy.acquire(request)
+
+    assert probes[0].outcome is AcquisitionOutcome.POLICY_SKIPPED
+    assert probes[0].reason_code == "browser_captured_json_url_policy_denied"
+    assert probes[0].policy_decision is AcquisitionPolicyDecision.DENIED_DOMAIN_POLICY
 
 
 @pytest.mark.asyncio
@@ -497,6 +577,76 @@ async def test_browser_navigation_disabled_or_unavailable_fails_closed() -> None
     assert disabled[0].capability_state is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
     assert unavailable[0].outcome is AcquisitionOutcome.FAILED
     assert adapter.calls == [ARTICLE_URL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        pytest.param("unconfigured", id="unconfigured"),
+        pytest.param("unavailable", id="unavailable"),
+    ],
+)
+async def test_typed_browser_setup_failures_are_skipped_without_attempt_budget(
+    error_type: str,
+) -> None:
+    from cti_app.application.browser_acquisition import (
+        BrowserUnavailableError,
+        BrowserUnconfiguredError,
+    )
+
+    class RaisingBrowser:
+        async def navigate(self, _url: str) -> BrowserObservation:
+            if error_type == "unconfigured":
+                raise BrowserUnconfiguredError()
+            raise BrowserUnavailableError()
+
+    strategy = BrowserDomStrategy(adapter=RaisingBrowser(), navigation_enabled=True)
+    request = _request(lambda *_args: pytest.fail("browser setup failure must not fetch"))
+    run = await ArticleAcquisitionOrchestrator(
+        (strategy,), deadline_seconds=5, max_attempts=1, per_domain_concurrency=1
+    ).run(request)
+
+    assert run.attempts == 0
+    assert run.probes[0].outcome is AcquisitionOutcome.POLICY_SKIPPED
+    assert run.probes[0].capability_state is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+    assert run.probes[0].policy_decision is AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
+
+
+@pytest.mark.asyncio
+async def test_browser_navigation_uses_shared_per_host_limiter() -> None:
+    class ConcurrentBrowser:
+        active = 0
+        max_active = 0
+
+        async def navigate(self, _url: str) -> BrowserObservation:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.02)
+            self.active -= 1
+            return BrowserObservation(
+                rendered_html=_article_html().decode(),
+                final_url=ARTICLE_URL,
+                status=200,
+                captured_json=(),
+                challenge_detected=False,
+                paywall_detected=False,
+                engine="chromium",
+                duration_ms=1,
+            )
+
+    adapter = ConcurrentBrowser()
+    limiter = DomainConcurrencyLimiter(1)
+    strategy = BrowserDomStrategy(
+        adapter=adapter,
+        domain_limiter=limiter,
+        navigation_enabled=True,
+    )
+    request = _request(lambda *_args: pytest.fail("browser does not use HTTP fetch"))
+
+    await asyncio.gather(strategy.acquire(request), strategy.acquire(request))
+
+    assert adapter.max_active == 1
 
 
 @pytest.mark.asyncio
@@ -692,15 +842,24 @@ async def test_credential_like_direct_failure_persists_only_safe_origin(tmp_path
         fallback_strategies=(),
     )
     source = (await app.initialize(subject.id))[0]
+    created_collection = factory.collections[source.id]
+    assert created_collection.requested_url == "https://publisher.example/"
+    assert created_collection.canonical_url == "https://publisher.example/"
+    assert "api_key=secret" not in repr(created_collection)
 
     state = await app.archive_one(source.id, uuid4())
     attempt = (await app.attempts(source.id))[-1]
     diagnostics = await app._failure_diagnostics([source])
-    persisted_audit = repr((attempt, diagnostics, factory.provenance))
+    persisted_collection = factory.collections[source.id]
+    persisted_audit = repr((persisted_collection, attempt, diagnostics, factory.provenance))
 
     assert state is CollectionState.BLOCKED
+    assert persisted_collection.requested_url == "https://publisher.example/"
+    assert persisted_collection.canonical_url == "https://publisher.example/"
     assert attempt.requested_url == "https://publisher.example/"
     assert attempt.failure_reason == "credential-like URL rejected"
+    assert attempt.reason_code is CollectionFailureReason.UNSAFE_DESTINATION
     assert diagnostics[0]["requested_url"] == "https://publisher.example/"
     assert "secret" not in persisted_audit
     assert "api_key" not in persisted_audit
+    assert "api_key=secret" not in persisted_audit

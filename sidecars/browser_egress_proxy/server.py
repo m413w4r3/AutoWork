@@ -13,7 +13,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 POLICY_VERSION = "browser-egress-v1"
 DEFAULT_ALLOWED_PORTS = frozenset({80, 443})
@@ -35,6 +35,35 @@ _METADATA_HOSTS = frozenset(
     }
 )
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_CREDENTIAL_URL_KEYS = frozenset(
+    {
+        "token",
+        "secret",
+        "signature",
+        "sig",
+        "auth",
+        "authorization",
+        "bearer",
+        "apikey",
+        "api_key",
+        "client_secret",
+        "cookie",
+        "password",
+        "credential",
+        "credentials",
+        "jwt",
+        "code",
+        "id_token",
+        "access_token",
+        "refresh_token",
+        "session",
+        "sessionid",
+        "key",
+    }
+)
+_NORMALIZED_CREDENTIAL_URL_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_URL_KEYS
+)
 
 Resolver = Callable[[str], Sequence[str] | Awaitable[Sequence[str]]]
 Connector = Callable[
@@ -299,6 +328,8 @@ class AsyncForwardProxy:
             or parsed.password is not None
         ):
             raise ProxyError(400, "absolute HTTP request target required")
+        if not _credential_free_http_url(target):
+            raise ProxyError(403, "credential-like destination URL is blocked")
         host = parsed.hostname
         if port not in self.config.allowed_ports:
             raise ProxyError(403, "destination port is not allowed")
@@ -709,6 +740,42 @@ def _normalize_hostname(host: str) -> str:
     if len(labels) < 2 or any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
         raise ProxyError(403, "private hostname is blocked")
     return normalized
+
+
+def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
+    """Mirror the renderer gate for absolute-form HTTP URLs before forwarding."""
+    if depth > 3:
+        return False
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port in {0}
+        ):
+            return False
+        for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+            normalized_key = re.sub(r"[^a-z0-9]", "", unquote(key).casefold())
+            if normalized_key in _NORMALIZED_CREDENTIAL_URL_KEYS:
+                return False
+            nested_value = unquote(query_value)
+            if nested_value.casefold().startswith(("http://", "https://")) and not (
+                _credential_free_http_url(nested_value, depth=depth + 1)
+            ):
+                return False
+        for segment in parsed.path.split("/"):
+            decoded = segment
+            for _ in range(3):
+                decoded = unquote(decoded)
+            key = re.split(r"[=/:]", decoded, maxsplit=1)[0]
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+            if normalized_key in _NORMALIZED_CREDENTIAL_URL_KEYS:
+                return False
+        return True
+    except ValueError:
+        return False
 
 
 def _is_forbidden_hostname(host: str) -> bool:

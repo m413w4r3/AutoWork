@@ -11,7 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 MAX_HTML_BYTES = int(os.environ.get("PLAYWRIGHT_ACQUIRER_MAX_HTML_BYTES", "10485760"))
 MAX_REQUEST_BYTES = MAX_HTML_BYTES * 2 + 1024 * 1024
@@ -102,7 +102,7 @@ class Handler(BaseHTTPRequestHandler):
         url = payload.get("url")
         timeout_ms = payload.get("timeout_ms")
         html = payload.get("html")
-        if not isinstance(url, str) or not _http_url_without_userinfo(url):
+        if not isinstance(url, str) or not _credential_free_http_url(url):
             self._write_json(400, {"error": "invalid_url"})
             return
         if type(timeout_ms) is not int or not 500 <= timeout_ms <= MAX_TIMEOUT_MS:
@@ -139,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         except TimeoutError:
             self._write_json(504, {"error": "navigation_timeout"})
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — keep browser internals out of responses.
             # Playwright and browser errors are intentionally kept out of logs/responses.
             del exc
             self._write_json(503, {"error": "renderer_unavailable"})
@@ -322,11 +322,11 @@ def _render_navigation(url: str, timeout_ms: int) -> dict[str, Any]:
 
 def _route_http_only(route: Any) -> None:
     try:
-        if not _http_url_without_userinfo(route.request.url):
+        if not _credential_free_http_url(route.request.url):
             route.abort()
             return
         route.continue_()
-    except Exception:
+    except Exception:  # noqa: BLE001 — an invalid route must be aborted fail-closed.
         route.abort()
 
 
@@ -365,12 +365,13 @@ def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
                 continue
             if total + len(body) > MAX_CAPTURE_JSON_TOTAL_BYTES:
                 continue
-        except Exception:
+        except Exception:  # noqa: BLE001, S112 — discard an unusable capture and continue.
             continue
         entries.append(
             {
                 "url": url,
                 "content_type": content_type,
+                "status": response.status,
                 "body_base64": base64.b64encode(body).decode("ascii"),
                 "sha256": __import__("hashlib").sha256(body).hexdigest(),
                 "size": len(body),
@@ -419,16 +420,38 @@ def _detect_markers(rendered_html: str) -> tuple[bool, bool, bool]:
     )
 
 
-def _http_url_without_userinfo(value: str) -> bool:
+def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
+    """Reject credential-bearing destinations before Chromium can forward them."""
+    if depth > 3:
+        return False
     try:
         parsed = urlsplit(value)
-        return (
-            parsed.scheme.casefold() in {"http", "https"}
-            and bool(parsed.hostname)
-            and parsed.username is None
-            and parsed.password is None
-            and parsed.port not in {0}
-        )
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port in {0}
+        ):
+            return False
+        for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+            normalized_key = re.sub(r"[^a-z0-9]", "", unquote(key).casefold())
+            if normalized_key in _NORMALIZED_CREDENTIAL_QUERY_KEYS:
+                return False
+            nested_value = unquote(query_value)
+            if nested_value.casefold().startswith(("http://", "https://")) and not (
+                _credential_free_http_url(nested_value, depth=depth + 1)
+            ):
+                return False
+        for segment in parsed.path.split("/"):
+            decoded = segment
+            for _ in range(3):
+                decoded = unquote(decoded)
+            key = re.split(r"[=/:]", decoded, maxsplit=1)[0]
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+            if normalized_key in _NORMALIZED_CREDENTIAL_QUERY_KEYS:
+                return False
+        return True
     except ValueError:
         return False
 

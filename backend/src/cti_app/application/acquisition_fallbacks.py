@@ -6,6 +6,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import os
 import re
 import shlex
 import time
@@ -14,9 +15,13 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from html.parser import HTMLParser
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
+from cti_app.application.browser_acquisition import (
+    BrowserUnavailableError,
+    BrowserUnconfiguredError,
+)
 from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
@@ -36,6 +41,9 @@ from cti_app.domain.acquisition import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 from cti_app.domain.discovery import canonicalize_http_url
+
+if TYPE_CHECKING:
+    from cti_app.application.acquisition_orchestrator import DomainConcurrencyLimiter
 
 _LINK_RELATIONS = frozenset({"amphtml", "alternate", "canonical", "print"})
 _LINK_HEADER_RE = re.compile(r"<([^>]+)>\s*;([^,]*)")
@@ -1667,6 +1675,29 @@ def _browser_failure_probe(
     )
 
 
+def _browser_unavailable_probe(
+    strategy: _BrowserStrategy,
+    request: AcquisitionRequest,
+    *,
+    reason: str,
+) -> AcquisitionProbe:
+    return _strategy_probe(
+        name=strategy.name,
+        version=strategy.version,
+        method=strategy.method,
+        url=safe_fallback_url(request.requested_url),
+        outcome=AcquisitionOutcome.POLICY_SKIPPED,
+        reason=reason,
+        capability=AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+        policy_decision=AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION,
+        observation=(
+            AcquisitionObservationKind.BROWSER_NETWORK_JSON
+            if strategy.mode == "network"
+            else AcquisitionObservationKind.BROWSER_DOM
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _BrowserStrategy:
     adapter: Any | None = None
@@ -1677,6 +1708,7 @@ class _BrowserStrategy:
     version: str = "1"
     method: SourceAcquisitionMethod = SourceAcquisitionMethod.PLAYWRIGHT_CHROMIUM_DOM
     mode: str = "dom"
+    domain_limiter: DomainConcurrencyLimiter | None = None
 
     @property
     def capability_state(self) -> AcquisitionCapabilityState:
@@ -1737,7 +1769,15 @@ class _BrowserStrategy:
         started = time.monotonic()
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                observation = await adapter.navigate(request.requested_url)
+                if self.domain_limiter is None:
+                    observation = await adapter.navigate(request.requested_url)
+                else:
+                    async with self.domain_limiter.semaphore_for(request.requested_url):
+                        observation = await adapter.navigate(request.requested_url)
+        except BrowserUnconfiguredError:
+            return (_browser_unavailable_probe(self, request, reason="browser_unconfigured"),)
+        except BrowserUnavailableError:
+            return (_browser_unavailable_probe(self, request, reason="browser_unavailable"),)
         except TimeoutError:
             return (_browser_failure_probe(self, request, reason="browser_timeout"),)
         except Exception:
@@ -1755,7 +1795,7 @@ class _BrowserStrategy:
                     outcome=AcquisitionOutcome.REJECTED,
                 ),
             )
-        if observation.status is not None and observation.status != 200:
+        if self.mode != "network" and observation.status is not None and observation.status != 200:
             return (
                 _browser_failure_probe(
                     self,
@@ -1777,10 +1817,17 @@ class _BrowserStrategy:
                 ),
             )
 
-        selected: tuple[Any, bytes, str | None, str] | None = None
+        selected: tuple[Any, bytes, str | None, str, Any | None] | None = None
+        denied_capture: tuple[str, AcquisitionPolicyDecision] | None = None
         if self.mode == "network":
             allowed = _methods(_API_METHODS | frozenset({"json_ld", "embedded_state"}))
             for captured in observation.captured_json:
+                capture_decision = request.policy.check_url(captured.url)
+                if capture_decision is not AcquisitionPolicyDecision.ALLOWED:
+                    denied_capture = (captured.url, capture_decision)
+                    continue
+                if captured.status != 200:
+                    continue
                 candidate = _candidate_article(
                     captured.body,
                     content_type=captured.content_type,
@@ -1789,7 +1836,13 @@ class _BrowserStrategy:
                     allowed_methods=allowed,
                 )
                 if candidate is not None:
-                    selected = (candidate, captured.body, captured.content_type, captured.url)
+                    selected = (
+                        candidate,
+                        captured.body,
+                        captured.content_type,
+                        captured.url,
+                        captured,
+                    )
                     break
         else:
             html_body = observation.rendered_html.encode("utf-8")
@@ -1806,8 +1859,19 @@ class _BrowserStrategy:
                 allowed_methods=methods,
             )
             if candidate is not None:
-                selected = (candidate, html_body, "text/html", observation.final_url)
+                selected = (candidate, html_body, "text/html", observation.final_url, None)
         if selected is None:
+            if denied_capture is not None:
+                return (
+                    _policy_skipped_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=denied_capture[0],
+                        decision=denied_capture[1],
+                        reason="browser_captured_json_url_policy_denied",
+                    ),
+                )
             return (
                 _browser_failure_probe(
                     self,
@@ -1816,18 +1880,31 @@ class _BrowserStrategy:
                     outcome=AcquisitionOutcome.REJECTED,
                 ),
             )
-        candidate, candidate_body, candidate_type, candidate_url = selected
-        raw_body = request.response_body if request.response_body is not None else candidate_body
-        raw_type = (
-            request.response_content_type if request.response_body is not None else candidate_type
-        )
-        status = observation.status or request.response_status or 200
+        candidate, candidate_body, candidate_type, candidate_url, captured_response = selected
+        if captured_response is not None:
+            raw_body = captured_response.body
+            raw_type = captured_response.content_type
+            status = captured_response.status
+            headers = captured_response.headers
+            observed_final_url = candidate_url
+        else:
+            raw_body = (
+                request.response_body if request.response_body is not None else candidate_body
+            )
+            raw_type = (
+                request.response_content_type
+                if request.response_body is not None
+                else candidate_type
+            )
+            status = observation.status or request.response_status or 200
+            headers = dict(request.response_headers)
+            observed_final_url = observation.final_url
         observed = CollectedResponse(
             requested_url=request.requested_url,
-            final_url=observation.final_url,
+            final_url=observed_final_url,
             redirect_chain=(),
             status=status,
-            headers=dict(request.response_headers),
+            headers=headers,
             declared_content_type=raw_type,
             detected_content_type=_detect_mime(raw_body),
             encoded_body=raw_body,
@@ -1852,7 +1929,7 @@ class _BrowserStrategy:
                     outcome=AcquisitionOutcome.REJECTED,
                 ),
             )
-        equivalence = _equivalence_for_observed_url(request.requested_url, observation.final_url)
+        equivalence = _equivalence_for_observed_url(request.requested_url, observed.final_url)
         duration = round((time.monotonic() - started) * 1000)
         return (
             _strategy_probe(
@@ -1876,7 +1953,7 @@ class _BrowserStrategy:
                 publication_date=candidate.published_at,
                 primary_source_verified=(
                     equivalence is SourceEquivalenceClass.EXACT_ORIGINAL
-                    and _same_acquisition_publisher(request.requested_url, observation.final_url)
+                    and _same_acquisition_publisher(request.requested_url, observed.final_url)
                 ),
             ),
         )
@@ -1966,18 +2043,85 @@ class _CommandOcrEngine:
             stdin=PIPE,
             stdout=PIPE,
             stderr=DEVNULL,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "LANG": "C.UTF-8",
+                "HOME": "/tmp",
+            },
         )
+        input_task = asyncio.create_task(_write_ocr_input(process, artifact.encoded_body))
+        output = bytearray()
         try:
-            stdout, _stderr = await asyncio.wait_for(
-                process.communicate(artifact.encoded_body), timeout=self.timeout_seconds
-            )
+            async with asyncio.timeout(self.timeout_seconds):
+                stdout = process.stdout
+                if stdout is None:
+                    raise RuntimeError("ocr_command_stdout_unavailable")
+                while True:
+                    remaining = _MAX_DERIVED_BODY_BYTES - len(output)
+                    chunk = await stdout.read(min(64 * 1024, remaining + 1))
+                    if not chunk:
+                        break
+                    if len(output) + len(chunk) > _MAX_DERIVED_BODY_BYTES:
+                        raise _OcrOutputLimitError
+                    output.extend(chunk)
+                await input_task
+                await process.wait()
+        except _OcrOutputLimitError as exc:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise RuntimeError("ocr_output_exceeds_limit") from exc
         except TimeoutError:
-            process.kill()
-            await process.wait()
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
             raise
-        if process.returncode != 0 or len(stdout) > _MAX_DERIVED_BODY_BYTES:
+        except asyncio.CancelledError:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise
+        except BaseException:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise
+        if process.returncode != 0:
             raise RuntimeError("ocr_command_failed_or_output_exceeded_limit")
-        return stdout.decode("utf-8", errors="replace")
+        return output.decode("utf-8", errors="replace")
+
+
+class _OcrOutputLimitError(Exception):
+    pass
+
+
+async def _write_ocr_input(process: Any, body: bytes) -> None:
+    stdin = process.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.write(body)
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionError, OSError, ValueError):
+        pass
+    finally:
+        stdin.close()
+        wait_closed = getattr(stdin, "wait_closed", None)
+        if wait_closed is not None:
+            try:
+                await wait_closed()
+            except (BrokenPipeError, ConnectionError, OSError, ValueError):
+                pass
+
+
+async def _cancel_ocr_input(task: asyncio.Task[None]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _kill_and_wait(process: Any) -> None:
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    await process.wait()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2597,6 +2741,7 @@ def default_acquisition_strategies(
     max_candidates: int = 24,
     playwright_adapter: BrowserRenderAdapter | None = None,
     browser_adapter: Any | None = None,
+    domain_limiter: DomainConcurrencyLimiter | None = None,
     browser_service_url: str | None = None,
     browser_control_socket: str = "",
     browser_navigation_enabled: bool = False,
@@ -2733,18 +2878,21 @@ def default_acquisition_strategies(
         ),
         BrowserDomStrategy(
             adapter=browser_adapter,
+            domain_limiter=domain_limiter,
             navigation_enabled=browser_navigation_enabled,
             enabled=on("playwright_chromium_dom"),
             timeout_seconds=configured("playwright_chromium_dom", 45),
         ),
         BrowserNetworkStrategy(
             adapter=browser_adapter,
+            domain_limiter=domain_limiter,
             navigation_enabled=browser_navigation_enabled,
             enabled=on("playwright_network_response"),
             timeout_seconds=configured("playwright_network_response", 45),
         ),
         BrowserEmbeddedStateStrategy(
             adapter=browser_adapter,
+            domain_limiter=domain_limiter,
             navigation_enabled=browser_navigation_enabled,
             enabled=on("playwright_embedded_state"),
             timeout_seconds=configured("playwright_embedded_state", 45),

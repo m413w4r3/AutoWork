@@ -113,9 +113,15 @@ class BrowserChallengeError(BrowserControlError):
 class CapturedJson:
     url: str
     content_type: str
+    status: int
     body: bytes
     sha256: str
     size: int
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """The captured response's safe, archived header subset."""
+        return {"content-type": self.content_type}
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +368,7 @@ def _parse_captured_json(value: Any) -> tuple[CapturedJson, ...]:
             raise BrowserInvalidResponseError()
         url = item.get("url")
         content_type = item.get("content_type")
+        status = item.get("status")
         encoded = item.get("body_base64")
         size = item.get("size")
         digest = item.get("sha256")
@@ -369,6 +376,8 @@ def _parse_captured_json(value: Any) -> tuple[CapturedJson, ...]:
             not isinstance(url, str)
             or not isinstance(content_type, str)
             or not _is_json_content_type(content_type)
+            or type(status) is not int
+            or not 100 <= status <= 599
             or not isinstance(encoded, str)
             or type(size) is not int
             or size < 0
@@ -404,6 +413,7 @@ def _parse_captured_json(value: Any) -> tuple[CapturedJson, ...]:
             CapturedJson(
                 url=safe_url,
                 content_type=content_type.split(";", 1)[0].strip().casefold(),
+                status=status,
                 body=body,
                 sha256=actual_digest,
                 size=len(body),
@@ -474,10 +484,7 @@ def _redact_credential_path(path: str) -> str:
 
 
 def _looks_like_credential_path_segment(value: str) -> bool:
-    return bool(
-        _JWT_PATH_SEGMENT.fullmatch(value)
-        or _OPAQUE_TOKEN_PATH_SEGMENT.fullmatch(value)
-    )
+    return bool(_JWT_PATH_SEGMENT.fullmatch(value) or _OPAQUE_TOKEN_PATH_SEGMENT.fullmatch(value))
 
 
 def _is_json_content_type(value: str) -> bool:
