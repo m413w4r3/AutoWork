@@ -2181,6 +2181,17 @@ class SubjectCollectionService:
             strategy_name = str(
                 payload.get("strategy_name") or payload.get("acquisition_method") or ""
             )
+            outcome = payload.get("outcome")
+            if outcome not in {
+                AcquisitionOutcome.SUCCEEDED.value,
+                AcquisitionOutcome.REJECTED.value,
+                AcquisitionOutcome.ARCHIVED.value,
+                AcquisitionOutcome.LOOKUP_SUCCEEDED.value,
+                AcquisitionOutcome.METADATA_SUCCEEDED.value,
+                AcquisitionOutcome.POLICY_SKIPPED.value,
+                AcquisitionOutcome.NEEDS_RECONCILIATION.value,
+            }:
+                continue
             attempted_url_hash = payload.get("attempted_url_sha256")
             strategy_url_hash = payload.get("attempted_strategy_url_sha256")
             if isinstance(strategy_url_hash, str):
@@ -2641,6 +2652,17 @@ class SubjectCollectionService:
         assert self._model_gateway is not None
         try:
             existing_run = await self._model_gateway.get_run(model_run_id)
+            if (
+                existing_run is not None
+                and getattr(existing_run.status, "value", existing_run.status) == "failed"
+                and getattr(
+                    existing_run.submission_state,
+                    "value",
+                    existing_run.submission_state,
+                )
+                == "not_submitted"
+            ):
+                request = replace(request, allow_failed_resubmit=True)
             if (
                 existing_run is not None
                 and getattr(existing_run.status, "value", "") in {"needs_review", "running"}
@@ -3130,8 +3152,6 @@ class SubjectCollectionService:
                 SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
                 if same_publisher
                 else SourceEquivalenceClass.INDEPENDENT_CORROBORATION
-                if syndicated
-                else SourceEquivalenceClass.UNKNOWN_MATCH
             )
             observed_text = response.decoded_body.decode("utf-8", errors="replace")
             quality = deterministic_acquisition_quality(
@@ -3144,7 +3164,11 @@ class SubjectCollectionService:
                 AcquisitionProbe(
                     strategy_name="bridge_source_discovery",
                     strategy_version="1",
-                    method=SourceAcquisitionMethod.DIRECT_HTTP,
+                    method=(
+                        SourceAcquisitionMethod.DIRECT_HTTP
+                        if same_publisher or syndicated
+                        else SourceAcquisitionMethod.INDEPENDENT_CORROBORATION
+                    ),
                     requested_url=candidate_url,
                     outcome=(
                         AcquisitionOutcome.REJECTED

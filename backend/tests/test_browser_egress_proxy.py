@@ -215,6 +215,9 @@ def test_proxy_credential_free_url_gate_allows_public_url() -> None:
 @pytest.mark.parametrize(
     "key",
     [
+        "X-Amz-Credential",
+        "X-Amz-Signature",
+        "X-Goog-Signature",
         "token",
         "secret",
         "signature",

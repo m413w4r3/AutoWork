@@ -37,6 +37,12 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
         "cookie",
         "credential",
         "credentials",
+        "awsaccesskeyid",
+        "x-amz-credential",
+        "x-amz-signature",
+        "x-amz-security-token",
+        "x-goog-signature",
+        "x-goog-credential",
         "id_token",
         "jwt",
         "key",
@@ -53,7 +59,9 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
 _NORMALIZED_CREDENTIAL_QUERY_KEYS = frozenset(
     re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_QUERY_KEYS
 )
-_JWT_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
+_JWT_PATH_SEGMENT = re.compile(
+    r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$"
+)
 _OPAQUE_TOKEN_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{24,}$")
 _REDACTED_PATH_SEGMENT = "%5BREDACTED%5D"
 
@@ -146,7 +154,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         finally:
             RENDER_SLOTS.release()
-        if not isinstance(result.get("rendered_html"), str) or not result["rendered_html"].strip():
+        if (
+            not isinstance(result.get("rendered_html"), str)
+            or not result["rendered_html"].strip()
+        ):
             self._write_json(422, {"error": "empty_render"})
             return
         rendered_bytes = result["rendered_html"].encode("utf-8")
@@ -160,7 +171,9 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(200, result)
 
     def _write_json(self, status: int, payload: dict[str, Any]) -> None:
-        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
         if len(encoded) > MAX_RENDER_RESPONSE_BYTES:
             status = 413
             encoded = b'{"error":"render_response_size_limit"}'
@@ -179,7 +192,9 @@ class Handler(BaseHTTPRequestHandler):
 class UnixThreadingHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_UNIX
 
-    def __init__(self, socket_path: str, handler_class: type[BaseHTTPRequestHandler]) -> None:
+    def __init__(
+        self, socket_path: str, handler_class: type[BaseHTTPRequestHandler]
+    ) -> None:
         self.socket_path = socket_path
         path = Path(socket_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +241,9 @@ def _render_offline(html: str, url: str, timeout_ms: int) -> dict[str, Any]:
                 context.route("**/*", lambda route: route.abort())
                 page = context.new_page()
                 try:
-                    page.set_content(html, wait_until="domcontentloaded", timeout=timeout_ms)
+                    page.set_content(
+                        html, wait_until="domcontentloaded", timeout=timeout_ms
+                    )
                 except PlaywrightTimeoutError as exc:
                     raise TimeoutError from exc
                 page.wait_for_timeout(min(timeout_ms, MAX_SETTLE_MS))
@@ -285,9 +302,11 @@ def _render_navigation(url: str, timeout_ms: int) -> dict[str, Any]:
                 responses: list[Any] = []
                 page.on(
                     "response",
-                    lambda response: responses.append(response)
-                    if len(responses) < MAX_TRACKED_RESPONSES
-                    else None,
+                    lambda response: (
+                        responses.append(response)
+                        if len(responses) < MAX_TRACKED_RESPONSES
+                        else None
+                    ),
                 )
                 try:
                     response = page.goto(
@@ -340,7 +359,10 @@ def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
     total = 0
     seen: set[str] = set()
     for response in responses:
-        if len(entries) >= MAX_CAPTURE_JSON_COUNT or total >= MAX_CAPTURE_JSON_TOTAL_BYTES:
+        if (
+            len(entries) >= MAX_CAPTURE_JSON_COUNT
+            or total >= MAX_CAPTURE_JSON_TOTAL_BYTES
+        ):
             break
         try:
             request = response.request
@@ -349,7 +371,9 @@ def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
             url = _credential_free_url(response.url)
             if url in seen:
                 continue
-            content_type = str(response.headers.get("content-type", "")).split(";", 1)[0].strip()
+            content_type = (
+                str(response.headers.get("content-type", "")).split(";", 1)[0].strip()
+            )
             if not _is_json_content_type(content_type):
                 continue
             declared_size = response.headers.get("content-length")
@@ -361,7 +385,10 @@ def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
             if total + declared_size_bytes > MAX_CAPTURE_JSON_TOTAL_BYTES:
                 continue
             body = response.body()
-            if len(body) > MAX_CAPTURE_JSON_BODY_BYTES or len(body) > declared_size_bytes:
+            if (
+                len(body) > MAX_CAPTURE_JSON_BODY_BYTES
+                or len(body) > declared_size_bytes
+            ):
                 continue
             if total + len(body) > MAX_CAPTURE_JSON_TOTAL_BYTES:
                 continue
@@ -403,7 +430,7 @@ def _detect_markers(rendered_html: str) -> tuple[bool, bool, bool]:
         "sign in to continue",
         "log in to continue",
         "login required",
-        "<input type=\"password\"",
+        '<input type="password"',
         "<input type='password'",
     )
     paywall_markers = (
@@ -436,7 +463,10 @@ def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
             return False
         for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
             normalized_key = re.sub(r"[^a-z0-9]", "", unquote(key).casefold())
-            if normalized_key in _NORMALIZED_CREDENTIAL_QUERY_KEYS:
+            cloud_signed_key = normalized_key.startswith(("xamz", "xgoog")) and (
+                normalized_key.endswith(("credential", "signature", "securitytoken"))
+            )
+            if normalized_key in _NORMALIZED_CREDENTIAL_QUERY_KEYS or cloud_signed_key:
                 return False
             nested_value = unquote(query_value)
             if nested_value.casefold().startswith(("http://", "https://")) and not (
@@ -464,7 +494,9 @@ def _credential_free_url(value: str) -> str:
         port = parsed.port
     except ValueError:
         port = None
-    if port is not None and port not in ({80} if parsed.scheme.casefold() == "http" else {443}):
+    if port is not None and port not in (
+        {80} if parsed.scheme.casefold() == "http" else {443}
+    ):
         netloc += f":{port}"
     return urlunsplit(
         (parsed.scheme.casefold(), netloc, _redact_credential_path(parsed.path), "", "")

@@ -482,6 +482,7 @@ def test_bridge_core_source_blocks_article_promotion_from_another_confirmed_ioc(
 @pytest.mark.parametrize(
     "method",
     (
+        SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
         SourceAcquisitionMethod.VISUAL_OCR,
         SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
     ),

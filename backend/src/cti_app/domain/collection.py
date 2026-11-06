@@ -93,6 +93,7 @@ class SourceAcquisitionMethod(StrEnum):
     EXACT_TITLE_SEARCH = "exact_title_search"
     PUBLISHER_ALTERNATIVE_URL = "publisher_alternative_url"
     AUTHORIZED_SYNDICATION = "authorized_syndication"
+    INDEPENDENT_CORROBORATION = "independent_corroboration"
     PUBLISHER_PDF = "publisher_pdf"
     VISUAL_OCR = "visual_ocr"
     OFFICIAL_NEWSLETTER_ARCHIVE = "official_newsletter_archive"

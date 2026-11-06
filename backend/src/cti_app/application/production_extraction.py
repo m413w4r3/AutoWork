@@ -493,6 +493,7 @@ def build_extraction_plan(
         )
         policy_suffixes: list[str] = []
         if source.acquisition_method in {
+            SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
             SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
             SourceAcquisitionMethod.VISUAL_OCR,
             SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
@@ -501,7 +502,7 @@ def build_extraction_plan(
         if (
             source.role is SourceRole.INDEPENDENT
             or source.editorial_role is ProductionEditorialRole.CORROBORATION
-        ):
+        ) and "independent_corroboration" not in policy_suffixes:
             policy_suffixes.append("independent_corroboration")
         if policy_suffixes:
             profile_policy_version = f"{profile_policy_version}:{':'.join(policy_suffixes)}"
@@ -1085,11 +1086,13 @@ def build_canonical_source_extraction(
     corroborating_source = (
         planned.role is SourceRole.INDEPENDENT
         or planned.editorial_role is ProductionEditorialRole.CORROBORATION
+        or planned.acquisition_method is SourceAcquisitionMethod.INDEPENDENT_CORROBORATION
     )
     corroboration_basis = (
         ProductionIndicatorEvidenceBasis.INDEPENDENT_CORROBORATION if corroborating_source else None
     )
     contextual_only = corroborating_source or planned.acquisition_method in {
+        SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
         SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
         SourceAcquisitionMethod.VISUAL_OCR,
         SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,

@@ -334,6 +334,7 @@ def decide_publication_routing(
             source.tier is ProductionReferenceTier.CORE
             and source.acquisition_method
             in {
+                SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
                 SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
                 SourceAcquisitionMethod.VISUAL_OCR,
                 SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,

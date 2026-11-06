@@ -51,6 +51,12 @@ _CREDENTIAL_URL_KEYS = frozenset(
         "password",
         "credential",
         "credentials",
+        "awsaccesskeyid",
+        "x-amz-credential",
+        "x-amz-signature",
+        "x-amz-security-token",
+        "x-goog-signature",
+        "x-goog-credential",
         "jwt",
         "code",
         "id_token",
@@ -104,7 +110,9 @@ class ProxyConfig:
             raise ValueError("proxy byte limits must be positive")
         if self.idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
-        if not self.allowed_ports or any(not 1 <= port <= 65535 for port in self.allowed_ports):
+        if not self.allowed_ports or any(
+            not 1 <= port <= 65535 for port in self.allowed_ports
+        ):
             raise ValueError("allowed_ports must contain valid TCP ports")
 
 
@@ -123,7 +131,9 @@ class _GlobalByteBudget:
 
 
 class _ByteBudget:
-    def __init__(self, limit: int, global_budget: _GlobalByteBudget | None = None) -> None:
+    def __init__(
+        self, limit: int, global_budget: _GlobalByteBudget | None = None
+    ) -> None:
         self.limit = limit
         self.global_budget = global_budget
         self.used = 0
@@ -201,9 +211,7 @@ class AsyncForwardProxy:
                 await writer.wait_closed()
                 return
             self._active += 1
-        budget = _ByteBudget(
-            self.config.max_connection_bytes, self._total_byte_budget
-        )
+        budget = _ByteBudget(self.config.max_connection_bytes, self._total_byte_budget)
         try:
             raw_header = await self._read_header(reader)
             budget.add(len(raw_header))
@@ -225,10 +233,14 @@ class AsyncForwardProxy:
                 await self._write_error(writer, exc.status, str(exc), budget=budget)
         except TimeoutError:
             if not writer.is_closing():
-                await self._write_error(writer, 504, "proxy idle timeout", budget=budget)
+                await self._write_error(
+                    writer, 504, "proxy idle timeout", budget=budget
+                )
         except (ConnectionError, OSError, asyncio.IncompleteReadError, ValueError):
             if not writer.is_closing():
-                await self._write_error(writer, 400, "invalid proxy request", budget=budget)
+                await self._write_error(
+                    writer, 400, "invalid proxy request", budget=budget
+                )
         finally:
             writer.close()
             try:
@@ -254,7 +266,9 @@ class AsyncForwardProxy:
         token = self.config.auth_token
         if not token:
             return True
-        values = [value for name, value in headers if name.casefold() == "proxy-authorization"]
+        values = [
+            value for name, value in headers if name.casefold() == "proxy-authorization"
+        ]
         if len(values) != 1:
             return False
         scheme, separator, credential = values[0].partition(" ")
@@ -266,11 +280,15 @@ class AsyncForwardProxy:
         if scheme != "basic":
             return False
         try:
-            decoded = base64.b64decode(credential.strip(), validate=True).decode("utf-8")
+            decoded = base64.b64decode(credential.strip(), validate=True).decode(
+                "utf-8"
+            )
         except (binascii.Error, UnicodeDecodeError):
             return False
         username, colon, password = decoded.partition(":")
-        return bool(colon and username == "autowork" and hmac.compare_digest(password, token))
+        return bool(
+            colon and username == "autowork" and hmac.compare_digest(password, token)
+        )
 
     async def _handle_connect(
         self,
@@ -287,8 +305,7 @@ class AsyncForwardProxy:
         upstream_reader, upstream_writer = await self._open_upstream(ip, port)
         try:
             response = (
-                b"HTTP/1.1 200 Connection Established\r\n"
-                b"Proxy-Agent: AutoWork\r\n\r\n"
+                b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: AutoWork\r\n\r\n"
             )
             budget.add(len(response))
             client_writer.write(response)
@@ -370,9 +387,15 @@ class AsyncForwardProxy:
             ).encode("latin-1")
             budget.add(len(request_head))
             upstream_writer.write(request_head)
-            await asyncio.wait_for(upstream_writer.drain(), self.config.idle_timeout_seconds)
-            await self._copy_request_body(client_reader, upstream_writer, headers, budget)
-            await asyncio.wait_for(upstream_writer.drain(), self.config.idle_timeout_seconds)
+            await asyncio.wait_for(
+                upstream_writer.drain(), self.config.idle_timeout_seconds
+            )
+            await self._copy_request_body(
+                client_reader, upstream_writer, headers, budget
+            )
+            await asyncio.wait_for(
+                upstream_writer.drain(), self.config.idle_timeout_seconds
+            )
             await self._forward_response(upstream_reader, client_writer, budget)
         finally:
             upstream_writer.close()
@@ -388,7 +411,11 @@ class AsyncForwardProxy:
         headers: list[tuple[str, str]],
         budget: _ByteBudget,
     ) -> None:
-        lengths = [value.strip() for name, value in headers if name.casefold() == "content-length"]
+        lengths = [
+            value.strip()
+            for name, value in headers
+            if name.casefold() == "content-length"
+        ]
         transfer_encodings = [
             value.strip().casefold()
             for name, value in headers
@@ -421,7 +448,9 @@ class AsyncForwardProxy:
     ) -> None:
         trailer_bytes = 0
         while True:
-            line = await asyncio.wait_for(reader.readline(), self.config.idle_timeout_seconds)
+            line = await asyncio.wait_for(
+                reader.readline(), self.config.idle_timeout_seconds
+            )
             if not line or len(line) > self.config.max_header_bytes:
                 raise ProxyError(400, "invalid chunked request body")
             budget.add(len(line))
@@ -456,7 +485,8 @@ class AsyncForwardProxy:
     ) -> None:
         while remaining:
             chunk = await asyncio.wait_for(
-                reader.read(min(READ_CHUNK_BYTES, remaining)), self.config.idle_timeout_seconds
+                reader.read(min(READ_CHUNK_BYTES, remaining)),
+                self.config.idle_timeout_seconds,
             )
             if not chunk:
                 raise ProxyError(400, "incomplete request body")
@@ -483,7 +513,9 @@ class AsyncForwardProxy:
             status = _response_status(response_head)
             budget.add(len(response_head))
             client_writer.write(response_head)
-            await asyncio.wait_for(client_writer.drain(), self.config.idle_timeout_seconds)
+            await asyncio.wait_for(
+                client_writer.drain(), self.config.idle_timeout_seconds
+            )
             if status < 100 or status >= 200 or status == 101:
                 break
         while True:
@@ -494,7 +526,9 @@ class AsyncForwardProxy:
                 return
             budget.add(len(chunk))
             client_writer.write(chunk)
-            await asyncio.wait_for(client_writer.drain(), self.config.idle_timeout_seconds)
+            await asyncio.wait_for(
+                client_writer.drain(), self.config.idle_timeout_seconds
+            )
 
     async def _relay(
         self,
@@ -516,7 +550,10 @@ class AsyncForwardProxy:
                         source.read(READ_CHUNK_BYTES), self.config.idle_timeout_seconds
                     )
                 except TimeoutError:
-                    if time.monotonic() - last_activity < self.config.idle_timeout_seconds:
+                    if (
+                        time.monotonic() - last_activity
+                        < self.config.idle_timeout_seconds
+                    ):
                         continue
                     return
                 if not chunk:
@@ -524,14 +561,18 @@ class AsyncForwardProxy:
                 last_activity = time.monotonic()
                 budget.add(len(chunk))
                 destination.write(chunk)
-                await asyncio.wait_for(destination.drain(), self.config.idle_timeout_seconds)
+                await asyncio.wait_for(
+                    destination.drain(), self.config.idle_timeout_seconds
+                )
 
         pumps = {
             asyncio.create_task(pump(client_reader, upstream_writer)),
             asyncio.create_task(pump(upstream_reader, client_writer)),
         }
         try:
-            done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                pumps, return_when=asyncio.FIRST_COMPLETED
+            )
             for task in done:
                 task.result()
             for task in pending:
@@ -573,7 +614,9 @@ class AsyncForwardProxy:
                 raise ProxyError(403, "non-public destination address")
             if address.is_multicast or address.is_unspecified or address.is_reserved:
                 raise ProxyError(403, "non-public destination address")
-            if port == self.config.listen_port and self._matches_listener(address, host):
+            if port == self.config.listen_port and self._matches_listener(
+                address, host
+            ):
                 raise ProxyError(403, "proxy listener destination is blocked")
             normalized = address.compressed
             if normalized not in unique:
@@ -587,10 +630,14 @@ class AsyncForwardProxy:
         normalized = _normalize_hostname(host)
         if _is_forbidden_hostname(normalized):
             raise ProxyError(403, "destination hostname is blocked")
-        if any(_matches_domain(normalized, domain) for domain in self.config.blocked_domains):
+        if any(
+            _matches_domain(normalized, domain)
+            for domain in self.config.blocked_domains
+        ):
             raise ProxyError(403, "destination domain is blocked")
         if self.config.allowed_domains and not any(
-            _matches_domain(normalized, domain) for domain in self.config.allowed_domains
+            _matches_domain(normalized, domain)
+            for domain in self.config.allowed_domains
         ):
             raise ProxyError(403, "destination domain is outside the allow-list")
 
@@ -643,7 +690,9 @@ class AsyncForwardProxy:
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         return await asyncio.open_connection(address, port)
 
-    async def _write_health(self, writer: asyncio.StreamWriter, budget: _ByteBudget) -> None:
+    async def _write_health(
+        self, writer: asyncio.StreamWriter, budget: _ByteBudget
+    ) -> None:
         body = json.dumps(
             {"status": "ok", "policy_version": POLICY_VERSION}, separators=(",", ":")
         ).encode("utf-8")
@@ -659,7 +708,9 @@ class AsyncForwardProxy:
     ) -> None:
         body = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
         try:
-            await self._write_response(writer, status, _reason(status), body, budget=budget)
+            await self._write_response(
+                writer, status, _reason(status), body, budget=budget
+            )
         except (ConnectionError, OSError, TimeoutError, ProxyError):
             pass
 
@@ -706,7 +757,11 @@ def _parse_headers(raw: bytes) -> tuple[str, list[tuple[str, str]]]:
 
 def _parse_request_line(value: str) -> tuple[str, str, str]:
     pieces = value.split(" ")
-    if len(pieces) != 3 or not pieces[0].isalpha() or pieces[2] not in {"HTTP/1.0", "HTTP/1.1"}:
+    if (
+        len(pieces) != 3
+        or not pieces[0].isalpha()
+        or pieces[2] not in {"HTTP/1.0", "HTTP/1.1"}
+    ):
         raise ProxyError(400, "invalid request line")
     return pieces[0].upper(), pieces[1], pieces[2]
 
@@ -720,7 +775,12 @@ def _parse_authority(value: str, allowed_ports: frozenset[int]) -> tuple[str, in
         port = parsed.port
     except ValueError as exc:
         raise ProxyError(400, "invalid CONNECT authority") from exc
-    if not host or parsed.username is not None or parsed.password is not None or port is None:
+    if (
+        not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None
+    ):
         raise ProxyError(400, "CONNECT requires host and port")
     if port not in allowed_ports:
         raise ProxyError(403, "destination port is not allowed")
@@ -758,7 +818,10 @@ def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
             return False
         for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
             normalized_key = re.sub(r"[^a-z0-9]", "", unquote(key).casefold())
-            if normalized_key in _NORMALIZED_CREDENTIAL_URL_KEYS:
+            cloud_signed_key = normalized_key.startswith(("xamz", "xgoog")) and (
+                normalized_key.endswith(("credential", "signature", "securitytoken"))
+            )
+            if normalized_key in _NORMALIZED_CREDENTIAL_URL_KEYS or cloud_signed_key:
                 return False
             nested_value = unquote(query_value)
             if nested_value.casefold().startswith(("http://", "https://")) and not (
@@ -861,7 +924,9 @@ def _domains_from_env(name: str) -> frozenset[str]:
     )
     for domain in domains:
         labels = domain.split(".")
-        if len(domain) > 253 or any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
+        if len(domain) > 253 or any(
+            not _DOMAIN_LABEL.fullmatch(label) for label in labels
+        ):
             raise ValueError(f"invalid domain policy in {name}")
     return domains
 
@@ -870,15 +935,21 @@ def config_from_env() -> ProxyConfig:
     return ProxyConfig(
         allowed_domains=_domains_from_env("BROWSER_EGRESS_ALLOWED_DOMAINS"),
         blocked_domains=_domains_from_env("BROWSER_EGRESS_BLOCKED_DOMAINS"),
-        max_connections=int(os.environ.get("BROWSER_EGRESS_MAX_CONNECTIONS", str(MAX_CONNECTIONS))),
+        max_connections=int(
+            os.environ.get("BROWSER_EGRESS_MAX_CONNECTIONS", str(MAX_CONNECTIONS))
+        ),
         max_connection_bytes=int(
-            os.environ.get("BROWSER_EGRESS_MAX_CONNECTION_BYTES", str(MAX_CONNECTION_BYTES))
+            os.environ.get(
+                "BROWSER_EGRESS_MAX_CONNECTION_BYTES", str(MAX_CONNECTION_BYTES)
+            )
         ),
         max_header_bytes=int(
             os.environ.get("BROWSER_EGRESS_MAX_HEADER_BYTES", str(MAX_HEADER_BYTES))
         ),
         idle_timeout_seconds=float(
-            os.environ.get("BROWSER_EGRESS_IDLE_TIMEOUT_SECONDS", str(IDLE_TIMEOUT_SECONDS))
+            os.environ.get(
+                "BROWSER_EGRESS_IDLE_TIMEOUT_SECONDS", str(IDLE_TIMEOUT_SECONDS)
+            )
         ),
         listen_host=os.environ.get("BROWSER_EGRESS_BIND", "0.0.0.0"),
         listen_port=int(os.environ.get("BROWSER_EGRESS_PORT", "8791")),
