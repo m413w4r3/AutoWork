@@ -79,6 +79,16 @@ class AcquisitionCapabilityState(StrEnum):
     BLOCKED_BY_SECURITY = "blocked_by_security"
     NOT_IMPLEMENTED = "not_implemented"
 
+class AcquisitionObservationKind(StrEnum):
+    HTTP_RESPONSE = "http_response"
+    BROWSER_DOM = "browser_dom"
+    BROWSER_NETWORK_JSON = "browser_network_json"
+    EMBEDDED_STRUCTURED_DATA = "embedded_structured_data"
+    PUBLISHER_PDF = "publisher_pdf"
+    IMAGE = "image"
+    MODEL_TRANSCRIPTION = "model_transcription"
+    OCR_TEXT = "ocr_text"
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionQuality:
     text_chars: int
@@ -145,6 +155,7 @@ policy_decision: AcquisitionPolicyDecision = ALLOWED
 capability_state: AcquisitionCapabilityState = IMPLEMENTED
 equivalence_class: SourceEquivalenceClass | None = None
 evidence_class: EvidenceClass | None = None
+observation_kind: AcquisitionObservationKind = HTTP_RESPONSE
 quality: AcquisitionQuality | None = None
 archive_snapshot_time: datetime | None = None
 publication_date: date | None = None
@@ -213,6 +224,48 @@ All probes are retained for diagnostics.
   through the configured proxy), returns `rendered_html` plus bounded metadata
   and captured JSON bodies (no response headers with credentials).
 
+### Browser isolation (mandatory)
+
+The rendering sidecar exposes its control API on a **Unix domain socket**
+mounted read-only into the backend/worker containers. It has no shared Docker
+network with the backend, worker, database or blob store. Its only network is a
+dedicated internal `acquisition-browser` network shared with the enforcing
+egress proxy; the proxy alone joins the internet-facing network.
+
+Consequences, all required:
+
+- A page script cannot reach AutoWork services, even by WebSocket, because they
+  are not on any network the renderer can reach.
+- `BROWSER_EGRESS_PROXY_URL` is mandatory for navigation. Without it, the
+  navigation strategy returns `BLOCKED_BY_SECURITY`; it never falls back to a
+  direct browser connection.
+- Navigation is disabled by default at the backend (`COLLECTION_BROWSER_NAVIGATION_ENABLED=false`).
+  The offline HTML render remains available and is safe by construction.
+- The sidecar returns bounded `captured_json` entries (URL without credential
+  query values, content type, body, size). Response headers, cookies and
+  authorization values are never returned.
+- `--no-sandbox` is accepted only inside this isolation (read-only rootfs,
+  dropped capabilities, no-new-privileges, dedicated network). A deployment
+  without that isolation must keep navigation disabled.
+
+### Capability matrix (must be reported truthfully)
+
+| Method | Expected state |
+|---|---|
+| existing_archive, direct_http, canonical/amp/print/mobile, feeds, publisher API, embedded structured data | implemented |
+| playwright chromium DOM / network JSON / embedded state | implemented, disabled unless secure egress is configured |
+| playwright firefox / webkit | not implemented (renderer ships Chromium only) |
+| multi_extractor, wayback, commoncrawl WARC, memento, publisher alternative URL, publisher PDF | implemented |
+| exact title search, official newsletter archive | not configured by default (explicit endpoint/archive setting required) |
+| authorized syndication | implemented when explicit publisher evidence exists; otherwise unknown |
+| visual OCR | dependency unavailable unless an OCR command is configured |
+| third-party extraction | disabled by default; generic adapter, policy-gated |
+| bridge source discovery / transcription | implemented |
+| manual human archive | existing manual upload path |
+
+No registry entry may claim `IMPLEMENTED` if its dependency or policy gate is
+missing. A skip must carry a typed `capability_state` and reason.
+
 ## Provenance payload on `source.archived_fallback`
 
 Add (only applicable fields required):
@@ -262,8 +315,33 @@ from the publisher or a verifiable historical archive keep their current routing
 | Integration | `application/acquisition_fallbacks.py`, `application/collection.py`, `application/production_*.py`, `domain/production_*.py`, tests | sidecars except agreed compose wiring |
 | Docs | `docs/**` except this note | code |
 
+## Derived-response rule
+
+When a fallback archives a derived article text (JSON/JSON-LD/embedded state,
+rendered DOM, PDF text, OCR):
+
+- `encoded_body` is the raw observed artifact and `encoded_sha256` its hash;
+- `decoded_body` is the deterministic article text and `decoded_sha256` its hash;
+- `declared_content_type` describes the observed artifact, while
+  `detected_content_type` describes the decoded/derived body used by EXTRACTION;
+- `observation_kind` states which observation produced the bytes;
+- `_pdf_processing_failure` is not applied to a fallback whose decoded body is
+  already validated derived text. Direct PDF acquisition still uses it.
+
 ## Acceptance oracles
 
 Each work package must provide deterministic offline tests and report
 `command`, exit code, pass/fail/skip counts. The final matrix covers the
 mission's cases 01–24 in `backend/tests/test_acquisition_matrix.py`.
+
+Mandatory additional oracles:
+
+- a fallback racing a manual upload never replaces or clears the manual document
+  (PostgreSQL row-lock/race test when the environment permits, plus a
+  deterministic in-memory interleaving test);
+- two fallbacks racing produce exactly one attached document and no duplicate
+  `SourceDocument`;
+- an already archived source is returned without any network call;
+- every `source.archived_fallback` payload round-trips the provenance contract;
+- archive/provider/Bridge submissions never contain credential-like query
+  values and never happen when their policy gate denies.
