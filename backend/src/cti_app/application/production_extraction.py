@@ -137,6 +137,7 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionOmissionReason,
     ProductionExtractionOmissionV1,
     ProductionExtractionV1,
+    ProductionIndicatorEvidenceBasis,
     ProductionSourceExtractionV1,
     extraction_profile_decision,
     production_extraction_from_json,
@@ -490,8 +491,20 @@ def build_extraction_plan(
             if intent is SourceAdditionExtractionIntent.DESCRIPTIVE_FACTS
             else EXTRACTION_PROFILE_POLICY_VERSION
         )
-        if source.acquisition_method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
-            profile_policy_version = f"{profile_policy_version}:bridge_transcription"
+        policy_suffixes: list[str] = []
+        if source.acquisition_method in {
+            SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+            SourceAcquisitionMethod.VISUAL_OCR,
+            SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+        }:
+            policy_suffixes.append(source.acquisition_method.value)
+        if (
+            source.role is SourceRole.INDEPENDENT
+            or source.editorial_role is ProductionEditorialRole.CORROBORATION
+        ):
+            policy_suffixes.append("independent_corroboration")
+        if policy_suffixes:
+            profile_policy_version = f"{profile_policy_version}:{':'.join(policy_suffixes)}"
         evidence = (evidence_documents or {}).get(source.source_document_id)
         effective_hash = (
             effective_evidence_sha256(evidence.parsed_text) if evidence is not None else None
@@ -1069,6 +1082,18 @@ def build_canonical_source_extraction(
         if planned.acquisition_method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
         else ProductionEvidenceBasis.SOURCE_VERIFIED
     )
+    corroborating_source = (
+        planned.role is SourceRole.INDEPENDENT
+        or planned.editorial_role is ProductionEditorialRole.CORROBORATION
+    )
+    corroboration_basis = (
+        ProductionIndicatorEvidenceBasis.INDEPENDENT_CORROBORATION if corroborating_source else None
+    )
+    contextual_only = corroborating_source or planned.acquisition_method in {
+        SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+        SourceAcquisitionMethod.VISUAL_OCR,
+        SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+    }
     facts = tuple(
         ExtractionFactV1(
             category=fact.category,
@@ -1104,13 +1129,14 @@ def build_canonical_source_extraction(
             artifact_type=ArtifactType(artifact.artifact_type),
             indicator_status=(
                 ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL
-                if planned.acquisition_method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+                if contextual_only
                 else ExtractionIndicatorStatus(artifact.indicator_status)
             ),
             context=artifact.context,
             evidence_quote=artifact.evidence_quote,
             evidence_basis=basis,
             source_document_ids=document_ids,
+            corroboration_basis=corroboration_basis,
         )
         for artifact in _unique(
             [

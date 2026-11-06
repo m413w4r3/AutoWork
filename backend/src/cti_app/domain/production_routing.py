@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid5
 
+from cti_app.domain.collection import SourceAcquisitionMethod
 from cti_app.domain.indicator_normalization import normalize_indicator_value
 from cti_app.domain.legitimate_services import LegitimateServiceRegistry
 from cti_app.domain.production import (
@@ -42,7 +43,7 @@ from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.subject_ioc_eligibility import is_subject_ioc_eligible
 
-ROUTING_POLICY_VERSION = "subject-publication-routing-v1-legitimate-services-v1"
+ROUTING_POLICY_VERSION = "subject-publication-routing-v2-bridge-evidence-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DECISION_NAMESPACE = UUID("484713e4-12ca-5e67-b18a-cafdad6ee989")
 
@@ -326,8 +327,19 @@ def decide_publication_routing(
     extraction = extraction_input.payload
     projection = relevance_input.payload
     source_availability_reason: RoutingReasonCode | None = None
+    force_critical_source_review = False
     if reason is None:
         assert isinstance(extraction, ProductionExtractionV1)
+        force_critical_source_review = any(
+            source.tier is ProductionReferenceTier.CORE
+            and source.acquisition_method
+            in {
+                SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+                SourceAcquisitionMethod.VISUAL_OCR,
+                SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+            }
+            for source in extraction.sources
+        )
         assert isinstance(projection, RelevanceProjectionV1)
         if extraction.subject_id != subject_id or extraction_input.artifact_hash not in (
             production_extraction_hashes(extraction)
@@ -491,7 +503,10 @@ def decide_publication_routing(
         contextual_ioc_count = len(contextual_iocs)
         ambiguous_ioc_count = len(ambiguous_iocs)
         if status is RoutingStatus.DECIDED:
-            if subject_iocs:
+            if force_critical_source_review:
+                status = RoutingStatus.NEEDS_REVIEW
+                reason = RoutingReasonCode.CRITICAL_SOURCE_MISSING
+            elif subject_iocs:
                 publication_kind = PublicationKind.ARTICLE
                 reason = RoutingReasonCode.SUBJECT_IOC_CONFIRMED
             elif source_availability_reason is not None:

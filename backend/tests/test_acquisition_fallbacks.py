@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
@@ -13,6 +14,7 @@ import pytest
 from cti_app.application.acquisition_fallbacks import (
     AlternateRepresentationStrategy,
     ArchivePhStrategy,
+    BridgeSourceDiscoveryStrategy,
     BridgeTranscriptionStrategy,
     BrowserRenderResult,
     BrowserSidecarUnavailable,
@@ -25,7 +27,11 @@ from cti_app.application.acquisition_fallbacks import (
     WaybackStrategy,
     _CommandOcrEngine,
     article_rejection_reason,
+    bridge_source_discovery_prompt,
+    bridge_transcription_prompt,
     default_acquisition_strategies,
+    parse_bridge_source_locations,
+    parse_bridge_transcription,
 )
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.http_collection import (
@@ -38,6 +44,7 @@ from cti_app.application.http_collection import (
 from cti_app.application.production_extraction import (
     PlannedExtractionSource,
     build_canonical_source_extraction,
+    build_extraction_plan,
     source_checkpoint_identity,
 )
 from cti_app.application.production_parsers import (
@@ -55,12 +62,19 @@ from cti_app.domain.collection import (
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import ExtractionProfile, ProductionEvidenceBasis
 from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
     ExtractionProfileReasonCode,
     ExtractionReuseState,
+    ProductionIndicatorEvidenceBasis,
+    production_extraction_from_json,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
+    ProductionReferenceCorpusV1,
     ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
@@ -177,6 +191,7 @@ async def _service(
     gateway: FakeGateway | None = None,
     external_llm_allowed: bool = False,
     source_url: str = "https://discovery.example/report",
+    acquisition_max_attempts: int = 40,
 ):
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, (source_url,))
@@ -186,6 +201,7 @@ async def _service(
         FilesystemBlobStore(tmp_path / "blobs"),
         model_gateway=gateway,  # type: ignore[arg-type]
         fallback_strategies=strategies,
+        acquisition_max_attempts=acquisition_max_attempts,
     )
     source = (await app.initialize(subject.id))[0]
     stored = factory.collections[source.id]
@@ -320,7 +336,7 @@ async def test_unparseable_bridge_output_stays_blocked_and_replay_is_not_resubmi
         if event.event_type == "source.acquisition_fallback_attempted"
     ]
     assert [event.payload["outcome"] for event in events] == [
-        "response_unparseable",
+        "rejected",
         "skipped",
     ]
     assert events[0].payload["response_sha256"]
@@ -336,7 +352,7 @@ async def test_unparseable_bridge_output_stays_blocked_and_replay_is_not_resubmi
     assert [
         item["outcome"] for item in reference_observation[source.canonical_url].acquisition_attempts
     ] == [
-        "response_unparseable",
+        "rejected",
         "skipped",
     ]
 
@@ -361,8 +377,8 @@ async def test_external_llm_disallowed_skips_bridge_with_durable_reason(tmp_path
         for event in factory.provenance
         if event.event_type == "source.acquisition_fallback_attempted"
     )
-    assert event.payload["outcome"] == "skipped"
-    assert event.payload["reason_code"] == "external_llm_not_allowed"
+    assert event.payload["outcome"] == "policy_skipped"
+    assert event.payload["reason_code"] == "bridge_policy_denied:denied_external_llm"
     attempt = (await app.attempts(source.id))[-1]
     assert attempt.outcome.value == "skipped"
     assert attempt.strategy_name == "bridge_transcription"
@@ -618,6 +634,206 @@ def test_article_acceptance_rejects_language_mismatch_and_interstitial_pages():
     )
 
 
+def test_bridge_transcription_parser_keeps_ioc_candidates_out_of_article_text():
+    raw = (
+        "Bridge note: the following is transcribed text.\r\n"
+        "```markdown\r\n"
+        "<<<ARTICLE_TRANSCRIPTION>>>\r\n"
+        "TITLE: Campaña técnica — informe\r\n"
+        "SOURCE_URL: https://source.example/report\r\n"
+        "PUBLISHER: Publisher\r\n"
+        "CONTENT:\r\n"
+        "The report describes a campaign with exact observed infrastructure.\r\n"
+        "The domain [C2].Example and URL https://C2[.]example/Path, were visible.\r\n"
+        "<<<END_ARTICLE_TRANSCRIPTION>>>\r\n"
+        "<<<IOC_CANDIDATES>>>\r\n"
+        "type | value | source_excerpt\r\n"
+        "domain | [C2].Example | the domain [C2].Example was visible\r\n"
+        "<<<END_IOC_CANDIDATES>>>\r\n"
+        "```\r\n"
+        "Additional explanation after the fenced format."
+    )
+
+    parsed = parse_bridge_transcription(raw)
+
+    assert parsed.parsed is True
+    assert parsed.reason is None
+    assert parsed.title == "Campaña técnica — informe"
+    assert parsed.publisher == "Publisher"
+    assert parsed.article_text.endswith("https://C2[.]example/Path, were visible.")
+    assert "source_excerpt" not in parsed.article_text
+    assert len(parsed.ioc_candidates) == 1
+    assert parsed.ioc_candidates[0].value == "[C2].Example"
+    assert parsed.ioc_candidates[0].excerpt == "the domain [C2].Example was visible"
+    assert parsed.raw_text == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    (
+        ("", "missing_article_label"),
+        ("ARTICLE: UNAVAILABLE", "article_unavailable"),
+        ("ARTICLE: I cannot access the report.", "article_unavailable"),
+        (
+            "<<<ARTICLE_TRANSCRIPTION>>>\nCONTENT:\ntext",
+            "malformed_article_block",
+        ),
+        (
+            "<<<ARTICLE_TRANSCRIPTION>>>\nTITLE: title\n<<<END_ARTICLE_TRANSCRIPTION>>>",
+            "missing_content_field",
+        ),
+    ),
+)
+def test_bridge_transcription_parser_rejects_unavailable_refusal_and_malformed(raw, reason):
+    parsed = parse_bridge_transcription(raw)
+    assert parsed.parsed is False
+    assert parsed.reason == reason
+
+
+def test_bridge_prompts_request_exact_transcription_and_locations_without_source_bytes():
+    transcription = bridge_transcription_prompt(
+        url="https://source.example/report", title="Report 1"
+    )
+    discovery = bridge_source_discovery_prompt(
+        url="https://source.example/report",
+        title="Report 1",
+        publisher="Publisher",
+        published_at=date(2026, 1, 10),
+    )
+
+    assert "do not invent, infer, or reconstruct" in transcription.lower()
+    assert "<<<ARTICLE_TRANSCRIPTION>>>" in transcription
+    assert "type | value | source_excerpt" in transcription
+    assert "potentially verifiable public locations" in discovery
+    assert "do not quote, summarize, or reproduce article/source bytes" in discovery
+    assert "2026-01-10" in discovery and "Publisher" in discovery
+
+
+@pytest.mark.asyncio
+async def test_bridge_source_discovery_fetches_and_archives_only_verified_content(tmp_path):
+    discovery_output = (
+        "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
+        "title | publisher | date | URL\n"
+        "Report 1 | Research team | UNAVAILABLE | "
+        "https://discovery.example/copy\n"
+        "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>"
+    )
+    gateway = FakeGateway(discovery_output)
+    transport = Transport(
+        [
+            _BLOCKED,
+            RawHttpResponse(200, {"content-type": "text/html"}, _ARTICLE),
+        ]
+    )
+    factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(BridgeSourceDiscoveryStrategy(), BridgeTranscriptionStrategy()),
+        gateway=gateway,
+        external_llm_allowed=True,
+    )
+
+    result = await app.archive_one(source.id, uuid4())
+
+    assert result is CollectionState.ARCHIVED
+    assert [request.url for request in transport.requests] == [
+        source.canonical_url,
+        "https://discovery.example/copy",
+    ]
+    assert len(gateway.requests) == 1
+    assert "article/source bytes" in gateway.requests[0].text
+    receipt = await app.archive_receipt(factory.collections[source.id])
+    assert receipt is not None
+    assert receipt.acquisition_method is SourceAcquisitionMethod.DIRECT_HTTP
+    archived = next(
+        event for event in factory.provenance if event.event_type == "source.archived_fallback"
+    )
+    assert archived.payload["source_equivalence_class"] == "verified_publisher_equivalent"
+    assert archived.payload["observation_kind"] == "http_response"
+    assert archived.payload["primary_source_verified"] is True
+    assert archived.payload["model_run_id"]
+    assert archived.payload["prompt_sha256"]
+    assert archived.payload["response_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_source_discovery_rejects_private_urls_without_fetch(tmp_path):
+    gateway = FakeGateway(
+        "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
+        "title | publisher | date | URL\n"
+        "Report 1: Campaign analysis | Publisher | 2026-01-10 | "
+        "http://127.0.0.1/private\n"
+        "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>"
+    )
+    transport = Transport([_BLOCKED])
+    factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(BridgeSourceDiscoveryStrategy(),),
+        gateway=gateway,
+        external_llm_allowed=True,
+    )
+
+    await app.archive_one(source.id, uuid4())
+
+    assert [request.url for request in transport.requests] == [source.canonical_url]
+    events = [
+        event
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_attempted"
+        and event.payload.get("acquisition_method") == "bridge_source_discovery"
+    ]
+    assert any(event.payload.get("reason_code") == "denied_private_destination" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_bridge_source_discovery_respects_remaining_attempt_budget(tmp_path):
+    gateway = FakeGateway(
+        "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
+        "title | publisher | date | URL\n"
+        "Report 1 | Research team | UNAVAILABLE | https://discovery.example/first\n"
+        "Report 1 | Research team | UNAVAILABLE | https://discovery.example/second\n"
+        "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>"
+    )
+    transport = Transport(
+        [
+            _BLOCKED,
+            RawHttpResponse(503, {"content-type": "text/plain"}, b"unavailable"),
+        ]
+    )
+    _factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(BridgeSourceDiscoveryStrategy(), BridgeTranscriptionStrategy()),
+        gateway=gateway,
+        external_llm_allowed=True,
+        acquisition_max_attempts=1,
+    )
+
+    await app.archive_one(source.id, uuid4())
+
+    assert [request.url for request in transport.requests] == [
+        source.canonical_url,
+        "https://discovery.example/first",
+    ]
+
+
+def test_bridge_discovery_registry_is_real_and_precedes_transcription():
+    strategies = default_acquisition_strategies(
+        flags={"bridge_source_discovery": True, "bridge_transcription": True}
+    )
+    discovery = next(item for item in strategies if item.name == "bridge_source_discovery")
+    names = [item.name for item in strategies]
+
+    assert isinstance(discovery, BridgeSourceDiscoveryStrategy)
+    assert discovery.capability_state.value == "implemented"
+    assert names.index("bridge_source_discovery") < names.index("bridge_transcription")
+    parsed = parse_bridge_source_locations(
+        "Locations:\n- https://source.example/copy.\nhttps://source.example/copy\n"
+    )
+    assert parsed[0].url == "https://source.example/copy"
+
+
 def test_bridge_extraction_is_unverified_and_checkpoint_scoped():
     planned = PlannedExtractionSource(
         source_document_id=uuid4(),
@@ -679,6 +895,199 @@ def test_bridge_extraction_is_unverified_and_checkpoint_scoped():
     )
     assert extraction.indicators[0].indicator_status.value == "unverified_contextual"
     assert direct_identity != bridge_identity
+
+
+@pytest.mark.parametrize(
+    ("method", "role", "tier", "editorial_role", "basis"),
+    (
+        (
+            SourceAcquisitionMethod.VISUAL_OCR,
+            SourceRole.PRIMARY,
+            ProductionReferenceTier.CORE,
+            ProductionEditorialRole.PRIMARY,
+            ProductionEvidenceBasis.SOURCE_VERIFIED,
+        ),
+        (
+            SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+            SourceRole.PRIMARY,
+            ProductionReferenceTier.CORE,
+            ProductionEditorialRole.PRIMARY,
+            ProductionEvidenceBasis.SOURCE_VERIFIED,
+        ),
+        (
+            SourceAcquisitionMethod.DIRECT_HTTP,
+            SourceRole.INDEPENDENT,
+            ProductionReferenceTier.SUPPORTING,
+            ProductionEditorialRole.CORROBORATION,
+            ProductionIndicatorEvidenceBasis.INDEPENDENT_CORROBORATION,
+        ),
+    ),
+)
+def test_context_only_extraction_methods_cannot_confirm_iocs(
+    method, role, tier, editorial_role, basis
+):
+    planned = PlannedExtractionSource(
+        source_document_id=uuid4(),
+        canonical_url="https://source.example/report",
+        content_sha256="a" * 64,
+        tier=tier,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=role,
+        editorial_role=editorial_role,
+        profile=ExtractionProfile.FULL,
+        profile_reason_code=ExtractionProfileReasonCode.CORE_PRIMARY_SOURCE,
+        profile_policy_version=f"production-reference-tier-v1:{method.value}",
+        title="Report",
+        collection_state=CollectionState.ARCHIVED,
+        acquisition_method=method,
+    )
+    extraction = build_canonical_source_extraction(
+        planned=planned,
+        gated=Q2SourceOutput(
+            artifacts=[
+                Q2ArtifactProposal(
+                    value="c2.example",
+                    artifact_type="domain",
+                    indicator_status="confirmed_ioc",
+                    context="Reported infrastructure.",
+                    evidence_quote="The source identifies c2.example.",
+                )
+            ]
+        ),
+        checkpoint_id=None,
+        reuse_state=ExtractionReuseState.FRESH,
+    )
+
+    assert extraction.indicators[0].indicator_status.value == "unverified_contextual"
+    if basis is ProductionIndicatorEvidenceBasis.INDEPENDENT_CORROBORATION:
+        assert extraction.indicators[0].evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED
+        assert extraction.indicators[0].corroboration_basis is basis
+        from tests.test_production_routing import _extraction, _indicator
+
+        canonical = _extraction(
+            indicators=(
+                _indicator(
+                    "c2.example",
+                    status=ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL,
+                ),
+            )
+        )
+        source = replace(
+            canonical.sources[0],
+            indicators=(
+                replace(
+                    canonical.sources[0].indicators[0],
+                    corroboration_basis=basis,
+                ),
+            ),
+        )
+        canonical = replace(canonical, sources=(source,))
+        roundtrip = production_extraction_from_json(production_extraction_to_json(canonical))
+        assert roundtrip.sources[0].indicators[0].corroboration_basis is basis
+    else:
+        assert extraction.indicators[0].evidence_basis is basis
+        assert extraction.indicators[0].corroboration_basis is None
+
+
+@pytest.mark.parametrize(
+    ("method", "tier", "role", "editorial_role", "suffix"),
+    (
+        (
+            SourceAcquisitionMethod.VISUAL_OCR,
+            ProductionReferenceTier.CORE,
+            SourceRole.PRIMARY,
+            ProductionEditorialRole.PRIMARY,
+            "visual_ocr",
+        ),
+        (
+            SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+            ProductionReferenceTier.CORE,
+            SourceRole.PRIMARY,
+            ProductionEditorialRole.PRIMARY,
+            "third_party_extraction",
+        ),
+        (
+            SourceAcquisitionMethod.DIRECT_HTTP,
+            ProductionReferenceTier.SUPPORTING,
+            SourceRole.INDEPENDENT,
+            ProductionEditorialRole.CORROBORATION,
+            "independent_corroboration",
+        ),
+    ),
+)
+def test_contextual_source_methods_are_in_extraction_cache_identity(
+    method, tier, role, editorial_role, suffix
+):
+    def reference(
+        url: str,
+        *,
+        tier: ProductionReferenceTier,
+        role: SourceRole,
+        editorial_role: ProductionEditorialRole,
+        method: SourceAcquisitionMethod,
+    ):
+        source_id = uuid4()
+        return ProductionReferenceSourceV1(
+            canonical_url=url,
+            tier=tier,
+            kind=ProductionReferenceKind.PUBLICATION,
+            role=role,
+            title="Report",
+            publisher="Publisher",
+            published_at=date(2026, 1, 10),
+            source_collection_id=None,
+            source_document_id=source_id,
+            discovery_candidate_ids=(),
+            collection_state=CollectionState.ARCHIVED,
+            content_sha256="b" * 64,
+            relevance_reason=None,
+            proposed_by_model=False,
+            eligible_for_extraction=True,
+            editorial_role=editorial_role,
+            acquisition_method=method,
+        )
+
+    core = reference(
+        "https://source.example/report",
+        tier=ProductionReferenceTier.CORE,
+        role=SourceRole.PRIMARY,
+        editorial_role=ProductionEditorialRole.PRIMARY,
+        method=(
+            SourceAcquisitionMethod.DIRECT_HTTP
+            if tier is ProductionReferenceTier.SUPPORTING
+            else method
+        ),
+    )
+    target = (
+        reference(
+            "https://independent.example/copy",
+            tier=tier,
+            role=role,
+            editorial_role=editorial_role,
+            method=method,
+        )
+        if tier is ProductionReferenceTier.SUPPORTING
+        else None
+    )
+    sources = (core, target) if target is not None else (core,)
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=uuid4(),
+        research_date=date(2026, 1, 11),
+        production_input_hash="a" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=sources,
+        warnings=(),
+    )
+
+    plan = build_extraction_plan(corpus)
+    planned = (
+        next(item for item in plan.sources if item.canonical_url.endswith("copy"))
+        if target
+        else plan.sources[0]
+    )
+
+    assert planned.profile_policy_version.endswith(suffix)
 
 
 @pytest.mark.asyncio

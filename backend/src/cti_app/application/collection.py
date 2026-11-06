@@ -18,11 +18,17 @@ from cti_app.application.acquisition_fallbacks import (
     AcquisitionProbe,
     AcquisitionRequest,
     AcquisitionStrategy,
+    _same_acquisition_publisher,
     _typed_probe_outcome,
     article_rejection_reason,
+    bridge_article_response_rejection,
+    bridge_location_metadata_rejection,
+    bridge_source_discovery_prompt,
     bridge_transcription_prompt,
     bridge_url_is_credential_free,
     default_acquisition_strategies,
+    deterministic_acquisition_quality,
+    parse_bridge_source_locations,
     parse_bridge_transcription,
     safe_fallback_url,
 )
@@ -54,7 +60,12 @@ from cti_app.application.jobs import (
     JobParameters,
     JobRegistry,
 )
-from cti_app.application.model_gateway import ModelGateway, ModelRequest, ModelRoutingHint
+from cti_app.application.model_gateway import (
+    ModelExecution,
+    ModelGateway,
+    ModelRequest,
+    ModelRoutingHint,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.source_filenames import analyst_filename
 from cti_app.application.source_media_collection import SourceMediaArchiveService
@@ -70,6 +81,7 @@ from cti_app.domain.acquisition import (
     EvidenceClass,
     SourceEquivalenceClass,
     credential_free_url,
+    evidence_class_for_equivalence,
     is_credential_free_url,
 )
 from cti_app.domain.classification import TLP
@@ -601,6 +613,9 @@ class SubjectCollectionService:
             )
         strategy_flags["bridge_transcription"] = (
             strategy_flags.get("bridge_transcription", True) and fallback_bridge_enabled
+        )
+        strategy_flags["bridge_source_discovery"] = (
+            strategy_flags.get("bridge_source_discovery", True) and fallback_bridge_enabled
         )
         self._fallback_strategies = (
             tuple(fallback_strategies)
@@ -2204,16 +2219,15 @@ class SubjectCollectionService:
                 allow_binary=allow_binary,
             )
 
-        bridge_status = self._bridge_fallback_status(bridge_events)
-
         fallback_collection_id = collection.id
         fallback_requested_url = collection.canonical_url
+        bridge_status = self._bridge_fallback_status(bridge_events)
 
         async def record_fallback_probe(probe: AcquisitionProbe) -> None:
             await self._record_fallback_probe(fallback_collection_id, job_id, probe)
 
         async def bridge_attempt() -> AcquisitionProbe:
-            if bridge_status in {"response_unparseable", "failed", "skipped"}:
+            if bridge_status in {"rejected", "skipped"}:
                 return AcquisitionProbe(
                     strategy_name="bridge_transcription",
                     strategy_version="1",
@@ -2227,35 +2241,27 @@ class SubjectCollectionService:
                     encoded_sha256=None,
                     duration_ms=0,
                 )
-            started = time.monotonic()
-            result = await self._bridge_transcribe(
+            return await self._bridge_transcribe(
                 collection,
                 subject,
                 candidate,
                 job_id,
                 context,
+                request,
                 expected_languages=edition.languages if edition is not None else (),
             )
-            return AcquisitionProbe(
-                strategy_name="bridge_transcription",
-                strategy_version="1",
-                method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
-                requested_url=collection.canonical_url,
-                outcome=_typed_probe_outcome(
-                    AcquisitionOutcome.ARCHIVED if result == "archived" else result
-                ),
-                reason_code=(
-                    CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED.value
-                    if result in {"failed", "response_unparseable"}
-                    else "bridge_submission_reconciliation_required"
-                    if result == "needs_reconciliation"
-                    else None
-                ),
-                response=None,
-                http_status=None,
-                encoded_size=None,
-                encoded_sha256=None,
-                duration_ms=round((time.monotonic() - started) * 1000),
+
+        async def bridge_discovery_attempt(max_candidates: int) -> Sequence[AcquisitionProbe]:
+            remaining_attempts = max(0, self._acquisition_max_attempts - attempted_count)
+            return await self._bridge_source_discover(
+                collection,
+                subject,
+                candidate,
+                job_id,
+                context,
+                request,
+                max_candidates=min(max_candidates, remaining_attempts),
+                expected_languages=edition.languages if edition is not None else (),
             )
 
         request = AcquisitionRequest(
@@ -2281,21 +2287,35 @@ class SubjectCollectionService:
             link_header=fallback_headers.get("link"),
             fetch=safe_fetch,
             bridge=bridge_attempt,
+            bridge_discovery=bridge_discovery_attempt,
+            publisher=candidate.publisher if candidate else collection.publisher,
             attempted_strategy_urls=frozenset(attempted_strategy_urls),
             min_text_chars=self._fallback_min_text_chars,
             expected_languages=edition.languages if edition is not None else (),
             policy=policy,
         )
 
-        # Bridge may persist the archive inside its callback, so it is kept last.
-        configured = tuple(
-            strategy
-            for strategy in self._fallback_strategies
-            if strategy.method is not SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
-        ) + tuple(
-            strategy
-            for strategy in self._fallback_strategies
-            if strategy.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+        # Run Bridge discovery after direct archive methods and before transcription.
+        configured = (
+            tuple(
+                strategy
+                for strategy in self._fallback_strategies
+                if strategy.method
+                not in {
+                    SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY,
+                    SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+                }
+            )
+            + tuple(
+                strategy
+                for strategy in self._fallback_strategies
+                if strategy.method is SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY
+            )
+            + tuple(
+                strategy
+                for strategy in self._fallback_strategies
+                if strategy.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+            )
         )
         handled_probe_ids: set[int] = set()
         deferred_success_probes: dict[int, AcquisitionProbe] = {}
@@ -2447,7 +2467,12 @@ class SubjectCollectionService:
                         attempted_count += 1
                     bounded_probes.append(probe)
                     if probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
-                        if probe.reason_code == "prior_bridge_attempt_not_replayable":
+                        if (
+                            probe.outcome is AcquisitionOutcome.SUCCEEDED
+                            and probe.response is not None
+                        ):
+                            deferred_success_probes[id(probe)] = probe
+                        else:
                             await record_fallback_probe(probe)
                         handled_probe_ids.add(id(probe))
                     elif (
@@ -2494,16 +2519,6 @@ class SubjectCollectionService:
         for probe_id, probe in deferred_success_probes.items():
             if probe_id != id(result.winner) and probe_id not in handled_probe_ids:
                 await self._record_fallback_probe(collection.id, job_id, probe)
-
-        bridge_archived = any(
-            probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
-            and probe.outcome == "archived"
-            for probe in result.probes
-        )
-        if bridge_archived:
-            async with self._uow_factory() as uow:
-                current = await uow.source_collections.get(collection.id)
-            return current.state if current is not None else collection.state
 
         winner = result.winner
         if winner is not None and winner.response is not None:
@@ -2553,6 +2568,216 @@ class SubjectCollectionService:
             current = await uow.source_collections.get(collection.id)
         return current.state if current is not None else collection.state
 
+    async def _bridge_execution(
+        self,
+        collection: SourceCollection,
+        method: SourceAcquisitionMethod,
+        *,
+        purpose: str,
+        prompt_template_id: str,
+        prompt_template_version: str,
+        prompt: str,
+        expected_tlp: TLP,
+        policy: AcquisitionPolicyContext,
+    ) -> tuple[ModelExecution | None, AcquisitionProbe | None, str, UUID]:
+        """Run one deterministic Bridge operation without persisting acquisition state."""
+        started = time.monotonic()
+        strategy_name = method.value
+        model_run_id = uuid5(
+            _FALLBACK_MODEL_RUN_NAMESPACE,
+            str(collection.id)
+            if method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+            else f"{collection.id}:{purpose}",
+        )
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        policy_decision = policy.check_destination(collection.canonical_url, external_llm=True)
+        reason = None
+        outcome = AcquisitionOutcome.POLICY_SKIPPED
+        if policy_decision is not AcquisitionPolicyDecision.ALLOWED:
+            reason = f"bridge_policy_denied:{policy_decision.value}"
+        elif self._model_gateway is None:
+            policy_decision = AcquisitionPolicyDecision.NOT_CONFIGURED
+            outcome = AcquisitionOutcome.NOT_CONFIGURED
+            reason = "model_gateway_unavailable"
+        if reason is not None:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=outcome,
+                    reason_code=reason,
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(model_run_id),
+                    prompt_sha256=prompt_sha256,
+                    policy_decision=policy_decision,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+
+        request = ModelRequest(
+            text=prompt,
+            prompt_template_id=prompt_template_id,
+            prompt_template_version=prompt_template_version,
+            evidence_pack_hash=prompt_sha256,
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            sensitivity=expected_tlp.value,
+            web_search=True,
+            run_id=model_run_id,
+            metadata={
+                "collection_id": str(collection.id),
+                "acquisition_method": method.value,
+            },
+            parameters={"purpose": purpose},
+        )
+        assert self._model_gateway is not None
+        try:
+            existing_run = await self._model_gateway.get_run(model_run_id)
+            if (
+                existing_run is not None
+                and getattr(existing_run.status, "value", "") in {"needs_review", "running"}
+                and getattr(existing_run.submission_state, "value", "") != "not_submitted"
+            ):
+                reconciliation = await self._model_gateway.reconcile_bridge_submission(model_run_id)
+                if reconciliation != "captured_output":
+                    consultation_id = existing_run.bridge_request_id or existing_run.response_id
+                    return (
+                        None,
+                        AcquisitionProbe(
+                            strategy_name=strategy_name,
+                            strategy_version="1",
+                            method=method,
+                            requested_url=collection.canonical_url,
+                            outcome=AcquisitionOutcome.NEEDS_RECONCILIATION,
+                            reason_code="bridge_submission_reconciliation_required",
+                            response=None,
+                            http_status=None,
+                            encoded_size=None,
+                            encoded_sha256=None,
+                            duration_ms=round((time.monotonic() - started) * 1000),
+                            model_run_id=str(model_run_id),
+                            consultation_id=consultation_id,
+                            prompt_sha256=prompt_sha256,
+                        ),
+                        prompt_sha256,
+                        model_run_id,
+                    )
+            execution = await self._model_gateway.research(request)
+        except JobCancelledError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", "")
+            reconciliation_required = code == "model_submission_reconciliation_required"
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=(
+                        AcquisitionOutcome.NEEDS_RECONCILIATION
+                        if reconciliation_required
+                        else AcquisitionOutcome.FAILED
+                    ),
+                    reason_code=(
+                        "bridge_submission_reconciliation_required"
+                        if reconciliation_required
+                        else f"bridge_execution_failed:{type(error).__name__}"
+                    ),
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(getattr(error, "model_run_id", None) or model_run_id),
+                    prompt_sha256=prompt_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+
+        run_status = getattr(execution.run.status, "value", execution.run.status)
+        if run_status in {"needs_review", "waiting_background", "running"}:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=AcquisitionOutcome.NEEDS_RECONCILIATION,
+                    reason_code="bridge_submission_reconciliation_required",
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(execution.run.id),
+                    consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                    prompt_sha256=prompt_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+        if execution.run.id != model_run_id or not execution.output_text:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=AcquisitionOutcome.FAILED,
+                    reason_code="bridge_output_missing_or_run_identity_mismatch",
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(execution.run.id),
+                    consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                    prompt_sha256=prompt_sha256,
+                    response_sha256=execution.run.raw_output_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+        raw_bytes = execution.output_text.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        if execution.run.raw_output_sha256 and execution.run.raw_output_sha256 != raw_sha256:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=AcquisitionOutcome.FAILED,
+                    reason_code="bridge_output_hash_mismatch",
+                    response=None,
+                    http_status=None,
+                    encoded_size=len(raw_bytes),
+                    encoded_sha256=raw_sha256,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(execution.run.id),
+                    consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                    prompt_sha256=prompt_sha256,
+                    response_sha256=execution.run.raw_output_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+        return execution, None, prompt_sha256, model_run_id
+
     async def _bridge_transcribe(
         self,
         collection: SourceCollection,
@@ -2560,249 +2785,395 @@ class SubjectCollectionService:
         candidate: SourceCandidate | None,
         job_id: UUID,
         context: JobExecutionContext | None,
+        acquisition_request: AcquisitionRequest,
         *,
         expected_languages: tuple[str, ...] = (),
-    ) -> str:
+    ) -> AcquisitionProbe:
+        del subject, job_id, context
         method = SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
-        bridge_started = time.monotonic()
         title = candidate.title if candidate else collection.title
-        model_run_id = uuid5(_FALLBACK_MODEL_RUN_NAMESPACE, str(collection.id))
-        try:
-            subject_tlp = getattr(subject, "tlp", collection.source_tlp)
-            effective_tlp = max(
-                (
-                    subject_tlp,
-                    collection.source_tlp,
-                    candidate.tlp if candidate else collection.source_tlp,
-                ),
-                key=lambda item: tuple(TLP).index(item),
-            )
-        except (TypeError, ValueError):
-            effective_tlp = TLP.RED
-        external_allowed = collection.external_llm_allowed and (
-            candidate.external_llm_allowed if candidate else True
-        )
-        skip_reason: str | None = None
-        if not external_allowed:
-            skip_reason = "external_llm_not_allowed"
-        elif effective_tlp is TLP.RED:
-            skip_reason = "tlp_red"
-        elif not bridge_url_is_credential_free(collection.canonical_url):
-            skip_reason = "credential_like_url"
-        elif self._model_gateway is None:
-            skip_reason = "model_gateway_unavailable"
-
-        if skip_reason is not None:
-            await self._record_fallback_skip(
-                collection,
-                job_id=job_id,
-                method=method,
-                reason_code=skip_reason,
-                model_run_id=model_run_id,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-            )
-            await self._fallback_diagnostic(
-                context,
-                collection,
-                method=method,
-                state="skipped",
-                reason_code=skip_reason,
-                requested_url=collection.canonical_url,
-            )
-            return "skipped"
-
-        assert self._model_gateway is not None
         prompt = bridge_transcription_prompt(url=collection.canonical_url, title=title)
-        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        request = ModelRequest(
-            text=prompt,
+        # The request policy was constructed from subject, collection and
+        # candidate metadata by _acquire_fallback_chain.
+        execution, failure, prompt_sha256, _model_run_id = await self._bridge_execution(
+            collection,
+            method,
+            purpose="public_article_transcription",
             prompt_template_id="source-acquisition-bridge-transcription",
-            prompt_template_version="1",
-            evidence_pack_hash=prompt_sha256,
-            external_llm_allowed=True,
-            routing_hint=ModelRoutingHint.WEB_RESEARCH,
-            sensitivity=effective_tlp.value,
-            web_search=True,
-            run_id=model_run_id,
-            metadata={
-                "collection_id": str(collection.id),
-                "acquisition_method": method.value,
-            },
-            parameters={"purpose": "public_article_transcription"},
+            prompt_template_version="2",
+            prompt=prompt,
+            expected_tlp=acquisition_request.policy.tlp,
+            policy=acquisition_request.policy,
         )
-
-        try:
-            existing_run = await self._model_gateway.get_run(model_run_id)
-            if (
-                existing_run is not None
-                and getattr(existing_run.status, "value", "")
-                in {
-                    "needs_review",
-                    "running",
-                }
-                and getattr(existing_run.submission_state, "value", "") != "not_submitted"
-            ):
-                reconciliation = await self._model_gateway.reconcile_bridge_submission(model_run_id)
-                if reconciliation != "captured_output":
-                    await self._record_fallback_skip(
-                        collection,
-                        job_id=job_id,
-                        method=method,
-                        reason_code="bridge_submission_reconciliation_required",
-                        outcome="needs_reconciliation",
-                        model_run_id=model_run_id,
-                        consultation_id=existing_run.bridge_request_id,
-                        duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                        prompt_sha256=prompt_sha256,
-                    )
-                    return "needs_reconciliation"
-            execution = await self._model_gateway.research(request)
-        except JobCancelledError:
-            raise
-        except Exception as error:
-            model_id = getattr(error, "model_run_id", None) or model_run_id
-            await self._record_fallback_failure(
-                collection.id,
-                job_id,
-                requested_url=collection.canonical_url,
-                method=method,
-                reason="Bridge transcription failed before a usable response",
-                reason_code=CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED,
-                outcome=(
-                    "needs_reconciliation"
-                    if getattr(error, "code", "") == "model_submission_reconciliation_required"
-                    else "failed"
-                ),
-                model_run_id=model_id,
-                consultation_id=None,
-                prompt_sha256=prompt_sha256,
-                response_sha256=None,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
+        if failure is not None:
+            return failure
+        assert execution is not None and execution.output_text is not None
+        raw_bytes = execution.output_text.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        parsed = parse_bridge_transcription(execution.output_text)
+        consultation_id = execution.run.bridge_request_id or execution.run.response_id
+        elapsed = max(0, int(getattr(execution.run, "duration_ms", 0) or 0))
+        if not parsed.parsed:
+            return AcquisitionProbe(
                 strategy_name="bridge_transcription",
-            )
-            return (
-                "needs_reconciliation"
-                if getattr(error, "code", "") == "model_submission_reconciliation_required"
-                else "failed"
-            )
-
-        run_status = getattr(execution.run.status, "value", execution.run.status)
-        if run_status in {"needs_review", "waiting_background", "running"}:
-            await self._record_fallback_skip(
-                collection,
-                job_id=job_id,
+                strategy_version="1",
                 method=method,
-                reason_code="bridge_submission_reconciliation_required",
-                outcome="needs_reconciliation",
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                prompt_sha256=prompt_sha256,
-            )
-            return "needs_reconciliation"
-
-        output_text = execution.output_text or ""
-        response_sha256 = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
-        article = parse_bridge_transcription(output_text)
-        if article is None:
-            await self._record_fallback_failure(
-                collection.id,
-                job_id,
                 requested_url=collection.canonical_url,
-                method=method,
-                reason="Bridge response did not contain a parseable article transcription",
-                reason_code=CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED,
-                outcome="response_unparseable",
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                outcome=AcquisitionOutcome.REJECTED,
+                reason_code=parsed.reason or "bridge_response_unparseable",
+                response=None,
+                http_status=None,
+                encoded_size=len(raw_bytes),
+                encoded_sha256=raw_sha256,
+                duration_ms=elapsed,
+                model_run_id=str(execution.run.id),
+                consultation_id=consultation_id,
                 prompt_sha256=prompt_sha256,
-                response_sha256=response_sha256,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                strategy_name="bridge_transcription",
-                encoded_size=len(output_text.encode("utf-8")),
-                encoded_sha256=execution.run.raw_output_sha256 or response_sha256,
-                decoded_size=len(output_text.encode("utf-8")),
-                decoded_sha256=execution.run.raw_output_sha256 or response_sha256,
+                response_sha256=execution.run.raw_output_sha256 or raw_sha256,
+                equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+                evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+                observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+                model_generated=True,
             )
-            return "response_unparseable"
-
-        content = article.encode("utf-8")
+        article_bytes = parsed.article_text.encode("utf-8")
         rejection = article_rejection_reason(
-            body=content,
+            body=article_bytes,
             content_type="text/plain",
             requested_url=collection.canonical_url,
             expected_title=title,
             min_text_chars=self._fallback_min_text_chars,
             expected_languages=expected_languages,
         )
+        quality = deterministic_acquisition_quality(
+            parsed.article_text,
+            expected_title=parsed.title or title,
+            expected_languages=expected_languages,
+            reason="model_transcription_unverified",
+        )
         if rejection is not None:
-            digest = hashlib.sha256(content).hexdigest()
-            await self._record_fallback_failure(
-                collection.id,
-                job_id,
-                requested_url=collection.canonical_url,
-                method=method,
-                reason="Bridge transcript failed the local article acceptance checks",
-                reason_code=CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED,
-                outcome=f"response_rejected:{rejection}",
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
-                prompt_sha256=prompt_sha256,
-                response_sha256=execution.run.raw_output_sha256 or response_sha256,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
+            return AcquisitionProbe(
                 strategy_name="bridge_transcription",
-                encoded_size=len(content),
-                encoded_sha256=digest,
-                decoded_size=len(content),
-                decoded_sha256=digest,
+                strategy_version="1",
+                method=method,
+                requested_url=collection.canonical_url,
+                outcome=AcquisitionOutcome.REJECTED,
+                reason_code=f"transcript_rejected:{rejection}",
+                response=None,
+                http_status=None,
+                encoded_size=len(raw_bytes),
+                encoded_sha256=raw_sha256,
+                duration_ms=elapsed,
+                model_run_id=str(execution.run.id),
+                consultation_id=consultation_id,
+                prompt_sha256=prompt_sha256,
+                response_sha256=execution.run.raw_output_sha256 or raw_sha256,
+                equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+                evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+                observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+                quality=quality,
+                model_generated=True,
             )
-            return "response_unparseable"
-
         response = CollectedResponse(
             requested_url=collection.canonical_url,
             final_url=collection.canonical_url,
             redirect_chain=(),
             status=0,
             headers={},
-            declared_content_type="text/plain",
+            declared_content_type="text/plain; charset=utf-8",
             detected_content_type=DetectedMimeType.TEXT,
-            encoded_body=content,
-            decoded_body=content,
-            encoded_size=len(content),
-            encoded_sha256=hashlib.sha256(content).hexdigest(),
-            decoded_size=len(content),
-            decoded_sha256=hashlib.sha256(content).hexdigest(),
+            encoded_body=raw_bytes,
+            decoded_body=article_bytes,
+            encoded_size=len(raw_bytes),
+            encoded_sha256=raw_sha256,
+            decoded_size=len(article_bytes),
+            decoded_sha256=hashlib.sha256(article_bytes).hexdigest(),
             content_encoding="identity",
             acquired_at=datetime.now(UTC),
         )
-        await self._archive(
-            collection.id,
-            datetime.now(UTC),
-            response,
-            acquisition=_FallbackAcquisition(
-                job_id=job_id,
-                method=method,
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
-                prompt_sha256=prompt_sha256,
-                response_sha256=(execution.run.raw_output_sha256 or response_sha256),
-                strategy_name="bridge_transcription",
-                strategy_version="1",
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                strategy_url=collection.canonical_url,
-                source_equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
-                evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
-                observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
-                publication_date=candidate.published_at if candidate else collection.published_at,
-                publisher=candidate.publisher if candidate else collection.publisher,
-                article_title=title,
-                model_generated=True,
-                primary_source_verified=False,
-                ioc_primary_verified=False,
-            ),
-            candidate=candidate,
+        return AcquisitionProbe(
+            strategy_name="bridge_transcription",
+            strategy_version="1",
+            method=method,
+            requested_url=collection.canonical_url,
+            outcome=AcquisitionOutcome.SUCCEEDED,
+            reason_code=None,
+            response=response,
+            http_status=None,
+            encoded_size=len(raw_bytes),
+            encoded_sha256=raw_sha256,
+            duration_ms=elapsed,
+            model_run_id=str(execution.run.id),
+            consultation_id=consultation_id,
+            prompt_sha256=prompt_sha256,
+            response_sha256=execution.run.raw_output_sha256 or raw_sha256,
+            equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+            evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+            observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+            quality=quality,
+            publication_date=candidate.published_at if candidate else collection.published_at,
+            publisher=parsed.publisher
+            or (candidate.publisher if candidate else collection.publisher),
+            model_generated=True,
+            primary_source_verified=False,
+            ioc_primary_verified=False,
         )
-        return "archived"
+
+    async def _bridge_source_discover(
+        self,
+        collection: SourceCollection,
+        subject: object,
+        candidate: SourceCandidate | None,
+        job_id: UUID,
+        context: JobExecutionContext | None,
+        acquisition_request: AcquisitionRequest,
+        *,
+        max_candidates: int,
+        expected_languages: tuple[str, ...] = (),
+    ) -> tuple[AcquisitionProbe, ...]:
+        del context, job_id
+        method = SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY
+        title = candidate.title if candidate else collection.title
+        publisher = candidate.publisher if candidate else collection.publisher
+        published_at = candidate.published_at if candidate else collection.published_at
+        prompt = bridge_source_discovery_prompt(
+            url=collection.canonical_url,
+            title=title,
+            publisher=publisher,
+            published_at=published_at,
+        )
+        del subject
+        request_tlp = acquisition_request.policy.tlp
+        execution, failure, prompt_sha256, model_run_id = await self._bridge_execution(
+            collection,
+            method,
+            purpose="public_article_source_discovery",
+            prompt_template_id="source-acquisition-bridge-source-discovery",
+            prompt_template_version="1",
+            prompt=prompt,
+            expected_tlp=request_tlp,
+            policy=acquisition_request.policy,
+        )
+        if failure is not None:
+            return (failure,)
+        assert execution is not None and execution.output_text is not None
+        raw_bytes = execution.output_text.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        response_sha256 = execution.run.raw_output_sha256 or raw_sha256
+        locations = parse_bridge_source_locations(execution.output_text)
+        duration_ms = max(0, int(getattr(execution.run, "duration_ms", 0) or 0))
+        model_probe = AcquisitionProbe(
+            strategy_name="bridge_source_discovery",
+            strategy_version="1",
+            method=method,
+            requested_url=collection.canonical_url,
+            outcome=(
+                AcquisitionOutcome.LOOKUP_SUCCEEDED if locations else AcquisitionOutcome.REJECTED
+            ),
+            reason_code=None if locations else "no_candidate_locations",
+            response=None,
+            http_status=None,
+            encoded_size=len(raw_bytes),
+            encoded_sha256=raw_sha256,
+            duration_ms=duration_ms,
+            model_run_id=str(execution.run.id),
+            consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+            prompt_sha256=prompt_sha256,
+            response_sha256=response_sha256,
+            policy_decision=AcquisitionPolicyDecision.ALLOWED,
+            equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+            evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+            model_generated=True,
+            primary_source_verified=False,
+            ioc_primary_verified=False,
+        )
+        # Candidate content probes carry the discovery run and response hashes.
+        # The model-only lookup has no HTTP response and therefore cannot be
+        # represented as a successful CollectionAttempt without inventing a
+        # final URL or content hash. Keep it as a rejection only when there are
+        # no locations to fetch.
+        probes: list[AcquisitionProbe] = [] if locations else [model_probe]
+        seen_urls: set[str] = set()
+        candidate_budget = max(0, min(max_candidates, len(locations)))
+        for location in locations[:candidate_budget]:
+            try:
+                candidate_url = canonicalize_http_url(location.url)
+            except (TypeError, ValueError):
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=method,
+                        requested_url="invalid-url",
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason_code="candidate_url_invalid",
+                        response=None,
+                        http_status=None,
+                        encoded_size=None,
+                        encoded_sha256=None,
+                        duration_ms=0,
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                    )
+                )
+                continue
+            if candidate_url in seen_urls:
+                continue
+            seen_urls.add(candidate_url)
+            decision = (
+                AcquisitionPolicyDecision.DENIED_CREDENTIALS
+                if not bridge_url_is_credential_free(candidate_url)
+                else acquisition_request.policy.check_url(candidate_url)
+            )
+            metadata_reason = bridge_location_metadata_rejection(location, acquisition_request)
+            if decision is not AcquisitionPolicyDecision.ALLOWED or metadata_reason is not None:
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=method,
+                        requested_url=safe_fallback_url(candidate_url),
+                        outcome=(
+                            AcquisitionOutcome.POLICY_SKIPPED
+                            if decision is not AcquisitionPolicyDecision.ALLOWED
+                            else AcquisitionOutcome.REJECTED
+                        ),
+                        reason_code=(
+                            decision.value
+                            if decision is not AcquisitionPolicyDecision.ALLOWED
+                            else metadata_reason
+                        ),
+                        response=None,
+                        http_status=None,
+                        encoded_size=None,
+                        encoded_sha256=None,
+                        duration_ms=0,
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                        policy_decision=decision,
+                    )
+                )
+                continue
+            attempt_key = hashlib.sha256(
+                f"bridge_source_discovery\0{candidate_url}".encode()
+            ).hexdigest()
+            if attempt_key in acquisition_request.attempted_strategy_urls:
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=method,
+                        requested_url=safe_fallback_url(candidate_url),
+                        outcome=AcquisitionOutcome.SKIPPED,
+                        reason_code="already_attempted_for_strategy",
+                        response=None,
+                        http_status=None,
+                        encoded_size=None,
+                        encoded_sha256=None,
+                        duration_ms=0,
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                    )
+                )
+                continue
+            started = time.monotonic()
+            try:
+                response = await acquisition_request.fetch(candidate_url, {}, 15.0, False)
+            except JobCancelledError:
+                raise
+            except (CollectionError, PermissionError, ValueError) as error:
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=SourceAcquisitionMethod.DIRECT_HTTP,
+                        requested_url=candidate_url,
+                        outcome=AcquisitionOutcome.FAILED,
+                        reason_code=f"candidate_fetch_failed:{type(error).__name__}",
+                        response=None,
+                        http_status=getattr(error, "http_status", None),
+                        encoded_size=getattr(error, "encoded_size", None),
+                        encoded_sha256=None,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                    )
+                )
+                continue
+            response_policy = acquisition_request.policy.check_url(response.final_url)
+            rejection = (
+                "redirect_destination_policy_denied"
+                if response_policy is not AcquisitionPolicyDecision.ALLOWED
+                else bridge_article_response_rejection(
+                    response,
+                    location=location,
+                    request=acquisition_request,
+                )
+            )
+            final_host = urlsplit(response.final_url).hostname or ""
+            same_publisher = _same_acquisition_publisher(
+                collection.canonical_url, response.final_url
+            )
+            syndicated = any(
+                final_host.casefold() == domain.casefold()
+                or final_host.casefold().endswith(f".{domain.casefold()}")
+                for domain in acquisition_request.policy.allowed_syndication_domains
+            )
+            equivalence = (
+                SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
+                if same_publisher
+                else SourceEquivalenceClass.INDEPENDENT_CORROBORATION
+                if syndicated
+                else SourceEquivalenceClass.UNKNOWN_MATCH
+            )
+            observed_text = response.decoded_body.decode("utf-8", errors="replace")
+            quality = deterministic_acquisition_quality(
+                observed_text,
+                expected_title=location.title or title,
+                expected_languages=expected_languages,
+                reason="bridge_discovery_content_observed",
+            )
+            probes.append(
+                AcquisitionProbe(
+                    strategy_name="bridge_source_discovery",
+                    strategy_version="1",
+                    method=SourceAcquisitionMethod.DIRECT_HTTP,
+                    requested_url=candidate_url,
+                    outcome=(
+                        AcquisitionOutcome.REJECTED
+                        if rejection is not None
+                        else AcquisitionOutcome.SUCCEEDED
+                    ),
+                    reason_code=rejection,
+                    response=response,
+                    http_status=response.status,
+                    encoded_size=response.encoded_size,
+                    encoded_sha256=response.encoded_sha256,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(model_run_id),
+                    consultation_id=model_probe.consultation_id,
+                    prompt_sha256=prompt_sha256,
+                    response_sha256=response_sha256,
+                    policy_decision=response_policy,
+                    observation_kind=AcquisitionObservationKind.HTTP_RESPONSE,
+                    equivalence_class=equivalence,
+                    evidence_class=evidence_class_for_equivalence(equivalence),
+                    quality=quality,
+                    publication_date=published_at,
+                    publisher=location.publisher or publisher,
+                    model_generated=False,
+                    primary_source_verified=same_publisher and rejection is None,
+                    ioc_primary_verified=same_publisher and rejection is None,
+                )
+            )
+        return tuple(probes)
 
     async def _record_fallback_failure(
         self,
@@ -2978,7 +3349,13 @@ class SubjectCollectionService:
                     else AttemptOutcome.ERROR
                 ),
                 failure_reason=None if success else f"Acquisition strategy {reason}",
-                reason_code=None if success else CollectionFailureReason.FALLBACK_FAILED,
+                reason_code=(
+                    None
+                    if success
+                    else CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED
+                    if probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+                    else CollectionFailureReason.FALLBACK_FAILED
+                ),
                 strategy_name=probe.strategy_name,
                 strategy_version=probe.strategy_version,
                 duration_ms=probe.duration_ms,

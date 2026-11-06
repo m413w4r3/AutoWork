@@ -49,7 +49,8 @@ _LINK_RELATIONS = frozenset({"amphtml", "alternate", "canonical", "print"})
 _LINK_HEADER_RE = re.compile(r"<([^>]+)>\s*;([^,]*)")
 _REFUSAL_RE = re.compile(
     r"(?is)^\s*(?:i\s+(?:cannot|can't|could not|couldn't|am unable to)\b|"
-    r"(?:the\s+)?article\s+(?:is\s+)?(?:unavailable|not available)\b)"
+    r"(?:the\s+)?article\s+(?:is\s+)?(?:unavailable|not available)\b|"
+    r"(?:i\s+)?(?:cannot|can't|could not|couldn't)\s+(?:access|retrieve|view)\b)"
 )
 _UNACCEPTABLE_PAGE_RE = re.compile(
     r"(?i)\b(?:captcha|verify you are human|robot check|access denied|subscribe to continue|"
@@ -133,6 +134,8 @@ class _ArticleLinkParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.links: list[tuple[str, str]] = []
         self.title_parts: list[str] = []
+        self.meta_title_parts: list[str] = []
+        self.html_title_parts: list[str] = []
         self.in_title = False
         self.noindex = False
         self.description: str | None = None
@@ -151,6 +154,7 @@ class _ArticleLinkParser(HTMLParser):
             "twitter:title",
         }:
             self.title_parts.append(values.get("content", ""))
+            self.meta_title_parts.append(values.get("content", ""))
         if tag.casefold() != "link":
             return
         rels = set(values.get("rel", "").casefold().split())
@@ -165,6 +169,11 @@ class _ArticleLinkParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.in_title:
             self.title_parts.append(data)
+            self.html_title_parts.append(data)
+
+    def page_title(self) -> str:
+        preferred = self.meta_title_parts or self.html_title_parts
+        return " ".join(" ".join(preferred).split())
 
 
 def discover_same_publication_variants(
@@ -215,52 +224,302 @@ def web_archive_snapshot_url(original_url: str) -> str:
 
 def bridge_transcription_prompt(*, url: str, title: str | None) -> str:
     safe_title = title.strip() if title and not _contains_credential_marker(title) else None
-    title_line = f"Title: {safe_title}\n" if safe_title else ""
+    title_line = f"EXPECTED_TITLE: {safe_title}\n" if safe_title else ""
     return (
-        "Retrieve and transcribe the public article at the URL below. Do not infer or "
-        "reconstruct missing text. Include IOC strings only when visible in the article. "
-        "If the article cannot be accessed, write ARTICLE: UNAVAILABLE. Return plain text "
-        "in this tolerant format:\n"
-        "ARTICLE:\n<article text>\n"
-        "IOCS:\n- <type>: <value> — <short context>\n\n"
+        "Transcribe the public article exactly as visible. Do not invent, infer, or "
+        "reconstruct missing paragraphs or IOCs. If the article or any requested detail "
+        "cannot be accessed, write UNAVAILABLE for that field. Return only this format:\n"
+        "<<<ARTICLE_TRANSCRIPTION>>>\n"
+        "TITLE: ...\nSOURCE_URL: ...\nPUBLISHER: ...\nCONTENT:\n"
+        "<exact article text>\n<<<END_ARTICLE_TRANSCRIPTION>>>\n"
+        "<<<IOC_CANDIDATES>>>\n"
+        "type | value | source_excerpt\n"
+        "<one literal candidate per line, only when visible in the article>\n"
+        "<<<END_IOC_CANDIDATES>>>\n\n"
         f"URL: {url}\n{title_line}"
     )
 
 
-def parse_bridge_transcription(text: str) -> str | None:
-    """Accept the requested labels or a plain article transcript; reject refusals."""
-    body = text.strip()
-    if body.startswith("```"):
-        body = re.sub(r"^```[^\n]*\n?", "", body, count=1)
-        body = re.sub(r"\n?```\s*$", "", body, count=1).strip()
-    if not body:
-        return None
+@dataclass(frozen=True, slots=True)
+class BridgeIocCandidate:
+    type: str
+    value: str
+    excerpt: str
 
-    article_match = re.search(r"(?im)^\s*(?:ARTICLE|TEXT|TRANSCRIPTION)\s*:\s*", body)
-    ioc_match = re.search(r"(?im)^\s*(?:IOCS|INDICATORS)\s*:\s*", body)
-    if article_match:
-        article_start = article_match.end()
-        article_end = (
-            ioc_match.start() if ioc_match and ioc_match.start() > article_start else len(body)
+
+@dataclass(frozen=True, slots=True)
+class BridgeTranscription:
+    article_text: str
+    title: str | None
+    source_url: str | None
+    publisher: str | None
+    ioc_candidates: tuple[BridgeIocCandidate, ...]
+    raw_text: str
+    parsed: bool
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeSourceLocation:
+    title: str | None
+    publisher: str | None
+    published_at: str | None
+    url: str
+
+
+def _unavailable_or_refusal(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized or _REFUSAL_RE.search(normalized):
+        return True
+    return (
+        re.fullmatch(
+            r"(?is)(?:\[?\s*)?(?:unavailable|not available|no access|n/?a)(?:\s*\]?)\W*",
+            normalized,
         )
-        article = body[article_start:article_end].strip()
-    else:
-        if _REFUSAL_RE.search(body):
-            return None
-        article = body
+        is not None
+    )
 
-    if re.fullmatch(
-        r"(?is)(?:\[?\s*)?(?:unavailable|not available|no access)(?:\s*\]?)\W*",
-        article,
-    ):
-        return None
-    if not article:
-        return None
-    if ioc_match:
-        ioc_notes = body[ioc_match.end() :].strip()
-        if ioc_notes:
-            article += "\n\nBridge IOC notes (unverified by primary source):\n" + ioc_notes
-    return article
+
+def _parse_bridge_iocs(value: str, *, legacy: bool) -> tuple[BridgeIocCandidate, ...] | None:
+    candidates: list[BridgeIocCandidate] = []
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if line.startswith("```"):
+            continue
+        if not line or line.casefold() in {"none", "no ioc candidates", "n/a"}:
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            line = line[1:-1].strip()
+        if re.fullmatch(r"[|\-:\s]+", line):
+            continue
+        if re.fullmatch(r"(?i)type\s*\|\s*value\s*\|\s*(?:source_excerpt|excerpt)", line):
+            continue
+        if "|" in line:
+            columns = line.split("|", 2)
+            if len(columns) != 3:
+                return None
+            candidate_type, candidate_value, excerpt = (part.strip() for part in columns)
+        elif legacy:
+            match = re.match(
+                r"^\s*[-*]?\s*([^:]+):\s*(.*?)(?:\s+[\u2014\u2013-]\s+|\s*\|\s*)(.*)?$",
+                raw_line,
+            )
+            if match is None:
+                return None
+            candidate_type = match.group(1).strip()
+            candidate_value = match.group(2).strip()
+            excerpt = (match.group(3) or "").strip()
+        else:
+            return None
+        if not candidate_type or not candidate_value:
+            return None
+        candidates.append(BridgeIocCandidate(candidate_type, candidate_value, excerpt))
+    return tuple(candidates)
+
+
+def parse_bridge_transcription(text: str) -> BridgeTranscription:
+    """Parse a fenced Bridge transcript while keeping model IOC notes separate."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    article_text = ""
+    title: str | None = None
+    source_url: str | None = None
+    publisher: str | None = None
+    candidates: tuple[BridgeIocCandidate, ...] = ()
+
+    block = re.search(
+        r"(?is)<<<ARTICLE_TRANSCRIPTION>>>\s*(.*?)\s*<<<END_ARTICLE_TRANSCRIPTION>>>",
+        normalized,
+    )
+    ioc_block = re.search(
+        r"(?is)<<<IOC_CANDIDATES>>>\s*(.*?)\s*<<<END_IOC_CANDIDATES>>>", normalized
+    )
+    if "<<<ARTICLE_TRANSCRIPTION>>>" in normalized:
+        if block is None:
+            return BridgeTranscription(
+                "", None, None, None, (), text, False, "malformed_article_block"
+            )
+        fields: dict[str, str] = {}
+        lines = block.group(1).splitlines()
+        content_index: int | None = None
+        for index, line in enumerate(lines):
+            match = re.match(r"^\s*(TITLE|SOURCE_URL|PUBLISHER)\s*:\s*(.*)$", line, re.I)
+            if match:
+                fields.setdefault(match.group(1).upper(), match.group(2).strip())
+            elif re.match(r"^\s*CONTENT\s*:\s*$", line, re.I):
+                content_index = index + 1
+                break
+        if content_index is None:
+            return BridgeTranscription(
+                "", None, None, None, (), text, False, "missing_content_field"
+            )
+        article_text = "\n".join(lines[content_index:]).strip()
+        title = _optional_location_value(fields.get("TITLE", ""))
+        source_url = _optional_location_value(fields.get("SOURCE_URL", ""))
+        publisher = _optional_location_value(fields.get("PUBLISHER", ""))
+        if "<<<IOC_CANDIDATES>>>" in normalized and ioc_block is None:
+            return BridgeTranscription(
+                article_text, title, source_url, publisher, (), text, False, "malformed_ioc_block"
+            )
+        if ioc_block is not None:
+            parsed_candidates = _parse_bridge_iocs(ioc_block.group(1), legacy=False)
+            if parsed_candidates is None:
+                return BridgeTranscription(
+                    article_text,
+                    title,
+                    source_url,
+                    publisher,
+                    (),
+                    text,
+                    False,
+                    "malformed_ioc_candidate",
+                )
+            candidates = parsed_candidates
+    else:
+        # Historical callers used ARTICLE:/IOCS: labels. Keep that wire format
+        # readable, but require the article label so surrounding prose cannot
+        # accidentally become an archived transcript.
+        article_match = re.search(r"(?im)^\s*ARTICLE\s*:\s*", normalized)
+        if article_match is None:
+            return BridgeTranscription(
+                "", None, None, None, (), text, False, "missing_article_label"
+            )
+        ioc_match = re.search(
+            r"(?im)^\s*(?:IOCS|INDICATORS)\s*:\s*", normalized[article_match.end() :]
+        )
+        article_end = (
+            article_match.end() + ioc_match.start() if ioc_match is not None else len(normalized)
+        )
+        article_text = normalized[article_match.end() : article_end].strip()
+        if ioc_match is not None:
+            ioc_start = article_match.end() + ioc_match.end()
+            parsed_candidates = _parse_bridge_iocs(normalized[ioc_start:], legacy=True)
+            if parsed_candidates is None:
+                return BridgeTranscription(
+                    article_text, None, None, None, (), text, False, "malformed_ioc_candidate"
+                )
+            candidates = parsed_candidates
+
+    if _unavailable_or_refusal(article_text) or re.match(r"(?i)^\s*UNAVAILABLE\b", article_text):
+        return BridgeTranscription(
+            article_text,
+            title,
+            source_url,
+            publisher,
+            candidates,
+            text,
+            False,
+            "article_unavailable",
+        )
+    if not article_text:
+        return BridgeTranscription(
+            "", title, source_url, publisher, candidates, text, False, "empty_article"
+        )
+    return BridgeTranscription(
+        article_text, title, source_url, publisher, candidates, text, True, None
+    )
+
+
+def bridge_source_discovery_prompt(
+    *,
+    url: str,
+    title: str | None,
+    publisher: str | None,
+    published_at: date | None,
+) -> str:
+    """Ask only for public locations; never include source bytes in discovery."""
+
+    def safe(value: str | None) -> str:
+        return value.strip() if value and not _contains_credential_marker(value) else "UNAVAILABLE"
+
+    return (
+        "Find potentially verifiable public locations or copies of this exact article. "
+        "Return locations only; do not quote, summarize, or reproduce article/source bytes. "
+        "Do not invent URLs. Use UNAVAILABLE for unknown metadata. Return this format:\n"
+        "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
+        "title | publisher | date | URL\n"
+        "<one public location per line>\n"
+        "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>\n\n"
+        f"TITLE: {safe(title)}\nPUBLISHER: {safe(publisher)}\n"
+        f"DATE: {published_at.isoformat() if published_at else 'UNAVAILABLE'}\nURL: {url}"
+    )
+
+
+def parse_bridge_source_locations(text: str) -> tuple[BridgeSourceLocation, ...]:
+    """Extract candidate public URLs from the Bridge's untrusted suggestions."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    block = re.search(
+        r"(?is)<<<PUBLIC_ARTICLE_LOCATIONS>>>\s*(.*?)\s*<<<END_PUBLIC_ARTICLE_LOCATIONS>>>",
+        normalized,
+    )
+    body = block.group(1) if block is not None else normalized
+    locations: list[BridgeSourceLocation] = []
+    for line in body.splitlines():
+        row = line.strip().strip("|").strip()
+        if not row or re.fullmatch(r"[-|\s]+", row):
+            continue
+        if re.match(r"(?i)^title\s*\|\s*publisher\s*\|\s*date\s*\|\s*url$", row):
+            continue
+        if "|" in row:
+            columns = [part.strip().strip("`\"'") for part in row.split("|", 3)]
+            if len(columns) == 4:
+                title_value, publisher_value, date_value, url_value = columns
+                url_value = re.sub(r"\s*\[.*$", "", url_value)
+                if re.match(r"(?i)^https?://", url_value):
+                    locations.append(
+                        BridgeSourceLocation(
+                            _optional_location_value(title_value),
+                            _optional_location_value(publisher_value),
+                            _optional_location_value(date_value),
+                            url_value.rstrip(".,;)]}"),
+                        )
+                    )
+                    continue
+        urls = re.findall(r"https?://[^\s<>\"'|]+", line, flags=re.I)
+        for raw_url in urls:
+            locations.append(BridgeSourceLocation(None, None, None, raw_url.rstrip(".,;)]}")))
+    return tuple(locations)
+
+
+def _optional_location_value(value: str) -> str | None:
+    return value if value and value.casefold() not in {"unavailable", "n/a", "none"} else None
+
+
+def deterministic_acquisition_quality(
+    text: str,
+    *,
+    expected_title: str | None,
+    expected_languages: tuple[str, ...] = (),
+    reason: str,
+) -> AcquisitionQuality:
+    """Build a stable compact quality summary without consulting a model."""
+    words = _WORD_RE.findall(text)
+    title_words = {
+        word.casefold() for word in _WORD_RE.findall(expected_title or "") if len(word) >= 3
+    }
+    body_words = {word.casefold() for word in words if len(word) >= 3}
+    similarity = (
+        len(title_words.intersection(body_words)) / len(title_words) if title_words else 1.0
+    )
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", text) if item.strip()]
+    duplicate_ratio = 1.0 - len(set(paragraphs)) / len(paragraphs) if paragraphs else 0.0
+    challenge = bool(_UNACCEPTABLE_PAGE_RE.search(text))
+    paywall = bool(re.search(r"(?i)\b(?:paywall|subscribe to read|subscription required)\b", text))
+    truncated = bool(re.search(r"(?:\.{3}|…|\[truncated\])\s*$", text, re.I))
+    length_score = min(1.0, len(words) / 200)
+    score = max(0.0, min(1.0, 0.7 * length_score + 0.3 * similarity))
+    return AcquisitionQuality(
+        text_chars=len(text),
+        word_count=len(words),
+        title_similarity=similarity,
+        language=expected_languages[0] if expected_languages else None,
+        boilerplate_ratio=1.0 if challenge else 0.0,
+        duplicate_ratio=duplicate_ratio,
+        truncated=truncated,
+        challenge_detected=challenge,
+        paywall_detected=paywall,
+        score=score,
+        reasons=(reason,),
+    )
 
 
 def bridge_url_is_credential_free(url: str) -> bool:
@@ -401,6 +660,67 @@ def article_rejection_reason(
     return None
 
 
+def bridge_location_metadata_rejection(
+    location: BridgeSourceLocation, request: AcquisitionRequest
+) -> str | None:
+    """Reject suggestions whose claimed metadata conflicts with the requested article."""
+    expected_title = " ".join((request.title or "").split()).casefold()
+    suggested_title = " ".join((location.title or "").split()).casefold()
+    if expected_title and suggested_title != expected_title:
+        return "suggested_title_mismatch"
+    if request.publisher and location.publisher:
+        if (
+            " ".join(request.publisher.split()).casefold()
+            != " ".join(location.publisher.split()).casefold()
+        ):
+            return "suggested_publisher_mismatch"
+    if request.published_at and location.published_at:
+        suggested_date = location.published_at.strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}(?:\b|T)", suggested_date):
+            return "suggested_publication_date_invalid"
+        if suggested_date[:10] != request.published_at.isoformat():
+            return "suggested_publication_date_mismatch"
+    return None
+
+
+def bridge_article_response_rejection(
+    response: CollectedResponse,
+    *,
+    location: BridgeSourceLocation,
+    request: AcquisitionRequest,
+) -> str | None:
+    """Require an observed article title and content check before accepting a URL."""
+    expected_title = location.title or request.title
+    if not expected_title:
+        return "article_title_unavailable"
+    content_type = response.declared_content_type
+    decoded = response.decoded_body.decode("utf-8-sig", errors="replace")
+    normalized_title = " ".join(expected_title.split()).casefold()
+    if (content_type or "").casefold().split(";", 1)[0] in {
+        "text/html",
+        "application/xhtml+xml",
+    } or "<html" in decoded[:1024].casefold():
+        parser = _ArticleLinkParser()
+        try:
+            parser.feed(decoded)
+        except Exception:
+            return "malformed_article_html"
+        observed_title = parser.page_title().casefold()
+    else:
+        observed_title = " ".join(decoded.split()).casefold()
+    if observed_title != normalized_title and normalized_title not in observed_title:
+        return "observed_title_mismatch"
+    return article_rejection_reason(
+        body=response.decoded_body,
+        content_type=content_type,
+        requested_url=response.final_url,
+        expected_title=expected_title,
+        min_text_chars=request.min_text_chars,
+        headers=response.headers,
+        expected_languages=request.expected_languages,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionProbe:
     """One public strategy request, suitable for durable attempt diagnostics."""
@@ -446,7 +766,16 @@ class AcquisitionProbe:
         if self.evidence_class is not None:
             supported_class = evidence_class_for_equivalence(self.equivalence_class)
             if (
-                _EVIDENCE_CLASS_STRENGTH[self.evidence_class]
+                not (
+                    self.method
+                    in {
+                        SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY,
+                        SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+                    }
+                    and self.evidence_class is EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED
+                    and self.equivalence_class is SourceEquivalenceClass.UNKNOWN_MATCH
+                )
+                and _EVIDENCE_CLASS_STRENGTH[self.evidence_class]
                 > _EVIDENCE_CLASS_STRENGTH[supported_class]
             ):
                 raise ValueError(
@@ -482,6 +811,8 @@ class AcquisitionRequest:
     fetch: Callable[[str, dict[str, str], float, bool], Awaitable[CollectedResponse]]
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     bridge: Callable[[], Awaitable[AcquisitionProbe]] | None = None
+    bridge_discovery: Callable[[int], Awaitable[Sequence[AcquisitionProbe]]] | None = None
+    publisher: str | None = None
     attempted_strategy_urls: frozenset[str] = frozenset()
     min_text_chars: int = 200
     expected_languages: tuple[str, ...] = ()
@@ -2734,6 +3065,37 @@ class BridgeTranscriptionStrategy:
         return (await request.bridge(),)
 
 
+@dataclass(frozen=True, slots=True)
+class BridgeSourceDiscoveryStrategy:
+    name: str = "bridge_source_discovery"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY
+    enabled: bool = True
+    timeout_seconds: float = 90.0
+    max_candidates: int = MAX_STRATEGY_CANDIDATES
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.enabled
+            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        )
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if request.bridge_discovery is None:
+            return (
+                _empty_probe(
+                    self.name,
+                    self.version,
+                    self.method,
+                    request.requested_url,
+                    "bridge_unavailable",
+                ),
+            )
+        return tuple(await request.bridge_discovery(self.max_candidates))
+
+
 def default_acquisition_strategies(
     *,
     flags: dict[str, bool] | None = None,
@@ -2973,12 +3335,10 @@ def default_acquisition_strategies(
             configured_enabled=(on("third_party_extraction") and third_party_provider_enabled),
             timeout_seconds=configured("third_party_extraction", 20),
         ),
-        CapabilityPlaceholderStrategy(
-            name="bridge_source_discovery",
-            method=SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY,
-            capability=AcquisitionCapabilityState.NOT_IMPLEMENTED,
-            reason="bridge_source_discovery_not_implemented",
+        BridgeSourceDiscoveryStrategy(
             enabled=on("bridge_source_discovery"),
+            timeout_seconds=configured("bridge_source_discovery", 90),
+            max_candidates=max_candidates,
         ),
         BridgeTranscriptionStrategy(
             enabled=on("bridge_transcription"),
