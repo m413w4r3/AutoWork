@@ -314,7 +314,12 @@ async def test_case_03_javascript_only_page_uses_fake_secure_browser_dom(tmp_pat
 async def test_case_04_empty_dom_uses_captured_public_json():
     body = json.dumps({"title": _TITLE, "url": _URL, "articleBody": _ARTICLE_TEXT}).encode()
     captured = CapturedJson(
-        _URL, "application/json", body, hashlib.sha256(body).hexdigest(), len(body)
+        url=_URL,
+        content_type="application/json",
+        status=200,
+        body=body,
+        sha256=hashlib.sha256(body).hexdigest(),
+        size=len(body),
     )
     observation = BrowserObservation(
         "<html><body></body></html>", _URL, 200, (captured,), False, False, "chromium", 1
