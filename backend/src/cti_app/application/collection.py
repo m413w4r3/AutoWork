@@ -26,6 +26,7 @@ from cti_app.application.acquisition_fallbacks import (
     parse_bridge_transcription,
     safe_fallback_url,
 )
+from cti_app.application.acquisition_orchestrator import ArticleAcquisitionOrchestrator
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection_errors import (
@@ -41,6 +42,7 @@ from cti_app.application.http_collection import (
     UnsafeAddressError,
     UnsupportedContentError,
     _detect_mime,
+    parse_domain_policy,
 )
 from cti_app.application.jobs import (
     JobCancelledError,
@@ -55,6 +57,16 @@ from cti_app.application.source_filenames import analyst_filename
 from cti_app.application.source_media_collection import SourceMediaArchiveService
 from cti_app.application.subject_lineage import resolve_subject_discovery_lineage
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
+from cti_app.domain.acquisition import (
+    AcquisitionCapabilityState,
+    AcquisitionObservationKind,
+    AcquisitionOutcome,
+    AcquisitionPolicyContext,
+    AcquisitionPolicyDecision,
+    AcquisitionQuality,
+    EvidenceClass,
+    SourceEquivalenceClass,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
     AttemptOutcome,
@@ -139,6 +151,17 @@ class _FallbackAcquisition:
     strategy_version: str = "1"
     duration_ms: int = 0
     strategy_url: str | None = None
+    source_equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    observation_kind: AcquisitionObservationKind | None = None
+    quality: AcquisitionQuality | None = None
+    archive_snapshot_time: datetime | None = None
+    publication_date: date | None = None
+    publisher: str | None = None
+    article_title: str | None = None
+    model_generated: bool = False
+    primary_source_verified: bool = False
+    ioc_primary_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +261,15 @@ class SourceArchiveReceipt:
     http_status: int | None = None
     strategy_bytes: int | None = None
     strategy_sha256: str | None = None
+    source_equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    observation_kind: AcquisitionObservationKind | None = None
+    quality_score: float | None = None
+    quality_reasons: tuple[str, ...] = ()
+    archive_snapshot_time: datetime | None = None
+    model_generated: bool | None = None
+    primary_source_verified: bool | None = None
+    ioc_primary_verified: bool | None = None
 
     @classmethod
     def from_provenance(cls, event: ProvenanceEvent) -> SourceArchiveReceipt | None:
@@ -260,6 +292,9 @@ class SourceArchiveReceipt:
                 )
             )
             model_run = payload.get("model_run_id")
+            quality = payload.get("quality_assessment")
+            quality = quality if isinstance(quality, dict) else {}
+            archive_snapshot_time = payload.get("archive_snapshot_time")
             return cls(
                 subject_id=event.subject_id,
                 collection_id=event.aggregate_id,
@@ -308,6 +343,47 @@ class SourceArchiveReceipt:
                     int(payload["bytes"]) if payload.get("bytes") is not None else None
                 ),
                 strategy_sha256=(str(payload["sha256"]) if payload.get("sha256") else None),
+                source_equivalence_class=(
+                    SourceEquivalenceClass(str(payload["source_equivalence_class"]))
+                    if payload.get("source_equivalence_class")
+                    else None
+                ),
+                evidence_class=(
+                    EvidenceClass(str(payload["evidence_class"]))
+                    if payload.get("evidence_class")
+                    else None
+                ),
+                observation_kind=(
+                    AcquisitionObservationKind(str(payload["observation_kind"]))
+                    if payload.get("observation_kind")
+                    else None
+                ),
+                quality_score=(
+                    float(quality["score"]) if quality.get("score") is not None else None
+                ),
+                quality_reasons=tuple(
+                    item for item in quality.get("reasons", ()) if isinstance(item, str)
+                ),
+                archive_snapshot_time=(
+                    datetime.fromisoformat(str(archive_snapshot_time))
+                    if archive_snapshot_time
+                    else None
+                ),
+                model_generated=(
+                    bool(payload["model_generated"])
+                    if payload.get("model_generated") is not None
+                    else None
+                ),
+                primary_source_verified=(
+                    bool(payload["primary_source_verified"])
+                    if payload.get("primary_source_verified") is not None
+                    else None
+                ),
+                ioc_primary_verified=(
+                    bool(payload["ioc_primary_verified"])
+                    if payload.get("ioc_primary_verified") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -375,6 +451,14 @@ class SubjectCollectionParameters(JobParameters):
     requested_by: str = Field(min_length=1, max_length=255)
 
 
+class FallbackAcquireParameters(JobParameters):
+    model_config = ConfigDict(extra="forbid", strict=False)
+
+    subject_id: UUID
+    collection_id: UUID
+    requested_by: str = Field(min_length=1, max_length=255)
+
+
 class SubjectCollectionService:
     def __init__(
         self,
@@ -395,6 +479,18 @@ class SubjectCollectionService:
         fallback_strategies: Sequence[AcquisitionStrategy] | None = None,
         fallback_min_text_chars: int = 200,
         fallback_playwright_sidecar_url: str | None = None,
+        acquisition_deadline_seconds: float = 120.0,
+        acquisition_max_attempts: int = 40,
+        acquisition_per_domain_concurrency: int = 2,
+        fallback_endpoint_enabled: bool = True,
+        browser_navigation_enabled: bool = False,
+        browser_control_socket: str = "",
+        syndication_domains: str = "",
+        exact_title_search_endpoint: str = "",
+        third_party_provider_url: str = "",
+        third_party_provider_token: str = "",
+        third_party_provider_enabled: bool = False,
+        ocr_command: str = "",
     ) -> None:
         self._uow_factory = uow_factory
         self._collector = collector
@@ -412,6 +508,24 @@ class SubjectCollectionService:
         self._fallback_variants_enabled = fallback_variants_enabled
         self._fallback_archive_enabled = fallback_archive_enabled
         self._fallback_bridge_enabled = fallback_bridge_enabled
+        self._fallback_endpoint_enabled = fallback_endpoint_enabled
+        self._browser_navigation_enabled = browser_navigation_enabled
+        self._browser_control_socket = browser_control_socket
+        self._allowed_syndication_domains = parse_domain_policy(syndication_domains)
+        self._exact_title_search_endpoint = exact_title_search_endpoint
+        self._third_party_provider_url = third_party_provider_url
+        self._third_party_provider_token = third_party_provider_token
+        self._third_party_provider_enabled = third_party_provider_enabled
+        self._ocr_command = ocr_command
+        if acquisition_deadline_seconds <= 0:
+            raise ValueError("acquisition_deadline_seconds must be positive")
+        if acquisition_max_attempts < 1:
+            raise ValueError("acquisition_max_attempts must be positive")
+        if acquisition_per_domain_concurrency < 1:
+            raise ValueError("acquisition_per_domain_concurrency must be positive")
+        self._acquisition_deadline_seconds = acquisition_deadline_seconds
+        self._acquisition_max_attempts = acquisition_max_attempts
+        self._acquisition_per_domain_concurrency = acquisition_per_domain_concurrency
         if fallback_max_variants < 1:
             raise ValueError("fallback_max_variants must be positive")
         self._fallback_max_variants = fallback_max_variants
@@ -469,6 +583,10 @@ class SubjectCollectionService:
             seconds=max(fetch_lease_seconds, self._collector.policy.timeout_seconds + 5)
         )
         self._policy_snapshot = self._collector.policy.snapshot()
+
+    @property
+    def fallback_acquisition_enabled(self) -> bool:
+        return self._fallback_acquisition_enabled and self._fallback_endpoint_enabled
 
     async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
         """Read archived content back, for consumers holding only a blob id."""
@@ -778,6 +896,40 @@ class SubjectCollectionService:
             await uow.source_collections.save(collection)
             await uow.commit()
             return collection
+
+    async def fallback_acquire(
+        self,
+        subject_id: UUID,
+        collection_id: UUID,
+        job_id: UUID,
+        context: JobExecutionContext,
+    ) -> CollectionState:
+        """Run only the configured fallback chain for an operator request."""
+        async with self._uow_factory() as uow:
+            collection = await uow.source_collections.get(collection_id)
+            if collection is None or collection.subject_id != subject_id:
+                raise CollectionItemNotFoundError(str(collection_id))
+            if collection.state in _COLLECTED_STATES:
+                return collection.state
+            if collection.state not in {
+                CollectionState.UNAVAILABLE,
+                CollectionState.BLOCKED,
+                CollectionState.FAILED_RETRYABLE,
+                CollectionState.FAILED_TERMINAL,
+            }:
+                raise CollectionNotAllowedError("Source state does not allow fallback acquisition")
+            if not self.fallback_acquisition_enabled:
+                raise CollectionNotAllowedError("fallback acquisition disabled")
+            if collection.source_document_id is not None:
+                raise CollectionNotAllowedError("source already has an archived document")
+        candidate = await self._candidate_for(collection)
+        return await self._acquire_fallback_chain(
+            collection_id,
+            job_id,
+            context,
+            candidate=candidate,
+            explicit_request=True,
+        )
 
     async def collect_subject(
         self,
@@ -1392,8 +1544,10 @@ class SubjectCollectionService:
             if fallback is not None and (
                 collection.state in _COLLECTED_STATES
                 or collection.state is CollectionState.FETCHING
+                or collection.source_document_id is not None
             ):
-                # A human upload or another active acquisition owns the source.
+                # PostgreSQL get_for_update holds this row lock through the
+                # state/pointer check and commit; a direct/manual document wins.
                 return None
             existing_names = {
                 item.logical_filename
@@ -1472,6 +1626,7 @@ class SubjectCollectionService:
                 strategy_name=fallback.strategy_name if fallback is not None else None,
                 strategy_version=fallback.strategy_version if fallback is not None else None,
                 duration_ms=fallback.duration_ms if fallback is not None else None,
+                fallback=fallback,
             )
             await uow.source_documents.add(document)
             await uow.collection_attempts.append(attempt)
@@ -1551,12 +1706,20 @@ class SubjectCollectionService:
                     "acquisition_method": acquisition_method,
                     "job_id": str(collector.job_id if collector else fallback.job_id),
                     "requested_url": (
-                        collection.requested_url if fallback is not None else response.requested_url
+                        safe_fallback_url(collection.requested_url)
+                        if fallback is not None
+                        else response.requested_url
                     ),
                     "original_url": (
-                        collection.requested_url if fallback is not None else response.requested_url
+                        safe_fallback_url(collection.requested_url)
+                        if fallback is not None
+                        else response.requested_url
                     ),
-                    "final_url": response.final_url,
+                    "final_url": (
+                        safe_fallback_url(response.final_url)
+                        if fallback is not None
+                        else response.final_url
+                    ),
                     "redirect_chain": list(response.redirect_chain),
                     "candidate_resolution_url": attempt.candidate_resolution_url,
                     "candidate_resolution_provenance": (
@@ -1573,7 +1736,48 @@ class SubjectCollectionService:
                             "duration_ms": fallback.duration_ms,
                             "http_status": attempt.http_status,
                             "bytes": response.encoded_size,
-                            "sha256": response.encoded_sha256,
+                            "sha256": response.decoded_sha256,
+                            "policy_snapshot_id": self._policy_snapshot.id,
+                            "acquisition_job_id": str(fallback.job_id),
+                            "actor": "system:acquisition_fallback",
+                            "requested_variant_url": safe_fallback_url(
+                                fallback.strategy_url or response.requested_url
+                            ),
+                            "publisher": fallback.publisher or meta_publisher,
+                            "article_title": fallback.article_title or meta_title,
+                            "publication_date_if_known": (
+                                fallback.publication_date or meta_published_at
+                            ).isoformat()
+                            if (fallback.publication_date or meta_published_at) is not None
+                            else None,
+                            "archive_snapshot_time": (
+                                fallback.archive_snapshot_time.isoformat()
+                                if fallback.archive_snapshot_time is not None
+                                else None
+                            ),
+                            "content_type": response.declared_content_type
+                            or response.detected_content_type.value,
+                            "raw_blob_reference": raw_blob.descriptor.object_key,
+                            "raw_blob_id": str(raw_blob.id),
+                            "decoded_blob_reference": decoded_blob.descriptor.object_key,
+                            "decoded_blob_id": str(decoded_blob.id),
+                            "attempt_id": str(attempt.id),
+                            "source_equivalence_class": (
+                                fallback.source_equivalence_class.value
+                                if fallback.source_equivalence_class is not None
+                                else None
+                            ),
+                            "evidence_class": (
+                                fallback.evidence_class.value
+                                if fallback.evidence_class is not None
+                                else None
+                            ),
+                            "observation_kind": (
+                                fallback.observation_kind.value
+                                if fallback.observation_kind is not None
+                                else None
+                            ),
+                            "quality_assessment": _quality_assessment(fallback.quality),
                             "model_run_id": (
                                 str(fallback.model_run_id)
                                 if fallback.model_run_id is not None
@@ -1582,6 +1786,9 @@ class SubjectCollectionService:
                             "consultation_id": fallback.consultation_id,
                             "prompt_sha256": fallback.prompt_sha256,
                             "response_sha256": fallback.response_sha256,
+                            "model_generated": fallback.model_generated,
+                            "primary_source_verified": fallback.primary_source_verified,
+                            "ioc_primary_verified": fallback.ioc_primary_verified,
                             "verification_status": (
                                 "unverified_by_primary_source"
                                 if fallback.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
@@ -1754,8 +1961,9 @@ class SubjectCollectionService:
         *,
         candidate: SourceCandidate | None = None,
         initial_error: CollectionError | None = None,
+        explicit_request: bool = False,
     ) -> CollectionState:
-        """Run the configured strategies in order, archiving only accepted content."""
+        """Run the bounded strategy registry and archive only its accepted winner."""
         async with self._uow_factory() as uow:
             collection = await uow.source_collections.get(collection_id)
             if collection is None:
@@ -1763,14 +1971,21 @@ class SubjectCollectionService:
             if (
                 collection.state in _COLLECTED_STATES
                 or collection.state is CollectionState.FETCHING
+                or collection.source_document_id is not None
             ):
                 return collection.state
-            if collection.state not in {CollectionState.BLOCKED, CollectionState.UNAVAILABLE}:
+            fallback_states = {CollectionState.BLOCKED, CollectionState.UNAVAILABLE}
+            if explicit_request:
+                fallback_states.update(
+                    {CollectionState.FAILED_RETRYABLE, CollectionState.FAILED_TERMINAL}
+                )
+            if collection.state not in fallback_states:
                 return collection.state
             subject = await uow.subjects.get(collection.subject_id)
             edition = await uow.editions.get(collection.edition_id)
             events = await uow.provenance.list_for_aggregate("source_collection", collection.id)
             attempts = await uow.collection_attempts.list_for_collection(collection.id)
+
         direct_attempt = next(
             (
                 attempt
@@ -1785,17 +2000,46 @@ class SubjectCollectionService:
             if initial_error is not None
             else direct_attempt.reason_code
             if direct_attempt is not None
-            else None
+            else collection.failure_reason_code
         )
-        if direct_failure_reason not in {
+        if direct_failure_reason is CollectionFailureReason.UNSAFE_DESTINATION:
+            return collection.state
+        if not explicit_request and direct_failure_reason not in {
             CollectionFailureReason.ACCESS_BLOCKED,
             CollectionFailureReason.HTTP_ERROR,
             CollectionFailureReason.OBSOLETE_URL_404,
         }:
             return collection.state
-        if subject is None:
+        if subject is None or not self._fallback_acquisition_enabled:
             return collection.state
-        if not self._fallback_acquisition_enabled:
+
+        effective_tlp = max(
+            (
+                subject.tlp,
+                collection.source_tlp,
+                candidate.tlp if candidate is not None else collection.source_tlp,
+            ),
+            key=lambda item: tuple(TLP).index(item),
+        )
+        external_llm_allowed = collection.external_llm_allowed and (
+            candidate.external_llm_allowed if candidate is not None else True
+        )
+        policy = AcquisitionPolicyContext(
+            allowed_domains=frozenset(self._policy.allowed_domains),
+            blocked_domains=frozenset(self._policy.blocked_domains),
+            external_llm_allowed=external_llm_allowed,
+            tlp=effective_tlp.value,
+            do_not_submit=collection.do_not_submit,
+            expected_languages=edition.languages if edition is not None else (),
+            allowed_syndication_domains=self._allowed_syndication_domains,
+            third_party_provider_allowed=external_llm_allowed,
+            provider_configured=bool(
+                self._third_party_provider_enabled
+                and self._third_party_provider_url
+                and self._third_party_provider_token
+            ),
+        )
+        if policy.check_url(collection.canonical_url) is not AcquisitionPolicyDecision.ALLOWED:
             return collection.state
 
         attempted_strategy_urls: set[str] = set()
@@ -1835,6 +2079,8 @@ class SubjectCollectionService:
         ) -> CollectedResponse:
             if not bridge_url_is_credential_free(url):
                 raise UnsafeAddressError("Credential-like URL is not eligible for fallback")
+            if policy.check_url(url) is not AcquisitionPolicyDecision.ALLOWED:
+                raise UnsafeAddressError("Destination is not allowed by fallback policy")
             return await self._collector.fetch(
                 url,
                 cancellation_check=context.check_cancelled if context else None,
@@ -1852,7 +2098,7 @@ class SubjectCollectionService:
                     strategy_version="1",
                     method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
                     requested_url=collection.canonical_url,
-                    outcome="skipped",
+                    outcome=AcquisitionOutcome.SKIPPED,
                     reason_code="prior_bridge_attempt_not_replayable",
                     response=None,
                     http_status=None,
@@ -1915,163 +2161,254 @@ class SubjectCollectionService:
             attempted_strategy_urls=frozenset(attempted_strategy_urls),
             min_text_chars=self._fallback_min_text_chars,
             expected_languages=edition.languages if edition is not None else (),
+            policy=policy,
         )
 
-        for strategy in self._fallback_strategies:
-            if context is not None:
-                await context.check_cancelled()
-            if not strategy.enabled:
-                disabled_key = hashlib.sha256(
-                    f"{strategy.name}\0{collection.canonical_url}".encode()
-                ).hexdigest()
-                if disabled_key in attempted_strategy_urls:
-                    continue
-                probe = AcquisitionProbe(
-                    strategy_name=strategy.name,
-                    strategy_version=strategy.version,
-                    method=strategy.method,
-                    requested_url=collection.canonical_url,
-                    outcome="skipped",
-                    reason_code="strategy_disabled",
-                    response=None,
-                    http_status=None,
-                    encoded_size=None,
-                    encoded_sha256=None,
-                    duration_ms=0,
-                )
-                await self._record_fallback_probe(collection.id, job_id, probe)
-                continue
-            started = time.monotonic()
-            try:
-                async with asyncio.timeout(strategy.timeout_seconds):
-                    probes = await strategy.acquire(request)
-            except JobCancelledError:
-                raise
-            except TimeoutError:
-                probes = (
-                    AcquisitionProbe(
-                        strategy_name=strategy.name,
-                        strategy_version=strategy.version,
-                        method=strategy.method,
-                        requested_url=collection.canonical_url,
-                        outcome="failed",
-                        reason_code="strategy_timeout",
-                        response=None,
-                        http_status=None,
-                        encoded_size=None,
-                        encoded_sha256=None,
-                        duration_ms=round((time.monotonic() - started) * 1000),
-                    ),
-                )
-            except Exception as error:
-                probes = (
-                    AcquisitionProbe(
-                        strategy_name=strategy.name,
-                        strategy_version=strategy.version,
-                        method=strategy.method,
-                        requested_url=collection.canonical_url,
-                        outcome="failed",
-                        reason_code=f"strategy_error:{type(error).__name__}",
-                        response=None,
-                        http_status=None,
-                        encoded_size=None,
-                        encoded_sha256=None,
-                        duration_ms=round((time.monotonic() - started) * 1000),
-                    ),
-                )
-            for probe in probes:
-                if probe.reason_code == "already_attempted_for_strategy":
-                    continue
-                if strategy.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
-                    # Bridge persistence and output adoption are handled by the
-                    # idempotent callback above; it has its own ModelRun record.
-                    async with self._uow_factory() as uow:
-                        refreshed = await uow.source_collections.get(collection.id)
-                    if refreshed is None:
-                        raise CollectionItemNotFoundError(str(collection.id))
-                    if refreshed.state in _COLLECTED_STATES:
-                        return refreshed.state
-                    if probe.reason_code == "prior_bridge_attempt_not_replayable":
-                        await self._record_fallback_probe(collection.id, job_id, probe)
-                    await self._fallback_diagnostic(
-                        context,
-                        collection,
-                        method=probe.method,
-                        state=probe.outcome,
-                        reason_code=probe.reason_code,
-                        requested_url=probe.requested_url,
-                        strategy_name=probe.strategy_name,
-                        strategy_version=probe.strategy_version,
-                        duration_ms=probe.duration_ms,
-                        http_status=probe.http_status,
-                        byte_count=probe.encoded_size,
-                        sha256=probe.encoded_sha256,
-                    )
-                    continue
-                if probe.outcome == "succeeded" and probe.response is not None:
-                    response = replace(
-                        probe.response,
-                        requested_url=safe_fallback_url(probe.response.requested_url),
-                        final_url=safe_fallback_url(probe.response.final_url),
-                        redirect_chain=tuple(
-                            safe_fallback_url(item) for item in probe.response.redirect_chain
+        # Bridge may persist the archive inside its callback, so it is kept last.
+        configured = tuple(
+            strategy
+            for strategy in self._fallback_strategies
+            if strategy.method is not SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+        ) + tuple(
+            strategy
+            for strategy in self._fallback_strategies
+            if strategy.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+        )
+        handled_probe_ids: set[int] = set()
+        deferred_success_probes: dict[int, AcquisitionProbe] = {}
+        attempted_count = 0
+        attempt_limit = self._acquisition_max_attempts
+        collection_service = self
+
+        class RecordingStrategy:
+            """Persist non-winning diagnostics before a later callback can archive."""
+
+            def __init__(self, strategy: AcquisitionStrategy) -> None:
+                self.inner = strategy
+                self.name = strategy.name
+                self.version = strategy.version
+                self.method = strategy.method
+                self.enabled = True
+                self.timeout_seconds = float(strategy.timeout_seconds) + 0.05
+                self.capability_state = AcquisitionCapabilityState.IMPLEMENTED
+
+            async def acquire(
+                self, acquisition_request: AcquisitionRequest
+            ) -> tuple[AcquisitionProbe, ...]:
+                nonlocal attempted_count
+                strategy = self.inner
+                if not strategy.enabled:
+                    probes = (
+                        AcquisitionProbe(
+                            strategy_name=strategy.name,
+                            strategy_version=strategy.version,
+                            method=strategy.method,
+                            requested_url=collection.canonical_url,
+                            outcome=AcquisitionOutcome.SKIPPED,
+                            reason_code="strategy_disabled",
+                            response=None,
+                            http_status=None,
+                            encoded_size=None,
+                            encoded_sha256=None,
+                            duration_ms=0,
+                            capability_state=AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION,
                         ),
                     )
-                    await self._archive(
-                        collection.id,
-                        datetime.now(UTC) - timedelta(milliseconds=probe.duration_ms),
-                        response,
-                        acquisition=_FallbackAcquisition(
-                            job_id=job_id,
-                            method=probe.method,
-                            strategy_name=probe.strategy_name,
-                            strategy_version=probe.strategy_version,
-                            duration_ms=probe.duration_ms,
-                            strategy_url=probe.requested_url,
-                        ),
-                        candidate=candidate,
-                        processing_failure=_pdf_processing_failure(
-                            collection.canonical_url, response
-                        ),
-                    )
-                    async with self._uow_factory() as uow:
-                        refreshed = await uow.source_collections.get(collection.id)
-                    if refreshed is None:
-                        raise CollectionItemNotFoundError(str(collection.id))
-                    if refreshed.state in _COLLECTED_STATES:
-                        await self._fallback_diagnostic(
-                            context,
-                            collection,
-                            method=probe.method,
-                            state="archived",
-                            reason_code=None,
-                            requested_url=probe.requested_url,
-                            strategy_name=probe.strategy_name,
-                            strategy_version=probe.strategy_version,
-                            duration_ms=probe.duration_ms,
-                            http_status=probe.http_status,
-                            byte_count=probe.encoded_size,
-                            sha256=probe.encoded_sha256,
-                        )
-                        return refreshed.state
-                    if refreshed.state is not collection.state:
-                        return refreshed.state
                 else:
-                    await self._record_fallback_probe(collection.id, job_id, probe)
-                await self._fallback_diagnostic(
-                    context,
-                    collection,
-                    method=probe.method,
-                    state=probe.outcome,
-                    reason_code=probe.reason_code,
-                    requested_url=probe.requested_url,
-                    strategy_name=probe.strategy_name,
-                    strategy_version=probe.strategy_version,
-                    duration_ms=probe.duration_ms,
-                    http_status=probe.http_status,
-                    byte_count=probe.encoded_size,
-                    sha256=probe.encoded_sha256,
-                )
+                    capability = getattr(
+                        strategy, "capability_state", AcquisitionCapabilityState.IMPLEMENTED
+                    )
+                    if capability is not AcquisitionCapabilityState.IMPLEMENTED:
+                        is_policy_block = capability in {
+                            AcquisitionCapabilityState.BLOCKED_BY_POLICY,
+                            AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+                        }
+                        probes = (
+                            AcquisitionProbe(
+                                strategy_name=strategy.name,
+                                strategy_version=strategy.version,
+                                method=strategy.method,
+                                requested_url=collection.canonical_url,
+                                outcome=(
+                                    AcquisitionOutcome.POLICY_SKIPPED
+                                    if is_policy_block
+                                    else AcquisitionOutcome.NOT_CONFIGURED
+                                ),
+                                reason_code=capability.value,
+                                response=None,
+                                http_status=None,
+                                encoded_size=None,
+                                encoded_sha256=None,
+                                duration_ms=0,
+                                policy_decision=(
+                                    AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
+                                    if capability is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+                                    else AcquisitionPolicyDecision.DENIED_DOMAIN_POLICY
+                                    if is_policy_block
+                                    else AcquisitionPolicyDecision.NOT_CONFIGURED
+                                ),
+                                capability_state=capability,
+                            ),
+                        )
+                    else:
+                        started = time.monotonic()
+                        try:
+                            async with asyncio.timeout(float(strategy.timeout_seconds)):
+                                probes = tuple(await strategy.acquire(acquisition_request))
+                        except JobCancelledError:
+                            raise
+                        except TimeoutError:
+                            probes = (
+                                AcquisitionProbe(
+                                    strategy_name=strategy.name,
+                                    strategy_version=strategy.version,
+                                    method=strategy.method,
+                                    requested_url=collection.canonical_url,
+                                    outcome=AcquisitionOutcome.FAILED,
+                                    reason_code="strategy_timeout",
+                                    response=None,
+                                    http_status=None,
+                                    encoded_size=None,
+                                    encoded_sha256=None,
+                                    duration_ms=round((time.monotonic() - started) * 1000),
+                                ),
+                            )
+                        except Exception as error:
+                            probes = (
+                                AcquisitionProbe(
+                                    strategy_name=strategy.name,
+                                    strategy_version=strategy.version,
+                                    method=strategy.method,
+                                    requested_url=collection.canonical_url,
+                                    outcome=AcquisitionOutcome.FAILED,
+                                    reason_code=f"strategy_error:{type(error).__name__}",
+                                    response=None,
+                                    http_status=None,
+                                    encoded_size=None,
+                                    encoded_sha256=None,
+                                    duration_ms=round((time.monotonic() - started) * 1000),
+                                ),
+                            )
+
+                bounded_probes: list[AcquisitionProbe] = []
+                for probe in probes:
+                    counts_as_attempt = probe.outcome in {
+                        AcquisitionOutcome.SUCCEEDED,
+                        AcquisitionOutcome.FAILED,
+                        AcquisitionOutcome.REJECTED,
+                        AcquisitionOutcome.NEEDS_RECONCILIATION,
+                        AcquisitionOutcome.LOOKUP_SUCCEEDED,
+                        AcquisitionOutcome.METADATA_SUCCEEDED,
+                        AcquisitionOutcome.ARCHIVED,
+                    }
+                    if counts_as_attempt and attempted_count >= attempt_limit:
+                        continue
+                    if counts_as_attempt:
+                        attempted_count += 1
+                    bounded_probes.append(probe)
+                    if probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
+                        if probe.reason_code == "prior_bridge_attempt_not_replayable":
+                            await collection_service._record_fallback_probe(
+                                collection.id, job_id, probe
+                            )
+                        handled_probe_ids.add(id(probe))
+                    elif (
+                        probe.outcome == AcquisitionOutcome.SUCCEEDED
+                        and probe.response is not None
+                        and probe.policy_decision is AcquisitionPolicyDecision.ALLOWED
+                    ):
+                        deferred_success_probes[id(probe)] = probe
+                    else:
+                        await self._record_fallback_probe(collection.id, job_id, probe)
+                        handled_probe_ids.add(id(probe))
+                return tuple(bounded_probes)
+
+        orchestrator = ArticleAcquisitionOrchestrator(
+            tuple(RecordingStrategy(strategy) for strategy in configured),
+            deadline_seconds=self._acquisition_deadline_seconds,
+            max_attempts=self._acquisition_max_attempts,
+            per_domain_concurrency=self._acquisition_per_domain_concurrency,
+        )
+        result = await orchestrator.run(
+            request,
+            cancellation_check=context.check_cancelled if context is not None else None,
+        )
+        for probe in result.probes:
+            if id(probe) not in handled_probe_ids and probe is not result.winner:
+                await self._record_fallback_probe(collection.id, job_id, probe)
+                handled_probe_ids.add(id(probe))
+            await self._fallback_diagnostic(
+                context,
+                collection,
+                method=probe.method,
+                state=probe.outcome,
+                reason_code=probe.reason_code,
+                requested_url=probe.requested_url,
+                strategy_name=probe.strategy_name,
+                strategy_version=probe.strategy_version,
+                duration_ms=probe.duration_ms,
+                http_status=probe.http_status,
+                byte_count=probe.encoded_size,
+                sha256=probe.encoded_sha256,
+            )
+
+        for probe_id, probe in deferred_success_probes.items():
+            if probe_id != id(result.winner) and probe_id not in handled_probe_ids:
+                await self._record_fallback_probe(collection.id, job_id, probe)
+
+        bridge_archived = any(
+            probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+            and probe.outcome == "archived"
+            for probe in result.probes
+        )
+        if bridge_archived:
+            async with self._uow_factory() as uow:
+                current = await uow.source_collections.get(collection.id)
+            return current.state if current is not None else collection.state
+
+        winner = result.winner
+        if winner is not None and winner.response is not None:
+            response = replace(
+                winner.response,
+                requested_url=safe_fallback_url(winner.response.requested_url),
+                final_url=safe_fallback_url(winner.response.final_url),
+                redirect_chain=tuple(
+                    safe_fallback_url(item) for item in winner.response.redirect_chain
+                ),
+            )
+            quality = winner.quality
+            await self._archive(
+                collection.id,
+                datetime.now(UTC) - timedelta(milliseconds=winner.duration_ms),
+                response,
+                acquisition=_FallbackAcquisition(
+                    job_id=job_id,
+                    method=winner.method,
+                    model_run_id=UUID(winner.model_run_id) if winner.model_run_id else None,
+                    consultation_id=winner.consultation_id,
+                    prompt_sha256=winner.prompt_sha256,
+                    response_sha256=winner.response_sha256,
+                    strategy_name=winner.strategy_name,
+                    strategy_version=winner.strategy_version,
+                    duration_ms=winner.duration_ms,
+                    strategy_url=winner.requested_url,
+                    source_equivalence_class=winner.equivalence_class,
+                    evidence_class=winner.evidence_class,
+                    observation_kind=winner.observation_kind,
+                    quality=quality,
+                    archive_snapshot_time=winner.archive_snapshot_time,
+                    publication_date=winner.publication_date,
+                    publisher=winner.publisher,
+                    article_title=candidate.title if candidate else collection.title,
+                    model_generated=winner.model_generated,
+                    primary_source_verified=winner.primary_source_verified,
+                    ioc_primary_verified=winner.ioc_primary_verified,
+                ),
+                candidate=candidate,
+            )
+            async with self._uow_factory() as uow:
+                current = await uow.source_collections.get(collection.id)
+            return current.state if current is not None else collection.state
 
         async with self._uow_factory() as uow:
             current = await uow.source_collections.get(collection.id)
@@ -2314,6 +2651,15 @@ class SubjectCollectionService:
                 strategy_version="1",
                 duration_ms=round((time.monotonic() - bridge_started) * 1000),
                 strategy_url=collection.canonical_url,
+                source_equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+                evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+                observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+                publication_date=candidate.published_at if candidate else collection.published_at,
+                publisher=candidate.publisher if candidate else collection.publisher,
+                article_title=title,
+                model_generated=True,
+                primary_source_verified=False,
+                ioc_primary_verified=False,
             ),
             candidate=candidate,
         )
@@ -2429,14 +2775,23 @@ class SubjectCollectionService:
         now = datetime.now(UTC)
         response = probe.response
         success = (
-            probe.outcome in {"lookup_succeeded", "metadata_succeeded"} and response is not None
+            probe.outcome
+            in {
+                AcquisitionOutcome.SUCCEEDED,
+                AcquisitionOutcome.LOOKUP_SUCCEEDED,
+                AcquisitionOutcome.METADATA_SUCCEEDED,
+            }
+            and response is not None
+            and probe.policy_decision is AcquisitionPolicyDecision.ALLOWED
         )
         reason = probe.reason_code or probe.outcome
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
             subject = await uow.subjects.get(collection.subject_id)
-            if subject is None or collection.state in (
-                _COLLECTED_STATES | {CollectionState.FETCHING}
+            if (
+                subject is None
+                or collection.state in (_COLLECTED_STATES | {CollectionState.FETCHING})
+                or collection.source_document_id is not None
             ):
                 return
             await uow.collection_policy_snapshots.add_if_absent(self._policy_snapshot)
@@ -2475,7 +2830,12 @@ class SubjectCollectionService:
                     AttemptOutcome.SUCCEEDED
                     if success
                     else AttemptOutcome.SKIPPED
-                    if probe.outcome == "skipped"
+                    if probe.outcome
+                    in {
+                        AcquisitionOutcome.SKIPPED,
+                        AcquisitionOutcome.NOT_CONFIGURED,
+                        AcquisitionOutcome.POLICY_SKIPPED,
+                    }
                     else AttemptOutcome.ERROR
                 ),
                 failure_reason=None if success else f"Acquisition strategy {reason}",
@@ -2483,6 +2843,16 @@ class SubjectCollectionService:
                 strategy_name=probe.strategy_name,
                 strategy_version=probe.strategy_version,
                 duration_ms=probe.duration_ms,
+                acquisition_method=probe.method,
+                source_equivalence_class=probe.equivalence_class,
+                evidence_class=probe.evidence_class,
+                observation_kind=probe.observation_kind,
+                quality_score=probe.quality.score if probe.quality is not None else None,
+                quality_assessment=_quality_assessment(probe.quality),
+                archive_snapshot_time=probe.archive_snapshot_time,
+                model_run_id=UUID(probe.model_run_id) if probe.model_run_id else None,
+                model_generated=probe.model_generated,
+                primary_source_verified=probe.primary_source_verified,
             )
             await uow.collection_attempts.append(attempt)
             collection.record_fallback_attempt(attempt.id)
@@ -2653,6 +3023,19 @@ def register_collection_jobs(registry: JobRegistry, service: SubjectCollectionSe
 
     registry.register("source.collect", SubjectCollectionParameters, handler)
 
+    async def fallback_handler(parameters: JobParameters, context: JobExecutionContext) -> str:
+        if not isinstance(parameters, FallbackAcquireParameters):
+            raise TypeError("Invalid source fallback acquisition parameters")
+        state = await service.fallback_acquire(
+            parameters.subject_id,
+            parameters.collection_id,
+            context.job_id,
+            context,
+        )
+        return state.value
+
+    registry.register("source.fallback_acquire", FallbackAcquireParameters, fallback_handler)
+
 
 def collection_idempotency_key(
     subject_id: UUID,
@@ -2725,6 +3108,7 @@ def _successful_attempt(
     strategy_name: str | None = None,
     strategy_version: str | None = None,
     duration_ms: int | None = None,
+    fallback: _FallbackAcquisition | None = None,
 ) -> CollectionAttempt:
     failure_reason_code = processing_failure[0] if processing_failure else None
     failure_reason = processing_failure[1] if processing_failure else None
@@ -2773,7 +3157,31 @@ def _successful_attempt(
         strategy_name=strategy_name,
         strategy_version=strategy_version,
         duration_ms=duration_ms,
+        acquisition_method=acquisition_method,
+        source_equivalence_class=(
+            fallback.source_equivalence_class if fallback is not None else None
+        ),
+        evidence_class=fallback.evidence_class if fallback is not None else None,
+        observation_kind=fallback.observation_kind if fallback is not None else None,
+        quality_score=(
+            fallback.quality.score if fallback is not None and fallback.quality else None
+        ),
+        quality_assessment=(
+            _quality_assessment(fallback.quality) if fallback is not None else None
+        ),
+        archive_snapshot_time=(fallback.archive_snapshot_time if fallback is not None else None),
+        model_run_id=fallback.model_run_id if fallback is not None else None,
+        model_generated=fallback.model_generated if fallback is not None else None,
+        primary_source_verified=(
+            fallback.primary_source_verified if fallback is not None else None
+        ),
     )
+
+
+def _quality_assessment(quality: AcquisitionQuality | None) -> dict[str, object] | None:
+    if quality is None:
+        return None
+    return {"score": quality.score, "reasons": list(quality.reasons)}
 
 
 def _fallback_attempt_event(

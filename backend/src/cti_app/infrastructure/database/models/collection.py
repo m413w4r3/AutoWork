@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     String,
@@ -196,6 +197,10 @@ class CollectionAttemptRow(Base):
             "(job_id IS NULL) <> (manual_lease_id IS NULL)",
             name="ck_collection_attempts_acquisition",
         ),
+        CheckConstraint(
+            "quality_score IS NULL OR (quality_score >= 0 AND quality_score <= 1)",
+            name="ck_collection_attempts_quality_score",
+        ),
         Index("ix_collection_attempts_collection", "collection_id", "attempted_at"),
         Index("ix_collection_attempts_job", "job_id"),
     )
@@ -238,6 +243,16 @@ class CollectionAttemptRow(Base):
     strategy_name: Mapped[str | None] = mapped_column(String(64))
     strategy_version: Mapped[str | None] = mapped_column(String(32))
     duration_ms: Mapped[int | None] = mapped_column(BigInteger)
+    acquisition_method: Mapped[str | None] = mapped_column(String(64))
+    source_equivalence_class: Mapped[str | None] = mapped_column(String(64))
+    evidence_class: Mapped[str | None] = mapped_column(String(64))
+    observation_kind: Mapped[str | None] = mapped_column(String(64))
+    quality_score: Mapped[float | None] = mapped_column(Float)
+    quality_assessment: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    archive_snapshot_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model_run_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    model_generated: Mapped[bool | None] = mapped_column(Boolean)
+    primary_source_verified: Mapped[bool | None] = mapped_column(Boolean)
 
 
 class DerivedArtifactRow(Base):

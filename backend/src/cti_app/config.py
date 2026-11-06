@@ -209,6 +209,18 @@ class Settings(BaseSettings):
     collection_fallback_bridge_enabled: bool = True
     collection_fallback_max_variants: int = Field(default=4, ge=1, le=20)
     collection_fallback_min_text_chars: int = Field(default=200, ge=50, le=10000)
+    collection_acquisition_deadline_seconds: float = Field(default=120.0, gt=0, le=900)
+    collection_acquisition_max_attempts: int = Field(default=40, ge=1, le=200)
+    collection_acquisition_per_domain_concurrency: int = Field(default=2, ge=1, le=8)
+    collection_fallback_endpoint_enabled: bool = True
+    collection_browser_navigation_enabled: bool = False
+    collection_browser_control_socket: str = ""
+    collection_syndication_domains: str = ""
+    collection_exact_title_search_endpoint: str = ""
+    collection_third_party_provider_url: str = ""
+    collection_third_party_provider_token: str = ""
+    collection_third_party_provider_enabled: bool = False
+    collection_ocr_command: str = ""
     collection_acquisition_strategy_enabled: dict[str, bool] = Field(
         default_factory=lambda: {
             "http_plain": True,

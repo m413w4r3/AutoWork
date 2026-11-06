@@ -73,6 +73,9 @@ class AttemptView(BaseModel):
     transport_classification: str | None
     candidate_resolution_url: str | None
     candidate_resolution_provenance: str | None
+    strategy_name: str | None = None
+    strategy_version: str | None = None
+    duration_ms: int | None = None
 
 
 class ArchiveReceiptView(BaseModel):
@@ -102,6 +105,15 @@ class ArchiveReceiptView(BaseModel):
     http_status: int | None = None
     strategy_bytes: int | None = None
     strategy_sha256: str | None = None
+    source_equivalence_class: str | None = None
+    evidence_class: str | None = None
+    observation_kind: str | None = None
+    quality_score: float | None = None
+    quality_reasons: list[str] = Field(default_factory=list)
+    archive_snapshot_time: str | None = None
+    model_generated: bool | None = None
+    primary_source_verified: bool | None = None
+    ioc_primary_verified: bool | None = None
 
 
 class SourceView(BaseModel):
@@ -263,6 +275,67 @@ async def retry_source(
     except DuplicateJobError as exc:
         job = await jobs.get(exc.existing_job_id)
         duplicate = True
+    return CollectionLaunchView(job_id=job.id, duplicate=duplicate)
+
+
+@router.post(
+    "/{subject_id}/sources/{collection_id}/fallback-acquire",
+    response_model=CollectionLaunchView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def fallback_acquire_source(
+    subject_id: UUID, collection_id: UUID, request: Request
+) -> CollectionLaunchView:
+    collection, _review, jobs, dispatcher = _runtime(request)
+    source = next(
+        (item for item in await collection.list_sources(subject_id) if item.id == collection_id),
+        None,
+    )
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source collection not found")
+    if not collection.fallback_acquisition_enabled:
+        raise HTTPException(status_code=409, detail="fallback acquisition disabled")
+    if (
+        source.state
+        not in {
+            CollectionState.UNAVAILABLE,
+            CollectionState.BLOCKED,
+            CollectionState.FAILED_RETRYABLE,
+            CollectionState.FAILED_TERMINAL,
+        }
+        or source.source_document_id is not None
+    ):
+        raise HTTPException(
+            status_code=409, detail="Source state does not allow fallback acquisition"
+        )
+
+    actor_id = await _actor_id(request)
+    key = (
+        f"source.fallback_acquire:{subject_id}:{collection_id}:"
+        f"{collection.policy_snapshot.id}:{source.attempt_count + 1}"
+    )
+    duplicate = False
+    try:
+        job = await jobs.submit(
+            kind="source.fallback_acquire",
+            aggregate_type="source_collection",
+            aggregate_id=source.id,
+            idempotency_key=key,
+            correlation_id=get_correlation_id(),
+            input_parameters={
+                "subject_id": str(subject_id),
+                "collection_id": str(collection_id),
+                "requested_by": actor_id,
+            },
+            max_attempts=3,
+            actor_id=actor_id,
+        )
+        await dispatcher.dispatch(job.id)
+    except DuplicateJobError as exc:
+        job = await jobs.get(exc.existing_job_id)
+        duplicate = True
+    except CollectionNotAllowedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return CollectionLaunchView(job_id=job.id, duplicate=duplicate)
 
 
@@ -659,6 +732,55 @@ def _source_view(
                     if isinstance(archive_receipt, SourceArchiveReceipt)
                     else None
                 ),
+                source_equivalence_class=(
+                    archive_receipt.source_equivalence_class.value
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    and archive_receipt.source_equivalence_class is not None
+                    else None
+                ),
+                evidence_class=(
+                    archive_receipt.evidence_class.value
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    and archive_receipt.evidence_class is not None
+                    else None
+                ),
+                observation_kind=(
+                    archive_receipt.observation_kind.value
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    and archive_receipt.observation_kind is not None
+                    else None
+                ),
+                quality_score=(
+                    archive_receipt.quality_score
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                quality_reasons=(
+                    list(archive_receipt.quality_reasons)
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else []
+                ),
+                archive_snapshot_time=(
+                    archive_receipt.archive_snapshot_time.isoformat()
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    and archive_receipt.archive_snapshot_time is not None
+                    else None
+                ),
+                model_generated=(
+                    archive_receipt.model_generated
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                primary_source_verified=(
+                    archive_receipt.primary_source_verified
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
+                ioc_primary_verified=(
+                    archive_receipt.ioc_primary_verified
+                    if isinstance(archive_receipt, SourceArchiveReceipt)
+                    else None
+                ),
             )
             if archive_receipt is not None
             else None
@@ -712,6 +834,9 @@ def _attempt_view(attempt: CollectionAttempt) -> AttemptView:
             if attempt.candidate_resolution_provenance is not None
             else None
         ),
+        strategy_name=attempt.strategy_name,
+        strategy_version=attempt.strategy_version,
+        duration_ms=attempt.duration_ms,
     )
 
 

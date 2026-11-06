@@ -364,6 +364,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         fallback_strategy_timeouts=settings.collection_acquisition_strategy_timeout_seconds,
         fallback_min_text_chars=settings.collection_fallback_min_text_chars,
         fallback_playwright_sidecar_url=settings.collection_playwright_sidecar_url or None,
+        acquisition_deadline_seconds=settings.collection_acquisition_deadline_seconds,
+        acquisition_max_attempts=settings.collection_acquisition_max_attempts,
+        acquisition_per_domain_concurrency=settings.collection_acquisition_per_domain_concurrency,
+        fallback_endpoint_enabled=settings.collection_fallback_endpoint_enabled,
+        browser_navigation_enabled=settings.collection_browser_navigation_enabled,
+        browser_control_socket=settings.collection_browser_control_socket,
+        syndication_domains=settings.collection_syndication_domains,
+        exact_title_search_endpoint=settings.collection_exact_title_search_endpoint,
+        third_party_provider_url=settings.collection_third_party_provider_url,
+        third_party_provider_token=settings.collection_third_party_provider_token,
+        third_party_provider_enabled=settings.collection_third_party_provider_enabled,
+        ocr_command=settings.collection_ocr_command,
     )
     collection_review_service = CollectionReviewService(
         uow_factory,
