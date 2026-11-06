@@ -131,9 +131,30 @@ def test_policy_context_allows_only_public_allowed_domains() -> None:
         policy.check_url("http://127.0.0.1/article")
         is AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
     )
+    assert policy.check_url("file:///etc/passwd") is AcquisitionPolicyDecision.DENIED_PUBLIC_ACCESS
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        "127.1",
+        "10.1",
+        "192.168.1",
+        "2130706433",
+        "0x7f000001",
+        "0177.1",
+    ),
+)
+def test_policy_context_denies_ambiguous_ip_literal_hosts(host: str) -> None:
     assert (
-        policy.check_url("file:///etc/passwd")
-        is AcquisitionPolicyDecision.DENIED_PUBLIC_ACCESS
+        _policy(allowed_domains=frozenset()).check_url(f"http://{host}/article")
+        is AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
+    )
+
+
+def test_policy_context_still_allows_public_hostname() -> None:
+    assert (
+        _policy().check_url("https://news.example.com/article") is AcquisitionPolicyDecision.ALLOWED
     )
 
 
@@ -143,8 +164,7 @@ def test_empty_domain_allowlist_allows_public_hosts_but_honors_blocklist() -> No
         blocked_domains=frozenset({"blocked.example.net"}),
     )
     assert (
-        policy.check_url("https://public.example.net/article")
-        is AcquisitionPolicyDecision.ALLOWED
+        policy.check_url("https://public.example.net/article") is AcquisitionPolicyDecision.ALLOWED
     )
     assert (
         policy.check_url("https://blocked.example.net/article")
@@ -177,17 +197,16 @@ def test_disclosure_policy_checks_external_llm_do_not_submit_and_tlp() -> None:
         _policy(external_llm_allowed=False).check_destination(url, external_llm=True)
         is AcquisitionPolicyDecision.DENIED_EXTERNAL_LLM
     )
-    assert _policy(do_not_submit=True, tlp=TLP.AMBER).check_destination(
-        url, external_llm=True
-    ) is AcquisitionPolicyDecision.ALLOWED
+    assert (
+        _policy(do_not_submit=True, tlp=TLP.AMBER).check_destination(url, external_llm=True)
+        is AcquisitionPolicyDecision.ALLOWED
+    )
     assert (
         _policy(tlp=TLP.RED).check_destination(url, external_llm=True)
         is AcquisitionPolicyDecision.DENIED_TLP
     )
     assert (
-        _policy(tlp="red", external_llm_allowed=True).check_destination(
-            url, external_llm=True
-        )
+        _policy(tlp="red", external_llm_allowed=True).check_destination(url, external_llm=True)
         is AcquisitionPolicyDecision.DENIED_TLP
     )
     assert (

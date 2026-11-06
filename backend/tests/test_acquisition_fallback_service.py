@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -44,6 +45,7 @@ from cti_app.domain.acquisition import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
+    CollectionFailureReason,
     CollectionState,
     DetectedMimeType,
     SourceAcquisitionMethod,
@@ -76,6 +78,23 @@ class Transport:
         if not self.responses:
             raise AssertionError("unexpected direct HTTP request")
         return self.responses.pop(0)
+
+
+class ConcurrencyTransport(Transport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = 0
+        self.maximum_active = 0
+
+    async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+        self.requests.append(request)
+        self.active += 1
+        self.maximum_active = max(self.maximum_active, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return RawHttpResponse(200, {"content-type": "text/plain"}, _ARTICLE)
+        finally:
+            self.active -= 1
 
 
 def _response(url: str, body: bytes = _ARTICLE) -> CollectedResponse:
@@ -144,6 +163,21 @@ class SuccessStrategy:
                 publisher="Example Publisher",
                 primary_source_verified=True,
                 ioc_primary_verified=True,
+            ),
+        )
+
+
+class FetchingSuccessStrategy(SuccessStrategy):
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        response = await request.fetch(request.requested_url, {}, 1.0, False)
+        probe = (await super().acquire(request))[0]
+        return (
+            replace(
+                probe,
+                response=response,
+                http_status=response.status,
+                encoded_size=response.encoded_size,
+                encoded_sha256=response.encoded_sha256,
             ),
         )
 
@@ -469,6 +503,94 @@ async def test_policy_denied_private_source_never_enters_fallback_chain(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "https://discovery.example/report?api_key=privatevalue123",
+        "https://user:secret@discovery.example/report",
+    ),
+)
+async def test_credential_like_requested_url_is_blocked_before_fetch_or_fallback(
+    tmp_path, unsafe_url
+):
+    transport = Transport()
+    strategy = SuccessStrategy()
+    factory, service, _subject, source, _blob_store = await _service(
+        tmp_path, transport=transport, strategies=(strategy,)
+    )
+    source.requested_url = unsafe_url
+    source.state = CollectionState.PENDING
+
+    state = await service.archive_one(source.id, uuid4())
+
+    saved_source = factory.collections[source.id]
+    assert state is CollectionState.BLOCKED
+    assert transport.requests == []
+    assert strategy.calls == 0
+    assert saved_source.source_document_id is None
+    assert saved_source.failure_reason_code is CollectionFailureReason.UNSAFE_DESTINATION
+    assert saved_source.error_reason == "Credential-like URL is not eligible for collection"
+    assert "privatevalue123" not in saved_source.error_reason
+    assert "secret" not in saved_source.error_reason
+    assert factory.documents == {}
+
+
+@pytest.mark.asyncio
+async def test_direct_collection_allows_benign_query_parameters(tmp_path):
+    requested_url = "https://discovery.example/report?edition=2026&lang=en"
+    transport = Transport([RawHttpResponse(200, {"content-type": "text/plain"}, _ARTICLE)])
+    _factory, service, _subject, source, _blob_store = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(SuccessStrategy(),),
+        source_url=requested_url,
+    )
+    source.state = CollectionState.PENDING
+
+    state = await service.archive_one(source.id, uuid4())
+
+    assert state is CollectionState.ARCHIVED
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url == source.requested_url
+
+
+@pytest.mark.asyncio
+async def test_service_fallback_runs_share_per_host_limiter(tmp_path):
+    transport = ConcurrencyTransport()
+    strategy = FetchingSuccessStrategy()
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        (
+            "https://discovery.example/first",
+            "https://discovery.example/second",
+        ),
+    )
+    service = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, Resolver(), CollectionPolicy()),
+        FilesystemBlobStore(tmp_path / "blobs"),
+        fallback_strategies=(strategy,),
+        acquisition_per_domain_concurrency=1,
+    )
+    sources = await service.initialize(subject.id)
+    assert len(sources) == 2
+    for source in sources:
+        factory.collections[source.id].state = CollectionState.BLOCKED
+
+    states = await asyncio.gather(
+        *(
+            service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+            for source in sources
+        )
+    )
+
+    assert states == [CollectionState.ARCHIVED, CollectionState.ARCHIVED]
+    assert len(transport.requests) == 2
+    assert transport.maximum_active == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("manual", [False, True], ids=["direct", "manual"])
 async def test_fallback_cannot_replace_attached_direct_or_manual_document(tmp_path, manual):
     body = b"<html><body>" + _ARTICLE + b"</body></html>"
@@ -508,6 +630,43 @@ async def test_fallback_cannot_replace_attached_direct_or_manual_document(tmp_pa
     assert factory.collections[source.id].source_document_id == document_id
     assert len(factory.documents) == before_documents == 1
     assert not any(event.event_type == "source.archived_fallback" for event in factory.provenance)
+
+
+@pytest.mark.asyncio
+async def test_fallback_archive_respects_manual_upload_lease(tmp_path):
+    factory, service, _subject, source, _blob_store = await _service(
+        tmp_path, transport=Transport(), strategies=(SuccessStrategy(),)
+    )
+    manual_lease_id = uuid4()
+    assert source.claim_manual_upload(
+        manual_lease_id,
+        lease_duration=timedelta(minutes=5),
+        policy_snapshot_id=service._policy_snapshot.id,
+    )
+    attempts_before = len(factory.attempts)
+    documents_before = len(factory.documents)
+    provenance_before = len(factory.provenance)
+
+    receipt = await service._archive(
+        source.id,
+        datetime.now(UTC),
+        _response(source.canonical_url),
+        acquisition=_FallbackAcquisition(
+            job_id=uuid4(),
+            method=SourceAcquisitionMethod.EXACT_TITLE_SEARCH,
+            strategy_name="test_exact_title",
+            strategy_version="1",
+        ),
+    )
+
+    assert receipt is None
+    assert source.state is CollectionState.FETCHING
+    assert source.manual_lease_id == manual_lease_id
+    assert source.fetch_job_id is None
+    assert source.source_document_id is None
+    assert len(factory.attempts) == attempts_before
+    assert len(factory.documents) == documents_before == 0
+    assert len(factory.provenance) == provenance_before
 
 
 @pytest.mark.asyncio

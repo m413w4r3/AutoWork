@@ -92,6 +92,9 @@ _SENSITIVE_VALUE = re.compile(
     r"(?:[=/:-])[^/?&\s]{8,}",
     re.IGNORECASE,
 )
+_AMBIGUOUS_IP_LITERAL = re.compile(
+    r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|[0-9]+))*$"
+)
 
 
 def _clean_text(value: str | None, limit: int) -> str | None:
@@ -123,9 +126,11 @@ def _host_matches(hostname: str, domain: str) -> bool:
 
 
 def _looks_private_hostname(hostname: str) -> bool:
-    return hostname == "localhost" or hostname.endswith(
-        (".localhost", ".local", ".internal", ".home", ".lan")
-    ) or "." not in hostname
+    return (
+        hostname == "localhost"
+        or hostname.endswith((".localhost", ".local", ".internal", ".home", ".lan"))
+        or "." not in hostname
+    )
 
 
 def is_credential_free_url(url: str) -> bool:
@@ -260,7 +265,9 @@ class AcquisitionPolicyContext:
         try:
             address = ipaddress.ip_address(normalized_host)
         except ValueError:
-            if _looks_private_hostname(normalized_host):
+            if _looks_private_hostname(normalized_host) or _AMBIGUOUS_IP_LITERAL.fullmatch(
+                normalized_host
+            ):
                 return AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
         else:
             if not address.is_global:

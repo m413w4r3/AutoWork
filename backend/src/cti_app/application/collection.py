@@ -27,7 +27,10 @@ from cti_app.application.acquisition_fallbacks import (
     parse_bridge_transcription,
     safe_fallback_url,
 )
-from cti_app.application.acquisition_orchestrator import ArticleAcquisitionOrchestrator
+from cti_app.application.acquisition_orchestrator import (
+    ArticleAcquisitionOrchestrator,
+    DomainConcurrencyLimiter,
+)
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection_errors import (
@@ -67,6 +70,8 @@ from cti_app.domain.acquisition import (
     AcquisitionQuality,
     EvidenceClass,
     SourceEquivalenceClass,
+    credential_free_url,
+    is_credential_free_url,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
@@ -528,6 +533,9 @@ class SubjectCollectionService:
         self._acquisition_deadline_seconds = acquisition_deadline_seconds
         self._acquisition_max_attempts = acquisition_max_attempts
         self._acquisition_per_domain_concurrency = acquisition_per_domain_concurrency
+        self._acquisition_domain_limiter = DomainConcurrencyLimiter(
+            acquisition_per_domain_concurrency
+        )
         if fallback_max_variants < 1:
             raise ValueError("fallback_max_variants must be positive")
         self._fallback_max_variants = fallback_max_variants
@@ -1112,6 +1120,17 @@ class SubjectCollectionService:
             await uow.commit()
 
         started_at = collection.fetch_started_at or datetime.now(UTC)
+        if not is_credential_free_url(collection.requested_url):
+            error = UnsafeAddressError("Credential-like URL is not eligible for collection")
+            state = await self._record_failure(collection.id, job_id, started_at, error)
+            self._log_source_result(
+                collection,
+                job_id,
+                state,
+                operation_started,
+                error=error,
+            )
+            return state
         try:
             response = await self._collector.fetch(
                 collection.requested_url,
@@ -1494,7 +1513,11 @@ class SubjectCollectionService:
                 "subject_id": str(collection.subject_id),
                 "source_collection_id": str(collection.id),
                 "source_candidate_id": str(collection.source_candidate_id),
-                "requested_url": collection.requested_url,
+                "requested_url": (
+                    collection.requested_url
+                    if is_credential_free_url(collection.requested_url)
+                    else credential_free_url(collection.requested_url)
+                ),
                 "phase": "persisted",
                 "state": state.value,
                 "duration_ms": round((time.monotonic() - started) * 1000),
@@ -1733,9 +1756,7 @@ class SubjectCollectionService:
                     ),
                 }
                 if fallback is not None:
-                    fallback_publication_date = (
-                        fallback.publication_date or meta_published_at
-                    )
+                    fallback_publication_date = fallback.publication_date or meta_published_at
                     payload.update(
                         {
                             "strategy_name": fallback.strategy_name,
@@ -2193,6 +2214,7 @@ class SubjectCollectionService:
         deferred_success_probes: dict[int, AcquisitionProbe] = {}
         attempted_count = 0
         attempt_limit = self._acquisition_max_attempts
+
         class RecordingStrategy:
             """Persist non-winning diagnostics before a later callback can archive."""
 
@@ -2340,6 +2362,7 @@ class SubjectCollectionService:
             deadline_seconds=self._acquisition_deadline_seconds,
             max_attempts=self._acquisition_max_attempts,
             per_domain_concurrency=self._acquisition_per_domain_concurrency,
+            domain_limiter=self._acquisition_domain_limiter,
         )
         result = await orchestrator.run(
             request,
@@ -3401,6 +3424,8 @@ async def _discovery_source(
 
 
 async def _require_collection(uow: UnitOfWork, collection_id: UUID) -> SourceCollection:
+    # PostgreSQL holds this row lock through the caller's commit, which keeps
+    # collection pointer and lease precedence checks atomic for fallback saves.
     collection = await uow.source_collections.get_for_update(collection_id)
     if collection is None:
         raise CollectionItemNotFoundError(str(collection_id))
