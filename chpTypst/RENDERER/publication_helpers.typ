@@ -826,7 +826,7 @@
     item.media_path,
     caption-content,
     annotation: annotation,
-    max-height-fraction: 0.15,
+    max-height-fraction: 0.36,
   )
 }
 
