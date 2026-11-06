@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cti_app.application.extraction import parse_document
 from cti_app.application.production_artifact_verification import (
     Q2ProposalSubmission,
@@ -23,8 +25,10 @@ from cti_app.application.production_source_evidence import (
     verify_q2_output_against_source,
 )
 from cti_app.domain.collection import DetectedMimeType
+from cti_app.domain.indicator_normalization import normalize_publication_indicator_value
 from cti_app.domain.production_extraction import decode_indicator_section_paths
 from cti_app.domain.production_references import ProductionReferenceKind
+from cti_app.domain.publication import ArtifactType
 
 
 def _artifact(
@@ -50,6 +54,55 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
     # The quote is the local source area, never the model-supplied quote.
     assert result.output.artifacts[0].evidence_quote == "The domain is evil.com."
     assert result.rejections == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "normalized"),
+    (
+        ("153.75.247.94:80", "153.75.247.94"),
+        ("153.75.247[.]94:80", "153.75.247.94"),
+        ("153.75.247(.)94:80", "153.75.247.94"),
+        ("hxxp://153.75.247[.]94:80", "153.75.247.94"),
+        ("hxxps[:]//153.75.247(.)94:443", "153.75.247.94"),
+        ("[2001:0db8::1]:443", "2001:db8::1"),
+        ("2001:DB8::1", "2001:db8::1"),
+    ),
+)
+def test_ip_endpoints_normalize_for_publication_without_changing_ipv6(
+    value: str, normalized: str
+) -> None:
+    assert normalize_publication_indicator_value(value, ArtifactType.IP) == normalized
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "999.1.1.1",
+        "999.1.1.1:80",
+        "not an IP",
+        "153.75.247.94:65536",
+        "http://153.75.247.94:80/path",
+    ),
+)
+def test_publication_ip_endpoint_normalization_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_publication_indicator_value(value, ArtifactType.IP)
+
+
+def test_source_evidence_gate_preserves_ip_port_value_and_quotes_local_evidence() -> None:
+    value = "153.75.247[.]94:80"
+    source_quote = "The annex lists 153.75.247[.]94:80 as an endpoint."
+    result = verify_q2_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact(value, "ip")]),
+        source_quote,
+    )
+
+    assert result.rejections == ()
+    assert result.output.artifacts[0].value == value
+    assert (
+        result.output.artifacts[0].evidence_quote
+        == "The annex lists 153.75.247.94:80 as an endpoint."
+    )
 
 
 def test_full_gate_preserves_facts_but_filters_artifacts_and_rules() -> None:

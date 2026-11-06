@@ -17,7 +17,7 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import references_corpus_hash
-from cti_app.application.production_normalization import normalize_indicator_value
+from cti_app.application.production_normalization import normalize_publication_indicator_value
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.semantic_annotation import (
     SemanticAnnotator,
@@ -383,7 +383,7 @@ def _project_publication_iocs(
                 )
                 continue
             try:
-                value = normalize_indicator_value(item.value, item.artifact_type)
+                value = normalize_publication_indicator_value(item.value, item.artifact_type)
             except ValueError as exc:
                 raise ValueError(f"Confirmed IOC {item.value!r} cannot be normalized") from exc
             if not is_supported_subject_ioc_hash(item.artifact_type, value):

@@ -2082,6 +2082,85 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
     )
 
 
+def test_assembly_normalizes_ip_endpoint_deduplicates_and_keeps_evidence_hashes_stable() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    endpoint = ExtractionIndicatorV1(
+        value="153.75.247[.]94:80",
+        artifact_type=ArtifactType.IP,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="C2 infrastructure",
+        evidence_quote="The annex lists 153.75.247.94:80.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    bare_ip = ExtractionIndicatorV1(
+        value="153.75.247.94",
+        artifact_type=ArtifactType.IP,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="C2 infrastructure",
+        evidence_quote="The source writes 153.75.247.94.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction = replace(
+        extraction,
+        sources=(replace(source, indicators=(endpoint, bare_ip)),),
+    )
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    extraction_hash = canonical_extraction_hash(extraction)
+    assembly_hash = compute_assembly_input_hash(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    def build():
+        return build_publication_document_v5(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+        )
+
+    publication = build()
+    repeated_publication = build()
+    ip_group = next(
+        group for group in publication.indicators if group.artifact_type is ArtifactType.IP
+    )
+
+    assert len(ip_group.indicators) == 1
+    assert ip_group.indicators[0].value == "153.75.247.94"
+    assert ip_group.indicators[0].normalized_value == "153.75.247.94"
+    assert ip_group.indicators[0].source_document_ids == (source.source_document_id,)
+    ip_details = [item for item in publication.ioc_details if item.artifact_type is ArtifactType.IP]
+    assert {(item.value, item.evidence_quote, item.context) for item in ip_details} == {
+        (endpoint.value, endpoint.evidence_quote, endpoint.context),
+        (bare_ip.value, bare_ip.evidence_quote, bare_ip.context),
+    }
+    assert all(item.normalized_value == "153.75.247.94" for item in ip_details)
+    assert all(item.source_document_ids == (source.source_document_id,) for item in ip_details)
+    assert publication == repeated_publication
+    assert publication_document_v5_to_json(publication) == publication_document_v5_to_json(
+        repeated_publication
+    )
+    assert canonical_extraction_hash(extraction) == extraction_hash
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+        )
+        == assembly_hash
+    )
+
+
 def test_publication_ioc_projection_removes_generic_services_only() -> None:
     _, _, extraction, synthesis = _canonical_inputs()
     source = extraction.sources[0]

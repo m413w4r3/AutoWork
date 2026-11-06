@@ -66,6 +66,70 @@ def normalize_indicator_value(raw: str, artifact_type: ArtifactType) -> str:
     return value
 
 
+def normalize_publication_indicator_value(raw: str, artifact_type: ArtifactType) -> str:
+    """Normalize a publication IOC, accepting a valid IP endpoint as its host IP.
+
+    Extraction keeps the source-verified original value and uses the stricter
+    ``normalize_indicator_value`` for its deduplication key. This publication
+    projection accepts endpoint-shaped values without changing that
+    extraction identity or discarding the original value from IOC detail rows.
+    """
+    try:
+        return normalize_indicator_value(raw, artifact_type)
+    except ValueError:
+        if artifact_type is not ArtifactType.IP:
+            raise
+    return _normalize_ip_endpoint(raw)
+
+
+def _normalize_ip_endpoint(raw: str) -> str:
+    value = refang(raw)
+    if value.lower().startswith(("http://", "https://")):
+        try:
+            parts = urlsplit(value)
+            hostname = parts.hostname
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("Invalid IP endpoint") from exc
+        if (
+            parts.scheme.lower() not in {"http", "https"}
+            or hostname is None
+            or port is None
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path not in {"", "/"}
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError("Invalid IP endpoint")
+        address = ipaddress.ip_address(hostname)
+    elif value.startswith("["):
+        closing = value.find("]")
+        if closing < 0 or value[closing + 1 : closing + 2] != ":":
+            raise ValueError("Invalid IP endpoint")
+        address = ipaddress.ip_address(value[1:closing])
+        if address.version != 6:
+            raise ValueError("Invalid IP endpoint")
+        port_text = value[closing + 2 :]
+        _validate_endpoint_port(port_text)
+    else:
+        host, separator, port_text = value.rpartition(":")
+        if not separator or ":" in host:
+            raise ValueError("Invalid IP endpoint")
+        address = ipaddress.ip_address(host)
+        if address.version != 4:
+            raise ValueError("Invalid IP endpoint")
+        _validate_endpoint_port(port_text)
+    return str(address)
+
+
+def _validate_endpoint_port(value: str) -> None:
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("Invalid IP endpoint port")
+    if not 1 <= int(value) <= 65535:
+        raise ValueError("Invalid IP endpoint port")
+
+
 def canonical_indicator_key(raw: str, artifact_type: ArtifactType) -> str:
     """Key used for exact, type-aware indicator comparison and deduplication."""
     return normalize_indicator_value(raw, artifact_type)
