@@ -529,7 +529,7 @@ async def test_credential_like_requested_url_is_blocked_before_fetch_or_fallback
     assert strategy.calls == 0
     assert saved_source.source_document_id is None
     assert saved_source.failure_reason_code is CollectionFailureReason.UNSAFE_DESTINATION
-    assert saved_source.error_reason == "Credential-like URL is not eligible for collection"
+    assert saved_source.error_reason == "credential-like URL rejected"
     assert "privatevalue123" not in saved_source.error_reason
     assert "secret" not in saved_source.error_reason
     assert factory.documents == {}

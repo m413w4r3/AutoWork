@@ -1723,10 +1723,21 @@ class _BrowserStrategy:
                     decision=decision,
                 ),
             )
+        adapter = self.adapter
+        if adapter is None:
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason="browser_navigation_disabled",
+                    outcome=AcquisitionOutcome.SKIPPED,
+                    capability=AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+                ),
+            )
         started = time.monotonic()
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                observation = await self.adapter.navigate(request.requested_url)
+                observation = await adapter.navigate(request.requested_url)
         except TimeoutError:
             return (_browser_failure_probe(self, request, reason="browser_timeout"),)
         except Exception:
@@ -1977,15 +1988,15 @@ class _PolicyAwareStrategy:
 
     @property
     def name(self) -> str:
-        return self.inner.name
+        return str(self.inner.name)
 
     @property
     def version(self) -> str:
-        return self.inner.version
+        return str(self.inner.version)
 
     @property
     def method(self) -> SourceAcquisitionMethod:
-        return self.inner.method
+        return cast(SourceAcquisitionMethod, self.inner.method)
 
     @property
     def enabled(self) -> bool:
@@ -2102,8 +2113,8 @@ class _PolicyAwareStrategy:
             return probes
         result: list[AcquisitionProbe] = []
         for probe in probes:
-            decision = denied.get(probe.requested_url)
-            if decision is None or probe.outcome is not AcquisitionOutcome.FAILED:
+            denied_decision = denied.get(probe.requested_url)
+            if denied_decision is None or probe.outcome is not AcquisitionOutcome.FAILED:
                 result.append(probe)
                 continue
             result.append(
@@ -2112,7 +2123,7 @@ class _PolicyAwareStrategy:
                     outcome=AcquisitionOutcome.POLICY_SKIPPED,
                     reason_code="destination_policy_denied",
                     response=None,
-                    policy_decision=decision,
+                    policy_decision=denied_decision,
                     capability_state=AcquisitionCapabilityState.BLOCKED_BY_POLICY,
                 )
             )
