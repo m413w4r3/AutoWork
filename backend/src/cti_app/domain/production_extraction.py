@@ -799,7 +799,14 @@ _SOURCE_KEYS = frozenset(
     }
 )
 _SOURCE_KEYS_WITHOUT_ACQUISITION = _SOURCE_KEYS - {"acquisition_method"}
-_LEGACY_SOURCE_KEYS = _SOURCE_KEYS - {"scope", "acquisition_method"}
+_SOURCE_KEYS_WITHOUT_SCOPE = _SOURCE_KEYS - {"scope"}
+_SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE = _SOURCE_KEYS - {"editorial_role"}
+_SOURCE_KEYS_WITHOUT_ACQUISITION_OR_EDITORIAL_ROLE = _SOURCE_KEYS_WITHOUT_ACQUISITION - {
+    "editorial_role"
+}
+_SOURCE_KEYS_WITHOUT_SCOPE_OR_EDITORIAL_ROLE = _SOURCE_KEYS_WITHOUT_SCOPE - {"editorial_role"}
+_LEGACY_SOURCE_KEYS = _SOURCE_KEYS_WITHOUT_SCOPE - {"acquisition_method"}
+_LEGACY_SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE = _LEGACY_SOURCE_KEYS - {"editorial_role"}
 _FACT_KEYS = frozenset(
     {
         "category",
@@ -1141,7 +1148,12 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
     if not isinstance(raw, Mapping) or set(raw) not in {
         _SOURCE_KEYS,
         _SOURCE_KEYS_WITHOUT_ACQUISITION,
+        _SOURCE_KEYS_WITHOUT_SCOPE,
         _LEGACY_SOURCE_KEYS,
+        _SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE,
+        _SOURCE_KEYS_WITHOUT_ACQUISITION_OR_EDITORIAL_ROLE,
+        _SOURCE_KEYS_WITHOUT_SCOPE_OR_EDITORIAL_ROLE,
+        _LEGACY_SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE,
     }:
         raise ValueError("Extraction source payload has an invalid shape")
     payload = raw
@@ -1152,7 +1164,11 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
         tier=_enum(ProductionReferenceTier, payload["tier"], "tier"),
         kind=_enum(ProductionReferenceKind, payload["kind"], "kind"),
         role=_enum(SourceRole, payload["role"], "role"),
-        editorial_role=_enum(ProductionEditorialRole, payload["editorial_role"], "editorial_role"),
+        editorial_role=(
+            _enum(ProductionEditorialRole, payload["editorial_role"], "editorial_role")
+            if "editorial_role" in payload
+            else None
+        ),
         profile=_enum(ExtractionProfile, payload["profile"], "profile"),
         profile_reason_code=_enum(
             ExtractionProfileReasonCode,

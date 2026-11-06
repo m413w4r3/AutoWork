@@ -4791,13 +4791,28 @@ def test_extraction_hash_recognizes_legacy_payload_without_optional_scope() -> N
     payload = production_extraction_to_json(world.extraction)
     for source in payload["sources"]:
         source.pop("scope")
+        assert "acquisition_method" in source
     legacy_extraction = production_extraction_from_json(payload)
+    historical_payload = {
+        **payload,
+        "sources": [
+            {key: value for key, value in source.items() if key != "acquisition_method"}
+            for source in payload["sources"]
+        ],
+    }
     legacy_hash = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(
+            historical_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
 
+    assert all(
+        source["scope"] is None and source["acquisition_method"] == "direct_http"
+        for source in production_extraction_to_json(legacy_extraction)["sources"]
+    )
     assert production_extraction_hashes(legacy_extraction)[0] == canonical_extraction_hash(
         legacy_extraction
     )

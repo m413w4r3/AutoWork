@@ -417,7 +417,7 @@ def test_production_reference_proposal_accepts_bridge_markdown_links() -> None:
     parsed = parse_production_reference_proposals(raw, date(2026, 8, 1))
 
     assert parsed.value is not None
-    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v4"
+    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v5"
     assert raw.count("## SOURCE ") == 3
     assert [proposal.canonical_url for proposal in parsed.value] == [
         "https://example.test/blog/report"

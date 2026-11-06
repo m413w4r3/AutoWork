@@ -194,7 +194,7 @@ async def test_one_unparseable_archived_source_does_not_rollback_others(tmp_path
     assert result.sources_seen == 2
     assert result.sources_processed == 1
     assert result.sources_failed == 1
-    assert result.outcomes[1].error_code == "unsupported_mime_type"
+    assert result.outcomes[1].error_code == "processing_error"
     assert factory.collections[collections[0].id].state is CollectionState.EXTRACTED
     assert factory.collections[invalid.id].state is CollectionState.ARCHIVED
     assert len(factory.artifacts) == 1
