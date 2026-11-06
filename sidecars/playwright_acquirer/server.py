@@ -59,6 +59,7 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
 _NORMALIZED_CREDENTIAL_QUERY_KEYS = frozenset(
     re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_QUERY_KEYS
 )
+_URL_KEY_ASSIGNMENT = re.compile(r"(?:^|[?&#/;])([^?&#/;=]+)=")
 _JWT_PATH_SEGMENT = re.compile(
     r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$"
 )
@@ -147,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
         except TimeoutError:
             self._write_json(504, {"error": "navigation_timeout"})
             return
-        except Exception as exc:  # noqa: BLE001 — keep browser internals out of responses.
+        except Exception as exc:
             # Playwright and browser errors are intentionally kept out of logs/responses.
             del exc
             self._write_json(503, {"error": "renderer_unavailable"})
@@ -345,7 +346,7 @@ def _route_http_only(route: Any) -> None:
             route.abort()
             return
         route.continue_()
-    except Exception:  # noqa: BLE001 — an invalid route must be aborted fail-closed.
+    except Exception:
         route.abort()
 
 
@@ -392,7 +393,7 @@ def _capture_json_responses(responses: list[Any]) -> list[dict[str, Any]]:
                 continue
             if total + len(body) > MAX_CAPTURE_JSON_TOTAL_BYTES:
                 continue
-        except Exception:  # noqa: BLE001, S112 — discard an unusable capture and continue.
+        except Exception:
             continue
         entries.append(
             {
@@ -447,10 +448,8 @@ def _detect_markers(rendered_html: str) -> tuple[bool, bool, bool]:
     )
 
 
-def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
+def _credential_free_http_url(value: str) -> bool:
     """Reject credential-bearing destinations before Chromium can forward them."""
-    if depth > 3:
-        return False
     try:
         parsed = urlsplit(value)
         if (
@@ -461,17 +460,24 @@ def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
             or parsed.port in {0}
         ):
             return False
-        for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+
+        decoded_url = value
+        for decode_depth in range(4):
+            if any(
+                re.sub(r"[^a-z0-9]", "", match.group(1).casefold())
+                in _NORMALIZED_CREDENTIAL_QUERY_KEYS
+                for match in _URL_KEY_ASSIGNMENT.finditer(decoded_url)
+            ):
+                return False
+            if decode_depth < 3:
+                decoded_url = unquote(decoded_url)
+
+        for key, _query_value in parse_qsl(parsed.query, keep_blank_values=True):
             normalized_key = re.sub(r"[^a-z0-9]", "", unquote(key).casefold())
             cloud_signed_key = normalized_key.startswith(("xamz", "xgoog")) and (
                 normalized_key.endswith(("credential", "signature", "securitytoken"))
             )
             if normalized_key in _NORMALIZED_CREDENTIAL_QUERY_KEYS or cloud_signed_key:
-                return False
-            nested_value = unquote(query_value)
-            if nested_value.casefold().startswith(("http://", "https://")) and not (
-                _credential_free_http_url(nested_value, depth=depth + 1)
-            ):
                 return False
         for segment in parsed.path.split("/"):
             decoded = segment

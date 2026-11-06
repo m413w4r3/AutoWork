@@ -3139,14 +3139,8 @@ class SubjectCollectionService:
                     request=acquisition_request,
                 )
             )
-            final_host = urlsplit(response.final_url).hostname or ""
             same_publisher = _same_acquisition_publisher(
                 collection.canonical_url, response.final_url
-            )
-            syndicated = any(
-                final_host.casefold() == domain.casefold()
-                or final_host.casefold().endswith(f".{domain.casefold()}")
-                for domain in acquisition_request.policy.allowed_syndication_domains
             )
             equivalence = (
                 SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
@@ -3166,7 +3160,7 @@ class SubjectCollectionService:
                     strategy_version="1",
                     method=(
                         SourceAcquisitionMethod.DIRECT_HTTP
-                        if same_publisher or syndicated
+                        if equivalence is SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
                         else SourceAcquisitionMethod.INDEPENDENT_CORROBORATION
                     ),
                     requested_url=candidate_url,

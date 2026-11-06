@@ -38,6 +38,7 @@ from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
     CollectionPolicy,
+    DownloadTransientError,
     RawHttpResponse,
     SafeHttpCollector,
 )
@@ -62,6 +63,7 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
     CollectionFailureReason,
     CollectionState,
+    CollectionTransportClassification,
     DetectedMimeType,
     SourceAcquisitionMethod,
 )
@@ -225,6 +227,7 @@ async def _service(
     gateway: FakeGateway | None = None,
     external_llm_allowed: bool = False,
     source_url: str = "https://discovery.example/report",
+    syndication_domains: str = "",
     acquisition_max_attempts: int = 40,
 ):
     factory = InMemoryCollectionUnitOfWorkFactory()
@@ -236,6 +239,7 @@ async def _service(
         model_gateway=gateway,  # type: ignore[arg-type]
         fallback_strategies=strategies,
         acquisition_max_attempts=acquisition_max_attempts,
+        syndication_domains=syndication_domains,
     )
     source = (await app.initialize(subject.id))[0]
     stored = factory.collections[source.id]
@@ -810,7 +814,7 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
         "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
         "title | publisher | date | URL\n"
         "Report 1 | Research team | UNAVAILABLE | "
-        "https://independent.example/copy\n"
+        "https://syndicated.example/copy\n"
         "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>"
     )
     gateway = FakeGateway(discovery_output)
@@ -822,6 +826,7 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
         strategies=(BridgeSourceDiscoveryStrategy(),),
         gateway=gateway,
         external_llm_allowed=True,
+        syndication_domains="syndicated.example",
     )
 
     assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
@@ -894,6 +899,10 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
         ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL
     )
     assert source_extraction.indicators[0].evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED
+    assert (
+        source_extraction.indicators[0].corroboration_basis
+        is ProductionIndicatorEvidenceBasis.INDEPENDENT_CORROBORATION
+    )
 
     extraction = ProductionExtractionV1(
         schema_version=PRODUCTION_EXTRACTION_SCHEMA_VERSION,
@@ -998,6 +1007,69 @@ async def test_bridge_discovery_retries_candidate_after_transient_fetch_failure(
         "https://independent.example/copy"
     ) == 2
     candidate_hash = hashlib.sha256(b"https://independent.example/copy").hexdigest()
+    candidate_attempts = [
+        event.payload
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_attempted"
+        and event.payload.get("strategy_name") == "bridge_source_discovery"
+        and event.payload.get("attempted_url_sha256") == candidate_hash
+    ]
+    assert [attempt["outcome"] for attempt in candidate_attempts] == ["failed", "archived"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_discovery_retries_candidate_after_transient_timeout(tmp_path):
+    candidate_url = "https://independent.example/copy"
+    discovery_output = (
+        "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
+        "title | publisher | date | URL\n"
+        f"Report 1 | Research team | UNAVAILABLE | {candidate_url}\n"
+        "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>"
+    )
+
+    class TimeoutOnceTransport(Transport):
+        def __init__(self):
+            super().__init__(
+                [_BLOCKED, RawHttpResponse(200, {"content-type": "text/html"}, _ARTICLE)]
+            )
+            self.candidate_timed_out = False
+
+        async def request(self, request):
+            self.requests.append(request)
+            if request.url == candidate_url and not self.candidate_timed_out:
+                self.candidate_timed_out = True
+                raise DownloadTransientError(
+                    "temporary network timeout",
+                    reason_code=CollectionFailureReason.TIMEOUT,
+                    transport_classification=CollectionTransportClassification.TIMEOUT,
+                )
+            return self.responses.pop(0)
+
+    gateway = FakeGateway(discovery_output)
+    transport = TimeoutOnceTransport()
+    factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(BridgeSourceDiscoveryStrategy(),),
+        gateway=gateway,
+        external_llm_allowed=True,
+    )
+
+    first_result = await app.archive_one(source.id, uuid4())
+    assert first_result is CollectionState.BLOCKED
+    retry_job_id = uuid4()
+    assert (
+        await app.fallback_acquire(
+            source.subject_id,
+            source.id,
+            retry_job_id,
+            NoopContext(retry_job_id),
+        )
+        is CollectionState.ARCHIVED
+    )
+
+    assert [request.url for request in transport.requests].count(candidate_url) == 2
+    candidate_hash = hashlib.sha256(candidate_url.encode()).hexdigest()
     candidate_attempts = [
         event.payload
         for event in factory.provenance

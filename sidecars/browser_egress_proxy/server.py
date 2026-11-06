@@ -70,6 +70,7 @@ _CREDENTIAL_URL_KEYS = frozenset(
 _NORMALIZED_CREDENTIAL_URL_KEYS = frozenset(
     re.sub(r"[^a-z0-9]", "", key) for key in _CREDENTIAL_URL_KEYS
 )
+_URL_KEY_ASSIGNMENT = re.compile(r"(?:^|[?&#/;])([^?&#/;=]+)=")
 
 Resolver = Callable[[str], Sequence[str] | Awaitable[Sequence[str]]]
 Connector = Callable[
@@ -802,10 +803,8 @@ def _normalize_hostname(host: str) -> str:
     return normalized
 
 
-def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
+def _credential_free_http_url(value: str) -> bool:
     """Mirror the renderer gate for absolute-form HTTP URLs before forwarding."""
-    if depth > 3:
-        return False
     try:
         parsed = urlsplit(value)
         if (
@@ -816,17 +815,24 @@ def _credential_free_http_url(value: str, *, depth: int = 0) -> bool:
             or parsed.port in {0}
         ):
             return False
-        for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+
+        decoded_url = value
+        for decode_depth in range(4):
+            if any(
+                re.sub(r"[^a-z0-9]", "", match.group(1).casefold())
+                in _NORMALIZED_CREDENTIAL_URL_KEYS
+                for match in _URL_KEY_ASSIGNMENT.finditer(decoded_url)
+            ):
+                return False
+            if decode_depth < 3:
+                decoded_url = unquote(decoded_url)
+
+        for key, _query_value in parse_qsl(parsed.query, keep_blank_values=True):
             normalized_key = re.sub(r"[^a-z0-9]", "", unquote(key).casefold())
             cloud_signed_key = normalized_key.startswith(("xamz", "xgoog")) and (
                 normalized_key.endswith(("credential", "signature", "securitytoken"))
             )
             if normalized_key in _NORMALIZED_CREDENTIAL_URL_KEYS or cloud_signed_key:
-                return False
-            nested_value = unquote(query_value)
-            if nested_value.casefold().startswith(("http://", "https://")) and not (
-                _credential_free_http_url(nested_value, depth=depth + 1)
-            ):
                 return False
         for segment in parsed.path.split("/"):
             decoded = segment
