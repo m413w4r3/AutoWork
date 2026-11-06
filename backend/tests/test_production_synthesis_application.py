@@ -37,6 +37,7 @@ from cti_app.application.production_brief_synthesis import (
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
 )
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_prompts import SYNTHESIS_EDITORIAL_CONTRACT_V5
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_relevance import build_relevance_projection
@@ -162,6 +163,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionV1,
     extraction_evidence_refs_v1,
     is_valid_editorial_title,
+    production_synthesis_from_json,
     production_synthesis_to_json,
     resolve_timeline_date_text,
 )
@@ -6638,6 +6640,10 @@ class _RevisionArtifactRepository:
     async def get_current_for_revision(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
         return await self.get_current(run_id, stage)
 
+    async def find_reusable(self, **kwargs: object) -> None:
+        del kwargs
+        return None
+
     async def append(self, artifact: ProductionArtifact) -> None:
         self.artifacts.append(artifact)
 
@@ -6667,16 +6673,25 @@ class _RevisionMemoryUow:
         artifacts: _RevisionArtifactRepository,
         documents: MemorySourceDocuments,
         repair_decisions: tuple[ProductionRepairDecision, ...] = (),
+        routing_decision: ProductionRoutingDecisionV1 | None = None,
     ) -> None:
         self.production_runs = SimpleNamespace(
             get_current_for_subject=lambda subject_id: _async_value(
                 run if subject_id == run.subject_id else None
-            )
+            ),
+            get_for_update=lambda run_id: _async_value(run if run_id == run.id else None),
         )
         self.production_input_snapshots = SimpleNamespace(
             get_by_run=lambda run_id: _async_value(snapshot if run_id == run.id else None)
         )
         self.production_artifacts = artifacts
+        self.production_routing_decisions = SimpleNamespace(
+            get=lambda decision_id: _async_value(
+                routing_decision
+                if routing_decision is not None and decision_id == routing_decision.decision_id
+                else None
+            )
+        )
         self.production_repair_decisions = SimpleNamespace(
             effective_decisions=lambda edition_id, subject_id: _async_value(
                 tuple(
@@ -6720,6 +6735,7 @@ class _FailOnceSynthesisWriter:
         raw_result: str | None,
         model_run_id: UUID | None,
         snapshot: ProductionInputSnapshot | None = None,
+        publication_kind: PublicationKind = PublicationKind.ARTICLE,
         mode: SynthesisMode = SynthesisMode.FRESH,
         model_policy_version: str = "",
         routing_policy_version: str = "",
@@ -6745,6 +6761,7 @@ class _FailOnceSynthesisWriter:
             synthesis=synthesis,
             extraction=extraction,
             snapshot=snapshot,
+            publication_kind=publication_kind,
             raw_result=raw_result,
             model_run_id=model_run_id,
             mode=mode,
@@ -6776,6 +6793,7 @@ class _SynthesisResultWriter(Protocol):
         raw_result: str | None,
         model_run_id: UUID | None,
         snapshot: ProductionInputSnapshot | None = None,
+        publication_kind: PublicationKind = PublicationKind.ARTICLE,
         mode: SynthesisMode = SynthesisMode.FRESH,
         model_policy_version: str = "",
         routing_policy_version: str = "",
@@ -8142,6 +8160,271 @@ def test_targeted_revision_applies_every_synthesis_operation(
         assert len(revised.sections[1].paragraphs) == len(base.sections[1].paragraphs) + 1
     elif operation is TargetedEditorialRevisionOperation.DELETE_PARAGRAPH:
         assert len(revised.sections[1].paragraphs) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        TargetedEditorialRevisionOperation.REWRITE_TITLE,
+        TargetedEditorialRevisionOperation.REWRITE_LEAD,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+    ],
+)
+async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
+    operation: TargetedEditorialRevisionOperation,
+) -> None:
+    from cti_app.application.production_stages import (
+        EditorialEnrichmentService,
+        SynthesisService,
+    )
+    from cti_app.application.production_synthesis_revision import (
+        ProductionSynthesisRevisionService,
+    )
+    from cti_app.application.publication_assembly import PublicationAssemblyService
+
+    world, base, _, _ = _targeted_revision_fixture()
+    source = world.extraction.sources[0]
+    snapshot = snapshot_with_core_source_metadata(
+        world.snapshot,
+        canonical_url=source.canonical_url,
+        published_at=date(2026, 2, 15),
+        title="Frozen report title",
+        publisher="Frozen publisher",
+    )
+    reference_source = ProductionReferenceSourceV1(
+        canonical_url=source.canonical_url,
+        tier=source.tier,
+        kind=source.kind,
+        role=source.role,
+        title="Frozen report title",
+        publisher="Frozen publisher",
+        published_at=date(2026, 2, 15),
+        source_collection_id=None,
+        source_document_id=source.source_document_id,
+        discovery_candidate_ids=(snapshot.core_sources[0].discovery_candidate_id,),
+        collection_state=CollectionState.ARCHIVED,
+        content_sha256=source.content_sha256,
+        relevance_reason=None,
+        proposed_by_model=False,
+        eligible_for_extraction=True,
+        editorial_role=source.editorial_role,
+    )
+    references = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=snapshot.subject_id,
+        research_date=snapshot.research_date,
+        production_input_hash=snapshot.input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(reference_source,),
+        warnings=(),
+    )
+    extraction = replace(
+        _matched_extraction(snapshot, source),
+        references_corpus_hash=references_corpus_hash(references),
+    )
+    timeline_warnings: list[str] = []
+    timeline = brief_timeline_from_extraction(
+        extraction,
+        (),
+        snapshot=snapshot,
+        warnings=timeline_warnings,
+    )
+    assert timeline is not None
+    base = replace(
+        base,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        timeline=timeline,
+        warnings=tuple(timeline_warnings),
+    )
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    handle = next(
+        str(item["handle"])
+        for item in evidence_pack.narrative_evidence
+        if item.get("kind") == EvidenceKind.FACT.value
+    )
+    payload = production_synthesis_to_json(base)
+
+    if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
+        target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
+        after = f"@@TITLE@@\n[{snapshot.actor_or_campaign}] Updated FooRAT activity\n@@END TITLE@@"
+    elif operation is TargetedEditorialRevisionOperation.REWRITE_LEAD:
+        target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.LEAD)
+        after = f"@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: {handle}\nTEXT: The report identifies FooRAT."
+    else:
+        section = payload["sections"][1]
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+            stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+            parent_id=synthesis_revision_module._section_id(section),
+        )
+        after = (
+            "@@SECTION overview S001@@\n@@CLAIM C001@@\n"
+            f"EVIDENCE: {handle}\nTEXT: The report identifies FooRAT.\n"
+            "@@END SECTION@@"
+        )
+    patch = _targeted_wire_patch(payload, target, operation, after)
+    wire = (
+        f"@@TARGET@@\n{patch.target}\n"
+        f"@@ACTION@@\n{operation.value}\n"
+        f"@@BASE_ARTIFACT_HASH@@\n{patch.base_artifact_hash}\n"
+        f"@@BEFORE_HASH@@\n{patch.before_hash}\n"
+        f"@@AFTER@@\n{patch.after}\n"
+        f"@@RATIONALE@@\n{patch.rationale}\n@@END@@"
+    )
+
+    route_id = uuid4()
+    routing_decision = ProductionRoutingDecisionV1(
+        decision_id=route_id,
+        production_run_id=world.run.id,
+        pipeline_generation=world.run.pipeline_generation,
+        extraction_artifact_id=world.artifact.id,
+        extraction_artifact_hash=canonical_extraction_hash(extraction),
+        relevance_artifact_id=uuid4(),
+        relevance_artifact_hash="f" * 64,
+        input_hash="d" * 64,
+        policy_version="test-publication-routing-v1",
+        status=RoutingStatus.DECIDED,
+        publication_kind=PublicationKind.BRIEF,
+        reason_code=RoutingReasonCode.NO_SUBJECT_IOC,
+        confirmed_ioc_count=0,
+        contextual_ioc_count=0,
+        ambiguous_ioc_count=0,
+        critical_source_diagnostics=(),
+        decided_at=datetime.now(UTC),
+        decision_hash="e" * 64,
+    )
+    run = replace(world.run, routing_decision_id=route_id)
+    projection = build_relevance_projection(snapshot, extraction)
+    artifact_store = _RevisionMemoryBlobStore()
+    references_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="c" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=artifact_store.add_json(production_reference_corpus_to_json(references)),
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash=EXTRACTION_ARTIFACT_HASH,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=artifact_store.add_json(production_extraction_to_json(extraction)),
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash=projection.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=artifact_store.add_json(relevance_projection_to_json(projection)),
+    )
+    policy = await build_synthesis_access_policy(
+        snapshot, extraction, world.docs, MemorySourceCollections()
+    )
+    policy_hash = synthesis_access_policy_hash(policy)
+    input_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        evidence_pack,
+        policy_hash,
+        publication_kind=PublicationKind.BRIEF,
+        routing_decision_hash=routing_decision.decision_hash,
+        publication_routing_policy_version=routing_decision.policy_version,
+    )
+    base_blob = artifact_store.add_json(payload)
+    base_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash=input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=base_blob,
+        metadata={
+            "publication_kind": PublicationKind.BRIEF.value,
+            "routing_decision_hash": routing_decision.decision_hash,
+            "publication_routing_policy_version": routing_decision.policy_version,
+            "relevance_projection_hash": projection.projection_hash,
+        },
+    )
+    repository = _RevisionArtifactRepository(
+        (references_artifact, extraction_artifact, projection_artifact, base_artifact)
+    )
+
+    def uow_factory() -> _RevisionMemoryUow:
+        return _RevisionMemoryUow(
+            run=run,
+            snapshot=snapshot,
+            artifacts=repository,
+            documents=world.docs,
+            routing_decision=routing_decision,
+        )
+
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=wire))
+    synthesis_service = ProductionSynthesisService(
+        uow_factory=uow_factory,  # type: ignore[arg-type]
+        artifact_store=artifact_store,  # type: ignore[arg-type]
+        model_gateway=gateway,  # type: ignore[arg-type]
+        synthesis_service=SynthesisService(uow_factory, artifact_store),  # type: ignore[arg-type]
+    )
+    revision_service = ProductionSynthesisRevisionService(
+        synthesis_service=synthesis_service,
+        synthesis_persistence=SynthesisService(uow_factory, artifact_store),
+        enrichment_persistence=EditorialEnrichmentService(
+            uow_factory,
+            artifact_store,  # type: ignore[arg-type]
+        ),
+        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    request = TargetedEditorialRevisionRequest(
+        subject_id=snapshot.subject_id,
+        base_artifact_id=base_artifact.id,
+        base_version=base_artifact.version,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=hashlib.sha256(artifact_store.bytes[base_blob]).hexdigest(),
+        target=target,
+        operation=operation,
+        instruction="Make the requested editorial change while preserving the evidence timeline.",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="test-analyst",
+    )
+
+    result = await revision_service.revise(request)
+    assert result.artifact is not None
+    assert result.artifact.metadata["publication_kind"] == PublicationKind.BRIEF.value
+    assert result.artifact.metadata["routing_decision_hash"] == routing_decision.decision_hash
+    assert result.artifact.canonical_blob_id is not None
+    revised_payload = await artifact_store.read_json(result.artifact.canonical_blob_id)
+    assert revised_payload["timeline"] == payload["timeline"]
+    assert revised_payload["timeline"][0]["evidence_refs"][0]["kind"] == (
+        EvidenceKind.SOURCE_METADATA.value
+    )
+
+    publication = await PublicationAssemblyService(artifact_store, repository).assemble_publication(
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=production_synthesis_from_json(revised_payload),
+        editorial_enrichment=None,
+        relevance_projection=projection,
+        publication_kind=PublicationKind.BRIEF,
+        routing_decision_hash=routing_decision.decision_hash,
+        routing_policy_version=routing_decision.policy_version,
+        metadata_extra={"input_artifacts": {"synthesis_artifact_id": str(result.artifact.id)}},
+    )
+    assert publication.artifact.canonical_blob_id is not None
+    assembled_payload = await artifact_store.read_json(publication.artifact.canonical_blob_id)
+    assembled_timeline = assembled_payload["base_publication"]["base_publication"]["timeline"]
+    assert assembled_payload["publication_kind"] == PublicationKind.BRIEF.value
+    assert assembled_timeline[0]["evidence_refs"][0]["kind"] == (EvidenceKind.SOURCE_METADATA.value)
 
 
 @pytest.mark.parametrize(

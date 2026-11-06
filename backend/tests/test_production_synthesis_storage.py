@@ -333,6 +333,20 @@ async def test_source_metadata_reference_requires_matching_frozen_snapshot_at_st
     with pytest.raises(ValueError, match="metadata citation"):
         await service.store_synthesis_result(**article)
 
+    forged_ref = source_metadata_evidence_ref_v1(
+        source_document_id=source.source_document_id,
+        canonical_url=source.canonical_url,
+        title="Forged report title",
+        publisher="Example publisher",
+        published_at=published_at,
+    )
+    forged_synthesis = replace(
+        synthesis,
+        timeline=(replace(synthesis.timeline[0], evidence_refs=(forged_ref,)),),
+    )
+    with pytest.raises(ValueError, match="metadata citation"):
+        await service.store_synthesis_result(**{**common, "synthesis": forged_synthesis})
+
     assert artifact.canonical_blob_id is not None
     assert metadata_ref.kind is EvidenceKind.SOURCE_METADATA
 

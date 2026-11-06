@@ -123,6 +123,7 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_lineage,
     validate_synthesis_section_headings,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.integrations.models import BridgeTransportError
 
 TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = (
@@ -2408,6 +2409,7 @@ class ProductionSynthesisRevisionService:
             )
 
         context = await self._load_context(request, uow=uow)
+        routing_decision = await get_adopted_production_routing_decision(uow=uow, run=context.run)
         resolved = _resolve_target(context.base_payload, request.target, request.operation)
         if request.before_hash is not None and request.before_hash != resolved.before_hash:
             raise TargetedEditorialRevisionConflictError("The targeted element changed")
@@ -2642,6 +2644,18 @@ class ProductionSynthesisRevisionService:
         if not access_policy.external_llm_allowed:
             raise TargetedSynthesisRevisionValidationError("synthesis_revision_policy_blocked")
 
+        if routing_decision is None:
+            publication_kind = PublicationKind.ARTICLE
+            routing_metadata: dict[str, Any] = {}
+        else:
+            assert routing_decision.publication_kind is not None
+            publication_kind = routing_decision.publication_kind
+            routing_metadata = {
+                "publication_kind": publication_kind.value,
+                "routing_decision_hash": routing_decision.decision_hash,
+                "publication_routing_policy_version": routing_decision.policy_version,
+            }
+
         base_request = build_synthesis_model_request(
             context.run,
             context.snapshot,
@@ -2832,6 +2846,7 @@ class ProductionSynthesisRevisionService:
             ),
             projection_hash=projection.projection_hash if projection is not None else None,
             metadata_extra={
+                **routing_metadata,
                 "revision": revision_data,
                 "paragraph_provenance": provenance,
                 "revision_contract_version": SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
@@ -2840,7 +2855,14 @@ class ProductionSynthesisRevisionService:
             expected_current_artifact_id=context.base_artifact.id,
             expected_current_input_hash=context.base_artifact.input_hash,
             expected_current_canonical_sha256=base_hash,
+            expected_routing_decision_id=(
+                routing_decision.decision_id if routing_decision is not None else None
+            ),
+            expected_routing_decision_hash=(
+                routing_decision.decision_hash if routing_decision is not None else None
+            ),
             stale_stages={ProductionArtifactStage.PUBLICATION.value},
+            publication_kind=publication_kind,
             uow=uow,
         )
 
