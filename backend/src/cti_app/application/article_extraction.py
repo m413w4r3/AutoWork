@@ -411,7 +411,7 @@ def _extract_pdf_candidates(
                 return ()
             parts.append(page_text)
         raw_text = "\n\n".join(parts)
-        metadata = reader.metadata or {}
+        metadata: Any = reader.metadata or {}
         title = _metadata_value(metadata, "/Title")
         author = _metadata_value(metadata, "/Author")
         published = _pdf_date(_metadata_value(metadata, "/CreationDate"))
@@ -650,7 +650,9 @@ def _extract_json(
         and value.get("type") in {"rich", "photo", "video", "link"}
         and "html" in value
     ):
-        return _oembed_candidates(value, url, expected_title, expected_languages, min_text_chars)
+        return tuple(
+            _oembed_candidates(value, url, expected_title, expected_languages, min_text_chars)
+        )
     candidates = _cms_json_candidates(
         value, url, expected_title, expected_languages, min_text_chars
     )
@@ -804,8 +806,7 @@ def _cms_json_candidates(
             continue
         content_obj = item.get("content")
         title_obj = item.get("title")
-        is_wordpress = isinstance(content_obj, dict) and "rendered" in content_obj
-        if is_wordpress:
+        if isinstance(content_obj, dict) and "rendered" in content_obj:
             raw = content_obj.get("rendered")
             title = (
                 _string_value(title_obj.get("rendered"))
