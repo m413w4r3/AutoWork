@@ -1,7 +1,7 @@
 """Record fallback acquisition strategy details on collection attempts.
 
 Revision ID: 0009_acquisition_strategy_attempts
-Revises: 0008_production_routing
+Revises: 0008b_version_length
 """
 
 from collections.abc import Sequence
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0009_acquisition_strategy_attempts"
-down_revision: str | None = "0008_production_routing"
+down_revision: str | None = "0008b_version_length"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

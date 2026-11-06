@@ -415,7 +415,7 @@ def test_confirmed_subject_ioc_routes_article_despite_critical_source_omission()
     assert len(decision.critical_source_diagnostics) == 1
 
 
-def test_bridge_transcribed_source_keeps_ioc_contextual_and_routes_brief():
+def test_bridge_transcribed_core_source_keeps_ioc_contextual_and_needs_review():
     extraction = _extraction(
         indicators=(
             _indicator(
@@ -433,13 +433,84 @@ def test_bridge_transcribed_source_keeps_ioc_contextual_and_routes_brief():
 
     decision = _inputs(extraction, _projection(extraction))
 
-    assert decision.status is RoutingStatus.DECIDED
-    assert decision.publication_kind is PublicationKind.BRIEF
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.publication_kind is None
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
     assert decision.confirmed_ioc_count == 0
     assert decision.contextual_ioc_count == 1
     assert extraction.sources[0].indicators[0].evidence_basis is (
         ProductionEvidenceBasis.UNVERIFIED_MODEL_OUTPUT
     )
+
+
+def test_bridge_core_source_blocks_article_promotion_from_another_confirmed_ioc():
+    extraction = _extraction(indicators=(_indicator("first.example"),))
+    bridge_source = replace(
+        extraction.sources[0],
+        acquisition_method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+    )
+    direct_source_id = uuid4()
+    direct_source = _source(
+        source_id=direct_source_id,
+        indicators=(_indicator("second.example", source_id=direct_source_id),),
+    )
+    extraction = replace(extraction, sources=(bridge_source, direct_source))
+
+    decision = _inputs(
+        extraction,
+        _projection(
+            extraction,
+            decisions={
+                "first.example": (
+                    RelevanceClassification.DIRECT,
+                    RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+                ),
+                "second.example": (
+                    RelevanceClassification.DIRECT,
+                    RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+                ),
+            },
+        ),
+    )
+
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.publication_kind is None
+    assert decision.confirmed_ioc_count == 2
+
+
+@pytest.mark.parametrize(
+    "method",
+    (
+        SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
+        SourceAcquisitionMethod.VISUAL_OCR,
+        SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+    ),
+)
+def test_derived_core_sources_force_review_even_with_confirmed_indicator(method):
+    extraction = _extraction(indicators=(_indicator("derived.example"),))
+    extraction = replace(
+        extraction,
+        sources=(replace(extraction.sources[0], acquisition_method=method),),
+    )
+
+    decision = _inputs(
+        extraction,
+        _projection(
+            extraction,
+            decisions={
+                "derived.example": (
+                    RelevanceClassification.DIRECT,
+                    RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+                )
+            },
+        ),
+    )
+
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.publication_kind is None
+    assert decision.confirmed_ioc_count == 1
 
 
 def test_unaccounted_source_extraction_failure_needs_review():

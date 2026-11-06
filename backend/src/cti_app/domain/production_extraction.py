@@ -205,6 +205,12 @@ class ExtractionIndicatorStatus(StrEnum):
     UNVERIFIED_CONTEXTUAL = "unverified_contextual"
 
 
+class ProductionIndicatorEvidenceBasis(StrEnum):
+    """Additional indicator provenance retained by the extraction artifact."""
+
+    INDEPENDENT_CORROBORATION = "independent_corroboration"
+
+
 class ProductionExtractionOmissionReason(StrEnum):
     """Why a corpus source stayed out of the extraction plan."""
 
@@ -436,6 +442,7 @@ class ExtractionIndicatorV1:
     evidence_quote: str
     evidence_basis: ProductionEvidenceBasis
     source_document_ids: tuple[UUID, ...]
+    corroboration_basis: ProductionIndicatorEvidenceBasis | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.value, label="Extraction indicator value")
@@ -453,6 +460,15 @@ class ExtractionIndicatorV1:
         )
         object.__setattr__(self, "source_document_ids", ids)
         object.__setattr__(self, "evidence_quote", quote)
+        if self.corroboration_basis is not None and not isinstance(
+            self.corroboration_basis, ProductionIndicatorEvidenceBasis
+        ):
+            raise ValueError("Extraction indicator corroboration basis is invalid")
+        if (
+            self.corroboration_basis is not None
+            and self.indicator_status is not ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL
+        ):
+            raise ValueError("Corroborating indicators must remain unverified and contextual")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -799,7 +815,14 @@ _SOURCE_KEYS = frozenset(
     }
 )
 _SOURCE_KEYS_WITHOUT_ACQUISITION = _SOURCE_KEYS - {"acquisition_method"}
-_LEGACY_SOURCE_KEYS = _SOURCE_KEYS - {"scope", "acquisition_method"}
+_SOURCE_KEYS_WITHOUT_SCOPE = _SOURCE_KEYS - {"scope"}
+_SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE = _SOURCE_KEYS - {"editorial_role"}
+_SOURCE_KEYS_WITHOUT_ACQUISITION_OR_EDITORIAL_ROLE = _SOURCE_KEYS_WITHOUT_ACQUISITION - {
+    "editorial_role"
+}
+_SOURCE_KEYS_WITHOUT_SCOPE_OR_EDITORIAL_ROLE = _SOURCE_KEYS_WITHOUT_SCOPE - {"editorial_role"}
+_LEGACY_SOURCE_KEYS = _SOURCE_KEYS_WITHOUT_SCOPE - {"acquisition_method"}
+_LEGACY_SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE = _LEGACY_SOURCE_KEYS - {"editorial_role"}
 _FACT_KEYS = frozenset(
     {
         "category",
@@ -833,6 +856,7 @@ _INDICATOR_KEYS = frozenset(
         "source_document_ids",
     }
 )
+_INDICATOR_KEYS_WITH_CORROBORATION = _INDICATOR_KEYS | {"corroboration_basis"}
 _RULE_KEYS = frozenset(
     {
         "rule_type",
@@ -932,7 +956,7 @@ def _event_to_json(event: ExtractionEventV1) -> dict[str, Any]:
 
 
 def _indicator_to_json(indicator: ExtractionIndicatorV1) -> dict[str, Any]:
-    return {
+    payload = {
         "value": indicator.value,
         "artifact_type": indicator.artifact_type.value,
         "indicator_status": indicator.indicator_status.value,
@@ -941,6 +965,9 @@ def _indicator_to_json(indicator: ExtractionIndicatorV1) -> dict[str, Any]:
         "evidence_basis": indicator.evidence_basis.value,
         "source_document_ids": [str(document_id) for document_id in indicator.source_document_ids],
     }
+    if indicator.corroboration_basis is not None:
+        payload["corroboration_basis"] = indicator.corroboration_basis.value
+    return payload
 
 
 def _rule_to_json(rule: ExtractionRuleV1) -> dict[str, Any]:
@@ -1109,7 +1136,12 @@ def _event_from_json(raw: Any) -> ExtractionEventV1:
 
 
 def _indicator_from_json(raw: Any) -> ExtractionIndicatorV1:
-    payload = _require_mapping(raw, _INDICATOR_KEYS, "Extraction indicator payload")
+    if not isinstance(raw, Mapping) or set(raw) not in {
+        _INDICATOR_KEYS,
+        _INDICATOR_KEYS_WITH_CORROBORATION,
+    }:
+        raise ValueError("Extraction indicator payload has an invalid shape")
+    payload = raw
     return ExtractionIndicatorV1(
         value=payload["value"],
         artifact_type=_enum(ArtifactType, payload["artifact_type"], "artifact_type"),
@@ -1120,6 +1152,15 @@ def _indicator_from_json(raw: Any) -> ExtractionIndicatorV1:
         evidence_quote=payload["evidence_quote"],
         evidence_basis=_enum(ProductionEvidenceBasis, payload["evidence_basis"], "evidence_basis"),
         source_document_ids=_uuid_array(payload["source_document_ids"], "source_document_ids"),
+        corroboration_basis=(
+            _enum(
+                ProductionIndicatorEvidenceBasis,
+                payload["corroboration_basis"],
+                "corroboration_basis",
+            )
+            if "corroboration_basis" in payload
+            else None
+        ),
     )
 
 
@@ -1141,7 +1182,12 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
     if not isinstance(raw, Mapping) or set(raw) not in {
         _SOURCE_KEYS,
         _SOURCE_KEYS_WITHOUT_ACQUISITION,
+        _SOURCE_KEYS_WITHOUT_SCOPE,
         _LEGACY_SOURCE_KEYS,
+        _SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE,
+        _SOURCE_KEYS_WITHOUT_ACQUISITION_OR_EDITORIAL_ROLE,
+        _SOURCE_KEYS_WITHOUT_SCOPE_OR_EDITORIAL_ROLE,
+        _LEGACY_SOURCE_KEYS_WITHOUT_EDITORIAL_ROLE,
     }:
         raise ValueError("Extraction source payload has an invalid shape")
     payload = raw
@@ -1152,7 +1198,11 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
         tier=_enum(ProductionReferenceTier, payload["tier"], "tier"),
         kind=_enum(ProductionReferenceKind, payload["kind"], "kind"),
         role=_enum(SourceRole, payload["role"], "role"),
-        editorial_role=_enum(ProductionEditorialRole, payload["editorial_role"], "editorial_role"),
+        editorial_role=(
+            _enum(ProductionEditorialRole, payload["editorial_role"], "editorial_role")
+            if "editorial_role" in payload
+            else None
+        ),
         profile=_enum(ExtractionProfile, payload["profile"], "profile"),
         profile_reason_code=_enum(
             ExtractionProfileReasonCode,

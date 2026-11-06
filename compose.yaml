@@ -175,6 +175,8 @@ services:
       COLLECTION_BLOCKED_DOMAINS: ${COLLECTION_BLOCKED_DOMAINS:-}
       COLLECTION_FETCH_LEASE_SECONDS: ${COLLECTION_FETCH_LEASE_SECONDS:-120}
       COLLECTION_PLAYWRIGHT_SIDECAR_URL: ${COLLECTION_PLAYWRIGHT_SIDECAR_URL:-}
+      COLLECTION_BROWSER_CONTROL_SOCKET: ${COLLECTION_BROWSER_CONTROL_SOCKET:-}
+      COLLECTION_BROWSER_NAVIGATION_ENABLED: ${COLLECTION_BROWSER_NAVIGATION_ENABLED:-false}
       PDF_MAX_DOCUMENT_BYTES: ${PDF_MAX_DOCUMENT_BYTES:-26214400}
       PDF_MAX_PAGES: ${PDF_MAX_PAGES:-200}
       PDF_PARSE_TIMEOUT_SECONDS: ${PDF_PARSE_TIMEOUT_SECONDS:-15}
@@ -290,6 +292,7 @@ services:
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
       - ./var/pdf-inspections:/var/cache/autowork/pdf-inspections
+      - browser-control:/run/browser:ro
     ports:
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     extra_hosts:
@@ -317,7 +320,7 @@ services:
       retries: 12
       start_period: 5s
     restart: unless-stopped
-    networks: [default, analysis-internal, acquisition-browser]
+    networks: [default, analysis-internal]
 
   migrate:
     build:
@@ -355,6 +358,7 @@ services:
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
       - ./var/pdf-inspections:/var/cache/autowork/pdf-inspections
+      - browser-control:/run/browser:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -375,7 +379,7 @@ services:
       retries: 6
     restart: unless-stopped
 
-    networks: [default, analysis-internal, acquisition-browser]
+    networks: [default, analysis-internal]
 
   job-recovery:
     build:
@@ -575,12 +579,74 @@ services:
       start_period: 90s
     restart: "no"
 
+  # Navigation stays disabled unless the renderer can reach only this proxy
+  # on the internal browser network and this proxy enforces the egress policy.
+  browser-control-init:
+    profiles: [playwright-acquisition]
+    image: python:3.12-slim
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    network_mode: none
+    volumes:
+      - browser-control:/run/browser
+    command:
+      [
+        "python",
+        "-c",
+        "import os; os.chown('/run/browser', 10001, 0); os.chmod('/run/browser', 0o770)",
+      ]
+    restart: "no"
+
+  browser-egress-proxy:
+    profiles: [playwright-acquisition]
+    build:
+      context: .
+      dockerfile: infra/acquisition-browser-proxy.Dockerfile
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 64
+    cpus: 0.5
+    environment:
+      BROWSER_EGRESS_BIND: 0.0.0.0
+      BROWSER_EGRESS_PORT: 8791
+      # Browser egress inherits collection policy so both acquisition paths share one domain policy.
+      BROWSER_EGRESS_ALLOWED_DOMAINS: ${COLLECTION_ALLOWED_DOMAINS:-}
+      BROWSER_EGRESS_BLOCKED_DOMAINS: ${COLLECTION_BLOCKED_DOMAINS:-}
+      BROWSER_EGRESS_PROXY_TOKEN: ${BROWSER_EGRESS_PROXY_TOKEN:-}
+    expose: ["8791"]
+    networks: [acquisition-browser, default]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8791/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 5s
+    restart: "no"
+
   playwright-acquirer:
     profiles: [playwright-acquisition]
     build:
       context: .
       dockerfile: infra/acquisition-playwright.Dockerfile
-    user: "10001:10001"
+    user: "10001:0"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700
@@ -590,18 +656,25 @@ services:
     pids_limit: 96
     cpus: 1.0
     environment:
-      PLAYWRIGHT_ACQUIRER_BIND: 0.0.0.0
-      PLAYWRIGHT_ACQUIRER_PORT: 8790
+      PLAYWRIGHT_ACQUIRER_SOCKET: /run/browser/acquirer.sock
       PLAYWRIGHT_ACQUIRER_MAX_HTML_BYTES: 10485760
-    expose: ["8790"]
+      BROWSER_EGRESS_PROXY_URL: http://browser-egress-proxy:8791
+      BROWSER_EGRESS_PROXY_TOKEN: ${BROWSER_EGRESS_PROXY_TOKEN:-}
+    volumes:
+      - browser-control:/run/browser
     networks: [acquisition-browser]
+    depends_on:
+      browser-control-init:
+        condition: service_completed_successfully
+      browser-egress-proxy:
+        condition: service_healthy
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=3)",
+          "import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect('/run/browser/acquirer.sock'); s.sendall(b'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n'); assert s.recv(4096).startswith(b'HTTP/1.1 200'); s.close()",
         ]
       interval: 15s
       timeout: 5s
@@ -634,6 +707,7 @@ volumes:
   redis_data:
   minio_data:
   goodware_cache:
+  browser-control:
 
 networks:
   analysis-internal:

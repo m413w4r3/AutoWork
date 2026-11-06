@@ -5,6 +5,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.domain.acquisition import (
+    AcquisitionObservationKind,
+    EvidenceClass,
+    SourceEquivalenceClass,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
     AttemptOutcome,
@@ -20,6 +25,7 @@ from cti_app.domain.collection import (
     Indicator,
     IndicatorKind,
     RejectedModelProposal,
+    SourceAcquisitionMethod,
     SourceCollection,
     SourceOriginKind,
     SourceSpan,
@@ -351,6 +357,26 @@ def _collection_attempt_values(attempt: CollectionAttempt) -> dict[str, object]:
         "strategy_name": attempt.strategy_name,
         "strategy_version": attempt.strategy_version,
         "duration_ms": attempt.duration_ms,
+        "acquisition_method": (
+            attempt.acquisition_method.value if attempt.acquisition_method is not None else None
+        ),
+        "source_equivalence_class": (
+            attempt.source_equivalence_class.value
+            if attempt.source_equivalence_class is not None
+            else None
+        ),
+        "evidence_class": (
+            attempt.evidence_class.value if attempt.evidence_class is not None else None
+        ),
+        "observation_kind": (
+            attempt.observation_kind.value if attempt.observation_kind is not None else None
+        ),
+        "quality_score": attempt.quality_score,
+        "quality_assessment": attempt.quality_assessment,
+        "archive_snapshot_time": attempt.archive_snapshot_time,
+        "model_run_id": attempt.model_run_id,
+        "model_generated": attempt.model_generated,
+        "primary_source_verified": attempt.primary_source_verified,
     }
 
 
@@ -394,6 +420,32 @@ def _collection_attempt_from_row(row: CollectionAttemptRow) -> CollectionAttempt
         strategy_name=row.strategy_name,
         strategy_version=row.strategy_version,
         duration_ms=row.duration_ms,
+        acquisition_method=(
+            SourceAcquisitionMethod(row.acquisition_method)
+            if row.acquisition_method is not None
+            else None
+        ),
+        source_equivalence_class=(
+            SourceEquivalenceClass(row.source_equivalence_class)
+            if row.source_equivalence_class is not None
+            else None
+        ),
+        evidence_class=(
+            EvidenceClass(row.evidence_class) if row.evidence_class is not None else None
+        ),
+        observation_kind=(
+            AcquisitionObservationKind(row.observation_kind)
+            if row.observation_kind is not None
+            else None
+        ),
+        quality_score=row.quality_score,
+        quality_assessment=(
+            dict(row.quality_assessment) if row.quality_assessment is not None else None
+        ),
+        archive_snapshot_time=row.archive_snapshot_time,
+        model_run_id=row.model_run_id,
+        model_generated=row.model_generated,
+        primary_source_verified=row.primary_source_verified,
     )
 
 

@@ -18,13 +18,23 @@ from cti_app.application.acquisition_fallbacks import (
     AcquisitionProbe,
     AcquisitionRequest,
     AcquisitionStrategy,
-    SidecarPlaywrightAdapter,
+    _same_acquisition_publisher,
+    _typed_probe_outcome,
     article_rejection_reason,
+    bridge_article_response_rejection,
+    bridge_location_metadata_rejection,
+    bridge_source_discovery_prompt,
     bridge_transcription_prompt,
     bridge_url_is_credential_free,
     default_acquisition_strategies,
+    deterministic_acquisition_quality,
+    parse_bridge_source_locations,
     parse_bridge_transcription,
     safe_fallback_url,
+)
+from cti_app.application.acquisition_orchestrator import (
+    ArticleAcquisitionOrchestrator,
+    DomainConcurrencyLimiter,
 )
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
@@ -41,6 +51,7 @@ from cti_app.application.http_collection import (
     UnsafeAddressError,
     UnsupportedContentError,
     _detect_mime,
+    parse_domain_policy,
 )
 from cti_app.application.jobs import (
     JobCancelledError,
@@ -49,12 +60,30 @@ from cti_app.application.jobs import (
     JobParameters,
     JobRegistry,
 )
-from cti_app.application.model_gateway import ModelGateway, ModelRequest, ModelRoutingHint
+from cti_app.application.model_gateway import (
+    ModelExecution,
+    ModelGateway,
+    ModelRequest,
+    ModelRoutingHint,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.source_filenames import analyst_filename
 from cti_app.application.source_media_collection import SourceMediaArchiveService
 from cti_app.application.subject_lineage import resolve_subject_discovery_lineage
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
+from cti_app.domain.acquisition import (
+    AcquisitionCapabilityState,
+    AcquisitionObservationKind,
+    AcquisitionOutcome,
+    AcquisitionPolicyContext,
+    AcquisitionPolicyDecision,
+    AcquisitionQuality,
+    EvidenceClass,
+    SourceEquivalenceClass,
+    credential_free_url,
+    evidence_class_for_equivalence,
+    is_credential_free_url,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
     AttemptOutcome,
@@ -86,11 +115,14 @@ _COLLECTED_STATES = {
     CollectionState.EXTRACTED,
     CollectionState.COMPLETED,
 }
+_CREDENTIAL_LIKE_URL_REJECTION = "credential-like URL rejected"
 
 
 def _snapshot_source_urls(snapshot: ProductionInputSnapshot) -> frozenset[str]:
     """Return the frozen source URL set in deterministic order-independent form."""
-    return frozenset(source.canonical_url for source in snapshot.core_sources)
+    return frozenset(
+        _safe_collection_url(source.canonical_url)[0] for source in snapshot.core_sources
+    )
 
 
 class ManualContentTypeError(CollectionNotAllowedError):
@@ -139,6 +171,17 @@ class _FallbackAcquisition:
     strategy_version: str = "1"
     duration_ms: int = 0
     strategy_url: str | None = None
+    source_equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    observation_kind: AcquisitionObservationKind | None = None
+    quality: AcquisitionQuality | None = None
+    archive_snapshot_time: datetime | None = None
+    publication_date: date | None = None
+    publisher: str | None = None
+    article_title: str | None = None
+    model_generated: bool = False
+    primary_source_verified: bool = False
+    ioc_primary_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +281,15 @@ class SourceArchiveReceipt:
     http_status: int | None = None
     strategy_bytes: int | None = None
     strategy_sha256: str | None = None
+    source_equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    observation_kind: AcquisitionObservationKind | None = None
+    quality_score: float | None = None
+    quality_reasons: tuple[str, ...] = ()
+    archive_snapshot_time: datetime | None = None
+    model_generated: bool | None = None
+    primary_source_verified: bool | None = None
+    ioc_primary_verified: bool | None = None
 
     @classmethod
     def from_provenance(cls, event: ProvenanceEvent) -> SourceArchiveReceipt | None:
@@ -260,6 +312,10 @@ class SourceArchiveReceipt:
                 )
             )
             model_run = payload.get("model_run_id")
+            quality = payload.get("quality_assessment")
+            quality = quality if isinstance(quality, dict) else {}
+            archive_snapshot_time = payload.get("archive_snapshot_time")
+            size_value = payload.get("size", payload.get("decoded_size", 0))
             return cls(
                 subject_id=event.subject_id,
                 collection_id=event.aggregate_id,
@@ -268,7 +324,7 @@ class SourceArchiveReceipt:
                 decoded_blob_id=UUID(str(payload["decoded_blob_id"])),
                 encoded_sha256=str(payload["encoded_sha256"]),
                 decoded_sha256=str(payload["decoded_sha256"]),
-                bytes=int(payload.get("size", payload.get("decoded_size", 0))),
+                bytes=int(size_value) if size_value is not None else 0,
                 declared_mime_type=str(
                     payload.get("declared_mime_type") or "application/octet-stream"
                 ),
@@ -308,6 +364,47 @@ class SourceArchiveReceipt:
                     int(payload["bytes"]) if payload.get("bytes") is not None else None
                 ),
                 strategy_sha256=(str(payload["sha256"]) if payload.get("sha256") else None),
+                source_equivalence_class=(
+                    SourceEquivalenceClass(str(payload["source_equivalence_class"]))
+                    if payload.get("source_equivalence_class")
+                    else None
+                ),
+                evidence_class=(
+                    EvidenceClass(str(payload["evidence_class"]))
+                    if payload.get("evidence_class")
+                    else None
+                ),
+                observation_kind=(
+                    AcquisitionObservationKind(str(payload["observation_kind"]))
+                    if payload.get("observation_kind")
+                    else None
+                ),
+                quality_score=(
+                    float(quality["score"]) if quality.get("score") is not None else None
+                ),
+                quality_reasons=tuple(
+                    item for item in quality.get("reasons", ()) if isinstance(item, str)
+                ),
+                archive_snapshot_time=(
+                    datetime.fromisoformat(str(archive_snapshot_time))
+                    if archive_snapshot_time
+                    else None
+                ),
+                model_generated=(
+                    bool(payload["model_generated"])
+                    if payload.get("model_generated") is not None
+                    else None
+                ),
+                primary_source_verified=(
+                    bool(payload["primary_source_verified"])
+                    if payload.get("primary_source_verified") is not None
+                    else None
+                ),
+                ioc_primary_verified=(
+                    bool(payload["ioc_primary_verified"])
+                    if payload.get("ioc_primary_verified") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -375,6 +472,14 @@ class SubjectCollectionParameters(JobParameters):
     requested_by: str = Field(min_length=1, max_length=255)
 
 
+class FallbackAcquireParameters(JobParameters):
+    model_config = ConfigDict(extra="forbid", strict=False)
+
+    subject_id: UUID
+    collection_id: UUID
+    requested_by: str = Field(min_length=1, max_length=255)
+
+
 class SubjectCollectionService:
     def __init__(
         self,
@@ -395,6 +500,19 @@ class SubjectCollectionService:
         fallback_strategies: Sequence[AcquisitionStrategy] | None = None,
         fallback_min_text_chars: int = 200,
         fallback_playwright_sidecar_url: str | None = None,
+        acquisition_deadline_seconds: float = 120.0,
+        acquisition_max_attempts: int = 40,
+        acquisition_per_domain_concurrency: int = 2,
+        fallback_endpoint_enabled: bool = True,
+        browser_navigation_enabled: bool = False,
+        browser_control_socket: str = "",
+        syndication_domains: str = "",
+        exact_title_search_endpoint: str = "",
+        third_party_provider_url: str = "",
+        third_party_provider_token: str = "",
+        third_party_provider_enabled: bool = False,
+        ocr_command: str = "",
+        newsletter_archive_endpoint: str = "",
     ) -> None:
         self._uow_factory = uow_factory
         self._collector = collector
@@ -412,6 +530,28 @@ class SubjectCollectionService:
         self._fallback_variants_enabled = fallback_variants_enabled
         self._fallback_archive_enabled = fallback_archive_enabled
         self._fallback_bridge_enabled = fallback_bridge_enabled
+        self._fallback_endpoint_enabled = fallback_endpoint_enabled
+        self._browser_navigation_enabled = browser_navigation_enabled
+        self._browser_control_socket = browser_control_socket
+        self._allowed_syndication_domains = parse_domain_policy(syndication_domains)
+        self._exact_title_search_endpoint = exact_title_search_endpoint
+        self._third_party_provider_url = third_party_provider_url
+        self._third_party_provider_token = third_party_provider_token
+        self._third_party_provider_enabled = third_party_provider_enabled
+        self._ocr_command = ocr_command
+        self._newsletter_archive_endpoint = newsletter_archive_endpoint
+        if acquisition_deadline_seconds <= 0:
+            raise ValueError("acquisition_deadline_seconds must be positive")
+        if acquisition_max_attempts < 1:
+            raise ValueError("acquisition_max_attempts must be positive")
+        if acquisition_per_domain_concurrency < 1:
+            raise ValueError("acquisition_per_domain_concurrency must be positive")
+        self._acquisition_deadline_seconds = acquisition_deadline_seconds
+        self._acquisition_max_attempts = acquisition_max_attempts
+        self._acquisition_per_domain_concurrency = acquisition_per_domain_concurrency
+        self._acquisition_domain_limiter = DomainConcurrencyLimiter(
+            acquisition_per_domain_concurrency
+        )
         if fallback_max_variants < 1:
             raise ValueError("fallback_max_variants must be positive")
         self._fallback_max_variants = fallback_max_variants
@@ -435,40 +575,79 @@ class SubjectCollectionService:
                     "http2",
                     "curl",
                     "representations",
-                    "wayback",
+                    "rss_atom_jsonfeed",
+                    "publisher_public_api",
+                    "embedded_structured_data",
+                    "playwright_chromium_dom",
+                    "playwright_network_response",
+                    "playwright_embedded_state",
+                    "wayback_snapshot",
                     "archive_ph",
-                    "common_crawl",
-                    "memento",
-                    "search_cache",
-                    "playwright",
+                    "commoncrawl_warc",
+                    "memento_archive",
+                    "exact_title_search",
+                    "publisher_alternative_url",
+                    "authorized_syndication",
+                    "publisher_pdf",
+                    "visual_ocr",
+                    "official_newsletter_archive",
+                    "third_party_extraction",
+                    "bridge_source_discovery",
                     "bridge_transcription",
                 )
             }
         strategy_flags["representations"] = (
             strategy_flags.get("representations", True) and fallback_variants_enabled
         )
-        for name in ("wayback", "archive_ph", "common_crawl", "memento", "search_cache"):
-            strategy_flags[name] = strategy_flags.get(name, True) and fallback_archive_enabled
+        for names in (
+            ("wayback_snapshot", "wayback"),
+            ("archive_ph",),
+            ("commoncrawl_warc", "common_crawl"),
+            ("memento_archive", "memento"),
+        ):
+            primary = names[0]
+            legacy = names[1] if len(names) > 1 else primary
+            strategy_flags[primary] = (
+                strategy_flags.get(primary, strategy_flags.get(legacy, True))
+                and fallback_archive_enabled
+            )
         strategy_flags["bridge_transcription"] = (
             strategy_flags.get("bridge_transcription", True) and fallback_bridge_enabled
         )
-        self._fallback_strategies = tuple(
-            fallback_strategies
-            or default_acquisition_strategies(
-                flags=strategy_flags,
-                timeouts=fallback_strategy_timeouts,
-                max_candidates=fallback_max_variants,
-                playwright_adapter=(
-                    SidecarPlaywrightAdapter(fallback_playwright_sidecar_url)
-                    if fallback_playwright_sidecar_url
-                    else None
-                ),
+        strategy_flags["bridge_source_discovery"] = (
+            strategy_flags.get("bridge_source_discovery", True) and fallback_bridge_enabled
+        )
+        self._fallback_strategies = (
+            tuple(fallback_strategies)
+            if fallback_strategies is not None
+            else tuple(
+                default_acquisition_strategies(
+                    flags=strategy_flags,
+                    timeouts=fallback_strategy_timeouts,
+                    max_candidates=fallback_max_variants,
+                    domain_limiter=self._acquisition_domain_limiter,
+                    browser_service_url=fallback_playwright_sidecar_url,
+                    browser_control_socket=browser_control_socket,
+                    browser_navigation_enabled=browser_navigation_enabled,
+                    exact_title_search_endpoint=exact_title_search_endpoint,
+                    syndication_domains=self._allowed_syndication_domains,
+                    third_party_provider_url=third_party_provider_url,
+                    third_party_provider_token=third_party_provider_token,
+                    third_party_provider_enabled=third_party_provider_enabled,
+                    newsletter_archive_endpoint=newsletter_archive_endpoint,
+                    ocr_command=ocr_command,
+                    min_text_chars=fallback_min_text_chars,
+                )
             )
         )
         self._fetch_lease = timedelta(
             seconds=max(fetch_lease_seconds, self._collector.policy.timeout_seconds + 5)
         )
         self._policy_snapshot = self._collector.policy.snapshot()
+
+    @property
+    def fallback_acquisition_enabled(self) -> bool:
+        return self._fallback_acquisition_enabled and self._fallback_endpoint_enabled
 
     async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
         """Read archived content back, for consumers holding only a blob id."""
@@ -483,19 +662,20 @@ class SubjectCollectionService:
             # étant (subject_id, source_candidate_id), il faut dédupliquer sur
             # l'URL canonique face à ce qui est déjà collecté ou archivé (§28).
             seen_urls: set[str] = {
-                canonicalize_http_url(collection.requested_url)
+                _safe_collection_url(canonicalize_http_url(collection.requested_url))[0]
                 for collection in await uow.source_collections.list_for_subject(subject_id)
             }
             seen_urls.update(
-                canonicalize_http_url(document.origin)
+                _safe_collection_url(canonicalize_http_url(document.origin))[0]
                 for document in await uow.source_documents.list_for_subject(subject_id)
                 if document.origin
             )
             for candidate in lineage.members:
                 for source in candidate.evidence.sources:
-                    if source.canonical_url in seen_urls:
+                    stored_url, _credential_like = _safe_collection_url(source.canonical_url)
+                    if stored_url in seen_urls:
                         continue
-                    seen_urls.add(source.canonical_url)
+                    seen_urls.add(stored_url)
                     await uow.source_collections.add_if_absent(
                         _new_collection(
                             subject.edition_id,
@@ -519,12 +699,13 @@ class SubjectCollectionService:
             current = list(await uow.source_collections.list_for_subject(subject_id))
             seen_urls = {item.canonical_url for item in current}
             for source in snapshot.core_sources:
-                if source.canonical_url in seen_urls:
+                stored_url, _credential_like = _safe_collection_url(source.canonical_url)
+                if stored_url in seen_urls:
                     continue
                 await uow.source_collections.add_if_absent(
                     _new_snapshot_collection(snapshot, subject_id, source)
                 )
-                seen_urls.add(source.canonical_url)
+                seen_urls.add(stored_url)
             await uow.commit()
             current = list(await uow.source_collections.list_for_subject(subject_id))
 
@@ -553,19 +734,21 @@ class SubjectCollectionService:
                     canonical = canonicalize_http_url(candidate.url)
                 except ValueError:
                     continue
-                existing = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+                stored_url, credential_like = _safe_collection_url(canonical)
+                existing = await uow.source_collections.get_by_canonical_url(subject_id, stored_url)
                 if existing is not None:
                     continue
                 collection = SourceCollection(
                     subject_id=subject_id,
                     edition_id=subject.edition_id,
-                    requested_url=canonical,
-                    canonical_url=canonical,
+                    requested_url=stored_url,
+                    canonical_url=stored_url,
                     origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
                     proposed_role=candidate.role,
                     title=candidate.title,
                     publisher=candidate.publisher,
                     published_at=candidate.published_at,
+                    error_reason=(_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None),
                 )
                 if await uow.source_collections.add_if_absent(collection):
                     added.append(collection)
@@ -589,15 +772,16 @@ class SubjectCollectionService:
         except ValueError as exc:
             raise CollectionNotAllowedError("Source URL cannot be canonicalized") from exc
 
+        stored_url, _credential_like = _safe_collection_url(canonical)
         async with self._uow_factory() as uow:
-            existing = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+            existing = await uow.source_collections.get_by_canonical_url(subject_id, stored_url)
         if existing is not None:
             return existing
 
         await self.add_supplemental_sources(subject_id, [replace(source, url=canonical)])
 
         async with self._uow_factory() as uow:
-            created = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+            created = await uow.source_collections.get_by_canonical_url(subject_id, stored_url)
         if created is None:
             raise CollectionNotAllowedError("The proposed source could not be attached")
         return created
@@ -639,13 +823,14 @@ class SubjectCollectionService:
                     canonical = canonicalize_http_url(resource.url)
                 except ValueError:
                     continue
-                if await uow.source_collections.get_by_canonical_url(subject_id, canonical):
+                stored_url, credential_like = _safe_collection_url(canonical)
+                if await uow.source_collections.get_by_canonical_url(subject_id, stored_url):
                     continue
                 child = SourceCollection(
                     subject_id=parent.subject_id,
                     edition_id=parent.edition_id,
-                    requested_url=canonical,
-                    canonical_url=canonical,
+                    requested_url=stored_url,
+                    canonical_url=stored_url,
                     origin_kind=SourceOriginKind.REFERENCED_EVIDENCE,
                     parent_source_collection_id=parent.id,
                     proposed_role=SourceRole.UNKNOWN,
@@ -655,6 +840,7 @@ class SubjectCollectionService:
                     external_llm_allowed=parent.external_llm_allowed,
                     do_not_submit=parent.do_not_submit,
                     relationship_evidence="deterministic:referenced_evidence_link",
+                    error_reason=(_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None),
                 )
                 if await uow.source_collections.add_if_absent(child):
                     added.append(child)
@@ -779,6 +965,40 @@ class SubjectCollectionService:
             await uow.commit()
             return collection
 
+    async def fallback_acquire(
+        self,
+        subject_id: UUID,
+        collection_id: UUID,
+        job_id: UUID,
+        context: JobExecutionContext,
+    ) -> CollectionState:
+        """Run only the configured fallback chain for an operator request."""
+        async with self._uow_factory() as uow:
+            collection = await uow.source_collections.get(collection_id)
+            if collection is None or collection.subject_id != subject_id:
+                raise CollectionItemNotFoundError(str(collection_id))
+            if collection.state in _COLLECTED_STATES:
+                return collection.state
+            if collection.state not in {
+                CollectionState.UNAVAILABLE,
+                CollectionState.BLOCKED,
+                CollectionState.FAILED_RETRYABLE,
+                CollectionState.FAILED_TERMINAL,
+            }:
+                raise CollectionNotAllowedError("Source state does not allow fallback acquisition")
+            if not self.fallback_acquisition_enabled:
+                raise CollectionNotAllowedError("fallback acquisition disabled")
+            if collection.source_document_id is not None:
+                raise CollectionNotAllowedError("source already has an archived document")
+        candidate = await self._candidate_for(collection)
+        return await self._acquire_fallback_chain(
+            collection_id,
+            job_id,
+            context,
+            candidate=candidate,
+            explicit_request=True,
+        )
+
     async def collect_subject(
         self,
         subject_id: UUID,
@@ -820,7 +1040,7 @@ class SubjectCollectionService:
                     "total": len(sources),
                     "title": candidate.title if candidate else None,
                     "publisher": candidate.publisher if candidate else None,
-                    "url": source.requested_url,
+                    "url": safe_fallback_url(source.requested_url),
                     "phase": "preparing",
                     "correlation_id": get_correlation_id(),
                 }
@@ -881,7 +1101,7 @@ class SubjectCollectionService:
                     "total": len(sources),
                     "title": candidate.title if candidate else None,
                     "publisher": candidate.publisher if candidate else None,
-                    "url": source.requested_url,
+                    "url": safe_fallback_url(source.requested_url),
                     "phase": "persisted",
                     "state": state.value,
                     "correlation_id": get_correlation_id(),
@@ -946,6 +1166,15 @@ class SubjectCollectionService:
                         fallback_policy_snapshot_id=self._policy_snapshot.id,
                     )
                 )
+            credential_like_source = (
+                collection.error_reason == _CREDENTIAL_LIKE_URL_REJECTION
+                or not is_credential_free_url(collection.requested_url)
+            )
+            if credential_like_source:
+                safe_url = credential_free_url(collection.requested_url)
+                collection.requested_url = safe_url
+                collection.canonical_url = safe_url
+                collection.error_reason = _CREDENTIAL_LIKE_URL_REJECTION
             claimed = collection.claim_fetch(
                 job_id,
                 lease_duration=self._fetch_lease,
@@ -958,6 +1187,23 @@ class SubjectCollectionService:
             await uow.commit()
 
         started_at = collection.fetch_started_at or datetime.now(UTC)
+        if credential_like_source or not is_credential_free_url(collection.requested_url):
+            error = UnsafeAddressError("Credential-like URL is not eligible for collection")
+            state = await self._record_failure(
+                collection.id,
+                job_id,
+                started_at,
+                error,
+                credential_like_rejection=True,
+            )
+            self._log_source_result(
+                collection,
+                job_id,
+                state,
+                operation_started,
+                error=error,
+            )
+            return state
         try:
             response = await self._collector.fetch(
                 collection.requested_url,
@@ -1332,6 +1578,9 @@ class SubjectCollectionService:
         size: int | None = None,
         error: CollectionError | None = None,
     ) -> None:
+        requested_url = collection.requested_url
+        if not is_credential_free_url(requested_url):
+            requested_url = credential_free_url(requested_url)
         logger.info(
             "source_collection_result",
             extra={
@@ -1340,7 +1589,7 @@ class SubjectCollectionService:
                 "subject_id": str(collection.subject_id),
                 "source_collection_id": str(collection.id),
                 "source_candidate_id": str(collection.source_candidate_id),
-                "requested_url": collection.requested_url,
+                "requested_url": requested_url,
                 "phase": "persisted",
                 "state": state.value,
                 "duration_ms": round((time.monotonic() - started) * 1000),
@@ -1392,8 +1641,10 @@ class SubjectCollectionService:
             if fallback is not None and (
                 collection.state in _COLLECTED_STATES
                 or collection.state is CollectionState.FETCHING
+                or collection.source_document_id is not None
             ):
-                # A human upload or another active acquisition owns the source.
+                # PostgreSQL get_for_update holds this row lock through the
+                # state/pointer check and commit; a direct/manual document wins.
                 return None
             existing_names = {
                 item.logical_filename
@@ -1472,6 +1723,7 @@ class SubjectCollectionService:
                 strategy_name=fallback.strategy_name if fallback is not None else None,
                 strategy_version=fallback.strategy_version if fallback is not None else None,
                 duration_ms=fallback.duration_ms if fallback is not None else None,
+                fallback=fallback,
             )
             await uow.source_documents.add(document)
             await uow.collection_attempts.append(attempt)
@@ -1541,22 +1793,32 @@ class SubjectCollectionService:
                     event_type = "source.archived_fallback"
                     actor = "system:acquisition_fallback"
                     acquisition_method = fallback.method.value
+                    payload_job_id = fallback.job_id
                 else:
                     assert collector is not None
                     event_type = "source.archived"
                     actor = "system:collector"
                     acquisition_method = SourceAcquisitionMethod.DIRECT_HTTP.value
+                    payload_job_id = collector.job_id
                 payload = {
                     **evidence,
                     "acquisition_method": acquisition_method,
-                    "job_id": str(collector.job_id if collector else fallback.job_id),
+                    "job_id": str(payload_job_id),
                     "requested_url": (
-                        collection.requested_url if fallback is not None else response.requested_url
+                        safe_fallback_url(collection.requested_url)
+                        if fallback is not None
+                        else response.requested_url
                     ),
                     "original_url": (
-                        collection.requested_url if fallback is not None else response.requested_url
+                        safe_fallback_url(collection.requested_url)
+                        if fallback is not None
+                        else response.requested_url
                     ),
-                    "final_url": response.final_url,
+                    "final_url": (
+                        safe_fallback_url(response.final_url)
+                        if fallback is not None
+                        else response.final_url
+                    ),
                     "redirect_chain": list(response.redirect_chain),
                     "candidate_resolution_url": attempt.candidate_resolution_url,
                     "candidate_resolution_provenance": (
@@ -1566,6 +1828,7 @@ class SubjectCollectionService:
                     ),
                 }
                 if fallback is not None:
+                    fallback_publication_date = fallback.publication_date or meta_published_at
                     payload.update(
                         {
                             "strategy_name": fallback.strategy_name,
@@ -1573,7 +1836,48 @@ class SubjectCollectionService:
                             "duration_ms": fallback.duration_ms,
                             "http_status": attempt.http_status,
                             "bytes": response.encoded_size,
-                            "sha256": response.encoded_sha256,
+                            "sha256": response.decoded_sha256,
+                            "policy_snapshot_id": self._policy_snapshot.id,
+                            "acquisition_job_id": str(fallback.job_id),
+                            "actor": "system:acquisition_fallback",
+                            "requested_variant_url": safe_fallback_url(
+                                fallback.strategy_url or response.requested_url
+                            ),
+                            "publisher": fallback.publisher or meta_publisher,
+                            "article_title": fallback.article_title or meta_title,
+                            "publication_date_if_known": (
+                                fallback_publication_date.isoformat()
+                                if fallback_publication_date is not None
+                                else None
+                            ),
+                            "archive_snapshot_time": (
+                                fallback.archive_snapshot_time.isoformat()
+                                if fallback.archive_snapshot_time is not None
+                                else None
+                            ),
+                            "content_type": response.declared_content_type
+                            or response.detected_content_type.value,
+                            "raw_blob_reference": raw_blob.descriptor.object_key,
+                            "raw_blob_id": str(raw_blob.id),
+                            "decoded_blob_reference": decoded_blob.descriptor.object_key,
+                            "decoded_blob_id": str(decoded_blob.id),
+                            "attempt_id": str(attempt.id),
+                            "source_equivalence_class": (
+                                fallback.source_equivalence_class.value
+                                if fallback.source_equivalence_class is not None
+                                else None
+                            ),
+                            "evidence_class": (
+                                fallback.evidence_class.value
+                                if fallback.evidence_class is not None
+                                else None
+                            ),
+                            "observation_kind": (
+                                fallback.observation_kind.value
+                                if fallback.observation_kind is not None
+                                else None
+                            ),
+                            "quality_assessment": _quality_assessment(fallback.quality),
                             "model_run_id": (
                                 str(fallback.model_run_id)
                                 if fallback.model_run_id is not None
@@ -1582,6 +1886,9 @@ class SubjectCollectionService:
                             "consultation_id": fallback.consultation_id,
                             "prompt_sha256": fallback.prompt_sha256,
                             "response_sha256": fallback.response_sha256,
+                            "model_generated": fallback.model_generated,
+                            "primary_source_verified": fallback.primary_source_verified,
+                            "ioc_primary_verified": fallback.ioc_primary_verified,
                             "verification_status": (
                                 "unverified_by_primary_source"
                                 if fallback.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
@@ -1687,17 +1994,49 @@ class SubjectCollectionService:
         job_id: UUID,
         started_at: datetime,
         error: CollectionError,
+        *,
+        credential_like_rejection: bool = False,
     ) -> CollectionState:
         completed_at = datetime.now(UTC)
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
+            credential_like_rejection = credential_like_rejection or (
+                error.reason_code is CollectionFailureReason.UNSAFE_DESTINATION
+                and not bridge_url_is_credential_free(collection.requested_url)
+            )
+            if credential_like_rejection:
+                collection.requested_url = credential_free_url(collection.requested_url)
+                collection.canonical_url = credential_free_url(collection.canonical_url)
+            persisted_requested_url = (
+                safe_fallback_url(collection.requested_url)
+                if credential_like_rejection
+                else collection.requested_url
+            )
+            persisted_final_url = (
+                safe_fallback_url(error.final_url)
+                if credential_like_rejection and error.final_url
+                else error.final_url
+            )
+            persisted_redirect_chain = (
+                tuple(safe_fallback_url(url) for url in error.redirect_chain)
+                if credential_like_rejection
+                else error.redirect_chain
+            )
+            failure_reason = (
+                "credential-like URL rejected" if credential_like_rejection else str(error)
+            )
+            candidate_resolution_url = _same_site_redirect_candidate(
+                collection.requested_url, error.final_url, error.redirect_chain
+            )
+            if credential_like_rejection and candidate_resolution_url is not None:
+                candidate_resolution_url = safe_fallback_url(candidate_resolution_url)
             attempt = CollectionAttempt(
                 collection_id=collection.id,
                 job_id=job_id,
                 policy_snapshot_id=self._policy_snapshot.id,
-                requested_url=collection.requested_url,
-                final_url=error.final_url,
-                redirect_chain=error.redirect_chain,
+                requested_url=persisted_requested_url,
+                final_url=persisted_final_url,
+                redirect_chain=persisted_redirect_chain,
                 attempted_at=started_at,
                 completed_at=completed_at,
                 http_status=error.http_status,
@@ -1712,12 +2051,10 @@ class SubjectCollectionService:
                 content_encoding=None,
                 allowed_headers=error.headers,
                 outcome=error.outcome,
-                failure_reason=str(error),
+                failure_reason=failure_reason,
                 reason_code=error.reason_code,
                 transport_classification=error.transport_classification,
-                candidate_resolution_url=_same_site_redirect_candidate(
-                    collection.requested_url, error.final_url, error.redirect_chain
-                ),
+                candidate_resolution_url=candidate_resolution_url,
                 candidate_resolution_provenance=(
                     CollectionResolutionProvenance.SAME_SITE_HTTP_REDIRECT
                     if _same_site_redirect_candidate(
@@ -1739,7 +2076,7 @@ class SubjectCollectionService:
             collection.fail(
                 state,
                 attempt_id=attempt.id,
-                reason=str(error),
+                reason=failure_reason,
                 reason_code=error.reason_code,
             )
             await uow.source_collections.save(collection)
@@ -1754,8 +2091,9 @@ class SubjectCollectionService:
         *,
         candidate: SourceCandidate | None = None,
         initial_error: CollectionError | None = None,
+        explicit_request: bool = False,
     ) -> CollectionState:
-        """Run the configured strategies in order, archiving only accepted content."""
+        """Run the bounded strategy registry and archive only its accepted winner."""
         async with self._uow_factory() as uow:
             collection = await uow.source_collections.get(collection_id)
             if collection is None:
@@ -1763,14 +2101,21 @@ class SubjectCollectionService:
             if (
                 collection.state in _COLLECTED_STATES
                 or collection.state is CollectionState.FETCHING
+                or collection.source_document_id is not None
             ):
                 return collection.state
-            if collection.state not in {CollectionState.BLOCKED, CollectionState.UNAVAILABLE}:
+            fallback_states = {CollectionState.BLOCKED, CollectionState.UNAVAILABLE}
+            if explicit_request:
+                fallback_states.update(
+                    {CollectionState.FAILED_RETRYABLE, CollectionState.FAILED_TERMINAL}
+                )
+            if collection.state not in fallback_states:
                 return collection.state
             subject = await uow.subjects.get(collection.subject_id)
             edition = await uow.editions.get(collection.edition_id)
             events = await uow.provenance.list_for_aggregate("source_collection", collection.id)
             attempts = await uow.collection_attempts.list_for_collection(collection.id)
+
         direct_attempt = next(
             (
                 attempt
@@ -1785,17 +2130,46 @@ class SubjectCollectionService:
             if initial_error is not None
             else direct_attempt.reason_code
             if direct_attempt is not None
-            else None
+            else collection.failure_reason_code
         )
-        if direct_failure_reason not in {
+        if direct_failure_reason is CollectionFailureReason.UNSAFE_DESTINATION:
+            return collection.state
+        if not explicit_request and direct_failure_reason not in {
             CollectionFailureReason.ACCESS_BLOCKED,
             CollectionFailureReason.HTTP_ERROR,
             CollectionFailureReason.OBSOLETE_URL_404,
         }:
             return collection.state
-        if subject is None:
+        if subject is None or not self._fallback_acquisition_enabled:
             return collection.state
-        if not self._fallback_acquisition_enabled:
+
+        effective_tlp = max(
+            (
+                subject.tlp,
+                collection.source_tlp,
+                candidate.tlp if candidate is not None else collection.source_tlp,
+            ),
+            key=lambda item: tuple(TLP).index(item),
+        )
+        external_llm_allowed = collection.external_llm_allowed and (
+            candidate.external_llm_allowed if candidate is not None else True
+        )
+        policy = AcquisitionPolicyContext(
+            allowed_domains=frozenset(self._policy.allowed_domains),
+            blocked_domains=frozenset(self._policy.blocked_domains),
+            external_llm_allowed=external_llm_allowed,
+            tlp=effective_tlp,
+            do_not_submit=collection.do_not_submit,
+            expected_languages=edition.languages if edition is not None else (),
+            allowed_syndication_domains=self._allowed_syndication_domains,
+            third_party_provider_allowed=self._third_party_provider_enabled,
+            provider_configured=bool(
+                self._third_party_provider_enabled
+                and self._third_party_provider_url
+                and self._third_party_provider_token
+            ),
+        )
+        if policy.check_url(collection.canonical_url) is not AcquisitionPolicyDecision.ALLOWED:
             return collection.state
 
         attempted_strategy_urls: set[str] = set()
@@ -1807,6 +2181,17 @@ class SubjectCollectionService:
             strategy_name = str(
                 payload.get("strategy_name") or payload.get("acquisition_method") or ""
             )
+            outcome = payload.get("outcome")
+            if outcome not in {
+                AcquisitionOutcome.SUCCEEDED.value,
+                AcquisitionOutcome.REJECTED.value,
+                AcquisitionOutcome.ARCHIVED.value,
+                AcquisitionOutcome.LOOKUP_SUCCEEDED.value,
+                AcquisitionOutcome.METADATA_SUCCEEDED.value,
+                AcquisitionOutcome.POLICY_SKIPPED.value,
+                AcquisitionOutcome.NEEDS_RECONCILIATION.value,
+            }:
+                continue
             attempted_url_hash = payload.get("attempted_url_sha256")
             strategy_url_hash = payload.get("attempted_strategy_url_sha256")
             if isinstance(strategy_url_hash, str):
@@ -1835,6 +2220,8 @@ class SubjectCollectionService:
         ) -> CollectedResponse:
             if not bridge_url_is_credential_free(url):
                 raise UnsafeAddressError("Credential-like URL is not eligible for fallback")
+            if policy.check_url(url) is not AcquisitionPolicyDecision.ALLOWED:
+                raise UnsafeAddressError("Destination is not allowed by fallback policy")
             return await self._collector.fetch(
                 url,
                 cancellation_check=context.check_cancelled if context else None,
@@ -1843,16 +2230,21 @@ class SubjectCollectionService:
                 allow_binary=allow_binary,
             )
 
+        fallback_collection_id = collection.id
+        fallback_requested_url = collection.canonical_url
         bridge_status = self._bridge_fallback_status(bridge_events)
 
+        async def record_fallback_probe(probe: AcquisitionProbe) -> None:
+            await self._record_fallback_probe(fallback_collection_id, job_id, probe)
+
         async def bridge_attempt() -> AcquisitionProbe:
-            if bridge_status in {"response_unparseable", "failed", "skipped"}:
+            if bridge_status in {"rejected", "skipped"}:
                 return AcquisitionProbe(
                     strategy_name="bridge_transcription",
                     strategy_version="1",
                     method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
                     requested_url=collection.canonical_url,
-                    outcome="skipped",
+                    outcome=AcquisitionOutcome.SKIPPED,
                     reason_code="prior_bridge_attempt_not_replayable",
                     response=None,
                     http_status=None,
@@ -1860,33 +2252,27 @@ class SubjectCollectionService:
                     encoded_sha256=None,
                     duration_ms=0,
                 )
-            started = time.monotonic()
-            result = await self._bridge_transcribe(
+            return await self._bridge_transcribe(
                 collection,
                 subject,
                 candidate,
                 job_id,
                 context,
+                request,
                 expected_languages=edition.languages if edition is not None else (),
             )
-            return AcquisitionProbe(
-                strategy_name="bridge_transcription",
-                strategy_version="1",
-                method=SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
-                requested_url=collection.canonical_url,
-                outcome="archived" if result == "archived" else result,
-                reason_code=(
-                    CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED.value
-                    if result in {"failed", "response_unparseable"}
-                    else "bridge_submission_reconciliation_required"
-                    if result == "needs_reconciliation"
-                    else None
-                ),
-                response=None,
-                http_status=None,
-                encoded_size=None,
-                encoded_sha256=None,
-                duration_ms=round((time.monotonic() - started) * 1000),
+
+        async def bridge_discovery_attempt(max_candidates: int) -> Sequence[AcquisitionProbe]:
+            remaining_attempts = max(0, self._acquisition_max_attempts - attempted_count)
+            return await self._bridge_source_discover(
+                collection,
+                subject,
+                candidate,
+                job_id,
+                context,
+                request,
+                max_candidates=min(max_candidates, remaining_attempts),
+                expected_languages=edition.languages if edition is not None else (),
             )
 
         request = AcquisitionRequest(
@@ -1912,170 +2298,507 @@ class SubjectCollectionService:
             link_header=fallback_headers.get("link"),
             fetch=safe_fetch,
             bridge=bridge_attempt,
+            bridge_discovery=bridge_discovery_attempt,
+            publisher=candidate.publisher if candidate else collection.publisher,
             attempted_strategy_urls=frozenset(attempted_strategy_urls),
             min_text_chars=self._fallback_min_text_chars,
             expected_languages=edition.languages if edition is not None else (),
+            policy=policy,
         )
 
-        for strategy in self._fallback_strategies:
-            if context is not None:
-                await context.check_cancelled()
-            if not strategy.enabled:
-                disabled_key = hashlib.sha256(
-                    f"{strategy.name}\0{collection.canonical_url}".encode()
-                ).hexdigest()
-                if disabled_key in attempted_strategy_urls:
-                    continue
-                probe = AcquisitionProbe(
-                    strategy_name=strategy.name,
-                    strategy_version=strategy.version,
-                    method=strategy.method,
-                    requested_url=collection.canonical_url,
-                    outcome="skipped",
-                    reason_code="strategy_disabled",
-                    response=None,
-                    http_status=None,
-                    encoded_size=None,
-                    encoded_sha256=None,
-                    duration_ms=0,
-                )
-                await self._record_fallback_probe(collection.id, job_id, probe)
-                continue
-            started = time.monotonic()
-            try:
-                async with asyncio.timeout(strategy.timeout_seconds):
-                    probes = await strategy.acquire(request)
-            except JobCancelledError:
-                raise
-            except TimeoutError:
-                probes = (
-                    AcquisitionProbe(
-                        strategy_name=strategy.name,
-                        strategy_version=strategy.version,
-                        method=strategy.method,
-                        requested_url=collection.canonical_url,
-                        outcome="failed",
-                        reason_code="strategy_timeout",
-                        response=None,
-                        http_status=None,
-                        encoded_size=None,
-                        encoded_sha256=None,
-                        duration_ms=round((time.monotonic() - started) * 1000),
-                    ),
-                )
-            except Exception as error:
-                probes = (
-                    AcquisitionProbe(
-                        strategy_name=strategy.name,
-                        strategy_version=strategy.version,
-                        method=strategy.method,
-                        requested_url=collection.canonical_url,
-                        outcome="failed",
-                        reason_code=f"strategy_error:{type(error).__name__}",
-                        response=None,
-                        http_status=None,
-                        encoded_size=None,
-                        encoded_sha256=None,
-                        duration_ms=round((time.monotonic() - started) * 1000),
-                    ),
-                )
-            for probe in probes:
-                if probe.reason_code == "already_attempted_for_strategy":
-                    continue
-                if strategy.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
-                    # Bridge persistence and output adoption are handled by the
-                    # idempotent callback above; it has its own ModelRun record.
-                    async with self._uow_factory() as uow:
-                        refreshed = await uow.source_collections.get(collection.id)
-                    if refreshed is None:
-                        raise CollectionItemNotFoundError(str(collection.id))
-                    if refreshed.state in _COLLECTED_STATES:
-                        return refreshed.state
-                    if probe.reason_code == "prior_bridge_attempt_not_replayable":
-                        await self._record_fallback_probe(collection.id, job_id, probe)
-                    await self._fallback_diagnostic(
-                        context,
-                        collection,
-                        method=probe.method,
-                        state=probe.outcome,
-                        reason_code=probe.reason_code,
-                        requested_url=probe.requested_url,
-                        strategy_name=probe.strategy_name,
-                        strategy_version=probe.strategy_version,
-                        duration_ms=probe.duration_ms,
-                        http_status=probe.http_status,
-                        byte_count=probe.encoded_size,
-                        sha256=probe.encoded_sha256,
+        # Run Bridge discovery after direct archive methods and before transcription.
+        configured = (
+            tuple(
+                strategy
+                for strategy in self._fallback_strategies
+                if strategy.method
+                not in {
+                    SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY,
+                    SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+                }
+            )
+            + tuple(
+                strategy
+                for strategy in self._fallback_strategies
+                if strategy.method is SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY
+            )
+            + tuple(
+                strategy
+                for strategy in self._fallback_strategies
+                if strategy.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+            )
+        )
+        handled_probe_ids: set[int] = set()
+        deferred_success_probes: dict[int, AcquisitionProbe] = {}
+        attempted_count = 0
+        attempt_limit = self._acquisition_max_attempts
+
+        class RecordingStrategy:
+            """Persist non-winning diagnostics before a later callback can archive."""
+
+            def __init__(self, strategy: AcquisitionStrategy) -> None:
+                self.inner = strategy
+                self.name = strategy.name
+                self.version = strategy.version
+                self.method = strategy.method
+                self.enabled = True
+                self.timeout_seconds = float(strategy.timeout_seconds) + 0.05
+                self.capability_state = AcquisitionCapabilityState.IMPLEMENTED
+
+            async def acquire(
+                self, acquisition_request: AcquisitionRequest
+            ) -> tuple[AcquisitionProbe, ...]:
+                nonlocal attempted_count
+                strategy = self.inner
+                probes: tuple[AcquisitionProbe, ...]
+                if not strategy.enabled:
+                    disabled_capability = getattr(
+                        strategy,
+                        "capability_state",
+                        AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION,
                     )
-                    continue
-                if probe.outcome == "succeeded" and probe.response is not None:
-                    response = replace(
-                        probe.response,
-                        requested_url=safe_fallback_url(probe.response.requested_url),
-                        final_url=safe_fallback_url(probe.response.final_url),
-                        redirect_chain=tuple(
-                            safe_fallback_url(item) for item in probe.response.redirect_chain
+                    disabled_outcome = getattr(
+                        strategy, "capability_outcome", AcquisitionOutcome.SKIPPED
+                    )
+                    probes = (
+                        AcquisitionProbe(
+                            strategy_name=strategy.name,
+                            strategy_version=strategy.version,
+                            method=strategy.method,
+                            requested_url=fallback_requested_url,
+                            outcome=disabled_outcome,
+                            reason_code=getattr(strategy, "capability_reason", "strategy_disabled"),
+                            response=None,
+                            http_status=None,
+                            encoded_size=None,
+                            encoded_sha256=None,
+                            duration_ms=0,
+                            capability_state=disabled_capability,
                         ),
                     )
-                    await self._archive(
-                        collection.id,
-                        datetime.now(UTC) - timedelta(milliseconds=probe.duration_ms),
-                        response,
-                        acquisition=_FallbackAcquisition(
-                            job_id=job_id,
-                            method=probe.method,
-                            strategy_name=probe.strategy_name,
-                            strategy_version=probe.strategy_version,
-                            duration_ms=probe.duration_ms,
-                            strategy_url=probe.requested_url,
-                        ),
-                        candidate=candidate,
-                        processing_failure=_pdf_processing_failure(
-                            collection.canonical_url, response
-                        ),
-                    )
-                    async with self._uow_factory() as uow:
-                        refreshed = await uow.source_collections.get(collection.id)
-                    if refreshed is None:
-                        raise CollectionItemNotFoundError(str(collection.id))
-                    if refreshed.state in _COLLECTED_STATES:
-                        await self._fallback_diagnostic(
-                            context,
-                            collection,
-                            method=probe.method,
-                            state="archived",
-                            reason_code=None,
-                            requested_url=probe.requested_url,
-                            strategy_name=probe.strategy_name,
-                            strategy_version=probe.strategy_version,
-                            duration_ms=probe.duration_ms,
-                            http_status=probe.http_status,
-                            byte_count=probe.encoded_size,
-                            sha256=probe.encoded_sha256,
-                        )
-                        return refreshed.state
-                    if refreshed.state is not collection.state:
-                        return refreshed.state
                 else:
-                    await self._record_fallback_probe(collection.id, job_id, probe)
-                await self._fallback_diagnostic(
-                    context,
-                    collection,
-                    method=probe.method,
-                    state=probe.outcome,
-                    reason_code=probe.reason_code,
-                    requested_url=probe.requested_url,
-                    strategy_name=probe.strategy_name,
-                    strategy_version=probe.strategy_version,
-                    duration_ms=probe.duration_ms,
-                    http_status=probe.http_status,
-                    byte_count=probe.encoded_size,
-                    sha256=probe.encoded_sha256,
-                )
+                    capability = getattr(
+                        strategy, "capability_state", AcquisitionCapabilityState.IMPLEMENTED
+                    )
+                    if capability is not AcquisitionCapabilityState.IMPLEMENTED:
+                        is_policy_block = capability in {
+                            AcquisitionCapabilityState.BLOCKED_BY_POLICY,
+                            AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+                        }
+                        configured_outcome = getattr(strategy, "capability_outcome", None)
+                        probes = (
+                            AcquisitionProbe(
+                                strategy_name=strategy.name,
+                                strategy_version=strategy.version,
+                                method=strategy.method,
+                                requested_url=fallback_requested_url,
+                                outcome=(
+                                    configured_outcome
+                                    if isinstance(configured_outcome, AcquisitionOutcome)
+                                    else AcquisitionOutcome.POLICY_SKIPPED
+                                    if is_policy_block
+                                    else AcquisitionOutcome.NOT_CONFIGURED
+                                ),
+                                reason_code=getattr(
+                                    strategy, "capability_reason", capability.value
+                                ),
+                                response=None,
+                                http_status=None,
+                                encoded_size=None,
+                                encoded_sha256=None,
+                                duration_ms=0,
+                                policy_decision=(
+                                    getattr(
+                                        strategy,
+                                        "capability_policy_decision",
+                                        AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION,
+                                    )
+                                    if capability is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+                                    else AcquisitionPolicyDecision.DENIED_DOMAIN_POLICY
+                                    if is_policy_block
+                                    else AcquisitionPolicyDecision.NOT_CONFIGURED
+                                ),
+                                capability_state=capability,
+                            ),
+                        )
+                    else:
+                        started = time.monotonic()
+                        try:
+                            async with asyncio.timeout(float(strategy.timeout_seconds)):
+                                probes = tuple(await strategy.acquire(acquisition_request))
+                        except JobCancelledError:
+                            raise
+                        except TimeoutError:
+                            probes = (
+                                AcquisitionProbe(
+                                    strategy_name=strategy.name,
+                                    strategy_version=strategy.version,
+                                    method=strategy.method,
+                                    requested_url=fallback_requested_url,
+                                    outcome=AcquisitionOutcome.FAILED,
+                                    reason_code="strategy_timeout",
+                                    response=None,
+                                    http_status=None,
+                                    encoded_size=None,
+                                    encoded_sha256=None,
+                                    duration_ms=round((time.monotonic() - started) * 1000),
+                                ),
+                            )
+                        except Exception as error:
+                            probes = (
+                                AcquisitionProbe(
+                                    strategy_name=strategy.name,
+                                    strategy_version=strategy.version,
+                                    method=strategy.method,
+                                    requested_url=fallback_requested_url,
+                                    outcome=AcquisitionOutcome.FAILED,
+                                    reason_code=f"strategy_error:{type(error).__name__}",
+                                    response=None,
+                                    http_status=None,
+                                    encoded_size=None,
+                                    encoded_sha256=None,
+                                    duration_ms=round((time.monotonic() - started) * 1000),
+                                ),
+                            )
+
+                bounded_probes: list[AcquisitionProbe] = []
+                for probe in probes:
+                    counts_as_attempt = probe.outcome in {
+                        AcquisitionOutcome.SUCCEEDED,
+                        AcquisitionOutcome.FAILED,
+                        AcquisitionOutcome.REJECTED,
+                        AcquisitionOutcome.NEEDS_RECONCILIATION,
+                        AcquisitionOutcome.LOOKUP_SUCCEEDED,
+                        AcquisitionOutcome.METADATA_SUCCEEDED,
+                        AcquisitionOutcome.ARCHIVED,
+                    }
+                    if counts_as_attempt and attempted_count >= attempt_limit:
+                        continue
+                    if counts_as_attempt:
+                        attempted_count += 1
+                    bounded_probes.append(probe)
+                    if probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION:
+                        if (
+                            probe.outcome is AcquisitionOutcome.SUCCEEDED
+                            and probe.response is not None
+                        ):
+                            deferred_success_probes[id(probe)] = probe
+                        else:
+                            await record_fallback_probe(probe)
+                        handled_probe_ids.add(id(probe))
+                    elif (
+                        probe.outcome == AcquisitionOutcome.SUCCEEDED
+                        and probe.response is not None
+                        and probe.policy_decision is AcquisitionPolicyDecision.ALLOWED
+                    ):
+                        deferred_success_probes[id(probe)] = probe
+                    else:
+                        await record_fallback_probe(probe)
+                        handled_probe_ids.add(id(probe))
+                return tuple(bounded_probes)
+
+        orchestrator = ArticleAcquisitionOrchestrator(
+            tuple(RecordingStrategy(strategy) for strategy in configured),
+            deadline_seconds=self._acquisition_deadline_seconds,
+            max_attempts=self._acquisition_max_attempts,
+            per_domain_concurrency=self._acquisition_per_domain_concurrency,
+            domain_limiter=self._acquisition_domain_limiter,
+        )
+        result = await orchestrator.run(
+            request,
+            cancellation_check=context.check_cancelled if context is not None else None,
+        )
+        for probe in result.probes:
+            if id(probe) not in handled_probe_ids and probe is not result.winner:
+                await self._record_fallback_probe(collection.id, job_id, probe)
+                handled_probe_ids.add(id(probe))
+            await self._fallback_diagnostic(
+                context,
+                collection,
+                method=probe.method,
+                state=probe.outcome,
+                reason_code=probe.reason_code,
+                requested_url=probe.requested_url,
+                strategy_name=probe.strategy_name,
+                strategy_version=probe.strategy_version,
+                duration_ms=probe.duration_ms,
+                http_status=probe.http_status,
+                byte_count=probe.encoded_size,
+                sha256=probe.encoded_sha256,
+            )
+
+        for probe_id, probe in deferred_success_probes.items():
+            if probe_id != id(result.winner) and probe_id not in handled_probe_ids:
+                await self._record_fallback_probe(collection.id, job_id, probe)
+
+        winner = result.winner
+        if winner is not None and winner.response is not None:
+            response = replace(
+                winner.response,
+                requested_url=safe_fallback_url(winner.response.requested_url),
+                final_url=safe_fallback_url(winner.response.final_url),
+                redirect_chain=tuple(
+                    safe_fallback_url(item) for item in winner.response.redirect_chain
+                ),
+            )
+            quality = winner.quality
+            await self._archive(
+                collection.id,
+                datetime.now(UTC) - timedelta(milliseconds=winner.duration_ms),
+                response,
+                acquisition=_FallbackAcquisition(
+                    job_id=job_id,
+                    method=winner.method,
+                    model_run_id=UUID(winner.model_run_id) if winner.model_run_id else None,
+                    consultation_id=winner.consultation_id,
+                    prompt_sha256=winner.prompt_sha256,
+                    response_sha256=winner.response_sha256,
+                    strategy_name=winner.strategy_name,
+                    strategy_version=winner.strategy_version,
+                    duration_ms=winner.duration_ms,
+                    strategy_url=winner.requested_url,
+                    source_equivalence_class=winner.equivalence_class,
+                    evidence_class=winner.evidence_class,
+                    observation_kind=winner.observation_kind,
+                    quality=quality,
+                    archive_snapshot_time=winner.archive_snapshot_time,
+                    publication_date=winner.publication_date,
+                    publisher=winner.publisher,
+                    article_title=candidate.title if candidate else collection.title,
+                    model_generated=winner.model_generated,
+                    primary_source_verified=winner.primary_source_verified,
+                    ioc_primary_verified=winner.ioc_primary_verified,
+                ),
+                candidate=candidate,
+            )
+            async with self._uow_factory() as uow:
+                current = await uow.source_collections.get(collection.id)
+            return current.state if current is not None else collection.state
 
         async with self._uow_factory() as uow:
             current = await uow.source_collections.get(collection.id)
         return current.state if current is not None else collection.state
+
+    async def _bridge_execution(
+        self,
+        collection: SourceCollection,
+        method: SourceAcquisitionMethod,
+        *,
+        purpose: str,
+        prompt_template_id: str,
+        prompt_template_version: str,
+        prompt: str,
+        expected_tlp: TLP,
+        policy: AcquisitionPolicyContext,
+    ) -> tuple[ModelExecution | None, AcquisitionProbe | None, str, UUID]:
+        """Run one deterministic Bridge operation without persisting acquisition state."""
+        started = time.monotonic()
+        strategy_name = method.value
+        model_run_id = uuid5(
+            _FALLBACK_MODEL_RUN_NAMESPACE,
+            str(collection.id)
+            if method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+            else f"{collection.id}:{purpose}",
+        )
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        policy_decision = policy.check_destination(collection.canonical_url, external_llm=True)
+        reason = None
+        outcome = AcquisitionOutcome.POLICY_SKIPPED
+        if policy_decision is not AcquisitionPolicyDecision.ALLOWED:
+            reason = f"bridge_policy_denied:{policy_decision.value}"
+        elif self._model_gateway is None:
+            policy_decision = AcquisitionPolicyDecision.NOT_CONFIGURED
+            outcome = AcquisitionOutcome.NOT_CONFIGURED
+            reason = "model_gateway_unavailable"
+        if reason is not None:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=outcome,
+                    reason_code=reason,
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(model_run_id),
+                    prompt_sha256=prompt_sha256,
+                    policy_decision=policy_decision,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+
+        request = ModelRequest(
+            text=prompt,
+            prompt_template_id=prompt_template_id,
+            prompt_template_version=prompt_template_version,
+            evidence_pack_hash=prompt_sha256,
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            sensitivity=expected_tlp.value,
+            web_search=True,
+            run_id=model_run_id,
+            metadata={
+                "collection_id": str(collection.id),
+                "acquisition_method": method.value,
+            },
+            parameters={"purpose": purpose},
+        )
+        assert self._model_gateway is not None
+        try:
+            existing_run = await self._model_gateway.get_run(model_run_id)
+            if (
+                existing_run is not None
+                and getattr(existing_run.status, "value", existing_run.status) == "failed"
+                and getattr(
+                    existing_run.submission_state,
+                    "value",
+                    existing_run.submission_state,
+                )
+                == "not_submitted"
+            ):
+                request = replace(request, allow_failed_resubmit=True)
+            if (
+                existing_run is not None
+                and getattr(existing_run.status, "value", "") in {"needs_review", "running"}
+                and getattr(existing_run.submission_state, "value", "") != "not_submitted"
+            ):
+                reconciliation = await self._model_gateway.reconcile_bridge_submission(model_run_id)
+                if reconciliation != "captured_output":
+                    consultation_id = existing_run.bridge_request_id or existing_run.response_id
+                    return (
+                        None,
+                        AcquisitionProbe(
+                            strategy_name=strategy_name,
+                            strategy_version="1",
+                            method=method,
+                            requested_url=collection.canonical_url,
+                            outcome=AcquisitionOutcome.NEEDS_RECONCILIATION,
+                            reason_code="bridge_submission_reconciliation_required",
+                            response=None,
+                            http_status=None,
+                            encoded_size=None,
+                            encoded_sha256=None,
+                            duration_ms=round((time.monotonic() - started) * 1000),
+                            model_run_id=str(model_run_id),
+                            consultation_id=consultation_id,
+                            prompt_sha256=prompt_sha256,
+                        ),
+                        prompt_sha256,
+                        model_run_id,
+                    )
+            execution = await self._model_gateway.research(request)
+        except JobCancelledError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", "")
+            reconciliation_required = code == "model_submission_reconciliation_required"
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=(
+                        AcquisitionOutcome.NEEDS_RECONCILIATION
+                        if reconciliation_required
+                        else AcquisitionOutcome.FAILED
+                    ),
+                    reason_code=(
+                        "bridge_submission_reconciliation_required"
+                        if reconciliation_required
+                        else f"bridge_execution_failed:{type(error).__name__}"
+                    ),
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(getattr(error, "model_run_id", None) or model_run_id),
+                    prompt_sha256=prompt_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+
+        run_status = getattr(execution.run.status, "value", execution.run.status)
+        if run_status in {"needs_review", "waiting_background", "running"}:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=AcquisitionOutcome.NEEDS_RECONCILIATION,
+                    reason_code="bridge_submission_reconciliation_required",
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(execution.run.id),
+                    consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                    prompt_sha256=prompt_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+        if execution.run.id != model_run_id or not execution.output_text:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=AcquisitionOutcome.FAILED,
+                    reason_code="bridge_output_missing_or_run_identity_mismatch",
+                    response=None,
+                    http_status=None,
+                    encoded_size=None,
+                    encoded_sha256=None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(execution.run.id),
+                    consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                    prompt_sha256=prompt_sha256,
+                    response_sha256=execution.run.raw_output_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+        raw_bytes = execution.output_text.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        if execution.run.raw_output_sha256 and execution.run.raw_output_sha256 != raw_sha256:
+            return (
+                None,
+                AcquisitionProbe(
+                    strategy_name=strategy_name,
+                    strategy_version="1",
+                    method=method,
+                    requested_url=collection.canonical_url,
+                    outcome=AcquisitionOutcome.FAILED,
+                    reason_code="bridge_output_hash_mismatch",
+                    response=None,
+                    http_status=None,
+                    encoded_size=len(raw_bytes),
+                    encoded_sha256=raw_sha256,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(execution.run.id),
+                    consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                    prompt_sha256=prompt_sha256,
+                    response_sha256=execution.run.raw_output_sha256,
+                ),
+                prompt_sha256,
+                model_run_id,
+            )
+        return execution, None, prompt_sha256, model_run_id
 
     async def _bridge_transcribe(
         self,
@@ -2084,240 +2807,391 @@ class SubjectCollectionService:
         candidate: SourceCandidate | None,
         job_id: UUID,
         context: JobExecutionContext | None,
+        acquisition_request: AcquisitionRequest,
         *,
         expected_languages: tuple[str, ...] = (),
-    ) -> str:
+    ) -> AcquisitionProbe:
+        del subject, job_id, context
         method = SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
-        bridge_started = time.monotonic()
         title = candidate.title if candidate else collection.title
-        model_run_id = uuid5(_FALLBACK_MODEL_RUN_NAMESPACE, str(collection.id))
-        try:
-            subject_tlp = getattr(subject, "tlp", collection.source_tlp)
-            effective_tlp = max(
-                (
-                    subject_tlp,
-                    collection.source_tlp,
-                    candidate.tlp if candidate else collection.source_tlp,
-                ),
-                key=lambda item: tuple(TLP).index(item),
-            )
-        except (TypeError, ValueError):
-            effective_tlp = TLP.RED
-        external_allowed = collection.external_llm_allowed and (
-            candidate.external_llm_allowed if candidate else True
-        )
-        skip_reason: str | None = None
-        if not external_allowed:
-            skip_reason = "external_llm_not_allowed"
-        elif effective_tlp is TLP.RED:
-            skip_reason = "tlp_red"
-        elif not bridge_url_is_credential_free(collection.canonical_url):
-            skip_reason = "credential_like_url"
-        elif self._model_gateway is None:
-            skip_reason = "model_gateway_unavailable"
-
-        if skip_reason is not None:
-            await self._record_fallback_skip(
-                collection,
-                job_id=job_id,
-                method=method,
-                reason_code=skip_reason,
-                model_run_id=model_run_id,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-            )
-            await self._fallback_diagnostic(
-                context,
-                collection,
-                method=method,
-                state="skipped",
-                reason_code=skip_reason,
-                requested_url=collection.canonical_url,
-            )
-            return "skipped"
-
-        assert self._model_gateway is not None
         prompt = bridge_transcription_prompt(url=collection.canonical_url, title=title)
-        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        request = ModelRequest(
-            text=prompt,
+        # The request policy was constructed from subject, collection and
+        # candidate metadata by _acquire_fallback_chain.
+        execution, failure, prompt_sha256, _model_run_id = await self._bridge_execution(
+            collection,
+            method,
+            purpose="public_article_transcription",
             prompt_template_id="source-acquisition-bridge-transcription",
-            prompt_template_version="1",
-            evidence_pack_hash=prompt_sha256,
-            external_llm_allowed=True,
-            routing_hint=ModelRoutingHint.WEB_RESEARCH,
-            sensitivity=effective_tlp.value,
-            web_search=True,
-            run_id=model_run_id,
-            metadata={
-                "collection_id": str(collection.id),
-                "acquisition_method": method.value,
-            },
-            parameters={"purpose": "public_article_transcription"},
+            prompt_template_version="2",
+            prompt=prompt,
+            expected_tlp=acquisition_request.policy.tlp,
+            policy=acquisition_request.policy,
         )
-
-        try:
-            existing_run = await self._model_gateway.get_run(model_run_id)
-            if (
-                existing_run is not None
-                and getattr(existing_run.status, "value", "")
-                in {
-                    "needs_review",
-                    "running",
-                }
-                and getattr(existing_run.submission_state, "value", "") != "not_submitted"
-            ):
-                reconciliation = await self._model_gateway.reconcile_bridge_submission(model_run_id)
-                if reconciliation != "captured_output":
-                    await self._record_fallback_skip(
-                        collection,
-                        job_id=job_id,
-                        method=method,
-                        reason_code="bridge_submission_reconciliation_required",
-                        outcome="needs_reconciliation",
-                        model_run_id=model_run_id,
-                        consultation_id=existing_run.bridge_request_id,
-                        duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                        prompt_sha256=prompt_sha256,
-                    )
-                    return "needs_reconciliation"
-            execution = await self._model_gateway.research(request)
-        except JobCancelledError:
-            raise
-        except Exception as error:
-            model_id = getattr(error, "model_run_id", None) or model_run_id
-            await self._record_fallback_failure(
-                collection.id,
-                job_id,
-                requested_url=collection.canonical_url,
-                method=method,
-                reason="Bridge transcription failed before a usable response",
-                reason_code=CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED,
-                outcome=(
-                    "needs_reconciliation"
-                    if getattr(error, "code", "") == "model_submission_reconciliation_required"
-                    else "failed"
-                ),
-                model_run_id=model_id,
-                consultation_id=None,
-                prompt_sha256=prompt_sha256,
-                response_sha256=None,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
+        if failure is not None:
+            return failure
+        assert execution is not None and execution.output_text is not None
+        raw_bytes = execution.output_text.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        parsed = parse_bridge_transcription(execution.output_text)
+        consultation_id = execution.run.bridge_request_id or execution.run.response_id
+        elapsed = max(0, int(getattr(execution.run, "duration_ms", 0) or 0))
+        if not parsed.parsed:
+            return AcquisitionProbe(
                 strategy_name="bridge_transcription",
-            )
-            return (
-                "needs_reconciliation"
-                if getattr(error, "code", "") == "model_submission_reconciliation_required"
-                else "failed"
-            )
-
-        run_status = getattr(execution.run.status, "value", execution.run.status)
-        if run_status in {"needs_review", "waiting_background", "running"}:
-            await self._record_fallback_skip(
-                collection,
-                job_id=job_id,
+                strategy_version="1",
                 method=method,
-                reason_code="bridge_submission_reconciliation_required",
-                outcome="needs_reconciliation",
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                prompt_sha256=prompt_sha256,
-            )
-            return "needs_reconciliation"
-
-        output_text = execution.output_text or ""
-        response_sha256 = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
-        article = parse_bridge_transcription(output_text)
-        if article is None:
-            await self._record_fallback_failure(
-                collection.id,
-                job_id,
                 requested_url=collection.canonical_url,
-                method=method,
-                reason="Bridge response did not contain a parseable article transcription",
-                reason_code=CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED,
-                outcome="response_unparseable",
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+                outcome=AcquisitionOutcome.REJECTED,
+                reason_code=parsed.reason or "bridge_response_unparseable",
+                response=None,
+                http_status=None,
+                encoded_size=len(raw_bytes),
+                encoded_sha256=raw_sha256,
+                duration_ms=elapsed,
+                model_run_id=str(execution.run.id),
+                consultation_id=consultation_id,
                 prompt_sha256=prompt_sha256,
-                response_sha256=response_sha256,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                strategy_name="bridge_transcription",
-                encoded_size=len(output_text.encode("utf-8")),
-                encoded_sha256=execution.run.raw_output_sha256 or response_sha256,
-                decoded_size=len(output_text.encode("utf-8")),
-                decoded_sha256=execution.run.raw_output_sha256 or response_sha256,
+                response_sha256=execution.run.raw_output_sha256 or raw_sha256,
+                equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+                evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+                observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+                model_generated=True,
             )
-            return "response_unparseable"
-
-        content = article.encode("utf-8")
+        article_bytes = parsed.article_text.encode("utf-8")
         rejection = article_rejection_reason(
-            body=content,
+            body=article_bytes,
             content_type="text/plain",
             requested_url=collection.canonical_url,
             expected_title=title,
             min_text_chars=self._fallback_min_text_chars,
             expected_languages=expected_languages,
         )
+        quality = deterministic_acquisition_quality(
+            parsed.article_text,
+            expected_title=parsed.title or title,
+            expected_languages=expected_languages,
+            reason="model_transcription_unverified",
+        )
         if rejection is not None:
-            digest = hashlib.sha256(content).hexdigest()
-            await self._record_fallback_failure(
-                collection.id,
-                job_id,
-                requested_url=collection.canonical_url,
-                method=method,
-                reason="Bridge transcript failed the local article acceptance checks",
-                reason_code=CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED,
-                outcome=f"response_rejected:{rejection}",
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
-                prompt_sha256=prompt_sha256,
-                response_sha256=execution.run.raw_output_sha256 or response_sha256,
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
+            return AcquisitionProbe(
                 strategy_name="bridge_transcription",
-                encoded_size=len(content),
-                encoded_sha256=digest,
-                decoded_size=len(content),
-                decoded_sha256=digest,
+                strategy_version="1",
+                method=method,
+                requested_url=collection.canonical_url,
+                outcome=AcquisitionOutcome.REJECTED,
+                reason_code=f"transcript_rejected:{rejection}",
+                response=None,
+                http_status=None,
+                encoded_size=len(raw_bytes),
+                encoded_sha256=raw_sha256,
+                duration_ms=elapsed,
+                model_run_id=str(execution.run.id),
+                consultation_id=consultation_id,
+                prompt_sha256=prompt_sha256,
+                response_sha256=execution.run.raw_output_sha256 or raw_sha256,
+                equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+                evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+                observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+                quality=quality,
+                model_generated=True,
             )
-            return "response_unparseable"
-
         response = CollectedResponse(
             requested_url=collection.canonical_url,
             final_url=collection.canonical_url,
             redirect_chain=(),
             status=0,
             headers={},
-            declared_content_type="text/plain",
+            declared_content_type="text/plain; charset=utf-8",
             detected_content_type=DetectedMimeType.TEXT,
-            encoded_body=content,
-            decoded_body=content,
-            encoded_size=len(content),
-            encoded_sha256=hashlib.sha256(content).hexdigest(),
-            decoded_size=len(content),
-            decoded_sha256=hashlib.sha256(content).hexdigest(),
+            encoded_body=raw_bytes,
+            decoded_body=article_bytes,
+            encoded_size=len(raw_bytes),
+            encoded_sha256=raw_sha256,
+            decoded_size=len(article_bytes),
+            decoded_sha256=hashlib.sha256(article_bytes).hexdigest(),
             content_encoding="identity",
             acquired_at=datetime.now(UTC),
         )
-        await self._archive(
-            collection.id,
-            datetime.now(UTC),
-            response,
-            acquisition=_FallbackAcquisition(
-                job_id=job_id,
-                method=method,
-                model_run_id=execution.run.id,
-                consultation_id=execution.run.bridge_request_id or execution.run.response_id,
-                prompt_sha256=prompt_sha256,
-                response_sha256=(execution.run.raw_output_sha256 or response_sha256),
-                strategy_name="bridge_transcription",
-                strategy_version="1",
-                duration_ms=round((time.monotonic() - bridge_started) * 1000),
-                strategy_url=collection.canonical_url,
-            ),
-            candidate=candidate,
+        return AcquisitionProbe(
+            strategy_name="bridge_transcription",
+            strategy_version="1",
+            method=method,
+            requested_url=collection.canonical_url,
+            outcome=AcquisitionOutcome.SUCCEEDED,
+            reason_code=None,
+            response=response,
+            http_status=None,
+            encoded_size=len(raw_bytes),
+            encoded_sha256=raw_sha256,
+            duration_ms=elapsed,
+            model_run_id=str(execution.run.id),
+            consultation_id=consultation_id,
+            prompt_sha256=prompt_sha256,
+            response_sha256=execution.run.raw_output_sha256 or raw_sha256,
+            equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+            evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+            observation_kind=AcquisitionObservationKind.MODEL_TRANSCRIPTION,
+            quality=quality,
+            publication_date=candidate.published_at if candidate else collection.published_at,
+            publisher=parsed.publisher
+            or (candidate.publisher if candidate else collection.publisher),
+            model_generated=True,
+            primary_source_verified=False,
+            ioc_primary_verified=False,
         )
-        return "archived"
+
+    async def _bridge_source_discover(
+        self,
+        collection: SourceCollection,
+        subject: object,
+        candidate: SourceCandidate | None,
+        job_id: UUID,
+        context: JobExecutionContext | None,
+        acquisition_request: AcquisitionRequest,
+        *,
+        max_candidates: int,
+        expected_languages: tuple[str, ...] = (),
+    ) -> tuple[AcquisitionProbe, ...]:
+        del context, job_id
+        method = SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY
+        title = candidate.title if candidate else collection.title
+        publisher = candidate.publisher if candidate else collection.publisher
+        published_at = candidate.published_at if candidate else collection.published_at
+        prompt = bridge_source_discovery_prompt(
+            url=collection.canonical_url,
+            title=title,
+            publisher=publisher,
+            published_at=published_at,
+        )
+        del subject
+        request_tlp = acquisition_request.policy.tlp
+        execution, failure, prompt_sha256, model_run_id = await self._bridge_execution(
+            collection,
+            method,
+            purpose="public_article_source_discovery",
+            prompt_template_id="source-acquisition-bridge-source-discovery",
+            prompt_template_version="1",
+            prompt=prompt,
+            expected_tlp=request_tlp,
+            policy=acquisition_request.policy,
+        )
+        if failure is not None:
+            return (failure,)
+        assert execution is not None and execution.output_text is not None
+        raw_bytes = execution.output_text.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        response_sha256 = execution.run.raw_output_sha256 or raw_sha256
+        locations = parse_bridge_source_locations(execution.output_text)
+        duration_ms = max(0, int(getattr(execution.run, "duration_ms", 0) or 0))
+        model_probe = AcquisitionProbe(
+            strategy_name="bridge_source_discovery",
+            strategy_version="1",
+            method=method,
+            requested_url=collection.canonical_url,
+            outcome=(
+                AcquisitionOutcome.LOOKUP_SUCCEEDED if locations else AcquisitionOutcome.REJECTED
+            ),
+            reason_code=None if locations else "no_candidate_locations",
+            response=None,
+            http_status=None,
+            encoded_size=len(raw_bytes),
+            encoded_sha256=raw_sha256,
+            duration_ms=duration_ms,
+            model_run_id=str(execution.run.id),
+            consultation_id=execution.run.bridge_request_id or execution.run.response_id,
+            prompt_sha256=prompt_sha256,
+            response_sha256=response_sha256,
+            policy_decision=AcquisitionPolicyDecision.ALLOWED,
+            equivalence_class=SourceEquivalenceClass.UNKNOWN_MATCH,
+            evidence_class=EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED,
+            model_generated=True,
+            primary_source_verified=False,
+            ioc_primary_verified=False,
+        )
+        # Candidate content probes carry the discovery run and response hashes.
+        # The model-only lookup has no HTTP response and therefore cannot be
+        # represented as a successful CollectionAttempt without inventing a
+        # final URL or content hash. Keep it as a rejection only when there are
+        # no locations to fetch.
+        probes: list[AcquisitionProbe] = [] if locations else [model_probe]
+        seen_urls: set[str] = set()
+        candidate_budget = max(0, min(max_candidates, len(locations)))
+        for location in locations[:candidate_budget]:
+            try:
+                candidate_url = canonicalize_http_url(location.url)
+            except (TypeError, ValueError):
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=method,
+                        requested_url="invalid-url",
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason_code="candidate_url_invalid",
+                        response=None,
+                        http_status=None,
+                        encoded_size=None,
+                        encoded_sha256=None,
+                        duration_ms=0,
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                    )
+                )
+                continue
+            if candidate_url in seen_urls:
+                continue
+            seen_urls.add(candidate_url)
+            decision = (
+                AcquisitionPolicyDecision.DENIED_CREDENTIALS
+                if not bridge_url_is_credential_free(candidate_url)
+                else acquisition_request.policy.check_url(candidate_url)
+            )
+            metadata_reason = bridge_location_metadata_rejection(location, acquisition_request)
+            if decision is not AcquisitionPolicyDecision.ALLOWED or metadata_reason is not None:
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=method,
+                        requested_url=safe_fallback_url(candidate_url),
+                        outcome=(
+                            AcquisitionOutcome.POLICY_SKIPPED
+                            if decision is not AcquisitionPolicyDecision.ALLOWED
+                            else AcquisitionOutcome.REJECTED
+                        ),
+                        reason_code=(
+                            decision.value
+                            if decision is not AcquisitionPolicyDecision.ALLOWED
+                            else metadata_reason
+                        ),
+                        response=None,
+                        http_status=None,
+                        encoded_size=None,
+                        encoded_sha256=None,
+                        duration_ms=0,
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                        policy_decision=decision,
+                    )
+                )
+                continue
+            attempt_key = hashlib.sha256(
+                f"bridge_source_discovery\0{candidate_url}".encode()
+            ).hexdigest()
+            if attempt_key in acquisition_request.attempted_strategy_urls:
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=method,
+                        requested_url=safe_fallback_url(candidate_url),
+                        outcome=AcquisitionOutcome.SKIPPED,
+                        reason_code="already_attempted_for_strategy",
+                        response=None,
+                        http_status=None,
+                        encoded_size=None,
+                        encoded_sha256=None,
+                        duration_ms=0,
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                    )
+                )
+                continue
+            started = time.monotonic()
+            try:
+                response = await acquisition_request.fetch(candidate_url, {}, 15.0, False)
+            except JobCancelledError:
+                raise
+            except (CollectionError, PermissionError, ValueError) as error:
+                probes.append(
+                    AcquisitionProbe(
+                        strategy_name="bridge_source_discovery",
+                        strategy_version="1",
+                        method=SourceAcquisitionMethod.DIRECT_HTTP,
+                        requested_url=candidate_url,
+                        outcome=AcquisitionOutcome.FAILED,
+                        reason_code=f"candidate_fetch_failed:{type(error).__name__}",
+                        response=None,
+                        http_status=getattr(error, "http_status", None),
+                        encoded_size=getattr(error, "encoded_size", None),
+                        encoded_sha256=None,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                        model_run_id=str(model_run_id),
+                        consultation_id=model_probe.consultation_id,
+                        prompt_sha256=prompt_sha256,
+                        response_sha256=response_sha256,
+                    )
+                )
+                continue
+            response_policy = acquisition_request.policy.check_url(response.final_url)
+            rejection = (
+                "redirect_destination_policy_denied"
+                if response_policy is not AcquisitionPolicyDecision.ALLOWED
+                else bridge_article_response_rejection(
+                    response,
+                    location=location,
+                    request=acquisition_request,
+                )
+            )
+            same_publisher = _same_acquisition_publisher(
+                collection.canonical_url, response.final_url
+            )
+            equivalence = (
+                SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
+                if same_publisher
+                else SourceEquivalenceClass.INDEPENDENT_CORROBORATION
+            )
+            observed_text = response.decoded_body.decode("utf-8", errors="replace")
+            quality = deterministic_acquisition_quality(
+                observed_text,
+                expected_title=location.title or title,
+                expected_languages=expected_languages,
+                reason="bridge_discovery_content_observed",
+            )
+            probes.append(
+                AcquisitionProbe(
+                    strategy_name="bridge_source_discovery",
+                    strategy_version="1",
+                    method=(
+                        SourceAcquisitionMethod.DIRECT_HTTP
+                        if equivalence is SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
+                        else SourceAcquisitionMethod.INDEPENDENT_CORROBORATION
+                    ),
+                    requested_url=candidate_url,
+                    outcome=(
+                        AcquisitionOutcome.REJECTED
+                        if rejection is not None
+                        else AcquisitionOutcome.SUCCEEDED
+                    ),
+                    reason_code=rejection,
+                    response=response,
+                    http_status=response.status,
+                    encoded_size=response.encoded_size,
+                    encoded_sha256=response.encoded_sha256,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    model_run_id=str(model_run_id),
+                    consultation_id=model_probe.consultation_id,
+                    prompt_sha256=prompt_sha256,
+                    response_sha256=response_sha256,
+                    policy_decision=response_policy,
+                    observation_kind=AcquisitionObservationKind.HTTP_RESPONSE,
+                    equivalence_class=equivalence,
+                    evidence_class=evidence_class_for_equivalence(equivalence),
+                    quality=quality,
+                    publication_date=published_at,
+                    publisher=location.publisher or publisher,
+                    model_generated=False,
+                    primary_source_verified=same_publisher and rejection is None,
+                    ioc_primary_verified=same_publisher and rejection is None,
+                )
+            )
+        return tuple(probes)
 
     async def _record_fallback_failure(
         self,
@@ -2429,14 +3303,23 @@ class SubjectCollectionService:
         now = datetime.now(UTC)
         response = probe.response
         success = (
-            probe.outcome in {"lookup_succeeded", "metadata_succeeded"} and response is not None
+            probe.outcome
+            in {
+                AcquisitionOutcome.SUCCEEDED,
+                AcquisitionOutcome.LOOKUP_SUCCEEDED,
+                AcquisitionOutcome.METADATA_SUCCEEDED,
+            }
+            and response is not None
+            and probe.policy_decision is AcquisitionPolicyDecision.ALLOWED
         )
         reason = probe.reason_code or probe.outcome
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
             subject = await uow.subjects.get(collection.subject_id)
-            if subject is None or collection.state in (
-                _COLLECTED_STATES | {CollectionState.FETCHING}
+            if (
+                subject is None
+                or collection.state in (_COLLECTED_STATES | {CollectionState.FETCHING})
+                or collection.source_document_id is not None
             ):
                 return
             await uow.collection_policy_snapshots.add_if_absent(self._policy_snapshot)
@@ -2475,14 +3358,35 @@ class SubjectCollectionService:
                     AttemptOutcome.SUCCEEDED
                     if success
                     else AttemptOutcome.SKIPPED
-                    if probe.outcome == "skipped"
+                    if probe.outcome
+                    in {
+                        AcquisitionOutcome.SKIPPED,
+                        AcquisitionOutcome.NOT_CONFIGURED,
+                        AcquisitionOutcome.POLICY_SKIPPED,
+                    }
                     else AttemptOutcome.ERROR
                 ),
                 failure_reason=None if success else f"Acquisition strategy {reason}",
-                reason_code=None if success else CollectionFailureReason.FALLBACK_FAILED,
+                reason_code=(
+                    None
+                    if success
+                    else CollectionFailureReason.BRIDGE_TRANSCRIPTION_FAILED
+                    if probe.method is SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION
+                    else CollectionFailureReason.FALLBACK_FAILED
+                ),
                 strategy_name=probe.strategy_name,
                 strategy_version=probe.strategy_version,
                 duration_ms=probe.duration_ms,
+                acquisition_method=probe.method,
+                source_equivalence_class=probe.equivalence_class,
+                evidence_class=probe.evidence_class,
+                observation_kind=probe.observation_kind,
+                quality_score=probe.quality.score if probe.quality is not None else None,
+                quality_assessment=_quality_assessment(probe.quality),
+                archive_snapshot_time=probe.archive_snapshot_time,
+                model_run_id=UUID(probe.model_run_id) if probe.model_run_id else None,
+                model_generated=probe.model_generated,
+                primary_source_verified=probe.primary_source_verified,
             )
             await uow.collection_attempts.append(attempt)
             collection.record_fallback_attempt(attempt.id)
@@ -2520,7 +3424,7 @@ class SubjectCollectionService:
         job_id: UUID,
         method: SourceAcquisitionMethod,
         reason_code: str,
-        outcome: str = "skipped",
+        outcome: AcquisitionOutcome | str = AcquisitionOutcome.SKIPPED,
         requested_url: str | None = None,
         model_run_id: UUID | None = None,
         consultation_id: str | None = None,
@@ -2536,7 +3440,7 @@ class SubjectCollectionService:
                 strategy_version="1",
                 method=method,
                 requested_url=requested_url or collection.canonical_url,
-                outcome=outcome,
+                outcome=_typed_probe_outcome(outcome),
                 reason_code=reason_code,
                 response=None,
                 http_status=None,
@@ -2608,7 +3512,9 @@ class SubjectCollectionService:
                 failures.append(
                     {
                         "collection_id": str(source.id),
-                        "requested_url": source.requested_url,
+                        "requested_url": safe_fallback_url(
+                            latest.requested_url if latest else source.requested_url
+                        ),
                         "state": current.state.value,
                         "reason_code": (
                             current.failure_reason_code.value
@@ -2619,8 +3525,12 @@ class SubjectCollectionService:
                         ),
                         "failure_reason": current.error_reason,
                         "http_status": latest.http_status if latest else None,
-                        "final_url": latest.final_url if latest else None,
-                        "redirect_chain": list(latest.redirect_chain) if latest else [],
+                        "final_url": safe_fallback_url(latest.final_url)
+                        if latest and latest.final_url
+                        else None,
+                        "redirect_chain": [safe_fallback_url(url) for url in latest.redirect_chain]
+                        if latest
+                        else [],
                         "declared_content_type": (latest.declared_content_type if latest else None),
                         "detected_content_type": (latest.detected_content_type if latest else None),
                         "encoded_size": latest.encoded_size if latest else None,
@@ -2653,6 +3563,19 @@ def register_collection_jobs(registry: JobRegistry, service: SubjectCollectionSe
 
     registry.register("source.collect", SubjectCollectionParameters, handler)
 
+    async def fallback_handler(parameters: JobParameters, context: JobExecutionContext) -> str:
+        if not isinstance(parameters, FallbackAcquireParameters):
+            raise TypeError("Invalid source fallback acquisition parameters")
+        state = await service.fallback_acquire(
+            parameters.subject_id,
+            parameters.collection_id,
+            context.job_id,
+            context,
+        )
+        return state.value
+
+    registry.register("source.fallback_acquire", FallbackAcquireParameters, fallback_handler)
+
 
 def collection_idempotency_key(
     subject_id: UUID,
@@ -2671,13 +3594,14 @@ def _new_collection(
     candidate: DiscoveryCandidate,
     source: SourceCandidate,
 ) -> SourceCollection:
+    stored_url, credential_like = _safe_collection_url(source.canonical_url)
     return SourceCollection(
         subject_id=subject_id,
         edition_id=edition_id,
         batch_id=candidate.discovery_batch_id,
         source_candidate_id=source.id,
-        requested_url=source.canonical_url,
-        canonical_url=source.canonical_url,
+        requested_url=stored_url,
+        canonical_url=stored_url,
         origin_kind=SourceOriginKind.DISCOVERY,
         proposed_role=source.role,
         title=source.title,
@@ -2686,6 +3610,7 @@ def _new_collection(
         source_tlp=source.tlp,
         sensitivity=source.sensitivity,
         external_llm_allowed=source.external_llm_allowed,
+        error_reason=_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None,
     )
 
 
@@ -2694,13 +3619,14 @@ def _new_snapshot_collection(
     subject_id: UUID,
     source: ProductionInputSource,
 ) -> SourceCollection:
+    stored_url, credential_like = _safe_collection_url(source.canonical_url)
     return SourceCollection(
         subject_id=subject_id,
         edition_id=snapshot.edition_id,
         batch_id=source.discovery_batch_id,
         source_candidate_id=source.source_candidate_id,
-        requested_url=source.canonical_url,
-        canonical_url=source.canonical_url,
+        requested_url=stored_url,
+        canonical_url=stored_url,
         origin_kind=SourceOriginKind.DISCOVERY,
         proposed_role=source.role,
         title=source.title,
@@ -2709,7 +3635,15 @@ def _new_snapshot_collection(
         source_tlp=source.tlp,
         sensitivity=source.sensitivity,
         external_llm_allowed=source.external_llm_allowed,
+        error_reason=_CREDENTIAL_LIKE_URL_REJECTION if credential_like else None,
     )
+
+
+def _safe_collection_url(url: str) -> tuple[str, bool]:
+    """Store only a safe origin when the source URL contains credentials."""
+    if is_credential_free_url(url):
+        return url, False
+    return credential_free_url(url), True
 
 
 def _successful_attempt(
@@ -2725,6 +3659,7 @@ def _successful_attempt(
     strategy_name: str | None = None,
     strategy_version: str | None = None,
     duration_ms: int | None = None,
+    fallback: _FallbackAcquisition | None = None,
 ) -> CollectionAttempt:
     failure_reason_code = processing_failure[0] if processing_failure else None
     failure_reason = processing_failure[1] if processing_failure else None
@@ -2773,7 +3708,31 @@ def _successful_attempt(
         strategy_name=strategy_name,
         strategy_version=strategy_version,
         duration_ms=duration_ms,
+        acquisition_method=acquisition_method,
+        source_equivalence_class=(
+            fallback.source_equivalence_class if fallback is not None else None
+        ),
+        evidence_class=fallback.evidence_class if fallback is not None else None,
+        observation_kind=fallback.observation_kind if fallback is not None else None,
+        quality_score=(
+            fallback.quality.score if fallback is not None and fallback.quality else None
+        ),
+        quality_assessment=(
+            _quality_assessment(fallback.quality) if fallback is not None else None
+        ),
+        archive_snapshot_time=(fallback.archive_snapshot_time if fallback is not None else None),
+        model_run_id=fallback.model_run_id if fallback is not None else None,
+        model_generated=fallback.model_generated if fallback is not None else None,
+        primary_source_verified=(
+            fallback.primary_source_verified if fallback is not None else None
+        ),
     )
+
+
+def _quality_assessment(quality: AcquisitionQuality | None) -> dict[str, object] | None:
+    if quality is None:
+        return None
+    return {"score": quality.score, "reasons": list(quality.reasons)}
 
 
 def _fallback_attempt_event(
@@ -2981,6 +3940,8 @@ async def _discovery_source(
 
 
 async def _require_collection(uow: UnitOfWork, collection_id: UUID) -> SourceCollection:
+    # PostgreSQL holds this row lock through the caller's commit, which keeps
+    # collection pointer and lease precedence checks atomic for fallback saves.
     collection = await uow.source_collections.get_for_update(collection_id)
     if collection is None:
         raise CollectionItemNotFoundError(str(collection_id))

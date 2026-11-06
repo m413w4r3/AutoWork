@@ -710,10 +710,11 @@ def test_snapshot_accepts_pre_scope_extraction_hash_without_rewriting_blobs() ->
     extraction_payload = payload["artifacts"]["extraction"]["canonical_content"]
     for source in extraction_payload["sources"]:
         source.pop("scope")
+        assert "acquisition_method" in source
     extraction = production_extraction_from_json(extraction_payload)
     extraction_hashes = production_extraction_hashes(extraction)
-    assert len(extraction_hashes) == 2
-    legacy_hash = extraction_hashes[1]
+    assert len(extraction_hashes) == 3
+    legacy_hash = extraction_hashes[-1]
 
     synthesis_payload = payload["artifacts"]["synthesis"]["canonical_content"]
     synthesis_payload["extraction_hash"] = legacy_hash
@@ -726,6 +727,10 @@ def test_snapshot_accepts_pre_scope_extraction_hash_without_rewriting_blobs() ->
     snapshot = _validate_snapshot(payload)
 
     assert snapshot.artifacts.extraction.canonical_content == extraction_payload
+    assert all(
+        "scope" not in source and "acquisition_method" in source
+        for source in snapshot.artifacts.extraction.canonical_content["sources"]
+    )
     assert snapshot.artifacts.synthesis.canonical_content["extraction_hash"] == legacy_hash
     assert snapshot.artifacts.editorial_enrichment.canonical_content["extraction_hash"] == (
         legacy_hash

@@ -461,7 +461,9 @@ async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> N
         ProductionRepairImpactKind.PUBLICATION_ONLY
     )
     extraction = production_extraction_from_json(store.payloads[UUID(int=11)])
-    current_hash, legacy_hash = production_extraction_hashes(extraction)
+    hashes = production_extraction_hashes(extraction)
+    current_hash = hashes[0]
+    legacy_hash = hashes[-1]
     synthesis = production_synthesis_from_json(store.payloads[UUID(int=12)])
     store.payloads[UUID(int=12)] = production_synthesis_to_json(
         replace(synthesis, extraction_hash=legacy_hash)

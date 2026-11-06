@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from pypdf import PdfWriter
 
+from cti_app.application import extraction as extraction_module
 from cti_app.application.extraction import (
     ChunkingPolicy,
     DocumentParsingError,
@@ -331,6 +332,41 @@ def test_pdf_timeout_is_explicit() -> None:
             PdfParsingPolicy(timeout_seconds=0.000001),
         )
     assert failure.value.code == "pdf_timeout"
+
+
+def test_pdf_worker_sets_address_space_limit_before_parsing_and_types_memory_error(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    limits: list[tuple[int, tuple[int, int]]] = []
+    messages: list[object] = []
+
+    def set_limit(kind: int, values: tuple[int, int]) -> None:
+        events.append("limit")
+        limits.append((kind, values))
+
+    def fail_to_parse(content: BytesIO, *, strict: bool) -> None:
+        del content, strict
+        events.append("parse")
+        raise MemoryError
+
+    monkeypatch.setattr(extraction_module.resource, "setrlimit", set_limit)
+    monkeypatch.setattr(extraction_module, "PdfReader", fail_to_parse)
+    connection = SimpleNamespace(send=messages.append, close=lambda: None)
+
+    extraction_module._pdf_worker(connection, b"%PDF-1.4", 10, 100_000, 10_000)
+
+    assert events == ["limit", "parse"]
+    assert limits == [
+        (
+            extraction_module.resource.RLIMIT_AS,
+            (
+                extraction_module._PDF_WORKER_ADDRESS_SPACE_LIMIT_BYTES,
+                extraction_module._PDF_WORKER_ADDRESS_SPACE_LIMIT_BYTES,
+            ),
+        )
+    ]
+    assert messages == [("error", ("pdf_too_large", "PDF exceeded the parser memory limit"))]
 
 
 def test_pdf_metadata_limit_is_explicit() -> None:

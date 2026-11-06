@@ -7,6 +7,7 @@ import ipaddress
 import json
 import multiprocessing
 import re
+import resource
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
@@ -39,6 +40,7 @@ from cti_app.domain.publication import ArtifactType
 PARSER_NAME = "cti-safe-text"
 PARSER_VERSION = "2.1.0"
 CHUNKING_VERSION = "fixed-overlap-v1"
+_PDF_WORKER_ADDRESS_SPACE_LIMIT_BYTES = 512 * 1024 * 1024
 CancellationCheck = Callable[[], Awaitable[None]]
 
 
@@ -475,6 +477,13 @@ def _pdf_worker(
 ) -> None:
     sender = connection
     try:
+        # The OS enforces this bound in the child; expansion OOM is not deterministic to unit-test.
+        _, hard_limit = resource.getrlimit(resource.RLIMIT_AS)
+        memory_limit = _PDF_WORKER_ADDRESS_SPACE_LIMIT_BYTES
+        if hard_limit != resource.RLIM_INFINITY:
+            memory_limit = min(memory_limit, hard_limit)
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+
         reader = PdfReader(io.BytesIO(content), strict=True)
         if reader.is_encrypted:
             sender.send(("error", ("pdf_encrypted", "Encrypted PDFs are not supported")))
@@ -501,6 +510,10 @@ def _pdf_worker(
                 return
             metadata[str(key).lstrip("/").casefold()] = rendered
         sender.send(("ok", ("\n\n".join(parts).strip(), metadata)))
+    except MemoryError:
+        sender.send(("error", ("pdf_too_large", "PDF exceeded the parser memory limit")))
+    except OSError:
+        sender.send(("error", ("pdf_malformed", "PDF parser could not read the document")))
     except Exception as exc:
         sender.send(("error", ("pdf_malformed", f"Malformed PDF: {type(exc).__name__}")))
     finally:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -7,6 +8,11 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
+from cti_app.domain.acquisition import (
+    AcquisitionObservationKind,
+    EvidenceClass,
+    SourceEquivalenceClass,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     SourceRelationshipStatus,
@@ -59,14 +65,40 @@ class CollectionFailureReason(StrEnum):
 class SourceAcquisitionMethod(StrEnum):
     """How the bytes attached to a source document were obtained."""
 
+    EXISTING_ARCHIVE = "existing_archive"
     DIRECT_HTTP = "direct_http"
     HTTP_VARIANT = "http_variant"
+    CANONICAL_VARIANT = "canonical_variant"
+    AMP_VARIANT = "amp_variant"
+    PRINT_VARIANT = "print_variant"
+    MOBILE_VARIANT = "mobile_variant"
+    RSS_ATOM_JSONFEED = "rss_atom_jsonfeed"
+    PUBLISHER_PUBLIC_API = "publisher_public_api"
+    EMBEDDED_STRUCTURED_DATA = "embedded_structured_data"
+    PLAYWRIGHT_CHROMIUM_DOM = "playwright_chromium_dom"
+    PLAYWRIGHT_NETWORK_RESPONSE = "playwright_network_response"
+    PLAYWRIGHT_EMBEDDED_STATE = "playwright_embedded_state"
+    PLAYWRIGHT_FIREFOX = "playwright_firefox"
+    PLAYWRIGHT_WEBKIT = "playwright_webkit"
+    MULTI_EXTRACTOR = "multi_extractor"
     WEB_ARCHIVE = "web_archive"
     WAYBACK = "wayback"
+    WAYBACK_SNAPSHOT = "wayback_snapshot"
     ARCHIVE_PH = "archive_ph"
     COMMON_CRAWL = "common_crawl"
+    COMMONCRAWL_WARC = "commoncrawl_warc"
     MEMENTO = "memento"
+    MEMENTO_ARCHIVE = "memento_archive"
     SEARCH_CACHE = "search_cache"
+    EXACT_TITLE_SEARCH = "exact_title_search"
+    PUBLISHER_ALTERNATIVE_URL = "publisher_alternative_url"
+    AUTHORIZED_SYNDICATION = "authorized_syndication"
+    INDEPENDENT_CORROBORATION = "independent_corroboration"
+    PUBLISHER_PDF = "publisher_pdf"
+    VISUAL_OCR = "visual_ocr"
+    OFFICIAL_NEWSLETTER_ARCHIVE = "official_newsletter_archive"
+    THIRD_PARTY_EXTRACTION = "third_party_extraction"
+    BRIDGE_SOURCE_DISCOVERY = "bridge_source_discovery"
     PLAYWRIGHT_RENDERED = "playwright_rendered"
     BRIDGE_TRANSCRIPTION = "bridge_transcription"
     MANUAL_UPLOAD = "manual_upload"
@@ -572,6 +604,16 @@ class CollectionAttempt:
     strategy_name: str | None = None
     strategy_version: str | None = None
     duration_ms: int | None = None
+    acquisition_method: SourceAcquisitionMethod | None = None
+    source_equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    observation_kind: AcquisitionObservationKind | None = None
+    quality_score: float | None = None
+    quality_assessment: dict[str, Any] | None = None
+    archive_snapshot_time: datetime | None = None
+    model_run_id: UUID | None = None
+    model_generated: bool | None = None
+    primary_source_verified: bool | None = None
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
@@ -606,6 +648,41 @@ class CollectionAttempt:
             raise ValueError("A strategy name and version must be recorded together")
         if self.duration_ms is not None and self.duration_ms < 0:
             raise ValueError("A collection attempt duration cannot be negative")
+        for field_name, enum_type in (
+            ("acquisition_method", SourceAcquisitionMethod),
+            ("source_equivalence_class", SourceEquivalenceClass),
+            ("evidence_class", EvidenceClass),
+            ("observation_kind", AcquisitionObservationKind),
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, enum_type):
+                object.__setattr__(self, field_name, enum_type(value))
+        if self.quality_score is not None and (
+            isinstance(self.quality_score, bool)
+            or not math.isfinite(self.quality_score)
+            or not 0.0 <= self.quality_score <= 1.0
+        ):
+            raise ValueError("Acquisition quality score must be between 0 and 1")
+        if self.quality_assessment is not None:
+            if set(self.quality_assessment) != {"score", "reasons"}:
+                raise ValueError("Acquisition quality assessment contains unsupported fields")
+            score = self.quality_assessment["score"]
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(score)
+                or not 0.0 <= score <= 1.0
+            ):
+                raise ValueError("Acquisition quality assessment score must be between 0 and 1")
+            if self.quality_score is not None and float(score) != self.quality_score:
+                raise ValueError("Acquisition quality score and assessment must agree")
+            reasons = self.quality_assessment["reasons"]
+            if not isinstance(reasons, (tuple, list)) or any(
+                not isinstance(reason, str) for reason in reasons
+            ):
+                raise ValueError("Acquisition quality reasons must be typed strings")
+        if self.archive_snapshot_time is not None and self.archive_snapshot_time.tzinfo is None:
+            raise ValueError("Archive snapshot time must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,28 +6,51 @@ import asyncio
 import gzip
 import hashlib
 import json
+import os
 import re
+import shlex
 import time
+from asyncio.subprocess import DEVNULL, PIPE
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from html.parser import HTMLParser
-from typing import Protocol
-from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from typing import TYPE_CHECKING, Any, Protocol, cast
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
+from cti_app.application.browser_acquisition import (
+    BrowserUnavailableError,
+    BrowserUnconfiguredError,
+)
 from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
     _detect_mime,
 )
+from cti_app.domain.acquisition import (
+    AcquisitionCapabilityState,
+    AcquisitionObservationKind,
+    AcquisitionOutcome,
+    AcquisitionPolicyContext,
+    AcquisitionPolicyDecision,
+    AcquisitionQuality,
+    EvidenceClass,
+    SourceEquivalenceClass,
+    evidence_class_for_equivalence,
+)
+from cti_app.domain.classification import TLP
 from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 from cti_app.domain.discovery import canonicalize_http_url
+
+if TYPE_CHECKING:
+    from cti_app.application.acquisition_orchestrator import DomainConcurrencyLimiter
 
 _LINK_RELATIONS = frozenset({"amphtml", "alternate", "canonical", "print"})
 _LINK_HEADER_RE = re.compile(r"<([^>]+)>\s*;([^,]*)")
 _REFUSAL_RE = re.compile(
     r"(?is)^\s*(?:i\s+(?:cannot|can't|could not|couldn't|am unable to)\b|"
-    r"(?:the\s+)?article\s+(?:is\s+)?(?:unavailable|not available)\b)"
+    r"(?:the\s+)?article\s+(?:is\s+)?(?:unavailable|not available)\b|"
+    r"(?:i\s+)?(?:cannot|can't|could not|couldn't)\s+(?:access|retrieve|view)\b)"
 )
 _UNACCEPTABLE_PAGE_RE = re.compile(
     r"(?i)\b(?:captcha|verify you are human|robot check|access denied|subscribe to continue|"
@@ -40,6 +63,70 @@ _UNACCEPTABLE_PAGE_RE = re.compile(
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 MAX_RETRY_AFTER_SECONDS = 3.0
 MAX_STRATEGY_CANDIDATES = 24
+_EVIDENCE_CLASS_STRENGTH = {
+    EvidenceClass.PRIMARY_OBSERVED: 7,
+    EvidenceClass.HISTORICAL_PRIMARY: 6,
+    EvidenceClass.VERIFIED_EQUIVALENT: 5,
+    EvidenceClass.AUTHORIZED_REPUBLICATION: 4,
+    EvidenceClass.INDEPENDENT_CORROBORATION: 3,
+    EvidenceClass.OCR_DERIVED: 2,
+    EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED: 1,
+    EvidenceClass.UNKNOWN: 0,
+}
+_MAX_DERIVED_RAW_BYTES = 25 * 1024 * 1024
+_MAX_DERIVED_BODY_BYTES = 5 * 1024 * 1024
+_MAX_DERIVED_BODY_CHARS = 2_000_000
+
+
+def derived_collected_response(
+    *,
+    requested_url: str,
+    final_url: str,
+    raw_body: bytes,
+    raw_content_type: str | None,
+    derived_body: bytes,
+    derived_content_type: str,
+    status: int,
+    headers: dict[str, str],
+    redirect_chain: tuple[str, ...] = (),
+    acquired_at: datetime | None = None,
+) -> CollectedResponse:
+    """Build a bounded response that preserves observed and derived bytes separately."""
+    if len(raw_body) > _MAX_DERIVED_RAW_BYTES:
+        raise ValueError("observed_artifact_exceeds_limit")
+    if len(derived_body) > _MAX_DERIVED_BODY_BYTES:
+        raise ValueError("derived_article_exceeds_limit")
+    if derived_content_type.casefold().split(";", 1)[0].strip() not in {
+        "text/plain",
+        "text/html",
+        "application/xhtml+xml",
+    }:
+        raise ValueError("unsupported_derived_content_type")
+    timestamp = acquired_at or datetime.now(UTC)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    else:
+        timestamp = timestamp.astimezone(UTC)
+    detected = _detect_mime(derived_body)
+    if detected not in {DetectedMimeType.TEXT, DetectedMimeType.HTML}:
+        raise ValueError("derived_body_is_not_article_text")
+    return CollectedResponse(
+        requested_url=requested_url,
+        final_url=final_url,
+        redirect_chain=redirect_chain,
+        status=status,
+        headers=dict(headers),
+        declared_content_type=raw_content_type,
+        detected_content_type=detected,
+        encoded_body=raw_body,
+        decoded_body=derived_body,
+        encoded_size=len(raw_body),
+        encoded_sha256=hashlib.sha256(raw_body).hexdigest(),
+        decoded_size=len(derived_body),
+        decoded_sha256=hashlib.sha256(derived_body).hexdigest(),
+        content_encoding="identity",
+        acquired_at=timestamp,
+    )
 
 
 class _ArticleLinkParser(HTMLParser):
@@ -47,6 +134,8 @@ class _ArticleLinkParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.links: list[tuple[str, str]] = []
         self.title_parts: list[str] = []
+        self.meta_title_parts: list[str] = []
+        self.html_title_parts: list[str] = []
         self.in_title = False
         self.noindex = False
         self.description: str | None = None
@@ -65,6 +154,7 @@ class _ArticleLinkParser(HTMLParser):
             "twitter:title",
         }:
             self.title_parts.append(values.get("content", ""))
+            self.meta_title_parts.append(values.get("content", ""))
         if tag.casefold() != "link":
             return
         rels = set(values.get("rel", "").casefold().split())
@@ -79,6 +169,11 @@ class _ArticleLinkParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.in_title:
             self.title_parts.append(data)
+            self.html_title_parts.append(data)
+
+    def page_title(self) -> str:
+        preferred = self.meta_title_parts or self.html_title_parts
+        return " ".join(" ".join(preferred).split())
 
 
 def discover_same_publication_variants(
@@ -129,52 +224,302 @@ def web_archive_snapshot_url(original_url: str) -> str:
 
 def bridge_transcription_prompt(*, url: str, title: str | None) -> str:
     safe_title = title.strip() if title and not _contains_credential_marker(title) else None
-    title_line = f"Title: {safe_title}\n" if safe_title else ""
+    title_line = f"EXPECTED_TITLE: {safe_title}\n" if safe_title else ""
     return (
-        "Retrieve and transcribe the public article at the URL below. Do not infer or "
-        "reconstruct missing text. Include IOC strings only when visible in the article. "
-        "If the article cannot be accessed, write ARTICLE: UNAVAILABLE. Return plain text "
-        "in this tolerant format:\n"
-        "ARTICLE:\n<article text>\n"
-        "IOCS:\n- <type>: <value> — <short context>\n\n"
+        "Transcribe the public article exactly as visible. Do not invent, infer, or "
+        "reconstruct missing paragraphs or IOCs. If the article or any requested detail "
+        "cannot be accessed, write UNAVAILABLE for that field. Return only this format:\n"
+        "<<<ARTICLE_TRANSCRIPTION>>>\n"
+        "TITLE: ...\nSOURCE_URL: ...\nPUBLISHER: ...\nCONTENT:\n"
+        "<exact article text>\n<<<END_ARTICLE_TRANSCRIPTION>>>\n"
+        "<<<IOC_CANDIDATES>>>\n"
+        "type | value | source_excerpt\n"
+        "<one literal candidate per line, only when visible in the article>\n"
+        "<<<END_IOC_CANDIDATES>>>\n\n"
         f"URL: {url}\n{title_line}"
     )
 
 
-def parse_bridge_transcription(text: str) -> str | None:
-    """Accept the requested labels or a plain article transcript; reject refusals."""
-    body = text.strip()
-    if body.startswith("```"):
-        body = re.sub(r"^```[^\n]*\n?", "", body, count=1)
-        body = re.sub(r"\n?```\s*$", "", body, count=1).strip()
-    if not body:
-        return None
+@dataclass(frozen=True, slots=True)
+class BridgeIocCandidate:
+    type: str
+    value: str
+    excerpt: str
 
-    article_match = re.search(r"(?im)^\s*(?:ARTICLE|TEXT|TRANSCRIPTION)\s*:\s*", body)
-    ioc_match = re.search(r"(?im)^\s*(?:IOCS|INDICATORS)\s*:\s*", body)
-    if article_match:
-        article_start = article_match.end()
-        article_end = (
-            ioc_match.start() if ioc_match and ioc_match.start() > article_start else len(body)
+
+@dataclass(frozen=True, slots=True)
+class BridgeTranscription:
+    article_text: str
+    title: str | None
+    source_url: str | None
+    publisher: str | None
+    ioc_candidates: tuple[BridgeIocCandidate, ...]
+    raw_text: str
+    parsed: bool
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeSourceLocation:
+    title: str | None
+    publisher: str | None
+    published_at: str | None
+    url: str
+
+
+def _unavailable_or_refusal(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized or _REFUSAL_RE.search(normalized):
+        return True
+    return (
+        re.fullmatch(
+            r"(?is)(?:\[?\s*)?(?:unavailable|not available|no access|n/?a)(?:\s*\]?)\W*",
+            normalized,
         )
-        article = body[article_start:article_end].strip()
-    else:
-        if _REFUSAL_RE.search(body):
-            return None
-        article = body
+        is not None
+    )
 
-    if re.fullmatch(
-        r"(?is)(?:\[?\s*)?(?:unavailable|not available|no access)(?:\s*\]?)\W*",
-        article,
-    ):
-        return None
-    if not article:
-        return None
-    if ioc_match:
-        ioc_notes = body[ioc_match.end() :].strip()
-        if ioc_notes:
-            article += "\n\nBridge IOC notes (unverified by primary source):\n" + ioc_notes
-    return article
+
+def _parse_bridge_iocs(value: str, *, legacy: bool) -> tuple[BridgeIocCandidate, ...] | None:
+    candidates: list[BridgeIocCandidate] = []
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if line.startswith("```"):
+            continue
+        if not line or line.casefold() in {"none", "no ioc candidates", "n/a"}:
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            line = line[1:-1].strip()
+        if re.fullmatch(r"[|\-:\s]+", line):
+            continue
+        if re.fullmatch(r"(?i)type\s*\|\s*value\s*\|\s*(?:source_excerpt|excerpt)", line):
+            continue
+        if "|" in line:
+            columns = line.split("|", 2)
+            if len(columns) != 3:
+                return None
+            candidate_type, candidate_value, excerpt = (part.strip() for part in columns)
+        elif legacy:
+            match = re.match(
+                r"^\s*[-*]?\s*([^:]+):\s*(.*?)(?:\s+[\u2014\u2013-]\s+|\s*\|\s*)(.*)?$",
+                raw_line,
+            )
+            if match is None:
+                return None
+            candidate_type = match.group(1).strip()
+            candidate_value = match.group(2).strip()
+            excerpt = (match.group(3) or "").strip()
+        else:
+            return None
+        if not candidate_type or not candidate_value:
+            return None
+        candidates.append(BridgeIocCandidate(candidate_type, candidate_value, excerpt))
+    return tuple(candidates)
+
+
+def parse_bridge_transcription(text: str) -> BridgeTranscription:
+    """Parse a fenced Bridge transcript while keeping model IOC notes separate."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    article_text = ""
+    title: str | None = None
+    source_url: str | None = None
+    publisher: str | None = None
+    candidates: tuple[BridgeIocCandidate, ...] = ()
+
+    block = re.search(
+        r"(?is)<<<ARTICLE_TRANSCRIPTION>>>\s*(.*?)\s*<<<END_ARTICLE_TRANSCRIPTION>>>",
+        normalized,
+    )
+    ioc_block = re.search(
+        r"(?is)<<<IOC_CANDIDATES>>>\s*(.*?)\s*<<<END_IOC_CANDIDATES>>>", normalized
+    )
+    if "<<<ARTICLE_TRANSCRIPTION>>>" in normalized:
+        if block is None:
+            return BridgeTranscription(
+                "", None, None, None, (), text, False, "malformed_article_block"
+            )
+        fields: dict[str, str] = {}
+        lines = block.group(1).splitlines()
+        content_index: int | None = None
+        for index, line in enumerate(lines):
+            match = re.match(r"^\s*(TITLE|SOURCE_URL|PUBLISHER)\s*:\s*(.*)$", line, re.I)
+            if match:
+                fields.setdefault(match.group(1).upper(), match.group(2).strip())
+            elif re.match(r"^\s*CONTENT\s*:\s*$", line, re.I):
+                content_index = index + 1
+                break
+        if content_index is None:
+            return BridgeTranscription(
+                "", None, None, None, (), text, False, "missing_content_field"
+            )
+        article_text = "\n".join(lines[content_index:]).strip()
+        title = _optional_location_value(fields.get("TITLE", ""))
+        source_url = _optional_location_value(fields.get("SOURCE_URL", ""))
+        publisher = _optional_location_value(fields.get("PUBLISHER", ""))
+        if "<<<IOC_CANDIDATES>>>" in normalized and ioc_block is None:
+            return BridgeTranscription(
+                article_text, title, source_url, publisher, (), text, False, "malformed_ioc_block"
+            )
+        if ioc_block is not None:
+            parsed_candidates = _parse_bridge_iocs(ioc_block.group(1), legacy=False)
+            if parsed_candidates is None:
+                return BridgeTranscription(
+                    article_text,
+                    title,
+                    source_url,
+                    publisher,
+                    (),
+                    text,
+                    False,
+                    "malformed_ioc_candidate",
+                )
+            candidates = parsed_candidates
+    else:
+        # Historical callers used ARTICLE:/IOCS: labels. Keep that wire format
+        # readable, but require the article label so surrounding prose cannot
+        # accidentally become an archived transcript.
+        article_match = re.search(r"(?im)^\s*ARTICLE\s*:\s*", normalized)
+        if article_match is None:
+            return BridgeTranscription(
+                "", None, None, None, (), text, False, "missing_article_label"
+            )
+        ioc_match = re.search(
+            r"(?im)^\s*(?:IOCS|INDICATORS)\s*:\s*", normalized[article_match.end() :]
+        )
+        article_end = (
+            article_match.end() + ioc_match.start() if ioc_match is not None else len(normalized)
+        )
+        article_text = normalized[article_match.end() : article_end].strip()
+        if ioc_match is not None:
+            ioc_start = article_match.end() + ioc_match.end()
+            parsed_candidates = _parse_bridge_iocs(normalized[ioc_start:], legacy=True)
+            if parsed_candidates is None:
+                return BridgeTranscription(
+                    article_text, None, None, None, (), text, False, "malformed_ioc_candidate"
+                )
+            candidates = parsed_candidates
+
+    if _unavailable_or_refusal(article_text) or re.match(r"(?i)^\s*UNAVAILABLE\b", article_text):
+        return BridgeTranscription(
+            article_text,
+            title,
+            source_url,
+            publisher,
+            candidates,
+            text,
+            False,
+            "article_unavailable",
+        )
+    if not article_text:
+        return BridgeTranscription(
+            "", title, source_url, publisher, candidates, text, False, "empty_article"
+        )
+    return BridgeTranscription(
+        article_text, title, source_url, publisher, candidates, text, True, None
+    )
+
+
+def bridge_source_discovery_prompt(
+    *,
+    url: str,
+    title: str | None,
+    publisher: str | None,
+    published_at: date | None,
+) -> str:
+    """Ask only for public locations; never include source bytes in discovery."""
+
+    def safe(value: str | None) -> str:
+        return value.strip() if value and not _contains_credential_marker(value) else "UNAVAILABLE"
+
+    return (
+        "Find potentially verifiable public locations or copies of this exact article. "
+        "Return locations only; do not quote, summarize, or reproduce article/source bytes. "
+        "Do not invent URLs. Use UNAVAILABLE for unknown metadata. Return this format:\n"
+        "<<<PUBLIC_ARTICLE_LOCATIONS>>>\n"
+        "title | publisher | date | URL\n"
+        "<one public location per line>\n"
+        "<<<END_PUBLIC_ARTICLE_LOCATIONS>>>\n\n"
+        f"TITLE: {safe(title)}\nPUBLISHER: {safe(publisher)}\n"
+        f"DATE: {published_at.isoformat() if published_at else 'UNAVAILABLE'}\nURL: {url}"
+    )
+
+
+def parse_bridge_source_locations(text: str) -> tuple[BridgeSourceLocation, ...]:
+    """Extract candidate public URLs from the Bridge's untrusted suggestions."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    block = re.search(
+        r"(?is)<<<PUBLIC_ARTICLE_LOCATIONS>>>\s*(.*?)\s*<<<END_PUBLIC_ARTICLE_LOCATIONS>>>",
+        normalized,
+    )
+    body = block.group(1) if block is not None else normalized
+    locations: list[BridgeSourceLocation] = []
+    for line in body.splitlines():
+        row = line.strip().strip("|").strip()
+        if not row or re.fullmatch(r"[-|\s]+", row):
+            continue
+        if re.match(r"(?i)^title\s*\|\s*publisher\s*\|\s*date\s*\|\s*url$", row):
+            continue
+        if "|" in row:
+            columns = [part.strip().strip("`\"'") for part in row.split("|", 3)]
+            if len(columns) == 4:
+                title_value, publisher_value, date_value, url_value = columns
+                url_value = re.sub(r"\s*\[.*$", "", url_value)
+                if re.match(r"(?i)^https?://", url_value):
+                    locations.append(
+                        BridgeSourceLocation(
+                            _optional_location_value(title_value),
+                            _optional_location_value(publisher_value),
+                            _optional_location_value(date_value),
+                            url_value.rstrip(".,;)]}"),
+                        )
+                    )
+                    continue
+        urls = re.findall(r"https?://[^\s<>\"'|]+", line, flags=re.I)
+        for raw_url in urls:
+            locations.append(BridgeSourceLocation(None, None, None, raw_url.rstrip(".,;)]}")))
+    return tuple(locations)
+
+
+def _optional_location_value(value: str) -> str | None:
+    return value if value and value.casefold() not in {"unavailable", "n/a", "none"} else None
+
+
+def deterministic_acquisition_quality(
+    text: str,
+    *,
+    expected_title: str | None,
+    expected_languages: tuple[str, ...] = (),
+    reason: str,
+) -> AcquisitionQuality:
+    """Build a stable compact quality summary without consulting a model."""
+    words = _WORD_RE.findall(text)
+    title_words = {
+        word.casefold() for word in _WORD_RE.findall(expected_title or "") if len(word) >= 3
+    }
+    body_words = {word.casefold() for word in words if len(word) >= 3}
+    similarity = (
+        len(title_words.intersection(body_words)) / len(title_words) if title_words else 1.0
+    )
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", text) if item.strip()]
+    duplicate_ratio = 1.0 - len(set(paragraphs)) / len(paragraphs) if paragraphs else 0.0
+    challenge = bool(_UNACCEPTABLE_PAGE_RE.search(text))
+    paywall = bool(re.search(r"(?i)\b(?:paywall|subscribe to read|subscription required)\b", text))
+    truncated = bool(re.search(r"(?:\.{3}|…|\[truncated\])\s*$", text, re.I))
+    length_score = min(1.0, len(words) / 200)
+    score = max(0.0, min(1.0, 0.7 * length_score + 0.3 * similarity))
+    return AcquisitionQuality(
+        text_chars=len(text),
+        word_count=len(words),
+        title_similarity=similarity,
+        language=expected_languages[0] if expected_languages else None,
+        boilerplate_ratio=1.0 if challenge else 0.0,
+        duplicate_ratio=duplicate_ratio,
+        truncated=truncated,
+        challenge_detected=challenge,
+        paywall_detected=paywall,
+        score=score,
+        reasons=(reason,),
+    )
 
 
 def bridge_url_is_credential_free(url: str) -> bool:
@@ -315,6 +660,67 @@ def article_rejection_reason(
     return None
 
 
+def bridge_location_metadata_rejection(
+    location: BridgeSourceLocation, request: AcquisitionRequest
+) -> str | None:
+    """Reject suggestions whose claimed metadata conflicts with the requested article."""
+    expected_title = " ".join((request.title or "").split()).casefold()
+    suggested_title = " ".join((location.title or "").split()).casefold()
+    if expected_title and suggested_title != expected_title:
+        return "suggested_title_mismatch"
+    if request.publisher and location.publisher:
+        if (
+            " ".join(request.publisher.split()).casefold()
+            != " ".join(location.publisher.split()).casefold()
+        ):
+            return "suggested_publisher_mismatch"
+    if request.published_at and location.published_at:
+        suggested_date = location.published_at.strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}(?:\b|T)", suggested_date):
+            return "suggested_publication_date_invalid"
+        if suggested_date[:10] != request.published_at.isoformat():
+            return "suggested_publication_date_mismatch"
+    return None
+
+
+def bridge_article_response_rejection(
+    response: CollectedResponse,
+    *,
+    location: BridgeSourceLocation,
+    request: AcquisitionRequest,
+) -> str | None:
+    """Require an observed article title and content check before accepting a URL."""
+    expected_title = location.title or request.title
+    if not expected_title:
+        return "article_title_unavailable"
+    content_type = response.declared_content_type
+    decoded = response.decoded_body.decode("utf-8-sig", errors="replace")
+    normalized_title = " ".join(expected_title.split()).casefold()
+    if (content_type or "").casefold().split(";", 1)[0] in {
+        "text/html",
+        "application/xhtml+xml",
+    } or "<html" in decoded[:1024].casefold():
+        parser = _ArticleLinkParser()
+        try:
+            parser.feed(decoded)
+        except Exception:
+            return "malformed_article_html"
+        observed_title = parser.page_title().casefold()
+    else:
+        observed_title = " ".join(decoded.split()).casefold()
+    if observed_title != normalized_title and normalized_title not in observed_title:
+        return "observed_title_mismatch"
+    return article_rejection_reason(
+        body=response.decoded_body,
+        content_type=content_type,
+        requested_url=response.final_url,
+        expected_title=expected_title,
+        min_text_chars=request.min_text_chars,
+        headers=response.headers,
+        expected_languages=request.expected_languages,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionProbe:
     """One public strategy request, suitable for durable attempt diagnostics."""
@@ -323,7 +729,7 @@ class AcquisitionProbe:
     strategy_version: str
     method: SourceAcquisitionMethod
     requested_url: str
-    outcome: str
+    outcome: AcquisitionOutcome
     reason_code: str | None
     response: CollectedResponse | None
     http_status: int | None
@@ -335,6 +741,61 @@ class AcquisitionProbe:
     consultation_id: str | None = None
     prompt_sha256: str | None = None
     response_sha256: str | None = None
+    policy_decision: AcquisitionPolicyDecision = AcquisitionPolicyDecision.ALLOWED
+    capability_state: AcquisitionCapabilityState = AcquisitionCapabilityState.IMPLEMENTED
+    observation_kind: AcquisitionObservationKind = AcquisitionObservationKind.HTTP_RESPONSE
+    equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    quality: AcquisitionQuality | None = None
+    archive_snapshot_time: datetime | None = None
+    publication_date: date | None = None
+    publisher: str | None = None
+    model_generated: bool = False
+    primary_source_verified: bool = False
+    ioc_primary_verified: bool = False
+
+    def __post_init__(self) -> None:
+        # StrEnum retains existing string comparisons and serialization. Keep
+        # any unmodeled historical status strings usable by older callers.
+        try:
+            typed_outcome = AcquisitionOutcome(self.outcome)
+        except ValueError:
+            pass
+        else:
+            object.__setattr__(self, "outcome", typed_outcome)
+        if self.evidence_class is not None:
+            supported_class = evidence_class_for_equivalence(self.equivalence_class)
+            if (
+                not (
+                    self.method
+                    in {
+                        SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY,
+                        SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+                    }
+                    and self.evidence_class is EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED
+                    and self.equivalence_class is SourceEquivalenceClass.UNKNOWN_MATCH
+                )
+                and _EVIDENCE_CLASS_STRENGTH[self.evidence_class]
+                > _EVIDENCE_CLASS_STRENGTH[supported_class]
+            ):
+                raise ValueError(
+                    "evidence_class cannot be stronger than the equivalence class supports"
+                )
+
+
+def _default_policy_context() -> AcquisitionPolicyContext:
+    """A deny-by-default policy used only by legacy request constructors."""
+    return AcquisitionPolicyContext(
+        allowed_domains=frozenset(),
+        blocked_domains=frozenset(),
+        external_llm_allowed=False,
+        tlp=TLP.RED,
+        do_not_submit=True,
+        expected_languages=(),
+        allowed_syndication_domains=frozenset(),
+        third_party_provider_allowed=False,
+        provider_configured=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,21 +811,47 @@ class AcquisitionRequest:
     fetch: Callable[[str, dict[str, str], float, bool], Awaitable[CollectedResponse]]
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     bridge: Callable[[], Awaitable[AcquisitionProbe]] | None = None
+    bridge_discovery: Callable[[int], Awaitable[Sequence[AcquisitionProbe]]] | None = None
+    publisher: str | None = None
     attempted_strategy_urls: frozenset[str] = frozenset()
     min_text_chars: int = 200
     expected_languages: tuple[str, ...] = ()
+    policy: AcquisitionPolicyContext = field(default_factory=_default_policy_context)
 
 
 class AcquisitionStrategy(Protocol):
-    """An ordered, pluggable acquisition port. Implementations never bypass safe fetch."""
+    """An ordered, pluggable acquisition port. Implementations never bypass safe fetch.
 
-    name: str
-    version: str
-    method: SourceAcquisitionMethod
-    enabled: bool
-    timeout_seconds: float
+    ``capability_state`` and ``description`` remain optional runtime metadata.
+    PEP 544 cannot express optional structural members; declaring them as
+    properties would require every legacy frozen strategy to implement them.
+    Callers that need either value should use ``getattr`` with a default.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def method(self) -> SourceAcquisitionMethod: ...
+
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def timeout_seconds(self) -> float: ...
 
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]: ...
+
+
+def _typed_probe_outcome(outcome: AcquisitionOutcome | str) -> AcquisitionOutcome:
+    try:
+        return AcquisitionOutcome(outcome)
+    except ValueError:
+        # Legacy metadata-only probe outcomes are not acquisition outcomes.
+        return cast(AcquisitionOutcome, outcome)
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,7 +968,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="failed",
+                    outcome=_typed_probe_outcome("failed"),
                     reason_code="no_renderable_html_available",
                     response=None,
                     http_status=status,
@@ -500,7 +987,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="rejected",
+                    outcome=_typed_probe_outcome("rejected"),
                     reason_code="browser_render_requires_html",
                     response=None,
                     http_status=status,
@@ -523,7 +1010,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="skipped",
+                    outcome=_typed_probe_outcome("skipped"),
                     reason_code="playwright_sidecar_unavailable",
                     response=None,
                     http_status=status,
@@ -549,7 +1036,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="rejected",
+                    outcome=_typed_probe_outcome("rejected"),
                     reason_code=reason,
                     response=None,
                     http_status=status,
@@ -583,7 +1070,7 @@ class PlaywrightStrategy:
                 strategy_version=self.version,
                 method=self.method,
                 requested_url=request.requested_url,
-                outcome="succeeded",
+                outcome=_typed_probe_outcome("succeeded"),
                 reason_code=None,
                 response=rendered_response,
                 http_status=status,
@@ -625,7 +1112,7 @@ async def _probe_url(
             strategy_version=strategy_version,
             method=method,
             requested_url=url,
-            outcome="failed",
+            outcome=_typed_probe_outcome("failed"),
             reason_code=error.reason_code.value,
             response=None,
             http_status=error.http_status,
@@ -652,7 +1139,7 @@ async def _probe_url(
         strategy_version=strategy_version,
         method=method,
         requested_url=url,
-        outcome="succeeded" if reason is None else "rejected",
+        outcome=_typed_probe_outcome("succeeded" if reason is None else "rejected"),
         reason_code=reason,
         response=response if reason is None else None,
         http_status=response.status,
@@ -709,6 +1196,18 @@ class UnavailableTransportStrategy:
     timeout_seconds: float = 1.0
     reason: str = "transport_not_supported_by_pinned_adapter"
 
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return AcquisitionCapabilityState.NOT_IMPLEMENTED
+
+    @property
+    def capability_reason(self) -> str:
+        return self.reason
+
+    @property
+    def capability_outcome(self) -> AcquisitionOutcome:
+        return AcquisitionOutcome.SKIPPED
+
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
         return (
             AcquisitionProbe(
@@ -716,13 +1215,14 @@ class UnavailableTransportStrategy:
                 strategy_version=self.version,
                 method=self.method,
                 requested_url=request.requested_url,
-                outcome="skipped",
+                outcome=_typed_probe_outcome("skipped"),
                 reason_code=self.reason,
                 response=None,
                 http_status=None,
                 encoded_size=None,
                 encoded_sha256=None,
                 duration_ms=0,
+                capability_state=self.capability_state,
             ),
         )
 
@@ -803,7 +1303,7 @@ class AlternateRepresentationStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="skipped",
+                    outcome=_typed_probe_outcome("skipped"),
                     reason_code="no_public_representation_discovered",
                     response=None,
                     http_status=None,
@@ -813,6 +1313,1458 @@ class AlternateRepresentationStrategy:
                 ),
             )
         return tuple(probes)
+
+
+def _strategy_probe(
+    *,
+    name: str,
+    version: str,
+    method: SourceAcquisitionMethod,
+    url: str,
+    outcome: AcquisitionOutcome,
+    reason: str | None = None,
+    response: CollectedResponse | None = None,
+    observed_response: CollectedResponse | None = None,
+    duration_ms: int = 0,
+    capability: AcquisitionCapabilityState = AcquisitionCapabilityState.IMPLEMENTED,
+    policy_decision: AcquisitionPolicyDecision = AcquisitionPolicyDecision.ALLOWED,
+    observation: AcquisitionObservationKind = AcquisitionObservationKind.HTTP_RESPONSE,
+    equivalence: SourceEquivalenceClass | None = None,
+    evidence: EvidenceClass | None = None,
+    quality: AcquisitionQuality | None = None,
+    publisher: str | None = None,
+    publication_date: date | None = None,
+    primary_source_verified: bool = False,
+) -> AcquisitionProbe:
+    metadata = observed_response or response
+    return AcquisitionProbe(
+        strategy_name=name,
+        strategy_version=version,
+        method=method,
+        requested_url=url,
+        outcome=outcome,
+        reason_code=reason,
+        response=response,
+        http_status=metadata.status if metadata is not None else None,
+        encoded_size=metadata.encoded_size if metadata is not None else None,
+        encoded_sha256=metadata.encoded_sha256 if metadata is not None else None,
+        duration_ms=max(0, duration_ms),
+        capability_state=capability,
+        policy_decision=policy_decision,
+        observation_kind=observation,
+        equivalence_class=equivalence,
+        evidence_class=evidence,
+        quality=quality,
+        publication_date=publication_date,
+        publisher=publisher,
+        primary_source_verified=primary_source_verified,
+    )
+
+
+def _policy_skipped_probe(
+    *,
+    name: str,
+    version: str,
+    method: SourceAcquisitionMethod,
+    url: str,
+    decision: AcquisitionPolicyDecision,
+    reason: str = "destination_policy_denied",
+) -> AcquisitionProbe:
+    return _strategy_probe(
+        name=name,
+        version=version,
+        method=method,
+        url=safe_fallback_url(url),
+        outcome=AcquisitionOutcome.POLICY_SKIPPED,
+        reason=reason,
+        capability=AcquisitionCapabilityState.BLOCKED_BY_POLICY,
+        policy_decision=decision,
+    )
+
+
+def _attempt_key(strategy_name: str, url: str) -> str:
+    return hashlib.sha256(f"{strategy_name}\0{url}".encode()).hexdigest()
+
+
+async def _fetch_for_strategy(
+    request: AcquisitionRequest,
+    *,
+    name: str,
+    version: str,
+    method: SourceAcquisitionMethod,
+    url: str,
+    timeout_seconds: float,
+    headers: dict[str, str] | None = None,
+    allow_binary: bool = False,
+) -> tuple[CollectedResponse | None, AcquisitionProbe | None]:
+    if _attempt_key(name, url) in request.attempted_strategy_urls:
+        return None, _strategy_probe(
+            name=name,
+            version=version,
+            method=method,
+            url=safe_fallback_url(url),
+            outcome=AcquisitionOutcome.SKIPPED,
+            reason="already_attempted_for_strategy",
+        )
+    decision = request.policy.check_url(url)
+    if decision is not AcquisitionPolicyDecision.ALLOWED:
+        return None, _policy_skipped_probe(
+            name=name,
+            version=version,
+            method=method,
+            url=url,
+            decision=decision,
+        )
+    started = time.monotonic()
+    try:
+        response = await request.fetch(url, headers or {}, timeout_seconds, allow_binary)
+    except CollectionError as error:
+        return None, _strategy_probe(
+            name=name,
+            version=version,
+            method=method,
+            url=safe_fallback_url(url),
+            outcome=AcquisitionOutcome.FAILED,
+            reason=getattr(error.reason_code, "value", "collection_failed"),
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+    except TimeoutError:
+        return None, _strategy_probe(
+            name=name,
+            version=version,
+            method=method,
+            url=safe_fallback_url(url),
+            outcome=AcquisitionOutcome.FAILED,
+            reason="timeout",
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+    except Exception:
+        return None, _strategy_probe(
+            name=name,
+            version=version,
+            method=method,
+            url=safe_fallback_url(url),
+            outcome=AcquisitionOutcome.FAILED,
+            reason="fetch_failed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+    return response, None
+
+
+def _host_for_acquisition(url: str) -> str | None:
+    try:
+        hostname = urlsplit(url).hostname
+        return (
+            hostname.encode("idna").decode("ascii").casefold().removeprefix("www.")
+            if hostname
+            else None
+        )
+    except (AttributeError, UnicodeError, TypeError, ValueError):
+        return None
+
+
+def _same_acquisition_publisher(left: str, right: str) -> bool:
+    first, second = _host_for_acquisition(left), _host_for_acquisition(right)
+    return first is not None and first == second
+
+
+def _equivalence_for_observed_url(
+    requested_url: str,
+    observed_url: str,
+) -> SourceEquivalenceClass:
+    try:
+        if canonicalize_http_url(requested_url) == canonicalize_http_url(observed_url):
+            return SourceEquivalenceClass.EXACT_ORIGINAL
+    except (TypeError, ValueError):
+        return SourceEquivalenceClass.UNKNOWN_MATCH
+    if _same_acquisition_publisher(requested_url, observed_url):
+        return SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
+    return SourceEquivalenceClass.UNKNOWN_MATCH
+
+
+def _candidate_article(
+    body: bytes,
+    *,
+    content_type: str | None,
+    url: str,
+    request: AcquisitionRequest,
+    allowed_methods: frozenset[Any],
+) -> Any | None:
+    from cti_app.application.article_extraction import extract_candidates, select_best_candidate
+
+    candidates = extract_candidates(
+        body,
+        content_type=content_type,
+        url=url,
+        expected_title=request.title,
+        expected_languages=request.expected_languages,
+        min_text_chars=request.min_text_chars,
+    )
+    preferred = tuple(candidate for candidate in candidates if candidate.method in allowed_methods)
+    return select_best_candidate(
+        preferred,
+        expected_title=request.title,
+        expected_url=url,
+    )
+
+
+def _feed_article_candidate(
+    body: bytes,
+    *,
+    content_type: str | None,
+    feed_url: str,
+    request: AcquisitionRequest,
+) -> Any | None:
+    from cti_app.application.article_extraction import extract_candidates, select_best_candidate
+
+    candidates = extract_candidates(
+        body,
+        content_type=content_type,
+        url=feed_url,
+        expected_title=request.title,
+        expected_languages=request.expected_languages,
+        min_text_chars=request.min_text_chars,
+    )
+    allowed = _methods(_FEED_METHODS)
+    accepted = []
+    for candidate in candidates:
+        if candidate.method not in allowed or not candidate.canonical_url:
+            continue
+        # Feed entries identify article URLs separately from the feed endpoint.
+        # Validate each entry against its own published URL, then classify the
+        # feed response against the originally requested publication URL.
+        if not _same_acquisition_publisher(request.requested_url, candidate.canonical_url):
+            continue
+        selected = select_best_candidate(
+            (candidate,),
+            expected_title=request.title,
+            expected_url=candidate.canonical_url,
+        )
+        if selected is not None:
+            accepted.append(selected)
+    return max(accepted, key=lambda candidate: candidate.quality.score, default=None)
+
+
+def _article_text_response(
+    observed: CollectedResponse,
+    candidate: Any,
+    *,
+    request: AcquisitionRequest,
+    method: SourceAcquisitionMethod,
+) -> CollectedResponse:
+    del method  # The persisted acquisition method belongs to AcquisitionProbe.
+    if len(candidate.text) > _MAX_DERIVED_BODY_CHARS:
+        raise ValueError("derived_article_exceeds_limit")
+    derived_body = candidate.text.encode("utf-8")
+    return derived_collected_response(
+        requested_url=request.requested_url,
+        final_url=observed.final_url,
+        raw_body=observed.encoded_body,
+        raw_content_type=observed.declared_content_type,
+        derived_body=derived_body,
+        derived_content_type="text/plain",
+        status=observed.status,
+        headers=observed.headers,
+        redirect_chain=observed.redirect_chain,
+        acquired_at=observed.acquired_at,
+    )
+
+
+_STRUCTURED_METHODS = frozenset(
+    {
+        "json_ld",
+        "embedded_state",
+        "cms_json",
+        "oembed",
+        "html_article",
+    }
+)
+_FEED_METHODS = frozenset({"rss_atom", "json_feed"})
+_API_METHODS = frozenset({"cms_json", "oembed", "plain_text"})
+_BROWSER_EMBEDDED_METHODS = frozenset({"json_ld", "embedded_state", "cms_json", "oembed"})
+
+
+def _methods(values: frozenset[str]) -> frozenset[Any]:
+    from cti_app.application.article_extraction import ExtractionMethod
+
+    return frozenset(ExtractionMethod(value) for value in values)
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredDataStrategy:
+    name: str = "embedded_structured_data"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.EMBEDDED_STRUCTURED_DATA
+    enabled: bool = True
+    timeout_seconds: float = 15.0
+    max_candidates: int = 12
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.enabled
+            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        )
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        candidates = (
+            request.requested_url,
+            *same_publication_variant_urls(
+                request.requested_url,
+                request.response_body,
+                request.link_header,
+                request.title,
+                max_candidates=self.max_candidates,
+            ),
+        )
+        probes: list[AcquisitionProbe] = []
+        for url in tuple(dict.fromkeys(candidates))[: self.max_candidates + 1]:
+            observed, issue = await _fetch_for_strategy(
+                request,
+                name=self.name,
+                version=self.version,
+                method=self.method,
+                url=url,
+                headers={"accept": "text/html, application/xhtml+xml, application/json"},
+                timeout_seconds=self.timeout_seconds,
+            )
+            if issue is not None:
+                probes.append(issue)
+                continue
+            assert observed is not None
+            if observed.status != 200:
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="article_http_status_not_200",
+                        observed_response=observed,
+                    )
+                )
+                continue
+            candidate = _candidate_article(
+                observed.decoded_body,
+                content_type=observed.declared_content_type,
+                url=observed.final_url,
+                request=request,
+                allowed_methods=_methods(_STRUCTURED_METHODS),
+            )
+            if candidate is None:
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="no_accepted_structured_article",
+                        observed_response=observed,
+                    )
+                )
+                continue
+            try:
+                derived = _article_text_response(
+                    observed, candidate, request=request, method=self.method
+                )
+            except (UnicodeEncodeError, ValueError):
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="derived_article_exceeds_limit",
+                        observed_response=observed,
+                    )
+                )
+                continue
+            equivalence = _equivalence_for_observed_url(request.requested_url, observed.final_url)
+            direct_publisher = (
+                equivalence is SourceEquivalenceClass.EXACT_ORIGINAL
+                and _same_acquisition_publisher(request.requested_url, observed.final_url)
+            )
+            probes.append(
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=url,
+                    outcome=AcquisitionOutcome.SUCCEEDED,
+                    response=derived,
+                    observed_response=observed,
+                    duration_ms=0,
+                    observation=AcquisitionObservationKind.EMBEDDED_STRUCTURED_DATA,
+                    equivalence=equivalence,
+                    evidence=evidence_class_for_equivalence(equivalence),
+                    quality=candidate.quality,
+                    publisher=candidate.publisher,
+                    publication_date=candidate.published_at,
+                    primary_source_verified=direct_publisher,
+                )
+            )
+            break
+        if not probes:
+            return (
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=request.requested_url,
+                    outcome=AcquisitionOutcome.SKIPPED,
+                    reason="no_structured_data_candidates",
+                ),
+            )
+        return tuple(probes)
+
+
+def _is_feed_url(url: str) -> bool:
+    try:
+        path = urlsplit(url).path.casefold().rstrip("/")
+    except ValueError:
+        return False
+    return bool(
+        re.search(r"(?:^|/)(?:feed|rss|atom)(?:\.xml|\.json|\.rss|\.atom)?$", path)
+        or path.endswith((".rss", ".atom", ".jsonfeed"))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FeedStrategy:
+    name: str = "rss_atom_jsonfeed"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.RSS_ATOM_JSONFEED
+    enabled: bool = True
+    timeout_seconds: float = 15.0
+    max_candidates: int = 12
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.enabled
+            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        )
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        discovered = same_publication_variant_urls(
+            request.requested_url,
+            request.response_body,
+            request.link_header,
+            request.title,
+            max_candidates=self.max_candidates,
+        )
+        parsed = urlsplit(canonicalize_http_url(request.requested_url))
+        path = parsed.path or "/"
+        known_feeds = tuple(
+            urlunsplit((parsed.scheme, parsed.netloc, feed_path, "", ""))
+            for feed_path in (
+                "/feed",
+                "/feed/",
+                "/rss.xml",
+                "/feed.xml",
+                "/feed.json",
+                "/atom.xml",
+                path.rstrip("/") + "/feed/",
+            )
+        )
+        urls = tuple(
+            dict.fromkeys(url for url in (*known_feeds, *discovered) if _is_feed_url(url))
+        )[: self.max_candidates]
+        probes: list[AcquisitionProbe] = []
+        for url in urls:
+            observed, issue = await _fetch_for_strategy(
+                request,
+                name=self.name,
+                version=self.version,
+                method=self.method,
+                url=url,
+                headers={
+                    "accept": "application/rss+xml, application/atom+xml, application/feed+json"
+                },
+                timeout_seconds=self.timeout_seconds,
+            )
+            if issue is not None:
+                probes.append(issue)
+                continue
+            assert observed is not None
+            candidate = None
+            if observed.status == 200:
+                candidate = _feed_article_candidate(
+                    observed.decoded_body,
+                    content_type=observed.declared_content_type,
+                    feed_url=observed.final_url,
+                    request=request,
+                )
+            if candidate is None:
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason=(
+                            "article_http_status_not_200"
+                            if observed.status != 200
+                            else "no_matching_full_text_feed_entry"
+                        ),
+                        observed_response=observed,
+                    )
+                )
+                continue
+            try:
+                derived = _article_text_response(
+                    observed, candidate, request=request, method=self.method
+                )
+            except (UnicodeEncodeError, ValueError):
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="derived_article_exceeds_limit",
+                        observed_response=observed,
+                    )
+                )
+                continue
+            equivalence = (
+                SourceEquivalenceClass.VERIFIED_PUBLISHER_EQUIVALENT
+                if _same_acquisition_publisher(request.requested_url, observed.final_url)
+                else SourceEquivalenceClass.UNKNOWN_MATCH
+            )
+            probes.append(
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=url,
+                    outcome=AcquisitionOutcome.SUCCEEDED,
+                    response=derived,
+                    observed_response=observed,
+                    observation=AcquisitionObservationKind.HTTP_RESPONSE,
+                    equivalence=equivalence,
+                    evidence=evidence_class_for_equivalence(equivalence),
+                    quality=candidate.quality,
+                    publisher=candidate.publisher,
+                    publication_date=candidate.published_at,
+                )
+            )
+            break
+        return tuple(probes) or (
+            _strategy_probe(
+                name=self.name,
+                version=self.version,
+                method=self.method,
+                url=request.requested_url,
+                outcome=AcquisitionOutcome.SKIPPED,
+                reason="no_feed_urls_discovered",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublisherApiStrategy:
+    name: str = "publisher_public_api"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PUBLISHER_PUBLIC_API
+    enabled: bool = True
+    timeout_seconds: float = 15.0
+    max_candidates: int = 8
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.enabled
+            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        )
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        discovered = same_publication_variant_urls(
+            request.requested_url,
+            request.response_body,
+            request.link_header,
+            request.title,
+            max_candidates=self.max_candidates,
+        )
+        urls = tuple(
+            dict.fromkeys(
+                (
+                    request.requested_url,
+                    *(
+                        url
+                        for url in discovered
+                        if any(
+                            marker in urlsplit(url).path.casefold()
+                            for marker in ("/wp-json/", "/oembed")
+                        )
+                        or urlsplit(url).path.casefold().endswith(".json")
+                    ),
+                )
+            )
+        )[: self.max_candidates + 1]
+        probes: list[AcquisitionProbe] = []
+        for url in urls:
+            observed, issue = await _fetch_for_strategy(
+                request,
+                name=self.name,
+                version=self.version,
+                method=self.method,
+                url=url,
+                headers={"accept": "application/json, text/html;q=0.8"},
+                timeout_seconds=self.timeout_seconds,
+            )
+            if issue is not None:
+                probes.append(issue)
+                continue
+            assert observed is not None
+            candidate = None
+            if observed.status == 200:
+                candidate = _candidate_article(
+                    observed.decoded_body,
+                    content_type=observed.declared_content_type,
+                    url=observed.final_url,
+                    request=request,
+                    allowed_methods=_methods(_API_METHODS),
+                )
+            if candidate is None:
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason=(
+                            "article_http_status_not_200"
+                            if observed.status != 200
+                            else "no_coherent_public_api_article"
+                        ),
+                        observed_response=observed,
+                    )
+                )
+                continue
+            try:
+                derived = _article_text_response(
+                    observed, candidate, request=request, method=self.method
+                )
+            except (UnicodeEncodeError, ValueError):
+                probes.append(
+                    _strategy_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=url,
+                        outcome=AcquisitionOutcome.REJECTED,
+                        reason="derived_article_exceeds_limit",
+                        observed_response=observed,
+                    )
+                )
+                continue
+            equivalence = _equivalence_for_observed_url(request.requested_url, observed.final_url)
+            direct_publisher = (
+                equivalence is SourceEquivalenceClass.EXACT_ORIGINAL
+                and _same_acquisition_publisher(request.requested_url, observed.final_url)
+            )
+            probes.append(
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=url,
+                    outcome=AcquisitionOutcome.SUCCEEDED,
+                    response=derived,
+                    observed_response=observed,
+                    observation=AcquisitionObservationKind.HTTP_RESPONSE,
+                    equivalence=equivalence,
+                    evidence=evidence_class_for_equivalence(equivalence),
+                    quality=candidate.quality,
+                    publisher=candidate.publisher,
+                    publication_date=candidate.published_at,
+                    primary_source_verified=direct_publisher,
+                )
+            )
+            break
+        return tuple(probes)
+
+
+def _browser_failure_probe(
+    strategy: _BrowserStrategy,
+    request: AcquisitionRequest,
+    *,
+    reason: str,
+    outcome: AcquisitionOutcome = AcquisitionOutcome.FAILED,
+    capability: AcquisitionCapabilityState | None = None,
+) -> AcquisitionProbe:
+    return _strategy_probe(
+        name=strategy.name,
+        version=strategy.version,
+        method=strategy.method,
+        url=safe_fallback_url(request.requested_url),
+        outcome=outcome,
+        reason=reason,
+        capability=capability or strategy.capability_state,
+        observation=(
+            AcquisitionObservationKind.BROWSER_NETWORK_JSON
+            if strategy.mode == "network"
+            else AcquisitionObservationKind.BROWSER_DOM
+        ),
+    )
+
+
+def _browser_unavailable_probe(
+    strategy: _BrowserStrategy,
+    request: AcquisitionRequest,
+    *,
+    reason: str,
+) -> AcquisitionProbe:
+    return _strategy_probe(
+        name=strategy.name,
+        version=strategy.version,
+        method=strategy.method,
+        url=safe_fallback_url(request.requested_url),
+        outcome=AcquisitionOutcome.POLICY_SKIPPED,
+        reason=reason,
+        capability=AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+        policy_decision=AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION,
+        observation=(
+            AcquisitionObservationKind.BROWSER_NETWORK_JSON
+            if strategy.mode == "network"
+            else AcquisitionObservationKind.BROWSER_DOM
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserStrategy:
+    adapter: Any | None = None
+    navigation_enabled: bool = False
+    enabled: bool = True
+    timeout_seconds: float = 45.0
+    name: str = "browser"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PLAYWRIGHT_CHROMIUM_DOM
+    mode: str = "dom"
+    domain_limiter: DomainConcurrencyLimiter | None = None
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        if not self.enabled:
+            return AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        if not self.navigation_enabled or self.adapter is None:
+            return AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+        return AcquisitionCapabilityState.IMPLEMENTED
+
+    @property
+    def capability_reason(self) -> str:
+        if not self.navigation_enabled or self.adapter is None:
+            return "browser_navigation_disabled"
+        return self.capability_state.value
+
+    @property
+    def capability_outcome(self) -> AcquisitionOutcome:
+        return AcquisitionOutcome.SKIPPED
+
+    @property
+    def capability_policy_decision(self) -> AcquisitionPolicyDecision:
+        return AcquisitionPolicyDecision.NOT_CONFIGURED
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        capability = self.capability_state
+        if capability is not AcquisitionCapabilityState.IMPLEMENTED:
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason=self.capability_reason,
+                    outcome=AcquisitionOutcome.SKIPPED,
+                    capability=capability,
+                ),
+            )
+        decision = request.policy.check_url(request.requested_url)
+        if decision is not AcquisitionPolicyDecision.ALLOWED:
+            return (
+                _policy_skipped_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=request.requested_url,
+                    decision=decision,
+                ),
+            )
+        adapter = self.adapter
+        if adapter is None:
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason="browser_navigation_disabled",
+                    outcome=AcquisitionOutcome.SKIPPED,
+                    capability=AcquisitionCapabilityState.BLOCKED_BY_SECURITY,
+                ),
+            )
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                if self.domain_limiter is None:
+                    observation = await adapter.navigate(request.requested_url)
+                else:
+                    async with self.domain_limiter.semaphore_for(request.requested_url):
+                        observation = await adapter.navigate(request.requested_url)
+        except BrowserUnconfiguredError:
+            return (_browser_unavailable_probe(self, request, reason="browser_unconfigured"),)
+        except BrowserUnavailableError:
+            return (_browser_unavailable_probe(self, request, reason="browser_unavailable"),)
+        except TimeoutError:
+            return (_browser_failure_probe(self, request, reason="browser_timeout"),)
+        except Exception:
+            return (_browser_failure_probe(self, request, reason="browser_unavailable"),)
+        if observation.challenge_detected or observation.paywall_detected:
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason=(
+                        "browser_challenge_detected"
+                        if observation.challenge_detected
+                        else "browser_paywall_detected"
+                    ),
+                    outcome=AcquisitionOutcome.REJECTED,
+                ),
+            )
+        if self.mode != "network" and observation.status is not None and observation.status != 200:
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason="browser_http_status_not_200",
+                    outcome=AcquisitionOutcome.REJECTED,
+                ),
+            )
+        final_decision = request.policy.check_url(observation.final_url)
+        if final_decision is not AcquisitionPolicyDecision.ALLOWED:
+            return (
+                _policy_skipped_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=observation.final_url,
+                    decision=final_decision,
+                    reason="browser_final_url_policy_denied",
+                ),
+            )
+
+        selected: tuple[Any, bytes, str | None, str, Any | None] | None = None
+        denied_capture: tuple[str, AcquisitionPolicyDecision] | None = None
+        if self.mode == "network":
+            allowed = _methods(_API_METHODS | frozenset({"json_ld", "embedded_state"}))
+            for captured in observation.captured_json:
+                capture_decision = request.policy.check_url(captured.url)
+                if capture_decision is not AcquisitionPolicyDecision.ALLOWED:
+                    denied_capture = (captured.url, capture_decision)
+                    continue
+                if captured.status != 200:
+                    continue
+                candidate = _candidate_article(
+                    captured.body,
+                    content_type=captured.content_type,
+                    url=captured.url,
+                    request=request,
+                    allowed_methods=allowed,
+                )
+                if candidate is not None:
+                    selected = (
+                        candidate,
+                        captured.body,
+                        captured.content_type,
+                        captured.url,
+                        captured,
+                    )
+                    break
+        else:
+            html_body = observation.rendered_html.encode("utf-8")
+            methods = (
+                _methods(_BROWSER_EMBEDDED_METHODS)
+                if self.mode == "embedded"
+                else _methods(frozenset({"html_article", "html_generic"}))
+            )
+            candidate = _candidate_article(
+                html_body,
+                content_type="text/html",
+                url=observation.final_url,
+                request=request,
+                allowed_methods=methods,
+            )
+            if candidate is not None:
+                selected = (candidate, html_body, "text/html", observation.final_url, None)
+        if selected is None:
+            if denied_capture is not None:
+                return (
+                    _policy_skipped_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=denied_capture[0],
+                        decision=denied_capture[1],
+                        reason="browser_captured_json_url_policy_denied",
+                    ),
+                )
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason="no_matching_browser_article",
+                    outcome=AcquisitionOutcome.REJECTED,
+                ),
+            )
+        candidate, candidate_body, candidate_type, candidate_url, captured_response = selected
+        if captured_response is not None:
+            raw_body = captured_response.body
+            raw_type = captured_response.content_type
+            status = captured_response.status
+            headers = captured_response.headers
+            observed_final_url = candidate_url
+        else:
+            raw_body = (
+                request.response_body if request.response_body is not None else candidate_body
+            )
+            raw_type = (
+                request.response_content_type
+                if request.response_body is not None
+                else candidate_type
+            )
+            status = observation.status or request.response_status or 200
+            headers = dict(request.response_headers)
+            observed_final_url = observation.final_url
+        observed = CollectedResponse(
+            requested_url=request.requested_url,
+            final_url=observed_final_url,
+            redirect_chain=(),
+            status=status,
+            headers=headers,
+            declared_content_type=raw_type,
+            detected_content_type=_detect_mime(raw_body),
+            encoded_body=raw_body,
+            decoded_body=raw_body,
+            encoded_size=len(raw_body),
+            encoded_sha256=hashlib.sha256(raw_body).hexdigest(),
+            decoded_size=len(raw_body),
+            decoded_sha256=hashlib.sha256(raw_body).hexdigest(),
+            content_encoding="identity",
+            acquired_at=datetime.now(UTC),
+        )
+        try:
+            response = _article_text_response(
+                observed, candidate, request=request, method=self.method
+            )
+        except (UnicodeEncodeError, ValueError):
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason="derived_article_exceeds_limit",
+                    outcome=AcquisitionOutcome.REJECTED,
+                ),
+            )
+        equivalence = _equivalence_for_observed_url(request.requested_url, observed.final_url)
+        duration = round((time.monotonic() - started) * 1000)
+        return (
+            _strategy_probe(
+                name=self.name,
+                version=self.version,
+                method=self.method,
+                url=candidate_url,
+                outcome=AcquisitionOutcome.SUCCEEDED,
+                response=response,
+                observed_response=observed,
+                duration_ms=duration,
+                observation=(
+                    AcquisitionObservationKind.BROWSER_NETWORK_JSON
+                    if self.mode == "network"
+                    else AcquisitionObservationKind.BROWSER_DOM
+                ),
+                equivalence=equivalence,
+                evidence=evidence_class_for_equivalence(equivalence),
+                quality=candidate.quality,
+                publisher=candidate.publisher,
+                publication_date=candidate.published_at,
+                primary_source_verified=(
+                    equivalence is SourceEquivalenceClass.EXACT_ORIGINAL
+                    and _same_acquisition_publisher(request.requested_url, observed.final_url)
+                ),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserDomStrategy(_BrowserStrategy):
+    name: str = "playwright_chromium_dom"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PLAYWRIGHT_CHROMIUM_DOM
+    mode: str = "dom"
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserNetworkStrategy(_BrowserStrategy):
+    name: str = "playwright_network_response"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PLAYWRIGHT_NETWORK_RESPONSE
+    mode: str = "network"
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserEmbeddedStateStrategy(_BrowserStrategy):
+    name: str = "playwright_embedded_state"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PLAYWRIGHT_EMBEDDED_STATE
+    mode: str = "embedded"
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityPlaceholderStrategy:
+    name: str
+    method: SourceAcquisitionMethod
+    capability: AcquisitionCapabilityState
+    reason: str
+    enabled: bool = True
+    version: str = "1"
+    timeout_seconds: float = 0.1
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return self.capability
+
+    @property
+    def capability_reason(self) -> str:
+        return self.reason
+
+    @property
+    def capability_outcome(self) -> AcquisitionOutcome:
+        return AcquisitionOutcome.NOT_CONFIGURED
+
+    @property
+    def capability_policy_decision(self) -> AcquisitionPolicyDecision:
+        return AcquisitionPolicyDecision.NOT_CONFIGURED
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        policy_block = self.capability is AcquisitionCapabilityState.BLOCKED_BY_SECURITY
+        return (
+            _strategy_probe(
+                name=self.name,
+                version=self.version,
+                method=self.method,
+                url=safe_fallback_url(request.requested_url),
+                outcome=(
+                    AcquisitionOutcome.POLICY_SKIPPED
+                    if policy_block
+                    else AcquisitionOutcome.NOT_CONFIGURED
+                ),
+                reason=self.reason,
+                capability=self.capability,
+                policy_decision=(
+                    AcquisitionPolicyDecision.DENIED_PRIVATE_DESTINATION
+                    if policy_block
+                    else AcquisitionPolicyDecision.NOT_CONFIGURED
+                ),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandOcrEngine:
+    command: tuple[str, ...]
+    timeout_seconds: float = 20.0
+
+    async def recognize(self, artifact: Any) -> str:
+        if len(artifact.encoded_body) > _MAX_DERIVED_RAW_BYTES:
+            raise ValueError("ocr_input_exceeds_limit")
+        process = await asyncio.create_subprocess_exec(
+            *self.command,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=DEVNULL,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "LANG": "C.UTF-8",
+                "HOME": "/tmp",
+            },
+        )
+        input_task = asyncio.create_task(_write_ocr_input(process, artifact.encoded_body))
+        output = bytearray()
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                stdout = process.stdout
+                if stdout is None:
+                    raise RuntimeError("ocr_command_stdout_unavailable")
+                while True:
+                    remaining = _MAX_DERIVED_BODY_BYTES - len(output)
+                    chunk = await stdout.read(min(64 * 1024, remaining + 1))
+                    if not chunk:
+                        break
+                    if len(output) + len(chunk) > _MAX_DERIVED_BODY_BYTES:
+                        raise _OcrOutputLimitError
+                    output.extend(chunk)
+                await input_task
+                await process.wait()
+        except _OcrOutputLimitError as exc:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise RuntimeError("ocr_output_exceeds_limit") from exc
+        except TimeoutError:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise
+        except asyncio.CancelledError:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise
+        except BaseException:
+            await _kill_and_wait(process)
+            await _cancel_ocr_input(input_task)
+            raise
+        if process.returncode != 0:
+            raise RuntimeError("ocr_command_failed_or_output_exceeded_limit")
+        return output.decode("utf-8", errors="replace")
+
+
+class _OcrOutputLimitError(Exception):
+    pass
+
+
+async def _write_ocr_input(process: Any, body: bytes) -> None:
+    stdin = process.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.write(body)
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionError, OSError, ValueError):
+        pass
+    finally:
+        stdin.close()
+        wait_closed = getattr(stdin, "wait_closed", None)
+        if wait_closed is not None:
+            try:
+                await wait_closed()
+            except (BrokenPipeError, ConnectionError, OSError, ValueError):
+                pass
+
+
+async def _cancel_ocr_input(task: asyncio.Task[None]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _kill_and_wait(process: Any) -> None:
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    await process.wait()
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyAwareStrategy:
+    inner: Any
+    configured_enabled: bool
+    timeout_seconds: float
+
+    @property
+    def name(self) -> str:
+        return str(self.inner.name)
+
+    @property
+    def version(self) -> str:
+        return str(self.inner.version)
+
+    @property
+    def method(self) -> SourceAcquisitionMethod:
+        return cast(SourceAcquisitionMethod, self.inner.method)
+
+    @property
+    def enabled(self) -> bool:
+        return self.configured_enabled
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        if not self.configured_enabled:
+            return AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        return getattr(
+            self.inner,
+            "capability_state",
+            AcquisitionCapabilityState.IMPLEMENTED,
+        )
+
+    @property
+    def capability_reason(self) -> str:
+        if not self.configured_enabled:
+            return "strategy_disabled"
+        if self.name == "exact_title_search" and not self.inner.search_endpoint:
+            return "search_endpoint_not_configured"
+        if self.name == "official_newsletter_archive" and not self.inner.archive_endpoint:
+            return "official_archive_not_configured"
+        if self.name == "third_party_extraction" and not self.inner.enabled:
+            return "provider_not_configured"
+        return self.capability_state.value
+
+    @property
+    def capability_outcome(self) -> AcquisitionOutcome:
+        return (
+            AcquisitionOutcome.SKIPPED
+            if not self.configured_enabled
+            else AcquisitionOutcome.NOT_CONFIGURED
+        )
+
+    @property
+    def capability_policy_decision(self) -> AcquisitionPolicyDecision:
+        return AcquisitionPolicyDecision.NOT_CONFIGURED
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if not self.configured_enabled:
+            return (
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=safe_fallback_url(request.requested_url),
+                    outcome=AcquisitionOutcome.SKIPPED,
+                    reason="strategy_disabled",
+                    capability=AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION,
+                ),
+            )
+        if self.name == "exact_title_search" and self.inner.search_endpoint:
+            decision = request.policy.check_destination(
+                self.inner.search_endpoint, external_llm=True
+            )
+            if decision is not AcquisitionPolicyDecision.ALLOWED:
+                return (
+                    _policy_skipped_probe(
+                        name=self.name,
+                        version=self.version,
+                        method=self.method,
+                        url=self.inner.search_endpoint,
+                        decision=decision,
+                        reason="external_search_policy_denied",
+                    ),
+                )
+
+        denied: dict[str, AcquisitionPolicyDecision] = {}
+
+        async def guarded_fetch(
+            url: str,
+            headers: dict[str, str],
+            timeout_seconds: float,
+            allow_binary: bool,
+        ) -> CollectedResponse:
+            decision = (
+                AcquisitionPolicyDecision.DENIED_CREDENTIALS
+                if not bridge_url_is_credential_free(url)
+                else request.policy.check_url(url)
+            )
+            if self.name == "exact_title_search" and decision is AcquisitionPolicyDecision.ALLOWED:
+                decision = request.policy.check_destination(url, external_llm=True)
+            if decision is not AcquisitionPolicyDecision.ALLOWED:
+                denied[url] = decision
+                raise PermissionError("acquisition destination policy denied")
+            return await request.fetch(url, headers, timeout_seconds, allow_binary)
+
+        attempted = request.attempted_strategy_urls
+        if (
+            self.name == "third_party_extraction"
+            and self.inner.enabled
+            and self.inner.provider_url
+            and request.title
+        ):
+            from cti_app.application.acquisition_discovery import safe_external_url
+
+            endpoint = urlsplit(self.inner.provider_url)
+            query = parse_qsl(endpoint.query, keep_blank_values=True)
+            query.extend(
+                (
+                    ("url", canonicalize_http_url(request.requested_url)),
+                    ("title", request.title),
+                )
+            )
+            target = urlunsplit(
+                (endpoint.scheme, endpoint.netloc, endpoint.path, urlencode(query), "")
+            )
+            if _attempt_key(self.name, safe_external_url(target)) in attempted:
+                attempted = attempted | frozenset({_attempt_key(self.name, target)})
+        guarded_request = replace(request, fetch=guarded_fetch, attempted_strategy_urls=attempted)
+        probes = tuple(await self.inner.acquire(guarded_request))
+        if not denied:
+            return probes
+        result: list[AcquisitionProbe] = []
+        for probe in probes:
+            denied_decision = denied.get(probe.requested_url)
+            if denied_decision is None or probe.outcome is not AcquisitionOutcome.FAILED:
+                result.append(probe)
+                continue
+            result.append(
+                replace(
+                    probe,
+                    outcome=AcquisitionOutcome.POLICY_SKIPPED,
+                    reason_code="destination_policy_denied",
+                    response=None,
+                    policy_decision=denied_decision,
+                    capability_state=AcquisitionCapabilityState.BLOCKED_BY_POLICY,
+                )
+            )
+        return tuple(result)
+
+
+@dataclass(frozen=True, slots=True)
+class _PublisherPdfAdapter:
+    enabled: bool = True
+    timeout_seconds: float = 20.0
+    min_text_chars: int = 200
+    expected_languages: tuple[str, ...] = ()
+
+    name: str = "publisher_pdf"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.PUBLISHER_PDF
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.enabled
+            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        )
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if not self.enabled:
+            return (
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=request.requested_url,
+                    outcome=AcquisitionOutcome.SKIPPED,
+                    reason="strategy_disabled",
+                    capability=AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION,
+                ),
+            )
+        from cti_app.application.acquisition_discovery import PublisherPdfStrategy
+        from cti_app.application.article_extraction import extract_candidates, select_best_candidate
+
+        pdf_urls: dict[str, str] = {}
+
+        async def capture_pdf_url(
+            url: str,
+            headers: dict[str, str],
+            timeout_seconds: float,
+            allow_binary: bool,
+        ) -> CollectedResponse:
+            decision = request.policy.check_url(url)
+            if (
+                decision is not AcquisitionPolicyDecision.ALLOWED
+                or not bridge_url_is_credential_free(url)
+            ):
+                raise PermissionError("acquisition destination policy denied")
+            observed = await request.fetch(url, headers, timeout_seconds, allow_binary)
+            pdf_urls[hashlib.sha256(observed.decoded_body).hexdigest()] = observed.final_url
+            return observed
+
+        def extract_pdf(raw_pdf: bytes) -> str:
+            source_url = pdf_urls.get(hashlib.sha256(raw_pdf).hexdigest(), request.requested_url)
+            candidates = extract_candidates(
+                raw_pdf,
+                content_type="application/pdf",
+                url=source_url,
+                expected_title=request.title,
+                expected_languages=request.expected_languages,
+                min_text_chars=self.min_text_chars,
+            )
+            selection_title = (
+                request.title if any(candidate.title for candidate in candidates) else None
+            )
+            selected = select_best_candidate(
+                candidates,
+                expected_title=selection_title,
+                expected_url=source_url,
+                min_score=0.2,
+            )
+            if selected is None:
+                return ""
+            if request.title:
+                expected_title = re.findall(r"[a-z0-9]+", request.title.casefold())
+                extracted_prefix = re.findall(r"[a-z0-9]+", selected.text.casefold())
+                if not expected_title or extracted_prefix[: len(expected_title)] != expected_title:
+                    return ""
+            return selected.text
+
+        strategy = PublisherPdfStrategy(
+            extractor=extract_pdf,
+            timeout_seconds=self.timeout_seconds,
+        )
+        # The wrapper above validates the requested title as a normalized
+        # prefix because PDF extractors often return the title and first body
+        # sentence on one line. The C strategy still enforces PDF structure,
+        # bounds, text quality, and publisher URL policy.
+        return tuple(await strategy.acquire(replace(request, fetch=capture_pdf_url, title=None)))
+
+
+@dataclass(frozen=True, slots=True)
+class _VisualOcrAdapter:
+    engine: Any | None
+    enabled: bool = True
+    timeout_seconds: float = 20.0
+    name: str = "visual_ocr"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.VISUAL_OCR
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        if not self.enabled:
+            return AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.engine is not None
+            else AcquisitionCapabilityState.DEPENDENCY_UNAVAILABLE
+        )
+
+    @property
+    def capability_reason(self) -> str:
+        return "ocr_not_configured" if self.engine is None else self.capability_state.value
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if self.engine is None:
+            return (
+                _strategy_probe(
+                    name=self.name,
+                    version=self.version,
+                    method=self.method,
+                    url=request.requested_url,
+                    outcome=AcquisitionOutcome.NOT_CONFIGURED,
+                    reason="ocr_not_configured",
+                    capability=AcquisitionCapabilityState.DEPENDENCY_UNAVAILABLE,
+                ),
+            )
+        from cti_app.application.acquisition_discovery import CapturedArtifact, VisualOcrStrategy
+
+        body = request.response_body
+        content_type = request.response_content_type or _detect_mime(body or b"").value
+        if body is None:
+            artifact = None
+        else:
+            artifact = CapturedArtifact(
+                encoded_body=body,
+                content_type=content_type,
+                source_url=request.requested_url,
+                sha256=hashlib.sha256(body).hexdigest(),
+            )
+        strategy = VisualOcrStrategy(
+            artifact=artifact,
+            engine=self.engine,
+            timeout_seconds=self.timeout_seconds,
+        )
+        return tuple(await strategy.acquire(request))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1001,7 +2953,7 @@ class CommonCrawlStrategy:
                     _metadata_probe(
                         range_probe,
                         response=range_probe.response,
-                        outcome="rejected",
+                        outcome=_typed_probe_outcome("rejected"),
                         reason_code="invalid_warc_record",
                     )
                 )
@@ -1019,7 +2971,7 @@ class CommonCrawlStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=warc_url,
-                    outcome="succeeded" if reason is None else "rejected",
+                    outcome=_typed_probe_outcome("succeeded" if reason is None else "rejected"),
                     reason_code=reason,
                     response=article if reason is None else None,
                     http_status=range_probe.http_status,
@@ -1126,22 +3078,124 @@ class BridgeTranscriptionStrategy:
         return (await request.bridge(),)
 
 
+@dataclass(frozen=True, slots=True)
+class BridgeSourceDiscoveryStrategy:
+    name: str = "bridge_source_discovery"
+    version: str = "1"
+    method: SourceAcquisitionMethod = SourceAcquisitionMethod.BRIDGE_SOURCE_DISCOVERY
+    enabled: bool = True
+    timeout_seconds: float = 90.0
+    max_candidates: int = MAX_STRATEGY_CANDIDATES
+
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return (
+            AcquisitionCapabilityState.IMPLEMENTED
+            if self.enabled
+            else AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        )
+
+    async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if request.bridge_discovery is None:
+            return (
+                _empty_probe(
+                    self.name,
+                    self.version,
+                    self.method,
+                    request.requested_url,
+                    "bridge_unavailable",
+                ),
+            )
+        return tuple(await request.bridge_discovery(self.max_candidates))
+
+
 def default_acquisition_strategies(
     *,
     flags: dict[str, bool] | None = None,
     timeouts: dict[str, float] | None = None,
     max_candidates: int = 24,
     playwright_adapter: BrowserRenderAdapter | None = None,
+    browser_adapter: Any | None = None,
+    domain_limiter: DomainConcurrencyLimiter | None = None,
+    browser_service_url: str | None = None,
+    browser_control_socket: str = "",
+    browser_navigation_enabled: bool = False,
+    exact_title_search_endpoint: str = "",
+    syndication_domains: frozenset[str] = frozenset(),
+    third_party_provider_url: str = "",
+    third_party_provider_token: str = "",
+    third_party_provider_enabled: bool = False,
+    newsletter_archive_endpoint: str = "",
+    ocr_command: str = "",
+    min_text_chars: int = 200,
+    expected_languages: tuple[str, ...] = (),
 ) -> tuple[AcquisitionStrategy, ...]:
     """Ordered default strategy registry. All HTTP calls remain SafeHttpCollector calls."""
-    enabled = flags or {}
-    timeout = timeouts or {}
+    enabled = flags if flags is not None else {}
+    timeout = timeouts if timeouts is not None else {}
 
     def configured(name: str, default: float) -> float:
         return max(0.1, min(float(timeout.get(name, default)), 300.0))
 
     def on(name: str) -> bool:
         return enabled.get(name, True)
+
+    def on_any(*names: str) -> bool:
+        return next((enabled[name] for name in names if name in enabled), True)
+
+    if browser_adapter is None and (browser_service_url or browser_control_socket):
+        from cti_app.application.browser_acquisition import SidecarBrowserAdapter
+
+        browser_adapter = SidecarBrowserAdapter(
+            service_url=browser_service_url or None,
+            socket_path=browser_control_socket or None,
+            timeout_seconds=configured("playwright_chromium_dom", 45),
+        )
+    # The legacy renderer only renders already fetched HTML and cannot provide
+    # navigation or captured network JSON. Keep its argument for callers that
+    # instantiate this registry directly, but do not route navigation through it.
+    del playwright_adapter
+
+    from cti_app.application.acquisition_archives import (
+        CommonCrawlWarcStrategy,
+        MementoArchiveStrategy,
+        WaybackSnapshotStrategy,
+    )
+    from cti_app.application.acquisition_discovery import (
+        AuthorizedSyndicationStrategy,
+        ExactTitleSearchStrategy,
+        OfficialNewsletterArchiveStrategy,
+        PublisherAlternativeUrlStrategy,
+        ThirdPartyExtractionStrategy,
+    )
+
+    try:
+        ocr_args = tuple(shlex.split(ocr_command)) if ocr_command.strip() else ()
+    except ValueError:
+        ocr_args = ()
+    ocr_engine = (
+        _CommandOcrEngine(ocr_args, timeout_seconds=configured("visual_ocr", 20))
+        if ocr_args
+        else None
+    )
+
+    def guarded(inner: Any, key: str, default_timeout: float) -> _PolicyAwareStrategy:
+        return _PolicyAwareStrategy(
+            inner=inner,
+            configured_enabled=on(key),
+            timeout_seconds=configured(key, default_timeout),
+        )
+
+    newsletter_host = _host_for_acquisition(newsletter_archive_endpoint)
+    newsletter_domains = frozenset(
+        (*syndication_domains, *((newsletter_host,) if newsletter_host else ()))
+    )
+    provider = ThirdPartyExtractionStrategy(
+        provider_url=third_party_provider_url or None,
+        provider_token=third_party_provider_token or None,
+        # SafeHttpCollector currently strips Authorization; never forward the token.
+        auth_transport_supported=False,
+    )
 
     return (
         PinnedHttpProfileStrategy(
@@ -1182,19 +3236,122 @@ def default_acquisition_strategies(
             timeout_seconds=configured("representations", 20),
             max_candidates=max_candidates,
         ),
-        WaybackStrategy(enabled=on("wayback"), timeout_seconds=configured("wayback", 20)),
+        FeedStrategy(
+            enabled=on("rss_atom_jsonfeed"),
+            timeout_seconds=configured("rss_atom_jsonfeed", 15),
+            max_candidates=max_candidates,
+        ),
+        PublisherApiStrategy(
+            enabled=on("publisher_public_api"),
+            timeout_seconds=configured("publisher_public_api", 15),
+            max_candidates=max_candidates,
+        ),
+        StructuredDataStrategy(
+            enabled=on("embedded_structured_data"),
+            timeout_seconds=configured("embedded_structured_data", 15),
+            max_candidates=max_candidates,
+        ),
+        BrowserDomStrategy(
+            adapter=browser_adapter,
+            domain_limiter=domain_limiter,
+            navigation_enabled=browser_navigation_enabled,
+            enabled=on("playwright_chromium_dom"),
+            timeout_seconds=configured("playwright_chromium_dom", 45),
+        ),
+        BrowserNetworkStrategy(
+            adapter=browser_adapter,
+            domain_limiter=domain_limiter,
+            navigation_enabled=browser_navigation_enabled,
+            enabled=on("playwright_network_response"),
+            timeout_seconds=configured("playwright_network_response", 45),
+        ),
+        BrowserEmbeddedStateStrategy(
+            adapter=browser_adapter,
+            domain_limiter=domain_limiter,
+            navigation_enabled=browser_navigation_enabled,
+            enabled=on("playwright_embedded_state"),
+            timeout_seconds=configured("playwright_embedded_state", 45),
+        ),
+        CapabilityPlaceholderStrategy(
+            name="playwright_firefox",
+            method=SourceAcquisitionMethod.PLAYWRIGHT_FIREFOX,
+            capability=AcquisitionCapabilityState.NOT_IMPLEMENTED,
+            reason="browser_engine_not_implemented",
+            enabled=on("playwright_firefox"),
+        ),
+        CapabilityPlaceholderStrategy(
+            name="playwright_webkit",
+            method=SourceAcquisitionMethod.PLAYWRIGHT_WEBKIT,
+            capability=AcquisitionCapabilityState.NOT_IMPLEMENTED,
+            reason="browser_engine_not_implemented",
+            enabled=on("playwright_webkit"),
+        ),
+        guarded(
+            WaybackSnapshotStrategy(timeout_seconds=configured("wayback_snapshot", 20)),
+            "wayback_snapshot" if "wayback_snapshot" in enabled else "wayback",
+            20,
+        ),
+        guarded(
+            CommonCrawlWarcStrategy(timeout_seconds=configured("commoncrawl_warc", 25)),
+            "commoncrawl_warc" if "commoncrawl_warc" in enabled else "common_crawl",
+            25,
+        ),
+        guarded(
+            MementoArchiveStrategy(timeout_seconds=configured("memento_archive", 15)),
+            "memento_archive" if "memento_archive" in enabled else "memento",
+            15,
+        ),
         ArchivePhStrategy(enabled=on("archive_ph"), timeout_seconds=configured("archive_ph", 15)),
-        CommonCrawlStrategy(
-            enabled=on("common_crawl"), timeout_seconds=configured("common_crawl", 25)
+        guarded(
+            ExactTitleSearchStrategy(
+                search_endpoint=exact_title_search_endpoint or None,
+                timeout_seconds=configured("exact_title_search", 15),
+            ),
+            "exact_title_search",
+            15,
         ),
-        MementoStrategy(enabled=on("memento"), timeout_seconds=configured("memento", 15)),
-        SearchCacheStrategy(
-            enabled=on("search_cache"), timeout_seconds=configured("search_cache", 10)
+        guarded(
+            PublisherAlternativeUrlStrategy(
+                timeout_seconds=configured("publisher_alternative_url", 15),
+                max_candidates=max_candidates,
+            ),
+            "publisher_alternative_url",
+            15,
         ),
-        PlaywrightStrategy(
-            adapter=playwright_adapter,
-            enabled=on("playwright") and playwright_adapter is not None,
-            timeout_seconds=configured("playwright", 45),
+        guarded(
+            AuthorizedSyndicationStrategy(timeout_seconds=configured("authorized_syndication", 15)),
+            "authorized_syndication",
+            15,
+        ),
+        _PublisherPdfAdapter(
+            enabled=on("publisher_pdf"),
+            timeout_seconds=configured("publisher_pdf", 20),
+            min_text_chars=min_text_chars,
+            expected_languages=expected_languages,
+        ),
+        _VisualOcrAdapter(
+            engine=ocr_engine,
+            enabled=on("visual_ocr"),
+            timeout_seconds=configured("visual_ocr", 20),
+        ),
+        guarded(
+            OfficialNewsletterArchiveStrategy(
+                archive_endpoint=newsletter_archive_endpoint or None,
+                official_domains=newsletter_domains,
+                timeout_seconds=configured("official_newsletter_archive", 15),
+            ),
+            "official_newsletter_archive",
+            15,
+        ),
+        _PolicyAwareStrategy(
+            inner=provider,
+            configured_enabled=(on("third_party_extraction") and third_party_provider_enabled),
+            timeout_seconds=configured("third_party_extraction", 20),
+        ),
+        BridgeSourceDiscoveryStrategy(
+            enabled=on("bridge_source_discovery"),
+            timeout_seconds=configured("bridge_source_discovery", 90),
+            max_candidates=max_candidates,
         ),
         BridgeTranscriptionStrategy(
             enabled=on("bridge_transcription"),
@@ -1325,7 +3482,7 @@ def archive_url_variants(original_url: str) -> tuple[str, ...]:
 
 
 def retry_after_seconds(value: str | None, *, retry: int) -> float:
-    fallback = min(0.25 * (2**retry), MAX_RETRY_AFTER_SECONDS)
+    fallback: float = min(0.25 * (2**retry), MAX_RETRY_AFTER_SECONDS)
     if not value:
         return fallback
     try:
@@ -1356,7 +3513,7 @@ def _metadata_probe(
         strategy_version=probe.strategy_version,
         method=probe.method,
         requested_url=probe.requested_url,
-        outcome=outcome,
+        outcome=_typed_probe_outcome(outcome),
         reason_code=reason_code,
         response=response,
         http_status=response.status,
@@ -1378,7 +3535,7 @@ def _empty_probe(
         strategy_version=version,
         method=method,
         requested_url=url,
-        outcome="skipped",
+        outcome=_typed_probe_outcome("skipped"),
         reason_code=reason,
         response=None,
         http_status=None,
