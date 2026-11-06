@@ -1551,7 +1551,7 @@ def _walk_jsonld(value: Any) -> list[dict[str, Any]]:
                 for item in types
             ):
                 result.append(node)
-            children = node.values()
+            children = list(node.values())
         elif isinstance(node, list):
             children = node
         else:
@@ -1743,7 +1743,7 @@ def _bounded_object_string(value: Any, preferred_keys: tuple[str, ...]) -> str |
                 result = _string_value(node.get(key))
                 if result:
                     return result
-            children = node.values()
+            children = list(node.values())
         elif isinstance(node, list):
             children = node
         else:
