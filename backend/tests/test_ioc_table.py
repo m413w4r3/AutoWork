@@ -336,6 +336,52 @@ def test_ioc_table_merges_roles_for_one_canonical_value_without_dropping_provena
     assert "Preuve, contexte et décision" not in str(model.content_sections[0])
 
 
+def test_scheme_less_c2_url_reaches_ioc_list_and_invalid_urls_are_counted() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    values = (
+        "www.xionamiconm[.]com:8050/ws/",
+        "bad host/path",
+        ":8050/ws/",
+        "www.example.com:notaport/ws/",
+        "this is not a URL",
+        " www.leading.example/ws/ ",
+    )
+    indicators = tuple(
+        ExtractionIndicatorV1(
+            value=value,
+            artifact_type=ArtifactType.URL,
+            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+            context="C2 infrastructure",
+            evidence_quote=value,
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+        )
+        for value in values
+    )
+    extraction = replace(extraction, sources=(replace(source, indicators=indicators),))
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    document = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=_enrichment_with(extraction=extraction, synthesis=synthesis),
+    )
+
+    model = project_publication_to_typst_model(document)
+    ioc_section = next(section for section in model.content_sections if section["type"] == "ioc")
+    article_items = [item for group in ioc_section["source_indicators"] for item in group["items"]]
+    displayed_values = {
+        item["value"]["text"] if isinstance(item["value"], dict) else str(item["value"])
+        for item in article_items
+    }
+
+    assert "www[.]xionamiconm[.]com:8050/ws/" in displayed_values
+    assert "omitted_invalid_url_count" in ioc_section
+    assert ioc_section["omitted_invalid_url_count"] == 5
+
+
 def test_ioc_groups_deduplicate_candidate_against_article_and_original_statuses() -> None:
     base, _values = _ioc_document()
     source_id = base.document.sources[0].source_document_id

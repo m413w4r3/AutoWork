@@ -107,7 +107,7 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import (
     is_subject_ioc_eligible,
-    is_supported_subject_ioc_hash,
+    is_supported_publication_ioc_hash,
 )
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
 
@@ -386,7 +386,7 @@ def _project_publication_iocs(
                 value = normalize_publication_indicator_value(item.value, item.artifact_type)
             except ValueError as exc:
                 raise ValueError(f"Confirmed IOC {item.value!r} cannot be normalized") from exc
-            if not is_supported_subject_ioc_hash(item.artifact_type, value):
+            if not is_supported_publication_ioc_hash(item.artifact_type, value):
                 detail_candidates.append(
                     (
                         PublicationIOCDetailV1(
@@ -597,9 +597,9 @@ def _validate_publication_lineage(
             )
 
 
-# V12 changes only PUBLICATION: generic legitimate-service hosts are filtered
-# from IOC groups. Upstream artifacts remain valid.
-ASSEMBLY_POLICY_VERSION: Final[str] = "14-ip-endpoint-normalization"
+# V15 preserves publication hash semantics for ssdeep and TLSH. Extraction
+# identities and routing policy remain unchanged.
+ASSEMBLY_POLICY_VERSION: Final[str] = "15-publication-fuzzy-hash-normalization"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:

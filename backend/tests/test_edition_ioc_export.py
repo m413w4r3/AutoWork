@@ -231,6 +231,32 @@ def test_projection_maps_hashes_deduplicates_and_excludes_unsupported_types() ->
     assert all(not any(char in row.value for char in ",|\r\n") for row in projection.rows)
 
 
+def test_scheme_less_c2_url_is_in_frozen_edition_ioc_export() -> None:
+    url = "www.xionamiconm.com:8050/ws/"
+    publication = _publication(
+        "[Group] Scheme-less C2",
+        indicators=(_group(ArtifactType.URL, url),),
+        headings=("Infrastructure",),
+        body="Observed C2 infrastructure.",
+    )
+    edition = EditionDocumentV2(
+        edition={
+            "id": "11111111-1111-4111-8111-111111111111",
+            "country_code": "FR",
+            "period_start": "2026-08-01",
+        },
+        publications=(
+            EditionPublicationV2(position=1, subject_id=UUID(int=1), document=publication),
+        ),
+    )
+
+    archive = build_edition_ioc_archive(edition, edition_sha256="a" * 64)
+
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
+        csv = zipped.read("articles/article01/article.csv").decode("utf-8")
+    assert f"0,url,{url}\n" in csv
+
+
 def test_frozen_edition_export_defensively_excludes_generic_service_hosts() -> None:
     base = _full_document()
     source_id = base.sources[0].source_document_id

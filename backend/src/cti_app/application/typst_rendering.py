@@ -23,7 +23,10 @@ from cti_app.application.investigation_figures import (
 from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION, target_descriptor
 from cti_app.application.production_normalization import (
     display_indicator_value,
+    display_publication_indicator_value,
     normalize_indicator_value,
+    normalize_publication_indicator_value,
+    publication_indicator_identity_key,
 )
 from cti_app.application.protocol_diagram_projection import (
     PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
@@ -111,6 +114,7 @@ _INDICATOR_KEYS = {
     ArtifactType.EMAIL: "emails",
     ArtifactType.HASH: "hashes",
 }
+_PUBLICATION_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
 _IOC_DISPOSITION_LABELS = {
     PublicationIOCDisposition.RETAINED: "Retenu",
     PublicationIOCDisposition.UNCERTAIN: "Incertain",
@@ -225,12 +229,60 @@ def _indicator_values(groups: tuple[Any, ...]) -> dict[str, list[dict[str, Any]]
     for group in groups:
         key = _INDICATOR_KEYS[group.artifact_type]
         for indicator in group.indicators:
-            normalized_value = indicator.normalized_value.casefold()
+            normalized_value = publication_indicator_identity_key(
+                indicator.normalized_value, group.artifact_type
+            )
             if normalized_value in seen[key]:
                 continue
             seen[key].add(normalized_value)
             result[key].append(_breakable_typst_display_text(indicator.value))
     return result
+
+
+def _valid_publication_url_host(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    try:
+        ascii_hostname = hostname.rstrip(".").encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    if (
+        not ascii_hostname
+        or len(ascii_hostname) > 253
+        or ("." not in ascii_hostname and ascii_hostname.casefold() != "localhost")
+    ):
+        return False
+    labels = ascii_hostname.split(".")
+    return all(
+        label and len(label) <= 63 and _PUBLICATION_HOST_LABEL.fullmatch(label) is not None
+        for label in labels
+    )
+
+
+def _validated_publication_url(value: str) -> str:
+    """Validate a publication URL while leaving unknown schemes uninferred."""
+    canonical = normalize_publication_indicator_value(value, ArtifactType.URL)
+    if any(character.isspace() for character in canonical) or "\\" in canonical:
+        raise ValueError("invalid publication URL")
+    has_explicit_scheme = "://" in canonical
+    parts = urlsplit(canonical if has_explicit_scheme else f"//{canonical}")
+    if (
+        (has_explicit_scheme and parts.scheme.casefold() not in {"http", "https"})
+        or not parts.netloc
+        or parts.hostname is None
+        or parts.netloc.endswith(":")
+        or (not has_explicit_scheme and parts.username is not None)
+    ):
+        raise ValueError("invalid publication URL")
+    port = parts.port
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("invalid publication URL port")
+    if not _valid_publication_url_host(parts.hostname):
+        raise ValueError("invalid publication URL host")
+    return canonical
 
 
 _DETECTION_REASON_LABELS = {
@@ -1535,10 +1587,14 @@ def project_publication_to_typst_model(
 
     def canonical_ioc_key(value: str, artifact_type: ArtifactType) -> str:
         try:
-            return normalize_indicator_value(value, artifact_type)
+            return normalize_publication_indicator_value(value, artifact_type)
         except ValueError:
             # Preserve legacy/test literals rather than fabricating a normalized IP.
             return value.strip()
+
+    def ioc_identity_key(value: str, artifact_type: ArtifactType) -> tuple[ArtifactType, str]:
+        canonical = canonical_ioc_key(value, artifact_type)
+        return artifact_type, publication_indicator_identity_key(canonical, artifact_type)
 
     omitted_invalid_urls: set[str] = set()
 
@@ -1547,21 +1603,17 @@ def project_publication_to_typst_model(
     ) -> str | None:
         if artifact_type is ArtifactType.URL:
             try:
-                canonical_url = normalize_indicator_value(normalized_value, artifact_type)
+                canonical_url = _validated_publication_url(normalized_value)
             except ValueError:
                 omitted_invalid_urls.add(value)
                 return None
-            parsed_url = urlsplit(canonical_url)
-            if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
-                omitted_invalid_urls.add(value)
-                return None
-            return display_indicator_value(canonical_url, artifact_type, defanged=True)
+            return display_publication_indicator_value(canonical_url, artifact_type, defanged=True)
         try:
-            canonical = normalize_indicator_value(normalized_value, artifact_type)
-            normalized_source_value = normalize_indicator_value(value, artifact_type)
+            canonical = normalize_publication_indicator_value(normalized_value, artifact_type)
+            normalized_source_value = normalize_publication_indicator_value(value, artifact_type)
             if normalized_source_value != canonical:
                 return value.strip()
-            return display_indicator_value(canonical, artifact_type, defanged=True)
+            return display_publication_indicator_value(canonical, artifact_type, defanged=True)
         except ValueError:
             return value.strip()
 
@@ -1570,8 +1622,7 @@ def project_publication_to_typst_model(
         value: str,
         normalized_value: str,
     ) -> dict[str, Any] | None:
-        canonical = canonical_ioc_key(normalized_value, artifact_type)
-        key = (artifact_type, canonical.casefold())
+        key = ioc_identity_key(normalized_value, artifact_type)
         row = ioc_by_key.get(key)
         if row is None:
             displayed_value = defanged_ioc_value(value, normalized_value, artifact_type)
@@ -1600,8 +1651,7 @@ def project_publication_to_typst_model(
 
     detail_source_keys = {
         (
-            item.artifact_type,
-            canonical_ioc_key(item.normalized_value, item.artifact_type).casefold(),
+            *ioc_identity_key(item.normalized_value, item.artifact_type),
             source_id,
         )
         for item in ioc_details
@@ -1620,10 +1670,7 @@ def project_publication_to_typst_model(
                 row["statuses"].add(status_label)
                 for source_id in indicator.source_document_ids:
                     key = (
-                        indicator.artifact_type,
-                        canonical_ioc_key(
-                            indicator.normalized_value, indicator.artifact_type
-                        ).casefold(),
+                        *ioc_identity_key(indicator.normalized_value, indicator.artifact_type),
                         source_id,
                     )
                     if key in detail_source_keys:
@@ -1831,10 +1878,7 @@ def project_publication_to_typst_model(
     ioc_origins: dict[tuple[ArtifactType, str], set[str]] = {}
 
     def record_ioc_origin(artifact_type: ArtifactType, normalized_value: str, origin: str) -> None:
-        key = (
-            artifact_type,
-            canonical_ioc_key(normalized_value, artifact_type).casefold(),
-        )
+        key = ioc_identity_key(normalized_value, artifact_type)
         ioc_origins.setdefault(key, set()).add(origin)
 
     def ioc_type_heading(artifact_type: ArtifactType, value: str) -> str:
@@ -1855,12 +1899,12 @@ def project_publication_to_typst_model(
     def matching_ioc_details(
         artifact_type: ArtifactType, normalized_value: str, source_id: UUID
     ) -> list[Any]:
-        key = canonical_ioc_key(normalized_value, artifact_type).casefold()
+        key = ioc_identity_key(normalized_value, artifact_type)[1]
         return [
             detail
             for detail in ioc_details
             if detail.artifact_type is artifact_type
-            and canonical_ioc_key(detail.normalized_value, artifact_type).casefold() == key
+            and ioc_identity_key(detail.normalized_value, artifact_type)[1] == key
             and source_id in detail.source_document_ids
         ]
 
@@ -1877,8 +1921,7 @@ def project_publication_to_typst_model(
         display_value = defanged_ioc_value(value, normalized_value, artifact_type)
         if display_value is None:
             return
-        canonical = canonical_ioc_key(normalized_value, artifact_type).casefold()
-        key = (artifact_type, canonical)
+        key = ioc_identity_key(normalized_value, artifact_type)
         owner = ioc_group_owner.get(key)
         if owner is None or ioc_group_priority[status] < ioc_group_priority[owner]:
             if owner is not None:
@@ -1985,8 +2028,7 @@ def project_publication_to_typst_model(
 
     for draft_ioc in draft_iocs:
         status = draft_ioc.status
-        canonical = canonical_ioc_key(draft_ioc.normalized_value, draft_ioc.artifact_type)
-        list_key = (draft_ioc.artifact_type, canonical.casefold())
+        list_key = ioc_identity_key(draft_ioc.normalized_value, draft_ioc.artifact_type)
         record_ioc_origin(
             draft_ioc.artifact_type,
             draft_ioc.normalized_value,
