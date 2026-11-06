@@ -41,7 +41,9 @@ from cti_app.application.production_synthesis import (
     ProductionSynthesisExecution,
     SynthesisExecutionStatus,
     build_synthesis_evidence_pack,
+    build_synthesis_timeline,
     canonical_extraction_hash,
+    extraction_evidence_elements,
     synthesis_input_hash,
 )
 from cti_app.application.production_workflow import (
@@ -87,7 +89,11 @@ from cti_app.domain.production_references import (
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
-from cti_app.domain.production_relevance import relevance_projection_to_json
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceReasonCode,
+    relevance_projection_to_json,
+)
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -1795,19 +1801,14 @@ def _brief_synthesis_world(
     external_llm_allowed: bool = True,
     source_date_text: str = "2026-07-02",
     source_quote: str = "Le 2026-07-02, la campagne commence.",
+    events: tuple[ExtractionEventV1, ...] | None = None,
 ) -> SimpleNamespace:
     world = _synthesis_world()
     source = world.extraction.sources[0]
-    source = replace(
-        source,
-        facts=(
-            replace(
-                source.facts[0],
-                context="accès initial",
-                evidence_quote="Le rapport identifie FooRAT.",
-            ),
-        ),
-        events=(
+    event_values = (
+        tuple(replace(event, source_document_ids=(world.source_id,)) for event in events)
+        if events is not None
+        else (
             (
                 replace(
                     source.events[0],
@@ -1819,7 +1820,18 @@ def _brief_synthesis_world(
             )
             if with_chronology
             else ()
+        )
+    )
+    source = replace(
+        source,
+        facts=(
+            replace(
+                source.facts[0],
+                context="accès initial",
+                evidence_quote="Le rapport identifie FooRAT.",
+            ),
         ),
+        events=event_values,
         indicators=(),
     )
     extraction = replace(world.extraction, sources=(source,))
@@ -2150,6 +2162,136 @@ async def test_brief_synthesis_uses_shared_gateway_and_source_dated_timeline() -
     assert canonical.sections == ()
     assert len(canonical.timeline) == 1
     assert canonical.timeline[0].event_date == date(2026, 7, 2)
+
+
+def _first_observation_events() -> tuple[ExtractionEventV1, ...]:
+    dates = [
+        date(2017, 10, 31),
+        date(2019, 1, 1),
+        date(2019, 1, 12),
+        date(2019, 10, 30),
+        date(2022, 9, 15),
+        date(2024, 3, 8),
+        date(2026, 7, 15),
+    ]
+    dates.extend(date(2020, 1, 1) + timedelta(days=index) for index in range(53))
+    unique_dates = tuple(dict.fromkeys(dates))
+    campaign_names = {
+        4: "Victory Against Traitors",
+        5: "Tailgate",
+        6: "Sail",
+    }
+    return tuple(
+        ExtractionEventV1(
+            event_date=event_date,
+            date_text=event_date.isoformat(),
+            text=(
+                "Première observation renseignée pour la campagne "
+                f"« {campaign_names.get(index, f'Campaign {index:02}')} » "
+                f"({event_date.isoformat()})."
+            ),
+            context="Date de première observation de la campagne.",
+            evidence_quote=f"Première observation le {event_date.isoformat()}.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(uuid4(),),
+        )
+        for index, event_date in enumerate(unique_dates)
+    )
+
+
+@pytest.mark.asyncio
+async def test_brief_timeline_prefers_grounded_events_cited_by_validated_lead() -> None:
+    events = _first_observation_events()
+    world = _brief_synthesis_world(events=events)
+    event_refs_by_text = {
+        str(payload["text"]): ref
+        for ref, payload in extraction_evidence_elements(world.extraction)
+        if ref.kind is EvidenceKind.EVENT
+    }
+    cited_refs = tuple(event_refs_by_text[str(events[index].text)] for index in (4, 5, 6))
+    handles = tuple(world.pack.handle_for(ref) for ref in cited_refs)
+    assert all(handle is not None for handle in handles)
+    world.gateway.proposal = {
+        "title": "[Groupe] Trois campagnes documentées",
+        "lead": [
+            {
+                "text": ("Le rapport documente Victory Against Traitors, Tailgate et Sail."),
+                "evidence_handles": list(handles),
+            }
+        ],
+    }
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "success"
+    stored = world.artifacts.appended[-1]
+    assert stored.canonical_blob_id is not None
+    assert world.gateway.requests[0].metadata["synthesis_input_hash"] == stored.input_hash
+    canonical = production_synthesis_from_json(
+        await world.store.read_json(stored.canonical_blob_id)
+    )
+    assert [entry.event_date for entry in canonical.timeline] == [
+        date(2022, 9, 15),
+        date(2024, 3, 8),
+        date(2026, 7, 15),
+    ]
+    assert set(
+        canonical.timeline[0].evidence_refs
+        + canonical.timeline[1].evidence_refs
+        + canonical.timeline[2].evidence_refs
+    ) == set(cited_refs)
+
+
+def test_brief_timeline_fallback_ranks_direct_relevance_then_period_proximity() -> None:
+    events = _first_observation_events()
+    world = _brief_synthesis_world(events=events)
+    ref_by_text = {
+        str(payload["text"]): ref
+        for ref, payload in extraction_evidence_elements(world.extraction)
+        if ref.kind is EvidenceKind.EVENT
+    }
+    index_by_ref = {ref_by_text[event.text]: index for index, event in enumerate(events)}
+    classifications = []
+    for item in world.projection.classifications:
+        if item.evidence_ref.kind is not EvidenceKind.EVENT:
+            classifications.append(item)
+            continue
+        index = index_by_ref[item.evidence_ref]
+        if index < 4:
+            classification = RelevanceClassification.CONTEXT
+            reason = RelevanceReasonCode.CONTEXT_SOURCE_WITHOUT_RELATION
+        elif index in {4, 5}:
+            classification = RelevanceClassification.DIRECT
+            reason = RelevanceReasonCode.SUBJECT_MATCHED_PRIMARY
+        elif index == 7:
+            classification = RelevanceClassification.INDETERMINATE
+            reason = RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED
+        elif index == 8:
+            classification = RelevanceClassification.OUT_OF_SCOPE
+            reason = RelevanceReasonCode.EXPLICIT_OTHER_ACTOR
+        elif index == 9:
+            classification = RelevanceClassification.COUNTER_INDICATION
+            reason = RelevanceReasonCode.EXPLICIT_SUBJECT_DENIAL
+        else:
+            classification = RelevanceClassification.DIRECT
+            reason = RelevanceReasonCode.PRIMARY_CORE_DEFAULT
+        classifications.append(replace(item, classification=classification, reason_code=reason))
+    projection = replace(world.projection, classifications=tuple(classifications))
+
+    timeline = brief_timeline_from_extraction(
+        world.extraction,
+        build_synthesis_timeline(world.extraction),
+        snapshot=world.snapshot,
+        projection=projection,
+    )
+
+    assert timeline is not None
+    assert [entry.event_date for entry in timeline] == [
+        events[index].event_date for index in (59, 4, 5, 6)
+    ]
+    assert set(ref for entry in timeline for ref in entry.evidence_refs) == {
+        ref_by_text[events[index].text] for index in (59, 4, 5, 6)
+    }
 
 
 @pytest.mark.asyncio

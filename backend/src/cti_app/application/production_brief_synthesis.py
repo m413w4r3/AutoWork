@@ -16,6 +16,11 @@ from cti_app.domain.production_references import (
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceProjectionV1,
+    RelevanceReasonCode,
+)
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -26,7 +31,9 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.wire_markers import contains_wire_marker_line
 
 BRIEF_SYNTHESIS_PROMPT_VERSION = "brief-synthesis-v1-french-grounded-chronology"
-BRIEF_TIMELINE_POLICY_VERSION = "brief-timeline-v3-core-primary-metadata-publication-fallback"
+BRIEF_TIMELINE_POLICY_VERSION = (
+    "brief-timeline-v4-narrative-cited-relevance-ranked-publication-fallback"
+)
 BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING = (
     "brief_chronology_source_publication_fallback"
 )
@@ -137,13 +144,18 @@ def brief_timeline_from_extraction(
     entries: Iterable[SynthesisTimelineEntryV1],
     *,
     snapshot: ProductionInputSnapshot | None = None,
+    projection: RelevanceProjectionV1 | None = None,
+    cited_evidence_refs: Iterable[ExtractionEvidenceRefV1] = (),
     warnings: list[str] | None = None,
 ) -> tuple[SynthesisTimelineEntryV1, ...] | None:
-    """Keep at most four dated events whose date text is present in source evidence.
+    """Select up to four grounded events cited by the lead, or relevant fallbacks.
 
-    ``None`` means no defensible chronology exists and the brief must be sent
-    to review. Metadata supplies only the final, explicitly marked fallback.
+    Without a grounded lead citation, direct subject-matched primary events rank
+    first, followed by other direct events. The four selected events nearest to
+    the subject period win; ties prefer the most recent dates, and output is
+    chronological. Metadata supplies only the final, explicitly marked fallback.
     """
+    cited_refs = set(cited_evidence_refs)
     payload_by_ref: dict[ExtractionEvidenceRefV1, Mapping[str, object]] = {
         ref: payload for ref, payload in extraction_evidence_elements(extraction)
     }
@@ -151,7 +163,7 @@ def brief_timeline_from_extraction(
     for entry in entries:
         if entry.event_date is None or not entry.evidence_refs:
             continue
-        source_support = False
+        supporting_refs: list[ExtractionEvidenceRefV1] = []
         for ref in entry.evidence_refs:
             if ref.kind is not EvidenceKind.EVENT:
                 continue
@@ -170,26 +182,9 @@ def brief_timeline_from_extraction(
                 isinstance(value, str) and _source_contains_date(value, entry.event_date)
                 for value in source_values
             ):
-                source_support = True
-                break
-        if source_support:
-            grounded.append(entry)
-    if not grounded:
-        fallback = _core_primary_publication_timeline_entry(extraction, payload_by_ref)
-        if fallback is not None:
-            if warnings is not None:
-                warnings.append(BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING)
-            return (fallback,)
-        metadata_fallback = (
-            brief_metadata_publication_fallback_entry(snapshot, extraction)
-            if snapshot is not None
-            else None
-        )
-        if metadata_fallback is None:
-            return None
-        if warnings is not None:
-            warnings.append(BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING)
-        return (metadata_fallback,)
+                supporting_refs.append(ref)
+        if supporting_refs:
+            grounded.append(replace(entry, evidence_refs=tuple(supporting_refs)))
 
     deduplicated: list[SynthesisTimelineEntryV1] = []
     for entry in grounded:
@@ -205,7 +200,77 @@ def brief_timeline_from_extraction(
         existing = deduplicated[index]
         evidence_refs = tuple(dict.fromkeys((*existing.evidence_refs, *entry.evidence_refs)))
         deduplicated[index] = replace(existing, evidence_refs=evidence_refs)
-    return tuple(deduplicated[:4])
+
+    cited_grounded = [
+        replace(
+            entry,
+            evidence_refs=tuple(ref for ref in entry.evidence_refs if ref in cited_refs),
+        )
+        for entry in deduplicated
+        if any(ref in cited_refs for ref in entry.evidence_refs)
+    ]
+    if cited_grounded:
+        return tuple(sorted(cited_grounded, key=lambda entry: entry.event_date or date.max)[:4])
+
+    relevance_ranked: list[tuple[tuple[int, int, int], SynthesisTimelineEntryV1]] = []
+    for entry in deduplicated:
+        direct_refs: list[ExtractionEvidenceRefV1] = []
+        subject_matched_primary = False
+        for ref in entry.evidence_refs:
+            if projection is None:
+                # Legacy callers without a projection have no classification data.
+                direct_refs.append(ref)
+                continue
+            item = projection.classification_for(ref)
+            if item.classification is not RelevanceClassification.DIRECT:
+                continue
+            direct_refs.append(ref)
+            subject_matched_primary = subject_matched_primary or (
+                item.reason_code is RelevanceReasonCode.SUBJECT_MATCHED_PRIMARY
+            )
+        if not direct_refs:
+            continue
+        ranked_entry = replace(entry, evidence_refs=tuple(direct_refs))
+        assert ranked_entry.event_date is not None
+        period_distance = _brief_period_distance(ranked_entry.event_date, snapshot)
+        rank = (
+            0 if subject_matched_primary else 1,
+            period_distance,
+            -ranked_entry.event_date.toordinal(),
+        )
+        relevance_ranked.append((rank, ranked_entry))
+
+    if relevance_ranked:
+        selected = [entry for _, entry in sorted(relevance_ranked, key=lambda item: item[0])[:4]]
+        return tuple(sorted(selected, key=lambda entry: entry.event_date or date.max))
+
+    fallback = _core_primary_publication_timeline_entry(extraction, payload_by_ref)
+    if fallback is not None:
+        if warnings is not None:
+            warnings.append(BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING)
+        return (fallback,)
+    metadata_fallback = (
+        brief_metadata_publication_fallback_entry(snapshot, extraction)
+        if snapshot is not None
+        else None
+    )
+    if metadata_fallback is None:
+        return None
+    if warnings is not None:
+        warnings.append(BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING)
+    return (metadata_fallback,)
+
+
+def _brief_period_distance(
+    event_date: date,
+    snapshot: ProductionInputSnapshot | None,
+) -> int:
+    """Distance in days from an event to the frozen subject period."""
+    if snapshot is None or snapshot.period_start <= event_date <= snapshot.period_end:
+        return 0
+    if event_date < snapshot.period_start:
+        return (snapshot.period_start - event_date).days
+    return (event_date - snapshot.period_end).days
 
 
 def brief_metadata_publication_fallback_entry(

@@ -87,8 +87,12 @@ def build_brief_publication_document_v5(
     if metadata_refs:
         expected_timeline = brief_timeline_from_extraction(
             extraction,
-            build_synthesis_timeline(extraction, projection=relevance_projection),
+            build_synthesis_timeline(extraction),
             snapshot=snapshot,
+            projection=relevance_projection,
+            cited_evidence_refs=(
+                ref for paragraph in synthesis.lead for ref in paragraph.evidence_refs
+            ),
         )
         expected_metadata_refs = frozenset(
             ref
