@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import date, timedelta
@@ -25,7 +26,7 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.wire_markers import contains_wire_marker_line
 
 BRIEF_SYNTHESIS_PROMPT_VERSION = "brief-synthesis-v1-french-grounded-chronology"
-BRIEF_TIMELINE_POLICY_VERSION = "brief-timeline-v2-core-primary-metadata-publication-fallback"
+BRIEF_TIMELINE_POLICY_VERSION = "brief-timeline-v3-core-primary-metadata-publication-fallback"
 BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING = (
     "brief_chronology_source_publication_fallback"
 )
@@ -235,7 +236,7 @@ def brief_metadata_publication_fallback_entry(
             continue
         publisher = _bounded_metadata_component(metadata.publisher, 120)
         title = _bounded_metadata_component(metadata.title, 240)
-        if publisher is None or title is None:
+        if title is None:
             continue
         ref = source_metadata_evidence_ref_v1(
             source_document_id=source.source_document_id,
@@ -244,10 +245,17 @@ def brief_metadata_publication_fallback_entry(
             publisher=metadata.publisher,
             published_at=published_at,
         )
+        publisher_is_latin = publisher is not None and _is_predominantly_latin(publisher)
+        if not publisher_is_latin:
+            text = "Publication d'un article de la source principale."
+        elif not _is_predominantly_latin(title):
+            text = f"Publication d'un article par {publisher}."
+        else:
+            text = f"Publication par {publisher} de « {title} »."
         entry = SynthesisTimelineEntryV1(
             event_date=published_at,
             date_text=None,
-            text=f"Publication par {publisher} de « {title} ».",
+            text=text,
             evidence_refs=(ref,),
         )
         candidate = (published_at, metadata.canonical_url, entry)
@@ -257,7 +265,9 @@ def brief_metadata_publication_fallback_entry(
 
 
 def _bounded_metadata_component(value: str, max_chars: int) -> str | None:
-    printable = "".join(char if char.isprintable() else " " for char in value)
+    printable = "".join(
+        char if char.isprintable() and unicodedata.category(char) != "Cf" else " " for char in value
+    )
     normalized = " ".join(printable.split())
     if not normalized:
         return None
@@ -267,6 +277,16 @@ def _bounded_metadata_component(value: str, max_chars: int) -> str | None:
     if not shortened:
         shortened = normalized[: max_chars - 1]
     return shortened + "…"
+
+
+def _is_predominantly_latin(value: str) -> bool:
+    for char in value:
+        if unicodedata.bidirectional(char) in {"R", "AL", "AN"}:
+            return False
+        if unicodedata.category(char).startswith("L"):
+            if "LATIN" not in unicodedata.name(char, ""):
+                return False
+    return True
 
 
 def _core_primary_publication_timeline_entry(

@@ -689,13 +689,59 @@ def test_brief_publication_fallback_recovers_event_with_period_date_text():
     assert warnings == [BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING]
 
 
-def test_brief_metadata_publication_fallback_uses_hashed_core_source_metadata():
+@pytest.mark.parametrize(
+    ("title", "publisher", "expected_text"),
+    (
+        (
+            "מתקפות הסייבר לקראת הבחירות",
+            "Calcalist",
+            "Publication d'un article par Calcalist.",
+        ),
+        (
+            "هجمات إلكترونية قبل الانتخابات",
+            "Calcalist",
+            "Publication d'un article par Calcalist.",
+        ),
+        ("Persian فارسی report", "Calcalist", "Publication d'un article par Calcalist."),
+        ("Cyber attacks מתקפות", "Calcalist", "Publication d'un article par Calcalist."),
+        (
+            "Rapport détaillé sur les menaces",
+            "Éditeur source",
+            "Publication par Éditeur source de « Rapport détaillé sur les menaces ».",
+        ),
+        (
+            "Security report 2026",
+            "Example publisher",
+            "Publication par Example publisher de « Security report 2026 ».",
+        ),
+        (
+            "Security\u202ereport 2026",
+            "Example publisher",
+            "Publication par Example publisher de « Security report 2026 ».",
+        ),
+        (
+            "Security report 2026",
+            "إيران نيوز",
+            "Publication d'un article de la source principale.",
+        ),
+        (
+            "Security report 2026",
+            "\u202e",
+            "Publication d'un article de la source principale.",
+        ),
+    ),
+)
+def test_brief_metadata_publication_fallback_uses_hashed_core_source_metadata(
+    title: str, publisher: str, expected_text: str
+):
     subject_id, source_id = uuid4(), uuid4()
     source_url = "https://example.com/metadata-only-brief"
     snapshot = snapshot_with_core_source_metadata(
         make_snapshot(subject_id),
         canonical_url=source_url,
         published_at=date(2026, 2, 15),
+        title=title,
+        publisher=publisher,
     )
     changed_date_snapshot = replace(
         snapshot,
@@ -721,7 +767,7 @@ def test_brief_metadata_publication_fallback_uses_hashed_core_source_metadata():
     assert len(timeline) == 1
     assert timeline[0].event_date == date(2026, 2, 15)
     assert timeline[0].date_text is None
-    assert timeline[0].text == "Publication par Éditeur source de « Titre du rapport »."
+    assert timeline[0].text == expected_text
     assert timeline[0].evidence_refs[0].source_document_id == source_id
     assert timeline[0].evidence_refs[0].kind is EvidenceKind.SOURCE_METADATA
     assert warnings == [BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING]
