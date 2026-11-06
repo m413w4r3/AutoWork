@@ -762,7 +762,7 @@ class ExactTitleSearchStrategy:
                     name=self.name,
                     version=self.version,
                     method=self.method,
-                    url=self.search_endpoint,
+                    url=endpoint,
                     outcome=AcquisitionOutcome.SKIPPED,
                     reason="expected_title_missing",
                 ),
