@@ -17,6 +17,7 @@ from cti_app.domain.acquisition import (
     evidence_class_for_equivalence,
     is_credential_free_url,
 )
+from cti_app.domain.classification import TLP
 
 
 def _policy(
@@ -24,7 +25,7 @@ def _policy(
     allowed_domains: frozenset[str] = frozenset({"example.com"}),
     blocked_domains: frozenset[str] = frozenset(),
     external_llm_allowed: bool = True,
-    tlp: str = "CLEAR",
+    tlp: TLP | str = TLP.CLEAR,
     do_not_submit: bool = False,
 ) -> AcquisitionPolicyContext:
     return AcquisitionPolicyContext(
@@ -109,7 +110,7 @@ def test_policy_context_strips_and_limits_untrusted_text() -> None:
         provider_configured=True,
     )
     assert policy.allowed_domains == frozenset({"example.com"})
-    assert policy.tlp == "CLEAR"
+    assert policy.tlp is TLP.CLEAR
     assert policy.expected_languages == ("en",)
     assert policy.check_url("https://news.example.com/story") is AcquisitionPolicyDecision.ALLOWED
 
@@ -176,11 +177,17 @@ def test_disclosure_policy_checks_external_llm_do_not_submit_and_tlp() -> None:
         _policy(external_llm_allowed=False).check_destination(url, external_llm=True)
         is AcquisitionPolicyDecision.DENIED_EXTERNAL_LLM
     )
-    assert _policy(do_not_submit=True, tlp="AMBER").check_destination(
+    assert _policy(do_not_submit=True, tlp=TLP.AMBER).check_destination(
         url, external_llm=True
     ) is AcquisitionPolicyDecision.ALLOWED
     assert (
-        _policy(tlp="RED").check_destination(url, external_llm=True)
+        _policy(tlp=TLP.RED).check_destination(url, external_llm=True)
+        is AcquisitionPolicyDecision.DENIED_TLP
+    )
+    assert (
+        _policy(tlp="red", external_llm_allowed=True).check_destination(
+            url, external_llm=True
+        )
         is AcquisitionPolicyDecision.DENIED_TLP
     )
     assert (
@@ -191,6 +198,11 @@ def test_disclosure_policy_checks_external_llm_do_not_submit_and_tlp() -> None:
         _policy(do_not_submit=True).check_destination(url, third_party_provider=True)
         is AcquisitionPolicyDecision.DENIED_PROVIDER_DISCLOSURE
     )
+
+
+def test_invalid_tlp_fails_closed_during_policy_construction() -> None:
+    with pytest.raises(ValueError, match="recognized TLP"):
+        _policy(tlp="UNKNOWN_LABEL")
 
 
 def test_credential_free_url_returns_only_the_origin() -> None:

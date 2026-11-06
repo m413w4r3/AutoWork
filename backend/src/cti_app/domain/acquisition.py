@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import unquote, urlsplit
 
+from cti_app.domain.classification import TLP
+
 
 class AcquisitionOutcome(StrEnum):
     SUCCEEDED = "succeeded"
@@ -209,7 +211,7 @@ class AcquisitionPolicyContext:
     allowed_domains: frozenset[str]
     blocked_domains: frozenset[str]
     external_llm_allowed: bool
-    tlp: str
+    tlp: TLP
     do_not_submit: bool
     expected_languages: tuple[str, ...]
     allowed_syndication_domains: frozenset[str]
@@ -230,7 +232,12 @@ class AcquisitionPolicyContext:
             if (cleaned := _clean_text(language, _MAX_LANGUAGE_LENGTH)) is not None
         )
         object.__setattr__(self, "expected_languages", languages)
-        object.__setattr__(self, "tlp", self.tlp.strip().upper()[:16])
+        try:
+            raw_tlp = self.tlp.value if isinstance(self.tlp, TLP) else str(self.tlp)
+            tlp = TLP(raw_tlp.strip().upper())
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("tlp must be a recognized TLP label") from error
+        object.__setattr__(self, "tlp", tlp)
 
     def check_url(self, url: str) -> AcquisitionPolicyDecision:
         """Check syntax, embedded credentials, public destination, and domain policy."""
@@ -279,7 +286,7 @@ class AcquisitionPolicyContext:
             return url_decision
         if not (external_llm or third_party_provider):
             return AcquisitionPolicyDecision.ALLOWED
-        if self.tlp == "RED":
+        if self.tlp is TLP.RED:
             return AcquisitionPolicyDecision.DENIED_TLP
         if external_llm and not self.external_llm_allowed:
             return AcquisitionPolicyDecision.DENIED_EXTERNAL_LLM

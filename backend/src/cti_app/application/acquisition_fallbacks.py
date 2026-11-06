@@ -29,7 +29,9 @@ from cti_app.domain.acquisition import (
     AcquisitionQuality,
     EvidenceClass,
     SourceEquivalenceClass,
+    evidence_class_for_equivalence,
 )
+from cti_app.domain.classification import TLP
 from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 from cti_app.domain.discovery import canonicalize_http_url
 
@@ -50,6 +52,16 @@ _UNACCEPTABLE_PAGE_RE = re.compile(
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 MAX_RETRY_AFTER_SECONDS = 3.0
 MAX_STRATEGY_CANDIDATES = 24
+_EVIDENCE_CLASS_STRENGTH = {
+    EvidenceClass.PRIMARY_OBSERVED: 7,
+    EvidenceClass.HISTORICAL_PRIMARY: 6,
+    EvidenceClass.VERIFIED_EQUIVALENT: 5,
+    EvidenceClass.AUTHORIZED_REPUBLICATION: 4,
+    EvidenceClass.INDEPENDENT_CORROBORATION: 3,
+    EvidenceClass.OCR_DERIVED: 2,
+    EvidenceClass.MODEL_CONTEXTUAL_UNVERIFIED: 1,
+    EvidenceClass.UNKNOWN: 0,
+}
 
 
 class _ArticleLinkParser(HTMLParser):
@@ -364,8 +376,18 @@ class AcquisitionProbe:
         try:
             typed_outcome = AcquisitionOutcome(self.outcome)
         except ValueError:
-            return
-        object.__setattr__(self, "outcome", typed_outcome)
+            pass
+        else:
+            object.__setattr__(self, "outcome", typed_outcome)
+        if self.evidence_class is not None:
+            supported_class = evidence_class_for_equivalence(self.equivalence_class)
+            if (
+                _EVIDENCE_CLASS_STRENGTH[self.evidence_class]
+                > _EVIDENCE_CLASS_STRENGTH[supported_class]
+            ):
+                raise ValueError(
+                    "evidence_class cannot be stronger than the equivalence class supports"
+                )
 
 
 def _default_policy_context() -> AcquisitionPolicyContext:
@@ -374,7 +396,7 @@ def _default_policy_context() -> AcquisitionPolicyContext:
         allowed_domains=frozenset(),
         blocked_domains=frozenset(),
         external_llm_allowed=False,
-        tlp="RED",
+        tlp=TLP.RED,
         do_not_submit=True,
         expected_languages=(),
         allowed_syndication_domains=frozenset(),
@@ -403,7 +425,13 @@ class AcquisitionRequest:
 
 
 class AcquisitionStrategy(Protocol):
-    """An ordered, pluggable acquisition port. Implementations never bypass safe fetch."""
+    """An ordered, pluggable acquisition port. Implementations never bypass safe fetch.
+
+    ``capability_state`` and ``description`` remain optional runtime metadata.
+    PEP 544 cannot express optional structural members; declaring them as
+    properties would require every legacy frozen strategy to implement them.
+    Callers that need either value should use ``getattr`` with a default.
+    """
 
     @property
     def name(self) -> str: ...

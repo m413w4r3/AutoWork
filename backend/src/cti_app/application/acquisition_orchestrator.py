@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
+import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from time import monotonic
@@ -38,6 +40,73 @@ CancellationCheck = Callable[[], Awaitable[None] | None]
 Clock = Callable[[], float]
 
 
+class AcquisitionBudgetExceeded(RuntimeError):
+    """Raised before a strategy can issue more fetches than its run budget."""
+
+
+class DomainConcurrencyLimiter:
+    """Share one hostname semaphore per running event loop across orchestrator runs."""
+
+    def __init__(self, per_domain_concurrency: int) -> None:
+        if per_domain_concurrency < 1:
+            raise ValueError("per_domain_concurrency must be positive")
+        self._per_domain_concurrency = per_domain_concurrency
+        self._semaphores: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]
+        ] = weakref.WeakKeyDictionary()
+        self._lock = threading.Lock()
+
+    def semaphore_for(self, url: str) -> asyncio.Semaphore:
+        """Get the per-loop semaphore for a URL's normalized hostname."""
+        try:
+            hostname = urlsplit(url).hostname or ""
+        except (TypeError, ValueError):
+            hostname = ""
+        try:
+            hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            # Keep invalid labels in a stable bucket without conflating them
+            # with any valid IDNA hostname.
+            pass
+        key = hostname.casefold().rstrip(".")
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            loop_semaphores = self._semaphores.setdefault(loop, {})
+            semaphore = loop_semaphores.get(key)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self._per_domain_concurrency)
+                loop_semaphores[key] = semaphore
+            return semaphore
+
+
+class _AttemptBudget:
+    """Count fetches immediately and preserve probe-only strategy attempts."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.attempts = 0
+        self._reserved_fetches = 0
+
+    def reserve_fetch(self) -> None:
+        if self.attempts + self._reserved_fetches >= self.limit:
+            raise AcquisitionBudgetExceeded("network attempt budget exhausted")
+        self._reserved_fetches += 1
+
+    def start_fetch(self) -> None:
+        self._reserved_fetches -= 1
+        self.attempts += 1
+
+    def release_fetch(self) -> None:
+        self._reserved_fetches -= 1
+
+    def complete_strategy(self, fetches: int, probe_attempts: int) -> None:
+        # A fetch is one attempt. Strategies that return attempt probes without
+        # fetching still consume budget; multiple probes for fewer fetches are
+        # charged only for the excess, preserving the historical probe budget.
+        probe_only_attempts = max(0, probe_attempts - fetches)
+        self.attempts = min(self.limit, self.attempts + probe_only_attempts)
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionRunResult:
     outcome: AcquisitionOutcome
@@ -58,6 +127,7 @@ class ArticleAcquisitionOrchestrator:
         max_attempts: int,
         per_domain_concurrency: int,
         clock: Clock = monotonic,
+        domain_limiter: DomainConcurrencyLimiter | None = None,
     ) -> None:
         if deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be positive")
@@ -70,6 +140,12 @@ class ArticleAcquisitionOrchestrator:
         self._max_attempts = max_attempts
         self._per_domain_concurrency = per_domain_concurrency
         self._clock = clock
+        # A SubjectCollectionService can inject a longer-lived limiter when it
+        # owns multiple orchestrator instances; the default is shared by every
+        # run made through this orchestrator.
+        self._domain_limiter = domain_limiter or DomainConcurrencyLimiter(
+            per_domain_concurrency
+        )
 
     async def run(
         self,
@@ -78,11 +154,19 @@ class ArticleAcquisitionOrchestrator:
         cancellation_check: CancellationCheck | None = None,
     ) -> AcquisitionRunResult:
         probes: list[AcquisitionProbe] = []
-        attempts = 0
+        budget = _AttemptBudget(self._max_attempts)
         winner: AcquisitionProbe | None = None
-        semaphores: dict[str, asyncio.Semaphore] = {}
         active_strategy: _Strategy | None = None
         active_started: float | None = None
+        active_fetches = 0
+        budget_exceeded = False
+
+        async def check_cancellation() -> None:
+            if cancellation_check is None:
+                return
+            cancellation_result = cancellation_check()
+            if inspect.isawaitable(cancellation_result):
+                await cancellation_result
 
         async def bounded_fetch(
             url: str,
@@ -90,27 +174,44 @@ class ArticleAcquisitionOrchestrator:
             timeout_seconds: float,
             allow_binary: bool,
         ) -> CollectedResponse:
+            nonlocal active_fetches, budget_exceeded
+            await check_cancellation()
             try:
-                hostname = (urlsplit(url).hostname or "").casefold()
-            except ValueError:
-                hostname = ""
-            semaphore = semaphores.setdefault(
-                hostname, asyncio.Semaphore(self._per_domain_concurrency)
-            )
-            async with semaphore:
-                return await request.fetch(url, headers, timeout_seconds, allow_binary)
+                budget.reserve_fetch()
+            except AcquisitionBudgetExceeded:
+                budget_exceeded = True
+                raise
+            reserved = True
+            try:
+                semaphore = self._domain_limiter.semaphore_for(url)
+                async with semaphore:
+                    if budget_exceeded:
+                        raise AcquisitionBudgetExceeded("network attempt budget exhausted")
+                    # Check again after waiting so cancellation cannot slip
+                    # between queueing and performing the underlying fetch.
+                    await check_cancellation()
+                    budget.start_fetch()
+                    reserved = False
+                    active_fetches += 1
+                    response = await request.fetch(
+                        url, headers, timeout_seconds, allow_binary
+                    )
+                    await check_cancellation()
+                    return response
+            finally:
+                if reserved:
+                    budget.release_fetch()
 
         bounded_request = replace(request, fetch=bounded_fetch)
         global_timeout = asyncio.timeout(self._deadline_seconds)
         try:
             async with global_timeout:
                 for strategy in self._strategies:
-                    if attempts >= self._max_attempts:
+                    if budget.attempts >= self._max_attempts:
                         break
-                    if cancellation_check is not None:
-                        cancellation_result = cancellation_check()
-                        if inspect.isawaitable(cancellation_result):
-                            await cancellation_result
+                    await check_cancellation()
+                    active_fetches = 0
+                    budget_exceeded = False
 
                     capability = getattr(
                         strategy,
@@ -157,11 +258,30 @@ class ArticleAcquisitionOrchestrator:
                             raise ValueError("strategy timeout must be positive")
                         async with asyncio.timeout(strategy_timeout):
                             strategy_probes = await strategy.acquire(bounded_request)
+                            # A strategy can finish after its last fetch caused
+                            # cancellation; do not accept or append its output.
+                            await check_cancellation()
+                            strategy_probes = tuple(strategy_probes)
+                    except AcquisitionBudgetExceeded:
+                        budget.complete_strategy(active_fetches, 1)
+                        probes.append(
+                            self._probe(
+                                strategy,
+                                request,
+                                outcome=AcquisitionOutcome.FAILED,
+                                reason_code="attempt_budget_exceeded",
+                                duration_ms=self._duration_ms(started),
+                            )
+                        )
+                        active_strategy = None
+                        active_started = None
+                        break
                     except JobCancelledError:
                         raise
                     except TimeoutError:
                         if global_timeout.expired():
                             raise
+                        budget.complete_strategy(active_fetches, 1)
                         probes.append(
                             self._probe(
                                 strategy,
@@ -171,11 +291,11 @@ class ArticleAcquisitionOrchestrator:
                                 duration_ms=self._duration_ms(started),
                             )
                         )
-                        attempts += 1
                         active_strategy = None
                         active_started = None
                         continue
                     except Exception as error:
+                        budget.complete_strategy(active_fetches, 1)
                         probes.append(
                             self._probe(
                                 strategy,
@@ -185,27 +305,41 @@ class ArticleAcquisitionOrchestrator:
                                 duration_ms=self._duration_ms(started),
                             )
                         )
-                        attempts += 1
                         active_strategy = None
                         active_started = None
                         continue
                     active_strategy = None
                     active_started = None
 
-                    for probe in tuple(strategy_probes):
-                        if _is_attempt_probe(probe):
-                            if attempts >= self._max_attempts:
-                                continue
-                            attempts += 1
+                    attempt_probe_count = sum(
+                        1 for probe in strategy_probes if _is_attempt_probe(probe)
+                    )
+                    budget.complete_strategy(active_fetches, attempt_probe_count)
+                    if budget_exceeded:
+                        # Keep returned diagnostics, but a strategy that tried
+                        # to exceed its budget cannot produce an accepted winner.
+                        probes.extend(strategy_probes)
+                        probes.append(
+                            self._probe(
+                                strategy,
+                                request,
+                                outcome=AcquisitionOutcome.FAILED,
+                                reason_code="attempt_budget_exceeded",
+                                duration_ms=self._duration_ms(started),
+                            )
+                        )
+                        break
+
+                    for probe in strategy_probes:
                         probes.append(probe)
-                        if _is_accepted_success(probe):
+                        if winner is None and _is_accepted_success(probe):
                             winner = probe
-                            break
                     if winner is not None:
                         break
         except TimeoutError:
             if global_timeout.expired():
-                if active_strategy is not None and attempts < self._max_attempts:
+                if active_strategy is not None:
+                    budget.complete_strategy(active_fetches, 1)
                     probes.append(
                         self._probe(
                             active_strategy,
@@ -219,13 +353,12 @@ class ArticleAcquisitionOrchestrator:
                             ),
                         )
                     )
-                    attempts += 1
                 return AcquisitionRunResult(
                     outcome=AcquisitionOutcome.FAILED,
                     probes=tuple(probes),
                     winner=None,
                     reason_code="global_deadline_exceeded",
-                    attempts=attempts,
+                    attempts=budget.attempts,
                     deadline_exceeded=True,
                     cancelled=False,
                 )
@@ -237,17 +370,32 @@ class ArticleAcquisitionOrchestrator:
                 probes=tuple(probes),
                 winner=winner,
                 reason_code=None,
-                attempts=attempts,
+                attempts=budget.attempts,
                 deadline_exceeded=False,
                 cancelled=False,
             )
 
+        empty_reason: str | None
+        empty_outcome: AcquisitionOutcome
+        if not probes:
+            empty_reason = (
+                "no_strategies_configured" if not self._strategies else "no_probes_returned"
+            )
+            empty_outcome = (
+                AcquisitionOutcome.NOT_CONFIGURED
+                if not self._strategies
+                else AcquisitionOutcome.FAILED
+            )
+        else:
+            empty_reason = _final_reason(probes)
+            empty_outcome = _final_outcome(probes)
+
         return AcquisitionRunResult(
-            outcome=_final_outcome(probes),
+            outcome=empty_outcome,
             probes=tuple(probes),
             winner=None,
-            reason_code=_final_reason(probes),
-            attempts=attempts,
+            reason_code=empty_reason,
+            attempts=budget.attempts,
             deadline_exceeded=False,
             cancelled=False,
         )

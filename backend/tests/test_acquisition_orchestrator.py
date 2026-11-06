@@ -8,7 +8,10 @@ from datetime import UTC, datetime
 import pytest
 
 from cti_app.application.acquisition_fallbacks import AcquisitionProbe, AcquisitionRequest
-from cti_app.application.acquisition_orchestrator import ArticleAcquisitionOrchestrator
+from cti_app.application.acquisition_orchestrator import (
+    ArticleAcquisitionOrchestrator,
+    DomainConcurrencyLimiter,
+)
 from cti_app.application.http_collection import CollectedResponse
 from cti_app.application.jobs import JobCancelledError
 from cti_app.domain.acquisition import (
@@ -16,6 +19,8 @@ from cti_app.domain.acquisition import (
     AcquisitionObservationKind,
     AcquisitionOutcome,
     AcquisitionPolicyDecision,
+    EvidenceClass,
+    SourceEquivalenceClass,
 )
 from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 
@@ -75,6 +80,8 @@ def _probe(
     response: CollectedResponse | None = None,
     reason_code: str | None = None,
     policy_decision: AcquisitionPolicyDecision = AcquisitionPolicyDecision.ALLOWED,
+    equivalence_class: SourceEquivalenceClass | None = None,
+    evidence_class: EvidenceClass | None = None,
 ) -> AcquisitionProbe:
     return AcquisitionProbe(
         strategy_name="fake",
@@ -89,6 +96,8 @@ def _probe(
         encoded_sha256=response.encoded_sha256 if response else None,
         duration_ms=1,
         policy_decision=policy_decision,
+        equivalence_class=equivalence_class,
+        evidence_class=evidence_class,
     )
 
 
@@ -158,14 +167,19 @@ def test_ordered_strategies_stop_on_first_accepted_success_and_keep_probes() -> 
         ).run(_request())
 
         assert call_order == ["first", "second"]
-        assert [probe.reason_code for probe in result.probes] == [None, "unrelated_page", None]
+        assert [probe.reason_code for probe in result.probes] == [
+            None,
+            "unrelated_page",
+            None,
+            None,
+        ]
         assert result.outcome is AcquisitionOutcome.SUCCEEDED
         assert result.winner is result.probes[2]
         assert result.winner.response is winner_response
         assert first.calls == 1
         assert second.calls == 1
         assert third.calls == 0
-        assert result.attempts == 3
+        assert result.attempts == 4
 
     asyncio.run(run())
 
@@ -367,12 +381,12 @@ def test_per_hostname_fetches_respect_concurrency_ceiling() -> None:
         result = await ArticleAcquisitionOrchestrator(
             (strategy,),
             deadline_seconds=1.0,
-            max_attempts=2,
+            max_attempts=6,
             per_domain_concurrency=2,
         ).run(_request(fetch))
 
         assert maximum == 2
-        assert result.attempts == 1
+        assert result.attempts == 6
 
     asyncio.run(run())
 
@@ -396,7 +410,7 @@ def test_success_without_response_is_not_promoted_or_fabricated() -> None:
     asyncio.run(run())
 
 
-def test_empty_strategy_output_does_not_fabricate_a_probe() -> None:
+def test_empty_strategy_output_does_not_claim_no_strategies_are_configured() -> None:
     async def run() -> None:
         result = await ArticleAcquisitionOrchestrator(
             (FakeStrategy("empty", _handler()),),
@@ -408,8 +422,8 @@ def test_empty_strategy_output_does_not_fabricate_a_probe() -> None:
         assert result.probes == ()
         assert result.winner is None
         assert result.attempts == 0
-        assert result.outcome is AcquisitionOutcome.NOT_CONFIGURED
-        assert result.reason_code == "no_strategies_configured"
+        assert result.outcome is AcquisitionOutcome.FAILED
+        assert result.reason_code == "no_probes_returned"
 
     asyncio.run(run())
 
@@ -442,5 +456,261 @@ def test_success_with_denied_policy_decision_is_not_accepted() -> None:
         ).run(_request())
         assert result.winner is None
         assert result.probes == (denied,)
+
+    asyncio.run(run())
+
+
+def test_unexpected_strategy_exception_is_recorded_and_later_strategies_run() -> None:
+    async def run() -> None:
+        async def explode(_request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+            raise RuntimeError("offline failure")
+
+        recovered_probe = _probe(AcquisitionOutcome.FAILED, reason_code="not_found")
+        broken = FakeStrategy("broken", explode)
+        recovered = FakeStrategy("recovered", _handler(recovered_probe))
+        result = await ArticleAcquisitionOrchestrator(
+            (broken, recovered),
+            deadline_seconds=1.0,
+            max_attempts=2,
+            per_domain_concurrency=1,
+        ).run(_request())
+
+        assert result.probes[0].reason_code == "strategy_error:RuntimeError"
+        assert result.probes[1] is recovered_probe
+        assert recovered.calls == 1
+        assert result.attempts == 2
+
+    asyncio.run(run())
+
+
+def test_global_timeout_keeps_probes_from_earlier_strategies() -> None:
+    async def run() -> None:
+        prior_probe = _probe(AcquisitionOutcome.FAILED, reason_code="not_found")
+
+        async def block_until_deadline(
+            _request: AcquisitionRequest,
+        ) -> Sequence[AcquisitionProbe]:
+            await asyncio.Event().wait()
+
+        result = await ArticleAcquisitionOrchestrator(
+            (
+                FakeStrategy("first", _handler(prior_probe)),
+                FakeStrategy("slow", block_until_deadline, timeout_seconds=1.0),
+            ),
+            deadline_seconds=0.01,
+            max_attempts=3,
+            per_domain_concurrency=1,
+        ).run(_request())
+
+        assert result.deadline_exceeded is True
+        assert result.reason_code == "global_deadline_exceeded"
+        assert result.probes[0] is prior_probe
+        assert result.probes[1].reason_code == "global_deadline_exceeded"
+        assert result.attempts == 2
+
+    asyncio.run(run())
+
+
+def test_fetches_are_bounded_by_remaining_attempt_budget() -> None:
+    async def run() -> None:
+        fetch_urls: list[str] = []
+
+        async def fetch(
+            url: str, headers: dict[str, str], timeout_seconds: float, allow_binary: bool
+        ) -> CollectedResponse:
+            del headers, timeout_seconds, allow_binary
+            fetch_urls.append(url)
+            return _response(url)
+
+        prior_probe = _probe(AcquisitionOutcome.FAILED, reason_code="prior_failure")
+        must_not_run = FakeStrategy("must-not-run", _handler(_probe(AcquisitionOutcome.SUCCEEDED)))
+
+        async def over_budget(request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+            for index in range(4):
+                await request.fetch(f"https://example.com/{index}", {}, 1.0, False)
+            return (_probe(AcquisitionOutcome.FAILED),)
+
+        result = await ArticleAcquisitionOrchestrator(
+            (
+                FakeStrategy("prior", _handler(prior_probe)),
+                FakeStrategy("many-fetches", over_budget),
+                must_not_run,
+            ),
+            deadline_seconds=1.0,
+            max_attempts=2,
+            per_domain_concurrency=2,
+        ).run(_request(fetch))
+
+        assert len(fetch_urls) == 1
+        assert result.probes[0] is prior_probe
+        assert result.probes[-1].reason_code == "attempt_budget_exceeded"
+        assert result.winner is None
+        assert result.attempts == 2
+        assert must_not_run.calls == 0
+
+    asyncio.run(run())
+
+
+def test_multi_fetch_strategy_succeeds_when_budget_is_sufficient() -> None:
+    async def run() -> None:
+        fetch_urls: list[str] = []
+
+        async def fetch(
+            url: str, headers: dict[str, str], timeout_seconds: float, allow_binary: bool
+        ) -> CollectedResponse:
+            del headers, timeout_seconds, allow_binary
+            fetch_urls.append(url)
+            return _response(url)
+
+        async def acquire(request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+            for index in range(3):
+                await request.fetch(f"https://example.com/{index}", {}, 1.0, False)
+            return (_probe(AcquisitionOutcome.FAILED),)
+
+        result = await ArticleAcquisitionOrchestrator(
+            (FakeStrategy("multi-fetch", acquire),),
+            deadline_seconds=1.0,
+            max_attempts=3,
+            per_domain_concurrency=2,
+        ).run(_request(fetch))
+
+        assert len(fetch_urls) == 3
+        assert result.probes[0].outcome is AcquisitionOutcome.FAILED
+        assert result.probes[0].reason_code is None
+        assert result.attempts == 3
+
+    asyncio.run(run())
+
+
+def test_cancellation_after_strategy_returns_success_propagates() -> None:
+    async def run() -> None:
+        checks = 0
+
+        async def fetch(
+            url: str, headers: dict[str, str], timeout_seconds: float, allow_binary: bool
+        ) -> CollectedResponse:
+            del headers, timeout_seconds, allow_binary
+            return _response(url)
+
+        async def successful_acquire(request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+            response = await request.fetch("https://example.com/article", {}, 1.0, False)
+            return (_probe(AcquisitionOutcome.SUCCEEDED, response=response),)
+
+        async def cancel_after_return() -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 4:
+                raise JobCancelledError
+
+        with pytest.raises(JobCancelledError):
+            await ArticleAcquisitionOrchestrator(
+                (FakeStrategy("final", successful_acquire),),
+                deadline_seconds=1.0,
+                max_attempts=2,
+                per_domain_concurrency=1,
+            ).run(_request(fetch), cancellation_check=cancel_after_return)
+
+        assert checks == 4
+
+    asyncio.run(run())
+
+
+def test_domain_limiter_is_shared_across_runs_and_normalizes_hostnames() -> None:
+    async def run() -> None:
+        active = 0
+        maximum = 0
+        entered_handlers = 0
+        both_handlers_entered = asyncio.Event()
+        first_fetch_started = asyncio.Event()
+        release_first_fetch = asyncio.Event()
+
+        async def fetch(
+            url: str, headers: dict[str, str], timeout_seconds: float, allow_binary: bool
+        ) -> CollectedResponse:
+            nonlocal active, maximum
+            del headers, timeout_seconds, allow_binary
+            active += 1
+            maximum = max(maximum, active)
+            first_fetch_started.set()
+            try:
+                await release_first_fetch.wait()
+                return _response(url)
+            finally:
+                active -= 1
+
+        async def acquire(request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+            nonlocal entered_handlers
+            entered_handlers += 1
+            if entered_handlers == 2:
+                both_handlers_entered.set()
+            suffix = "first" if entered_handlers == 1 else "second"
+            await request.fetch(f"https://EXAMPLE.COM./{suffix}", {}, 1.0, False)
+            return (_probe(AcquisitionOutcome.FAILED),)
+
+        orchestrator = ArticleAcquisitionOrchestrator(
+            (FakeStrategy("parallel-runs", acquire),),
+            deadline_seconds=1.0,
+            max_attempts=2,
+            per_domain_concurrency=1,
+        )
+        first = asyncio.create_task(orchestrator.run(_request(fetch)))
+        second = asyncio.create_task(orchestrator.run(_request(fetch)))
+        await asyncio.wait_for(both_handlers_entered.wait(), timeout=0.5)
+        await asyncio.wait_for(first_fetch_started.wait(), timeout=0.5)
+        await asyncio.sleep(0.01)
+        assert maximum == 1
+        release_first_fetch.set()
+        await asyncio.gather(first, second)
+        assert maximum == 1
+
+        limiter = DomainConcurrencyLimiter(1)
+        standard = limiter.semaphore_for("https://example.com/")
+        assert standard is limiter.semaphore_for("https://EXAMPLE.COM./story")
+        assert limiter.semaphore_for("https://exämple.com/") is limiter.semaphore_for(
+            "https://xn--exmple-cua.com/"
+        )
+
+    asyncio.run(run())
+
+
+def test_domain_limiter_does_not_reuse_semaphores_between_event_loops() -> None:
+    limiter = DomainConcurrencyLimiter(1)
+
+    async def semaphore() -> asyncio.Semaphore:
+        return limiter.semaphore_for("https://example.com/")
+
+    first = asyncio.run(semaphore())
+    second = asyncio.run(semaphore())
+    assert first is not second
+
+
+def test_probe_rejects_evidence_stronger_than_its_equivalence_class() -> None:
+    with pytest.raises(ValueError, match="stronger than the equivalence class"):
+        _probe(
+            AcquisitionOutcome.SUCCEEDED,
+            equivalence_class=SourceEquivalenceClass.INDEPENDENT_CORROBORATION,
+            evidence_class=EvidenceClass.PRIMARY_OBSERVED,
+        )
+
+
+def test_probe_accepts_conservative_evidence_for_equivalence_class() -> None:
+    probe = _probe(
+        AcquisitionOutcome.SUCCEEDED,
+        equivalence_class=SourceEquivalenceClass.EXACT_ORIGINAL,
+        evidence_class=EvidenceClass.UNKNOWN,
+    )
+    assert probe.evidence_class is EvidenceClass.UNKNOWN
+
+
+def test_empty_registry_has_no_strategies_reason() -> None:
+    async def run() -> None:
+        result = await ArticleAcquisitionOrchestrator(
+            (),
+            deadline_seconds=1.0,
+            max_attempts=1,
+            per_domain_concurrency=1,
+        ).run(_request())
+        assert result.outcome is AcquisitionOutcome.NOT_CONFIGURED
+        assert result.reason_code == "no_strategies_configured"
 
     asyncio.run(run())
