@@ -28,15 +28,11 @@ observation, qualité, hashes raw/decoded, ainsi que la provenance du modèle lo
 persistées dans `collection_attempts`; l’événement `source.archived_fallback` conserve la
 provenance d’archivage.
 
-Une archive directe ou humaine déjà attachée gagne toujours contre un fallback. Le service
-possède un chemin CAS sous verrou pour qu’une archive humaine ultérieure remplace une archive de
-fallback en gardant l’ancien document et ses blobs immuables. **Limite de l’API actuelle :**
-`POST /api/subjects/{subject_id}/sources/{collection_id}/content` renvoie `409 source_already_archived`
-avant d’atteindre ce chemin si l’état est `ARCHIVED`, `EXTRACTED` ou `COMPLETED`. Un fallback
-normalement archivé n’est donc pas remplaçable par cette route ; un fallback passé à
-`FAILED_TERMINAL` après une erreur de traitement peut suivre un autre chemin. Pour le parcours
-courant, transmettre l’archive humaine avant le fallback. Le test du service couvre le CAS, pas
-le garde HTTP pour une source déjà archivée.
+Une archive directe ou humaine déjà attachée gagne toujours contre un fallback. L’endpoint
+`POST /api/subjects/{subject_id}/sources/{collection_id}/content` permet à un humain de remplacer
+un fallback archivé en passant par le CAS sous verrou du service. L’ancien document et ses blobs
+restent immuables. Une archive directe ou humaine déjà attachée ne peut pas être remplacée et
+renvoie `409 source_already_archived`.
 
 ## Ordre du registre
 
@@ -149,7 +145,7 @@ privée, locale, link-local ou de métadonnées.
 | Méthode/groupe | État par défaut et dépendance | Coût/failure observables |
 |---|---|---|
 | Profils HTTP, représentations, flux, API éditeur, données structurées | Implémentés ; SafeHttpCollector requis. | Requêtes HTTP bornées ; `failed`, `rejected`, `blocked` ou timeout avec raison. |
-| `http2`, `curl` | Transport non implémenté : `transport_not_supported_by_pinned_adapter` / `curl_adapter_not_available_with_same_dns_pinning`. | Probe `skipped`, aucun téléchargement. Le code actuel laisse toutefois le champ `capability_state` à sa valeur par défaut `IMPLEMENTED` : ne pas interpréter ce champ comme une capacité de transport. |
+| `http2`, `curl` | Transport non implémenté : `transport_not_supported_by_pinned_adapter` / `curl_adapter_not_available_with_same_dns_pinning`. | Registre et probes indiquent `NOT_IMPLEMENTED`, avec résultat `skipped` et cette raison ; aucun téléchargement. |
 | Chromium DOM/réseau/état | Navigation désactivée par défaut ; sidecar, UDS et proxy filtrant requis. | CPU + sorties réseau contrôlées ; `BLOCKED_BY_SECURITY`, indisponible ou timeout. Le mode offline HTML reste sûr. |
 | Firefox/WebKit | Non implémentés (`browser_engine_not_implemented`). | Probe `NOT_IMPLEMENTED`, pas de moteur de remplacement. |
 | Wayback, Common Crawl WARC, Memento, archive.ph | Implémentés ; endpoints publics et collector sûrs requis. | Requêtes de recherche puis snapshot ; absence de capture, refus de policy ou timeout. |

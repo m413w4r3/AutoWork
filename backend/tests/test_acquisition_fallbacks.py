@@ -591,16 +591,30 @@ async def test_wayback_archive_ph_common_crawl_and_memento_are_separate_fakeable
 @pytest.mark.asyncio
 async def test_http2_curl_and_search_cache_report_explicit_offline_skips():
     request = _request(lambda *_args: pytest.fail("unavailable strategies must not fetch"))
-    http2 = await UnavailableTransportStrategy("http2").acquire(request)
-    curl = await UnavailableTransportStrategy(
+    http2_strategy = UnavailableTransportStrategy("http2")
+    curl_strategy = UnavailableTransportStrategy(
         "curl", reason="curl_adapter_not_available_with_same_dns_pinning"
-    ).acquire(request)
+    )
+    http2 = await http2_strategy.acquire(request)
+    curl = await curl_strategy.acquire(request)
     search = await SearchCacheStrategy().acquire(request)
 
     assert http2[0].reason_code == "transport_not_supported_by_pinned_adapter"
     assert curl[0].reason_code == "curl_adapter_not_available_with_same_dns_pinning"
+    for strategy, probes in ((http2_strategy, http2), (curl_strategy, curl)):
+        assert strategy.capability_state.value == "not_implemented"
+        assert strategy.capability_reason == strategy.reason
+        assert strategy.capability_outcome.value == "skipped"
+        assert probes[0].outcome.value == "skipped"
+        assert probes[0].capability_state.value == "not_implemented"
     assert search[0].reason_code == "no_supported_public_search_cache_endpoint"
-    registry_names = [strategy.name for strategy in default_acquisition_strategies()]
+    registry = default_acquisition_strategies()
+    registry_names = [strategy.name for strategy in registry]
+    registry_by_name = {strategy.name: strategy for strategy in registry}
+    for name in ("http2", "curl"):
+        strategy = registry_by_name[name]
+        assert strategy.capability_state.value == "not_implemented"
+        assert strategy.capability_outcome.value == "skipped"
     assert registry_names.index("representations") < registry_names.index("wayback_snapshot")
     assert registry_names.index("memento_archive") < registry_names.index("bridge_transcription")
 

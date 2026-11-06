@@ -1196,6 +1196,18 @@ class UnavailableTransportStrategy:
     timeout_seconds: float = 1.0
     reason: str = "transport_not_supported_by_pinned_adapter"
 
+    @property
+    def capability_state(self) -> AcquisitionCapabilityState:
+        return AcquisitionCapabilityState.NOT_IMPLEMENTED
+
+    @property
+    def capability_reason(self) -> str:
+        return self.reason
+
+    @property
+    def capability_outcome(self) -> AcquisitionOutcome:
+        return AcquisitionOutcome.SKIPPED
+
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
         return (
             AcquisitionProbe(
@@ -1210,6 +1222,7 @@ class UnavailableTransportStrategy:
                 encoded_size=None,
                 encoded_sha256=None,
                 duration_ms=0,
+                capability_state=self.capability_state,
             ),
         )
 

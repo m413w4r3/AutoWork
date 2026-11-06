@@ -6,6 +6,7 @@ import httpx
 from fastapi import FastAPI
 
 from cti_app.api.collection import router
+from cti_app.application.acquisition_fallbacks import PinnedHttpProfileStrategy
 from cti_app.application.collection import SubjectCollectionService, register_collection_jobs
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.http_collection import (
@@ -170,6 +171,85 @@ async def test_manual_content_endpoint_accepts_multipart_and_refuses_replacement
     assert reloaded_receipt["actor_id"] == "analyst-1"
     assert reloaded_receipt["source_document_id"] == posted_receipt["source_document_id"]
     assert reloaded_receipt["decoded_blob_id"] == posted_receipt["decoded_blob_id"]
+
+
+async def test_manual_content_endpoint_replaces_fallback_and_preserves_old_evidence(
+    tmp_path: Path,
+) -> None:
+    collection_uow = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(collection_uow, ("https://blocked.example/report",))
+    blob_store = FilesystemBlobStore(tmp_path / "blobs")
+    fallback_content = (
+        b"<html><head><title>Report</title></head><body>"
+        + b"The analyst report describes observed activity, infrastructure, affected systems, "
+        b"and mitigation guidance. " * 8 + b"</body></html>"
+    )
+    transport = Transport(
+        [
+            RawHttpResponse(403, {"content-type": "text/html"}, b"blocked"),
+            RawHttpResponse(200, {"content-type": "text/html"}, fallback_content),
+        ]
+    )
+    service = SubjectCollectionService(
+        collection_uow,
+        SafeHttpCollector(transport, Resolver()),
+        blob_store,
+        fallback_strategies=(PinnedHttpProfileStrategy("http_plain"),),
+        fallback_min_text_chars=50,
+    )
+    source = (await service.initialize(subject.id))[0]
+    assert await service.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
+    original_document_id = collection_uow.collections[source.id].source_document_id
+    assert original_document_id is not None
+    assert any(
+        event.event_type == "source.archived_fallback"
+        and event.payload.get("source_document_id") == str(original_document_id)
+        for event in collection_uow.provenance
+    )
+    original_document = collection_uow.documents[original_document_id]
+    original_raw = collection_uow.blobs[original_document.blob_id].descriptor
+    assert original_document.decoded_blob_id is not None
+    original_decoded = collection_uow.blobs[original_document.decoded_blob_id].descriptor
+    review_service = CollectionReviewService(collection_uow, blob_store)
+    jobs_uow = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+    register_collection_jobs(registry, service)
+    job_service = JobService(jobs_uow, registry)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.collection_service = service
+    app.state.collection_review_service = review_service
+    app.state.job_service = job_service
+    app.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(jobs_uow, registry))
+    app.state.identity_provider = LocalIdentityProvider("analyst-1")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = f"/api/subjects/{subject.id}/sources/{source.id}/content"
+        replacement_content = "<html><body>Human verified replacement</body></html>"
+        replacement = await client.post(
+            path,
+            json={"content": replacement_content, "declared_mime_type": "text/html"},
+        )
+        repeated = await client.post(
+            path,
+            json={"content": replacement_content, "declared_mime_type": "text/html"},
+        )
+
+    assert replacement.status_code == 200
+    assert repeated.status_code == 409
+    assert repeated.json()["detail"] == "source_already_archived"
+    replacement_document_id = UUID(replacement.json()["source_document_id"])
+    assert replacement_document_id != original_document_id
+    assert collection_uow.collections[source.id].source_document_id == replacement_document_id
+    assert collection_uow.documents[original_document_id] == original_document
+    assert original_document.blob_id in collection_uow.blobs
+    assert original_document.decoded_blob_id in collection_uow.blobs
+    assert await blob_store.read(original_raw, max_bytes=len(fallback_content)) == fallback_content
+    assert (
+        await blob_store.read(original_decoded, max_bytes=len(fallback_content)) == fallback_content
+    )
 
 
 async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) -> None:

@@ -355,14 +355,6 @@ async def archive_manual_source_content(
     if source_for_subject is None:
         _log_manual_archive_failure(subject_id, collection_id, actor_id, "source_not_found")
         raise HTTPException(status_code=404, detail="Source collection not found")
-    if source_for_subject.state in {
-        CollectionState.ARCHIVED,
-        CollectionState.EXTRACTED,
-        CollectionState.COMPLETED,
-    }:
-        _log_manual_archive_failure(subject_id, collection_id, actor_id, "source_already_archived")
-        raise HTTPException(status_code=409, detail="source_already_archived")
-
     try:
         content, declared_mime_type, final_url = await _manual_content_payload(request)
     except HTTPException as exc:
@@ -380,6 +372,7 @@ async def archive_manual_source_content(
     except CollectionItemNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Source collection not found") from exc
     except ManualContentAlreadyArchivedError as exc:
+        _log_manual_archive_failure(subject_id, collection_id, actor_id, "source_already_archived")
         raise HTTPException(status_code=409, detail="source_already_archived") from exc
     except ManualContentTypeError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc

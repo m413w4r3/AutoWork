@@ -143,7 +143,11 @@ une commande explicite de l'opérateur sur une source en échec, via
 `POST /api/subjects/{subject_id}/sources/{collection_id}/fallback-acquire`. Il essaie les profils
 HTTP, représentations/flux/API/structured data, Playwright Chromium, archives web, redécouverte
 éditeur, PDF/OCR et providers optionnels, puis Bridge discovery/transcription. `http2` et `curl`
-restent des entrées non implémentées ; Firefox/WebKit ne sont pas disponibles. L'ordre complet,
+restent non implémentés : leurs probes indiquent `NOT_IMPLEMENTED` avec le résultat `skipped` et
+ne téléchargent rien ; Firefox/WebKit ne sont pas disponibles. Une archive humaine peut remplacer
+un fallback via l'endpoint `content`, qui conserve l'ancien document et ses blobs immuables. Les
+archives directes et humaines déjà attachées restent immuables et un remplacement renvoie
+`409 source_already_archived`. L'ordre complet,
 les defaults et les raisons de capability sont dans le [contrat M16](m16/ACQUISITION_ENGINE.md).
 Chaque probe demeure dans les tentatives d'acquisition et chaque archivage fallback a une
 provenance typée.

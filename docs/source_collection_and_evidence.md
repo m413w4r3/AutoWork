@@ -64,8 +64,9 @@ pas contourner la politique. Une nouvelle collecte globale ne retente pas silenc
 ## Chaîne d'acquisition de repli
 
 Le fallback ne démarre qu'après une commande opérateur sur une source en échec et sans document
-attaché. L'ordre exact, y compris les entrées Firefox/WebKit non implémentées et les placeholders
-HTTP/2/curl, figure dans le [contrat M16](m16/ACQUISITION_ENGINE.md#ordre-du-registre). Les
+attaché. L'ordre exact, y compris les entrées Firefox/WebKit non implémentées et HTTP/2/curl,
+figure dans le [contrat M16](m16/ACQUISITION_ENGINE.md#ordre-du-registre). HTTP/2/curl signalent
+`NOT_IMPLEMENTED` avec un résultat `skipped` et ne téléchargent rien. Les
 téléchargements passent tous par la policy SSRF, les résolutions DNS épinglées, les domaines
 interdits et les limites du collecteur. `Retry-After` est borné par le budget global et par
 tentative. Les pages courtes, incohérentes, paywall, CAPTCHA ou erreur sont rejetées comme contenu
@@ -86,13 +87,10 @@ porte `model_generated=true`, `primary_source_verified=false`, `ioc_primary_veri
 tierce ou une corroboration ne deviennent pas primaires sans vérification indépendante. Un CORE
 qui n'est disponible que sous forme Bridge/OCR/tierce impose `NEEDS_REVIEW` avec
 `CRITICAL_SOURCE_MISSING`, même si des IOC confirmés existent ailleurs. Une réponse modèle ambiguë
-n'est jamais soumise de nouveau avant réconciliation. Une archive humaine déjà attachée empêche le
-repli de la remplacer. Le service supporte le remplacement CAS d'un fallback par une archive
-humaine tout en conservant l'ancien document et ses blobs ; l'endpoint HTTP `content` renvoie
-toutefois `409 source_already_archived` avant ce chemin pour les états `ARCHIVED`, `EXTRACTED` et
-`COMPLETED`. Un fallback normalement archivé n'est donc pas remplaçable via cette route ; un
-fallback passé à `FAILED_TERMINAL` après une erreur de traitement peut suivre un autre chemin.
-Transmettre l'archive humaine avant le fallback pour le parcours courant.
+n'est jamais soumise de nouveau avant réconciliation. L'endpoint HTTP `content` permet à un humain
+de remplacer un fallback archivé par une archive vérifiée ; le CAS du service conserve l'ancien
+document et ses blobs immuables. Les archives directes et les archives humaines déjà attachées ne
+peuvent pas être remplacées et renvoient `409 source_already_archived`.
 
 `COLLECTION_ACQUISITION_STRATEGY_ENABLED` et
 `COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS` pilotent les probes. Le rendu navigateur
