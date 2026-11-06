@@ -599,7 +599,7 @@ def _validate_publication_lineage(
 
 # V12 changes only PUBLICATION: generic legitimate-service hosts are filtered
 # from IOC groups. Upstream artifacts remain valid.
-ASSEMBLY_POLICY_VERSION: Final[str] = "13-complete-ioc-provenance-ledger"
+ASSEMBLY_POLICY_VERSION: Final[str] = "14-ip-endpoint-normalization"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
