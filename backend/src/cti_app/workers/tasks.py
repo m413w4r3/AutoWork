@@ -327,6 +327,15 @@ async def _execute_job(job_id: UUID) -> int | None:
             fetch_lease_seconds=settings.collection_fetch_lease_seconds,
             workspace_materializer=SubjectWorkspaceMaterializer(blob_store),
             workspace_root=settings.subject_workspace_root,
+            model_gateway=model_gateway,
+            fallback_variants_enabled=settings.collection_fallback_variants_enabled,
+            fallback_archive_enabled=settings.collection_fallback_archive_enabled,
+            fallback_bridge_enabled=settings.collection_fallback_bridge_enabled,
+            fallback_max_variants=settings.collection_fallback_max_variants,
+            fallback_strategy_flags=settings.collection_acquisition_strategy_enabled,
+            fallback_strategy_timeouts=settings.collection_acquisition_strategy_timeout_seconds,
+            fallback_min_text_chars=settings.collection_fallback_min_text_chars,
+            fallback_playwright_sidecar_url=settings.collection_playwright_sidecar_url or None,
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.

@@ -25,7 +25,11 @@ from cti_app.application.production_parsers import (
     reconcile_reference_report_with_archives,
     reference_report_from_json,
 )
-from cti_app.domain.collection import CollectionFailureReason, CollectionState
+from cti_app.domain.collection import (
+    CollectionFailureReason,
+    CollectionState,
+    SourceAcquisitionMethod,
+)
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
@@ -43,7 +47,7 @@ if TYPE_CHECKING:
 
 # AW-010 contract versions. They participate in the functional REFERENCES
 # identity: a parser or schema change invalidates the stored corpus.
-PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v4"
+PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v5"
 PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION = 1
 
 #: Corpus warnings that restate availability and are recomputed on each build.
@@ -80,6 +84,8 @@ _SOURCE_KEYS = {
     "relevance_reason",
     "proposed_by_model",
     "eligible_for_extraction",
+    "acquisition_method",
+    "acquisition_attempts",
 }
 _SOURCE_BLOCKS = {"source": "source"}
 
@@ -112,6 +118,8 @@ class ReferenceCollectionObservation:
     source_document_id: UUID | None = None
     content_sha256: str | None = None
     failure_reason_code: CollectionFailureReason | None = None
+    acquisition_method: SourceAcquisitionMethod = SourceAcquisitionMethod.DIRECT_HTTP
+    acquisition_attempts: tuple[dict[str, object], ...] = ()
 
 
 async def observe_reference_collections(
@@ -147,12 +155,41 @@ async def observe_reference_collections(
         content_sha256 = digest.casefold() if isinstance(digest, str) else None
         if content_sha256 is not None and not _SHA256_RE.fullmatch(content_sha256):
             content_sha256 = None
+        acquisition_method = SourceAcquisitionMethod.DIRECT_HTTP
+        acquisition_attempts: list[dict[str, object]] = []
+        provenance_repository = getattr(uow, "provenance", None)
+        if provenance_repository is not None:
+            events = await provenance_repository.list_for_aggregate(
+                "source_collection", collection.id
+            )
+            for event in sorted(events, key=lambda item: item.occurred_at):
+                if event.event_type != "source.acquisition_fallback_attempted":
+                    continue
+                payload = event.payload if isinstance(event.payload, dict) else {}
+                acquisition_attempts.append(_reference_acquisition_diagnostic(event, payload))
+            if document_id is not None:
+                for event in sorted(events, key=lambda item: item.occurred_at, reverse=True):
+                    payload = event.payload if isinstance(event.payload, dict) else {}
+                    if payload.get("source_document_id") != str(document_id):
+                        continue
+                    raw_method = payload.get("acquisition_method")
+                    if raw_method is None and event.event_type == "source.archived_manually":
+                        raw_method = SourceAcquisitionMethod.MANUAL_UPLOAD.value
+                    try:
+                        acquisition_method = SourceAcquisitionMethod(
+                            str(raw_method or SourceAcquisitionMethod.DIRECT_HTTP.value)
+                        )
+                    except ValueError:
+                        acquisition_method = SourceAcquisitionMethod.DIRECT_HTTP
+                    break
         observations[url] = ReferenceCollectionObservation(
             collection_id=collection.id,
             state=_collection_state(collection.state),
             source_document_id=document_id,
             content_sha256=content_sha256,
             failure_reason_code=_collection_failure_reason(collection),
+            acquisition_method=acquisition_method,
+            acquisition_attempts=tuple(acquisition_attempts),
         )
     return observations
 
@@ -221,6 +258,8 @@ def build_production_reference_corpus(
                 source_document_id=observation.source_document_id,
                 collection_state=observation.state,
                 content_sha256=observation.content_sha256,
+                acquisition_method=observation.acquisition_method,
+                acquisition_attempts=observation.acquisition_attempts,
                 eligible_for_extraction=is_eligible_for_extraction(
                     collection_state=observation.state,
                     source_document_id=observation.source_document_id,
@@ -335,6 +374,8 @@ def production_reference_corpus_to_json(
                 "relevance_reason": source.relevance_reason,
                 "proposed_by_model": source.proposed_by_model,
                 "eligible_for_extraction": source.eligible_for_extraction,
+                "acquisition_method": source.acquisition_method.value,
+                "acquisition_attempts": list(source.acquisition_attempts),
             }
             for source in corpus.sources
         ],
@@ -358,12 +399,18 @@ def production_reference_corpus_from_json(
         raise ValueError("Production reference warnings must be strings")
 
     sources: list[ProductionReferenceSourceV1] = []
-    legacy_source_keys = _SOURCE_KEYS - {"editorial_role"}
+    legacy_source_shapes = {
+        frozenset(_SOURCE_KEYS),
+        frozenset(_SOURCE_KEYS - {"acquisition_attempts"}),
+        frozenset(_SOURCE_KEYS - {"acquisition_attempts", "acquisition_method"}),
+        frozenset(_SOURCE_KEYS - {"acquisition_method"}),
+        frozenset(_SOURCE_KEYS - {"editorial_role"}),
+        frozenset(_SOURCE_KEYS - {"editorial_role", "acquisition_attempts"}),
+        frozenset(_SOURCE_KEYS - {"editorial_role", "acquisition_attempts", "acquisition_method"}),
+        frozenset(_SOURCE_KEYS - {"editorial_role", "acquisition_method"}),
+    }
     for raw_source in raw_sources:
-        if not isinstance(raw_source, Mapping) or frozenset(raw_source) not in {
-            frozenset(_SOURCE_KEYS),
-            frozenset(legacy_source_keys),
-        }:
+        if not isinstance(raw_source, Mapping) or frozenset(raw_source) not in legacy_source_shapes:
             raise ValueError("Production reference source has an invalid shape")
         candidates = raw_source["discovery_candidate_ids"]
         if not isinstance(candidates, list):
@@ -398,6 +445,18 @@ def production_reference_corpus_from_json(
                 relevance_reason=_optional_string(raw_source, "relevance_reason"),
                 proposed_by_model=_required_bool(raw_source, "proposed_by_model"),
                 eligible_for_extraction=_required_bool(raw_source, "eligible_for_extraction"),
+                acquisition_method=(
+                    _enum(
+                        SourceAcquisitionMethod,
+                        raw_source["acquisition_method"],
+                        "acquisition_method",
+                    )
+                    if "acquisition_method" in raw_source
+                    else SourceAcquisitionMethod.DIRECT_HTTP
+                ),
+                acquisition_attempts=_optional_acquisition_attempts(
+                    raw_source.get("acquisition_attempts")
+                ),
             )
         )
     return ProductionReferenceCorpusV1(
@@ -638,6 +697,81 @@ async def load_reference_projection(
         return None
     raw = await store.read_text(artifact.raw_blob_id)
     return load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
+
+
+def _reference_acquisition_diagnostic(event: Any, payload: Mapping[str, Any]) -> dict[str, object]:
+    allowed = (
+        "attempt_id",
+        "strategy_name",
+        "strategy_version",
+        "outcome",
+        "reason_code",
+        "http_status",
+        "bytes",
+        "sha256",
+        "duration_ms",
+        "model_run_id",
+        "consultation_id",
+        "prompt_sha256",
+        "response_sha256",
+    )
+    result: dict[str, object] = {"event_id": str(event.id)}
+    for name in allowed:
+        value = payload.get(name)
+        if name in {"http_status", "bytes", "duration_ms"}:
+            result[name] = value if type(value) is int and value >= 0 else None
+        elif name.endswith("sha256"):
+            result[name] = value if isinstance(value, str) and _SHA256_RE.fullmatch(value) else None
+        else:
+            result[name] = value if isinstance(value, str) else None
+    return result
+
+
+def _optional_acquisition_attempts(value: object) -> tuple[dict[str, object], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+        raise ValueError("Production reference acquisition diagnostics must be an array")
+    expected = {
+        "event_id",
+        "attempt_id",
+        "strategy_name",
+        "strategy_version",
+        "outcome",
+        "reason_code",
+        "http_status",
+        "bytes",
+        "sha256",
+        "duration_ms",
+        "model_run_id",
+        "consultation_id",
+        "prompt_sha256",
+        "response_sha256",
+    }
+    output: list[dict[str, object]] = []
+    for item in value:
+        if set(item) != expected:
+            raise ValueError("Production reference acquisition diagnostic has an invalid shape")
+        for key in expected - {
+            "http_status",
+            "bytes",
+            "duration_ms",
+            "sha256",
+            "prompt_sha256",
+            "response_sha256",
+        }:
+            if item[key] is not None and not isinstance(item[key], str):
+                raise ValueError(f"Production reference diagnostic {key} must be a string")
+        for key in {"http_status", "bytes", "duration_ms"}:
+            if item[key] is not None and (type(item[key]) is not int or item[key] < 0):
+                raise ValueError(f"Production reference diagnostic {key} must be nonnegative")
+        for key in {"sha256", "prompt_sha256", "response_sha256"}:
+            if item[key] is not None and (
+                not isinstance(item[key], str) or not _SHA256_RE.fullmatch(item[key])
+            ):
+                raise ValueError(f"Production reference diagnostic {key} must be a SHA-256")
+        output.append(dict(item))
+    return tuple(output)
 
 
 def _required_string(payload: Mapping[str, Any], key: str) -> str:

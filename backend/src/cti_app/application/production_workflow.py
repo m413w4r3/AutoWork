@@ -429,7 +429,12 @@ def _canonical_extraction_progress(
             item.indicator_status is ExtractionIndicatorStatus.CONFIRMED_IOC for item in indicators
         ),
         "contextual_iocs": sum(
-            item.indicator_status is ExtractionIndicatorStatus.CONTEXTUAL for item in indicators
+            item.indicator_status
+            in {
+                ExtractionIndicatorStatus.CONTEXTUAL,
+                ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL,
+            }
+            for item in indicators
         ),
         "rules_total": len(rules),
         **{

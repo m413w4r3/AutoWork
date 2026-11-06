@@ -403,6 +403,7 @@ class ProductionEvidenceBasis(StrEnum):
     """Why a production object is eligible for publication."""
 
     SOURCE_VERIFIED = "source_verified"
+    UNVERIFIED_MODEL_OUTPUT = "unverified_model_output"
     ANALYST_OVERRIDE = "analyst_override"
 
 

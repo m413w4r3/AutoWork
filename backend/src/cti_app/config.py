@@ -204,6 +204,48 @@ class Settings(BaseSettings):
     collection_allowed_domains: str = ""
     collection_blocked_domains: str = ""
     collection_fetch_lease_seconds: float = Field(default=120.0, gt=1, le=3600)
+    collection_fallback_variants_enabled: bool = True
+    collection_fallback_archive_enabled: bool = True
+    collection_fallback_bridge_enabled: bool = True
+    collection_fallback_max_variants: int = Field(default=4, ge=1, le=20)
+    collection_fallback_min_text_chars: int = Field(default=200, ge=50, le=10000)
+    collection_acquisition_strategy_enabled: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "http_plain": True,
+            "http_standard_headers": True,
+            "http_same_site_referer": True,
+            "http_retry_after": True,
+            "http2": True,
+            "curl": True,
+            "representations": True,
+            "wayback": True,
+            "archive_ph": True,
+            "common_crawl": True,
+            "memento": True,
+            "search_cache": True,
+            "bridge_transcription": True,
+            "playwright": True,
+        }
+    )
+    collection_acquisition_strategy_timeout_seconds: dict[str, float] = Field(
+        default_factory=lambda: {
+            "http_plain": 15.0,
+            "http_standard_headers": 15.0,
+            "http_same_site_referer": 15.0,
+            "http_retry_after": 20.0,
+            "http2": 1.0,
+            "curl": 1.0,
+            "representations": 20.0,
+            "wayback": 20.0,
+            "archive_ph": 15.0,
+            "common_crawl": 25.0,
+            "memento": 15.0,
+            "search_cache": 10.0,
+            "bridge_transcription": 90.0,
+            "playwright": 45.0,
+        }
+    )
+    collection_playwright_sidecar_url: str = ""
     pdf_max_document_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
     pdf_max_pages: int = Field(default=200, gt=0, le=10_000)
     pdf_parse_timeout_seconds: float = Field(default=15.0, gt=0, le=300)

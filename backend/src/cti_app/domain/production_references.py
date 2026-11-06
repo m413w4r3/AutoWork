@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
 
 
@@ -194,6 +194,8 @@ class ProductionReferenceSourceV1:
     proposed_by_model: bool
     eligible_for_extraction: bool
     editorial_role: ProductionEditorialRole | None = None
+    acquisition_method: SourceAcquisitionMethod = SourceAcquisitionMethod.DIRECT_HTTP
+    acquisition_attempts: tuple[dict[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -221,6 +223,12 @@ class ProductionReferenceSourceV1:
             object.__setattr__(self, "editorial_role", inferred)
         elif not isinstance(self.editorial_role, ProductionEditorialRole):
             raise ValueError("Reference editorial role is invalid")
+        if not isinstance(self.acquisition_method, SourceAcquisitionMethod):
+            raise ValueError("Reference acquisition method is invalid")
+        if not isinstance(self.acquisition_attempts, tuple) or any(
+            not isinstance(item, dict) for item in self.acquisition_attempts
+        ):
+            raise ValueError("Reference acquisition attempts must be a tuple of diagnostics")
         if (
             self.tier is ProductionReferenceTier.CORE
             and self.editorial_role is not ProductionEditorialRole.PRIMARY

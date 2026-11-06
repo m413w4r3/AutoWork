@@ -438,7 +438,10 @@ def decide_publication_routing(
                     key = (item.artifact_type, normalized)
                 except (TypeError, ValueError):
                     pass
-                if item.indicator_status is ExtractionIndicatorStatus.CONTEXTUAL:
+                if item.indicator_status in {
+                    ExtractionIndicatorStatus.CONTEXTUAL,
+                    ExtractionIndicatorStatus.UNVERIFIED_CONTEXTUAL,
+                }:
                     if key is not None and item.artifact_type in {
                         ArtifactType.IP,
                         ArtifactType.DOMAIN,

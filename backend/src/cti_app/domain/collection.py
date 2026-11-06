@@ -35,6 +35,7 @@ class AttemptOutcome(StrEnum):
     TOO_LARGE = "too_large"
     ERROR = "error"
     INTERRUPTED = "interrupted"
+    SKIPPED = "skipped"
 
 
 class CollectionFailureReason(StrEnum):
@@ -51,6 +52,24 @@ class CollectionFailureReason(StrEnum):
     NON_PDF_CONTENT = "non_pdf_content"
     PDF_PARSE_FAILURE = "pdf_parse_failure"
     INTERRUPTED = "interrupted"
+    FALLBACK_FAILED = "fallback_failed"
+    BRIDGE_TRANSCRIPTION_FAILED = "bridge_transcription_failed"
+
+
+class SourceAcquisitionMethod(StrEnum):
+    """How the bytes attached to a source document were obtained."""
+
+    DIRECT_HTTP = "direct_http"
+    HTTP_VARIANT = "http_variant"
+    WEB_ARCHIVE = "web_archive"
+    WAYBACK = "wayback"
+    ARCHIVE_PH = "archive_ph"
+    COMMON_CRAWL = "common_crawl"
+    MEMENTO = "memento"
+    SEARCH_CACHE = "search_cache"
+    PLAYWRIGHT_RENDERED = "playwright_rendered"
+    BRIDGE_TRANSCRIPTION = "bridge_transcription"
+    MANUAL_UPLOAD = "manual_upload"
 
 
 class CollectionTransportClassification(StrEnum):
@@ -76,6 +95,7 @@ class DetectedMimeType(StrEnum):
     GIF = "image/gif"
     WEBP = "image/webp"
     SVG = "image/svg+xml"
+    BINARY = "application/octet-stream"
 
 
 class ClaimKind(StrEnum):
@@ -241,14 +261,15 @@ class SourceCollection:
         *,
         lease_duration: timedelta,
         policy_snapshot_id: str,
+        allow_replace_archived_fallback: bool = False,
         now: datetime | None = None,
     ) -> bool:
         """Open an archiving lease for content supplied by the analyst.
 
         Unlike `claim_fetch`, this accepts BLOCKED and FAILED_TERMINAL: those
-        are exactly the states an analyst supplies content for. An already
-        archived source is refused — replacing archived evidence would break
-        the immutability the whole pipeline relies on.
+        are exactly the states an analyst supplies content for. Direct and
+        manual archives are immutable; a provenance-verified fallback can be
+        superseded while its old document and blobs remain queryable.
 
         The lease token is generated for this one operation and is deliberately
         NOT a job id: an analyst upload is not a collector download, and no
@@ -262,7 +283,7 @@ class SourceCollection:
             CollectionState.ARCHIVED,
             CollectionState.EXTRACTED,
             CollectionState.COMPLETED,
-        }:
+        } and not (allow_replace_archived_fallback and self.source_document_id is not None):
             return False
         if self.state is CollectionState.FETCHING:
             if self.fetch_lease_expires_at and self.fetch_lease_expires_at > timestamp:
@@ -312,12 +333,49 @@ class SourceCollection:
             raise ValueError("Only the current manual lease owner can archive a source")
         self._complete_archive(attempt_id, source_document_id, decoded_blob_id)
 
+    def archive_fallback(
+        self,
+        *,
+        attempt_id: UUID,
+        source_document_id: UUID,
+        decoded_blob_id: UUID,
+    ) -> None:
+        """Archive a safe fallback only while the source remains unarchived.
+
+        The row lock held by the caller serializes this check with a manual
+        upload. An archive already supplied by a person is immutable and wins.
+        """
+        if self.state in {
+            CollectionState.ARCHIVED,
+            CollectionState.EXTRACTED,
+            CollectionState.COMPLETED,
+        }:
+            raise ValueError("An archived source cannot be replaced by a fallback")
+        if self.state is CollectionState.FETCHING:
+            raise ValueError("A fallback cannot replace an active collection lease")
+        self.attempt_count += 1
+        self._complete_archive(attempt_id, source_document_id, decoded_blob_id)
+
+    def record_fallback_attempt(self, attempt_id: UUID) -> None:
+        """Track a failed fallback without changing the direct failure state."""
+        if self.state in {
+            CollectionState.ARCHIVED,
+            CollectionState.EXTRACTED,
+            CollectionState.COMPLETED,
+            CollectionState.FETCHING,
+        }:
+            raise ValueError("A fallback attempt cannot be recorded for this source state")
+        self.attempt_count += 1
+        self.latest_attempt_id = attempt_id
+        self._touch()
+
     def _complete_archive(
         self, attempt_id: UUID, source_document_id: UUID, decoded_blob_id: UUID
     ) -> None:
         self.latest_attempt_id = attempt_id
         self.source_document_id = source_document_id
         self.decoded_blob_id = decoded_blob_id
+        self.derived_artifact_id = None
         self.state = CollectionState.ARCHIVED
         self.error_reason = None
         self.failure_reason_code = None
@@ -511,6 +569,9 @@ class CollectionAttempt:
     transport_classification: CollectionTransportClassification | None = None
     candidate_resolution_url: str | None = None
     candidate_resolution_provenance: CollectionResolutionProvenance | None = None
+    strategy_name: str | None = None
+    strategy_version: str | None = None
+    duration_ms: int | None = None
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
@@ -541,6 +602,10 @@ class CollectionAttempt:
             self.candidate_resolution_provenance is None
         ):
             raise ValueError("A candidate resolution URL requires its provenance")
+        if (self.strategy_name is None) != (self.strategy_version is None):
+            raise ValueError("A strategy name and version must be recorded together")
+        if self.duration_ms is not None and self.duration_ms < 0:
+            raise ValueError("A collection attempt duration cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)
