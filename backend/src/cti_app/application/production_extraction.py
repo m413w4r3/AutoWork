@@ -279,6 +279,36 @@ class ExtractionProgressEvent:
 ExtractionProgressObserver = Callable[[ExtractionProgressEvent], Awaitable[None]]
 _LOGGER = logging.getLogger(__name__)
 
+_SOURCE_EXTRACTION_POLICY_VERSION_MAX_LENGTH = 64
+_COMPACT_PROFILE_POLICY_SUFFIXES = {
+    "independent_corroboration": "indep_corr",
+    "bridge_transcription": "bridge_tx",
+    "visual_ocr": "ocr",
+    "third_party_extraction": "thirdparty",
+}
+
+
+def _source_extraction_profile_policy_version(
+    base_version: str,
+    suffixes: Sequence[str],
+) -> str:
+    """Format the persisted identity without changing any spelling that fits."""
+
+    if not suffixes:
+        if len(base_version) > _SOURCE_EXTRACTION_POLICY_VERSION_MAX_LENGTH:
+            raise ValueError("Source extraction profile policy version exceeds varchar(64)")
+        return base_version
+
+    full_version = f"{base_version}:{':'.join(suffixes)}"
+    if len(full_version) <= _SOURCE_EXTRACTION_POLICY_VERSION_MAX_LENGTH:
+        return full_version
+
+    compact_suffixes = tuple(_COMPACT_PROFILE_POLICY_SUFFIXES[suffix] for suffix in suffixes)
+    compact_version = f"{base_version}:{':'.join(compact_suffixes)}"
+    if len(compact_version) > _SOURCE_EXTRACTION_POLICY_VERSION_MAX_LENGTH:
+        raise ValueError("Source extraction profile policy version exceeds varchar(64)")
+    return compact_version
+
 
 # --- Planning --------------------------------------------------------------
 
@@ -504,8 +534,10 @@ def build_extraction_plan(
             or source.editorial_role is ProductionEditorialRole.CORROBORATION
         ) and "independent_corroboration" not in policy_suffixes:
             policy_suffixes.append("independent_corroboration")
-        if policy_suffixes:
-            profile_policy_version = f"{profile_policy_version}:{':'.join(policy_suffixes)}"
+        profile_policy_version = _source_extraction_profile_policy_version(
+            profile_policy_version,
+            policy_suffixes,
+        )
         evidence = (evidence_documents or {}).get(source.source_document_id)
         effective_hash = (
             effective_evidence_sha256(evidence.parsed_text) if evidence is not None else None

@@ -50,6 +50,8 @@ from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION,
     DetectionRuleType,
     ExtractionProfile,
     ProductionArtifactStatus,
@@ -703,6 +705,50 @@ def test_plan_profile_follows_tier_and_never_role() -> None:
     assert profiles["https://example.test/other-2"] is ExtractionProfile.IOC_RULES
     assert profiles["https://example.test/other-3"] is ExtractionProfile.IOC_RULES
     assert plan.profile_policy_version == "production-reference-tier-core-first-v5"
+
+
+@pytest.mark.parametrize("profile", tuple(ExtractionProfile))
+@pytest.mark.parametrize(
+    "base_version",
+    (EXTRACTION_PROFILE_POLICY_VERSION, SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION),
+)
+@pytest.mark.parametrize(
+    "suffixes",
+    (
+        (),
+        ("independent_corroboration",),
+        ("bridge_transcription",),
+        ("visual_ocr",),
+        ("third_party_extraction",),
+        ("bridge_transcription", "independent_corroboration"),
+        ("visual_ocr", "independent_corroboration"),
+        ("third_party_extraction", "independent_corroboration"),
+    ),
+)
+def test_source_checkpoint_policy_identity_fits_varchar64_for_all_profiles(
+    profile: ExtractionProfile,
+    base_version: str,
+    suffixes: tuple[str, ...],
+) -> None:
+    policy_version = production_extraction._source_extraction_profile_policy_version(
+        base_version,
+        suffixes,
+    )
+    identity = production_extraction.source_checkpoint_identity(
+        effective_evidence_sha256="a" * 64,
+        profile=profile,
+        prompt_version=production_extraction.source_prompt_version(profile),
+        profile_policy_version=policy_version,
+    )
+
+    assert len(identity["profile_policy_version"]) <= 64
+    if suffixes == ("independent_corroboration",):
+        expected_suffix = (
+            "indep_corr"
+            if base_version == EXTRACTION_PROFILE_POLICY_VERSION
+            else "independent_corroboration"
+        )
+        assert identity["profile_policy_version"].endswith(f":{expected_suffix}")
 
 
 def test_plan_and_hashes_are_stable_when_corpus_order_changes() -> None:

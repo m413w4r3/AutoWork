@@ -871,7 +871,7 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
     plan = build_extraction_plan(corpus)
     planned = plan.sources[0]
     assert planned.acquisition_method is SourceAcquisitionMethod.INDEPENDENT_CORROBORATION
-    assert planned.profile_policy_version.endswith(":independent_corroboration")
+    assert planned.profile_policy_version.endswith(":indep_corr")
 
     evidence = build_source_evidence_document(_ARTICLE, mime_type="text/html")
     output = Q2SourceOutput(
@@ -1401,7 +1401,7 @@ def test_context_only_extraction_methods_cannot_confirm_iocs(
             ProductionReferenceTier.CORE,
             SourceRole.PRIMARY,
             ProductionEditorialRole.PRIMARY,
-            "independent_corroboration",
+            "indep_corr",
         ),
         (
             SourceAcquisitionMethod.VISUAL_OCR,
@@ -1422,7 +1422,7 @@ def test_context_only_extraction_methods_cannot_confirm_iocs(
             ProductionReferenceTier.SUPPORTING,
             SourceRole.INDEPENDENT,
             ProductionEditorialRole.CORROBORATION,
-            "independent_corroboration",
+            "indep_corr",
         ),
     ),
 )
