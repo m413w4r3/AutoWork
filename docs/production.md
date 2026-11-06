@@ -129,27 +129,39 @@ Tous les stages construisent leur contexte depuis ce snapshot. Son absence est u
 
 ### REFERENCES et corpus de production
 
+> Mise à jour acquisition M16 : 2026-11-06 — ordre, gates et provenance détaillés dans
+> [`m16/ACQUISITION_ENGINE.md`](m16/ACQUISITION_ENGINE.md).
+
 Dans AW-010, l’artifact canonique de `REFERENCES` est `ProductionReferenceCorpusV1` : il décrit
 les sources retenues pour ce run, leur provenance, tier, type, état de collecte, document archivé
 exact, hash du contenu et éligibilité à l’extraction. Les sources du snapshot sont conservées
 comme `CORE`; la recherche web peut ajouter des références `SUPPORTING` ou des ressources
 `TECHNICAL`. Une source inaccessible reste dans le corpus avec son état et n’est pas éligible.
 
-La collecte peut tenter une chaîne de replis bornée avant de figer cet état : profils HTTP
-conformes, représentations annoncées par la publication, puis plusieurs archives publiques
-indépendantes. Chaque stratégie et diagnostic demeure dans `acquisition_attempts`. Une source
-archivée via Bridge reste marquée `bridge_transcription` et n'est pas une preuve primaire; ses IOC
-sont contextualisés/non vérifiés et ne suffisent pas à router une publication comme ARTICLE. Une
-source core ne devient donc pas une source d'IOC confirmés par le seul fait qu'une transcription a
-été archivée. Les règles de collecte, les diagnostics et les limites de diffusion sont détaillés
-dans [`source_collection_and_evidence.md`](source_collection_and_evidence.md#chaîne-dacquisition-de-repli).
+La collecte `source.collect` archive la réponse directe. Le moteur de repli n'est lancé qu'après
+une commande explicite de l'opérateur sur une source en échec, via
+`POST /api/subjects/{subject_id}/sources/{collection_id}/fallback-acquire`. Il essaie les profils
+HTTP, représentations/flux/API/structured data, Playwright Chromium, archives web, redécouverte
+éditeur, PDF/OCR et providers optionnels, puis Bridge discovery/transcription. `http2` et `curl`
+restent des entrées non implémentées ; Firefox/WebKit ne sont pas disponibles. L'ordre complet,
+les defaults et les raisons de capability sont dans le [contrat M16](m16/ACQUISITION_ENGINE.md).
+Chaque probe demeure dans les tentatives d'acquisition et chaque archivage fallback a une
+provenance typée.
 
-Le rendu Chromium est facultatif : il n'est activé que si `COLLECTION_PLAYWRIGHT_SIDECAR_URL` pointe
-vers le service `playwright-acquirer` du profil Compose `playwright-acquisition`. Le backend lui
-transmet le HTML déjà obtenu par le transport HTTP épinglé; le sidecar exécute les scripts inline
-dans un profil neuf et bloque toutes les requêtes réseau du navigateur. Il peut donc révéler du DOM
-produit localement, mais ne charge pas les scripts ou API externes de la page. Cette limite garde
-Chromium hors du backend et hors de tout accès réseau non contrôlé par le collecteur.
+Une source CORE disponible seulement via Bridge, OCR ou extraction tierce ne peut pas étayer une
+publication comme source primaire : elle force `NEEDS_REVIEW` avec `CRITICAL_SOURCE_MISSING`, même
+si des IOC sont confirmés dans d'autres sources. La transcription Bridge est marquée
+`model_contextual_unverified`, générée par modèle et non vérifiée par la source primaire ; OCR,
+républication et corroboration gardent également leur classe propre jusqu'à vérification. Le
+pipeline `EXTRACTION` reste archive-only et n'ouvre aucune URL. La collecte, la provenance et les
+limites de diffusion sont détaillées dans
+[`source_collection_and_evidence.md`](source_collection_and_evidence.md#chaîne-dacquisition-de-repli).
+
+La navigation Chromium est désactivée par défaut par
+`COLLECTION_BROWSER_NAVIGATION_ENABLED=false`. Le sidecar expose son contrôle par socket Unix,
+rejoint le réseau interne `acquisition-browser` et ne sort que par le proxy egress filtrant. Sans
+profil Compose, montage du socket et proxy configurés, garder la navigation désactivée. Le rendu
+offline du HTML déjà collecté reste disponible ; il bloque les requêtes secondaires.
 
 Le blob RAW conserve le wire format de recherche historique, notamment
 `editorial-title` et `EVENT`, pour la lecture des anciens imports. Ces champs ne font pas partie du

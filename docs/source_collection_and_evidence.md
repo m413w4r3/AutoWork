@@ -1,17 +1,25 @@
 # Collecte HTTP des sources
 
+> Mise à jour M16 : 2026-11-06 — le repli est une commande opérateur séparée, avec
+> provenance typée et navigateur isolé derrière un proxy egress.
+
 ## Frontière avec l'analyse
 
-La collecte démarre uniquement à la demande de l'analyste avec
+La collecte directe démarre à la demande de l'analyste avec
 `POST /api/subjects/{subject_id}/collection`. Cette action crée le job canonique
-`source.collect`; Dramatiq ne transporte que son identifiant.
+`source.collect`; Dramatiq ne transporte que son identifiant. Un échec de cette collecte ne
+lance pas le moteur de repli en arrière-plan. Pour un état admissible, l'opérateur demande le
+repli séparément avec
+`POST /api/subjects/{subject_id}/sources/{collection_id}/fallback-acquire` ; voir le
+[contrat M16](m16/ACQUISITION_ENGINE.md) pour l'ordre, les états et les limites.
 
-La collecte directe utilise le transport HTTP épinglé et n'appelle aucun modèle. Si une source
-retourne un blocage d'accès ou une indisponibilité terminale, une chaîne d'acquisition bornée peut
-essayer des variantes publiques, des représentations éditoriales et des archives. Bridge n'est
-considéré qu'en dernier recours, sous la politique TLP et `external_llm_allowed`. Ce résultat reste
-explicitement une transcription de modèle, jamais une preuve primaire. La collecte ne fait toujours
-ni extraction d'IOC/TTP, ni création de claim ou d'artefact dérivé.
+La collecte directe utilise le transport HTTP épinglé et n'appelle aucun modèle. Le repli explicite
+exécute le registre M16 borné : profils HTTP et représentations, flux/API/structured data,
+navigateur Chromium si la navigation sûre est activée, archives publiques, redécouverte éditeur,
+PDF/OCR, puis providers autorisés. Bridge discovery et transcription ferment le registre ; toute
+divulgation reste soumise au TLP effectif et à `external_llm_allowed`. Le texte Bridge est
+contextuel, jamais une preuve primaire. La collecte ne fait toujours ni extraction d'IOC/TTP, ni
+création de claim ou d'artefact dérivé.
 
 Le workflow métier préparé est : Sources → Analyse → Rédaction → Validation. Pour un article
 principal, il deviendra Sources → Analyse → Synthèse → Pivots → Validation. Seule l'étape Sources
@@ -55,38 +63,47 @@ pas contourner la politique. Une nouvelle collecte globale ne retente pas silenc
 
 ## Chaîne d'acquisition de repli
 
-Après un blocage ou une indisponibilité terminale, le collecteur essaie dans l'ordre les profils
-HTTP honnêtes, les liens canoniques/AMP/print/feeds et les endpoints publics de représentation,
-puis Wayback, archive.ph et ses miroirs, Common Crawl, Memento, la sonde de cache public, le rendu
-Chromium facultatif et enfin Bridge. Tous les téléchargements HTTP passent par le même contrôle
-SSRF, les résolutions DNS épinglées, les domaines
-interdits et les limites de collecte. HTTP/2 et curl apparaissent comme ignorés tant qu'un adaptateur
-respectant ces garanties n'existe pas. Les tentatives bornées respectent `Retry-After`; les pages
-trop courtes, incohérentes, sans index autorisé, de consentement, de CAPTCHA, de paywall ou d'erreur
-sont rejetées. Aucun cache de moteur de recherche public n'est actuellement pris en charge.
+Le fallback ne démarre qu'après une commande opérateur sur une source en échec et sans document
+attaché. L'ordre exact, y compris les entrées Firefox/WebKit non implémentées et les placeholders
+HTTP/2/curl, figure dans le [contrat M16](m16/ACQUISITION_ENGINE.md#ordre-du-registre). Les
+téléchargements passent tous par la policy SSRF, les résolutions DNS épinglées, les domaines
+interdits et les limites du collecteur. `Retry-After` est borné par le budget global et par
+tentative. Les pages courtes, incohérentes, paywall, CAPTCHA ou erreur sont rejetées comme contenu
+non admissible ; un statut HTTP `200` ne suffit pas. Les méthodes optionnelles restent désactivées
+ou indisponibles tant que leur configuration, dépendance ou autorisation manque.
 
 Chaque tentative écrit `strategy_name`, `strategy_version`, durée, statut HTTP, octets, SHA-256,
 résultat et raison dans `collection_attempts` et dans l'événement de provenance. Le corpus
 `REFERENCES` expose ces mêmes diagnostics par source. Les reçus d'archive et `SourceView` portent
-la méthode d'acquisition et, pour Bridge, l'identifiant de run/consultation ainsi que les hashes de
-prompt et de réponse.
+la méthode, l'équivalence, la classe de preuve, la qualité et les hashes. Pour Bridge, ils portent
+aussi l'identifiant de run/consultation et les hashes de prompt/réponse. Le workbench expose
+`latest_attempt` et `archive_receipt`; l'historique complet reste persisté dans PostgreSQL.
 
-Bridge ne reçoit que l'URL publique, le titre et les métadonnées indispensables après contrôle de
-`external_llm_allowed` et du TLP effectif (RED est refusé). Son texte archivé porte
-`acquisition_method=bridge_transcription` et `verification_status=unverified_by_primary_source`.
-Les éléments canoniques extraits portent `evidence_basis=unverified_model_output`; les IOC sont
-`unverified_contextual` et ne peuvent pas seuls produire un article avec IOC confirmés. Une réponse
-ambiguë n'est jamais soumise de nouveau avant réconciliation. Une archive humaine remplace
-explicitement un repli existant; un repli ne remplace jamais un document archivé ou une collecte
-active.
+Bridge ne reçoit que l'URL publique sans credentials, le titre et les métadonnées indispensables
+après contrôle de `external_llm_allowed` et du TLP effectif (RED est refusé). Sa transcription
+porte `model_generated=true`, `primary_source_verified=false`, `ioc_primary_verified=false` et
+`evidence_class=model_contextual_unverified`. OCR porte `evidence_class=ocr_derived`; une extraction
+tierce ou une corroboration ne deviennent pas primaires sans vérification indépendante. Un CORE
+qui n'est disponible que sous forme Bridge/OCR/tierce impose `NEEDS_REVIEW` avec
+`CRITICAL_SOURCE_MISSING`, même si des IOC confirmés existent ailleurs. Une réponse modèle ambiguë
+n'est jamais soumise de nouveau avant réconciliation. Une archive humaine déjà attachée empêche le
+repli de la remplacer. Le service supporte le remplacement CAS d'un fallback par une archive
+humaine tout en conservant l'ancien document et ses blobs ; l'endpoint HTTP `content` renvoie
+toutefois `409 source_already_archived` avant ce chemin pour les états `ARCHIVED`, `EXTRACTED` et
+`COMPLETED`. Un fallback normalement archivé n'est donc pas remplaçable via cette route ; un
+fallback passé à `FAILED_TERMINAL` après une erreur de traitement peut suivre un autre chemin.
+Transmettre l'archive humaine avant le fallback pour le parcours courant.
 
-Les stratégies sont configurables avec `COLLECTION_ACQUISITION_STRATEGY_ENABLED` et
-`COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS`. Playwright nécessite `COLLECTION_PLAYWRIGHT_SIDECAR_URL`
-et le profil Compose `playwright-acquisition`; sans URL configurée, la stratégie reste désactivée.
-Le sidecar n'a aucun montage de secret et n'a pas d'accès Internet. Chromium travaille sur le HTML
-collecté par le transport épinglé, exécute les scripts inline et bloque chaque requête secondaire.
-Ce mode ne charge pas les ressources distantes qu'une page JavaScript pourrait ensuite demander;
-HTTP/2 et curl restent ignorés car aucun adaptateur ne conserve aujourd'hui le DNS épinglé.
+`COLLECTION_ACQUISITION_STRATEGY_ENABLED` et
+`COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS` pilotent les probes. Le rendu navigateur
+utilise `COLLECTION_BROWSER_CONTROL_SOCKET` (socket Unix) et le profil Compose
+`playwright-acquisition`. La navigation distante reste désactivée par défaut par
+`COLLECTION_BROWSER_NAVIGATION_ENABLED=false` et exige le proxy egress `BROWSER_EGRESS_PROXY_URL`.
+Le sidecar Chromium rejoint uniquement le réseau interne dédié ; seul le proxy egress peut
+sortir, après validation DNS/IP et policy de domaine. Le mode de rendu hors ligne, sur HTML déjà
+collecté, reste disponible et bloque les requêtes secondaires. Aucun contournement de CAPTCHA,
+furtivité ou rotation de proxy n'est prévu. HTTP/2/curl sont enregistrés comme non implémentés tant
+qu'un adaptateur compatible avec le DNS épinglé n'existe pas.
 
 ## Raw, decoded et document analyste
 

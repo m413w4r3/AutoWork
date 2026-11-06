@@ -59,6 +59,7 @@ separate approval and state/backup preflight.
 | Operator CTI skill bundle (proposed) | [`operations/operator-skills.md`](operations/operator-skills.md) | PROPOSED; runtime loading and behavior gates pending |
 | Coding orchestration | [`operations/paseo-agent-orchestration.md`](operations/paseo-agent-orchestration.md) | ACTIVE_REFERENCE (recommended setup, not verified host config) |
 | Source collection | [`source_collection_and_evidence.md`](source_collection_and_evidence.md) | ACTIVE_REFERENCE; older workflow statements may be historical |
+| M16 acquisition engine | [`m16/ACQUISITION_ENGINE.md`](m16/ACQUISITION_ENGINE.md) | ACTIVE_REFERENCE; verify configuration and deployment capabilities against code |
 | Other accepted ADRs | [`adr/`](adr/) | ACTIVE_REFERENCE unless expressly superseded; dated decisions must be interpreted in sequence |
 
 ## Historical documents and intentional deletions

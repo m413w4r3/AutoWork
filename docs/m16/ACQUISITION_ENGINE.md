@@ -1,347 +1,224 @@
-# M16 — Resilient Article Acquisition Engine: implementation contracts
+# M16 — moteur d’acquisition résiliente
 
-This note is the integration contract for the M16 work packages. It refines the
-mission's concepts to repository types. It does not replace accepted ADRs,
-`backend/AGENTS.md`, or the production contracts.
+> Mise à jour intégrée : 2026-11-06. Cette page décrit le comportement du code et de ses
+> réglages par défaut ; elle ne constate pas l’état d’un déploiement.
 
-## Core invariants
+## Déclenchement opérateur
 
-1. PostgreSQL, versioned artifacts and MinIO blobs remain canonical. A model
-   output is never primary evidence.
-2. `encoded_body` is the **observed artifact** (HTTP payload, raw JSON, PDF,
-   image, original 403 HTML). `decoded_body` is the **article text derived from
-   that artifact** (rendered DOM, extracted JSON/PDF/OCR text). Both blobs and
-   both SHA-256 values are archived.
-3. `acquisition_method`, `source_equivalence_class` and `evidence_class` state
-   how the bytes were obtained and what authority they carry. `ARCHIVED` alone
-   never means "verified primary publication".
-4. A fallback never overwrites an existing direct/manual archive. A manual
-   archive may explicitly supersede a fallback under the existing CAS/row-lock
-   rules while the old document and blobs remain immutable.
-5. All network access uses `SafeHttpCollector` (DNS pinning, SSRF policy,
-   domain policy, size/time limits), including secondary artifact requests.
-   Chromium may only reach the network through the enforcing egress proxy.
-6. No CAPTCHA solving, stealth, fingerprint spoofing, proxy rotation,
-   authentication bypass, or credential use. An explicit denial is terminal for
-   that destination. `do_not_submit` is not a VT/Bridge veto; it keeps its
-   existing contract-specific meaning.
-7. Tests are offline: fake transports, fake browser, fake provider, fake OCR.
+`POST /api/subjects/{subject_id}/collection` lance la collecte HTTP directe (`source.collect`).
+Un échec ne déclenche pas automatiquement le moteur de repli. Après un échec admissible, un
+opérateur peut demander le repli avec :
 
-## Domain types — `cti_app/domain/acquisition.py` (new)
-
-Additive enum members on the existing `SourceAcquisitionMethod` are allowed;
-existing values keep their meaning for old rows.
-
-```python
-class AcquisitionOutcome(StrEnum):
-    SUCCEEDED = "succeeded"
-    REJECTED = "rejected"                 # content fetched but not the article
-    FAILED = "failed"
-    SKIPPED = "skipped"
-    NOT_CONFIGURED = "not_configured"     # capability/dependency absent
-    POLICY_SKIPPED = "policy_skipped"     # policy/authorization denied
-    NEEDS_RECONCILIATION = "needs_reconciliation"
-
-class AcquisitionPolicyDecision(StrEnum):
-    ALLOWED = "allowed"
-    DENIED_PUBLIC_ACCESS = "denied_public_access"
-    DENIED_DOMAIN_POLICY = "denied_domain_policy"
-    DENIED_PRIVATE_DESTINATION = "denied_private_destination"
-    DENIED_CREDENTIALS = "denied_credentials"
-    DENIED_EXTERNAL_LLM = "denied_external_llm"
-    DENIED_TLP = "denied_tlp"
-    DENIED_PROVIDER_DISCLOSURE = "denied_provider_disclosure"
-    NOT_CONFIGURED = "not_configured"
-
-class SourceEquivalenceClass(StrEnum):
-    EXACT_ORIGINAL = "exact_original"
-    HISTORICAL_ORIGINAL = "historical_original"
-    VERIFIED_PUBLISHER_EQUIVALENT = "verified_publisher_equivalent"
-    AUTHORIZED_REPUBLICATION = "authorized_republication"
-    INDEPENDENT_CORROBORATION = "independent_corroboration"
-    UNKNOWN_MATCH = "unknown_match"
-
-class EvidenceClass(StrEnum):
-    PRIMARY_OBSERVED = "primary_observed"
-    HISTORICAL_PRIMARY = "historical_primary"
-    VERIFIED_EQUIVALENT = "verified_equivalent"
-    AUTHORIZED_REPUBLICATION = "authorized_republication"
-    INDEPENDENT_CORROBORATION = "independent_corroboration"
-    OCR_DERIVED = "ocr_derived"
-    MODEL_CONTEXTUAL_UNVERIFIED = "model_contextual_unverified"
-    UNKNOWN = "unknown"
-
-class AcquisitionCapabilityState(StrEnum):
-    IMPLEMENTED = "implemented"
-    DISABLED_BY_CONFIGURATION = "disabled_by_configuration"
-    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
-    BLOCKED_BY_POLICY = "blocked_by_policy"
-    BLOCKED_BY_SECURITY = "blocked_by_security"
-    NOT_IMPLEMENTED = "not_implemented"
-
-class AcquisitionObservationKind(StrEnum):
-    HTTP_RESPONSE = "http_response"
-    BROWSER_DOM = "browser_dom"
-    BROWSER_NETWORK_JSON = "browser_network_json"
-    EMBEDDED_STRUCTURED_DATA = "embedded_structured_data"
-    PUBLISHER_PDF = "publisher_pdf"
-    IMAGE = "image"
-    MODEL_TRANSCRIPTION = "model_transcription"
-    OCR_TEXT = "ocr_text"
-
-@dataclass(frozen=True, slots=True)
-class AcquisitionQuality:
-    text_chars: int
-    word_count: int
-    title_similarity: float            # 0..1, 1 when no title was expected
-    language: str | None
-    boilerplate_ratio: float           # 0..1
-    duplicate_ratio: float             # 0..1
-    truncated: bool
-    challenge_detected: bool
-    paywall_detected: bool
-    score: float                        # 0..1 deterministic aggregate
-    reasons: tuple[str, ...] = ()
-
-@dataclass(frozen=True, slots=True)
-class AcquisitionPolicyContext:
-    allowed_domains: frozenset[str]
-    blocked_domains: frozenset[str]
-    external_llm_allowed: bool
-    tlp: str
-    do_not_submit: bool
-    expected_languages: tuple[str, ...]
-    allowed_syndication_domains: frozenset[str]
-    third_party_provider_allowed: bool
-    provider_configured: bool
+```http
+POST /api/subjects/{subject_id}/sources/{collection_id}/fallback-acquire
 ```
 
-Method mapping (extend `SourceAcquisitionMethod`; keep old members):
+La réponse est `202` avec `{job_id, duplicate}`. Le job asynchrone
+`source.fallback_acquire` est idempotent sur le sujet, la source, le snapshot de policy et le
+prochain numéro de tentative. Il est refusé (`404` source inconnue, `409` repli désactivé ou état
+inadmissible) si la source est déjà archivée, en cours de collecte, ou hors des états
+`UNAVAILABLE`, `BLOCKED`, `FAILED_RETRYABLE`, `FAILED_TERMINAL`. Un replay identique retourne le
+même job avec `duplicate=true`.
 
-| Mission method | Persisted method value |
-|---|---|
-| existing_archive | `EXISTING_ARCHIVE` |
-| direct_http | `DIRECT_HTTP` (existing) |
-| canonical/amp/print/mobile variant | `CANONICAL_VARIANT`, `AMP_VARIANT`, `PRINT_VARIANT`, `MOBILE_VARIANT` |
-| rss_atom_jsonfeed | `RSS_ATOM_JSONFEED` |
-| publisher_public_api | `PUBLISHER_PUBLIC_API` |
-| embedded_structured_data | `EMBEDDED_STRUCTURED_DATA` |
-| playwright_chromium_dom | `PLAYWRIGHT_CHROMIUM_DOM` |
-| playwright_network_response | `PLAYWRIGHT_NETWORK_RESPONSE` |
-| playwright_embedded_state | `PLAYWRIGHT_EMBEDDED_STATE` |
-| playwright_firefox / webkit | `PLAYWRIGHT_FIREFOX`, `PLAYWRIGHT_WEBKIT` |
-| multi_extractor | `MULTI_EXTRACTOR` |
-| wayback_snapshot | `WAYBACK_SNAPSHOT` (keep `WAYBACK` for old rows) |
-| commoncrawl_warc | `COMMONCRAWL_WARC` (keep `COMMON_CRAWL`) |
-| memento_archive | `MEMENTO_ARCHIVE` (keep `MEMENTO`) |
-| exact_title_search | `EXACT_TITLE_SEARCH` |
-| publisher_alternative_url | `PUBLISHER_ALTERNATIVE_URL` |
-| authorized_syndication | `AUTHORIZED_SYNDICATION` |
-| publisher_pdf | `PUBLISHER_PDF` |
-| visual_ocr | `VISUAL_OCR` |
-| official_newsletter_archive | `OFFICIAL_NEWSLETTER_ARCHIVE` |
-| third_party_extraction | `THIRD_PARTY_EXTRACTION` |
-| bridge_source_discovery | `BRIDGE_SOURCE_DISCOVERY` |
-| bridge_transcription | `BRIDGE_TRANSCRIPTION` (existing) |
-| manual_human_archive | `MANUAL_UPLOAD` (existing; API stays manual) |
+Le workbench `GET /api/subjects/{subject_id}/workbench` présente pour chaque source son
+`latest_attempt` et son `archive_receipt`. La tentative porte stratégie, version, résultat,
+raison, durée, statut HTTP et hashes. Le reçu porte méthode, classes d’équivalence et de preuve,
+observation, qualité, hashes raw/decoded, ainsi que la provenance du modèle lorsqu’elle existe
+(`model_run_id`, consultation et hashes du prompt/réponse). Toutes les tentatives restent
+persistées dans `collection_attempts`; l’événement `source.archived_fallback` conserve la
+provenance d’archivage.
 
-## Probe and request — `application/acquisition_fallbacks.py`
+Une archive directe ou humaine déjà attachée gagne toujours contre un fallback. Le service
+possède un chemin CAS sous verrou pour qu’une archive humaine ultérieure remplace une archive de
+fallback en gardant l’ancien document et ses blobs immuables. **Limite de l’API actuelle :**
+`POST /api/subjects/{subject_id}/sources/{collection_id}/content` renvoie `409 source_already_archived`
+avant d’atteindre ce chemin si l’état est `ARCHIVED`, `EXTRACTED` ou `COMPLETED`. Un fallback
+normalement archivé n’est donc pas remplaçable par cette route ; un fallback passé à
+`FAILED_TERMINAL` après une erreur de traitement peut suivre un autre chemin. Pour le parcours
+courant, transmettre l’archive humaine avant le fallback. Le test du service couvre le CAS, pas
+le garde HTTP pour une source déjà archivée.
 
-`AcquisitionProbe` keeps `outcome: AcquisitionOutcome` (StrEnum compares equal to
-its string value, so existing `== "succeeded"` checks remain valid) and gains:
+## Ordre du registre
 
-```python
-policy_decision: AcquisitionPolicyDecision = ALLOWED
-capability_state: AcquisitionCapabilityState = IMPLEMENTED
-equivalence_class: SourceEquivalenceClass | None = None
-evidence_class: EvidenceClass | None = None
-observation_kind: AcquisitionObservationKind = HTTP_RESPONSE
-quality: AcquisitionQuality | None = None
-archive_snapshot_time: datetime | None = None
-publication_date: date | None = None
-publisher: str | None = None
-model_generated: bool = False
-primary_source_verified: bool = False
-ioc_primary_verified: bool = False
-```
+Une archive déjà attachée court-circuite le registre. Pour les autres sources, l’orchestrateur
+essaie les stratégies dans cet ordre ; il garde les tentatives et s’arrête sur la première
+réponse admissible :
 
-`AcquisitionRequest` gains `policy: AcquisitionPolicyContext` and
-`expected_languages` (already present).
+1. Profils HTTP épinglés : `http_plain`, `http_standard_headers`, `http_same_site_referer`,
+   `http_retry_after`.
+2. Transport HTTP/2 `http2`, puis `curl` : emplacements présents dans le registre, mais aucun
+   adaptateur ne garantit actuellement le même épinglage DNS ; ils ne téléchargent rien.
+3. Représentations éditeur `representations` (canonique, AMP, print, mobile).
+4. `rss_atom_jsonfeed`, `publisher_public_api`, `embedded_structured_data`.
+5. `playwright_chromium_dom`, `playwright_network_response`, `playwright_embedded_state`, puis
+   `playwright_firefox` et `playwright_webkit` (ces deux moteurs ne sont pas implémentés).
+6. `wayback_snapshot`, `commoncrawl_warc`, `memento_archive`, `archive_ph`.
+7. `exact_title_search`, `publisher_alternative_url`, `authorized_syndication`.
+8. `publisher_pdf`, `visual_ocr`, `official_newsletter_archive`, `third_party_extraction`.
+9. `bridge_source_discovery`, puis `bridge_transcription`.
 
-`AcquisitionStrategy` protocol gains optional `capability_state` and
-`description`; `acquire` is unchanged.
+`multi_extractor` n’est pas une stratégie indépendante du registre : l’extraction déterministe
+interne de `application/article_extraction.py` choisit parmi HTML, JSON-LD/état embarqué,
+flux, PDF et texte dérivé. Le stage métier `EXTRACTION` reste strictement archive-only : il ne
+réouvre aucune URL.
 
-## Orchestrator — `application/acquisition_orchestrator.py` (new)
+## Réglages et valeurs par défaut
 
-```python
-@dataclass(frozen=True, slots=True)
-class AcquisitionRunResult:
-    outcome: AcquisitionOutcome
-    probes: tuple[AcquisitionProbe, ...]
-    winner: AcquisitionProbe | None
-    reason_code: str | None
-    attempts: int
-    deadline_exceeded: bool
-    cancelled: bool
+Les noms ci-dessous sont des variables d’environnement Settings (majuscules du champ Pydantic).
+Les chaînes vides sont les valeurs par défaut lorsqu’elles sont indiquées.
 
-class ArticleAcquisitionOrchestrator:
-    def __init__(self, strategies, *, deadline_seconds, max_attempts,
-                 per_domain_concurrency, clock=...): ...
-    async def run(self, request, *, cancellation_check=None) -> AcquisitionRunResult: ...
-```
+| Réglage | Défaut | Effet opérationnel |
+|---|---:|---|
+| `COLLECTION_ACQUISITION_DEADLINE_SECONDS` | `120` s | Plafond global du repli. |
+| `COLLECTION_ACQUISITION_MAX_ATTEMPTS` | `40` | Budget maximal de probes. |
+| `COLLECTION_ACQUISITION_PER_DOMAIN_CONCURRENCY` | `2` | Sémaphore par hôte. |
+| `COLLECTION_ACQUISITION_STRATEGY_ENABLED` | mapping ci-dessous | Active/désactive les stratégies par nom. |
+| `COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS` | mapping ci-dessous | Timeout propre à chaque stratégie. |
+| `COLLECTION_FALLBACK_ENDPOINT_ENABLED` | `true` | Autorise l’endpoint opérateur. |
+| `COLLECTION_FALLBACK_VARIANTS_ENABLED` / `COLLECTION_FALLBACK_ARCHIVE_ENABLED` / `COLLECTION_FALLBACK_BRIDGE_ENABLED` | `true` | Interrupteurs généraux historiques des groupes de repli. |
+| `COLLECTION_FALLBACK_MAX_VARIANTS` / `COLLECTION_FALLBACK_MIN_TEXT_CHARS` | `4` / `200` | Limite de variantes et seuil minimal de texte admissible. |
+| `COLLECTION_PLAYWRIGHT_SIDECAR_URL` | vide | URL de contrôle facultative du renderer. |
+| `COLLECTION_BROWSER_CONTROL_SOCKET` | vide | Chemin du socket de contrôle Unix partagé. |
+| `COLLECTION_BROWSER_NAVIGATION_ENABLED` | `false` | Le navigateur ne navigue pas par défaut. |
+| `PLAYWRIGHT_ACQUIRER_SOCKET` | `/run/browser/acquirer.sock` dans Compose | Socket Unix de contrôle du sidecar. |
+| `BROWSER_EGRESS_PROXY_URL` | défini par Compose dans le sidecar | Proxy sortant imposé pour la navigation ; ce n’est pas un champ Settings backend. |
+| `BROWSER_EGRESS_PROXY_TOKEN` | secret facultatif | Authentification proxy côté sidecar ; fournir par secret manager, jamais journaliser sa valeur. |
+| `COLLECTION_SYNDICATION_DOMAINS` | vide | Domaines de syndication explicitement autorisés. |
+| `COLLECTION_EXACT_TITLE_SEARCH_ENDPOINT` | vide | Endpoint public de recherche par titre exact. |
+| `COLLECTION_OFFICIAL_NEWSLETTER_ARCHIVE_ENDPOINT` | vide | Archive newsletter explicite. |
+| `COLLECTION_THIRD_PARTY_PROVIDER_URL` / `COLLECTION_THIRD_PARTY_PROVIDER_TOKEN` | vides | Endpoint et jeton du provider ; aucun jeton réel n’est consigné ici. |
+| `COLLECTION_THIRD_PARTY_PROVIDER_ENABLED` | `false` | Opt-in supplémentaire du provider tiers. |
+| `COLLECTION_OCR_COMMAND` | vide | Commande OCR locale, passée comme argv sans shell. |
+| `COLLECTION_ALLOWED_DOMAINS` / `COLLECTION_BLOCKED_DOMAINS` | vides | Allowlist facultative et denylist. |
+| `COLLECTION_TIMEOUT_SECONDS` / `COLLECTION_MAX_REDIRECTS` | `30` s / `5` | Limites du transport HTTP. |
+| `COLLECTION_MAX_DOWNLOAD_BYTES` / `COLLECTION_MAX_EXPANDED_BYTES` / `COLLECTION_MAX_DECOMPRESSION_RATIO` | `10 MiB` / `25 MiB` / `20` | Limites de réponse et de décompression. |
 
-Behavior: ordered strategies; skip disabled with `DISABLED_BY_CONFIGURATION`;
-per-strategy timeout; global `asyncio.timeout`; at most `max_attempts` probes;
-one semaphore per hostname around `request.fetch`; cancellation propagates
-`JobCancelledError`; the first probe with `SUCCEEDED` and an accepted response
-wins. A strategy that returns several probes stops the run on the first success.
-All probes are retained for diagnostics.
+Dans `COLLECTION_ACQUISITION_STRATEGY_ENABLED`, les stratégies sont activées par défaut sauf
+`playwright_firefox`, `playwright_webkit`, `visual_ocr`, `official_newsletter_archive`,
+`third_party_extraction` et `bridge_source_discovery`. Une stratégie activée peut rester
+indisponible si son endpoint ou sa dépendance manque.
 
-## Strategy adapters
+Valeurs par défaut de `COLLECTION_ACQUISITION_STRATEGY_TIMEOUT_SECONDS` : HTTP plain/standard/
+same-site `15` s, retry-after `20` s, HTTP/2 et curl `1` s, représentations `20` s, flux/API/
+structured data `15` s, Playwright `45` s par stratégie, Wayback `20` s, Common Crawl `25` s,
+Memento `15` s, archive.ph `15` s, titre exact/URL alternative/syndication/newsletter `15` s,
+PDF/OCR/provider tiers `20` s, Bridge discovery `1` s, transcription Bridge `90` s.
 
-- `application/article_extraction.py` (new): deterministic extraction from HTML,
-  JSON-LD, embedded state (`__NEXT_DATA__`, `__NUXT__`, `__INITIAL_STATE__`),
-  RSS/Atom/JSON Feed, CMS JSON, PDF text, OCR text. Returns
-  `ExtractionCandidate(text, title, publisher, published_at, canonical_url,
-  method, quality)`. Quality selects by score, not length alone. IOC literals
-  are copied byte-for-byte from the extracted text; normalization never runs
-  here.
-- `application/acquisition_sources.py` (new): archive adapters (Wayback CDX,
-  Common Crawl index/WARC, Memento), rediscovery (exact-title search adapter
-  that is `NOT_CONFIGURED` unless a public endpoint is configured; sitemap /
-  publisher alternative URL; authorized syndication classification), PDF and
-  OCR adapters, third-party provider port (disabled by default, policy-gated).
-- `application/browser_acquisition.py` (new): Playwright adapter calling the
-  isolated renderer; DOM, captured public JSON responses, embedded state; typed
-  failure when the secure egress proxy is not configured.
-- `sidecars/browser_egress_proxy/` (new): enforcing forward proxy. It resolves
-  and validates every destination (public IP only; configured domain policy),
-  handles CONNECT and absolute-form HTTP, blocks dangerous schemes, caps
-  connection bytes and idle time, and never forwards to loopback/private/
-  link-local/metadata addresses. The renderer has no other network.
-- `sidecars/playwright_acquirer/` (modified): `/render` accepts either
-  `html` (offline render, all secondary requests aborted) or `url` (navigate
-  through the configured proxy), returns `rendered_html` plus bounded metadata
-  and captured JSON bodies (no response headers with credentials).
+Une allowlist `COLLECTION_ALLOWED_DOMAINS` vide autorise toute destination **publique** ;
+`COLLECTION_BLOCKED_DOMAINS` gagne toujours. Les deux sont appliquées par le transport HTTP et
+par le proxy navigateur. Le choix d’une destination publique n’autorise jamais une adresse
+privée, locale, link-local ou de métadonnées.
 
-### Browser isolation (mandatory)
+## Sécurité et dépendances
 
-The rendering sidecar exposes its control API on a **Unix domain socket**
-mounted read-only into the backend/worker containers. It has no shared Docker
-network with the backend, worker, database or blob store. Its only network is a
-dedicated internal `acquisition-browser` network shared with the enforcing
-egress proxy; the proxy alone joins the internet-facing network.
+- Tous les fetchs HTTP revalident chaque redirection, résolvent puis épinglent une IP publique,
+  refusent les credentials dans l’URL et appliquent les domaines, tailles et délais. Une erreur
+  SSRF ou de domaine est terminale ; aucune stratégie suivante ne contourne ce refus.
+- Le profil Compose `playwright-acquisition` fournit le renderer Chromium sur socket Unix, un
+  réseau interne dédié `acquisition-browser` et le proxy egress filtrant. Le renderer n’a pas
+  d’autre sortie réseau. Compose alimente `BROWSER_EGRESS_ALLOWED_DOMAINS` et
+  `BROWSER_EGRESS_BLOCKED_DOMAINS` depuis la policy `COLLECTION_*`. `BROWSER_EGRESS_PROXY_URL`
+  est obligatoire pour naviguer ; sans proxy,
+  la stratégie est `BLOCKED_BY_SECURITY`. Sans le profil, le montage UDS et le proxy fonctionnels,
+  garder `COLLECTION_BROWSER_NAVIGATION_ENABLED=false`. Le rendu de HTML déjà collecté reste
+  disponible en mode hors ligne et bloque les requêtes secondaires. Pas de furtivité, résolution
+  de CAPTCHA, rotation de proxy, contournement de connexion ni usage de credentials.
+- Les archives publiques reçoivent uniquement une URL d’origine sans credentials et passent par
+  les contrôles de destination. Provider tiers et Bridge exigent la permission de divulgation
+  (`external_llm_allowed`) et un TLP admissible ; TLP RED est refusé. L’absence de permission
+  produit une tentative de policy refusée, pas un envoi.
+- Bridge source discovery et transcription utilisent des parseurs de réponse tolérants et gardent
+  les identifiants du run/de consultation et les hashes. Le résultat de découverte modèle lui-même
+  est `model_generated=true`, `primary_source_verified=false`, `ioc_primary_verified=false`,
+  `evidence_class=model_contextual_unverified`. Un article retrouvé est ensuite téléchargé et
+  évalué séparément, avec la provenance du run de découverte. Une transcription est toujours
+  `model_generated=true`, `primary_source_verified=false`, `ioc_primary_verified=false`,
+  `evidence_class=model_contextual_unverified`. Une réponse modèle reste du contexte, jamais une
+  preuve primaire. Les prompts, corps, URLs à credentials et secrets ne vont pas dans les logs.
+- OCR n’est pas activé par défaut. La commande reçoit l’artefact en stdin, avec seulement
+  `PATH`, `LANG` et `HOME` dans son environnement, sans stderr conservé ; l’entrée est bornée à
+  25 MiB, la sortie à 5 MiB et l’exécution au timeout de stratégie. Le résultat reste
+  `OCR_DERIVED`/`OCR_TEXT`, contextualisé jusqu’à vérification indépendante.
+- Le collector tiers est désactivé par défaut. Le transport `SafeHttpCollector` retire
+  actuellement `Authorization` : si provider, URL et jeton sont configurés et la stratégie
+  activée, elle est `BLOCKED_BY_SECURITY` (`provider_auth_transport_unavailable`). Aucun jeton
+  n’est transmis. La stratégie n’envoie que l’URL publique canonique et le titre après policy.
 
-Consequences, all required:
+## Capacité, dépendance et mode d’échec
 
-- A page script cannot reach AutoWork services, even by WebSocket, because they
-  are not on any network the renderer can reach.
-- `BROWSER_EGRESS_PROXY_URL` is mandatory for navigation. Without it, the
-  navigation strategy returns `BLOCKED_BY_SECURITY`; it never falls back to a
-  direct browser connection.
-- Navigation is disabled by default at the backend (`COLLECTION_BROWSER_NAVIGATION_ENABLED=false`).
-  The offline HTML render remains available and is safe by construction.
-- The sidecar returns bounded `captured_json` entries (URL without credential
-  query values, content type, body, size). Response headers, cookies and
-  authorization values are never returned.
-- `--no-sandbox` is accepted only inside this isolation (read-only rootfs,
-  dropped capabilities, no-new-privileges, dedicated network). A deployment
-  without that isolation must keep navigation disabled.
-
-### Capability matrix (must be reported truthfully)
-
-| Method | Expected state |
-|---|---|
-| existing_archive, direct_http, canonical/amp/print/mobile, feeds, publisher API, embedded structured data | implemented |
-| playwright chromium DOM / network JSON / embedded state | implemented, disabled unless secure egress is configured |
-| playwright firefox / webkit | not implemented (renderer ships Chromium only) |
-| multi_extractor, wayback, commoncrawl WARC, memento, publisher alternative URL, publisher PDF | implemented |
-| exact title search, official newsletter archive | not configured by default (explicit endpoint/archive setting required) |
-| authorized syndication | implemented when explicit publisher evidence exists; otherwise unknown |
-| visual OCR | dependency unavailable unless an OCR command is configured |
-| third-party extraction | disabled by default; generic adapter, policy-gated |
-| bridge source discovery / transcription | implemented |
-| manual human archive | existing manual upload path |
-
-No registry entry may claim `IMPLEMENTED` if its dependency or policy gate is
-missing. A skip must carry a typed `capability_state` and reason.
-
-## Provenance payload on `source.archived_fallback`
-
-Add (only applicable fields required):
-
-```
-acquisition_method, strategy_name, strategy_version, duration_ms,
-policy_snapshot_id, acquisition_job_id, actor,
-original_url, requested_variant_url, final_url,
-publisher, article_title, publication_date_if_known,
-archive_snapshot_time, content_type, raw_blob_reference, decoded_blob_reference,
-sha256 (decoded), encoded_sha256, attempt_id,
-source_equivalence_class, evidence_class, quality_assessment,
-model_run_id, consultation_id, prompt_sha256, response_sha256,
-model_generated, primary_source_verified, ioc_primary_verified
-```
-
-`quality_assessment` is a compact JSON object, never the article body. Logs never
-contain source bodies, URLs with credentials, prompts or provider keys.
-
-## Operator fallback
-
-`POST /api/subjects/{subject_id}/sources/{collection_id}/fallback-acquire`
-returns `202 {job_id, duplicate}`. Job kind `source.fallback_acquire`,
-idempotency key
-`source.fallback_acquire:{subject}:{collection}:{policy_snapshot}:{attempt_round}`.
-It is authorized by the existing actor identity, refuses non-fallbackable states,
-runs only the orchestrator (no direct re-fetch), and is a no-op duplicate when
-the same job key already exists. `EXTRACTION` never contacts the network.
-
-## Routing rule (Lot D)
-
-A CORE source whose `acquisition_method` is `BRIDGE_TRANSCRIPTION` (or whose
-evidence class is `MODEL_CONTEXTUAL_UNVERIFIED`) is a critical source loss for
-verified-publication purposes. The routing decision is `NEEDS_REVIEW` with
-`CRITICAL_SOURCE_MISSING`, even if the transcription yielded contextual IOCs.
-Independent corroboration is never promoted to CORE. Other CORE archives obtained
-from the publisher or a verifiable historical archive keep their current routing.
-
-## Work-package file ownership
-
-| WP | Owns (write) | Must not touch |
+| Méthode/groupe | État par défaut et dépendance | Coût/failure observables |
 |---|---|---|
-| A-core | `domain/acquisition.py`, `domain/collection.py`, `application/acquisition_orchestrator.py`, `application/acquisition_fallbacks.py`, `application/collection.py`, `api/collection.py`, `config.py`, `workers/tasks.py`, `tests/test_acquisition_fallbacks.py`, `tests/test_acquisition_orchestrator.py` | sidecars, compose, extraction modules, routing |
-| B-extract | `application/article_extraction.py`, `tests/test_article_extraction.py` | everything above |
-| B-browser | `sidecars/**`, `infra/acquisition-playwright.Dockerfile`, `infra/acquisition-browser-proxy.Dockerfile`, `compose.yaml`, `application/browser_acquisition.py`, `tests/test_browser_acquisition.py`, `tests/test_browser_egress_proxy.py` | backend collection/acquisition files |
-| C-sources | `application/acquisition_sources.py`, `tests/test_acquisition_sources.py` | everything above |
-| Integration | `application/acquisition_fallbacks.py`, `application/collection.py`, `application/production_*.py`, `domain/production_*.py`, tests | sidecars except agreed compose wiring |
-| Docs | `docs/**` except this note | code |
+| Profils HTTP, représentations, flux, API éditeur, données structurées | Implémentés ; SafeHttpCollector requis. | Requêtes HTTP bornées ; `failed`, `rejected`, `blocked` ou timeout avec raison. |
+| `http2`, `curl` | Transport non implémenté : `transport_not_supported_by_pinned_adapter` / `curl_adapter_not_available_with_same_dns_pinning`. | Probe `skipped`, aucun téléchargement. Le code actuel laisse toutefois le champ `capability_state` à sa valeur par défaut `IMPLEMENTED` : ne pas interpréter ce champ comme une capacité de transport. |
+| Chromium DOM/réseau/état | Navigation désactivée par défaut ; sidecar, UDS et proxy filtrant requis. | CPU + sorties réseau contrôlées ; `BLOCKED_BY_SECURITY`, indisponible ou timeout. Le mode offline HTML reste sûr. |
+| Firefox/WebKit | Non implémentés (`browser_engine_not_implemented`). | Probe `NOT_IMPLEMENTED`, pas de moteur de remplacement. |
+| Wayback, Common Crawl WARC, Memento, archive.ph | Implémentés ; endpoints publics et collector sûrs requis. | Requêtes de recherche puis snapshot ; absence de capture, refus de policy ou timeout. |
+| Recherche titre exact | `DISABLED_BY_CONFIGURATION` sans `COLLECTION_EXACT_TITLE_SEARCH_ENDPOINT` (`search_endpoint_not_configured`). | Pas de requête sans endpoint ; aucun candidat devient une preuve sans capture. |
+| URL alternative éditeur | Implémentée ; sitemap/URLs publiques et policy requises. | Requêtes éditeur bornées ; candidat absent ou rejet qualité. |
+| Syndication autorisée | Implémentée seulement pour domaine explicitement autorisé et éditeur concordant. | Requête/copie publique ; domaine non listé ou licence/provenance inconnue = refus/équivalence inconnue. |
+| PDF éditeur | Implémenté avec dépendance PDF disponible ; sinon `DEPENDENCY_UNAVAILABLE` (`pdf_extractor_not_configured`). | CPU et parsing ; type non PDF, lien absent ou parse impossible. |
+| OCR visuel | `DISABLED_BY_CONFIGURATION` par défaut ; commande absente = `DEPENDENCY_UNAVAILABLE` (`ocr_not_configured`). | CPU local ; timeout, erreur ou sortie > 5 MiB. |
+| Archive newsletter officielle | `DISABLED_BY_CONFIGURATION` sans endpoint (`official_archive_not_configured`). | Requête publique bornée ; endpoint non officiel (`archive_endpoint_not_official`) ou contenu non pertinent. |
+| Extraction tierce | Désactivée par défaut (`provider_not_configured`) ; transport d’authentification non supporté. | Divulgation/coût fournisseur évités ; avec URL/jeton et feature activée, `BLOCKED_BY_SECURITY` (`provider_auth_transport_unavailable`). |
+| Bridge discovery / transcription | Discovery désactivée par défaut ; transcription exige Bridge joignable et gate TLP/divulgation. | Appel modèle et coût de consultation ; refus policy, indisponibilité ou parse invalide. Résultat non primaire. |
 
-## Derived-response rule
+Les probes distinguent notamment `IMPLEMENTED`, `DISABLED_BY_CONFIGURATION`,
+`DEPENDENCY_UNAVAILABLE`, `BLOCKED_BY_SECURITY` et `NOT_IMPLEMENTED`. Un refus de policy est
+également conservé comme tel ; il ne signifie pas que la méthode manque.
 
-When a fallback archives a derived article text (JSON/JSON-LD/embedded state,
-rendered DOM, PDF text, OCR):
+## Décision pratique
 
-- `encoded_body` is the raw observed artifact and `encoded_sha256` its hash;
-- `decoded_body` is the deterministic article text and `decoded_sha256` its hash;
-- `declared_content_type` describes the observed artifact, while
-  `detected_content_type` describes the decoded/derived body used by EXTRACTION;
-- `observation_kind` states which observation produced the bytes;
-- `_pdf_processing_failure` is not applied to a fallback whose decoded body is
-  already validated derived text. Direct PDF acquisition still uses it.
+| Situation initiale | Méthodes permises au repli explicite | Résultat attendu / raison | Vue opérateur |
+|---|---|---|---|
+| `403` | Profils HTTP, représentations éditeur, browser si activé, archives, copies autorisées, puis providers/Bridge sous gates. | Une page de blocage ou CAPTCHA est rejetée ; aucun contournement. Le moteur poursuit dans son budget. | `latest_attempt` et raisons par stratégie ; `BLOCKED`/`REJECTED` si aucune copie valide. |
+| `404` | Représentations, URL éditeur alternative, recherche titre configurée, archives. | Copie/capture admissible ou `unavailable`/absence de candidat. | Méthode, outcome, raison et URL finale dans la tentative. |
+| Article JavaScript seulement | Données structurées/état déjà embarqué ; navigation Chromium avec proxy si activée. | Sans navigation sûre, skips explicites ; DOM/réponse JSON ne vaut que selon sa classe de preuve. | Capacité et raison `browser_navigation_disabled`/`browser_unavailable`, ou reçu d’archive. |
+| `200` vide, court ou hors sujet | Extracteurs déterministes, représentation, PDF/OCR si artefact fourni, archives. | `rejected` selon qualité/titre ; le statut HTTP 200 ne suffit pas. | `quality_score`, `quality_reasons`, outcome et hashes. |
+| `429` | Profil `http_retry_after`, puis sources publiques ultérieures si budget restant. | Respect borné de `Retry-After`; fin de budget si délais épuisés. | Durée, status HTTP et raison dans les tentatives. |
+| `5xx` | Profils/réessais bornés puis archives et autres stratégies autorisées. | Erreur temporaire ou aucune archive ; pas de succès supposé. | `failed`/timeout et raison exacte. |
+| SSRF, credential URL ou domaine bloqué | Aucun contournement ni repli vers une destination refusée. | Blocage terminal (`BLOCKED_BY_POLICY`/raison de destination). | Tentative refusée et raison ; pas de body ni secret dans les logs. |
+| Archive directe/humaine déjà attachée | Aucun fallback de remplacement. | Le job est refusé (`409`) ; l’archive canonique reste attachée. | `state`, `source_document_id` et reçu du document existant. |
+| CORE disponible seulement via Bridge | Aucun statut primaire ne peut être déduit du texte Bridge. | `NEEDS_REVIEW` avec `CRITICAL_SOURCE_MISSING`, même si des IOC confirmés existent ailleurs. | `model_generated`, classe contextualisée et identité de consultation. |
 
-## Acceptance oracles
+## Classes de preuve et routage
 
-Each work package must provide deterministic offline tests and report
-`command`, exit code, pass/fail/skip counts. The final matrix covers the
-mission's cases 01–24 in `backend/tests/test_acquisition_matrix.py`.
+La méthode décrit l’acquisition ; l’équivalence décrit le lien avec la publication ; la classe
+de preuve décrit l’autorité des octets. `archived` seul ne veut pas dire primaire.
 
-Mandatory additional oracles:
+| Valeur/code | Lecture opérateur |
+|---|---|
+| `exact_original` / `primary_observed` | Observation directe de l’original ; vérifier l’URL et l’éditeur. |
+| `historical_original` / `historical_primary` | Copie d’archive datée de l’original ; l’horodatage historique est conservé. |
+| `verified_publisher_equivalent` / `verified_equivalent` | Variante éditeur vérifiée (AMP/print/mobile/API, etc.). |
+| `authorized_republication` | Républication dont l’autorisation/lien éditeur est établi. |
+| `independent_corroboration` | Source indépendante utile pour corroborer, jamais promue en CORE par elle-même. |
+| `ocr_derived` | Texte dérivé d’image/PDF ; contexte tant que non vérifié sur une source primaire. |
+| `model_contextual_unverified` | Découverte/transcription modèle ; non primaire et non vérifiée. |
 
-- a fallback racing a manual upload never replaces or clears the manual document
-  (PostgreSQL row-lock/race test when the environment permits, plus a
-  deterministic in-memory interleaving test);
-- two fallbacks racing produce exactly one attached document and no duplicate
-  `SourceDocument`;
-- an already archived source is returned without any network call;
-- every `source.archived_fallback` payload round-trips the provenance contract;
-- archive/provider/Bridge submissions never contain credential-like query
-  values and never happen when their policy gate denies.
+Un CORE dont l’unique source exploitable est Bridge, OCR ou extraction tierce impose
+`NEEDS_REVIEW`/`CRITICAL_SOURCE_MISSING`. Les IOC contextuels ne lèvent pas ce blocage, même si
+d’autres IOC ont été confirmés. Une preuve indépendante ou une archive primaire doit être
+acquise puis vérifiée avant toute promotion.
+
+## Persistance, migrations et couverture hors ligne
+
+Chaque tentative porte `strategy_name`, `strategy_version`, `acquisition_method`, outcome et
+raison, équivalence, classe de preuve, observation, qualité et hashes. Les reçus/provenances
+conservent les références raw et decoded, `encoded_sha256`, `decoded_sha256`, temps de snapshot,
+acteur/job, et pour les modèles `model_run_id`, `consultation_id`, `prompt_sha256`,
+`response_sha256`, `model_generated`, `primary_source_verified`, `ioc_primary_verified`.
+PostgreSQL, les événements de provenance et les blobs content-addressed sont canoniques ; les
+artefacts/hashes anciens ne sont ni réécrits ni supprimés par l’ajout de ces champs.
+
+La migration additive `0008b_version_length` (fichier `0008b_alembic_version_length.py`) prépare
+la longueur de version, `0009_acquisition_strategy_attempts` ajoute les métadonnées de stratégie
+aux tentatives et `0010_acquisition_provenance` ajoute les classes,
+la qualité, le temps de snapshot et les provenances modèle aux tentatives qui portaient déjà les
+hashes de contenu. Les gardes de migration refusent les
+schémas partiels et le downgrade refuse de supprimer les données de provenance.
+
+La matrice hors ligne de 24 cas est dans `backend/tests/test_acquisition_matrix.py`. Les cas 14
+et 18 sont partiels : la policy d’acquisition ne modélise pas d’autorité G2/G3 explicite ; le cas
+18 vérifie le bail de service en mémoire, pas un verrou de ligne PostgreSQL. La course
+fallback/fallback a un test PostgreSQL ; la course manuelle/fallback n’a qu’un test en mémoire.
+Ces tests n’établissent pas une disponibilité réseau en production.
