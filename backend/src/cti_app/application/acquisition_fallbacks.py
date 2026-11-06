@@ -9,16 +9,26 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from html.parser import HTMLParser
-from typing import Protocol
+from typing import Protocol, cast
 from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
     _detect_mime,
+)
+from cti_app.domain.acquisition import (
+    AcquisitionCapabilityState,
+    AcquisitionObservationKind,
+    AcquisitionOutcome,
+    AcquisitionPolicyContext,
+    AcquisitionPolicyDecision,
+    AcquisitionQuality,
+    EvidenceClass,
+    SourceEquivalenceClass,
 )
 from cti_app.domain.collection import DetectedMimeType, SourceAcquisitionMethod
 from cti_app.domain.discovery import canonicalize_http_url
@@ -323,7 +333,7 @@ class AcquisitionProbe:
     strategy_version: str
     method: SourceAcquisitionMethod
     requested_url: str
-    outcome: str
+    outcome: AcquisitionOutcome
     reason_code: str | None
     response: CollectedResponse | None
     http_status: int | None
@@ -335,6 +345,42 @@ class AcquisitionProbe:
     consultation_id: str | None = None
     prompt_sha256: str | None = None
     response_sha256: str | None = None
+    policy_decision: AcquisitionPolicyDecision = AcquisitionPolicyDecision.ALLOWED
+    capability_state: AcquisitionCapabilityState = AcquisitionCapabilityState.IMPLEMENTED
+    observation_kind: AcquisitionObservationKind = AcquisitionObservationKind.HTTP_RESPONSE
+    equivalence_class: SourceEquivalenceClass | None = None
+    evidence_class: EvidenceClass | None = None
+    quality: AcquisitionQuality | None = None
+    archive_snapshot_time: datetime | None = None
+    publication_date: date | None = None
+    publisher: str | None = None
+    model_generated: bool = False
+    primary_source_verified: bool = False
+    ioc_primary_verified: bool = False
+
+    def __post_init__(self) -> None:
+        # StrEnum retains existing string comparisons and serialization. Keep
+        # any unmodeled historical status strings usable by older callers.
+        try:
+            typed_outcome = AcquisitionOutcome(self.outcome)
+        except ValueError:
+            return
+        object.__setattr__(self, "outcome", typed_outcome)
+
+
+def _default_policy_context() -> AcquisitionPolicyContext:
+    """A deny-by-default policy used only by legacy request constructors."""
+    return AcquisitionPolicyContext(
+        allowed_domains=frozenset(),
+        blocked_domains=frozenset(),
+        external_llm_allowed=False,
+        tlp="RED",
+        do_not_submit=True,
+        expected_languages=(),
+        allowed_syndication_domains=frozenset(),
+        third_party_provider_allowed=False,
+        provider_configured=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +399,7 @@ class AcquisitionRequest:
     attempted_strategy_urls: frozenset[str] = frozenset()
     min_text_chars: int = 200
     expected_languages: tuple[str, ...] = ()
+    policy: AcquisitionPolicyContext = field(default_factory=_default_policy_context)
 
 
 class AcquisitionStrategy(Protocol):
@@ -363,8 +410,18 @@ class AcquisitionStrategy(Protocol):
     method: SourceAcquisitionMethod
     enabled: bool
     timeout_seconds: float
+    capability_state: AcquisitionCapabilityState | None
+    description: str | None
 
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]: ...
+
+
+def _typed_probe_outcome(outcome: AcquisitionOutcome | str) -> AcquisitionOutcome:
+    try:
+        return AcquisitionOutcome(outcome)
+    except ValueError:
+        # Legacy metadata-only probe outcomes are not acquisition outcomes.
+        return cast(AcquisitionOutcome, outcome)
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,7 +538,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="failed",
+                    outcome=_typed_probe_outcome("failed"),
                     reason_code="no_renderable_html_available",
                     response=None,
                     http_status=status,
@@ -500,7 +557,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="rejected",
+                    outcome=_typed_probe_outcome("rejected"),
                     reason_code="browser_render_requires_html",
                     response=None,
                     http_status=status,
@@ -523,7 +580,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="skipped",
+                    outcome=_typed_probe_outcome("skipped"),
                     reason_code="playwright_sidecar_unavailable",
                     response=None,
                     http_status=status,
@@ -549,7 +606,7 @@ class PlaywrightStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="rejected",
+                    outcome=_typed_probe_outcome("rejected"),
                     reason_code=reason,
                     response=None,
                     http_status=status,
@@ -583,7 +640,7 @@ class PlaywrightStrategy:
                 strategy_version=self.version,
                 method=self.method,
                 requested_url=request.requested_url,
-                outcome="succeeded",
+                outcome=_typed_probe_outcome("succeeded"),
                 reason_code=None,
                 response=rendered_response,
                 http_status=status,
@@ -625,7 +682,7 @@ async def _probe_url(
             strategy_version=strategy_version,
             method=method,
             requested_url=url,
-            outcome="failed",
+            outcome=_typed_probe_outcome("failed"),
             reason_code=error.reason_code.value,
             response=None,
             http_status=error.http_status,
@@ -652,7 +709,7 @@ async def _probe_url(
         strategy_version=strategy_version,
         method=method,
         requested_url=url,
-        outcome="succeeded" if reason is None else "rejected",
+        outcome=_typed_probe_outcome("succeeded" if reason is None else "rejected"),
         reason_code=reason,
         response=response if reason is None else None,
         http_status=response.status,
@@ -716,7 +773,7 @@ class UnavailableTransportStrategy:
                 strategy_version=self.version,
                 method=self.method,
                 requested_url=request.requested_url,
-                outcome="skipped",
+                outcome=_typed_probe_outcome("skipped"),
                 reason_code=self.reason,
                 response=None,
                 http_status=None,
@@ -803,7 +860,7 @@ class AlternateRepresentationStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=request.requested_url,
-                    outcome="skipped",
+                    outcome=_typed_probe_outcome("skipped"),
                     reason_code="no_public_representation_discovered",
                     response=None,
                     http_status=None,
@@ -1001,7 +1058,7 @@ class CommonCrawlStrategy:
                     _metadata_probe(
                         range_probe,
                         response=range_probe.response,
-                        outcome="rejected",
+                        outcome=_typed_probe_outcome("rejected"),
                         reason_code="invalid_warc_record",
                     )
                 )
@@ -1019,7 +1076,7 @@ class CommonCrawlStrategy:
                     strategy_version=self.version,
                     method=self.method,
                     requested_url=warc_url,
-                    outcome="succeeded" if reason is None else "rejected",
+                    outcome=_typed_probe_outcome("succeeded" if reason is None else "rejected"),
                     reason_code=reason,
                     response=article if reason is None else None,
                     http_status=range_probe.http_status,
@@ -1356,7 +1413,7 @@ def _metadata_probe(
         strategy_version=probe.strategy_version,
         method=probe.method,
         requested_url=probe.requested_url,
-        outcome=outcome,
+        outcome=_typed_probe_outcome(outcome),
         reason_code=reason_code,
         response=response,
         http_status=response.status,
@@ -1378,7 +1435,7 @@ def _empty_probe(
         strategy_version=version,
         method=method,
         requested_url=url,
-        outcome="skipped",
+        outcome=_typed_probe_outcome("skipped"),
         reason_code=reason,
         response=None,
         http_status=None,
