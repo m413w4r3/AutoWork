@@ -132,7 +132,7 @@ SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v9-source-publ
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 3
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
-SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v7-grounded-section-heading-facts"
+SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v8-event-quote-dates"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
@@ -2554,7 +2554,9 @@ def _resolve_claim_refs(
     return tuple(dict.fromkeys(refs))
 
 
-def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> bool:
+def _date_supported_by_payload(
+    payload: Mapping[str, Any], date_key: str, *, include_event_evidence_quote: bool = False
+) -> bool:
     if "event_date" in payload:
         date_text = payload["date_text"]
         # event_date is a sort key; date_text preserves the precision asserted
@@ -2562,9 +2564,14 @@ def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> boo
         if isinstance(date_text, str) and date_text.strip():
             return date_key in _date_literals(date_text)
         event_date = payload["event_date"]
+        # Keep date_text's asserted precision above; synthesis may otherwise
+        # use only this event's own source quote as the date fallback.
+        supporting_texts = (event_date or "", date_text or "")
+        if include_event_evidence_quote:
+            supporting_texts += (payload.get("evidence_quote", ""),)
         return any(
             date_key in _date_literals(value)
-            for value in (event_date or "", date_text or "")
+            for value in supporting_texts
             if isinstance(value, str)
         )
     if "category" not in payload:
@@ -2614,9 +2621,13 @@ def _validate_grounded_text(
                 ),
             )
     for date_key in _date_literals(text):
-        if not any(_date_supported_by_payload(entries[ref], date_key) for ref in refs):
+        if not any(
+            _date_supported_by_payload(entries[ref], date_key, include_event_evidence_quote=True)
+            for ref in refs
+        ):
             date_in_extraction = any(
-                _date_supported_by_payload(payload, date_key) for payload in entries.values()
+                _date_supported_by_payload(payload, date_key, include_event_evidence_quote=True)
+                for payload in entries.values()
             )
             cause = "not_supported_by_cited_handles" if date_in_extraction else "not_in_extraction"
             raise SynthesisProposalControlError(

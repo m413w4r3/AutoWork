@@ -1671,7 +1671,7 @@ def test_output_invalid_carries_a_diagnosable_reason():
 def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
     assert SYNTHESIS_POLICY_VERSION == "production-synthesis-v7-source-domain-grounding"
     assert synthesis_module.SYNTHESIS_VALIDATOR_VERSION == (
-        "synthesis-validator-v7-grounded-section-heading-facts"
+        "synthesis-validator-v8-event-quote-dates"
     )
     assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
         "synthesis-draft-v13-french-coverage-diagnostics"
@@ -2592,6 +2592,189 @@ def test_proposal_accepts_event_and_fact_supported_dates_and_rejects_unsupported
         "synthesis_unknown_date:claim=C009:literal_kind=date:literal_value=2026-07-04:"
         "reason=not_supported_by_cited_handles"
     )
+
+
+@pytest.mark.parametrize(
+    ("quote", "claim_text"),
+    (
+        (
+            "The operation was reported on February 4, 2026.",
+            "The operation was reported on February 4, 2026.",
+        ),
+        (
+            "L'opération a été signalée le 4 février 2026.",
+            "L'opération a été signalée le 4 février 2026.",
+        ),
+    ),
+)
+def test_proposal_accepts_event_date_in_own_quote_without_date_text(quote, claim_text):
+    subject_id, source_id = uuid4(), uuid4()
+    event = replace(
+        make_event(source_id, "The report describes the operation.", None),
+        evidence_quote=quote,
+    )
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, events=(event,)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    event_handle = str(
+        next(
+            record["handle"]
+            for record in pack.narrative_evidence
+            if record["kind"] == EvidenceKind.EVENT.value
+        )
+    )
+
+    lead, _ = validate_synthesis_proposal(make_proposal(claim_text, event_handle), pack, extraction)
+
+    assert lead[0].evidence_refs == (pack.resolve_handle(event_handle),)
+
+
+def test_proposal_does_not_use_another_events_quote_to_support_a_date():
+    subject_id, source_id = uuid4(), uuid4()
+    cited_event = replace(
+        make_event(source_id, "The campaign began.", None),
+        evidence_quote="The report describes the campaign.",
+    )
+    other_event = replace(
+        make_event(source_id, "A service outage ended.", None),
+        evidence_quote="This downtime ended on May 27, 2026.",
+    )
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, events=(cited_event, other_event)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value and record["text"] == "The campaign began."
+    )
+
+    with pytest.raises(SynthesisProposalControlError) as unsupported_date:
+        validate_synthesis_proposal(
+            make_proposal("The campaign ended on May 27, 2026.", cited_handle), pack, extraction
+        )
+
+    assert unsupported_date.value.reason.endswith("reason=not_supported_by_cited_handles")
+
+
+def test_proposal_keeps_imprecise_event_date_text_as_a_precision_assertion():
+    subject_id, source_id = uuid4(), uuid4()
+    event = replace(
+        make_event(
+            source_id, "The operation was documented.", date(2024, 6, 15), date_text="mid-2024"
+        ),
+        evidence_quote="The operation took place on June 15, 2024.",
+    )
+    extraction = make_extraction(subject_id, (make_source(source_id, events=(event,)),))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    event_handle = str(
+        next(
+            record["handle"]
+            for record in pack.narrative_evidence
+            if record["kind"] == EvidenceKind.EVENT.value
+        )
+    )
+
+    with pytest.raises(SynthesisProposalControlError) as unsupported_precision:
+        validate_synthesis_proposal(
+            make_proposal("The operation took place on June 15, 2024.", event_handle),
+            pack,
+            extraction,
+        )
+
+    assert unsupported_precision.value.reason.endswith("reason=not_in_extraction")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication_kind", (PublicationKind.ARTICLE, PublicationKind.BRIEF))
+async def test_synthesis_route_accepts_a_date_in_the_cited_event_quote(publication_kind):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    target_event = replace(
+        make_event(source_id, "The operation was reported.", None),
+        evidence_quote="The operation was reported on February 4, 2026.",
+    )
+    timeline_event = make_event(
+        source_id,
+        "The campaign began.",
+        date(2026, 2, 5),
+        date_text="February 5, 2026",
+    )
+    timeline_event = replace(
+        timeline_event,
+        evidence_quote="The campaign began on February 5, 2026.",
+    )
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(source_id, events=(target_event, timeline_event)),
+    )
+    projection = build_relevance_projection(snapshot, extraction)
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
+    target_handle = next(
+        str(record["handle"])
+        for record in evidence_pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+        and record["text"] == "The operation was reported."
+    )
+    wire = (
+        "@@TITLE@@\n[Example actor] Reports an operation\n@@END TITLE@@\n"
+        "@@LEAD@@\n@@CLAIM L001@@\n"
+        f"EVIDENCE: {target_handle}\n"
+        "TEXT: The operation was reported on February 4, 2026.\n"
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=wire))
+    projection_blob_id = uuid4()
+    world = _service_world(
+        snapshot,
+        extraction,
+        (make_document(subject_id, source_id),),
+        gateway,
+        extra_payloads={projection_blob_id: relevance_projection_to_json(projection)},
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash=projection.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=projection_blob_id,
+    )
+    routing_decision = ProductionRoutingDecisionV1(
+        decision_id=uuid4(),
+        production_run_id=world.run.id,
+        pipeline_generation=world.run.pipeline_generation,
+        extraction_artifact_id=world.artifact.id,
+        extraction_artifact_hash=canonical_extraction_hash(extraction),
+        relevance_artifact_id=projection_artifact.id,
+        relevance_artifact_hash=projection.projection_hash,
+        input_hash="d" * 64,
+        policy_version="test-publication-routing-v1",
+        status=RoutingStatus.DECIDED,
+        publication_kind=publication_kind,
+        reason_code=RoutingReasonCode.NO_SUBJECT_IOC,
+        confirmed_ioc_count=0,
+        contextual_ioc_count=0,
+        ambiguous_ioc_count=0,
+        critical_source_diagnostics=(),
+        decided_at=datetime.now(UTC),
+        decision_hash="e" * 64,
+    )
+
+    result = await world.service.execute(
+        world.run,
+        snapshot,
+        world.artifact,
+        projection_artifact,
+        routing_decision=routing_decision,
+    )
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert len(world.writer.calls) == 1
+    assert world.writer.calls[0]["publication_kind"] is publication_kind
 
 
 def test_proposal_rejects_removed_revision_evidence():
