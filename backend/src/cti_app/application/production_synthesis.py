@@ -329,6 +329,89 @@ def _wire_line(line: str) -> str:
     return value
 
 
+_INLINE_CODE_TECHNICAL_PUNCTUATION = frozenset(" ._:/\\@%+=,#?&~$(){}[]'\";-*|!<>")
+_INLINE_CODE_MAX_LENGTH = 200
+
+
+def _is_safe_inline_technical_literal(value: str) -> bool:
+    if (
+        not value
+        or len(value) > _INLINE_CODE_MAX_LENGTH
+        or value != value.strip()
+        or any(char in value for char in "`\r\n\t")
+        or not all(char.isalnum() or char in _INLINE_CODE_TECHNICAL_PUNCTUATION for char in value)
+        or _XML_TAG_NAME.search(value) is not None
+        or _MARKDOWN_TABLE_ROW.search(value) is not None
+        or _MARKDOWN_TABLE_SEPARATOR.search(value) is not None
+    ):
+        return False
+    return not _contains_markdown_or_html(value)
+
+
+def _unwrap_safe_inline_technical_code(value: str) -> tuple[str, int]:
+    """Remove only balanced, single-line code spans containing technical text."""
+    output: list[str] = []
+    unwrapped_count = 0
+    index = 0
+
+    def backtick_run_end(start: int) -> int:
+        end = start + 1
+        while end < len(value) and value[end] == "`":
+            end += 1
+        return end
+
+    while index < len(value):
+        if value[index] != "`":
+            output.append(value[index])
+            index += 1
+            continue
+
+        run_end = backtick_run_end(index)
+        run_length = run_end - index
+        if run_length >= 3:
+            search = run_end
+            closing_end: int | None = None
+            while search < len(value):
+                next_run = value.find("`", search)
+                if next_run < 0:
+                    break
+                next_end = backtick_run_end(next_run)
+                if next_end - next_run >= 3:
+                    closing_end = next_end
+                    break
+                search = next_end
+            if closing_end is None:
+                output.append(value[index:])
+                break
+            output.append(value[index:closing_end])
+            index = closing_end
+            continue
+        if run_length != 1:
+            output.append(value[index:run_end])
+            index = run_end
+            continue
+
+        closing_start = value.find("`", run_end)
+        if closing_start < 0:
+            output.append(value[index:])
+            break
+        closing_end = backtick_run_end(closing_start)
+        if closing_end - closing_start != 1:
+            output.append(value[index:run_end])
+            index = run_end
+            continue
+
+        literal = value[run_end:closing_start]
+        if _is_safe_inline_technical_literal(literal):
+            output.append(literal)
+            unwrapped_count += 1
+        else:
+            output.append(value[index:closing_end])
+        index = closing_end
+
+    return "".join(output), unwrapped_count
+
+
 def _wire_rejection(
     block_id: str, reason_code: str, raw_lines: Iterable[str]
 ) -> SynthesisWireRejection:
@@ -360,6 +443,7 @@ def parse_synthesis_proposal_wire(
         sanitized = sanitized[1:]
     normalized_endings = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     transformations = ("bridge_ui_markers_removed",) if sanitized != normalized_endings else ()
+    inline_code_spans_unwrapped = 0
     lines = sanitized.splitlines()
     rejected: list[SynthesisWireRejection] = []
     warnings: list[SynthesisWireWarning] = []
@@ -380,11 +464,19 @@ def parse_synthesis_proposal_wire(
     seen_ids: set[str] = set()
     seen_headings: set[str] = set()
 
+    def parser_transformations() -> tuple[str, ...]:
+        if inline_code_spans_unwrapped:
+            return (
+                *transformations,
+                f"synthesis_inline_code_spans_unwrapped:{inline_code_spans_unwrapped}",
+            )
+        return transformations
+
     def reject(block_id: str, code: str, raw_lines: Iterable[str]) -> None:
         rejected.append(_wire_rejection(block_id, code, raw_lines))
 
     def finish_claim() -> None:
-        nonlocal current_claim
+        nonlocal current_claim, inline_code_spans_unwrapped
         claim = current_claim
         current_claim = None
         if claim is None:
@@ -403,15 +495,19 @@ def parse_synthesis_proposal_wire(
         if not claim.text_started or not "\n".join(claim.text_lines).strip():
             reject(claim.block_id, "synthesis_claim_missing_text", claim.raw_lines)
             return
+        normalized_text, unwrapped_count = _unwrap_safe_inline_technical_code(
+            "\n".join(claim.text_lines).strip()
+        )
         try:
             parsed = SynthesisClaimProposalV1(
-                text="\n".join(claim.text_lines).strip(),
+                text=normalized_text,
                 evidence_handles=claim.evidence_handles,
                 claim_scope=claim.claim_scope,
             )
         except ValueError:
             reject(claim.block_id, "synthesis_claim_schema_invalid", claim.raw_lines)
             return
+        inline_code_spans_unwrapped += unwrapped_count
         parsed._block_id = claim.block_id
         if claim.group == "lead":
             lead.append(parsed)
@@ -464,7 +560,7 @@ def parse_synthesis_proposal_wire(
             reject(section.block_id, "synthesis_section_schema_invalid", section.raw_lines)
 
     def finish_source_note() -> None:
-        nonlocal current_source_note
+        nonlocal current_source_note, inline_code_spans_unwrapped
         note = current_source_note
         current_source_note = None
         if note is None:
@@ -477,7 +573,9 @@ def parse_synthesis_proposal_wire(
             reject(note.block_id, "synthesis_source_note_missing_evidence_handles", note.raw_lines)
             warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
             return
-        text = "\n".join(note.text_lines).strip()
+        text, unwrapped_count = _unwrap_safe_inline_technical_code(
+            "\n".join(note.text_lines).strip()
+        )
         if not text:
             reject(note.block_id, "synthesis_source_note_missing_text", note.raw_lines)
             warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
@@ -490,6 +588,7 @@ def parse_synthesis_proposal_wire(
                     text=text,
                 )
             )
+            inline_code_spans_unwrapped += unwrapped_count
         except ValueError:
             reject(note.block_id, "synthesis_source_note_schema_invalid", note.raw_lines)
             warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
@@ -876,7 +975,7 @@ def parse_synthesis_proposal_wire(
                 lead=(), sections=(), title=title, source_notes=tuple(source_notes)
             ),
             explicit_empty=True,
-            transformations=transformations,
+            transformations=parser_transformations(),
             warnings=tuple(warnings),
             diagnostics=tuple(diagnostics),
         )
@@ -885,7 +984,7 @@ def parse_synthesis_proposal_wire(
             None,
             tuple(rejected),
             error_code="synthesis_unintelligible_response",
-            transformations=transformations,
+            transformations=parser_transformations(),
             warnings=tuple(warnings),
             diagnostics=tuple(diagnostics),
         )
@@ -895,7 +994,7 @@ def parse_synthesis_proposal_wire(
             None,
             tuple(rejected),
             error_code="synthesis_lead_missing",
-            transformations=transformations,
+            transformations=parser_transformations(),
             warnings=tuple(warnings),
             diagnostics=tuple(diagnostics),
         )
@@ -911,14 +1010,14 @@ def parse_synthesis_proposal_wire(
             None,
             tuple(rejected),
             error_code="synthesis_proposal_schema_invalid",
-            transformations=transformations,
+            transformations=parser_transformations(),
             warnings=tuple(warnings),
             diagnostics=tuple(diagnostics),
         )
     return SynthesisWireParseResult(
         proposal,
         tuple(rejected),
-        transformations=transformations,
+        transformations=parser_transformations(),
         warnings=tuple(warnings),
         diagnostics=tuple(diagnostics),
     )

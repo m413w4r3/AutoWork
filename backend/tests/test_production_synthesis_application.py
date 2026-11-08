@@ -1685,7 +1685,7 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         SYNTHESIS_EDITORIAL_CONTRACT_V5
     )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
-        "synthesis-text-parser-v7-end-marker-tolerance"
+        "synthesis-text-parser-v8-inline-technical-code-normalization"
     )
 
 
@@ -1785,6 +1785,109 @@ def test_plain_text_validator_still_rejects_markup_and_markdown(text: str) -> No
     with pytest.raises(SynthesisProposalControlError) as invalid:
         synthesis_module._validate_plain_text(text)
     assert invalid.value.reason == "plain_text_violation"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        (
+            "Le fichier `updatelist.txt` est utilisé dans la chaîne observée.",
+            "Le fichier updatelist.txt est utilisé dans la chaîne observée.",
+        ),
+        (
+            "L'adresse `185.244.129.70`, associée à l'AS204641, est documentée.",
+            "L'adresse 185.244.129.70, associée à l'AS204641, est documentée.",
+        ),
+        (
+            "La réponse HTTP associée à `fdir.php` est décrite.",
+            "La réponse HTTP associée à fdir.php est décrite.",
+        ),
+        (
+            "Le lanceur `cmd.exe /c whoami.exe` est mentionné.",
+            "Le lanceur cmd.exe /c whoami.exe est mentionné.",
+        ),
+    ),
+)
+def test_wire_parser_unwraps_technical_inline_code_spans(text: str, expected: str) -> None:
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: E001\nTEXT: " + text
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.lead[0].text == expected
+    assert "synthesis_inline_code_spans_unwrapped:1" in parsed.transformations
+    synthesis_module._validate_plain_text(parsed.proposal.lead[0].text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "La commande ```powershell\nwhoami\n``` est citée.",
+        "La valeur `<script>` est citée.",
+        "La clé `ligne un\nligne deux` est citée.",
+        "La référence `updatelist.txt reste ouverte.",
+    ),
+)
+def test_wire_parser_leaves_unsafe_or_unbalanced_backticks_for_rejection(text: str) -> None:
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: E001\nTEXT: " + text
+    )
+
+    assert parsed.proposal is not None
+    assert not any(
+        item.startswith("synthesis_inline_code_spans_unwrapped:") for item in parsed.transformations
+    )
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        synthesis_module._validate_plain_text(parsed.proposal.lead[0].text)
+    assert invalid.value.reason == "plain_text_violation"
+
+
+def test_unwrapped_wire_technical_literal_still_runs_grounding() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT was identified."),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {handle}\n"
+        "TEXT: FooRAT contacted `185.244.129.70`, according to the report."
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.lead[0].text == (
+        "FooRAT contacted 185.244.129.70, according to the report."
+    )
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        validate_synthesis_proposal(parsed.proposal, pack, extraction)
+    assert invalid.value.code is SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE
+
+
+@pytest.mark.asyncio
+async def test_inline_code_unwrap_count_is_persisted_with_wire_diagnostics() -> None:
+    world = _fresh_setup()
+    raw = (
+        "@@LEAD@@\n@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: `FooRAT` was identified in the report.\n@@END LEAD@@"
+    )
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert world.writer.calls[0]["synthesis"].lead[0].text == (
+        "FooRAT was identified in the report."
+    )
+    assert (
+        "synthesis_inline_code_spans_unwrapped:1" in world.gateway.diagnostics[0]["transformations"]
+    )
+    assert result.model_run_id is not None
+    stored_run = world.gateway.runs[result.model_run_id]
+    assert stored_run.raw_output_sha256 == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.parametrize("section_kind", ("infection_chain", "campaign", "other", "overview"))
