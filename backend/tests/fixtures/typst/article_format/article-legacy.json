@@ -1,0 +1,56 @@
+{
+  "schema_version": "typst-publication-model-v32-brief-kind",
+  "kind": "article",
+  "document_label": "article-legacy-fixture",
+  "document_header": "Bulletin n°3 / Septembre 2026",
+  "brand_logo_available": true,
+  "title": "Article ancien sans format v33",
+  "overview": {"status_label": "STATUT INTERNE À MASQUER", "source_count": 7},
+  "content_sections": [
+    {
+      "type": "references",
+      "show_heading": true,
+      "sources": [
+        {"publisher": "Legacy Lab", "title": "Rapport conservé", "date": "2026-08-02", "url": "https://legacy.example.test/report"}
+      ],
+      "entries": [],
+      "timeline": [{"display_date": "LEGACY REFERENCE CHRONOLOGY", "text": "MUST NOT RENDER"}],
+      "blocks": []
+    },
+    {
+      "type": "chronology",
+      "timeline": [{"display_date": "2 août 2026", "text": "LEGACY CHRONOLOGY MUST NOT RENDER"}]
+    },
+    {
+      "type": "synthesis",
+      "blocks": [
+        {"type": "section_heading", "text": "Synthèse héritée"},
+        {"type": "paragraph", "text": "Le texte ancien reste lisible sans les champs ajoutés en v33."}
+      ]
+    },
+    {
+      "type": "ioc",
+      "source_indicators": [
+        {
+          "heading": "IPv4",
+          "items": [
+            {
+              "value": {"text": "203.0.113.19", "break_chunks": ["203.0.113.19"], "break_after": []},
+              "indicator_status_label": "Documenté dans l’article",
+              "relationship_status_label": "Candidat non confirmé",
+              "source_refs": [{"number": 4}]
+            }
+          ]
+        }
+      ],
+      "candidate_indicators": [
+        {"heading": "URLs", "items": [{"value": {"text": "contextual indicator", "break_chunks": ["contextual indicator"], "break_after": []}}]}
+      ]
+    },
+    {
+      "type": "technical_annex",
+      "title": "ANNEXE TECHNIQUE — inventaire exhaustif des IOC",
+      "publication_identity_provenance": "PROVENANCE DE PUBLICATION SHA-256 22222222222222222222222222222222"
+    }
+  ]
+}

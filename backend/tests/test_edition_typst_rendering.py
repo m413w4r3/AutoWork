@@ -411,9 +411,30 @@ async def test_real_typst_compiles_mixed_edition_without_empty_annex_or_demo_val
         "ARTICLES",
         "BRÈVES",
         "A short sourced update",
-        "One source event",
     ):
         assert expected in text
+    page_texts = [page.extract_text() or "" for page in reader.pages]
+    article_title = "A technical article without IOC annex"
+    article_page = next(
+        page_text for page_text in page_texts if article_title in page_text
+    )
+    brief_page = next(
+        page_text for page_text in page_texts if "A short sourced update" in page_text
+    )
+    assert "One source event" not in article_page
+    assert "Chronologie" not in article_page
+    assert "Chronologie" in brief_page
+    assert "One source event" in brief_page
+    for hidden in (
+        "PROVENANCE DE PUBLICATION",
+        "Indicateur :",
+        "Relation :",
+        "Candidat non confirmé",
+        "Pistes non confirmées",
+        "IOC de l'article",
+        "ANNEXE TECHNIQUE",
+    ):
+        assert hidden.casefold() not in article_page.casefold()
     for absent in (
         "Vue d'ensemble",
         "ANNEXE TECHNIQUE — inventaire exhaustif des IOC",
@@ -916,7 +937,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v28-brief-paragraph-gap"
+    assert bundle.template_version == "chp-edition-v29-article-format"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

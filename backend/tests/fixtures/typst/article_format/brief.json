@@ -1,0 +1,46 @@
+{
+  "schema_version": "typst-publication-model-v32-brief-kind",
+  "kind": "brief",
+  "document_label": "brief-fixture",
+  "document_header": "Bulletin n°3 / Septembre 2026",
+  "brand_logo_available": true,
+  "title": "Une brève mise à jour",
+  "article_format": null,
+  "content_sections": [
+    {
+      "type": "chronology",
+      "timeline": [
+        {"display_date": "8 septembre 2026", "text": "Un avis public confirme le correctif appliqué."}
+      ]
+    },
+    {
+      "type": "synthesis",
+      "blocks": [
+        {"type": "paragraph", "text": "La brève conserve sa chronologie et son résumé."}
+      ]
+    },
+    {
+      "type": "ioc",
+      "source_indicators": [
+        {
+          "heading": "Domaines",
+          "items": [
+            {
+              "value": {"text": "notice[.]example[.]test", "break_chunks": ["notice[.]example[.]test"], "break_after": []},
+              "indicator_status_label": "Documenté dans l’article",
+              "relationship_status_label": "Candidat non confirmé"
+            }
+          ]
+        }
+      ],
+      "candidate_indicators": [
+        {"heading": "URLs", "items": [{"value": {"text": "Pistes non confirmées", "break_chunks": ["Pistes non confirmées"], "break_after": []}}]}
+      ]
+    },
+    {
+      "type": "technical_annex",
+      "title": "ANNEXE TECHNIQUE — inventaire exhaustif des IOC",
+      "publication_identity_provenance": "PROVENANCE DE PUBLICATION SHA-256 33333333333333333333333333333333"
+    }
+  ]
+}
