@@ -939,9 +939,9 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "TABLE MINIMUM NOT MET" in article_contract
     assert "DIAGRAM OMITTED" in article_contract
     assert "ne dépasse jamais 9" in article_contract
-    assert "ne dépasse jamais 9" in brief_contract
     assert "Règles ARTICLE R7" not in brief_contract
     assert "TABLE MINIMUM NOT MET" not in brief_contract
+    assert "FIGURE SOURCE proposées ne dépasse jamais" not in brief_contract
 
 
 def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
@@ -2720,11 +2720,24 @@ def test_figure_selection_uses_accepted_catalog_bound_instead_of_three() -> None
         ).replace("FIGURE P001", f"FIGURE P{index:03d}")
         for index in range(1, 5)
     )
-    parsed = parse_editorial_enrichment_proposal_wire(over_limit, pack, figure_catalog=catalog)
+    parsed = parse_editorial_enrichment_proposal_wire(
+        over_limit,
+        pack,
+        figure_catalog=catalog,
+        maximum_figure_proposals=9,
+    )
+    brief_parsed = parse_editorial_enrichment_proposal_wire(
+        over_limit, pack, figure_catalog=catalog
+    )
     assert parsed.proposal is not None
     assert len(parsed.proposal.figures) == 4
     assert "editorial_enrichment_figure_limit_exceeded" not in {
         item.reason_code for item in parsed.rejections
+    }
+    assert brief_parsed.proposal is not None
+    assert len(brief_parsed.proposal.figures) == 3
+    assert "editorial_enrichment_figure_limit_exceeded" in {
+        item.reason_code for item in brief_parsed.rejections
     }
 
 
@@ -3030,6 +3043,20 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert extraction.sources[0].canonical_url not in request.text
     assert "F001" in request.text
     assert '"asset_url":null' in request.text
+
+    brief_request = build_editorial_enrichment_model_request(
+        run,
+        snapshot,
+        extraction,
+        synthesis,
+        pack,
+        access_policy,
+        figure_catalog=figure_catalog,
+        publication_kind=PublicationKind.BRIEF,
+    )
+    assert brief_request.web_search is True
+    assert brief_request.parameters["maximum_figure_proposals"] == 1
+    assert extraction.sources[0].canonical_url in brief_request.text
     assert '"source_page_url":null' in request.text
     assert '"source_caption":"ExampleRAT execution architecture"' in request.text
     assert '"evidence":["E001"]' in request.text

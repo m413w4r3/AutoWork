@@ -237,6 +237,7 @@ MAX_EDITORIAL_ENRICHMENT_TECHNICAL_EVIDENCE = 128
 # Reconstructed diagrams/charts are independent of source figures. Source-figure
 # selection is bounded by both this hard maximum and the configured inventory.
 MAX_ENRICHMENT_FIGURE_PROPOSALS = MAX_SOURCE_FIGURES
+MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS = 3
 MAX_ENRICHMENT_RESOURCE_NEEDS = 4
 MAX_ENRICHMENT_RESOURCE_PROPOSALS = 12
 
@@ -2430,6 +2431,7 @@ def parse_editorial_enrichment_proposal_wire(
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     *,
     figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
+    maximum_figure_proposals: int = MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS,
 ) -> EditorialEnrichmentWireParseResult:
     """Recover independent text blocks, leaving canonical validation strict."""
     if not isinstance(raw_text, str):
@@ -2842,6 +2844,7 @@ def parse_editorial_enrichment_proposal_wire(
     source_figure_questions: dict[str, str] = {}
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
     maximum_figure_proposals = min(
+        maximum_figure_proposals,
         MAX_ENRICHMENT_FIGURE_PROPOSALS,
         sum(
             entry.figure.decision is SourceFigureDecision.ACCEPTED
@@ -4972,9 +4975,15 @@ def build_editorial_resource_proposal_model_request(
 def editorial_enrichment_output_contract_example(
     *,
     publication_kind: PublicationKind | None = None,
-    maximum_figure_proposals: int = MAX_ENRICHMENT_FIGURE_PROPOSALS,
+    maximum_figure_proposals: int | None = None,
 ) -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
+    if maximum_figure_proposals is None:
+        maximum_figure_proposals = (
+            MAX_ENRICHMENT_FIGURE_PROPOSALS
+            if publication_kind is PublicationKind.ARTICLE
+            else MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS
+        )
     contract = (
         """Return independent plain-text blocks. Give every block a local id.
 Détermine intérieurement une question analytique pour chaque besoin.
@@ -5289,15 +5298,16 @@ décrire qu'un média analytique pertinent manquant. Ne renvoie aucune URL dans 
             "DIAGRAM OMITTED\n"
             "REASON: motif précis en français, sans fait nouveau\nEND DIAGRAM OMITTED\n"
         )
-    contract = contract.replace(
-        "Le renderer choisit les couleurs.",
-        "Le renderer choisit les couleurs. Le nombre de propositions FIGURE ne dépasse "
-        f"jamais {maximum_figure_proposals}.",
-    )
-    contract += (
-        f"\n\nLe nombre de FIGURE SOURCE proposées ne dépasse jamais "
-        f"{maximum_figure_proposals}."
-    )
+    if publication_kind is PublicationKind.ARTICLE:
+        contract = contract.replace(
+            "Le renderer choisit les couleurs.",
+            "Le renderer choisit les couleurs. Le nombre de propositions FIGURE ne dépasse "
+            f"jamais {maximum_figure_proposals}.",
+        )
+        contract += (
+            f"\n\nLe nombre de FIGURE SOURCE proposées ne dépasse jamais "
+            f"{maximum_figure_proposals}."
+        )
     return contract
 
 
@@ -5349,12 +5359,18 @@ def build_editorial_enrichment_model_request(
         source_figure_inventory_hash=source_figure_inventory_hash,
         projection_hash=evidence_pack.projection_hash,
     )
+    figure_proposal_ceiling = (
+        MAX_ENRICHMENT_FIGURE_PROPOSALS
+        if publication_kind is PublicationKind.ARTICLE
+        else MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS
+    )
+    accepted_figure_count = sum(
+        entry.figure.decision is SourceFigureDecision.ACCEPTED
+        for entry in figure_catalog
+    )
     maximum_figure_proposals = min(
-        MAX_ENRICHMENT_FIGURE_PROPOSALS,
-        sum(
-            entry.figure.decision is SourceFigureDecision.ACCEPTED
-            for entry in figure_catalog
-        ),
+        figure_proposal_ceiling,
+        accepted_figure_count,
     )
     article_requirements = (
         "ARTICLE R7 — exigences conditionnelles. Produis au moins deux TABLE utiles quand "
@@ -5515,8 +5531,8 @@ def build_editorial_enrichment_model_request(
         },
         "figure_catalog": [
             entry.prompt_record(
-                include_source_page=False,
-                include_asset_url=False,
+                include_source_page=publication_kind is not PublicationKind.ARTICLE,
+                include_asset_url=publication_kind is not PublicationKind.ARTICLE,
                 evidence_handles=evidence_pack.evidence_handles_for_source(
                     entry.figure.source_document_id
                 ),
@@ -5583,8 +5599,11 @@ def build_editorial_enrichment_model_request(
         external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
-        # Figure selection uses archived source context; this stage never browses.
-        web_search=False,
+        # ARTICLE figure selection uses archived context only. Preserve the
+        # legacy BRIEF lookup against source pages when accepted figures exist.
+        web_search=(
+            publication_kind is not PublicationKind.ARTICLE and accepted_figure_count > 0
+        ),
         background=False,
         conversation=None,
         run_id=editorial_enrichment_model_run_id(run, invocation_hash),
@@ -5830,6 +5849,7 @@ def validate_editorial_enrichment_proposal(
     warnings: tuple[str, ...] = (),
     accepted_blocks: tuple[EditorialEnrichmentAcceptedBlock, ...] = (),
     validation_rejections: list[EditorialEnrichmentValidationRejection] | None = None,
+    maximum_figure_proposals: int = MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS,
     _drop_invalid_blocks: bool = True,
 ) -> EditorialEnrichmentV1:
     """Resolve exact handles, ground technical literals, and build canonical V1."""
@@ -5850,6 +5870,7 @@ def validate_editorial_enrichment_proposal(
             message="evidence_pack_type_invalid",
         )
     maximum_figure_proposals = min(
+        maximum_figure_proposals,
         MAX_ENRICHMENT_FIGURE_PROPOSALS,
         sum(
             entry.figure.decision is SourceFigureDecision.ACCEPTED
@@ -5887,6 +5908,7 @@ def validate_editorial_enrichment_proposal(
                 resource_model_run_id=resource_model_run_id,
                 warnings=warnings,
                 accepted_blocks=accepted_blocks,
+                maximum_figure_proposals=maximum_figure_proposals,
                 _drop_invalid_blocks=False,
             )
         except EditorialEnrichmentProposalControlError as full_error:
@@ -5929,6 +5951,7 @@ def validate_editorial_enrichment_proposal(
                         resource_model_run_id=resource_model_run_id,
                         warnings=warnings,
                         accepted_blocks=accepted_blocks,
+                        maximum_figure_proposals=maximum_figure_proposals,
                         _drop_invalid_blocks=False,
                     )
                 except EditorialEnrichmentProposalControlError as block_error:
@@ -5995,6 +6018,7 @@ def validate_editorial_enrichment_proposal(
             resource_model_run_id=resource_model_run_id,
             warnings=tuple(dict.fromkeys((*warnings, *block_warnings))),
             accepted_blocks=accepted_blocks,
+            maximum_figure_proposals=maximum_figure_proposals,
             _drop_invalid_blocks=False,
         )
 
@@ -6792,6 +6816,11 @@ class ProductionEditorialEnrichmentService:
             resource_search_enabled=self._resource_search_enabled,
             publication_kind=publication_kind,
         )
+        maximum_figure_proposals = request.parameters.get(
+            "maximum_figure_proposals", MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS
+        )
+        if type(maximum_figure_proposals) is not int:
+            raise ValueError("Editorial Enrichment figure limit is invalid")
         model_run_id = request.run_id
         if model_run_id is None:
             raise ValueError("Editorial Enrichment request has no invocation identity")
@@ -6880,7 +6909,10 @@ class ProductionEditorialEnrichmentService:
                 model_calls=model_calls,
             )
         parsed = parse_editorial_enrichment_proposal_wire(
-            raw_text, evidence_pack, figure_catalog=figure_catalog
+            raw_text,
+            evidence_pack,
+            figure_catalog=figure_catalog,
+            maximum_figure_proposals=maximum_figure_proposals,
         )
         parse_identity = await self._record_wire_parse(
             model_run, evidence_pack, parsed, figure_catalog=figure_catalog
@@ -7059,6 +7091,7 @@ class ProductionEditorialEnrichmentService:
                 ),
                 accepted_blocks=parsed.accepted_blocks,
                 validation_rejections=validation_rejections,
+                maximum_figure_proposals=maximum_figure_proposals,
             )
         except EditorialEnrichmentProposalControlError as exc:
             validation_details = [item.to_json() for item in validation_rejections]
@@ -7501,8 +7534,16 @@ class ProductionEditorialEnrichmentService:
             details.update({"status": "raw_output_unverified", "error": raw_error})
             return first_pass, details, model_calls
         try:
+            maximum_figure_proposals = request.parameters.get(
+                "maximum_figure_proposals", MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS
+            )
+            if type(maximum_figure_proposals) is not int:
+                raise ValueError("Editorial Enrichment repair figure limit is invalid")
             repair_pass = parse_editorial_enrichment_proposal_wire(
-                raw_text, evidence_pack, figure_catalog=figure_catalog
+                raw_text,
+                evidence_pack,
+                figure_catalog=figure_catalog,
+                maximum_figure_proposals=maximum_figure_proposals,
             )
             parse_identity = await self._record_wire_parse(
                 execution.run,
