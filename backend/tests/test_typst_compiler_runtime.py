@@ -991,7 +991,7 @@ async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
 
 
 @pytest.mark.asyncio
-async def test_real_typst_keeps_invalid_url_note_with_candidate_heading(
+async def test_real_typst_hides_candidate_indicators_and_annex_from_legacy_render_data(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -1039,18 +1039,17 @@ async def test_real_typst_keeps_invalid_url_note_with_candidate_heading(
         )
     )
     reader = PdfReader(BytesIO(compiled.content), strict=True)
-    page_texts = [page.extract_text() or "" for page in reader.pages]
-    heading_page = next(
-        index for index, text in enumerate(page_texts) if "Pistes non confirmées" in text
-    )
-    note_page = next(
-        index
-        for index, text in enumerate(page_texts)
-        if "1 URL non valide(s) omise(s) des listes." in text
-    )
-    assert heading_page == note_page, (
-        f"candidate heading is on page {heading_page + 1}, invalid-URL note on page {note_page + 1}"
-    )
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    normalized_text = text.casefold()
+    for hidden in (
+        "Pistes non confirmées",
+        "Valeurs à vérifier",
+        "1 URL non valide(s) omise(s) des listes.",
+        "ANNEXE TECHNIQUE",
+        "candidate-000.example",
+        "a" * 64,
+    ):
+        assert hidden.casefold() not in normalized_text
 
 
 @pytest.mark.asyncio

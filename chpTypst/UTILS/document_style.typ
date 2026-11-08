@@ -27,7 +27,16 @@
   linebreak()
 }
 
-#let apply-document-style(body, country: none, period: none, draft-watermark: none) = {
+#let apply-document-style(
+  body,
+  country: none,
+  period: none,
+  bulletin-number: none,
+  bulletin-identifier: none,
+  document-header: none,
+  brand-logo-available: true,
+  draft-watermark: none,
+) = {
   set text(
     font: "Hanken Grotesk",
     size: 11pt,
@@ -42,10 +51,20 @@
       left: 2.2cm,
       right: 2.2cm,
     ),
-    header: report-header(country: country, period: period),
+    header: report-header(
+      country: country,
+      period: period,
+      bulletin-number: bulletin-number,
+      document-header: document-header,
+      brand-logo-available: brand-logo-available,
+    ),
+    header-ascent: 28pt,
     footer: report-footer(
       country: country,
       period: period,
+      bulletin-number: bulletin-number,
+      bulletin-identifier: bulletin-identifier,
+      document-header: document-header,
       draft-notice: draft-watermark,
     ),
   )

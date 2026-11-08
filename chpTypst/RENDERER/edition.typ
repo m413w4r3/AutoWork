@@ -4,18 +4,10 @@
 #let edition = json("edition-render-data.json")
 
 #apply-document-style(
-  country: edition.edition.bulletin_country,
+  country: edition.edition.country,
   period: edition.edition.bulletin_period,
+  bulletin-number: edition.edition.bulletin_number,
+  bulletin-identifier: edition.edition.bulletin_identifier,
 )[
-  #set page(
-    header: context {
-      if counter(page).get().first() > 1 {
-        align(right)[
-          #text(size: 8pt, fill: gray)[#edition.at("document_header", default: "Bulletin de veille CTI")]
-        ]
-      }
-    },
-    header-ascent: 14pt,
-  )
   #render-edition(edition)
 ]

@@ -898,11 +898,10 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert human_document_imports[document_style] == {"apply-document-style"}
     assert production_imports[publication_helpers] == {"render-publication"}
     assert human_imports[shared_helpers] >= {"article", "ioc-list", "styled-table"}
-    assert re.search(
-        r"#apply-document-style\s*(?:\(draft-watermark:[^\n]*\))?\s*\[.*?#render-publication\s*\(",
-        production_source,
-        re.DOTALL,
-    )
+    assert "#apply-document-style(" in production_source
+    assert "document-header: publication.at(" in production_source
+    assert "brand-logo-available: publication.at(" in production_source
+    assert "#render-publication(publication)" in production_source
     assert re.search(r"#apply-document-style\s*\[", human_document_source)
     assert re.search(r"#article\s*\(", human_source)
     assert not re.search(r"\barticle\s*\(", production_source + production_helpers_source)
@@ -914,12 +913,19 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
 
     production_helpers_imports = _resolved_imports(production_helpers_path)
     assert production_helpers_imports[shared_helpers] >= {
-        "section-title",
-        "timeline",
-        "ioc-list",
+        "semantic-text",
+        "semantic-or-plain",
+        "code-font-families",
+        "noteAnalyste",
+        "tag",
     }
     assert "source-list" not in production_helpers_imports[shared_helpers]
-    assert production_helpers_imports[colors] == {"accent", "grey", "purple"}
+    assert production_helpers_imports[colors] == {
+        "accent",
+        "grey",
+        "purple",
+        "purple-light",
+    }
     style_imports = _resolved_imports(document_style)
     assert style_imports[header_footer] == {"report-header", "report-footer"}
     assert style_imports[colors] == {"purple"}
@@ -949,14 +955,14 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
 
 def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> None:
     helpers = (_CHP_TYPST_ROOT / "RENDERER" / "publication_helpers.typ").read_text(encoding="utf-8")
-    assert '#let render-body-block(item, reference-scope: "", paragraph-gap: 3pt) = {' in helpers
+    assert '#let render-body-block(item, reference-scope: "", paragraph-gap: 5pt) = {' in helpers
     assert "#block(above: 0pt, below: paragraph-gap)[" in helpers
     synthesis_start = helpers.index('} else if content_section.type == "synthesis" [')
     chronology_start = helpers.index('] else if content_section.type == "chronology" [')
     synthesis = helpers[synthesis_start:chronology_start]
-    assert "paragraph-gap: 10pt" in synthesis
+    assert "paragraph-gap: 5pt" in synthesis
     assert synthesis.count("render-body-block(") == 2
-    assert synthesis.count("paragraph-gap: 10pt") == 1
+    assert synthesis.count("paragraph-gap: 5pt") == 1
     assert "render-body-block(item, reference-scope: reference-scope)" in synthesis
     assert "#set par(spacing: 1em)" not in synthesis
 
@@ -1004,11 +1010,8 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
 
     expected_text = (
         "CHP visual parity fixture",
-        "RÉFÉRENCES",
-        "No display date",
-        "One source event",
-        "Several source event",
-        "SYNTHÈSE",
+        "Références",
+        "Synthèse",
         "Accès initial",
         "Persistance",
         "Détection",
@@ -1079,12 +1082,12 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert "Synthèse" in brief_text
     assert "SYNTHÈSE" not in brief_text
     assert "Chronologie" in brief_text
-    assert "RÉFÉRENCES" not in brief_text
+    assert "Références" not in brief_text
     assert all(title not in brief_text for title in ("Accès initial", "Persistance", "Détection"))
     assert "extraction_source_skipped" not in text
     assert "synthesis_output_invalid" not in text
     assert "Attribution remains unresolved" not in text
-    assert text.count("RÉFÉRENCES") == 1
+    assert text.count("Références") == 1
     assert "CHRONOLOGIE" not in brief_text
     assert "Sources complémentaires" not in text
     assert "https://example.test/one" in brief_text
@@ -1904,16 +1907,17 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     )
     assert render_data["title"] in pdf_text
     assert "BROUILLON NON APPROUVÉ" in normalized_text
-    assert sum(line.strip() == "CHRONOLOGIE" for line in normalized_text.splitlines()) == 1
-    assert "IOC DE L'ARTICLE" in normalized_text
-    assert "IOC ORIGINAUX" in normalized_text
-    assert "PISTES NON CONFIRMÉES" in normalized_text
+    assert "CHRONOLOGIE" not in normalized_text
+    assert "IOC" in normalized_text
+    assert "IOC DE L'ARTICLE" not in normalized_text
+    assert "IOC ORIGINAUX" not in normalized_text
+    assert "PISTES NON CONFIRMÉES" not in normalized_text
     assert "CORE[.]EXAMPLE" in normalized_text
     assert "ORIGINAL[.]EXAMPLE" in normalized_text
     assert "CONTEXTUAL[.]EXAMPLE" in normalized_text
-    assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
-    assert "FAIT OBSERVÉ" in normalized_text
-    assert "EMPREINTE DE FICHIER" in normalized_text
+    assert "DOCUMENTÉ, NON OBSERVÉ" not in normalized_text
+    assert "FAIT OBSERVÉ" not in normalized_text
+    assert "EMPREINTE DE FICHIER" not in normalized_text
     assert "D" * 64 not in normalized_text
     assert "OBSERVED_CONTACT" not in normalized_text
     assert "CONTACT OBSERVÉ" in normalized_text
@@ -2405,8 +2409,8 @@ async def test_real_typst_omits_references_heading_when_timeline_is_empty(
     )
     text, _ = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
 
-    assert "SYNTHÈSE" in text
-    assert "RÉFÉRENCES" not in text
+    assert "Synthèse" in text
+    assert "Références" not in text
 
 
 async def test_real_typst_renders_annotated_literal_content_without_evaluating_it(
@@ -2508,7 +2512,7 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
 
 
 @pytest.mark.asyncio
-async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
+async def test_real_typst_frontmatter_hides_internal_and_legacy_annex_indicators(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -2552,42 +2556,27 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     )
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     text, compact_text = _normalized_pdf_text(reader)
-    assert len(reader.pages) >= 2
+    assert len(reader.pages) >= 1
     assert "[Example actor] Décrit une activité documentée" in text
-    assert "RÉFÉRENCES" in text
+    assert "Références" in text
     assert "Technical IOC feed" in text
     assert "Contexte technique" in text
-    candidate_heading = "Pistes non confirmées"
-    assert candidate_heading in text
-    original_position = text.index("IOC originaux")
-    candidate_position = text.index(candidate_heading)
-    assert text.index("core[.]example") < candidate_position
+    assert "IOC" in text
+    assert "core[.]example" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Date de publication non précisée" in text
-    assert all(f"original-{index:03d}[.]example" in compact_text for index in range(120))
-    candidate_end = text.index("ANNEXE TECHNIQUE", candidate_position)
-    candidate_list_text = text[candidate_position:candidate_end]
-    originals_text = text[original_position:candidate_position]
-    assert all(f"original-{index:03d}[.]example" in originals_text for index in range(120))
-    assert all(f"original-{index:03d}[.]example" not in candidate_list_text for index in range(120))
-
-    output_dir = anyio.Path(
-        os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", str(tmp_path / "review"))
-    )
-    await output_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = output_dir / "frontmatter-ioc-review.pdf"
-    await pdf_path.write_bytes(compiled.content)
-    rasterizer = shutil.which("pdftoppm")
-    assert rasterizer is not None, "pdftoppm is required to save review PNG pages"
-    png_prefix = output_dir / "frontmatter-ioc-review"
-    rasterized = await anyio.run_process(
-        (rasterizer, "-png", "-r", "120", str(pdf_path), str(png_prefix)),
-        check=False,
-    )
-    assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
-    review_pages = [path async for path in output_dir.glob("frontmatter-ioc-review-*.png")]
-    assert len(review_pages) >= 2
+    assert all(f"original-{index:03d}[.]example" not in compact_text for index in range(120))
+    for hidden in (
+        "IOC de l'article",
+        "IOC originaux",
+        "Pistes non confirmées",
+        "ANNEXE TECHNIQUE",
+        "Candidat non confirmé",
+        "Indicateur :",
+        "Relation :",
+    ):
+        assert hidden.casefold() not in text.casefold()
 
 
 @pytest.mark.asyncio
@@ -2660,7 +2649,7 @@ async def test_real_typst_wide_component_cards_keep_filenames_and_paths_readable
     assert any("Blackwood.dll" in line for line in extracted_text.splitlines())
     assert "Program Files" in extracted_text
     assert "ProgramData" in extracted_text
-    ioc_start = extracted_text.index("IOC de l'article")
+    ioc_start = extracted_text.index("IOC")
     assert hash_value in re.sub(r"\s+", "", extracted_text[ioc_start:])
     assert hash_value not in re.sub(r"\s+", "", extracted_text[:ioc_start])
 

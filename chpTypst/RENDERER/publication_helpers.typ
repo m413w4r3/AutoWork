@@ -1,16 +1,7 @@
-#import "../UTILS/helpers.typ": section-title, timeline, ioc-list, semantic-text, semantic-or-plain, code-font-families, noteAnalyste
-#import "../UTILS/colors.typ": accent, grey, purple
+#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, code-font-families, noteAnalyste, tag
+#import "../UTILS/colors.typ": accent, grey, purple, purple-light
 
 #let has-text(value) = value != none and value != ""
-#let has-ioc-values(indicators) = {
-  if indicators == none {
-    false
-  } else {
-    ("ips", "domains", "urls", "emails", "hashes").any(
-      key => indicators.at(key, default: ()).len() > 0,
-    )
-  }
-}
 
 #let publication-display-text(item) = {
   if type(item) == str {
@@ -36,15 +27,128 @@
   }
 }
 
-#let render-breakable-token(value, chunk-size: 16) = {
-  let clusters = value.clusters()
-  let start = 0
-  while start < clusters.len() {
-    let end = calc.min(start + chunk-size, clusters.len())
-    text(clusters.slice(start, end).join(""))
-    if end < clusters.len() { h(0.01pt) }
-    start = end
-  }
+#let render-section-heading(title, level: 1) = heading(level: level)[#title]
+
+#let render-article-overview(overview) = {
+  let fields = (
+    ("Victimologie", overview.at("victimology", default: none)),
+    ("Arsenal", overview.at("arsenal", default: none)),
+    ("Objectif principal", overview.at("main_objective", default: none)),
+  )
+  let visible-fields = fields.filter(entry => entry.at(1) != none)
+  if visible-fields.len() > 0 [
+    #block(
+      width: 100%,
+      above: 10pt,
+      below: 8pt,
+      fill: purple-light,
+      inset: 12pt,
+      radius: 4pt,
+      breakable: false,
+    )[
+      #text(size: 14pt, weight: "extrabold", fill: purple)[Vue d'ensemble]
+      #v(4pt)
+      #for (label, field) in visible-fields [
+        #let value = if type(field) == str { field } else { field.at("text", default: "") }
+        #block(below: 3pt)[
+          #text(size: 9pt, weight: "semibold", fill: purple)[• #label : ]
+          #text(size: 9pt)[#value]
+        ]
+      ]
+    ]
+  ]
+}
+
+#let render-article-timeline(events) = {
+  if events.len() >= 2 [
+    #render-section-heading[Chronologie]
+    #for (index, event) in events.enumerate() [
+      #grid(
+        columns: (12pt, 1fr),
+        column-gutter: 8pt,
+        align: (center, left),
+        [#circle(radius: 3pt, fill: purple)],
+        [
+          #block(above: 0pt, below: 4pt)[
+            #text(size: 9pt, weight: "bold", fill: purple)[#event.display_date_fr]
+            #linebreak()
+            #text(size: 10pt)[#text(event.text)]
+          ]
+        ],
+      )
+      #if index < events.len() - 1 [
+        #grid(
+          columns: (12pt, 1fr),
+          column-gutter: 8pt,
+          align: (center, left),
+          [#rect(width: 1.2pt, height: 10pt, fill: purple-light, radius: 0.6pt)],
+          [],
+        )
+      ]
+    ]
+    #v(4pt)
+  ]
+}
+
+#let render-article-ioc-category(label, values) = {
+  if values.len() > 0 [
+    #block(sticky: true)[
+      #block(above: 5pt, below: 2pt)[
+        #text(size: 10pt, weight: "bold", fill: purple)[#(label + " :")]
+      ]
+      #set text(hyphenate: false)
+      #for item in values [
+        #block(above: 0pt, below: 2pt)[
+          #text(size: 8.75pt)[#publication-display-text(item.value)]
+        ]
+      ]
+    ]
+  ]
+}
+
+#let render-article-iocs(article-format) = {
+  let categories = article-format.at("ioc_categories", default: ())
+  let ips = categories.at("ips", default: ())
+  let urls = categories.at("urls", default: ())
+  let domains = categories.at("domains", default: ())
+  let files = categories.at("files", default: ())
+  if ips.len() + urls.len() + domains.len() + files.len() > 0 [
+    #block(sticky: true)[
+      #render-section-heading[IOC]
+      #render-article-ioc-category("Adresses IP", ips)
+      #render-article-ioc-category("URL", urls)
+      #render-article-ioc-category("Noms de domaine", domains)
+      #render-article-ioc-category("Fichiers", files)
+    ]
+  ]
+}
+
+#let render-legacy-iocs(content-sections) = {
+  let ioc-sections = content-sections.filter(section => section.type == "ioc")
+  let has-values = ioc-sections.any(section => {
+    section.at("source_indicators", default: ()).any(
+      group => group.at("items", default: ()).len() > 0,
+    )
+  })
+  if has-values [
+    #render-section-heading[IOC]
+    #for section in ioc-sections {
+      for group in section.at("source_indicators", default: ()) {
+        let items = group.at("items", default: ())
+        if items.len() > 0 [
+          #block(above: 5pt, below: 2pt, sticky: true)[
+            #text(size: 10pt, weight: "bold", fill: purple)[#(group.heading + " :")]
+          ]
+          #set text(hyphenate: false)
+          #for item in items [
+            #block(above: 0pt, below: 2pt)[
+              #text(size: 8.75pt)[#publication-display-text(item.value)]
+            ]
+          ]
+        ]
+      }
+    }
+  ]
 }
 
 #let publication-detection-code-line(item) = {
@@ -183,41 +287,41 @@
   }
 }
 
-#let render-publication-reference(entry, fallback-number, reference-scope: "") = {
-  let number = entry.at("number", default: fallback-number)
-  let display-date = entry.at("display_date", default: "Date de publication non précisée")
+#let render-publication-reference(entry) = {
+  let publisher = entry.at("publisher", default: "")
+  let title = entry.at("title", default: "")
+  let display-date = entry.at("display_date", default: entry.at("date", default: ""))
+  let url = entry.at("url", default: none)
   let source-urls = entry.at("source_urls", default: ())
-  let target-id = entry.at(
-    "target_id",
-    default: "publication-source-legacy-" + str(number),
-  )
   let entry-text = entry.at("text", default: "")
-  block(above: 4pt, below: 5pt)[
+  let publisher = if has-text(publisher) { str(publisher) } else { "" }
+  let title = if has-text(title) { str(title) } else { "" }
+  let display-date = if has-text(display-date) { str(display-date) } else { "" }
+  let entry-text = if has-text(entry-text) { entry-text } else { "" }
+  let primary-url = if url != none { url } else if source-urls.len() > 0 { source-urls.first() } else { none }
+  let next-urls = source-urls.filter(candidate => candidate != primary-url)
+  let has-label = title != "" or entry-text != ""
+  list.item[
     #set par(justify: false)
-    #text(size: 8pt, fill: grey)[#number. #display-date]
-    #if entry.at("role_label", default: none) != none [
-      #h(0.5em)
-      #text(size: 7pt, weight: "bold", fill: grey)[#entry.role_label]
-    ]
-    #linebreak()
-    #v(2pt)
-    #if source-urls.len() > 0 [
-      #let primary-url = source-urls.first()
-      #link(primary-url)[#semantic-or-plain(entry-text, entry.at("semantic_spans", default: none))]
-      #if entry-text != primary-url [
-        #linebreak()
-        #text(size: 7pt, fill: grey)[#number ]
-        #link(primary-url)[#text(size: 7pt, fill: grey)[#primary-url]]
+    #if publisher != "" [#text(publisher)]
+    #if has-label [
+      #if publisher != "" [ — ]
+      #if title != "" [#text(title)] else [
+        #semantic-or-plain(entry-text, entry.at("semantic_spans", default: none))
       ]
-      #for url in source-urls.slice(1) [
-        #linebreak()
-        #text(size: 7pt, fill: grey)[#number ]
-        #link(url)[#text(size: 7pt, fill: grey)[#url]]
-      ]
-    ] else [
-      #semantic-or-plain(entry-text, entry.at("semantic_spans", default: none))
     ]
-    #label(reference-scope + target-id)
+    #if display-date != "" [
+      #if publisher != "" or has-label [ — ]
+      #text(display-date)
+    ]
+    #if primary-url != none [
+      #if publisher != "" or has-label or display-date != "" [ — ]
+      #link(primary-url)[#text(primary-url)]
+    ]
+    #for next-url in next-urls [
+      #text(" — ")
+      #link(next-url)[#text(next-url)]
+    ]
   ]
 }
 
@@ -268,7 +372,8 @@
   if body-row-count <= 12 {
     block(
       breakable: breakable,
-      above: if title == none { 0pt } else { 6pt },
+      above: 10pt,
+      below: 8pt,
     )[
       #if title != none [
         #title
@@ -277,13 +382,15 @@
       #rendered-table
     ]
   } else {
-    if title != none [
-      #block(sticky: true, above: 6pt)[
-        #title
-        #v(4pt)
+    block(above: 10pt, below: 8pt)[
+      #if title != none [
+        #block(sticky: true)[
+          #title
+          #v(4pt)
+        ]
       ]
+      #rendered-table
     ]
-    rendered-table
   }
 }
 
@@ -361,7 +468,7 @@
   let semantic-cells = item.at("semantic_cells", default: none)
   let card-display-cells = item.at("card_display_cells", default: ())
   if item.columns.len() > 2 {
-    block(above: 6pt)[
+    block(above: 10pt, below: 8pt)[
       #if title != none [#title]
       #for (row-index, row) in item.rows.enumerate() [
         #block(
@@ -450,103 +557,6 @@
   ]
 }
 
-#let render-publication-provenance(document-label, document-label-display: none) = {
-  let display = if document-label-display == none { document-label } else { document-label-display }
-  block(
-    width: 100%,
-    above: 4pt,
-    below: 4pt,
-    fill: rgb("#F8FAFC"),
-    stroke: 0.4pt + rgb("#D0D5DD"),
-    inset: 6pt,
-    radius: 3pt,
-    breakable: true,
-  )[
-    #set par(justify: false)
-    #text(size: 8pt, weight: "bold", fill: accent)[PROVENANCE DE PUBLICATION]
-    #linebreak()
-    #text(size: 7.5pt, fill: grey)[Identité complète : ]
-    #text(font: code-font-families, size: 7.5pt, fill: grey, hyphenate: false)[
-      #publication-display-text(display)
-    ]
-  ]
-}
-
-#let render-ioc-table(groups, reference-scope: "") = {
-  for group in groups {
-    let hash-only = group.rows.len() > 0 and group.rows.all(row => row.type == "hash")
-    let header-cells = if hash-only {
-      ([Empreinte de fichier — une valeur par ligne], [Statut, relation et provenance])
-    } else {
-      ([Type], [Valeur défanguée], [Statut indicateur], [Statut relation], [Contexte et provenance])
-    }
-    let body-cells = if hash-only {
-      group.rows.map(row => (
-        [
-          #text(font: code-font-families, size: 9pt, hyphenate: false)[
-            #render-breakable-token(row.value)
-          ]
-        ],
-        [
-          #text(size: 8.5pt, weight: "bold")[Ind. #row.at("indicator_status_short_label", default: row.at("indicator_status_label", default: "")) · Rel. #row.at("relationship_status_short_label", default: row.at("relationship_status_label", default: row.status_label))]
-          #let context-summary = row.at("hash_context_summary", default: row.at("context_summary", default: ""))
-          #let source-refs = row.at("source_refs", default: ())
-          #if context-summary != "" [
-            #linebreak()
-            #text(size: 8.5pt, fill: grey)[#context-summary]
-          ]
-          #if source-refs.len() > 0 [
-            #if context-summary != "" [#text(size: 8.5pt, fill: grey)[ · ]]
-            #text(size: 8.5pt, fill: grey)[src ]
-            #text(size: 8.5pt, fill: grey)[#render-source-references(source-refs, reference-scope: reference-scope)]
-          ]
-          #let draft-refs = row.at("draft_refs", default: ())
-          #if draft-refs.len() > 0 [
-            #if context-summary != "" or source-refs.len() > 0 [#text(size: 8.5pt, fill: grey)[ · ]]
-            #render-opinion-references(draft-refs, reference-scope: reference-scope)
-          ]
-        ],
-      )).flatten()
-    } else {
-      group.rows.map(row => (
-        [#text(size: 9pt, weight: "bold")[#row.type_label]],
-        [#text(font: code-font-families, size: 9pt, hyphenate: false)[#semantic-or-plain(row.value, row.value_spans)]],
-        [#text(size: 8.5pt, weight: "bold")[#row.at("indicator_status_label", default: "")]],
-        [#text(size: 8.5pt, weight: "bold")[#row.at("relationship_status_label", default: row.status_label)]],
-        [
-          #let context-summary = row.at("context_summary", default: "")
-          #if context-summary != "" [#text(size: 8.5pt, fill: grey)[#context-summary]]
-          #let source-refs = row.at("source_refs", default: ())
-          #if source-refs.len() > 0 [
-            #if context-summary != "" [#linebreak()]
-            #text(size: 8.5pt, fill: grey)[src #render-source-references(source-refs, reference-scope: reference-scope)]
-          ]
-          #let draft-refs = row.at("draft_refs", default: ())
-          #if draft-refs.len() > 0 [
-            #if context-summary != "" or source-refs.len() > 0 [#linebreak()]
-            #render-opinion-references(draft-refs, reference-scope: reference-scope)
-          ]
-        ],
-      )).flatten()
-    }
-    block(sticky: true, above: 3pt, below: 1pt)[
-      #text(size: 9pt, weight: "bold")[#group.heading]
-    ]
-    publication-styled-table(
-      if hash-only {
-        (0.55, 0.45).map(weight => weight * 1fr)
-      } else {
-        (0.65, 1.45, 1.15, 1.15, 2.35).map(weight => weight * 1fr)
-      },
-      cell-align: if hash-only { (left, left) } else { (left, left, left, left, left) },
-      breakable: true,
-      text-size: 9pt,
-      inset: (x: 4pt, y: 2.5pt),
-      ..(header-cells + body-cells),
-    )
-  }
-}
-
 #let render-figure-caption(
   number,
   caption,
@@ -566,34 +576,6 @@
     #v(bottom-space)
   ],
 )
-
-#let render-derived-timeline-figure(data, reference-scope: "") = {
-  let header-cells = ([Date], [Événement et source])
-  let body-cells = data.events.map(event => (
-    [#text(size: 9pt, weight: "bold")[#event.date]],
-    [
-      #text(size: 9pt, hyphenate: false)[#event.text]
-      #let source-refs = event.at("source_refs", default: ())
-      #if source-refs.len() > 0 [
-        #linebreak()
-        #text(size: 7.5pt, fill: grey)[Sources : #render-source-references(source-refs, reference-scope: reference-scope)]
-      ]
-    ],
-  )).flatten()
-  block(breakable: true, above: 2pt)[
-    #render-figure-caption(data.figure_number, data.title, none, top-space: 5pt)
-    #if has-text(data.at("caption", default: none)) [
-      #text(size: 8pt, fill: grey, style: "italic")[#data.caption]
-      #v(4pt)
-    ]
-    #publication-styled-table(
-      (1.15, 4.85).map(weight => weight * 1fr),
-      cell-align: (left, left),
-      breakable: true,
-      ..(header-cells + body-cells),
-    )
-  ]
-}
 
 #let render-investigation-chain-figure(data, reference-scope: "") = {
   block(breakable: true)[
@@ -711,7 +693,8 @@
 #let render-publication-image(media-path, caption, annotation: [], max-height-fraction: 0.82) = block(
   breakable: false,
   width: 100%,
-  below: 10pt,
+  above: 10pt,
+  below: 8pt,
 )[
   #layout(size => {
     let natural-image = image(media-path)
@@ -858,89 +841,9 @@
   ]
 ]
 
-#let render-ioc-item(item, reference-scope: "") = {
-  list.item[
-    #text(font: code-font-families, size: 8.5pt, hyphenate: false)[#publication-display-text(item.value)]
-    #let indicator-status = item.at("indicator_status_label", default: none)
-    #let relationship-status = item.at("relationship_status_label", default: none)
-    #if has-text(indicator-status) or has-text(relationship-status) [
-      #linebreak()
-      #text(size: 7pt, fill: grey)[
-        #if has-text(indicator-status) [Indicateur : #text(indicator-status)]
-        #if has-text(indicator-status) and has-text(relationship-status) [ · ]
-        #if has-text(relationship-status) [Relation : #text(relationship-status)]
-      ]
-    ]
-    #let source-refs = item.at("source_refs", default: ())
-    #let opinion-refs = item.at("draft_refs", default: ())
-    #if source-refs.len() > 0 or opinion-refs.len() > 0 [
-      #text(size: 7pt, fill: grey)[ · ]
-      #render-source-references(source-refs, reference-scope: reference-scope)
-      #if source-refs.len() > 0 and opinion-refs.len() > 0 [ · ]
-      #render-opinion-references(opinion-refs, reference-scope: reference-scope)
-    ]
-  ]
-}
-
-#let render-ioc-groups(
-  groups,
-  skip-first-heading: false,
-  skip-first-item: false,
-  reference-scope: "",
-) = {
-  for (group-index, group) in groups.enumerate() {
-    if not (skip-first-heading and skip-first-item and group-index == 0 and group.items.len() == 1) {
-      block(above: 5pt, below: 2pt)[
-        #if not (skip-first-heading and group-index == 0) [
-          #text(size: 10pt, weight: "bold")[#group.heading]
-        ]
-      ]
-    }
-    for (item-index, item) in group.items.enumerate() {
-      if not (skip-first-item and group-index == 0 and item-index == 0) {
-        render-ioc-item(item, reference-scope: reference-scope)
-      }
-    }
-  }
-}
-
-#let render-ioc-section(title, description, groups, reference-scope: "") = {
-  if groups.len() == 0 {
-    block(breakable: false)[
-      #section-title[#title]
-      #if description != none [
-        #text(size: 8pt, fill: grey)[#description]
-      #linebreak()
-      ]
-    ]
-  } else {
-    let first-group = groups.first()
-    let first-item = first-group.items.first()
-    block(breakable: false)[
-      #section-title[#title]
-      #if description != none [
-        #text(size: 8pt, fill: grey)[#description]
-      ]
-      #v(6pt)
-      #block(above: 4pt, below: 2pt)[
-        #text(size: 10pt, weight: "bold")[#first-group.heading]
-      ]
-      #render-ioc-item(first-item, reference-scope: reference-scope)
-    ]
-    render-ioc-groups(
-      groups,
-      skip-first-heading: true,
-      skip-first-item: true,
-      reference-scope: reference-scope,
-    )
-  }
-}
-
-#let render-body-block(item, reference-scope: "", paragraph-gap: 3pt) = {
+#let render-body-block(item, reference-scope: "", paragraph-gap: 5pt) = {
   let body = if item.type == "section_heading" {
-    block(sticky: true, above: 7pt, below: 5pt)[
-      #heading(level: 3)[#item.text]
-    ]
+    heading(level: 2)[#item.text]
   } else if item.type == "paragraph" {
     [
       #block(above: 0pt, below: paragraph-gap)[
@@ -950,7 +853,9 @@
       #parbreak()
     ]
   } else if item.type == "analyst_observation" {
-    render-analyst-observation(item, reference-scope: reference-scope)
+    block(above: 10pt, below: 8pt)[
+      #render-analyst-observation(item, reference-scope: reference-scope)
+    ]
   } else if item.type == "table" {
     render-table(item)
   } else if item.type == "diagram" {
@@ -967,97 +872,79 @@
 
 #let render-publication-body(publication, reference-scope: "") = {
   let brief-publication = publication.at("kind", default: "article") == "brief"
+  let article-format = publication.at("article_format", default: none)
+  let article-events = if article-format == none {
+    ()
+  } else {
+    article-format.at("timeline_key_events", default: ())
+  }
+  let has-chronology-section = publication.content_sections.any(
+    section => section.type == "chronology",
+  )
+  let has-synthesis-section = publication.content_sections.any(
+    section => section.type == "synthesis",
+  )
   for content_section in publication.content_sections {
     if content_section.type == "references" {
-      let legacy-timeline = content_section.at("timeline", default: ())
-      let has-entries = content_section.at("entries", default: none) != none
-      let has-legacy-chronology = (
-        not has-entries
-        and legacy-timeline.len() > 0
-        and legacy-timeline.all(
-          event => event.at("number", default: none) == none
-            and event.at("target_id", default: none) == none,
-        )
-      )
-      let entries = if has-entries {
-        content_section.entries
-      } else if has-legacy-chronology {
-        ()
-      } else {
-        legacy-timeline
-      }
+      let sources = content_section.at("sources", default: ())
+      let entries = if sources.len() > 0 { sources } else { content_section.at("entries", default: ()) }
       let blocks = content_section.at("blocks", default: ())
       if brief-publication {
         for item in blocks {
           render-body-block(item, reference-scope: reference-scope)
         }
-      } else if entries.len() > 0 or has-legacy-chronology or blocks.len() > 0 [
+      } else if entries.len() > 0 or blocks.len() > 0 [
         #if content_section.at("show_heading", default: true) [
-          #section-title[RÉFÉRENCES]
+          #render-section-heading[Références]
         ]
-        #if has-legacy-chronology [
-          #render-publication-timeline(legacy-timeline, reference-scope: reference-scope)
-        ] else [
-          #for (index, entry) in entries.enumerate() [#render-publication-reference(entry, index + 1, reference-scope: reference-scope)]
+        #set list(spacing: 4pt, indent: 12pt)
+        #for entry in entries [
+          #render-publication-reference(entry)
         ]
         #for item in blocks {
           render-body-block(item, reference-scope: reference-scope)
         }
       ]
     } else if content_section.type == "synthesis" [
+      #if not brief-publication and article-format != none and not has-chronology-section [
+        #render-article-timeline(article-events)
+        #let overview = article-format.at("overview", default: none)
+        #if overview != none [#render-article-overview(overview)]
+      ]
       #if brief-publication [
-        #section-title[Synthèse]
+        #render-section-heading[Synthèse]
         #for item in content_section.at("blocks", default: ()) {
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: 10pt,
+            paragraph-gap: 5pt,
           )
         }
       ] else [
-        #section-title[SYNTHÈSE]
+        #render-section-heading[Synthèse]
         #for item in content_section.at("blocks", default: ()) {
           render-body-block(item, reference-scope: reference-scope)
         }
       ]
     ] else if content_section.type == "chronology" [
       #let brief-chronology = publication.at("kind", default: "article") == "brief"
-      #let timeline-order = not brief-chronology
-      #let chronology-date-fill = if brief-chronology { purple } else { none }
       #if brief-chronology [
-        #section-title[Chronologie]
-      ] else [
-        #section-title[CHRONOLOGIE]
-      ]
-      #let derived-figure = content_section.at("derived_timeline_figure", default: none)
-      #if brief-chronology or derived-figure == none [
+        #render-section-heading[Chronologie]
         #render-publication-timeline(
           content_section.timeline,
-          ordered: timeline-order,
           reference-scope: reference-scope,
-          date-fill: chronology-date-fill,
+          date-fill: purple,
           footnotes: brief-chronology,
         )
       ] else [
-        #render-derived-timeline-figure(derived-figure, reference-scope: reference-scope)
-        // The derived figure only carries exact ISO-dated events.  Keep every
-        // other canonical chronology entry visible instead of dropping it.
-        #let figure-texts = derived-figure.at("events", default: ()).map(event => event.text)
-        #let undated-entries = content_section.timeline.filter(
-          entry => not figure-texts.contains(entry.text),
-        )
-        #if undated-entries.len() > 0 [
-          #v(8pt)
-          #render-publication-timeline(
-            undated-entries,
-            ordered: timeline-order,
-            reference-scope: reference-scope,
-            date-fill: chronology-date-fill,
-          )
+        #render-article-timeline(article-events)
+        #if article-format != none [
+          #let overview = article-format.at("overview", default: none)
+          #if overview != none [#render-article-overview(overview)]
         ]
       ]
     ] else if content_section.type == "limitations" [
-      #section-title[LIMITES DES PREUVES]
+      #render-section-heading[Limites des preuves]
       #for item in content_section.items [
         #render-opinion-text(item.at("text_spans", default: none), item.text)
         #let source-refs = item.at("source_refs", default: ())
@@ -1066,7 +953,7 @@
           #text(size: 7.5pt, fill: grey)[Sources : ]
           #for (index, source-ref) in source-refs.enumerate() [
             #if index > 0 [ · ]
-            #link(source-ref.url)[#str(source-ref.number)]
+            #super[#link(source-ref.url)[#str(source-ref.number)]]
           ]
         ]
         #parbreak()
@@ -1075,10 +962,9 @@
       #if source-list.len() > 0 [
         #v(3pt)
         #text(size: 8pt, weight: "bold")[Sources]
+        #set list(spacing: 3pt, indent: 12pt)
         #for source in source-list [
-          #linebreak()
-          #text(size: 7pt, fill: grey)[#str(source.number) · ]
-          #link(source.url)[#text(size: 7pt, fill: grey)[#source.url]]
+          #list.item[#link(source.url)[#text(size: 7pt, fill: grey)[#source.url]]]
         ]
       ]
     ] else if content_section.type == "analyst_opinion" [
@@ -1096,7 +982,7 @@
         or content_section.at("infrastructure_graph_figure", default: none) != none
       )
       #if has-opinion-content [
-      #section-title[AVIS DE L'ANALYSTE]
+      #render-section-heading[Avis de l'analyste]
       #for item in opinion-blocks [
         #heading(level: 3)[#item.number #text(item.heading)]
         #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
@@ -1140,7 +1026,7 @@
       ]
     ] else if content_section.type == "technical_materials" [
       #v(12pt)
-      #section-title[#text(content_section.heading)]
+      #render-section-heading[#text(content_section.heading)]
       #text(size: 8pt)[ · Valeurs reproduites en clair telles qu’observées dans l’échantillon.]
       #if content_section.editorial_text != none [
         #v(5pt)
@@ -1167,7 +1053,7 @@
       ]
       #text(size: 7pt, fill: grey)[#text(content_section.attacker_identifier_note)]
     ] else if content_section.type == "detection" [
-      #section-title[DÉTECTION]
+      #render-section-heading[Détection]
       #block(
         width: 100%,
         fill: rgb("#fff8e8"),
@@ -1227,175 +1113,26 @@
           publication-detection-code-line(line)
         }
       ]
-    ] else if content_section.type == "ioc" [
-      #v(16pt)
-      #render-ioc-section(
-        "IOC de l'article",
-        none,
-        content_section.source_indicators,
-        reference-scope: reference-scope,
-      )
-      #if content_section.original_indicators.len() > 0 [
-        #v(8pt)
-        #render-ioc-section(
-          "IOC originaux",
-          "Découverts dans les sources de ce run et associés au sujet par l'extrait cité.",
-          content_section.original_indicators,
-          reference-scope: reference-scope,
-        )
-      ]
-      #let omitted-url-count = content_section.at("omitted_invalid_url_count", default: 0)
-      #if content_section.candidate_indicators.len() > 0 [
-        #v(8pt)
-        #let candidate-description = if omitted-url-count > 0 {
-          (
-            "Éléments à examiner, sans promotion au statut d'IOC confirmé. "
-            + str(omitted-url-count)
-            + " URL non valide(s) omise(s) des listes."
-          )
-        } else {
-          "Éléments à examiner, sans promotion au statut d'IOC confirmé."
-        }
-        #render-ioc-section(
-          "Pistes non confirmées",
-          candidate-description,
-          content_section.candidate_indicators,
-          reference-scope: reference-scope,
-        )
-      ]
-      #if content_section.candidate_indicators.len() == 0 and omitted-url-count > 0 [
-        #block(sticky: true)[
-          #text(size: 8pt, fill: grey)[#omitted-url-count URL non valide(s) omise(s) des listes.]
-        ]
-      ]
-    ] else if content_section.type == "technical_annex" [
-      #let ioc_rows = content_section.at("ioc_rows", default: ())
-      #let ioc_row_groups = content_section.at("ioc_row_groups", default: ())
-      #let legacy_indicators = content_section.at("indicators", default: none)
-      #let legacy_original_indicators = content_section.at("original_indicators", default: none)
-      #let has-legacy-iocs = has-ioc-values(legacy_indicators)
-      #let has-original-iocs = has-ioc-values(legacy_original_indicators)
-      #let has-ioc-annex = ioc_rows.len() > 0 or has-legacy-iocs or has-original-iocs
-      #let identity-provenance = content_section.at("publication_identity_provenance", default: none)
-      #let implant_identifier_rows = content_section.at("implant_identifier_rows", default: ())
-      #let opinion_refs = content_section.at("opinion_refs", default: ())
-      #let figure-provenance = content_section.at("protocol_figure_provenance", default: ())
-      #let has-technical-annex-content = (
-        has-ioc-annex
-        or has-text(identity-provenance)
-        or implant_identifier_rows.len() > 0
-        or opinion_refs.len() > 0
-        or figure-provenance.len() > 0
-      )
-      #if has-technical-annex-content [
-      #set page(flipped: true)
-      #if has-text(identity-provenance) [
-        #section-title[PROVENANCE DE PUBLICATION]
-        #text(size: 7.5pt, fill: grey)[Identité de base : #identity-provenance]
-        #v(5pt)
-      ]
-      #if ioc_rows.len() > 0 [
-        #v(16pt)
-        #section-title[ANNEXE TECHNIQUE — inventaire exhaustif des IOC]
-        #render-ioc-table(ioc_row_groups, reference-scope: reference-scope)
-      ] else if has-legacy-iocs [
-        #ioc-list(
-          title: [IOC],
-          note: content_section.at("original_indicator_note", default: none),
-          ips: legacy_indicators.at("ips", default: ()),
-          domains: legacy_indicators.at("domains", default: ()),
-          urls: legacy_indicators.at("urls", default: ()),
-          emails: legacy_indicators.at("emails", default: ()),
-          hashes: legacy_indicators.at("hashes", default: ()),
-        )
-      ]
-      #if implant_identifier_rows.len() > 0 [
-        #v(10pt)
-        #section-title[IDENTIFIANT C2 DE L’IMPLANT — IOC]
-        #text(size: 7pt, fill: grey)[Valeur observée dans l’échantillon; identifiant passif, sans authentification.]
-        #for item in implant_identifier_rows [
-          #block(breakable: false, width: 100%, above: 3pt, below: 5pt)[
-            #text(size: 8pt, weight: "bold")[#text(item.type_label)]
-            #text(size: 8pt)[ · Rôle : #text(item.role)]
-            #linebreak()
-            #text(size: 7pt)[Valeur : ]
-            #box[#text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.value)]]
-            #linebreak()
-            #text(size: 7pt)[Échantillon : ]
-            #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_sha256)]
-            #text(size: 7pt)[ · Emplacement : ]
-            #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_location)]
-            #linebreak()
-            #text(size: 7pt)[Preuve : ]
-            #link(label(reference-scope + item.evidence_ref.target_id))[#text(item.evidence_ref.label)]
-          ]
-        ]
-      ]
-      #if ioc_rows.len() == 0 and has-original-iocs [
-        #v(8pt)
-        #ioc-list(
-          title: [IOC originaux à lien non démontré],
-          note: content_section.at("original_indicator_note", default: none),
-          ips: legacy_original_indicators.at("ips", default: ()),
-          domains: legacy_original_indicators.at("domains", default: ()),
-          urls: legacy_original_indicators.at("urls", default: ()),
-          emails: legacy_original_indicators.at("emails", default: ()),
-          hashes: legacy_original_indicators.at("hashes", default: ()),
-        )
-      ]
-      #if opinion_refs.len() > 0 [
-        #v(10pt)
-        #section-title[ANNEXE DE TRAÇABILITÉ]
-        #text(size: 8pt, fill: grey)[Les renvois courts du corps désignent les identifiants canoniques suivants.]
-        #let finding-refs = opinion_refs.filter(item => item.kind_label == "Finding")
-        #let evidence-refs = opinion_refs.filter(item => item.kind_label == "Évidence")
-        #for (group-title, refs) in (("Findings", finding-refs), ("Évidences", evidence-refs)) [
-          #if refs.len() > 0 [
-            #v(4pt)
-            #text(size: 8pt, weight: "bold")[#group-title]
-            #grid(
-              columns: (1fr, 1fr),
-              column-gutter: 8pt,
-              row-gutter: 2pt,
-              ..refs.map(item => [
-                #block(breakable: false)[
-                  #text(size: 7.5pt, weight: "bold")[#item.label #label(reference-scope + item.target_id)]
-                  #h(0.35em)
-                  #link(item.href)[
-                    #text(font: code-font-families, size: 7.5pt, hyphenate: false)[
-                      #publication-display-text(item.reference_id_spans)
-                    ]
-                  ]
-                ]
-              ]),
-            )
-          ]
-        ]
-      ]
-      #if figure-provenance.len() > 0 [
-        #v(10pt)
-        #section-title[PROVENANCE DES FIGURES D'AVIS]
-        #for figure in figure-provenance [
-          #block(above: 3pt, below: 5pt, breakable: true)[
-            #text(size: 8pt, weight: "bold")[#figure.kind_label]
-            #linebreak()
-            #text(size: 7pt)[Identifiant d'actif : ]
-            #text(font: code-font-families, size: 7pt, hyphenate: false)[#figure.asset_id]
-            #for field in ("model_sha256", "spec_sha256", "asset_sha256", "preview_sha256", "pin_sha256") [
-              #if figure.at(field, default: none) != none [
-                #linebreak()
-                #text(size: 7pt)[#field : ]
-                #text(font: code-font-families, size: 6.5pt, hyphenate: false)[#figure.at(field)]
-              ]
-            ]
-          ]
-        ]
-      ]
-      #set page(flipped: false)
-      ]
+    ] else if content_section.type == "ioc" or content_section.type == "technical_annex" [
+      // Reader-facing IOC values are emitted once from article_format below.
+      // Legacy status groups and the exhaustive technical annex stay canonical data only.
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
     }
+  }
+  if not brief-publication {
+    if article-format != none {
+      if not has-chronology-section and not has-synthesis-section [
+        #render-article-timeline(article-events)
+        #let overview = article-format.at("overview", default: none)
+        #if overview != none [#render-article-overview(overview)]
+      ]
+      render-article-iocs(article-format)
+    } else {
+      render-legacy-iocs(publication.content_sections)
+    }
+  } else {
+    render-legacy-iocs(publication.content_sections)
   }
 }
 
@@ -1407,40 +1144,24 @@
   [
     #render-target(
       publication.at("article_title_target_id", default: none),
-      heading(level: 1)[#publication.title],
+      if publication.at("kind", default: "article") == "brief" [
+        #heading(level: 1)[#publication.title]
+      ] else [
+        #text(size: 16pt, weight: "regular", fill: purple)[#publication.title]
+      ],
     )
-    #let overview = publication.at("overview", default: none)
-    #if overview != none [
-      #block(
-        width: 100%,
-        above: 2pt,
-        below: 8pt,
-        fill: rgb("#F1F6F5"),
-        stroke: 0.5pt + rgb("#CAD8D6"),
-        inset: (x: 9pt, y: 7pt),
-        radius: 4pt,
-        breakable: false,
-      )[
-        #grid(
-          columns: (1fr, auto),
-          column-gutter: 12pt,
-          [
-            #text(size: 7pt, weight: "bold", fill: accent)[STATUT]
-            #linebreak()
-            #text(size: 8.5pt)[#overview.status_label]
-          ],
-          [
-            #text(size: 7pt, weight: "bold", fill: accent)[SOURCES]
-            #linebreak()
-            #text(size: 8.5pt)[#str(overview.source_count)]
-          ],
-        )
-      ]
+    #if publication.at("kind", default: "article") != "brief" [
+      #grid(
+        columns: (1fr, auto),
+        align: (left, right),
+        [#tag("Article")],
+        [
+          #let number = publication.at("number", default: none)
+          #if number != none [#text(size: 11pt, weight: "bold", fill: purple)[#number]]
+        ],
+      )
+      #v(10pt)
     ]
-    #render-publication-provenance(
-      document-label,
-      document-label-display: publication.at("document_label_display", default: document-label),
-    )
     #render-publication-body(publication)
   ]
 }

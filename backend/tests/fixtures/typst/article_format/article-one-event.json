@@ -1,0 +1,20 @@
+{
+  "schema_version": "typst-publication-model-v33-article-format",
+  "kind": "article",
+  "document_label": "article-one-event-fixture",
+  "document_header": "Bulletin n°3 / Septembre 2026",
+  "brand_logo_available": true,
+  "title": "Article avec un seul événement",
+  "article_format": {
+    "overview": null,
+    "timeline_key_events": [
+      {"date_iso": "2026-09-09", "display_date_fr": "9 septembre 2026", "text": "Événement unique."}
+    ],
+    "ioc_categories": {"ips": [], "urls": [], "domains": [], "files": []}
+  },
+  "content_sections": [
+    {"type": "references", "show_heading": true, "sources": [], "entries": [], "blocks": []},
+    {"type": "chronology", "timeline": [{"display_date": "LEGACY EMPTY TEST", "text": "MUST NOT RENDER"}]},
+    {"type": "synthesis", "blocks": [{"type": "paragraph", "text": "Une brève séquence documentée."}]}
+  ]
+}

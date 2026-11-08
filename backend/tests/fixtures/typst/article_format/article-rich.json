@@ -1,0 +1,139 @@
+{
+  "schema_version": "typst-publication-model-v33-article-format",
+  "kind": "article",
+  "document_label": "article-rich-fixture",
+  "document_header": "Bulletin n°3 / Septembre 2026",
+  "brand_logo_available": true,
+  "title": "[APT Exemple] Chaîne d’exploitation ciblée",
+  "overview": {
+    "status_label": "STATUT INTERNE À MASQUER",
+    "source_count": 99
+  },
+  "article_format": {
+    "overview": {
+      "victimology": {"text": "Organisations publiques en Europe."},
+      "arsenal": {"text": "Un chargeur et deux modules documentés."},
+      "main_objective": {"text": "Collecte de renseignements."}
+    },
+    "timeline_key_events": [
+      {
+        "date_iso": "2026-09-09",
+        "display_date_fr": "9 septembre 2026",
+        "text": "Un courriel ciblé distribue le chargeur initial."
+      },
+      {
+        "date_iso": "2026-09-21",
+        "display_date_fr": "21 septembre 2026",
+        "text": "Le module secondaire communique avec l’infrastructure observée."
+      }
+    ],
+    "ioc_categories": {
+      "ips": [
+        {"value": {"text": "192.0.2.77", "break_chunks": ["192.0.2.77"], "break_after": []}}
+      ],
+      "urls": [
+        {"value": {"text": "hxxps://c2[.]example[.]test/api", "break_chunks": ["hxxps://", "c2[.]example[.]test", "/api"], "break_after": [false, true]}}
+      ],
+      "domains": [
+        {"value": {"text": "relay[.]example[.]test", "break_chunks": ["relay[.]example[.]test"], "break_after": []}}
+      ],
+      "files": [
+        {"value": {"text": "8a9f9e24b4f9e2f2f6e578d7fd5a3d70", "break_chunks": ["8a9f9e24b4f9e2f2f6e578d7fd5a3d70"], "break_after": []}},
+        {"value": {"text": "C:\\ProgramData\\agent.dll", "break_chunks": ["C:\\ProgramData\\agent.dll"], "break_after": []}}
+      ]
+    }
+  },
+  "content_sections": [
+    {
+      "type": "references",
+      "show_heading": true,
+      "sources": [
+        {
+          "publisher": "Example Research",
+          "title": "Analyse de la chaîne observée",
+          "date": "2026-09-09",
+          "url": "https://example.test/report"
+        },
+        {
+          "publisher": "Threat Desk",
+          "title": "Suivi des modules secondaires",
+          "date": "2026-09-21",
+          "url": "https://threat.example.test/analysis"
+        }
+      ],
+      "entries": [
+        {
+          "display_date": "9 septembre 2026",
+          "text": "Legacy reference text must not replace the editor/title fields.",
+          "source_urls": ["https://example.test/report"]
+        }
+      ],
+      "timeline": [
+        {"display_date": "LEGACY REFERENCE TIMELINE", "text": "MUST NOT RENDER"}
+      ],
+      "blocks": []
+    },
+    {
+      "type": "chronology",
+      "timeline": [
+        {"display_date": "LEGACY CHRONOLOGY", "text": "MUST NOT RENDER"}
+      ],
+      "derived_timeline_figure": {
+        "title": "LEGACY DATE/TABLE FIGURE MUST NOT RENDER",
+        "events": []
+      }
+    },
+    {
+      "type": "synthesis",
+      "blocks": [
+        {"type": "section_heading", "text": "Séquence d’intrusion"},
+        {
+          "type": "paragraph",
+          "text": "Les opérateurs envoient un message ciblé puis exécutent le chargeur décrit dans l’analyse."
+        },
+        {
+          "type": "table",
+          "title": "Composants documentés",
+          "columns": ["Composant", "Rôle observé"],
+          "column_weights": [1.0, 1.6],
+          "rows": [
+            ["Loader", "Chargement du module secondaire"],
+            ["Module", "Échange avec l’infrastructure"]
+          ],
+          "caption": "Tableau 1 : Rôles décrits dans les sources."
+        },
+        {
+          "type": "figure",
+          "figure_number": 1,
+          "caption": "Chaîne d’exécution résumée",
+          "media_path": "media/attack-chain.svg",
+          "source_note": "Example Research",
+          "attribution": "Reconstitution à partir du rapport cité."
+        }
+      ]
+    },
+    {
+      "type": "ioc",
+      "source_indicators": [
+        {
+          "heading": "IPv4",
+          "items": [
+            {
+              "value": {"text": "198.51.100.66", "break_chunks": ["198.51.100.66"], "break_after": []},
+              "indicator_status_label": "Candidat non confirmé",
+              "relationship_status_label": "contextual indicator"
+            }
+          ]
+        }
+      ],
+      "candidate_indicators": [
+        {"heading": "URLs", "items": [{"value": {"text": "hxxps://candidate[.]invalid", "break_chunks": ["hxxps://candidate[.]invalid"], "break_after": []}}]}
+      ]
+    },
+    {
+      "type": "technical_annex",
+      "title": "ANNEXE TECHNIQUE — inventaire exhaustif des IOC",
+      "publication_identity_provenance": "PROVENANCE DE PUBLICATION SHA-256 11111111111111111111111111111111"
+    }
+  ]
+}

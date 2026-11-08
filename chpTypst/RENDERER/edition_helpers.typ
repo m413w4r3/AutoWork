@@ -1,6 +1,6 @@
 #import "../UTILS/colors.typ": purple
 #import "../UTILS/helpers.typ": article-indexing, better-link, styled-table, tag
-#import "publication_helpers.typ": render-publication-body, render-publication-provenance, render-target
+#import "publication_helpers.typ": render-publication-body, render-target
 
 #let has-text(value) = value != none and value != ""
 #let publication-reference-scope(publication) = "edition-article-" + str(publication.position) + "-"
@@ -14,7 +14,7 @@
   #pagebreak()
   #render-target(
     publication.at("article_title_target_id", default: none),
-    [#heading(level: 1, numbering: none)[#publication.title] #label(publication.anchor)],
+    [#text(size: 16pt, weight: "regular", fill: purple)[#publication.title] #label(publication.anchor)],
   )
   #grid(
     columns: (1fr, auto),
@@ -79,11 +79,6 @@
       #text(size: 10pt)[Classification : #edition.edition.tlp]
     ]
   ]
-
-  render-publication-provenance(
-    document-label,
-    document-label-display: edition.at("document_label_display", default: document-label),
-  )
 
   v(16pt)
   heading(level: 1)[Résumé de l'actualité #tag("ARTICLES")]

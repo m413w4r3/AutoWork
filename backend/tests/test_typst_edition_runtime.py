@@ -4,17 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
-import subprocess
-import xml.etree.ElementTree as ET
 from dataclasses import replace
 from io import BytesIO
-from itertools import pairwise
 from pathlib import Path
-from typing import TypedDict
 from uuid import UUID
 
-import anyio
 import pytest
 from pypdf import PdfReader
 
@@ -60,20 +54,6 @@ _EDITION_RENDER_LABEL = (
     "Édition publiée 00000000-0000-4000-8000-000000000020 "
     "— release 00000000-0000-4000-8000-000000000099"
 )
-
-
-class _BBoxWord(TypedDict):
-    text: str
-    x_min: float
-    y_min: float
-    x_max: float
-    y_max: float
-
-
-class _BBoxPage(TypedDict):
-    index: int
-    height: float
-    words: list[_BBoxWord]
 
 
 def _pdf_fragment_baselines(page, fragments: tuple[str, ...]) -> dict[str, tuple[float, ...]]:
@@ -281,17 +261,13 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert "Provenance :" not in text
     # L5: the uncertainty list is no longer published inside the article body.
     assert "Attribution remains uncertain" not in text
-    assert text.count("RÉFÉRENCES") >= 1
-    assert text.index("RÉFÉRENCES") < text.index("CHRONOLOGIE") < text.index("SYNTHÈSE")
+    assert text.count("Références") >= 1
+    assert text.index("Références") < text.index("Synthèse")
     page_texts = [page.extract_text() or "" for page in reader.pages]
-    first_article_page_text = next(page_text for page_text in page_texts if "SYNTHÈSE" in page_text)
-    assert "SYNTHÈSE" in first_article_page_text
-    assert "CHRONOLOGIE" in first_article_page_text
+    first_article_page_text = next(page_text for page_text in page_texts if "Synthèse" in page_text)
+    assert "Synthèse" in first_article_page_text
     assert "Chronologie" not in first_article_page_text
-    if "CHRONOLOGIE" in first_article_page_text:
-        assert first_article_page_text.index("CHRONOLOGIE") < first_article_page_text.index(
-            "SYNTHÈSE"
-        )
+    assert "CHRONOLOGIE" not in first_article_page_text
     assert text.index("Article with titled synthesis") < text.index("Short operational update")
     brief_page_text = next(
         page_text
@@ -299,7 +275,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
         if "Short operational update" in page_text and "Chronologie" in page_text
     )
     assert brief_page_text.index("Short operational update") < brief_page_text.index("BRÈVE")
-    assert "RÉFÉRENCES" not in brief_page_text
+    assert "Références" not in brief_page_text
     assert brief_page_text.index("Chronologie") < brief_page_text.index("Synthèse")
     assert "SYNTHÈSE" not in brief_page_text
     assert "https://example.test/one" in brief_page_text
@@ -320,9 +296,15 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert all(baselines.values())
     first_y = max(baselines["Brief body first paragraph."])
     second_y = max(baselines["Brief body second paragraph."])
-    assert first_y - second_y >= 21
+    assert first_y - second_y >= 16
     assert max(baselines["https://example.test/one"]) < second_y
-    assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
+    for footer_label in (
+        "Bulletin-IR2609",
+        "Actualité des codes et infrastructures Iran",
+        "Bulletin n°1",
+        "septembre 2026",
+    ):
+        assert footer_label in text
     for placeholder in (
         "Bulletin-CODE",
         "Bulletin n°XX",
@@ -332,7 +314,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     ):
         assert placeholder not in text
     page_count = len(reader.pages)
-    assert f"{page_count} / {page_count}" in text
+    assert re.search(rf"{page_count}\s*/\s*{page_count}", text)
     assert "Brèves" not in text
     assert "N/A" not in text
     assert "https://example.test/figure.png" not in text
@@ -402,7 +384,7 @@ async def test_real_typst_compiles_legacy_and_current_semantic_policies_together
 
 
 @pytest.mark.asyncio
-async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_together(
+async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_technical_annex(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -411,7 +393,6 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     finding_id = UUID(int=701)
     evidence_id = UUID(int=702)
     hash_value = "d" * 64
-    document_label = f"synthetic-publication-provenance-reference-{hash_value}"
     table_lines = [
         "Synthetic table preface marker.",
         "| Component | State | Context | Marker |",
@@ -445,14 +426,11 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     )
     preview = TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion)
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
-    source = TypstRenderer().render(preview, template_bundle, document_label=document_label)
+    source = TypstRenderer().render(preview, template_bundle, document_label="synthetic-layout")
     render_data = json.loads(source.render_data_bytes)
     section_types = [item["type"] for item in render_data["content_sections"]]
     assert section_types[0] == "references"
     assert section_types.index("references") < section_types.index("synthesis")
-    if "chronology" in section_types:
-        assert section_types.index("references") < section_types.index("chronology")
-        assert section_types.index("chronology") < section_types.index("synthesis")
 
     opinion_section = next(
         item for item in render_data["content_sections"] if item["type"] == "analyst_opinion"
@@ -472,45 +450,29 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
     annex = next(
         item for item in render_data["content_sections"] if item["type"] == "technical_annex"
     )
-    annex["ioc_rows"] = [*annex["ioc_rows"], {"type": "domain"}]
-    annex["ioc_row_groups"].extend(
-        (
-            {
-                "heading": "Synthetic hash fixture",
-                "rows": [
-                    {
-                        "type": "hash",
-                        "type_label": "SHA-256",
-                        "value": hash_value,
-                        "status_label": "Confirmé",
-                        "indicator_status_short_label": "Confirmé",
-                        "relationship_status_short_label": "Lien établi",
-                        "hash_context_summary": "HASH_CONTEXT_SYNTHETIC",
-                        "context_summary": "HASH_CONTEXT_SYNTHETIC",
-                        "source_refs": [{"number": 1}],
-                        "draft_refs": [],
-                    }
-                ],
-            },
-            {
-                "heading": "Synthetic network fixture",
-                "rows": [
-                    {
-                        "type": "domain",
-                        "type_label": "Domaine",
-                        "value": f"netrow{index:03d}.fixture.invalid",
-                        "value_spans": None,
-                        "status_label": "Confirmé",
-                        "indicator_status_label": "Confirmé",
-                        "relationship_status_label": "Lien établi",
-                        "context_summary": f"NET_CONTEXT_{index:03d}",
-                        "source_refs": [{"number": 1}],
-                        "draft_refs": [],
-                    }
-                    for index in range(1, 51)
-                ],
-            },
-        )
+    annex["ioc_row_groups"].append(
+        {
+            "heading": "Synthetic hidden values",
+            "rows": [
+                {
+                    "type": "hash",
+                    "type_label": "SHA-256",
+                    "value": hash_value,
+                    "status_label": "Confirmé",
+                    "context_summary": "HASH_CONTEXT_SYNTHETIC",
+                    "source_refs": [{"number": 1}],
+                    "draft_refs": [],
+                },
+                {
+                    "type": "domain",
+                    "type_label": "Domaine",
+                    "value": "hidden-netrow.fixture.invalid",
+                    "context_summary": "NET_CONTEXT_SYNTHETIC",
+                    "source_refs": [{"number": 1}],
+                    "draft_refs": [],
+                },
+            ],
+        }
     )
     modified_render_data = json.dumps(
         render_data,
@@ -536,127 +498,44 @@ async def test_real_typst_publication_layout_keeps_tables_notes_and_provenance_t
             font_paths=materialize_font_bundle(font_snapshot, font_root),
         )
     )
-    pdf_path = tmp_path / "m07-layout.pdf"
-    pdf_path.write_bytes(compiled.content)
     reader = PdfReader(BytesIO(compiled.content), strict=True)
-    text, text_without_whitespace = _normalized_pdf_text(reader)
+    text, compact_text = _normalized_pdf_text(reader)
     page_texts = [page.extract_text() or "" for page in reader.pages]
 
-    assert "SYNTHÈSE" in page_texts[0]
-    assert re.search(r"Confiance\s*:\s*\d+\s*%", text, flags=re.IGNORECASE) is None
-    assert "Fait étayé" in text
-    assert "[F1]" in text and "[E1]" in text
-    assert "Run token" in text
-    assert "Run `token`" not in text
-    assert hash_value in text_without_whitespace
-    assert "PROVENANCE DE PUBLICATION" in page_texts[0]
-    assert "NET_CONTEXT_050" in page_texts[-1]
-    assert "netrow050.fixture.invalid" in page_texts[-1]
-    assert len(page_texts) >= 5
+    assert "Synthèse" in text
+    assert "Synthetic table preface marker." in text
+    assert "PIPE_ROW_45" in text and "Synthetic table note marker." in text
+    assert "Run token" in text and "[F1]" in text and "[E1]" in text
+    assert hash_value not in compact_text
+    for hidden in (
+        "PROVENANCE DE PUBLICATION",
+        "ANNEXE TECHNIQUE",
+        "HASH_CONTEXT_SYNTHETIC",
+        "NET_CONTEXT_SYNTHETIC",
+        "hidden-netrow.fixture.invalid",
+    ):
+        assert hidden not in text
+    pages_with_last_row = [
+        index for index, page_text in enumerate(page_texts) if "PIPE_ROW_45" in page_text
+    ]
+    pages_with_note = [
+        index
+        for index, page_text in enumerate(page_texts)
+        if "Synthetic table note marker." in page_text
+    ]
+    assert pages_with_last_row == pages_with_note
 
     mono_fonts: list[str] = []
-    context_font_sizes: list[float] = []
     for page in reader.pages:
-
-        def collect_font_details(text_segment, _cm, _tm, font_dictionary, font_size) -> None:
+        def collect_font_details(text_segment, _cm, _tm, font_dictionary, _font_size) -> None:
             if "token" in text_segment:
                 mono_fonts.append(str((font_dictionary or {}).get("/BaseFont", "")))
-            if "NET_CONTEXT_001" in text_segment or "NET_CONTEXT_050" in text_segment:
-                context_font_sizes.append(float(font_size))
 
         page.extract_text(visitor_text=collect_font_details)
     assert mono_fonts and all(
-        "mono" in font_name.casefold() or "code" in font_name.casefold() for font_name in mono_fonts
+        "mono" in font_name.casefold() or "code" in font_name.casefold()
+        for font_name in mono_fonts
     )
-    assert context_font_sizes and min(context_font_sizes) >= 8.5
-
-    pdftotext = shutil.which("pdftotext")
-    assert pdftotext is not None, "pdftotext is required for page-box layout assertions"
-    bbox_result = await anyio.run_process(
-        (pdftotext, "-bbox", str(pdf_path), "-"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
-    bbox_root = ET.fromstring(bbox_result.stdout.decode("utf-8", errors="replace"))
-    bbox_pages: list[_BBoxPage] = []
-    for page_index, page_element in enumerate(
-        element for element in bbox_root.iter() if element.tag.rsplit("}", 1)[-1] == "page"
-    ):
-        words: list[_BBoxWord] = [
-            {
-                "text": word.text or "",
-                "x_min": float(word.attrib["xMin"]),
-                "y_min": float(word.attrib["yMin"]),
-                "x_max": float(word.attrib["xMax"]),
-                "y_max": float(word.attrib["yMax"]),
-            }
-            for word in page_element.iter()
-            if word.tag.rsplit("}", 1)[-1] == "word"
-        ]
-        bbox_pages.append(
-            {"index": page_index, "height": float(page_element.attrib["height"]), "words": words}
-        )
-
-    def pages_containing(token: str) -> list[int]:
-        return [
-            page["index"]
-            for page in bbox_pages
-            if token in " ".join(word["text"] for word in page["words"])
-        ]
-
-    provenance_line_words = [
-        word
-        for word in bbox_pages[0]["words"]
-        if word["text"] in {"Identité", "complète", ":"}
-        or word["text"].startswith("synthetic-publication-provenance-")
-    ]
-    provenance_line_words.sort(key=lambda word: word["x_min"])
-    provenance_gaps = [
-        right["x_min"] - left["x_max"]
-        for left, right in pairwise(provenance_line_words)
-        if abs(right["y_min"] - left["y_min"]) < 2
-    ]
-    assert provenance_gaps and max(provenance_gaps) < 8
-
-    network_page_indexes = pages_containing("NET_CONTEXT_")
-    assert len(network_page_indexes) >= 2
-    for page_index in network_page_indexes:
-        bbox_page = bbox_pages[page_index]
-        page_words = bbox_page["words"]
-        page_text = " ".join(word["text"] for word in page_words)
-        assert all(header in page_text for header in ("Type", "Valeur", "Statut", "Contexte"))
-        footer_zone = [word for word in page_words if word["y_min"] >= bbox_page["height"] - 55]
-        row_boxes = [
-            word for word in page_words if word["text"].startswith(("NET_CONTEXT_", "netrow"))
-        ]
-        assert footer_zone and row_boxes
-        footer_top = min(word["y_min"] for word in footer_zone)
-        assert all(word["y_max"] < footer_top for word in row_boxes)
-
-    annex_page = next(
-        index for index, page_text in enumerate(page_texts) if "ANNEXE TECHNIQUE" in page_text
-    )
-    group_page = next(
-        index
-        for index, page_text in enumerate(page_texts)
-        if "Synthetic network fixture" in page_text
-    )
-    first_network_row_page = pages_containing("NET_CONTEXT_001")[0]
-    assert group_page in {annex_page, annex_page + 1}
-    assert first_network_row_page in {group_page, group_page + 1}
-    assert pages_containing("PIPE_ROW_45") == pages_containing("Synthetic table note marker")
-
-    for bbox_page in bbox_pages:
-        body_words = [
-            word["text"]
-            for word in bbox_page["words"]
-            if word["text"]
-            and not word["text"].startswith("Bulletin")
-            and word["text"] not in {"Chaps", "Vision", "/"}
-            and not word["text"].isdigit()
-        ]
-        assert body_words, f"PDF page {bbox_page['index'] + 1} contains only headers or footers"
 
 
 @pytest.mark.asyncio
