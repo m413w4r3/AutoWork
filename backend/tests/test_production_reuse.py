@@ -2617,7 +2617,7 @@ async def test_synthesis_stage_rejects_an_invalid_canonical_extraction(failure: 
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stage_returns_needs_review_without_format_repair() -> None:
+async def test_synthesis_stage_allows_one_corrective_grounding_turn() -> None:
     world = _synthesis_world()
     world.gateway.proposal = {
         "lead": [{"text": "FooRAT was identified.", "evidence_handles": ["E999"]}],
@@ -2628,8 +2628,9 @@ async def test_synthesis_stage_returns_needs_review_without_format_repair() -> N
 
     assert result["status"] == "needs_review"
     assert result["error_code"] == "synthesis_unknown_evidence"
-    # Exactly one submission: an invalid answer is never re-asked.
-    assert len(world.gateway.requests) == 1
+    # The second submission is the one bounded corrective turn.
+    assert len(world.gateway.requests) == 2
+    assert world.gateway.requests[1].run_id != world.gateway.requests[0].run_id
     assert world.artifacts.appended == []
 
 

@@ -3910,10 +3910,13 @@ TEXT: Le domaine evil-example.com héberge FooRAT.
 
     assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
     assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE.value
-    assert result.details["validation_reason"] == (
+    expected_reason = (
         "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
         "literal_value=evil-example.com:reason=not_in_extraction"
     )
+    assert result.model_calls == 2
+    assert result.details["correction_errors"][0]["reason"] == expected_reason
+    assert result.details["correction_errors"][1]["reason"] == expected_reason
 
 
 @pytest.mark.asyncio
@@ -4456,27 +4459,320 @@ async def test_restart_resumes_same_archived_response_and_result():
 
 
 @pytest.mark.asyncio
-async def test_unknown_evidence_handle_reaches_needs_review_without_repair_call():
+async def test_unknown_evidence_handle_gets_one_corrective_turn():
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
     extraction = _matched_extraction(
         snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
     )
     proposal = SynthesisProposalV1.model_validate(make_proposal("FooRAT was identified.", "E999"))
-    gateway = _RecordingGateway(lambda request: _succeeded(request, proposal))
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    valid_handle = str(evidence_pack.narrative_evidence[0]["handle"])
+    valid = SynthesisProposalV1.model_validate(
+        make_proposal("FooRAT was identified.", valid_handle)
+    )
+    outputs = iter((proposal, valid))
+    gateway = _RecordingGateway(lambda request: _succeeded(request, next(outputs)))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(gateway.calls) == 2
+    first_request, correction_request = (call[0] for call in gateway.calls)
+    assert correction_request.run_id != first_request.run_id
+    assert '"code": "synthesis_unknown_evidence"' in correction_request.text
+    assert '"literal_value": "E999"' in correction_request.text
+    assert "valid evidence handles from the current evidence pack" in correction_request.text
+    assert result.model_run_id == correction_request.run_id
+    assert result.input_hash == gateway.calls[0][0].metadata["synthesis_input_hash"]
+    assert result.extraction_hash == canonical_extraction_hash(extraction)
+    lineage = world.writer.calls[0]["metadata_extra"]["synthesis_model_run_lineage"]
+    assert [item["model_run_id"] for item in lineage] == [
+        str(first_request.run_id),
+        str(correction_request.run_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_date_gets_one_corrective_turn_and_replay_reuses_both_runs():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            events=(make_event(source_id, "The campaign began.", date(2026, 7, 2)),),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    event_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    invalid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    )
+    valid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-02.", event_handle)
+    )
+    outputs = iter((invalid, valid))
+    gateway = _RecordingGateway(lambda request: _succeeded(request, next(outputs)))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(gateway.calls) == 2
+    first_request, correction_request = (call[0] for call in gateway.calls)
+    assert correction_request.run_id != first_request.run_id
+    assert correction_request.metadata["synthesis_parent_model_run_id"] == str(first_request.run_id)
+    assert '"claim_id": "L001"' in correction_request.text
+    assert '"literal_value": "2026-07-03"' in correction_request.text
+    assert '"reason": "not_in_extraction"' in correction_request.text
+    assert "without a year" in correction_request.text
+    assert correction_request.evidence_pack_hash == first_request.evidence_pack_hash
+    assert correction_request.external_llm_allowed is first_request.external_llm_allowed
+    assert correction_request.sensitivity == first_request.sensitivity
+    assert correction_request.routing_hint is first_request.routing_hint
+    assert correction_request.metadata["effective_tlp"] == first_request.metadata["effective_tlp"]
+    assert (
+        correction_request.metadata["external_llm_allowed"]
+        == first_request.metadata["external_llm_allowed"]
+    )
+    assert correction_request.metadata["do_not_submit"] == first_request.metadata["do_not_submit"]
+    assert correction_request.web_search is False
+    assert correction_request.background is False
+    assert correction_request.conversation is None
+    assert result.input_hash == first_request.metadata["synthesis_input_hash"]
+    assert result.model_run_id == correction_request.run_id
+    lineage = world.writer.calls[0]["metadata_extra"]["synthesis_model_run_lineage"]
+    assert [item["model_run_id"] for item in lineage] == [
+        str(first_request.run_id),
+        str(correction_request.run_id),
+    ]
+    assert [item["raw_output_sha256"] for item in lineage] == [
+        gateway.runs[first_request.run_id].raw_output_sha256,
+        gateway.runs[correction_request.run_id].raw_output_sha256,
+    ]
+    assert [item["authorized_input_hash"] for item in lineage] == [
+        gateway.runs[first_request.run_id].authorized_input_hash,
+        gateway.runs[correction_request.run_id].authorized_input_hash,
+    ]
+    assert any(
+        error["code"] == SynthesisProposalErrorCode.UNKNOWN_DATE.value
+        for error in gateway.runs[first_request.run_id].validation_errors or ()
+    )
+
+    replay = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert replay.status is SynthesisExecutionStatus.SUCCEEDED
+    assert replay.model_calls == 0
+    assert replay.model_run_id == correction_request.run_id
+    assert len(gateway.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_change", ["external_permission", "tlp_red"])
+async def test_corrective_turn_rechecks_source_policy_before_submission(policy_change: str):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            events=(make_event(source_id, "The campaign began.", date(2026, 7, 2)),),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    event_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    invalid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    )
+    document = make_document(subject_id, source_id)
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        if policy_change == "external_permission":
+            document.external_llm_allowed = False
+        else:
+            document.tlp = TLP.RED
+        return _succeeded(request, invalid)
+
+    gateway = _RecordingGateway(responder)
+    world = _service_world(snapshot, extraction, (document,), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.POLICY_BLOCKED.value
+    assert result.model_calls == 1
+    assert len(gateway.calls) == 1
+    assert world.writer.calls == []
+    if policy_change == "external_permission":
+        assert result.details["corrective_turn_blocked"] == "external_llm_not_allowed"
+    else:
+        assert result.details["corrective_turn_blocked"] == "tlp_red"
+
+
+@pytest.mark.asyncio
+async def test_corrective_turn_rechecks_do_not_submit_without_treating_it_as_veto():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            events=(make_event(source_id, "The campaign began.", date(2026, 7, 2)),),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    event_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    invalid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    )
+    valid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-02.", event_handle)
+    )
+    document = make_document(subject_id, source_id)
+    outputs = iter((invalid, valid))
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        if not gateway.calls:
+            document.do_not_submit = True
+        return _succeeded(request, next(outputs))
+
+    gateway = _RecordingGateway(responder)
+    world = _service_world(snapshot, extraction, (document,), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(gateway.calls) == 2
+    assert gateway.calls[1][0].metadata["do_not_submit"] is False
+
+
+@pytest.mark.asyncio
+async def test_second_grounding_failure_keeps_both_corrective_turn_errors():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            events=(make_event(source_id, "The campaign began.", date(2026, 7, 2)),),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    event_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    first_invalid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    )
+    second_invalid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-04.", event_handle)
+    )
+    outputs = iter((first_invalid, second_invalid))
+    gateway = _RecordingGateway(lambda request: _succeeded(request, next(outputs)))
     world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
 
     result = await world.service.execute(world.run, snapshot, world.artifact)
 
     assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
-    assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_EVIDENCE.value
-    assert result.error_code == "synthesis_unknown_evidence"
-    assert result.model_calls == 1
-    assert len(gateway.calls) == 1
-    assert result.model_run_id == gateway.calls[0][0].run_id
-    assert result.input_hash == gateway.calls[0][0].metadata["synthesis_input_hash"]
-    assert result.extraction_hash == canonical_extraction_hash(extraction)
+    assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_DATE.value
+    assert result.model_calls == 2
+    assert len(gateway.calls) == 2
+    errors = result.details["correction_errors"]
+    assert [error["error_code"] for error in errors] == [
+        SynthesisProposalErrorCode.UNKNOWN_DATE.value,
+        SynthesisProposalErrorCode.UNKNOWN_DATE.value,
+    ]
+    assert "literal_value=2026-07-03" in errors[0]["reason"]
+    assert "literal_value=2026-07-04" in errors[1]["reason"]
+    assert errors[0]["model_run_id"] == str(gateway.calls[0][0].run_id)
+    assert errors[1]["model_run_id"] == str(gateway.calls[1][0].run_id)
     assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_corrective_submission_is_not_resubmitted_on_replay():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            events=(make_event(source_id, "The campaign began.", date(2026, 7, 2)),),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    event_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    invalid = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    )
+    calls = 0
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _succeeded(request, invalid)
+        run = ModelRun(
+            provider=ModelProvider.OPENAI,
+            model_role=ModelRole.DRAFTING,
+            requested_model="gpt-5",
+            prompt_template_id=request.prompt_template_id,
+            prompt_template_version=request.prompt_template_version,
+            authorized_input_hash=hashlib.sha256(request.text.encode()).hexdigest(),
+            evidence_pack_hash=request.evidence_pack_hash,
+            parameters={},
+            id=request.run_id or uuid4(),
+        )
+        run.require_review(
+            PRODUCTION_RECONCILIATION_ERROR_CODE,
+            "submission state is unknown",
+            details={"bridge_reason": "active_signal_stalled"},
+        )
+        return ModelExecution(run=run)
+
+    gateway = _RecordingGateway(responder)
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    first_result = await world.service.execute(world.run, snapshot, world.artifact)
+    replay = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert first_result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert first_result.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+    assert first_result.model_calls == 2
+    assert len(gateway.calls) == 2
+    assert replay.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert replay.model_run_id == gateway.calls[1][0].run_id
+    assert replay.model_calls == 0
+    assert len(gateway.calls) == 2
+    assert replay.details["correction_errors"][0]["error_code"] == (
+        SynthesisProposalErrorCode.UNKNOWN_DATE.value
+    )
+    assert replay.details["correction_errors"][1]["error_code"] == (
+        PRODUCTION_RECONCILIATION_ERROR_CODE
+    )
 
 
 @pytest.mark.asyncio
@@ -5101,8 +5397,14 @@ async def test_revision_output_replaying_a_removed_evidence_handle_is_rejected()
     assert result.mode is SynthesisMode.REVISE_PREVIOUS
     assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_EVIDENCE.value
     assert result.error_code == "synthesis_unknown_evidence"
-    assert result.model_calls == 1
-    assert len(gateway.calls) == 1
+    assert result.model_calls == 2
+    assert len(gateway.calls) == 2
+    assert result.details["correction_errors"][0]["error_code"] == (
+        SynthesisProposalErrorCode.UNKNOWN_EVIDENCE.value
+    )
+    assert result.details["correction_errors"][1]["error_code"] == (
+        SynthesisProposalErrorCode.UNKNOWN_EVIDENCE.value
+    )
     assert world.writer.calls == []
 
 

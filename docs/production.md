@@ -329,8 +329,14 @@ Le brouillon passe par `ModelGateway.draft` sous forme stateless, avec Web désa
 structurée. L’identité durable du `ModelRun` porte la soumission et sa réconciliation : une
 soumission probablement acceptée n’est pas rejouée automatiquement et requiert une revue. Une
 sortie structurée invalide passe également en revue ; elle n’ouvre pas de conversation de
-réparation de format. La validation de proposition et le contrôle de son ancrage dans l’évidence
-ont lieu aux frontières gateway et application.
+réparation de format. Après une réponse complète et parsée, un rejet local de grounding sur une
+date, une valeur technique ou un handle d’évidence peut déclencher un seul nouveau draft stateless.
+Il réutilise le pack d’évidence et les mêmes contrôles d’accès, reçoit une identité `ModelRun`
+déterministe dérivée de l’identité initiale et de la violation, et n’est jamais soumis à nouveau
+si son état requiert une réconciliation. Si cette correction échoue, la revue conserve les deux
+erreurs et l’artifact accepté référence les deux `ModelRun`. `input_hash` et la règle de reuse
+exacte restent inchangés. La validation de proposition et le contrôle de son ancrage dans
+l’évidence ont lieu aux frontières gateway et application.
 
 Le canonical artifact est `ProductionSynthesisV1`, enregistré dans `canonical_blob_id`. La vue
 frontend lit cette valeur canonique et résout chaque `ExtractionEvidenceRefV1.source_document_id`
