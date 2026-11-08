@@ -620,3 +620,33 @@ parité PDF.
 aucun code applicatif modifié ; aucun test, PDF de référence, rendu Typst ou
 service live utilisé. Les faits non accessibles restent explicitement N/D ou à
 confirmer.
+
+## 11. Addendum orchestrateur — mesures sur les références (docs/references est gitignoré)
+
+Mesures faites sur `docs/references/{CN2609_typ,RU2609_typ}/articles/*/*.typ` et pdftotext (CN 120 p., RU 114 p.).
+Les comptes incluent code et légendes (mots ≈ `\w+` sur la source Typst, donc surestimés ; ordre de grandeur seulement).
+
+| Article | Figures (`#figure`/`image(`) | styled-table | noteAnalyste | blocs raw | `#fn(` | h1 | h2 | h3 | ioc-list | mots src ≈ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CN article01 | 34 | 11 | 10 | 48 | 24 | 15 | 49 | 7 | 3 | 18 400 |
+| RU article01 | 28 | 8 | 2 | 12 | 13 | 7 | 6 | 7 | 4 | 7 900 |
+| RU article02 | 14 | 2 | 2 | 26 | 3 | 7 | 8 | 1 | 5 | 7 300 |
+
+Calibrage : médiane ≈ 28 figures (hors doublons d'images), 8 tableaux, 7 h1 + 6–49 h2 ; les références sont des
+analyses de reverse/hunting très longues (7–18 k mots). Le plancher « ≥ 1 500 mots » du plan reste un **minimum** ; la cible
+visée par le prompt ARTICLE doit être nettement supérieure quand les preuves le permettent (2 500–5 000 mots, bornés par
+l'évidence et le budget de sortie du modèle).
+
+Titres h1 typiques (abstraits) : « Aperçu », « Reconnaissance », « Accès initial », « Persistance et accès aux identifiants »,
+« Collection », « Exfiltration », « Infrastructure utilisée », « Attribution », « Chaîne d'exploits / de l'implant »,
+« Campagnes observées », « Documents leurres et ciblage », « Diffusion et exécution », « Analyse de la porte dérobée »,
+« Perfectionnement progressif », « Perspectives ». h2/h3 : sous-composants, pivots/requêtes de recherche, analyse des
+fichiers déposés, variantes, commandes disponibles, réseau, synthèse.
+
+Format observé dans le PDF RU (p. 4) : en-tête = logo Chaps Vision à gauche, « Bulletin n°4 / Septembre 2026 » à droite,
+trait fin ; pied = tableau 3 colonnes « Bulletin-APT-RU2609 | Actualité des codes et infrastructures russes — n/N |
+Bulletin n°4 / Septembre 2026 » ; texte justifié, mots-clés en gras (noms d'outils/acteurs), listes à puces compactes,
+`#raw` inline grisé ; titres h1 vert-gris ~20 pt avec grand espace avant.
+Bloc IOC final = titre « IOC » puis sous-titres **« Adresses IP : »**, **« Noms de domaine : »**, **« Fichiers : »** (et URL
+si présentes) suivis de valeurs brutes une par ligne, sans table ni statut (vérifié p. 1205-1230 de `pdftotext`).
+(Les « IOC originaux » en milieu de PDF viennent de nos propres publications, pas de CN/RU.)
