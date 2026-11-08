@@ -16,12 +16,249 @@ REFERENCES_PROMPT_VERSION = "10"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v13-french-coverage-diagnostics"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v14-article-structured"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
-SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = "synthesis-targeted-revision-v4-grounded-heading-terms"
+ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-article-structured-v1-overview-hunting"
+SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = (
+    "synthesis-targeted-revision-v4-grounded-heading-terms"
+)
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v3-after-formats"
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v9-placeholder-token-normalization"
 
+SYNTHESIS_EDITORIAL_CONTRACT_V6 = """EDITORIAL CONTRACT — ARTICLE
+
+Write a detailed, technically rich CTI synthesis in the publication language.
+For French publications, write in French except for source names, quotations
+and exact technical literals. Preserve names, commands, paths, keys, fields,
+ports, user-agents, hashes and formats exactly as documented, using inline
+code for literal values. Explain what each mechanism does, what it enables,
+what evidence shows it, and how documented steps connect. Use only the supplied
+evidence blocks; add no facts, dates, identifiers, causal links, or source
+details from memory or outside research.
+
+Never refer in publication prose to the drafting materials or production
+system. Avoid process framing such as "sur la seule base du pack fourni",
+"les éléments fournis ne comportent pas…", "base du pack", "pack de preuves"
+or "evidence pack"; do not mention internal evidence handles or identifiers
+shaped as E followed by three digits. When public sources do not establish a
+detail, phrase the limit as "les sources publiques consultées ne permettent
+pas d'établir…" or equivalent. Technical uses of words such as model,
+extraction, handle, pack, and pipeline remain appropriate when they describe
+source-grounded CTI concepts, including a Windows handle, an exploit pack,
+data extraction, or a CI/CD pipeline.
+
+Return the lead first. It is one concise opening paragraph that identifies the
+subject and its CTI significance without repeating the article title or adding
+a second introduction. Then return the required sections in this order:
+Continue with campaign, victimology, and infection/execution chain details;
+documented TTPs, tools and components; the C2 protocol and infrastructure; and
+brief confidence limits and CTI analyst observations in the closing prose.
+State the confidence level and its basis where the evidence supports them.
+
+1. The first titled section is exactly `Vue d'ensemble`. It contains exactly
+   three short paragraphs, each a separate claim and in this exact order:
+   `Victimologie :`, `Arsenal :`, `Objectif principal :`. Put a concise,
+   factual value after each label and cite the usual evidence handles for that
+   value. Do not omit, rename, combine, or reorder these labels. If evidence
+   does not establish a value, state that briefly and precisely without
+   guessing.
+2. Add at least four further titled sections. Choose at least four distinct
+   headings exactly from this list: `Contexte et victimologie`, `Chaîne
+   d'attaque par étapes`, `Capacités et techniques`, `Infrastructure et
+   protocole C2`, `Artefacts hôte/réseau`, `Détection et hunting`, and
+   `Limites d'attribution`. These are editorial labels, not claims. Do not
+   create empty or duplicative sections.
+
+Develop the article as a technical analysis, not a short brief. Where the
+evidence allows, aim for 2,500-5,000 words of synthesis prose; 1,500 words is
+the minimum target. Expand with supported mechanisms, steps, variants,
+observables and source-qualified detail. Never pad, repeat the same fact, or
+invent material to reach a word count. If the evidence is too sparse to support
+the target, preserve accuracy and state only the concrete coverage limits.
+Keep paragraphs short to medium, usually focused on one mechanism or attack
+step; use additional headings to make longer analyses easy to scan.
+
+In `Chaîne d'attaque par étapes`, order steps only when the evidence establishes
+that order. Keep alternative branches separate and do not invent causal links.
+In `Capacités et techniques`, cover execution, persistence, privilege,
+evasion, anti-analysis, collection and impact only where documented. In
+`Infrastructure et protocole C2`, explain observed protocols, message fields,
+flows, roles and infrastructure, separating observation from inference. In
+`Détection et hunting`, give only pivots present in evidence: host or network
+paths, registry keys, mutexes, user-agents, ports, commands, patterns and
+useful pivots. For each, explain the observable, required telemetry, relation
+to the behavior and detection limits. Never invent a rule or promote an
+indicator into attribution. Put attribution limits briefly in a dedicated
+closing section when useful; do not repeat generic caveats in every paragraph.
+
+Use a consistent French technical vocabulary. Explain specialized terms on
+first use when that helps the analyst. Avoid vague defensive advice, generic
+claims that replace observed detail, and repeated IOC inventories.
+
+Headings are required for ARTICLE. The exact headings listed above are
+editorial labels, not evidence claims. Other headings must remain concise,
+describe their section, and must not add a name, number, indicator, or other
+fact absent from that section's claims. Keep all headings free of internal
+production vocabulary and evidence handles. Do not add prose to explain the
+structure.
+
+Section kinds are internal placement anchors only. A paragraph may cite several
+evidence handles when they all support its full account. Keep lineage fine
+grained: cite every supporting handle and no unrelated handle. State the
+epistemic status explicitly in the prose: distinguish a vendor observation,
+an adverse claim, independent corroboration, a hypothesis, and an analytical
+inference. A reserve that qualifies attribution or causality must qualify the
+same passage it concerns, not only the conclusion.
+
+Indicator and rule E handles may support claims in any non-lead section,
+including overview, campaign, infection_chain, and other. Section kind does not
+restrict evidence kind. Do not cite technical E handles in the lead. Keep exact
+technical literals in prose grounded in the evidence handles that support them.
+R handles remain available only for the qualification or
+contradiction they represent, including in the lead when relevant.
+
+The subject is treated from the angle of the core publication, the evidence
+whose editorial_role is primary: the lead, the scope and the order of the
+narrative follow it. Evidence from a corroboration source reinforces, dates,
+specifies or qualifies what the core publication states; it never widens the
+subject to another actor, campaign or period that the core publication does not
+carry, and it is not presented as a second main subject. Attribute each
+reinforcement to its source.
+
+Use reserve and source-pair context to qualify the exact claim it bears on.
+Weave counter-analysis into the prose as an analytic limit, name the source
+that supplies the limit, and cite its R handle in that passage. R handles are
+citeable only for passages that state the relevant qualification or
+contradiction; do not present reserved material as an unqualified established
+fact. When composing a cross-source account, cite each handle that supports
+the combined paragraph and state what each source does and does not establish.
+Every source cited through an R handle must appear in the publication sources.
+
+For every detection pivot, explain the concrete observable, the telemetry
+needed to see it, its link to the described mechanism, and its limits. Never
+present an invented rule as a published rule. Do not turn a technical value
+into an IOC attribution unless the evidence supports that relation. If the
+consulted public sources do not establish detail on a theme, do not invent it
+or pad the prose; report the coverage gap only in the optional diagnostics
+block.
+
+Do not duplicate recommendations or add vague defensive advice. Do not repeat
+the references merely to restate them. Mention dates in the synthesis only
+when they explain technical evolution, scope, attribution, or a material
+analytical limit. Preserve the source's exact date precision.
+
+EDITORIAL TITLE
+Write one French editorial title in exactly this format: [Groupe] Titre.
+The frozen subject title is DISCOVERY CONTEXT, NOT evidence. Do not repeat in
+the title any mechanism, protocol, field, tool name, port, CVE, or other
+technical detail unless an evidence handle documents that detail for THIS
+actor, campaign, or case. A detail that a source gives only as a generic
+example of a technique family, or for another actor, must not appear in the
+title; use generic wording instead, such as "des données de routage C2 dans la
+blockchain Bitcoin". Apply the same evidence discipline to the lead.
+Groupe is the principal actor/group named by the core publication, NOT the
+publisher of its article. Join documented aliases with " / ". If no actor is
+named, use a precise generic attribution such as "Acteurs présumés liés à
+l\u2019Iran". For an item whose subject is a tool or publication, use that tool
+or publication's name.
+Titre is one French sentence in sentence case describing what happened,
+including a campaign, tool or technique. Keep the complete title to 110
+characters or fewer. Do not repeat the group in Titre, add a final period,
+wrap the title in quotes, use Markdown, style actor/tool names, or include
+evidence handles.
+
+SOURCE NOTES
+For each publication alias listed after the evidence pack, write one note of
+one or two French sentences and no more than 260 characters. Explain the
+publication's relevant contribution in the tone of a dated source note, for
+example: "SafeBreach Labs publie une rétro-ingénierie de l\u2019implant Tornado
+v51, qui décrit son protocole de commande et ses fonctions d\u2019exfiltration."
+The note must be supported only by E handles listed for that source. Cite at
+least one of those handles, and never cite another source's handle. Do not
+write a date; the article release date is added by the renderer. Use plain
+text without Markdown or evidence handles in the note itself.
+
+Neutral precision examples (generic placeholders only; never reuse their facts
+or handles in the subject's synthesis):
+
+@@CLAIM EXAMPLE-1@@
+EVIDENCE: HANDLE_A, HANDLE_B
+TEXT: L'éditeur A observe `outil-exemple.exe` lancé avec `/mode-exemple` ; la
+source B confirme le processus, sans documenter cet argument.
+
+@@CLAIM EXAMPLE-2@@
+EVIDENCE: HANDLE_C, RESERVE_A
+TEXT: L'éditeur A attribue l'activité à un opérateur ; la réserve RESERVE_A ne relie
+pas l'observation indépendante au même événement, donc cette attribution reste
+hypothétique.
+
+@@CLAIM EXAMPLE-3@@
+EVIDENCE: HANDLE_D
+TEXT: La création de `cle-exemple` par `outil-exemple.exe` constitue un pivot
+si la télémétrie conserve le nom du processus et l'opération registre ; ce
+signal établit le comportement observé, pas l'identité de l'opérateur.
+
+OUTPUT FORMAT
+Use only the text-block wire format below. Do not return JSON. Do not write any
+text outside these blocks. The lead and required ARTICLE sections must be
+present. Each claim becomes one paragraph. Every section must have one
+`HEADING: <short descriptive title>` field immediately after its header and
+before its first claim. Section kinds are stable internal placement anchors;
+the heading is the displayed h2. Keep source notes in their own blocks.
+
+@@TITLE@@
+[Groupe] Titre
+@@END TITLE@@
+Exemple court : [Groupe] Déploie un implant.
+
+@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: E001, E002
+TEXT: one plain-text synthesis paragraph in the publication language
+
+@@SECTION overview S001@@
+HEADING: Vue d'ensemble
+@@CLAIM O001@@
+EVIDENCE: E003
+TEXT: Victimologie : <valeur courte étayée>
+@@CLAIM O002@@
+EVIDENCE: E004
+TEXT: Arsenal : <valeur courte étayée>
+@@CLAIM O003@@
+EVIDENCE: E005
+TEXT: Objectif principal : <valeur courte étayée>
+@@END SECTION@@
+
+@@SECTION technical S002@@
+HEADING: Contexte et victimologie
+@@CLAIM C001@@
+EVIDENCE: E006
+TEXT: one plain-text synthesis paragraph in the publication language
+@@END SECTION@@
+
+Return at least four additional titled sections after this overview, each with
+one or more grounded claims. Keep literal technical values exact and inline in
+backticks.
+
+@@SOURCE_NOTE S001@@
+EVIDENCE: E004, E005
+TEXT: <one or two short French sentences supported only by this source>
+@@END SOURCE NOTE@@
+
+An optional diagnostic block may appear after all synthesis blocks. Use it
+only for concrete missing-coverage observations, never for publication prose.
+Rédige toujours chaque observation en français, quelle que soit la langue des
+sources ou du texte principal de la publication. Écris une phrase courte en
+texte brut. Garde le marqueur littéral `MISSING COVERAGE:` inchangé et rédige
+l'observation en français après ce marqueur.
+
+Exemple neutre : MISSING COVERAGE: <thème non documenté dans les sources fournies>.
+
+@@DIAGNOSTICS@@
+MISSING COVERAGE: <thème absent des preuves fournies, en une phrase française>
+@@END DIAGNOSTICS@@
+"""
+# The targeted revision service still imports this historical contract.
 SYNTHESIS_EDITORIAL_CONTRACT_V5 = """EDITORIAL CONTRACT
 
 Write dense, coherent CTI prose in the publication language. For French

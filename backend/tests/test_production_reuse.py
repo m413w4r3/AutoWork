@@ -1537,6 +1537,26 @@ class _SynthesisGateway:
                     f"TEXT: {claim['text']}",
                 )
             )
+        lines.append("@@END LEAD@@")
+        sections = cast(list[dict[str, Any]], self.proposal.get("sections", []))
+        for section_index, section in enumerate(sections, start=1):
+            section_kind = cast(str, section["kind"])
+            lines.extend(
+                (
+                    f"@@SECTION {section_kind} S{section_index:03d}@@",
+                    f"HEADING: {section['heading']}",
+                )
+            )
+            claims = cast(list[dict[str, Any]], section["claims"])
+            for claim_index, claim in enumerate(claims, start=1):
+                lines.extend(
+                    (
+                        f"@@CLAIM S{section_index:03d}C{claim_index:03d}@@",
+                        f"EVIDENCE: {', '.join(claim['evidence_handles'])}",
+                        f"TEXT: {claim['text']}",
+                    )
+                )
+            lines.append("@@END SECTION@@")
         return "\n".join(lines)
 
     async def draft(
@@ -1729,6 +1749,51 @@ def _synthesis_proposal(handles: dict[str, str]) -> dict[str, object]:
     }
 
 
+def _article_synthesis_proposal(handles: dict[str, str]) -> dict[str, object]:
+    short_claim = "FooRAT was identified."
+    fact_handles = [handles["fact"]]
+    follow_on_headings = (
+        "Contexte et victimologie",
+        "Chaîne d'attaque par étapes",
+        "Capacités et techniques",
+        "Détection et hunting",
+    )
+    follow_on_sections: list[dict[str, Any]] = []
+    for index, heading in enumerate(follow_on_headings):
+        text = (
+            " ".join([short_claim] * 500)
+            if index == len(follow_on_headings) - 1
+            else short_claim
+        )
+        follow_on_sections.append(
+            {
+                "kind": "technical",
+                "heading": heading,
+                "claims": [{"text": text, "evidence_handles": fact_handles}],
+            }
+        )
+    overview_labels = ("Victimologie :", "Arsenal :", "Objectif principal :")
+    return {
+        "lead": [
+            {
+                "text": "FooRAT was identified.",
+                "evidence_handles": [handles["fact"], handles["event"]],
+            }
+        ],
+        "sections": [
+            {
+                "kind": "overview",
+                "heading": "Vue d'ensemble",
+                "claims": [
+                    {"text": f"{label} FooRAT", "evidence_handles": fact_handles}
+                    for label in overview_labels
+                ],
+            },
+            *follow_on_sections,
+        ],
+    }
+
+
 def _synthesis_world() -> SimpleNamespace:
     """One canonical extraction, ready for the SYNTHESIS stage."""
     run = _synthesis_run()
@@ -1770,7 +1835,7 @@ def _synthesis_world() -> SimpleNamespace:
     )
     pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
     handles = {str(entry["kind"]): str(entry["handle"]) for entry in pack.narrative_evidence}
-    gateway = _SynthesisGateway(_synthesis_proposal(handles))
+    gateway = _SynthesisGateway(_article_synthesis_proposal(handles))
     orchestrator = ProductionWorkflowOrchestrator(
         cast(Any, lambda: uow),
         model_gateway=cast(Any, gateway),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -30,15 +31,20 @@ from cti_app.application.production_artifact_reuse import ProductionArtifactReus
 from cti_app.application.production_brief_synthesis import (
     BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
     BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING,
+    BRIEF_SYNTHESIS_PROMPT_VERSION,
     BRIEF_TIMELINE_POLICY_VERSION,
     _source_contains_date,
     brief_timeline_from_extraction,
+    build_brief_synthesis_prompt,
 )
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
 )
 from cti_app.application.production_extraction import references_corpus_hash
-from cti_app.application.production_prompts import SYNTHESIS_EDITORIAL_CONTRACT_V5
+from cti_app.application.production_prompts import (
+    ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
+    SYNTHESIS_EDITORIAL_CONTRACT_V6,
+)
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_repairs import repair_key_for_source_extraction_failure
@@ -1671,22 +1677,263 @@ def test_output_invalid_carries_a_diagnosable_reason():
 def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
     assert SYNTHESIS_POLICY_VERSION == "production-synthesis-v7-source-domain-grounding"
     assert synthesis_module.SYNTHESIS_VALIDATOR_VERSION == (
-        "synthesis-validator-v8-event-quote-dates"
+        "synthesis-validator-v9-article-structure"
     )
     assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
-        "synthesis-draft-v13-french-coverage-diagnostics"
+        "synthesis-draft-v14-article-structured"
     )
-    assert "toujours chaque observation en français" in SYNTHESIS_EDITORIAL_CONTRACT_V5
-    assert "quelle que soit la langue des" in SYNTHESIS_EDITORIAL_CONTRACT_V5
+    assert "toujours chaque observation en français" in SYNTHESIS_EDITORIAL_CONTRACT_V6
+    assert "quelle que soit la langue des" in SYNTHESIS_EDITORIAL_CONTRACT_V6
     assert "MISSING COVERAGE: <thème non documenté dans les sources fournies>." in (
-        SYNTHESIS_EDITORIAL_CONTRACT_V5
+        SYNTHESIS_EDITORIAL_CONTRACT_V6
     )
     assert "TEXT: one plain-text synthesis paragraph in the publication language" in (
-        SYNTHESIS_EDITORIAL_CONTRACT_V5
+        SYNTHESIS_EDITORIAL_CONTRACT_V6
     )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
         "synthesis-text-parser-v9-placeholder-token-normalization"
     )
+
+
+@pytest.mark.asyncio
+async def test_article_prompt_contract_and_output_budget_are_structured_and_abstract() -> None:
+    world = _fresh_setup()
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    request = world.gateway.calls[0][0]
+    prompt = request.text
+    assert request.prompt_template_version == "synthesis-draft-v14-article-structured"
+    assert "Contract version: synthesis-article-structured-v1-overview-hunting" in prompt
+    assert "HEADING: Vue d'ensemble" in prompt
+    assert "Victimologie :" in prompt
+    assert "Arsenal :" in prompt
+    assert "Objectif principal :" in prompt
+    assert "Détection et hunting" in prompt
+    assert "Choose at least four distinct" in prompt
+    assert "Do not return @@EMPTY@@ for ARTICLE" in prompt
+    assert "host or network paths, registry keys, mutexes, user-agents, ports, commands" in (
+        " ".join(prompt.split())
+    )
+    assert "2,500-5,000 words" in prompt
+    assert request.parameters == {"max_output_tokens": 12_000}
+    assert "CN2609_typ" not in prompt
+    assert "RU2609_typ" not in prompt
+    assert "article01" not in prompt
+
+
+def test_article_wire_contract_accepts_and_rejects_required_structure() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    generic = SynthesisProposalV1.model_validate(
+        make_proposal("Le rapport décrit FooRAT.", handle)
+    )
+    article = _articleize_test_proposal(generic)
+
+    parsed = parse_synthesis_proposal_wire(_proposal_wire(article))
+    assert parsed.proposal is not None
+    lead, sections = validate_synthesis_proposal(
+        parsed.proposal,
+        pack,
+        extraction,
+        publication_kind=PublicationKind.ARTICLE,
+    )
+    assert lead
+    assert next(section.heading for section in sections) == "Vue d'ensemble"
+    assert len(sections) == 5
+
+    missing_overview = parse_synthesis_proposal_wire(
+        _proposal_wire(generic.model_copy(update={"sections": ()}))
+    )
+    assert missing_overview.proposal is not None
+    with pytest.raises(SynthesisProposalControlError) as missing:
+        validate_synthesis_proposal(
+            missing_overview.proposal,
+            pack,
+            extraction,
+            publication_kind=PublicationKind.ARTICLE,
+        )
+    assert missing.value.reason == "article_structure:overview_missing"
+
+    invalid_overview_heading = parse_synthesis_proposal_wire(_proposal_wire(generic))
+    assert invalid_overview_heading.proposal is not None
+    with pytest.raises(SynthesisProposalControlError) as heading:
+        validate_synthesis_proposal(
+            invalid_overview_heading.proposal,
+            pack,
+            extraction,
+            publication_kind=PublicationKind.ARTICLE,
+        )
+    assert heading.value.reason == "article_structure:overview_heading_invalid"
+
+    overview_sections = list(article.sections)
+    overview_claims = list(overview_sections[0].claims)
+    overview_claims[0] = overview_claims[0].model_copy(
+        update={"text": "Cibles : Le rapport décrit FooRAT."}
+    )
+    overview_sections[0] = overview_sections[0].model_copy(
+        update={"claims": tuple(overview_claims)}
+    )
+    missing_label = parse_synthesis_proposal_wire(
+        _proposal_wire(article.model_copy(update={"sections": tuple(overview_sections)}))
+    )
+    assert missing_label.proposal is not None
+    with pytest.raises(SynthesisProposalControlError) as label:
+        validate_synthesis_proposal(
+            missing_label.proposal,
+            pack,
+            extraction,
+            publication_kind=PublicationKind.ARTICLE,
+        )
+    assert label.value.reason == "article_structure:overview_field_missing:victimologie"
+
+    too_few_sections = parse_synthesis_proposal_wire(
+        _proposal_wire(article.model_copy(update={"sections": article.sections[:4]}))
+    )
+    assert too_few_sections.proposal is not None
+    with pytest.raises(SynthesisProposalControlError) as section_count:
+        validate_synthesis_proposal(
+            too_few_sections.proposal,
+            pack,
+            extraction,
+            publication_kind=PublicationKind.ARTICLE,
+        )
+    assert section_count.value.reason == "article_structure:too_few_sections"
+
+    empty_follow_on = article.sections[1].model_copy(update={"claims": ()})
+    empty_section_article = article.model_copy(
+        update={"sections": (article.sections[0], empty_follow_on, *article.sections[2:])}
+    )
+    with pytest.raises(SynthesisProposalControlError) as empty_section:
+        synthesis_module.validate_article_synthesis_structure(empty_section_article)
+    assert empty_section.value.reason == "article_structure:empty_section"
+
+    arbitrary_heading_article = article.model_copy(
+        update={
+            "sections": (
+                article.sections[0],
+                *(
+                    section.model_copy(update={"heading": f"Technical section {index}"})
+                    for index, section in enumerate(article.sections[1:], start=1)
+                ),
+            )
+        }
+    )
+    with pytest.raises(SynthesisProposalControlError) as required_headings:
+        synthesis_module.validate_article_synthesis_structure(arbitrary_heading_article)
+    assert required_headings.value.reason == "article_structure:required_heading_coverage"
+
+    overview_labels = ("Victimologie :", "Arsenal :", "Objectif principal :")
+    short_sections = tuple(
+        section.model_copy(
+            update={
+                "claims": tuple(
+                    claim.model_copy(
+                        update={
+                            "text": (
+                                f"{overview_labels[index]} FooRAT"
+                                if section_index == 0
+                                else "FooRAT was identified."
+                            )
+                        }
+                    )
+                    for index, claim in enumerate(section.claims)
+                )
+            }
+        )
+        for section_index, section in enumerate(article.sections)
+    )
+    short_article = article.model_copy(update={"sections": short_sections})
+    with pytest.raises(SynthesisProposalControlError) as word_floor:
+        synthesis_module.validate_article_synthesis_structure(short_article)
+    assert word_floor.value.reason is not None
+    assert word_floor.value.reason.startswith("article_structure:word_floor:")
+
+
+def test_article_structure_validation_keeps_technical_grounding_controls() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    article = _articleize_test_proposal(
+        SynthesisProposalV1.model_validate(
+            make_proposal("FooRAT uses evil-example.com.", handle)
+        )
+    )
+
+    with pytest.raises(SynthesisProposalControlError) as error:
+        validate_synthesis_proposal(
+            article,
+            pack,
+            extraction,
+            publication_kind=PublicationKind.ARTICLE,
+        )
+    assert error.value.code is SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE
+
+
+def test_brief_prompt_and_input_hash_remain_at_the_pre_article_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = build_brief_synthesis_prompt(
+        subject_title="Fixture article",
+        publication_language="fr",
+        tlp="clear",
+        discovery_summary="Fixture summary.",
+        actor_or_campaign="Fixture actor",
+        period_start="2026-01-01",
+        period_end="2026-02-01",
+        evidence_blocks=(("@@EVIDENCE E001@@", "TEXT:", "Observation de test."),),
+        reserve_blocks=(),
+    )
+    assert BRIEF_SYNTHESIS_PROMPT_VERSION == "brief-synthesis-v1-french-grounded-chronology"
+    assert hashlib.sha256(prompt.encode()).hexdigest() == (
+        "afc38a756093b0337fc5d54467f45a6b4928177e19fec7468cadd8333381bba0"
+    )
+    assert ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION == (
+        "synthesis-article-structured-v1-overview-hunting"
+    )
+
+    ids = iter(UUID(int=value) for value in range(100, 1_000))
+    monkeypatch.setattr(sys.modules[__name__], "uuid4", lambda: next(ids))
+    subject_id, source_id = UUID(int=1), UUID(int=2)
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FixtureActor"),)),),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    routing_identity = {
+        "routing_decision_hash": "c" * 64,
+        "publication_routing_policy_version": "publication-routing-test-v1",
+    }
+    brief_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        pack,
+        "a" * 64,
+        publication_kind=PublicationKind.BRIEF,
+        **routing_identity,
+    )
+    article_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        pack,
+        "a" * 64,
+        publication_kind=PublicationKind.ARTICLE,
+        **routing_identity,
+    )
+    assert brief_hash == "38c9d023f721bc3045221bea4bdabc84bfbd3298a0c6669110c9a2bc117a75b9"
+    assert article_hash != "d5639be5170bdbeaa54d1da8c52e92e108adba015a834887bdd1509d6597878c"
 
 
 @pytest.mark.parametrize(
@@ -1933,7 +2180,8 @@ async def test_inline_code_unwrap_count_is_persisted_with_wire_diagnostics() -> 
     raw = (
         "@@LEAD@@\n@@CLAIM L001@@\n"
         f"EVIDENCE: {world.handle}\n"
-        "TEXT: `FooRAT` was identified in the report.\n@@END LEAD@@"
+        "TEXT: `FooRAT` was identified in the report.\n@@END LEAD@@\n"
+        + _article_sections_wire(world.handle, "FooRAT was identified in the report.")
     )
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
 
@@ -2889,6 +3137,8 @@ async def test_synthesis_route_accepts_a_date_in_the_cited_event_quote(publicati
         f"EVIDENCE: {target_handle}\n"
         "TEXT: The operation was reported on February 4, 2026.\n"
     )
+    if publication_kind is PublicationKind.ARTICLE:
+        wire += "\n" + _article_sections_wire(target_handle, "The operation was reported.")
     gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=wire))
     projection_blob_id = uuid4()
     world = _service_world(
@@ -3248,7 +3498,7 @@ async def test_model_gateway_receives_synthesis_as_plain_text_without_schema():
     assert gateway.request_seen is request
     assert gateway.schema_seen is None
     assert "Do not return JSON" in request.text
-    assert "dense, coherent CTI prose" in request.text
+    assert "detailed, technically rich CTI synthesis" in request.text
     for marker in (
         "campaign, victimology",
         "infection/execution chain",
@@ -3266,8 +3516,7 @@ async def test_model_gateway_receives_synthesis_as_plain_text_without_schema():
     assert request.text.index("Attribution remains uncertain.") < request.text.index(
         "Scope remains unknown."
     )
-    assert "optional `HEADING: <short descriptive title>`" in request.text
-    assert "force headings into a brief" in request.text
+    assert "Headings are required for ARTICLE." in request.text
     assert "Return JSON" not in request.text
 
 
@@ -3428,7 +3677,111 @@ class _PreSubmissionFailure(ModelGatewayError):
     retryable = True
 
 
-def _proposal_wire(proposal: SynthesisProposalV1) -> str:
+def _articleize_test_proposal(proposal: SynthesisProposalV1) -> SynthesisProposalV1:
+    """Give generic service fixtures the current ARTICLE wire outline."""
+    if not proposal.lead and not proposal.sections:
+        return proposal
+    source_claim = next(
+        (
+            claim
+            for section in proposal.sections
+            for claim in section.claims
+        ),
+        proposal.lead[0] if proposal.lead else None,
+    )
+    if source_claim is None:
+        return proposal
+
+    if (
+        proposal.sections
+        and proposal.sections[0].heading == "Vue d'ensemble"
+        and len(proposal.sections[0].claims) == 3
+    ):
+        overview = proposal.sections[0]
+        follow_on = list(proposal.sections[1:])
+    else:
+        short_value = source_claim.text[:280]
+        overview = SynthesisSectionProposalV1(
+            kind=SynthesisSectionKind.OVERVIEW,
+            heading="Vue d'ensemble",
+            claims=tuple(
+                SynthesisClaimProposalV1(
+                    text=f"{label} {short_value}",
+                    evidence_handles=source_claim.evidence_handles,
+                )
+                for label in (
+                    "Victimologie :",
+                    "Arsenal :",
+                    "Objectif principal :",
+                )
+            ),
+        )
+        follow_on = list(proposal.sections)
+
+    editorial_headings = (
+        "Contexte et victimologie",
+        "Chaîne d'attaque par étapes",
+        "Capacités et techniques",
+        "Infrastructure et protocole C2",
+        "Artefacts hôte/réseau",
+        "Détection et hunting",
+        "Limites d'attribution",
+    )
+    allowed_headings = {heading.casefold() for heading in editorial_headings}
+    used_headings = {
+        section.heading.casefold()
+        for section in follow_on
+        if section.heading.casefold() in allowed_headings
+    }
+    available_headings = [
+        heading for heading in editorial_headings if heading.casefold() not in used_headings
+    ]
+    for index, section in enumerate(follow_on):
+        if section.heading.casefold() not in allowed_headings and available_headings:
+            heading = available_headings.pop(0)
+            follow_on[index] = section.model_copy(update={"heading": heading})
+            used_headings.add(heading.casefold())
+    for heading in editorial_headings:
+        if len(follow_on) >= 4 and len(used_headings) >= 4:
+            break
+        if heading.casefold() in used_headings:
+            continue
+        follow_on.append(
+            SynthesisSectionProposalV1(
+                kind=SynthesisSectionKind.TECHNICAL,
+                heading=heading,
+                claims=(source_claim,),
+            )
+        )
+        used_headings.add(heading.casefold())
+
+    if follow_on and len(follow_on) >= 4:
+        def word_count(value: str) -> int:
+            return len(re.findall(r"\b[^\W_]+(?:[-\u2019'][^\W_]+)*\b", value, re.UNICODE))
+
+        current_words = sum(word_count(claim.text) for claim in proposal.lead)
+        current_words += sum(
+            word_count(claim.text)
+            for section in (overview, *follow_on)
+            for claim in section.claims
+        )
+        seed_word_count = max(1, word_count(source_claim.text))
+        repeats = max(1, (1_500 - current_words + seed_word_count - 1) // seed_word_count)
+        filler = SynthesisClaimProposalV1(
+            text=" ".join(source_claim.text for _ in range(repeats)),
+            evidence_handles=source_claim.evidence_handles,
+        )
+        last_section = follow_on[-1]
+        follow_on[-1] = last_section.model_copy(
+            update={"claims": (*last_section.claims, filler)}
+        )
+
+    return proposal.model_copy(update={"sections": (overview, *follow_on)})
+
+
+def _proposal_wire(proposal: SynthesisProposalV1, *, article: bool = False) -> str:
+    if article:
+        proposal = _articleize_test_proposal(proposal)
     lines = ["@@LEAD@@"]
     for index, claim in enumerate(proposal.lead, start=1):
         lines.extend(
@@ -3457,12 +3810,55 @@ def _proposal_wire(proposal: SynthesisProposalV1) -> str:
     return "\n".join(lines)
 
 
+def _article_sections_wire(handle: str, supported_text: str) -> str:
+    """Render a compact test outline with enough grounded text for the ARTICLE floor."""
+    labels = ("Victimologie :", "Arsenal :", "Objectif principal :")
+    lines = ["@@SECTION overview S001@@", "HEADING: Vue d'ensemble"]
+    for index, label in enumerate(labels, start=1):
+        lines.extend(
+            (
+                f"@@CLAIM O{index:03d}@@",
+                f"EVIDENCE: {handle}",
+                f"TEXT: {label} {supported_text[:280]}",
+            )
+        )
+    lines.append("@@END SECTION@@")
+    headings = (
+        "Contexte et victimologie",
+        "Chaîne d'attaque par étapes",
+        "Capacités et techniques",
+        "Détection et hunting",
+    )
+    base_words = max(
+        1,
+        len(re.findall(r"\b[^\W_]+(?:[-\u2019'][^\W_]+)*\b", supported_text, re.UNICODE)),
+    )
+    for index, heading in enumerate(headings, start=2):
+        text = supported_text
+        if index == len(headings) + 1:
+            text = " ".join(supported_text for _ in range(1_500 // base_words + 1))
+        lines.extend(
+            (
+                f"@@SECTION technical S{index:03d}@@",
+                f"HEADING: {heading}",
+                f"@@CLAIM T{index:03d}@@",
+                f"EVIDENCE: {handle}",
+                f"TEXT: {text}",
+                "@@END SECTION@@",
+            )
+        )
+    return "\n".join(lines)
+
+
 def _succeeded(
     request: ModelRequest, proposal: BaseModel | None, *, text: str | None = None
 ) -> ModelExecution:
     if text is None:
         text = (
-            _proposal_wire(proposal)
+            _proposal_wire(
+                proposal,
+                article=request.prompt_template_id == "production-synthesis",
+            )
             if isinstance(proposal, SynthesisProposalV1)
             else "This response has no synthesis blocks."
         )
@@ -3801,10 +4197,12 @@ async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
     assert [item.text for item in synthesis.uncertainties] == ["Attribution remains uncertain."]
     assert synthesis.lead[0].text == "FooRAT was identified in the report."
     assert synthesis.lead[0].evidence_refs == (world.pack.resolve_handle(world.handle),)
-    assert [section.kind for section in synthesis.sections] == [SynthesisSectionKind.OVERVIEW]
+    assert len(synthesis.sections) == 5
+    assert synthesis.sections[0].kind is SynthesisSectionKind.OVERVIEW
+    assert synthesis.sections[0].heading == "Vue d'ensemble"
 
     # The stage result stays bounded: counters only, never the narrative body.
-    assert result.details["section_count"] == 1
+    assert result.details["section_count"] == 5
     assert result.details["timeline_entry_count"] == 1
     assert "FooRAT was identified in the report." not in str(result.details)
     assert result.artifact_id is not None
@@ -3820,7 +4218,7 @@ async def test_invalid_editorial_title_uses_fallback_and_stable_warning() -> Non
 @@CLAIM L001@@
 EVIDENCE: {world.handle}
 TEXT: FooRAT est identifié dans le rapport.
-"""
+""" + "\n" + _article_sections_wire(world.handle, "FooRAT est identifié dans le rapport.")
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
 
     result = await world.service.execute(world.run, world.snapshot, world.artifact)
@@ -3845,7 +4243,7 @@ async def test_unprefixed_model_title_is_salvaged_with_source_group_and_warning(
 @@CLAIM L001@@
 EVIDENCE: {world.handle}
 TEXT: FooRAT est identifié dans le rapport.
-"""
+""" + "\n" + _article_sections_wire(world.handle, "FooRAT est identifié dans le rapport.")
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
 
     result = await world.service.execute(world.run, world.snapshot, world.artifact)
@@ -4086,7 +4484,8 @@ TEXT: Le domaine evil-example.com héberge FooRAT.
 @pytest.mark.asyncio
 async def test_dirty_synthesis_wire_keeps_valid_blocks_and_archives_raw_response():
     world = _fresh_setup()
-    raw = f"""```text
+    raw = (
+        f"""```text
 @@LEAD@@
 @@CLAIM L001@@
 EVIDENCE: {world.handle}
@@ -4096,18 +4495,17 @@ EVIDENCE: {world.handle}
 @@CLAIM L002@@
 Evidence {world.handle}
 Text: L'analyse cite aussi "FooRAT" comme élément du dossier.
-@@SECTION overview S001@@
-HEADING: Constat principal
-@@CLAIM C001@@
-EVIDENCE: {world.handle}
-TEXT: Le texte associe "FooRAT" à cette campagne.
-@@END SECTION@@
-```"""
+"""
+        + _article_sections_wire(
+            world.handle, 'Le texte associe "FooRAT" à cette campagne.'
+        )
+        + "\n```"
+    )
     parsed = parse_synthesis_proposal_wire(raw)
 
     assert parsed.proposal is not None
     assert len(parsed.proposal.lead) == 2
-    assert len(parsed.proposal.sections) == 1
+    assert len(parsed.proposal.sections) == 5
     assert [(item.block_id, item.reason_code) for item in parsed.rejections] == [
         ("BROKEN", "synthesis_claim_missing_text")
     ]
@@ -4134,8 +4532,8 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
         'Le rapport nomme "FooRAT"  dans cette activité.',
         'L\'analyse cite aussi "FooRAT" comme élément du dossier.',
     ]
-    assert len(synthesis.sections) == 1
-    assert synthesis.sections[0].heading == "Constat principal"
+    assert len(synthesis.sections) == 5
+    assert synthesis.sections[0].heading == "Vue d'ensemble"
     assert synthesis.sections[0].paragraphs[0].evidence_refs == (
         world.pack.resolve_handle(world.handle),
     )
@@ -4402,20 +4800,19 @@ def test_wire_parser_drops_ambiguous_duplicate_heading_fields_but_keeps_claims()
 @pytest.mark.asyncio
 async def test_synthesis_diagnostics_are_persisted_separately_from_body():
     world = _fresh_setup()
+    article_sections = _article_sections_wire(
+        world.handle, "FooRAT was also examined technically."
+    ).replace(
+        "@@SECTION overview S001@@\nHEADING: Vue d'ensemble\n",
+        "@@SECTION overview S001@@\nHEADING: Vue d'ensemble\n"
+        f"@@CLAIM BROKEN@@\nEVIDENCE: {world.handle}\n",
+    )
     raw = f"""@@LEAD@@
 @@CLAIM L001@@
 EVIDENCE: {world.handle}
 TEXT: FooRAT was identified in the report.
 @@END LEAD@@
-@@SECTION overview S001@@
-HEADING: E001 Activité examinée
-@@CLAIM BROKEN@@
-EVIDENCE: {world.handle}
-@@CLAIM C001@@
-EVIDENCE: {world.handle}
-TEXT: FooRAT was also examined technically.
-@@END SECTION@@
-@@DIAGNOSTICS@@
+""" + article_sections + "\n" + """@@DIAGNOSTICS@@
 MISSING COVERAGE: la chaîne de livraison n'est pas documentée dans les sources fournies
 @@END DIAGNOSTICS@@"""
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
@@ -4434,26 +4831,22 @@ MISSING COVERAGE: la chaîne de livraison n'est pas documentée dans les sources
             "block_id": "L001",
             "warning_code": "synthesis_end_marker_tolerated",
         },
-        {
-            "block_id": "S001",
-            "warning_code": "synthesis_section_heading_dropped_invalid",
-        },
     ]
     assert (
         "synthesis_wire_warning:synthesis_end_marker_tolerated"
         in (world.gateway.diagnostics[0]["transformations"])
     )
-    warning_transformation = "synthesis_wire_warning:synthesis_section_heading_dropped_invalid"
-    assert warning_transformation in world.gateway.diagnostics[0]["transformations"]
     synthesis = world.writer.calls[0]["synthesis"]
     assert isinstance(synthesis, ProductionSynthesisV1)
     body = render_synthesis_markdown(synthesis, world.extraction)
     assert [paragraph.text for paragraph in synthesis.lead] == [
         "FooRAT was identified in the report."
     ]
-    assert synthesis.sections[0].heading == ""
+    assert synthesis.sections[0].heading == "Vue d'ensemble"
     assert [paragraph.text for paragraph in synthesis.sections[0].paragraphs] == [
-        "FooRAT was also examined technically."
+        "Victimologie : FooRAT was also examined technically.",
+        "Arsenal : FooRAT was also examined technically.",
+        "Objectif principal : FooRAT was also examined technically.",
     ]
     assert "delivery chain is absent" not in body
     assert "synthesis_section_heading_dropped" not in body
@@ -4462,21 +4855,18 @@ MISSING COVERAGE: la chaîne de livraison n'est pas documentée dans les sources
 
 
 @pytest.mark.asyncio
-async def test_explicit_empty_synthesis_marker_is_a_valid_empty_proposal():
+async def test_explicit_empty_synthesis_marker_fails_article_contract_after_one_repair():
     world = _fresh_setup()
     raw = "```text\n@@EMPTY@@\n```"
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
 
     result = await world.service.execute(world.run, world.snapshot, world.artifact)
 
-    assert result.status is SynthesisExecutionStatus.SUCCEEDED
-    assert result.error_code is None
-    assert result.model_calls == 1
-    synthesis = world.writer.calls[0]["synthesis"]
-    assert isinstance(synthesis, ProductionSynthesisV1)
-    assert synthesis.lead == ()
-    assert synthesis.sections == ()
-    assert result.details["paragraph_count"] == 0
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.OUTPUT_INVALID.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert world.writer.calls == []
 
 
 @pytest.mark.asyncio
@@ -4571,8 +4961,8 @@ async def test_contract_version_change_requires_a_new_model_call(monkeypatch):
 
     monkeypatch.setattr(
         synthesis_module,
-        "SYNTHESIS_PROPOSAL_CONTRACT_VERSION",
-        "synthesis-text-blocks-v2-test",
+        "ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION",
+        "synthesis-article-structured-v2-test",
     )
     next_world = _service_world(
         first_world.snapshot,
@@ -4590,7 +4980,9 @@ async def test_contract_version_change_requires_a_new_model_call(monkeypatch):
     assert next_result.input_hash != first.input_hash
     assert next_result.model_run_id != first.model_run_id
     assert len(first_world.gateway.calls) == 2
-    assert "Contract version: synthesis-text-blocks-v2-test" in first_world.gateway.calls[1][0].text
+    assert "Contract version: synthesis-article-structured-v2-test" in (
+        first_world.gateway.calls[1][0].text
+    )
 
 
 @pytest.mark.asyncio
@@ -4657,6 +5049,32 @@ async def test_unknown_evidence_handle_gets_one_corrective_turn():
         str(first_request.run_id),
         str(correction_request.run_id),
     ]
+
+
+@pytest.mark.asyncio
+async def test_article_structure_failure_gets_exactly_one_corrective_turn() -> None:
+    world = _fresh_setup()
+    invalid_proposal = SynthesisProposalV1.model_validate(
+        make_proposal("FooRAT was identified in the report.", world.handle)
+    )
+    corrected_proposal = _articleize_test_proposal(invalid_proposal)
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        if request.metadata.get("synthesis_corrective_turn") == 1:
+            return _succeeded(request, corrected_proposal)
+        return _succeeded(request, None, text=_proposal_wire(invalid_proposal))
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert "CORRECTIVE ARTICLE STRUCTURE TURN" in world.gateway.calls[1][0].text
+    assert world.writer.calls[0]["metadata_extra"]["synthesis_corrective_turn"]["max_turns"] == 1
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert synthesis.sections[0].heading == "Vue d'ensemble"
 
 
 @pytest.mark.asyncio
@@ -5770,7 +6188,13 @@ async def test_revision_never_merges_previous_paragraphs_into_the_new_document()
     texts.extend(
         paragraph.text for section in synthesis.sections for paragraph in section.paragraphs
     )
-    assert texts == ["QuxLoader was observed.", "QuxLoader was observed."]
+    assert texts[0] == "QuxLoader was observed."
+    assert texts[1:4] == [
+        "Victimologie : QuxLoader was observed.",
+        "Arsenal : QuxLoader was observed.",
+        "Objectif principal : QuxLoader was observed.",
+    ]
+    assert len(texts) > 2
     assert "FooRAT was observed." not in texts
     assert "BarRAT was also observed." not in texts
 

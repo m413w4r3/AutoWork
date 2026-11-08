@@ -64,6 +64,20 @@ _SECTION_HEADING_IOC = re.compile(
     r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}\b",
     re.IGNORECASE,
 )
+_ARTICLE_EDITORIAL_SECTION_HEADINGS = frozenset(
+    heading.casefold()
+    for heading in (
+        "Vue d'ensemble",
+        "Contexte et victimologie",
+        "Chaîne d'attaque par étapes",
+        "Capacités et techniques",
+        "Capacités et techniques (exécution, persistance, évasion)",
+        "Infrastructure et protocole C2",
+        "Artefacts hôte/réseau",
+        "Détection et hunting",
+        "Limites d'attribution",
+    )
+)
 
 
 def validate_synthesis_section_heading(
@@ -99,6 +113,8 @@ def validate_synthesis_section_heading(
     claims = tuple(claim_texts)
     if any(not isinstance(text, str) for text in claims):
         raise ValueError("Synthesis section claims must be text")
+    if normalized.casefold() in _ARTICLE_EDITORIAL_SECTION_HEADINGS:
+        return normalized
     folded_claims = tuple(unicodedata.normalize("NFKC", text).casefold() for text in claims)
     generic_term_spans = tuple(
         match.span() for match in _SECTION_HEADING_GENERIC_TECHNICAL_TERM.finditer(normalized)
