@@ -1685,7 +1685,7 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         SYNTHESIS_EDITORIAL_CONTRACT_V5
     )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
-        "synthesis-text-parser-v8-inline-technical-code-normalization"
+        "synthesis-text-parser-v9-placeholder-token-normalization"
     )
 
 
@@ -1817,6 +1817,67 @@ def test_wire_parser_unwraps_technical_inline_code_spans(text: str, expected: st
     assert parsed.proposal.lead[0].text == expected
     assert "synthesis_inline_code_spans_unwrapped:1" in parsed.transformations
     synthesis_module._validate_plain_text(parsed.proposal.lead[0].text)
+    assert synthesis_module._technical_literals("{YY}{M}{WEEK NUMBER}{G}{3}") == set()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        (
+            "Le préfixe 26623G3 (`<YY><M><WEEK NUMBER><G><3>`) est observé.",
+            "Le préfixe 26623G3 ({YY}{M}{WEEK NUMBER}{G}{3}) est observé.",
+        ),
+        (
+            (
+                "Le format exfiltré est `L<YY><MM><DD><HH><MM><SS>"
+                "<VICTIM IP overwritten with zeroes>`. "
+            ),
+            "Le format exfiltré est L{YY}{MM}{DD}{HH}{MM}{SS}{VICTIM IP overwritten with zeroes}.",
+        ),
+    ),
+)
+def test_wire_parser_rewrites_placeholder_tokens_and_validates_plain_text(
+    text: str, expected: str
+) -> None:
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: E001\nTEXT: " + text
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.rejections == ()
+    assert parsed.proposal.lead[0].text == expected
+    assert "synthesis_inline_code_spans_unwrapped:1" in parsed.transformations
+    synthesis_module._validate_plain_text(parsed.proposal.lead[0].text)
+
+
+@pytest.mark.parametrize(
+    "span",
+    (
+        "<script>",
+        "<table>",
+        '<img src="x">',
+        "</x>",
+        "<YY>>",
+        "<unclosed",
+        "<bad/name>",
+        "<bad=name>",
+        "<bad\nname>",
+        "<" + "x" * 300 + ">",
+        "<img>",
+    ),
+)
+def test_wire_parser_does_not_unwrap_real_tags_or_unsafe_placeholder_spans(span: str) -> None:
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: E001\nTEXT: Value `" + span + "` remains."
+    )
+
+    assert parsed.proposal is not None
+    assert not any(
+        item.startswith("synthesis_inline_code_spans_unwrapped:") for item in parsed.transformations
+    )
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        synthesis_module._validate_plain_text(parsed.proposal.lead[0].text)
+    assert invalid.value.reason == "plain_text_violation"
 
 
 @pytest.mark.parametrize(

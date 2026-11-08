@@ -331,6 +331,37 @@ def _wire_line(line: str) -> str:
 
 _INLINE_CODE_TECHNICAL_PUNCTUATION = frozenset(" ._:/\\@%+=,#?&~$(){}[]'\";-*|!<>")
 _INLINE_CODE_MAX_LENGTH = 200
+_INLINE_PLACEHOLDER_TOKEN = re.compile(r"<([A-Za-z0-9 _.-]{1,40})>")
+_INLINE_PLACEHOLDER_TAG_NAMES = frozenset(
+    "a b body br div g html i iframe img p script style svg".split()
+)
+
+
+def _rewrite_inline_placeholder_tokens(value: str) -> str | None:
+    """Render name-pattern placeholders as braces so plain text cannot parse as HTML."""
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == ">":
+            return None
+        if value[index] != "<":
+            output.append(value[index])
+            index += 1
+            continue
+        match = _INLINE_PLACEHOLDER_TOKEN.match(value, index)
+        if match is None:
+            return None
+        tag_name = match.group(1)
+        if (
+            tag_name.casefold() in (_INLINE_PLACEHOLDER_TAG_NAMES | _ACTIVE_OR_FORMATTING_XML_TAGS)
+            and tag_name != "G"
+        ):
+            return None
+        output.append("{")
+        output.append(match.group(1))
+        output.append("}")
+        index = match.end()
+    return "".join(output)
 
 
 def _is_safe_inline_technical_literal(value: str) -> bool:
@@ -402,8 +433,9 @@ def _unwrap_safe_inline_technical_code(value: str) -> tuple[str, int]:
             continue
 
         literal = value[run_end:closing_start]
-        if _is_safe_inline_technical_literal(literal):
-            output.append(literal)
+        normalized_literal = _rewrite_inline_placeholder_tokens(literal)
+        if normalized_literal is not None and _is_safe_inline_technical_literal(normalized_literal):
+            output.append(normalized_literal)
             unwrapped_count += 1
         else:
             output.append(value[index:closing_end])
