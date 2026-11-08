@@ -64,7 +64,7 @@ from cti_app.domain.production import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
-    PublicationDocumentV7,
+    PublicationDocumentV8,
     publication_document_from_json,
     publication_document_v5_sha256,
     serialize_publication_document,
@@ -790,8 +790,10 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     publication_bytes = await production.artifact_store.read_bytes(publication.canonical_blob_id)
     publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
     publication_envelope = publication_document_from_json(json.loads(publication_bytes))
-    assert isinstance(publication_envelope, PublicationDocumentV7)
-    document = publication_envelope.base_publication.base_publication
+    assert isinstance(publication_envelope, PublicationDocumentV8)
+    document = (
+        publication_envelope.base_publication.base_publication.base_publication
+    )
     assert isinstance(document, PublicationDocumentV5)
     publication_body_sha256 = publication_document_v5_sha256(document)
     document_payload = serialize_publication_document(document)
@@ -1447,11 +1449,12 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     assert manifest_before_repin is not None and manifest_before_repin.id == accepted_v5.manifest.id
     v6_bytes = await production.artifact_store.read_bytes(v6_artifact.canonical_blob_id)
     augmented_envelope = publication_document_from_json(json.loads(v6_bytes))
-    assert isinstance(augmented_envelope, PublicationDocumentV7)
+    assert isinstance(augmented_envelope, PublicationDocumentV8)
+    assert augmented_envelope.article_format == publication_envelope.article_format
     assert augmented_envelope.publication_kind is publication_envelope.publication_kind
     assert augmented_envelope.routing_decision_hash == publication_envelope.routing_decision_hash
     assert augmented_envelope.routing_policy_version == publication_envelope.routing_policy_version
-    v6_document = augmented_envelope.base_publication
+    v6_document = augmented_envelope.base_publication.base_publication
     assert isinstance(v6_document, PublicationDocumentV6)
     assert v6_document.provenance.base_publication_artifact_id == publication.id
     assert v6_document.provenance.base_publication_sha256 == publication_sha256

@@ -66,6 +66,7 @@ from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
     PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION,
     PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
 )
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
@@ -552,9 +553,10 @@ def _ensure_edition_publications_are_supported(payload: dict[str, Any]) -> None:
             PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
         }:
             raise EditionRenderPublicationSchemaUnsupportedError(
-                "Edition rendering requires every publication to use schema version 4, 5, 6 or 7"
+                "Edition rendering requires every publication to use schema version 4 through 8"
             )
 
 

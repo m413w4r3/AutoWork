@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -96,6 +97,7 @@ PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION = "4"
 PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
 PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION = "6"
 PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION = "7"
+PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION = "8"
 _PUBLICATION_SOURCE_REQUIRED_FIELDS = frozenset(
     {
         "source_document_id",
@@ -2292,6 +2294,498 @@ class PublicationDocumentV7:
         )
 
 
+def normalize_article_format_text(value: str) -> str:
+    """Normalize editorial headings and timeline text for deterministic matching."""
+    apostrophes_normalized = value.replace(chr(0x2019), "'").replace(chr(0x2018), "'")
+    folded = unicodedata.normalize("NFKD", apostrophes_normalized)
+    without_marks = "".join(char for char in folded if not unicodedata.combining(char))
+    return " ".join(without_marks.casefold().split())
+
+
+def is_article_overview_heading(value: str) -> bool:
+    return normalize_article_format_text(value) == "vue d'ensemble"
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewFieldV1:
+    text: str
+    evidence_refs: tuple[PublicationEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        validate_text(self.text, "Article overview text", semantic=True)
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _validate_article_format_evidence_refs(self.evidence_refs, "Article overview"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ArticleOverviewV1:
+    victimology: OverviewFieldV1 | None
+    arsenal: OverviewFieldV1 | None
+    main_objective: OverviewFieldV1 | None
+
+    def __post_init__(self) -> None:
+        if any(
+            value is not None and not isinstance(value, OverviewFieldV1)
+            for value in (self.victimology, self.arsenal, self.main_objective)
+        ):
+            raise ValueError("Article overview fields have an invalid type")
+
+
+def extract_article_overview(
+    sections: tuple[PublicationSectionV1, ...],
+) -> ArticleOverviewV1 | None:
+    """Extract only the first, explicitly labelled overview section."""
+    if not isinstance(sections, tuple) or not sections:
+        return None
+    section = sections[0]
+    if not isinstance(section, PublicationSectionV1) or not is_article_overview_heading(
+        section.heading
+    ):
+        return None
+    # The synthesis convention is exactly three labelled paragraphs. A malformed
+    # section is not guessed at or repaired during canonical publication.
+    if len(section.paragraphs) != 3:
+        return None
+
+    fields_by_label = {
+        "victimologie": "victimology",
+        "arsenal": "arsenal",
+        "objectif principal": "main_objective",
+    }
+    extracted: dict[str, list[OverviewFieldV1]] = {name: [] for name in fields_by_label.values()}
+    for paragraph in section.paragraphs:
+        before, separator, after = paragraph.text.partition(":")
+        if not separator:
+            continue
+        field_name = fields_by_label.get(normalize_article_format_text(before))
+        text = after.strip()
+        if field_name is None or not text or not paragraph.evidence_refs:
+            continue
+        extracted[field_name].append(
+            OverviewFieldV1(text=text, evidence_refs=paragraph.evidence_refs)
+        )
+
+    values: dict[str, OverviewFieldV1 | None] = {
+        name: candidates[0] if len(candidates) == 1 else None
+        for name, candidates in extracted.items()
+    }
+    if all(value is None for value in values.values()):
+        return None
+    return ArticleOverviewV1(
+        victimology=values["victimology"],
+        arsenal=values["arsenal"],
+        main_objective=values["main_objective"],
+    )
+
+
+def _validate_article_format_evidence_refs(
+    refs: tuple[PublicationEvidenceRefV1, ...], label: str
+) -> tuple[PublicationEvidenceRefV1, ...]:
+    if not isinstance(refs, tuple) or not refs:
+        raise ValueError(f"{label} evidence_refs must be a non-empty tuple")
+    if any(not isinstance(ref, PublicationEvidenceRefV1) for ref in refs):
+        raise ValueError(f"{label} evidence_refs contain an invalid value")
+    if len(set(refs)) != len(refs):
+        raise ValueError(f"{label} evidence_refs must be unique")
+    return tuple(
+        sorted(
+            refs,
+            key=lambda ref: (str(ref.source_document_id), ref.kind.value, ref.evidence_key),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineKeyEventV1:
+    event_date: date
+    text: str
+    evidence_refs: tuple[PublicationEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.event_date) is not date:
+            raise ValueError("Timeline key event date must be an exact date")
+        validate_text(self.text, "Timeline key event text", semantic=True)
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _validate_article_format_evidence_refs(self.evidence_refs, "Timeline key event"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationIOCValueV1:
+    value: str
+    normalized_value: str
+    source_document_ids: tuple[UUID, ...]
+    evidence_refs: tuple[PublicationEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        validate_text(self.value, "Article IOC value", semantic=True)
+        validate_text(self.normalized_value, "Article IOC normalized_value", semantic=True)
+        if not isinstance(self.source_document_ids, tuple) or not self.source_document_ids:
+            raise ValueError("Article IOC source_document_ids must be non-empty")
+        if any(not isinstance(source_id, UUID) for source_id in self.source_document_ids):
+            raise ValueError("Article IOC source_document_ids must contain UUIDs")
+        if len(set(self.source_document_ids)) != len(self.source_document_ids):
+            raise ValueError("Article IOC source_document_ids must be unique")
+        object.__setattr__(
+            self,
+            "source_document_ids",
+            tuple(sorted(self.source_document_ids, key=str)),
+        )
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _validate_article_format_evidence_refs(self.evidence_refs, "Article IOC"),
+        )
+        if not {
+            ref.source_document_id for ref in self.evidence_refs
+        } <= set(self.source_document_ids):
+            raise ValueError("Article IOC evidence refs must belong to one of its source documents")
+
+
+@dataclass(frozen=True, slots=True)
+class IOCArticleCategoriesV1:
+    ips: tuple[PublicationIOCValueV1, ...]
+    urls: tuple[PublicationIOCValueV1, ...]
+    domains: tuple[PublicationIOCValueV1, ...]
+    files: tuple[PublicationIOCValueV1, ...]
+
+    def __post_init__(self) -> None:
+        for category in (self.ips, self.urls, self.domains, self.files):
+            if not isinstance(category, tuple) or any(
+                not isinstance(value, PublicationIOCValueV1) for value in category
+            ):
+                raise ValueError("Article IOC categories must contain PublicationIOCValueV1 tuples")
+            normalized_values = tuple(value.normalized_value for value in category)
+            if len(normalized_values) != len(set(normalized_values)):
+                raise ValueError("Article IOC category values must be deduplicated")
+            ordered = tuple(
+                sorted(
+                    category,
+                    key=lambda value: (
+                        value.normalized_value.casefold(),
+                        value.value.casefold(),
+                        value.value,
+                        tuple(map(str, value.source_document_ids)),
+                    ),
+                )
+            )
+            if ordered != category:
+                raise ValueError("Article IOC category values must be in deterministic order")
+
+
+@dataclass(frozen=True, slots=True)
+class ArticleFormatV1:
+    overview: ArticleOverviewV1 | None
+    timeline_key_events: tuple[TimelineKeyEventV1, ...]
+    ioc_categories: IOCArticleCategoriesV1
+
+    def __post_init__(self) -> None:
+        if self.overview is not None and not isinstance(self.overview, ArticleOverviewV1):
+            raise ValueError("ArticleFormatV1 overview has an invalid type")
+        if not isinstance(self.timeline_key_events, tuple) or any(
+            not isinstance(event, TimelineKeyEventV1) for event in self.timeline_key_events
+        ):
+            raise ValueError("ArticleFormatV1 timeline_key_events have an invalid type")
+        if len(self.timeline_key_events) > 8 or len(self.timeline_key_events) == 1:
+            raise ValueError(
+                "ArticleFormatV1 timeline must be empty or contain two to eight events"
+            )
+        ordered = tuple(
+            sorted(
+                self.timeline_key_events,
+                key=lambda event: (event.event_date, normalize_article_format_text(event.text)),
+            )
+        )
+        if ordered != self.timeline_key_events:
+            raise ValueError("ArticleFormatV1 timeline events must be in deterministic date order")
+        keys = tuple(
+            (event.event_date, normalize_article_format_text(event.text))
+            for event in self.timeline_key_events
+        )
+        if len(keys) != len(set(keys)):
+            raise ValueError("ArticleFormatV1 timeline events must be deduplicated")
+        if not isinstance(self.ioc_categories, IOCArticleCategoriesV1):
+            raise ValueError("ArticleFormatV1 ioc_categories have an invalid type")
+
+
+ARTICLE_FORMAT_TIMELINE_MAX_EVENTS = 8
+
+
+def select_article_timeline_key_events_v1(
+    timeline: tuple[PublicationTimelineEntryV1, ...],
+) -> tuple[TimelineKeyEventV1, ...]:
+    """Apply the canonical ARTICLE timeline selection and eight-event cap."""
+    deduplicated: dict[
+        tuple[date, str], tuple[str, set[PublicationEvidenceRefV1]]
+    ] = {}
+    for entry in timeline:
+        if entry.event_date is None or not entry.evidence_refs:
+            continue
+        key = (entry.event_date, normalize_article_format_text(entry.text))
+        existing = deduplicated.get(key)
+        if existing is None:
+            deduplicated[key] = (entry.text, set(entry.evidence_refs))
+            continue
+        text, refs = existing
+        refs.update(entry.evidence_refs)
+        stable_text = min((text, entry.text), key=lambda value: (value.casefold(), value))
+        deduplicated[key] = (stable_text, refs)
+
+    events = [
+        TimelineKeyEventV1(
+            event_date=event_date,
+            text=text,
+            evidence_refs=tuple(
+                sorted(
+                    refs,
+                    key=lambda ref: (
+                        str(ref.source_document_id),
+                        ref.kind.value,
+                        ref.evidence_key,
+                    ),
+                )
+            ),
+        )
+        for (event_date, _normalized_text), (text, refs) in deduplicated.items()
+    ]
+    events.sort(key=lambda event: (event.event_date, normalize_article_format_text(event.text)))
+    if len(events) < 2:
+        return ()
+    if len(events) <= ARTICLE_FORMAT_TIMELINE_MAX_EVENTS:
+        return tuple(events)
+
+    first, last = events[0], events[-1]
+    interior = events[1:-1]
+    prioritized = sorted(
+        interior,
+        key=lambda event: (
+            -len({ref.source_document_id for ref in event.evidence_refs}),
+            event.event_date,
+            normalize_article_format_text(event.text),
+        ),
+    )[: ARTICLE_FORMAT_TIMELINE_MAX_EVENTS - 2]
+    selected = [first, last, *prioritized]
+    selected.sort(key=lambda event: (event.event_date, normalize_article_format_text(event.text)))
+    return tuple(selected)
+
+
+def _article_overview_to_json(value: ArticleOverviewV1 | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+
+    def field_to_json(field: OverviewFieldV1 | None) -> dict[str, Any] | None:
+        if field is None:
+            return None
+        return {
+            "text": field.text,
+            "evidence_refs": [evidence_ref_to_json(ref) for ref in field.evidence_refs],
+        }
+
+    return {
+        "victimology": field_to_json(value.victimology),
+        "arsenal": field_to_json(value.arsenal),
+        "main_objective": field_to_json(value.main_objective),
+    }
+
+
+def _article_overview_from_json(value: Any) -> ArticleOverviewV1 | None:
+    if value is None:
+        return None
+    item = json_object(
+        value,
+        frozenset({"victimology", "arsenal", "main_objective"}),
+        "Article overview",
+    )
+
+    def field_from_json(raw: Any) -> OverviewFieldV1 | None:
+        if raw is None:
+            return None
+        field = json_object(raw, frozenset({"text", "evidence_refs"}), "Article overview field")
+        return OverviewFieldV1(
+            text=json_text(field["text"], "Article overview text"),
+            evidence_refs=_publication_evidence_refs_from_json(field["evidence_refs"]),
+        )
+
+    return ArticleOverviewV1(
+        victimology=field_from_json(item["victimology"]),
+        arsenal=field_from_json(item["arsenal"]),
+        main_objective=field_from_json(item["main_objective"]),
+    )
+
+
+def _article_ioc_value_to_json(value: PublicationIOCValueV1) -> dict[str, Any]:
+    return {
+        "value": value.value,
+        "normalized_value": value.normalized_value,
+        "source_document_ids": [str(source_id) for source_id in value.source_document_ids],
+        "evidence_refs": [evidence_ref_to_json(ref) for ref in value.evidence_refs],
+    }
+
+
+def _article_ioc_value_from_json(value: Any) -> PublicationIOCValueV1:
+    item = json_object(
+        value,
+        frozenset({"value", "normalized_value", "source_document_ids", "evidence_refs"}),
+        "Article IOC value",
+    )
+    return PublicationIOCValueV1(
+        value=json_text(item["value"], "Article IOC value"),
+        normalized_value=json_text(item["normalized_value"], "Article IOC normalized_value"),
+        source_document_ids=_source_ids_from_json(
+            item["source_document_ids"], "Article IOC source_document_id"
+        ),
+        evidence_refs=_publication_evidence_refs_from_json(item["evidence_refs"]),
+    )
+
+
+def _article_format_to_json(value: ArticleFormatV1 | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return {
+        "overview": _article_overview_to_json(value.overview),
+        "timeline_key_events": [
+            {
+                "event_date": event.event_date.isoformat(),
+                "text": event.text,
+                "evidence_refs": [evidence_ref_to_json(ref) for ref in event.evidence_refs],
+            }
+            for event in value.timeline_key_events
+        ],
+        "ioc_categories": {
+            category: [
+                _article_ioc_value_to_json(item)
+                for item in getattr(value.ioc_categories, category)
+            ]
+            for category in ("ips", "urls", "domains", "files")
+        },
+    }
+
+
+def _article_format_from_json(value: Any) -> ArticleFormatV1 | None:
+    if value is None:
+        return None
+    item = json_object(
+        value,
+        frozenset({"overview", "timeline_key_events", "ioc_categories"}),
+        "ArticleFormatV1",
+    )
+    timeline: list[TimelineKeyEventV1] = []
+    for raw in json_array(item["timeline_key_events"], "Timeline key events"):
+        event = json_object(
+            raw,
+            frozenset({"event_date", "text", "evidence_refs"}),
+            "Timeline key event",
+        )
+        event_date = _date_from_json(event["event_date"], "Timeline key event date")
+        if event_date is None:
+            raise ValueError("Timeline key event date must not be null")
+        timeline.append(
+            TimelineKeyEventV1(
+                event_date=event_date,
+                text=json_text(event["text"], "Timeline key event text"),
+                evidence_refs=_publication_evidence_refs_from_json(event["evidence_refs"]),
+            )
+        )
+    categories = json_object(
+        item["ioc_categories"],
+        frozenset({"ips", "urls", "domains", "files"}),
+        "Article IOC categories",
+    )
+    return ArticleFormatV1(
+        overview=_article_overview_from_json(item["overview"]),
+        timeline_key_events=tuple(timeline),
+        ioc_categories=IOCArticleCategoriesV1(
+            ips=tuple(
+                _article_ioc_value_from_json(raw)
+                for raw in json_array(categories["ips"], "Article IP values")
+            ),
+            urls=tuple(
+                _article_ioc_value_from_json(raw)
+                for raw in json_array(categories["urls"], "Article URL values")
+            ),
+            domains=tuple(
+                _article_ioc_value_from_json(raw)
+                for raw in json_array(categories["domains"], "Article domain values")
+            ),
+            files=tuple(
+                _article_ioc_value_from_json(raw)
+                for raw in json_array(categories["files"], "Article file values")
+            ),
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV8:
+    """Additive article-format envelope around the exact V7 publication."""
+
+    base_publication: PublicationDocumentV7
+    article_format: ArticleFormatV1 | None
+
+    @property
+    def schema_version(self) -> str:
+        return PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_publication, name)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_publication, PublicationDocumentV7):
+            raise ValueError("PublicationDocumentV8 requires a validated V7 base document")
+        if self.base_publication.publication_kind is PublicationKind.BRIEF:
+            if self.article_format is not None:
+                raise ValueError("BRIEF PublicationDocumentV8 requires article_format=null")
+            return
+        if self.base_publication.publication_kind is not PublicationKind.ARTICLE:
+            raise ValueError("PublicationDocumentV8 has an unsupported publication kind")
+        if not isinstance(self.article_format, ArticleFormatV1):
+            raise ValueError("ARTICLE PublicationDocumentV8 requires ArticleFormatV1")
+        base_v5 = self.base_publication.base_publication.base_publication
+        expected_overview = extract_article_overview(base_v5.document.sections)
+        if self.article_format.overview != expected_overview:
+            raise ValueError("ArticleFormat overview must be extracted from the canonical section")
+        expected_timeline = select_article_timeline_key_events_v1(base_v5.document.timeline)
+        if self.article_format.timeline_key_events != expected_timeline:
+            raise ValueError("ArticleFormat timeline must match deterministic canonical selection")
+        known_source_ids = {source.source_document_id for source in base_v5.document.sources}
+        for category in ("ips", "urls", "domains", "files"):
+            for value in getattr(self.article_format.ioc_categories, category):
+                if not set(value.source_document_ids) <= known_source_ids:
+                    raise ValueError("ArticleFormat IOC identifies an unknown publication source")
+
+    def _to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "base_publication": self.base_publication._to_json(),
+            "article_format": _article_format_to_json(self.article_format),
+        }
+
+    @classmethod
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV8:
+        document = json_object(
+            payload,
+            frozenset({"schema_version", "base_publication", "article_format"}),
+            "PublicationDocumentV8",
+        )
+        if document["schema_version"] != PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION:
+            raise ValueError("PublicationDocumentV8 schema version is unsupported")
+        raw_base = document["base_publication"]
+        if (
+            not isinstance(raw_base, Mapping)
+            or raw_base.get("schema_version") != PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION
+        ):
+            raise ValueError("PublicationDocumentV8 base must be a V7 publication")
+        return cls(
+            base_publication=publication_document_v7_from_json(raw_base),
+            article_format=_article_format_from_json(document["article_format"]),
+        )
+
+
 _OPINION_BLOCK_ORDER = {item: index for index, item in enumerate(OpinionBlockType)}
 _OPINION_BLOCK_HEADINGS = {
     OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
@@ -2588,7 +3082,11 @@ def _rendered_opinion_from_json(raw: Any) -> PublicationAnalystOpinionSectionV1:
 
 
 type CanonicalPublicationDocument = (
-    PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6 | PublicationDocumentV7
+    PublicationDocumentV4
+    | PublicationDocumentV5
+    | PublicationDocumentV6
+    | PublicationDocumentV7
+    | PublicationDocumentV8
 )
 
 
@@ -2603,6 +3101,11 @@ def publication_document_article_v5_body(
         and document.publication_kind is PublicationKind.ARTICLE
     ):
         return document.base_publication.base_publication
+    if (
+        isinstance(document, PublicationDocumentV8)
+        and document.publication_kind is PublicationKind.ARTICLE
+    ):
+        return document.base_publication.base_publication.base_publication
     return None
 
 
@@ -2640,6 +3143,16 @@ def publication_document_v7_to_json(document: PublicationDocumentV7) -> dict[str
     return document._to_json()
 
 
+def publication_document_v8_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV8:
+    return PublicationDocumentV8._from_json(payload)
+
+
+def publication_document_v8_to_json(document: PublicationDocumentV8) -> dict[str, Any]:
+    if not isinstance(document, PublicationDocumentV8):
+        raise ValueError("Expected a PublicationDocumentV8")
+    return document._to_json()
+
+
 def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
     version = payload.get("schema_version")
     if version == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
@@ -2650,6 +3163,8 @@ def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPubli
         return publication_document_v6_from_json(payload)
     if version == PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION:
         return publication_document_v7_from_json(payload)
+    if version == PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION:
+        return publication_document_v8_from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={version!r}")
 
 
@@ -2664,6 +3179,7 @@ def validate_publication_document(
             PublicationDocumentV5,
             PublicationDocumentV6,
             PublicationDocumentV7,
+            PublicationDocumentV8,
         ),
     ):
         if value.schema_version not in {
@@ -2671,6 +3187,7 @@ def validate_publication_document(
             PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
         }:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
@@ -2695,17 +3212,25 @@ def serialize_publication_document(
         return validated._to_json()
     if isinstance(validated, PublicationDocumentV7):
         return validated._to_json()
+    if isinstance(validated, PublicationDocumentV8):
+        return validated._to_json()
     if isinstance(validated, PublicationDocumentV5):
         return publication_document_v5_to_json(validated)
     return publication_document_v4_to_json(validated)
 
 
 __all__ = [
+    "ARTICLE_FORMAT_TIMELINE_MAX_EVENTS",
     "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION",
+    "PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION",
+    "ArticleFormatV1",
+    "ArticleOverviewV1",
     "CanonicalPublicationDocument",
+    "IOCArticleCategoriesV1",
+    "OverviewFieldV1",
     "PublicationAnalystOpinionBlockV1",
     "PublicationAnalystOpinionSectionV1",
     "PublicationChartV1",
@@ -2718,10 +3243,16 @@ __all__ = [
     "PublicationDocumentV6ProvenanceV1",
     "PublicationDocumentV6ValidationError",
     "PublicationDocumentV7",
+    "PublicationDocumentV8",
+    "PublicationIOCValueV1",
     "PublicationSourceFigureV1",
     "PublicationTableColumnV1",
     "PublicationTableRowV1",
     "PublicationTableV1",
+    "TimelineKeyEventV1",
+    "extract_article_overview",
+    "is_article_overview_heading",
+    "normalize_article_format_text",
     "order_publication_references",
     "parse_publication_document",
     "publication_document_article_v5_body",
@@ -2735,6 +3266,9 @@ __all__ = [
     "publication_document_v6_from_json",
     "publication_document_v7_from_json",
     "publication_document_v7_to_json",
+    "publication_document_v8_from_json",
+    "publication_document_v8_to_json",
+    "select_article_timeline_key_events_v1",
     "serialize_publication_document",
     "validate_publication_document",
 ]

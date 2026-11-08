@@ -37,6 +37,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV7,
+    PublicationDocumentV8,
     publication_document_from_json,
     publication_document_text_anchors,
 )
@@ -280,9 +281,13 @@ class ProductionArticleSnapshotAdapter:
         if blob_id is None:
             return ()
         payload = await self._artifact_store.read_json(blob_id)
-        if payload.get("schema_version") not in {"4", "5", "6", "7"}:
+        if payload.get("schema_version") not in {"4", "5", "6", "7", "8"}:
             return ()
         document = publication_document_from_json(payload)
+        if isinstance(document, PublicationDocumentV8):
+            if document.publication_kind is not PublicationKind.ARTICLE:
+                return ()
+            document = document.base_publication
         if isinstance(document, PublicationDocumentV7):
             if document.publication_kind is not PublicationKind.ARTICLE:
                 return ()

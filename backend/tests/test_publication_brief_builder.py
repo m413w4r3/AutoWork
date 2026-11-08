@@ -88,9 +88,9 @@ def test_brief_assembly_stays_brief_across_narrative_lengths(word_count: int) ->
     assert all(section.paragraphs for section in publication.sections)
     assert [item["type"] for item in render_model.content_sections] == [
         "references",
-        "chronology",
         "synthesis",
     ]
+    assert render_model.article_format is None
     assert qa["passed"] is True
     assert qa["checks"]["no_placeholder_markers"] is True
     assert qa["checks"]["no_ioc_annex"] is True
@@ -222,10 +222,16 @@ def test_metadata_derived_brief_timeline_keeps_source_footnote_and_typst_chronol
         publication=publication,
     )
     render_model = project_publication_to_typst_model(publication)
-    chronology = {item["type"]: item for item in render_model.content_sections}["chronology"]
+    section_types = [item["type"] for item in render_model.content_sections]
+    references_section = render_model.content_sections[0]
 
     assert publication.timeline[0].event_date == published_at
     assert publication.timeline[0].evidence_refs[0].kind.value == "source_metadata"
-    assert chronology["timeline"][0]["source_urls"] == [source_url]
+    assert section_types == ["references", "synthesis"]
+    assert render_model.article_format is None
+    assert any(
+        source_url in entry.get("urls", ())
+        for entry in references_section["entries"]
+    )
     assert publication.indicators == ()
     assert qa["passed"] is True

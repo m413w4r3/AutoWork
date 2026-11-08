@@ -289,8 +289,9 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v32-brief-kind"
+    assert data["schema_version"] == "typst-publication-model-v33-article-format"
     assert data["kind"] == "brief"
+    assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
     assert data["document_header"] == "Publication"
     assert data["overview"] == {"status_label": "Publication", "source_count": 1}
@@ -433,11 +434,10 @@ def test_opinion_github_tokens_and_typed_rc4_material_reach_publication_render_d
     assert material_items[0]["type_label"] == "Clé RC4"
     assert material_items[0]["role"] == "Déchiffrement des données de configuration"
     assert material_items[0]["sample_location"] == "0x120-0x12f"
-    assert material_items[0]["sample_sha256"] == sample_sha256
+    assert "sample_sha256" not in material_items[0]
     assert material_items[0]["evidence_ref"]["label"] == "[E1]"
-    assert sections["technical_annex"]["implant_identifier_rows"][0]["value"] == (
-        fine_grained_token
-    )
+    assert "technical_annex" not in sections
+    assert any(item["value"] == fine_grained_token for item in material_items)
 
 
 def test_typst_opinion_text_keeps_reservations_and_excludes_bridge_audit_metadata(
@@ -604,8 +604,13 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
     sections = {item["type"]: item for item in model["content_sections"]}
     references = sections["references"]
     synthesis = sections["synthesis"]
-    annex = sections["technical_annex"]
+    ioc = sections["ioc"]
+    domain_group = next(
+        group for group in ioc["source_indicators"] if group["heading"] == "Domaines"
+    )
+    displayed_domain_texts = [item["value"]["text"] for item in domain_group["items"]]
     assert references["type"] == "references"
+    assert model["article_format"] is None
     assert references["entries"][0]["display_date"] == "10 janvier 2026"
     assert references["entries"][0]["source_urls"] == ["https://a.example/report"]
     undated_reference = next(
@@ -615,17 +620,9 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
     )
     assert undated_reference["display_date"] == "Date de publication non précisée"
     assert synthesis["type"] == "synthesis"
-    assert annex["type"] == "technical_annex"
-    assert annex["indicators"]["domains"]
-    displayed_domain_texts = [item["text"] for item in annex["indicators"]["domains"]]
     assert len(displayed_domain_texts) == len(set(displayed_domain_texts))
-    assert not {
-        item["text"].casefold() for item in annex["original_indicators"]["domains"]
-    }.intersection(item.casefold() for item in displayed_domain_texts)
-    assert [item["text"] for item in annex["original_indicators"]["domains"]] == [
-        "context.example",
-        "original.example",
-    ]
+    assert {"context[.]example", "original[.]example"} <= set(displayed_domain_texts)
+    assert all("type_label" not in item for item in domain_group["items"])
 
 
 def test_v6_render_model_keeps_original_ioc_values_separate_from_subject_values(
@@ -636,19 +633,18 @@ def test_v6_render_model_keeps_original_ioc_values_separate_from_subject_values(
     renderer, bundle = _renderer(tmp_path)
 
     model = json.loads(_render(renderer, publication, bundle).render_data_bytes)
-    annex = model["content_sections"][-1]
-
-    displayed_domains = annex["indicators"]["domains"]
-    displayed_texts = [item["text"] for item in displayed_domains]
-    assert original.value not in displayed_texts
-    assert original.value in {item["text"] for item in annex["original_indicators"]["domains"]}
-    assert "pas démontré" in annex["original_indicator_note"]
+    ioc = model["content_sections"][-1]
+    domain_group = next(
+        group for group in ioc["source_indicators"] if group["heading"] == "Domaines"
+    )
+    displayed_texts = [item["value"]["text"] for item in domain_group["items"]]
+    assert original.normalized_value.replace(".", "[.]") in displayed_texts
     assert len(displayed_texts) == len({value.casefold() for value in displayed_texts})
     assert publication.original_indicators[0].indicators[0] == original
-    assert [item["text"] for item in annex["original_indicators"]["domains"]] == [
-        "context.example",
-        "original.example",
-    ]
+    assert all(
+        "status_label" not in item and "type_label" not in item
+        for item in domain_group["items"]
+    )
 
 
 def test_render_ioc_projection_deduplicates_normalized_values_across_groups() -> None:
@@ -693,13 +689,17 @@ def test_ioc_projection_keeps_defanged_values_in_type_specific_lists() -> None:
     )
 
     model = project_publication_to_typst_model(document)
-    annex = next(item for item in model.content_sections if item["type"] == "technical_annex")
-    indicators = annex["indicators"]
+    assert model.article_format is not None
+    indicators = model.article_format["ioc_categories"]
 
-    assert [item["text"] for item in indicators["ips"]] == ["198.51.100[.]10"]
-    assert [item["text"] for item in indicators["domains"]] == ["core[.]example"]
-    assert [item["text"] for item in indicators["urls"]] == ["hxxps://cdn[.]example[.]test/path"]
-    assert [item["text"] for item in indicators["hashes"]] == ["a" * 64]
+    assert [item["value"]["text"] for item in indicators["ips"]] == [
+        "198[.]51[.]100[.]10"
+    ]
+    assert [item["value"]["text"] for item in indicators["domains"]] == ["core[.]example"]
+    assert [item["value"]["text"] for item in indicators["urls"]] == [
+        "hxxps://cdn[.]example[.]test/path"
+    ]
+    assert [item["value"]["text"] for item in indicators["files"]] == ["a" * 64]
 
 
 def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
@@ -718,42 +718,29 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     assert data["title"] == "Intrusion report"
     sections = {item["type"]: item for item in data["content_sections"]}
     references = sections["references"]
-    chronology = sections["chronology"]
     synthesis = sections["synthesis"]
-    technical_annex = sections["technical_annex"]
+    article_format = data["article_format"]
     assert references["type"] == "references"
     assert {item["source_urls"][0] for item in references["entries"]} == {
         "https://example.test/one",
         "https://example.test/two",
     }
-    assert [
-        (item["display_date"], item["text"], item["source_urls"]) for item in chronology["timeline"]
-    ] == [
-        ("", "No display date", ["https://example.test/one"]),
-        ("3 février 2025", "One source event", ["https://example.test/two"]),
-        (
-            "early 2025",
-            "Several source event",
-            ["https://example.test/one", "https://example.test/two"],
-        ),
+    assert article_format["timeline_key_events"] == []
+    assert set(article_format["ioc_categories"]) == {"ips", "urls", "domains", "files"}
+    ioc_categories = article_format["ioc_categories"]
+    assert [item["value"]["text"] for item in ioc_categories["ips"]] == ["Display ip"]
+    assert [item["value"]["text"] for item in ioc_categories["domains"]] == [
+        "normalized-domain"
     ]
-    reference_target_ids = {entry["target_id"] for entry in references["entries"]}
+    assert [item["value"]["text"] for item in ioc_categories["urls"]] == ["normalized-url"]
+    assert [item["value"]["text"] for item in ioc_categories["files"]] == [
+        "normalized-hash"
+    ]
+    assert not {"chronology", "technical_annex", "provenance"}.intersection(sections)
     assert all(
-        reference["target_id"] in reference_target_ids
-        for item in chronology["timeline"]
-        for reference in item["source_refs"]
+        {"publisher", "title", "date", "url", "urls"} <= set(item)
+        for item in references["entries"]
     )
-    assert technical_annex["type"] == "technical_annex"
-    assert technical_annex["indicators"] == {
-        key: [{"text": f"Display {label}", "break_chunks": []}]
-        for key, label in (
-            ("ips", "ip"),
-            ("domains", "domain"),
-            ("urls", "url"),
-            ("emails", "email"),
-            ("hashes", "hash"),
-        )
-    }
     assert "uncertainties" not in data
     assert references["sources"] == [
         {
@@ -878,7 +865,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v32-brief-kind"
+    assert data["schema_version"] == "typst-publication-model-v33-article-format"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
@@ -1021,18 +1008,11 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
     )
     spans = {span["style"]: span for span in lead["semantic_spans"]}
 
-    technical_annex = next(
-        section for section in data["content_sections"] if section["type"] == "technical_annex"
-    )
-    ioc_row = technical_annex["ioc_rows"][0]
-    assert ioc_row["value"] == long_hash
-    assert len(ioc_row["value_spans"]) == 1
-    ioc_value_span = ioc_row["value_spans"][0]
+    files = data["article_format"]["ioc_categories"]["files"]
+    ioc_value_span = next(item["value"] for item in files if item["value"]["text"] == long_hash)
     assert ioc_value_span["text"] == long_hash
-    assert ioc_value_span["break_chunks"] == [
-        long_hash[index : index + 6] for index in range(0, len(long_hash), 6)
-    ]
-    assert ioc_value_span["break_after"] == [True] * ((len(long_hash) + 5) // 6 - 1)
+    assert "".join(ioc_value_span["break_chunks"]) == long_hash
+    assert ioc_value_span["break_after"] == [True] * (len(ioc_value_span["break_chunks"]) - 1)
     for style, value in (
         ("semantic-ioc", long_hash),
         ("semantic-path", long_path),
@@ -1129,13 +1109,7 @@ def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(
     synthesis = sections["synthesis"]
     paragraphs = [block["text"] for block in synthesis["blocks"] if block["type"] == "paragraph"]
 
-    assert [section["type"] for section in data["content_sections"]] == [
-        "references",
-        "chronology",
-        "synthesis",
-        "ioc",
-        "technical_annex",
-    ]
+    assert [section["type"] for section in data["content_sections"]] == ["references", "synthesis"]
     assert paragraphs[0] == "Opening assessment."
     assert (
         sum(" ".join(text.casefold().split()) == "opening assessment." for text in paragraphs) == 1
