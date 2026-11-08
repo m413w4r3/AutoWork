@@ -6539,6 +6539,275 @@ def _targeted_wire_patch(
     )
 
 
+def _targeted_article_revision_fixture() -> tuple[
+    SimpleNamespace,
+    ProductionSynthesisV1,
+    SynthesisEvidencePackV1,
+    str,
+]:
+    world, base, evidence_pack, handle = _targeted_revision_fixture()
+    ref = evidence_pack.resolve_handle(handle)
+    overview = SynthesisSectionV1(
+        kind=SynthesisSectionKind.OVERVIEW,
+        heading="Vue d'ensemble",
+        paragraphs=(
+            SynthesisParagraphV1(
+                text="Victimologie : le rapport décrit FooRAT.", evidence_refs=(ref,)
+            ),
+            SynthesisParagraphV1(text="Arsenal : FooRAT.", evidence_refs=(ref,)),
+            SynthesisParagraphV1(
+                text="Objectif principal : activité documentée dans le rapport.",
+                evidence_refs=(ref,),
+            ),
+        ),
+    )
+    follow_on = tuple(
+        SynthesisSectionV1(
+            kind=SynthesisSectionKind.OVERVIEW,
+            heading=heading,
+            paragraphs=(
+                SynthesisParagraphV1(
+                    text=f"The report records FooRAT in paragraph {index}.",
+                    evidence_refs=(ref,),
+                ),
+            ),
+        )
+        for index, heading in enumerate(
+            (
+                "Contexte et victimologie",
+                "Chaîne d'attaque par étapes",
+                "Capacités et techniques",
+                "Infrastructure et protocole C2",
+            ),
+            start=1,
+        )
+    )
+    return world, replace(base, sections=(overview, *follow_on)), evidence_pack, handle
+
+
+def _apply_targeted_article_revision(
+    world: SimpleNamespace,
+    base: ProductionSynthesisV1,
+    evidence_pack: SynthesisEvidencePackV1,
+    target: TargetedEditorialRevisionTarget,
+    operation: TargetedEditorialRevisionOperation,
+    after: str,
+) -> tuple[ProductionSynthesisV1, dict[str, Any]]:
+    payload = production_synthesis_to_json(base)
+    patch = _targeted_wire_patch(payload, target, operation, after)
+    revised, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=world.extraction,
+        snapshot=world.snapshot,
+        publication_kind=PublicationKind.ARTICLE,
+    )
+    return revised, revised_payload
+
+
+def test_targeted_article_revision_accepts_technical_section_edits() -> None:
+    world, base, evidence_pack, handle = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][3]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+        parent_id=synthesis_revision_module._section_id(section),
+    )
+
+    revised, _ = _apply_targeted_article_revision(
+        world,
+        base,
+        evidence_pack,
+        target,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        "@@SECTION overview S001@@\n@@CLAIM C001@@\n"
+        f"EVIDENCE: {handle}\nTEXT: FooRAT was identified in the report.\n@@END SECTION@@",
+    )
+
+    assert revised.sections[0].heading == "Vue d'ensemble"
+    assert revised.sections[3].paragraphs[0].text == "FooRAT was identified in the report."
+
+
+def test_targeted_article_revision_can_rewrite_another_section() -> None:
+    world, base, evidence_pack, handle = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][3]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(section),),
+    )
+
+    revised, _ = _apply_targeted_article_revision(
+        world,
+        base,
+        evidence_pack,
+        target,
+        TargetedEditorialRevisionOperation.REWRITE_SECTION,
+        "@@SECTION overview S001@@\nHEADING: Observed facts\n@@CLAIM C001@@\n"
+        f"EVIDENCE: {handle}\nTEXT: FooRAT was identified in the report.\n@@END SECTION@@",
+    )
+
+    assert revised.sections[3].heading == "Observed facts"
+    assert revised.sections[0].heading == "Vue d'ensemble"
+    assert len(revised.sections) == 5
+
+
+def test_targeted_article_revision_can_insert_paragraph_in_technical_section() -> None:
+    world, base, evidence_pack, handle = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][3]
+    paragraph = section["paragraphs"][0]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(section),),
+        anchor_id=synthesis_revision_module._paragraph_id(paragraph),
+        insert_after=True,
+    )
+
+    revised, _ = _apply_targeted_article_revision(
+        world,
+        base,
+        evidence_pack,
+        target,
+        TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
+        "@@SECTION overview S001@@\n@@CLAIM C001@@\n"
+        f"EVIDENCE: {handle}\nTEXT: FooRAT was identified in the report.\n@@END SECTION@@",
+    )
+
+    assert len(revised.sections[3].paragraphs) == 2
+    assert revised.sections[0].heading == "Vue d'ensemble"
+
+
+def test_targeted_article_revision_allows_rewriting_an_overview_value() -> None:
+    world, base, evidence_pack, handle = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][0]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+        parent_id=synthesis_revision_module._section_id(section),
+    )
+
+    revised, _ = _apply_targeted_article_revision(
+        world,
+        base,
+        evidence_pack,
+        target,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        "@@SECTION overview S001@@\n@@CLAIM C001@@\n"
+        f"EVIDENCE: {handle}\nTEXT: Victimologie : FooRAT\n"
+        "@@END SECTION@@",
+    )
+
+    assert revised.sections[0].paragraphs[0].text.startswith("Victimologie :")
+    assert tuple(item.text.split(":", 1)[0] for item in revised.sections[0].paragraphs) == (
+        "Victimologie ",
+        "Arsenal ",
+        "Objectif principal ",
+    )
+
+
+@pytest.mark.parametrize("change", ["delete_overview", "rename_overview", "move_overview"])
+def test_targeted_article_revision_rejects_overview_removal_rename_or_displacement(
+    change: str,
+) -> None:
+    world, base, evidence_pack, handle = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    overview_id = synthesis_revision_module._section_id(payload["sections"][0])
+    if change == "delete_overview":
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=(overview_id,),
+        )
+        operation = TargetedEditorialRevisionOperation.DELETE_SECTION
+        after = "EMPTY"
+    elif change == "rename_overview":
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=(overview_id,),
+        )
+        operation = TargetedEditorialRevisionOperation.RENAME_SECTION
+        after = "Observed facts"
+    else:
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTIONS,
+            anchor_id=overview_id,
+        )
+        operation = TargetedEditorialRevisionOperation.INSERT_SECTION
+        after = (
+            "@@SECTION overview S001@@\nHEADING: Editorial introduction\n"
+            "@@CLAIM C001@@\n"
+            f"EVIDENCE: {handle}\nTEXT: The report records FooRAT.\n@@END SECTION@@"
+        )
+
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError
+    ) as error:
+        _apply_targeted_article_revision(
+            world, base, evidence_pack, target, operation, after
+        )
+
+    assert error.value.reason_code == "article_structure:overview_heading_invalid"
+
+
+@pytest.mark.parametrize("replacement", ["Cibles : FooRAT", "Arsenal : FooRAT"])
+def test_targeted_article_revision_rejects_losing_or_reordering_an_overview_label(
+    replacement: str,
+) -> None:
+    world, base, evidence_pack, handle = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][0]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+        parent_id=synthesis_revision_module._section_id(section),
+    )
+
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError
+    ) as error:
+        _apply_targeted_article_revision(
+            world,
+            base,
+            evidence_pack,
+            target,
+            TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+            "@@SECTION overview S001@@\n@@CLAIM C001@@\n"
+            f"EVIDENCE: {handle}\nTEXT: {replacement}\n"
+            "@@END SECTION@@",
+        )
+
+    assert error.value.reason_code == "article_structure:overview_field_missing:victimologie"
+
+
+def test_targeted_article_revision_rejects_fewer_than_four_follow_on_sections() -> None:
+    world, base, evidence_pack, _ = _targeted_article_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(payload["sections"][-1]),),
+    )
+
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError
+    ) as error:
+        _apply_targeted_article_revision(
+            world,
+            base,
+            evidence_pack,
+            target,
+            TargetedEditorialRevisionOperation.DELETE_SECTION,
+            "EMPTY",
+        )
+
+    assert error.value.reason_code == "article_structure:too_few_sections"
+
+
 def test_targeted_revision_rewrites_only_paragraph_in_middle_section() -> None:
     world, base, evidence_pack, handle = _targeted_revision_fixture()
     payload = production_synthesis_to_json(base)
@@ -7904,7 +8173,7 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         TargetedEditorialRevisionConflictError,
     )
 
-    world, base, _, _ = _targeted_revision_fixture()
+    world, base, _, _ = _targeted_article_revision_fixture()
     failed_source_url = "https://example.com/failed-counter-analysis"
     failed_source_error = "extraction_source_output_invalid"
     world.extraction = replace(
@@ -8347,7 +8616,7 @@ async def test_canonical_no_change_archives_model_run_without_creating_artifacts
         TargetedSynthesisRevisionValidationError,
     )
 
-    world, base, _, _ = _targeted_revision_fixture()
+    world, base, _, _ = _targeted_article_revision_fixture()
     base = replace(base, title=f"[{world.snapshot.actor_or_campaign}] FooRAT activity")
     artifact_store = _RevisionMemoryBlobStore()
     extraction_blob = artifact_store.add_json(production_extraction_to_json(world.extraction))
@@ -9795,6 +10064,77 @@ def test_revision_prompt_specifies_plain_heading_after_format() -> None:
     assert synthesis_revision_module.SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION == (
         "synthesis-targeted-revision-v4-grounded-heading-terms"
     )
+
+
+def test_targeted_revision_article_identity_is_versioned_and_brief_hashes_are_stable() -> None:
+    request = TargetedEditorialRevisionRequest(
+        subject_id=UUID("00000000-0000-0000-0000-000000000001"),
+        base_artifact_id=UUID("00000000-0000-0000-0000-000000000002"),
+        base_version=1,
+        base_input_hash="a" * 64,
+        base_canonical_sha256="b" * 64,
+        target=TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=("1" * 64,),
+        ),
+        operation=TargetedEditorialRevisionOperation.RENAME_SECTION,
+        instruction="Name this section.",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="test-analyst",
+    )
+    evidence_pack = SimpleNamespace(
+        narrative_evidence=(), technical_evidence=(), reserve_evidence=()
+    )
+    prompt_args = {
+        "request": request,
+        "target_path": "synthesis.section[example]",
+        "base_hash": "b" * 64,
+        "before_hash": "c" * 64,
+        "current_payload": {},
+        "evidence_pack": evidence_pack,
+    }
+
+    brief_prompt = synthesis_revision_module.ProductionSynthesisRevisionService._revision_prompt(
+        **prompt_args, publication_kind=PublicationKind.BRIEF
+    )
+    brief_prompt_hash = hashlib.sha256(brief_prompt.encode()).hexdigest()
+    brief_identity = synthesis_revision_module._sha256(
+        synthesis_revision_module.ProductionSynthesisRevisionService._request_identity_payload(
+            request, publication_kind=PublicationKind.BRIEF
+        )
+    )
+    brief_version_hash = hashlib.sha256(
+        "|".join(
+            (
+                synthesis_revision_module.SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
+                synthesis_revision_module.SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+                synthesis_revision_module.TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION,
+            )
+        ).encode()
+    ).hexdigest()
+
+    assert brief_prompt_hash == "09dba540d64d3e14c8b13d14ee8cdce597a7d953d778ab64b421d72029d092a1"
+    assert brief_identity == "4aae9723aa0df80fbcfb5b20b29c0dba1423c6f6d1caad8ed95d324e622e85b0"
+    assert brief_version_hash == "77a046050dec6d592afcc96c2e8fd8a696b28e8d9c0984b25a6f6c3f042bead7"
+    assert hashlib.sha256(
+        synthesis_revision_module.SYNTHESIS_EDITORIAL_CONTRACT_V5.encode()
+    ).hexdigest() == "317dced3d28f90675bf518310c42e1d04115762de0400b29f552ca0f8411ab6f"
+
+    article_prompt = synthesis_revision_module.ProductionSynthesisRevisionService._revision_prompt(
+        **prompt_args, publication_kind=PublicationKind.ARTICLE
+    )
+    article_prompt_hash = hashlib.sha256(article_prompt.encode()).hexdigest()
+    article_identity = synthesis_revision_module._sha256(
+        synthesis_revision_module.ProductionSynthesisRevisionService._request_identity_payload(
+            request, publication_kind=PublicationKind.ARTICLE
+        )
+    )
+
+    assert "Prompt version: synthesis-targeted-revision-v5-article-structure" in article_prompt
+    assert "ARTICLE STRUCTURE RULES:" in article_prompt
+    assert article_prompt_hash == "088778da8c75e6e14e503d22f33eab463d66ec035616db8f7bb3f79570585d20"
+    assert article_identity != brief_identity
+    assert article_identity == "02b82006a408b2228740eac652c013be2f4e477a6acff1e899d4d181f46dcc02"
 
 
 def test_revision_prompt_defines_after_format_for_every_synthesis_operation() -> None:

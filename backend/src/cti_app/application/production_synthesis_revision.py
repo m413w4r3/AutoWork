@@ -28,6 +28,8 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment,
 )
 from cti_app.application.production_prompts import (
+    ARTICLE_SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+    ARTICLE_SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
     SYNTHESIS_EDITORIAL_CONTRACT_V5,
     SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
 )
@@ -60,6 +62,7 @@ from cti_app.application.production_synthesis import (
     synthesis_access_policy_hash,
     synthesis_evidence_pack_hash,
     synthesis_input_hash,
+    validate_article_synthesis_outline,
     validate_synthesis_proposal,
 )
 from cti_app.application.publication_assembly import PublicationAssemblyService
@@ -133,6 +136,9 @@ TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = (
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v6-source-waivers"
 TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (
     "targeted-synthesis-patch-validator-v6-source-waivers"
+)
+ARTICLE_TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (
+    "targeted-synthesis-patch-validator-v7-article-structure"
 )
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -233,6 +239,23 @@ class _RevisionContext:
     projection_artifact: ProductionArtifact | None
     publication_artifact: ProductionArtifact | None
     effective_repair_decisions: tuple[ProductionRepairDecision, ...]
+    publication_kind: PublicationKind = PublicationKind.ARTICLE
+
+
+def _targeted_revision_versions(
+    publication_kind: PublicationKind,
+) -> tuple[str, str, str]:
+    if publication_kind is PublicationKind.ARTICLE:
+        return (
+            ARTICLE_SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
+            ARTICLE_SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+            ARTICLE_TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION,
+        )
+    return (
+        SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
+        SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+        TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1667,6 +1690,7 @@ def _apply_wire_patch(
     evidence_pack: SynthesisEvidencePackV1,
     extraction: ProductionExtractionV1,
     snapshot: ProductionInputSnapshot,
+    publication_kind: PublicationKind | None = None,
     source_addition_document_ids: frozenset[UUID] = frozenset(),
     require_claim_scopes: bool = False,
 ) -> tuple[ProductionSynthesisV1, dict[str, Any], str]:
@@ -1849,6 +1873,18 @@ def _apply_wire_patch(
             raise TargetedSynthesisRevisionValidationError("revision_operation_not_supported")
 
     revised = replace(base_synthesis, title=title, lead=tuple(lead), sections=tuple(sections))
+    if publication_kind is PublicationKind.ARTICLE:
+        try:
+            validate_article_synthesis_outline(
+                tuple(
+                    (section.heading, tuple(paragraph.text for paragraph in section.paragraphs))
+                    for section in revised.sections
+                )
+            )
+        except SynthesisProposalControlError as exc:
+            raise TargetedSynthesisRevisionValidationError(
+                exc.reason or "article_structure:invalid"
+            ) from exc
     if not is_production_extraction_hash(extraction, base_synthesis.extraction_hash):
         raise TargetedSynthesisRevisionValidationError("synthesis_extraction_lineage_invalid")
     try:
@@ -1977,7 +2013,11 @@ class ProductionSynthesisRevisionService:
                     source_additions_hash=addition_preview.source_additions_hash,
                     before_hash=resolved.before_hash,
                 )
-                identity = _sha256(self._request_identity_payload(effective_request))
+                identity = _sha256(
+                    self._request_identity_payload(
+                        effective_request, publication_kind=context.publication_kind
+                    )
+                )
                 model_run_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-model-run:{identity}")
                 existing_run = await self._synthesis._model_gateway.get_run(model_run_id)
                 revision_calls = 0 if existing_run is not None else 1
@@ -2096,7 +2136,11 @@ class ProductionSynthesisRevisionService:
                 if not access_policy.external_llm_allowed:
                     calls = 0
                 else:
-                    identity = _sha256(self._request_identity_payload(request))
+                    identity = _sha256(
+                        self._request_identity_payload(
+                            request, publication_kind=context.publication_kind
+                        )
+                    )
                     model_run_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-model-run:{identity}")
                     existing_run = await self._synthesis._model_gateway.get_run(model_run_id)
                     calls = 0 if existing_run is not None else 1
@@ -2149,12 +2193,47 @@ class ProductionSynthesisRevisionService:
                 TargetedSynthesisRevisionResult,
                 await self._enrichment_revision_service.revise_targeted(request),
             )
-        identity_payload = self._request_identity_payload(request)
-        request_identity = _sha256(identity_payload)
-        revision_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-revision:{request_identity}")
-        prior = await self._existing_result(request.subject_id, revision_id)
-        if prior is not None:
-            return prior
+        async with self._synthesis._uow_factory() as uow:
+            route_run = await uow.production_runs.get_current_for_subject(request.subject_id)
+            if route_run is None:
+                raise TargetedEditorialRevisionConflictError(
+                    "The requested production run is no longer current"
+                )
+            routing_decision = await get_adopted_production_routing_decision(
+                uow=uow, run=route_run
+            )
+            if routing_decision is None:
+                publication_kind = PublicationKind.ARTICLE
+            else:
+                assert routing_decision.publication_kind is not None
+                publication_kind = routing_decision.publication_kind
+            identity_payload = self._request_identity_payload(
+                request, publication_kind=publication_kind
+            )
+            request_identity = _sha256(identity_payload)
+            revision_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-revision:{request_identity}")
+            prior = await self._existing_result(request.subject_id, revision_id, uow=uow)
+            if prior is not None:
+                return prior
+            if publication_kind is PublicationKind.ARTICLE:
+                # A pre-versioning ARTICLE revision used the shared BRIEF identity.
+                # Reuse it only when its stored route is ARTICLE or absent (the
+                # historical default), never when a routed BRIEF happens to collide.
+                legacy_identity = _sha256(
+                    self._request_identity_payload(
+                        request, publication_kind=PublicationKind.BRIEF
+                    )
+                )
+                legacy_revision_id = uuid5(
+                    NAMESPACE_URL, f"targeted-synthesis-revision:{legacy_identity}"
+                )
+                legacy_prior = await self._existing_result(
+                    request.subject_id, legacy_revision_id, uow=uow
+                )
+                if legacy_prior is not None and legacy_prior.artifact is not None:
+                    stored_kind = legacy_prior.artifact.metadata.get("publication_kind")
+                    if stored_kind in {None, PublicationKind.ARTICLE.value}:
+                        return legacy_prior
 
         promotion: SourceAdditionPromotionResult | None = None
         if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION and (
@@ -2276,7 +2355,10 @@ class ProductionSynthesisRevisionService:
                     "revision_requires_one_section",
                     "revision_requires_one_section_claim",
                 }
-                if exc.reason_code not in deterministic_refusals:
+                if (
+                    exc.reason_code not in deterministic_refusals
+                    and not exc.reason_code.startswith("article_structure:")
+                ):
                     raise
                 refusal_details = _bounded_claim_grounding_details(exc.details)
                 return TargetedSynthesisRevisionResult(
@@ -2374,7 +2456,22 @@ class ProductionSynthesisRevisionService:
                     ),
                 )
 
-        identity_payload = self._request_identity_payload(request)
+        route_run = await uow.production_runs.get_current_for_subject(request.subject_id)
+        if route_run is None:
+            raise TargetedEditorialRevisionConflictError(
+                "The requested production run is no longer current"
+            )
+        routing_decision = await get_adopted_production_routing_decision(
+            uow=uow, run=route_run
+        )
+        if routing_decision is None:
+            publication_kind = PublicationKind.ARTICLE
+        else:
+            assert routing_decision.publication_kind is not None
+            publication_kind = routing_decision.publication_kind
+        identity_payload = self._request_identity_payload(
+            request, publication_kind=publication_kind
+        )
         request_identity = _sha256(identity_payload)
         revision_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-revision:{request_identity}")
         existing_artifact = await uow.production_artifacts.get(revision_id)
@@ -2409,7 +2506,6 @@ class ProductionSynthesisRevisionService:
             )
 
         context = await self._load_context(request, uow=uow)
-        routing_decision = await get_adopted_production_routing_decision(uow=uow, run=context.run)
         resolved = _resolve_target(context.base_payload, request.target, request.operation)
         if request.before_hash is not None and request.before_hash != resolved.before_hash:
             raise TargetedEditorialRevisionConflictError("The targeted element changed")
@@ -2655,6 +2751,9 @@ class ProductionSynthesisRevisionService:
                 "routing_decision_hash": routing_decision.decision_hash,
                 "publication_routing_policy_version": routing_decision.policy_version,
             }
+        prompt_version, contract_version, validator_version = _targeted_revision_versions(
+            publication_kind
+        )
 
         base_request = build_synthesis_model_request(
             context.run,
@@ -2671,21 +2770,22 @@ class ProductionSynthesisRevisionService:
             before_hash=resolved.before_hash,
             current_payload=base_payload_for_apply,
             evidence_pack=evidence_pack,
+            publication_kind=publication_kind,
         )
         model_run_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-model-run:{request_identity}")
         model_request = replace(
             base_request,
             text=prompt,
             prompt_template_id="production-synthesis-targeted-revision",
-            prompt_template_version=SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
+            prompt_template_version=prompt_version,
             evidence_pack_hash=evidence_pack_hash,
             metadata={
                 **base_request.metadata,
                 "targeted_revision_request_identity": request_identity,
-                "targeted_revision_contract_version": SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+                "targeted_revision_contract_version": contract_version,
                 "targeted_revision_parser_version": TARGETED_SYNTHESIS_REVISION_PARSER_VERSION,
                 "targeted_revision_validator_version": (
-                    TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION
+                    validator_version
                 ),
                 "targeted_revision_source_additions_hash": request.source_additions_hash,
                 "targeted_revision_base_artifact_fences": (
@@ -2764,6 +2864,7 @@ class ProductionSynthesisRevisionService:
             evidence_pack=evidence_pack,
             extraction=extraction,
             snapshot=context.snapshot,
+            publication_kind=publication_kind,
             source_addition_document_ids=source_addition_document_ids,
             require_claim_scopes=(
                 request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
@@ -2798,10 +2899,10 @@ class ProductionSynthesisRevisionService:
             "mode": request.mode.value,
             "actor": request.requester,
             "model_run_id": str(execution.run.id),
-            "prompt_version": SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
-            "contract_version": SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+            "prompt_version": prompt_version,
+            "contract_version": contract_version,
             "parser_version": TARGETED_SYNTHESIS_REVISION_PARSER_VERSION,
-            "validator_version": TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION,
+            "validator_version": validator_version,
             "evidence_refs": self._revision_evidence_refs(context.base_payload, revised_payload),
             "evidence_handles": sorted(evidence_pack._handle_to_ref),
             "claim_scopes": (
@@ -2849,7 +2950,7 @@ class ProductionSynthesisRevisionService:
                 **routing_metadata,
                 "revision": revision_data,
                 "paragraph_provenance": provenance,
-                "revision_contract_version": SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+                "revision_contract_version": contract_version,
             },
             artifact_id=revision_id,
             expected_current_artifact_id=context.base_artifact.id,
@@ -3017,7 +3118,14 @@ class ProductionSynthesisRevisionService:
             raise ValueError("targeted_synthesis_revision_base_hash_invalid")
 
     @staticmethod
-    def _request_identity_payload(request: TargetedEditorialRevisionRequest) -> dict[str, Any]:
+    def _request_identity_payload(
+        request: TargetedEditorialRevisionRequest,
+        *,
+        publication_kind: PublicationKind = PublicationKind.BRIEF,
+    ) -> dict[str, Any]:
+        prompt_version, contract_version, validator_version = _targeted_revision_versions(
+            publication_kind
+        )
         return {
             "subject_id": str(request.subject_id),
             "base_artifact_id": str(request.base_artifact_id),
@@ -3036,42 +3144,44 @@ class ProductionSynthesisRevisionService:
             ),
             "source_additions_hash": request.source_additions_hash,
             "before_hash": request.before_hash,
-            "prompt_version": SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
-            "contract_version": SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
+            "prompt_version": prompt_version,
+            "contract_version": contract_version,
             "parser_version": TARGETED_SYNTHESIS_REVISION_PARSER_VERSION,
-            "validator_version": TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION,
+            "validator_version": validator_version,
         }
 
     async def _existing_result(
-        self, subject_id: UUID, revision_id: UUID
+        self, subject_id: UUID, revision_id: UUID, *, uow: Any | None = None
     ) -> TargetedSynthesisRevisionResult | None:
-        async with self._synthesis._uow_factory() as uow:
-            artifact = await uow.production_artifacts.get(revision_id)
-            if artifact is None:
-                return None
-            if (
-                artifact.subject_id != subject_id
-                or artifact.stage is not ProductionArtifactStage.SYNTHESIS
-            ):
-                raise TargetedEditorialRevisionConflictError(
-                    "The deterministic revision identity belongs to another artifact"
+        if uow is None:
+            async with self._synthesis._uow_factory() as active_uow:
+                return await self._existing_result(
+                    subject_id, revision_id, uow=active_uow
                 )
-            revision = artifact.metadata.get("revision")
-            if not isinstance(revision, dict):
-                raise ValueError("targeted_synthesis_revision_result_corrupt")
-            publication = next(
-                (
-                    item
-                    for item in await uow.production_artifacts.list_for_run(
-                        artifact.production_run_id
-                    )
-                    if item.stage is ProductionArtifactStage.PUBLICATION
-                    and isinstance(item.metadata.get("input_artifacts"), dict)
-                    and item.metadata["input_artifacts"].get("synthesis_artifact_id")
-                    == str(artifact.id)
-                ),
-                None,
+        artifact = await uow.production_artifacts.get(revision_id)
+        if artifact is None:
+            return None
+        if (
+            artifact.subject_id != subject_id
+            or artifact.stage is not ProductionArtifactStage.SYNTHESIS
+        ):
+            raise TargetedEditorialRevisionConflictError(
+                "The deterministic revision identity belongs to another artifact"
             )
+        revision = artifact.metadata.get("revision")
+        if not isinstance(revision, dict):
+            raise ValueError("targeted_synthesis_revision_result_corrupt")
+        publication = next(
+            (
+                item
+                for item in await uow.production_artifacts.list_for_run(artifact.production_run_id)
+                if item.stage is ProductionArtifactStage.PUBLICATION
+                and isinstance(item.metadata.get("input_artifacts"), dict)
+                and item.metadata["input_artifacts"].get("synthesis_artifact_id")
+                == str(artifact.id)
+            ),
+            None,
+        )
         return TargetedSynthesisRevisionResult(
             artifact=artifact,
             publication_artifact=publication,
@@ -3090,6 +3200,12 @@ class ProductionSynthesisRevisionService:
             raise TargetedEditorialRevisionConflictError(
                 "The requested synthesis base is no longer current"
             )
+        routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
+        if routing_decision is None:
+            publication_kind = PublicationKind.ARTICLE
+        else:
+            assert routing_decision.publication_kind is not None
+            publication_kind = routing_decision.publication_kind
         current = await uow.production_artifacts.get_current(
             run.id, ProductionArtifactStage.SYNTHESIS.value
         )
@@ -3149,6 +3265,7 @@ class ProductionSynthesisRevisionService:
             projection_artifact=projection,
             publication_artifact=publication,
             effective_repair_decisions=tuple(effective_repair_decisions),
+            publication_kind=publication_kind,
         )
 
     @staticmethod
@@ -3160,6 +3277,7 @@ class ProductionSynthesisRevisionService:
         before_hash: str,
         current_payload: Mapping[str, Any],
         evidence_pack: SynthesisEvidencePackV1,
+        publication_kind: PublicationKind = PublicationKind.BRIEF,
     ) -> str:
         authorized_evidence = [
             *evidence_pack.narrative_evidence,
@@ -3167,6 +3285,23 @@ class ProductionSynthesisRevisionService:
             *evidence_pack.reserve_evidence,
         ]
         operation = request.operation
+        prompt_version, contract_version, _ = _targeted_revision_versions(publication_kind)
+        article_structure_rules = (
+            (
+                "ARTICLE STRUCTURE RULES:",
+                "Keep the first titled section exactly `Vue d'ensemble` and keep it first.",
+                "Preserve exactly three overview paragraphs, labeled `Victimologie :`, "
+                "`Arsenal :`, and `Objectif principal :` in that order. "
+                "When rewriting one, keep its exact "
+                "label and a non-empty value; do not leave a fourth paragraph or remove a label.",
+                "Keep at least four further sections after the overview, each with a non-empty "
+                "editorial heading and at least one paragraph. Edits to those sections are allowed "
+                "while these outline rules remain true.",
+                "",
+            )
+            if publication_kind is PublicationKind.ARTICLE
+            else ()
+        )
         if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
             after_format = "AFTER format: one line containing only the replacement title."
         elif operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
@@ -3274,8 +3409,8 @@ class ProductionSynthesisRevisionService:
         return "\n".join(
             (
                 "TASK: Apply exactly one targeted synthesis revision patch.",
-                f"Prompt version: {SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION}",
-                f"Contract version: {SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION}",
+                f"Prompt version: {prompt_version}",
+                f"Contract version: {contract_version}",
                 f"TARGET: {target_path}",
                 f"ACTION: {request.operation.value}",
                 f"BASE_ARTIFACT_HASH: {base_hash}",
@@ -3291,6 +3426,7 @@ class ProductionSynthesisRevisionService:
                 "",
                 SYNTHESIS_EDITORIAL_CONTRACT_V5,
                 "",
+                *article_structure_rules,
                 "CONSERVATION RULES:",
                 (
                     "Do not modify any content outside TARGET. Do not alter IOC, sources, "

@@ -8,7 +8,7 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import StrEnum
@@ -2615,54 +2615,67 @@ def _proposal_from_payload(value: Any) -> SynthesisProposalV1:
     )
 
 
-def validate_article_synthesis_structure(proposal: SynthesisProposalV1) -> None:
-    """Enforce the versioned ARTICLE outline and supported minimum prose length."""
-    if not proposal.sections:
+def validate_article_synthesis_outline(
+    sections: Sequence[tuple[str, Sequence[str]]],
+) -> None:
+    """Validate the ARTICLE overview and minimum titled follow-on sections."""
+    if not sections:
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
             "article_structure:overview_missing",
         )
-    overview = proposal.sections[0]
-    if overview.heading != "Vue d'ensemble":
+    overview_heading, overview_claims = sections[0]
+    if overview_heading != "Vue d'ensemble":
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
             "article_structure:overview_heading_invalid",
         )
-    if len(overview.claims) != len(ARTICLE_SYNTHESIS_OVERVIEW_LABELS):
+    if len(overview_claims) != len(ARTICLE_SYNTHESIS_OVERVIEW_LABELS):
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
             "article_structure:overview_field_count_invalid",
         )
-    for label, claim in zip(ARTICLE_SYNTHESIS_OVERVIEW_LABELS, overview.claims, strict=True):
+    for label, text in zip(ARTICLE_SYNTHESIS_OVERVIEW_LABELS, overview_claims, strict=True):
         field_name = label[:-1].strip().casefold()
-        if not claim.text.startswith(label):
+        if not text.startswith(label):
             raise SynthesisProposalControlError(
                 SynthesisProposalErrorCode.OUTPUT_INVALID,
                 f"article_structure:overview_field_missing:{field_name}",
             )
-        value = claim.text[len(label) :].strip()
+        value = text[len(label) :].strip()
         if not value or len(value) > ARTICLE_SYNTHESIS_OVERVIEW_VALUE_MAX_CHARS:
             raise SynthesisProposalControlError(
                 SynthesisProposalErrorCode.OUTPUT_INVALID,
                 f"article_structure:overview_value_invalid:{field_name}",
             )
 
-    follow_on_sections = proposal.sections[1:]
+    follow_on_sections = sections[1:]
     if len(follow_on_sections) < ARTICLE_SYNTHESIS_MIN_FOLLOW_ON_SECTIONS:
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
             "article_structure:too_few_sections",
         )
-    if any(not section.claims for section in follow_on_sections):
+    if any(not claims for _, claims in follow_on_sections):
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
             "article_structure:empty_section",
         )
-    if any(not section.heading.strip() for section in follow_on_sections):
+    if any(not heading.strip() for heading, _ in follow_on_sections):
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
             "article_structure:section_heading_missing",
         )
+
+
+def validate_article_synthesis_structure(proposal: SynthesisProposalV1) -> None:
+    """Enforce the versioned ARTICLE outline and supported minimum prose length."""
+    validate_article_synthesis_outline(
+        tuple(
+            (section.heading, tuple(claim.text for claim in section.claims))
+            for section in proposal.sections
+        )
+    )
+    follow_on_sections = proposal.sections[1:]
     required_headings = {
         section.heading for section in follow_on_sections
     } & ARTICLE_SYNTHESIS_REQUIRED_HEADINGS
