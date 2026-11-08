@@ -54,6 +54,7 @@ from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
     build_editorial_enrichment_model_request,
     build_editorial_figure_catalog,
+    build_source_figure_inventory_diagnostics,
     canonical_synthesis_hash,
     compute_editorial_enrichment_input_hash,
     compute_editorial_enrichment_invocation_hash,
@@ -87,7 +88,10 @@ from cti_app.application.source_figure_inventory import (
     SourceFigureCatalogMetadata,
     SourceFigureInventory,
     SourceFigureInventoryResult,
+    SourceFigureTruncationDiagnostic,
+    load_archived_source_figure_inventory,
 )
+from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection
 from cti_app.domain.discovery import SourceRole
@@ -181,10 +185,14 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1, SemanticRole
 from cti_app.domain.source_media import (
     SourceFigureProvenanceDiagnostic,
     SourceFigureProvenanceStage,
+    SourceMediaReasonCode,
+    SourceMediaRecord,
+    SourceMediaStatus,
 )
 
 _SUBJECT_ID = UUID("a0a4f09c-1107-4ae1-8311-bf43fd2a2ce0")
@@ -915,6 +923,25 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
         "reconstruite, lorsque les deux répondent à la même question analytique."
     ) in contract
     assert "Deux enrichissements ne doivent pas répondre à la même question analytique." in contract
+
+    article_contract = editorial_enrichment_output_contract_example(
+        publication_kind=PublicationKind.ARTICLE,
+        maximum_figure_proposals=9,
+    )
+    brief_contract = editorial_enrichment_output_contract_example(
+        publication_kind=PublicationKind.BRIEF,
+        maximum_figure_proposals=9,
+    )
+    assert "au moins deux TABLE utiles" in article_contract
+    assert "au moins un DIAGRAMME" in article_contract
+    assert "timeline à dates exactes" in article_contract
+    assert "FIGURE SOURCE archivées pertinentes" in article_contract
+    assert "TABLE MINIMUM NOT MET" in article_contract
+    assert "DIAGRAM OMITTED" in article_contract
+    assert "ne dépasse jamais 9" in article_contract
+    assert "ne dépasse jamais 9" in brief_contract
+    assert "Règles ARTICLE R7" not in brief_contract
+    assert "TABLE MINIMUM NOT MET" not in brief_contract
 
 
 def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
@@ -2660,7 +2687,7 @@ def test_empty_figure_response_is_valid_and_model_cannot_supply_hash_or_image() 
     assert "editorial_enrichment_no_figure_selected" in enrichment.warnings
 
 
-def test_figure_selection_accepts_at_most_three_figures() -> None:
+def test_figure_selection_uses_accepted_catalog_bound_instead_of_three() -> None:
     snapshot = _snapshot()
     extraction = _extraction(input_hash=snapshot.input_hash)
     synthesis = _synthesis(extraction)
@@ -2695,8 +2722,8 @@ def test_figure_selection_accepts_at_most_three_figures() -> None:
     )
     parsed = parse_editorial_enrichment_proposal_wire(over_limit, pack, figure_catalog=catalog)
     assert parsed.proposal is not None
-    assert len(parsed.proposal.figures) == 3
-    assert "editorial_enrichment_figure_limit_exceeded" in {
+    assert len(parsed.proposal.figures) == 4
+    assert "editorial_enrichment_figure_limit_exceeded" not in {
         item.reason_code for item in parsed.rejections
     }
 
@@ -2986,12 +3013,10 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
         pack,
         access_policy,
         figure_catalog=figure_catalog,
+        publication_kind=PublicationKind.ARTICLE,
     )
 
-    # An accepted catalog figure makes the model look at the live article.
-    assert request.web_search is any(
-        entry.figure.decision.value == "accepted" for entry in figure_catalog
-    )
+    assert request.web_search is False
     assert request.background is False
     assert request.conversation is None
     assert request.routing_hint.value == "editorial_enrichment"
@@ -3001,26 +3026,32 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     )
     assert str(source.id) not in request.text
     assert str(extraction.sources[0].source_document_id) not in request.text
-    # Each prompt entry carries the page, safe asset path, context, dimensions,
-    # and only evidence handles belonging to that source.
-    assert request.text.count(extraction.sources[0].canonical_url) == len(figure_catalog)
+    # The model receives archived context and evidence, with no page or asset URL.
+    assert extraction.sources[0].canonical_url not in request.text
     assert "F001" in request.text
-    assert '"asset_url":"https://cdn.example.test/example-rat.png"' in request.text
+    assert '"asset_url":null' in request.text
+    assert '"source_page_url":null' in request.text
     assert '"source_caption":"ExampleRAT execution architecture"' in request.text
     assert '"evidence":["E001"]' in request.text
     assert '"width":640' in request.text and '"height":400' in request.text
     assert "ExampleRAT execution architecture" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v9-analytic-value"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v10-article-density"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v13-editorial-tables"
+        "editorial-enrichment-block-contract-v14-article-density"
     )
 
-    assert "sélectionne zéro ou une image" in request.text
+    assert "au moins deux TABLE utiles" in request.text
+    assert "au moins un DIAGRAMME" in request.text
+    assert "en français" in request.text
+    assert "TABLE MINIMUM NOT MET" in request.text
+    assert "DIAGRAM OMITTED" in request.text
+    assert "Figures sources ARTICLE" in request.text
+    assert "sélectionne zéro ou une image" not in request.text
     assert "capture de code ou artefact directement informative" in request.text
     assert "image d'un article adjacent" in request.text
-    assert "SOURCE_PAGE_URL" in request.text and "ASSET_URL" in request.text
+    assert "SOURCE_PAGE_URL" not in request.text and "ASSET_URL" not in request.text
 
     revision_request = ProductionEditorialEnrichmentRevisionService._model_request(
         request_identity="c" * 64,
@@ -3197,7 +3228,8 @@ class _MemoryArtifactStore:
             return value
         return payload
 
-    async def read_bytes(self, blob_id: UUID) -> bytes:
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        del max_bytes
         payload = self.payloads[blob_id]
         if isinstance(payload, bytes):
             return payload
@@ -3261,6 +3293,7 @@ class _Uow:
         self.source_documents = documents
         self.source_collections = _MemorySourceCollections(collections)
         self.blobs = _MemoryBlobs()
+        self.source_media_candidates = _MemorySourceMediaCandidates()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -3273,6 +3306,18 @@ class _MemoryBlobs:
     async def get(self, blob_id: UUID) -> None:
         del blob_id
         return None
+
+
+class _MemorySourceMediaCandidates:
+    def __init__(self, records: tuple[SourceMediaRecord, ...] = ()) -> None:
+        self.calls: list[tuple[UUID, str]] = []
+        self.records = records
+
+    async def list_for_subject_policy(
+        self, subject_id: UUID, policy_sha256: str
+    ) -> tuple[SourceMediaRecord, ...]:
+        self.calls.append((subject_id, policy_sha256))
+        return self.records
 
 
 class _RecordingGateway:
@@ -3554,7 +3599,37 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                 ]
             )
         lines.append("END DIAGRAM")
-    return "\n".join(lines) if lines else "NO USEFUL ENRICHMENT"
+    if len(payload["tables"]) < 2:
+        lines.extend(
+            [
+                "TABLE MINIMUM NOT MET",
+                "REASON: Le cas de test ne documente pas deux questions tabulaires distinctes.",
+                "END TABLE MINIMUM NOT MET",
+            ]
+        )
+    if not payload["diagrams"]:
+        lines.extend(
+            [
+                "DIAGRAM OMITTED",
+                "REASON: Le cas de test ne documente pas trois étapes ou relations distinctes.",
+                "END DIAGRAM OMITTED",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _empty_article_wire() -> str:
+    return "\n".join(
+        (
+            "NO USEFUL ENRICHMENT",
+            "TABLE MINIMUM NOT MET",
+            "REASON: Le cas de test ne documente pas deux questions tabulaires distinctes.",
+            "END TABLE MINIMUM NOT MET",
+            "DIAGRAM OMITTED",
+            "REASON: Le cas de test ne documente pas trois étapes ou relations distinctes.",
+            "END DIAGRAM OMITTED",
+        )
+    )
 
 
 def _ioc_table_wire(
@@ -3740,11 +3815,18 @@ async def test_bluemoon_archived_chain_is_catalogued_selected_and_published_from
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chain_caption = "Chaîne d'exploitation BlueMoon, du leurre aux charges post-exploitation."
-    world = _world(
-        _RecordingGateway(
-            lambda request: _succeeded_text(request, _figure_wire(caption=chain_caption))
+    article_wire = "\n\n".join(
+        (
+            _figure_wire(caption=chain_caption),
+            "TABLE MINIMUM NOT MET\n"
+            "REASON: Les preuves de ce cas de test ne décrivent qu'une seule question tabulaire.\n"
+            "END TABLE MINIMUM NOT MET",
+            "DIAGRAM OMITTED\n"
+            "REASON: Le cas de test ne fournit pas trois étapes ou relations documentées.\n"
+            "END DIAGRAM OMITTED",
         )
     )
+    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, article_wire)))
     article_source = world.extraction.sources[0]
     image_url = "https://cdn.example.test/bluemoon-exploitation-chain.png"
     article_bytes = (
@@ -3775,7 +3857,10 @@ async def test_bluemoon_archived_chain_is_catalogued_selected_and_published_from
     )
     inventory = SourceFigureInventory().inventory((archived_source,), (archived_asset,))
 
-    async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
+    inventory_load_arguments: dict[str, object] = {}
+
+    async def load_inventory(**kwargs: object) -> SourceFigureInventoryResult:
+        inventory_load_arguments.update(kwargs)
         return inventory
 
     monkeypatch.setattr(
@@ -3794,10 +3879,12 @@ async def test_bluemoon_archived_chain_is_catalogued_selected_and_published_from
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     request = world.gateway.calls[0][0]
     assert "F001" in request.text
-    assert request.web_search is True
+    assert request.web_search is False
     assert "BlueMoon exploitation chain" in request.text
-    assert image_url in request.text
+    assert image_url not in request.text
     assert str(world.extraction.sources[0].source_document_id) not in request.text
+    assert inventory_load_arguments.get("source_media_repository") is not None
+    assert "media_archiver" not in inventory_load_arguments
     assert result.source_figure_count == 1
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.source_figures) == 1  # type: ignore[attr-defined]
@@ -3805,7 +3892,12 @@ async def test_bluemoon_archived_chain_is_catalogued_selected_and_published_from
     assert enrichment.source_figures[0].resolved_figure.sha256 == "f" * 64  # type: ignore[attr-defined]
     assert enrichment.source_figures[0].resolved_figure.blob_id == UUID(int=601)  # type: ignore[attr-defined]
     metadata = world.writer.calls[0]["metadata_extra"]
-    assert metadata["source_figure_provenance_version"] == "source-figure-provenance-v1"  # type: ignore[index]
+    assert metadata["source_figure_provenance_version"] == (
+        "source-figure-provenance-v3-inventory-summary"
+    )  # type: ignore[index]
+    inventory_diagnostics = metadata["source_figure_inventory_diagnostics"]  # type: ignore[index]
+    assert inventory_diagnostics["counts"]["accepted"] == 1  # type: ignore[index]
+    assert inventory_diagnostics["selected_source_figure_handles"] == ["F001"]  # type: ignore[index]
     diagnostics = metadata["source_figure_provenance_diagnostics"]  # type: ignore[index]
     stages = [item["stage"] for item in diagnostics]  # type: ignore[union-attr]
     assert stages == ["discovered", "archived", "catalogued", "selected"]
@@ -3813,6 +3905,86 @@ async def test_bluemoon_archived_chain_is_catalogued_selected_and_published_from
     assert selected["blob_id"] == str(UUID(int=601))
     assert selected["sha256"] == "f" * 64
     assert "image_bytes" not in json.dumps(diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_source_figure_inventory_reads_archived_blobs_without_collection() -> None:
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, _empty_article_wire()))
+    )
+    source_blob_id = UUID(int=8101)
+    image_blob_id = UUID(int=8102)
+    image_url = "https://cdn.example.test/archived-diagram.png"
+    source_url = world.extraction.sources[0].canonical_url
+    source_bytes = (
+        f'<article><p>Payload execution sequence.</p><img src="{image_url}" '
+        'alt="Payload sequence"></article>'
+    ).encode()
+    image_bytes = b"already archived image bytes"
+    source_document = replace(
+        _document(),
+        blob_id=source_blob_id,
+        detected_mime_type="text/html",
+        final_url=source_url,
+    )
+
+    class _ReadOnlyBlobs:
+        async def get(self, blob_id: UUID) -> BlobRecord | None:
+            contents = source_bytes if blob_id == source_blob_id else image_bytes
+            mime = "text/html" if blob_id == source_blob_id else "image/png"
+            return BlobRecord(
+                id=blob_id,
+                descriptor=BlobDescriptor(
+                    sha256=hashlib.sha256(contents).hexdigest(),
+                    size=len(contents),
+                    mime_type=mime,
+                    logical_bucket="test",
+                ),
+            )
+
+    archive_store = _MemoryArtifactStore()
+    archive_store.payloads[source_blob_id] = source_bytes
+    archive_store.payloads[image_blob_id] = image_bytes
+
+    class _NoCollectionArchive:
+        policy_sha256 = "a" * 64
+
+        async def collect(self, *_args: object, **_kwargs: object) -> tuple[object, ...]:
+            raise AssertionError("production enrichment must not collect or download media")
+
+    media_candidates = _MemorySourceMediaCandidates(
+        (
+            SourceMediaRecord(
+                subject_id=world.snapshot.subject_id,
+                source_document_id=world.extraction.sources[0].source_document_id,
+                policy_version="source-media-v1",
+                policy_sha256="a" * 64,
+                status=SourceMediaStatus.ACCEPTED_FOR_REVIEW,
+                reason_code=SourceMediaReasonCode.ELIGIBLE_FOR_REVIEW,
+                blob_id=image_blob_id,
+                sha256=hashlib.sha256(image_bytes).hexdigest(),
+                mime_type="image/png",
+                width=640,
+                height=400,
+                byte_size=len(image_bytes),
+                requested_url=image_url,
+            ),
+        )
+    )
+    inventory = await load_archived_source_figure_inventory(
+        subject_id=world.snapshot.subject_id,
+        extraction_sources=world.extraction.sources,
+        source_document_repository=_MemorySourceDocuments((source_document,)),
+        blob_repository=_ReadOnlyBlobs(),  # type: ignore[arg-type]
+        artifact_store=archive_store,  # type: ignore[arg-type]
+        source_media_repository=media_candidates,  # type: ignore[arg-type]
+        media_policy_sha256="a" * 64,
+        media_archiver=_NoCollectionArchive(),  # type: ignore[arg-type]
+    )
+
+    assert len(inventory.accepted) == 1
+    assert inventory.accepted[0].blob_id == image_blob_id
+    assert media_candidates.calls == [(world.snapshot.subject_id, "a" * 64)]
 
 
 @pytest.mark.asyncio
@@ -3919,8 +4091,9 @@ async def test_all_failed_diagrams_degrade_to_stored_tables_with_review_rejectio
 
 @pytest.mark.asyncio
 async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
-    empty = EditorialEnrichmentProposalV1()
-    world = _world(_RecordingGateway(lambda request: _succeeded(request, empty)))
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, _empty_article_wire()))
+    )
 
     result = await _execute(world)
 
@@ -3930,13 +4103,30 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
 
 
 @pytest.mark.asyncio
+async def test_article_minima_without_nonproduction_reason_require_review() -> None:
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, "NO USEFUL ENRICHMENT"))
+    )
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value
+    assert len(world.writer.calls) == 0
+    assert result.details is not None
+    assert result.details["article_enrichment_minimum_diagnostics"][
+        "missing_nonproduction_reasons"
+    ] == ["tables", "diagrams"]
+
+
+@pytest.mark.asyncio
 async def test_rejecting_every_quality_block_can_store_an_empty_success() -> None:
     anchor = "ExampleRAT downloads the payload and starts execution."
     wire_payload = {"value": ""}
 
     def respond(request: ModelRequest) -> ModelExecution:
         if request.prompt_template_id == "production-editorial-enrichment-repair":
-            return _succeeded_text(request, "NO USEFUL ENRICHMENT")
+            return _succeeded_text(request, _empty_article_wire())
         return _succeeded_text(request, wire_payload["value"])
 
     world = _world(_RecordingGateway(respond))
@@ -4029,7 +4219,10 @@ async def test_resource_need_is_persisted_and_search_stays_off_by_default() -> N
     needs_wire = (
         "NEEDS N001\nKIND: MEDIA\n"
         "REASON: No relevant execution figure is archived.\n"
-        "QUERY_HINT: Example incident ExampleRAT execution diagram\nEND NEEDS"
+        "QUERY_HINT: Example incident ExampleRAT execution diagram\nEND NEEDS\n\n"
+        "TABLE MINIMUM NOT MET\nREASON: No two distinct table questions are documented.\n"
+        "END TABLE MINIMUM NOT MET\nDIAGRAM OMITTED\n"
+        "REASON: No three-step sequence or relation is documented.\nEND DIAGRAM OMITTED"
     )
     world = _world(_RecordingGateway(lambda request: _succeeded_text(request, needs_wire)))
 
@@ -4052,7 +4245,10 @@ async def test_resource_search_opt_in_uses_separate_call_and_persists_proposals_
     needs_wire = (
         "NEEDS N001\nKIND: TECHNICAL_ANALYSIS\n"
         "REASON: A protocol field explanation is missing.\n"
-        "QUERY_HINT: Example incident protocol field analysis\nEND NEEDS"
+        "QUERY_HINT: Example incident protocol field analysis\nEND NEEDS\n\n"
+        "TABLE MINIMUM NOT MET\nREASON: No two distinct table questions are documented.\n"
+        "END TABLE MINIMUM NOT MET\nDIAGRAM OMITTED\n"
+        "REASON: No three-step sequence or relation is documented.\nEND DIAGRAM OMITTED"
     )
     resource_wire = (
         "RESOURCE R001\nNEED: N001\nURL: https://vendor.example/report\n"
@@ -4141,7 +4337,11 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
     )
     wire = wire.replace("CELL: ExampleRAT", 'CELL: "ExampleRAT"', 1)
     wire = wire.replace("EVIDENCE: E001", "EVIDENCE: E001【cite:turn2】", 1)
-    polluted = f"```text\n{wire}\n```"
+    polluted = (
+        f"```text\n{wire}\nDIAGRAM OMITTED\n"
+        "REASON: The malformed diagram relationships are not retained.\n"
+        "END DIAGRAM OMITTED\n```"
+    )
     world = _world(
         _RecordingGateway(
             lambda request: replace(_succeeded(request, _proposal("E001")), output_text=polluted)
@@ -4257,6 +4457,28 @@ async def test_prompt_or_contract_version_bump_uses_a_new_model_invocation(
     assert second.model_calls == 1
     assert second.input_hash != first.input_hash
     assert second.model_run_id != first.model_run_id
+
+
+def test_enrichment_policy_version_changes_artifact_input_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    common = {
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "evidence_pack_hash": "1" * 64,
+        "access_policy_hash": "2" * 64,
+    }
+    original = compute_editorial_enrichment_input_hash(**common)
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "EDITORIAL_ENRICHMENT_POLICY_VERSION",
+        "editorial-enrichment-v12-test",
+    )
+
+    assert compute_editorial_enrichment_input_hash(**common) != original
 
 
 @pytest.mark.asyncio
@@ -4406,7 +4628,13 @@ async def test_invalid_structured_output_needs_review_without_artifact(failure: 
     elif failure == "gateway_error":
         responder = StructuredOutputError("schema mismatch")
     else:
-        responder = lambda request: _succeeded(request, _proposal("E999"))  # noqa: E731
+        unknown_wire = (
+            _proposal_to_wire(_proposal("E999"))
+            + "\nDIAGRAM OMITTED\n"
+            "REASON: The candidate diagram uses an unknown evidence handle.\n"
+            "END DIAGRAM OMITTED"
+        )
+        responder = lambda request: _succeeded_text(request, unknown_wire)  # noqa: E731
     world = _world(_RecordingGateway(responder))
 
     result = await _execute(world)
@@ -4439,7 +4667,17 @@ async def test_key_collision_rejects_only_the_conflicting_wire_block(
     collision: str,
 ) -> None:
     proposal = EditorialEnrichmentProposalV1.model_validate(_colliding_proposal(collision))
-    world = _world(_RecordingGateway(lambda request: _succeeded(request, proposal)))
+    collision_wire = (
+        _proposal_to_wire(proposal)
+        + "\nTABLE MINIMUM NOT MET\n"
+        "REASON: Les propositions en collision ne donnent qu'un tableau distinct conservable.\n"
+        "END TABLE MINIMUM NOT MET\nDIAGRAM OMITTED\n"
+        "REASON: Le diagramme du test entre en collision avec la clé du tableau.\n"
+        "END DIAGRAM OMITTED"
+    )
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, collision_wire))
+    )
 
     result = await _execute(world)
 
@@ -6346,10 +6584,17 @@ def test_final_validation_drops_only_the_invalid_repaired_sibling_block() -> Non
 
 @pytest.mark.asyncio
 async def test_final_validation_rejection_is_persisted_even_for_empty_enrichment() -> None:
-    wire = _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001").replace(
-        "LIMITS: No additional tool behavior is documented.",
-        "LIMITS: The table excludes operations under prefixes @@ and **.",
-        1,
+    wire = (
+        _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001").replace(
+            "LIMITS: No additional tool behavior is documented.",
+            "LIMITS: The table excludes operations under prefixes @@ and **.",
+            1,
+        )
+        + "\nTABLE MINIMUM NOT MET\n"
+        "REASON: This test's only table is rejected for malformed limits.\n"
+        "END TABLE MINIMUM NOT MET\nDIAGRAM OMITTED\n"
+        "REASON: This test does not provide three distinct steps or relations.\n"
+        "END DIAGRAM OMITTED"
     )
     world = _world(_RecordingGateway(lambda request: _succeeded_text(request, wire)))
 
@@ -6550,7 +6795,15 @@ async def test_targeted_repair_is_single_call_versioned_and_reused_on_replay() -
     valid_wire = _proposal_to_wire(_proposal("E001"))
     table = _top_wire_block(valid_wire, "TABLE T001")
     invalid_table = table.replace("PURPOSE_EVIDENCE: E001", "PURPOSE_EVIDENCE: E999", 1)
-    first_pass = "\n\n".join((invalid_table, _top_wire_block(valid_wire, "DIAGRAM D001")))
+    first_pass = "\n\n".join(
+        (
+            invalid_table,
+            _top_wire_block(valid_wire, "DIAGRAM D001"),
+            "TABLE MINIMUM NOT MET\n"
+            "REASON: Le cas de test ne documente pas deux questions tabulaires distinctes.\n"
+            "END TABLE MINIMUM NOT MET",
+        )
+    )
 
     def respond(request: ModelRequest) -> ModelExecution:
         if request.prompt_template_id == "production-editorial-enrichment-repair":
@@ -6585,7 +6838,15 @@ async def test_resource_search_setting_is_preserved_through_enrichment_storage()
     valid_wire = _proposal_to_wire(_proposal("E001"))
     table = _top_wire_block(valid_wire, "TABLE T001")
     invalid_table = table.replace("PURPOSE_EVIDENCE: E001", "PURPOSE_EVIDENCE: E999", 1)
-    first_pass = "\n\n".join((invalid_table, _top_wire_block(valid_wire, "DIAGRAM D001")))
+    first_pass = "\n\n".join(
+        (
+            invalid_table,
+            _top_wire_block(valid_wire, "DIAGRAM D001"),
+            "TABLE MINIMUM NOT MET\n"
+            "REASON: Le cas de test ne documente pas deux questions tabulaires distinctes.\n"
+            "END TABLE MINIMUM NOT MET",
+        )
+    )
 
     def respond(request: ModelRequest) -> ModelExecution:
         if request.prompt_template_id == "production-editorial-enrichment-repair":
@@ -6623,7 +6884,14 @@ async def test_rejected_diagram_does_not_discard_a_valid_source_figure(
     invalid_diagram = _top_wire_block(valid_wire, "DIAGRAM D001").replace(
         "RELATION_TYPE: factual", "RELATION_TYPE: causal", 1
     )
-    first_wire = f"{_figure_wire()}\n\n{invalid_diagram}"
+    first_wire = (
+        f"{_figure_wire()}\n\n{invalid_diagram}\n\n"
+        "TABLE MINIMUM NOT MET\n"
+        "REASON: Le cas de test ne documente pas deux questions tabulaires distinctes.\n"
+        "END TABLE MINIMUM NOT MET\nDIAGRAM OMITTED\n"
+        "REASON: Le diagramme du cas de test échoue au contrôle de relation.\n"
+        "END DIAGRAM OMITTED"
+    )
 
     def respond(request: ModelRequest) -> ModelExecution:
         return _succeeded_text(
@@ -6665,7 +6933,7 @@ async def test_rejected_diagram_does_not_discard_a_valid_source_figure(
 @pytest.mark.asyncio
 async def test_enrichment_and_repair_prompts_keep_the_text_block_contract() -> None:
     world = _world(
-        _RecordingGateway(lambda request: _succeeded_text(request, "NO USEFUL ENRICHMENT"))
+        _RecordingGateway(lambda request: _succeeded_text(request, _empty_article_wire()))
     )
     result = await _execute(world)
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
@@ -6737,7 +7005,7 @@ async def test_repair_failure_keeps_valid_siblings_and_all_rejected_blocks_can_b
 
     def unrepaired(request: ModelRequest) -> ModelExecution:
         if request.prompt_template_id == "production-editorial-enrichment-repair":
-            return _succeeded_text(request, "NO USEFUL ENRICHMENT")
+            return _succeeded_text(request, _empty_article_wire())
         return _succeeded_text(request, "\n\n".join((invalid_table, invalid_diagram)))
 
     rejected_world = _world(_RecordingGateway(unrepaired))
@@ -6795,6 +7063,100 @@ def test_source_figure_inventory_warning_only_reports_pending_items() -> None:
     assert warning in enrichment_module._source_figure_inventory_warnings(pending)
     assert warning in enrichment_module._source_figure_inventory_warnings(page_excerpt)
     assert warning in enrichment_module._source_figure_inventory_warnings(oversized_source)
+
+
+def test_source_figure_inventory_diagnostics_report_decisions_and_bounded_truncation() -> None:
+    source_url = "https://example.test/figure.png"
+    locator = SourceFigureLocatorV1(
+        page=2, original_asset_url=f"{source_url}?token=must-not-persist"
+    )
+
+    def figure(decision: SourceFigureDecision, reason: str, index: int) -> ResolvedSourceFigureV1:
+        accepted = decision is SourceFigureDecision.ACCEPTED
+        digest = f"{index:x}" * 64 if accepted else None
+        selected_locator = replace(locator, figure_label=f"Candidate {index}")
+        return ResolvedSourceFigureV1(
+            figure_id=source_figure_id(
+                source_document_id=_DOCUMENT_ID,
+                sha256=digest,
+                source=source_url,
+                locator=selected_locator,
+            ),
+            blob_id=UUID(int=index) if accepted else None,
+            sha256=digest,
+            mime_type="image/png" if accepted else None,
+            byte_size=256 if accepted else None,
+            source_document_id=_DOCUMENT_ID,
+            source=source_url,
+            provenance="fixture",
+            locator=selected_locator,
+            decision=decision,
+            decision_reason=reason,
+        )
+
+    figures = (
+        figure(SourceFigureDecision.ACCEPTED, "matched_archived_blob", 1),
+        figure(SourceFigureDecision.REJECTED, "decorative_asset", 2),
+        figure(SourceFigureDecision.PENDING, "image_not_in_local_archive", 3),
+    )
+    inventory = SourceFigureInventoryResult(
+        figures=figures,
+        truncated=True,
+        truncated_count=2,
+        max_figures=1,
+        truncated_decision_counts={"accepted": 1, "pending": 1},
+        truncated_reason_counts={
+            "accepted": {"inventory_max_figure_limit": 1},
+            "pending": {"image_bytes_not_in_blob_store": 1},
+        },
+        truncated_candidates=(
+            SourceFigureTruncationDiagnostic(
+                source_document_id=_DOCUMENT_ID,
+                page=3,
+                section="body",
+                figure_label="Candidate 4",
+                candidate_decision="accepted",
+                candidate_reason="inventory_max_figure_limit",
+            ),
+        ),
+    )
+    catalog = tuple(
+        EditorialFigureCatalogEntry(
+            handle=f"F{index:03d}",
+            source_role="primary",
+            editorial_role="technical",
+            figure=item,
+            metadata=SourceFigureCatalogMetadata(),
+        )
+        for index, item in enumerate(figures, start=1)
+    )
+
+    diagnostic = build_source_figure_inventory_diagnostics(inventory, catalog)
+
+    assert diagnostic["counts"] == {
+        "accepted": 2,
+        "rejected": 1,
+        "pending": 2,
+        "truncated": 2,
+        "max_figures": 1,
+    }
+    assert diagnostic["reasons"] == {
+        "accepted": {
+            "matched_archived_blob": 1,
+            "inventory_max_figure_limit": 1,
+        },
+        "rejected": {"decorative_asset": 1},
+        "pending": {
+            "image_not_in_local_archive": 1,
+            "image_bytes_not_in_blob_store": 1,
+        },
+    }
+    assert diagnostic["pending"][0]["handle"] == "F003"
+    assert diagnostic["pending"][0]["archived_location"] == source_url
+    assert diagnostic["truncation"]["candidates"][0]["candidate_reason"] == (
+        "inventory_max_figure_limit"
+    )
+    assert diagnostic["accepted_not_selected"][0]["handle"] == "F001"
 
 
 def test_translated_diagram_labels_are_grounded_by_their_cited_english_evidence() -> None:

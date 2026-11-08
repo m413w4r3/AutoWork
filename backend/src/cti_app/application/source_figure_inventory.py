@@ -12,7 +12,11 @@ from typing import Protocol
 from urllib.parse import unquote_to_bytes
 from uuid import UUID
 
-from cti_app.application.persistence import BlobRepository, SourceDocumentRepository
+from cti_app.application.persistence import (
+    BlobRepository,
+    SourceDocumentRepository,
+    SourceMediaRepository,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.source_media_collection import (
     SOURCE_MEDIA_MAX_PIXELS,
@@ -44,8 +48,9 @@ from cti_app.domain.source_media import (
     SourceMediaStatus,
 )
 
-SOURCE_FIGURE_INVENTORY_POLICY_VERSION = "source-figure-inventory-v2-provenance"
+SOURCE_FIGURE_INVENTORY_POLICY_VERSION = "source-figure-inventory-v3-bounded-diagnostics"
 MAX_SOURCE_FIGURES = 128
+MAX_SOURCE_FIGURE_TRUNCATION_DIAGNOSTICS = 128
 MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_FIGURE_BYTES = 5 * 1024 * 1024
 MAX_SOURCE_FIGURE_TOTAL_BYTES = 50 * 1024 * 1024
@@ -96,9 +101,34 @@ class SourceFigureCatalogMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceFigureTruncationDiagnostic:
+    source_document_id: UUID
+    page: int | None
+    section: str | None
+    figure_label: str | None
+    candidate_decision: str
+    candidate_reason: str
+
+    def to_json(self) -> dict[str, str | int | None]:
+        return {
+            "source_document_id": str(self.source_document_id),
+            "page": self.page,
+            "section": self.section,
+            "figure_label": self.figure_label,
+            "candidate_decision": self.candidate_decision,
+            "candidate_reason": self.candidate_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SourceFigureInventoryResult:
     figures: tuple[ResolvedSourceFigureV1, ...]
     truncated: bool = False
+    truncated_count: int = 0
+    max_figures: int = MAX_SOURCE_FIGURES
+    truncated_decision_counts: Mapping[str, int] = field(default_factory=dict)
+    truncated_reason_counts: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    truncated_candidates: tuple[SourceFigureTruncationDiagnostic, ...] = ()
     warnings: tuple[str, ...] = ()
     policy_sha256: str | None = None
     catalog_metadata: Mapping[UUID, SourceFigureCatalogMetadata] = field(default_factory=dict)
@@ -131,6 +161,14 @@ class SourceFigureInventoryResult:
         payload = {
             "inventory_policy_version": SOURCE_FIGURE_INVENTORY_POLICY_VERSION,
             "truncated": self.truncated,
+            "truncated_count": self.truncated_count,
+            "max_figures": self.max_figures,
+            "truncated_decision_counts": dict(self.truncated_decision_counts),
+            "truncated_reason_counts": {
+                decision: dict(counts)
+                for decision, counts in self.truncated_reason_counts.items()
+            },
+            "truncated_candidates": [item.to_json() for item in self.truncated_candidates],
             "warnings": list(self.warnings),
             "policy_sha256": self.policy_sha256,
             "provenance_diagnostics": [item.to_json() for item in self.provenance_diagnostics],
@@ -189,6 +227,8 @@ class SourceFigureInventory:
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if max_figures > MAX_SOURCE_FIGURES:
+            raise ValueError(f"max_figures must not exceed {MAX_SOURCE_FIGURES}")
         self._max_figures = max_figures
         self._max_source_bytes = max_source_bytes
         self._max_figure_bytes = max_figure_bytes
@@ -231,6 +271,12 @@ class SourceFigureInventory:
         seen_locations: set[tuple[UUID, str]] = set()
         total_figure_bytes = 0
         truncated = False
+        truncated_count = 0
+        truncated_decision_counts: dict[str, int] = {}
+        truncated_reason_counts: dict[str, dict[str, int]] = {}
+        truncated_candidates: list[SourceFigureTruncationDiagnostic] = []
+        truncated_hashes: set[str] = set()
+        truncated_locations: set[tuple[UUID, str]] = set()
         warnings: set[str] = set()
         catalog_metadata: dict[UUID, SourceFigureCatalogMetadata] = {}
 
@@ -257,7 +303,7 @@ class SourceFigureInventory:
             in_article_body: bool = False,
             anchor: str | None = None,
         ) -> bool:
-            nonlocal total_figure_bytes, truncated
+            nonlocal total_figure_bytes, truncated, truncated_count
             observed_width = width
             observed_height = height
             if media_record is not None:
@@ -298,14 +344,14 @@ class SourceFigureInventory:
                         }
                     ):
                         return True
+                if sha256 in truncated_hashes:
+                    return True
             else:
                 location = (source.source_document_id, asset_url or locator.figure_label or "")
-                if location in seen_locations:
+                if location in seen_locations or location in truncated_locations:
                     return True
             duplicate = sha256 is not None and sha256 in indices_by_hash
-            if not duplicate and len(found) >= self._max_figures:
-                truncated = True
-                return False
+            count_total_bytes = False
             if byte_size is not None:
                 if byte_size > self._max_figure_bytes:
                     decision = SourceFigureDecision.REJECTED
@@ -318,8 +364,37 @@ class SourceFigureInventory:
                     reason = "inventory_exceeds_total_byte_limit"
                     blob = None
                 else:
-                    if not duplicate:
-                        total_figure_bytes += byte_size
+                    count_total_bytes = not duplicate
+            if not duplicate and len(found) >= self._max_figures:
+                truncated = True
+                truncated_count += 1
+                decision_key = decision.value
+                truncated_decision_counts[decision_key] = (
+                    truncated_decision_counts.get(decision_key, 0) + 1
+                )
+                reason_counts = truncated_reason_counts.setdefault(decision_key, {})
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                if sha256 is not None:
+                    truncated_hashes.add(sha256)
+                else:
+                    truncated_locations.add(
+                        (source.source_document_id, asset_url or locator.figure_label or "")
+                    )
+                if len(truncated_candidates) < MAX_SOURCE_FIGURE_TRUNCATION_DIAGNOSTICS:
+                    truncated_candidates.append(
+                        SourceFigureTruncationDiagnostic(
+                            source_document_id=source.source_document_id,
+                            page=locator.page,
+                            section=locator.section,
+                            figure_label=locator.figure_label,
+                            candidate_decision=decision.value,
+                            candidate_reason=reason,
+                        )
+                    )
+                warnings.add("source_figure_inventory_max_figure_limit")
+                return True
+            if byte_size is not None and count_total_bytes:
+                total_figure_bytes += byte_size
             selected_locator = SourceFigureLocatorV1(
                 page=locator.page,
                 section=locator.section,
@@ -660,9 +735,6 @@ class SourceFigureInventory:
                     anchor=observation.anchor,
                 ):
                     break
-            if truncated:
-                break
-
         ordered = tuple(
             sorted(
                 found,
@@ -730,6 +802,11 @@ class SourceFigureInventory:
         return SourceFigureInventoryResult(
             figures=ordered,
             truncated=truncated,
+            truncated_count=truncated_count,
+            max_figures=self._max_figures,
+            truncated_decision_counts=truncated_decision_counts,
+            truncated_reason_counts=truncated_reason_counts,
+            truncated_candidates=tuple(truncated_candidates),
             warnings=tuple(sorted(warnings)),
             policy_sha256=policy_sha256,
             catalog_metadata=catalog_metadata,
@@ -995,8 +1072,15 @@ async def load_archived_source_figure_inventory(
     artifact_store: ProductionArtifactStore,
     inventory: SourceFigureInventory | None = None,
     media_archiver: SourceMediaArchiver | None = None,
+    source_media_repository: SourceMediaRepository | None = None,
+    media_policy_sha256: str | None = None,
 ) -> SourceFigureInventoryResult:
-    """Build a figure inventory and collect unresolved local-source media."""
+    """Build an inventory from archived source and media blobs only.
+
+    If no persisted media repository is supplied, ``media_archiver`` retains its
+    historical collection behavior for callers that explicitly require it.
+    Production enrichment supplies the repository and never invokes collection.
+    """
     scanner = inventory or SourceFigureInventory()
     documents = await source_document_repository.list_for_subject(subject_id)
     documents_by_id = {document.id: document for document in documents}
@@ -1073,30 +1157,34 @@ async def load_archived_source_figure_inventory(
         )
 
     media_candidates: tuple[SourceMediaRecord, ...] = ()
-    policy_sha256: str | None = None
-    if media_archiver is not None and archived_sources:
+    policy_sha256 = media_policy_sha256
+    if source_media_repository is not None and policy_sha256 is not None:
+        media_candidates = tuple(
+            await source_media_repository.list_for_subject_policy(subject_id, policy_sha256)
+        )
+    elif media_archiver is not None and archived_sources:
         media_candidates = await media_archiver.collect(subject_id, tuple(archived_sources))
         policy_sha256 = media_archiver.policy_sha256
-        for candidate in media_candidates:
-            if (
-                candidate.blob_id is None
-                or candidate.sha256 is None
-                or candidate.mime_type is None
-                or candidate.byte_size is None
-            ):
-                continue
-            archived_assets.append(
-                ArchivedFigureAsset(
-                    source_document_id=candidate.source_document_id,
-                    source_url=candidate.requested_url,
-                    blob_id=candidate.blob_id,
-                    sha256=candidate.sha256,
-                    mime_type=candidate.mime_type,
-                    byte_size=candidate.byte_size,
-                    width=candidate.width,
-                    height=candidate.height,
-                )
+    for candidate in media_candidates:
+        if (
+            candidate.blob_id is None
+            or candidate.sha256 is None
+            or candidate.mime_type is None
+            or candidate.byte_size is None
+        ):
+            continue
+        archived_assets.append(
+            ArchivedFigureAsset(
+                source_document_id=candidate.source_document_id,
+                source_url=candidate.requested_url,
+                blob_id=candidate.blob_id,
+                sha256=candidate.sha256,
+                mime_type=candidate.mime_type,
+                byte_size=candidate.byte_size,
+                width=candidate.width,
+                height=candidate.height,
             )
+        )
 
     result = scanner.inventory(
         tuple(archived_sources),

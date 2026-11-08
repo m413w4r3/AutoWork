@@ -206,14 +206,14 @@ MISSING COVERAGE: <thème absent des preuves fournies, en une phrase française>
 """
 # Editorial-only prompt changes preserve REFERENCES, EXTRACTION, RELEVANCE_PROJECTION,
 # and SYNTHESIS; only EDITORIAL_ENRICHMENT and its downstream PUBLICATION need rebuilding.
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v19-ioc-and-diagram-value"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v20-article-density"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
-    "editorial-enrichment-block-contract-v13-editorial-tables"
+    "editorial-enrichment-block-contract-v14-article-density"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v14-atomic-diagram-relations"
-EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v7-ioc-and-diagram-value"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v15-article-omission-diagnostics"
+EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v8-article-density"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = (
-    "editorial-enrichment-repair-contract-v6-editorial-tables"
+    "editorial-enrichment-repair-contract-v7-article-density"
 )
 SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v2-no-title"
 SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v2-no-title"
@@ -222,10 +222,10 @@ EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bou
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
 EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
-    "editorial-enrichment-revision-v5-ioc-and-diagram-value"
+    "editorial-enrichment-revision-v6-article-density"
 )
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
-    "editorial-enrichment-revision-contract-v6-critical-source-waiver"
+    "editorial-enrichment-revision-contract-v7-article-density"
 )
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"

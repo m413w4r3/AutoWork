@@ -68,6 +68,7 @@ from cti_app.application.production_prompts import (
     SEMANTIC_ANNOTATION_ROLE_GUIDANCE,
     SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION,
 )
+from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.production_synthesis import (
     SynthesisAccessPolicyV1,
     _all_evidence_entries,
@@ -86,7 +87,10 @@ from cti_app.application.production_wire_archive import (
     verified_raw_output_text,
 )
 from cti_app.application.source_figure_inventory import (
+    MAX_SOURCE_FIGURES,
+    SOURCE_FIGURE_INVENTORY_POLICY_VERSION,
     SourceFigureCatalogMetadata,
+    SourceFigureInventory,
     SourceFigureInventoryResult,
     load_archived_source_figure_inventory,
 )
@@ -175,6 +179,7 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_lineage,
 )
 from cti_app.domain.publication import PUBLICATION_IOC_ARTIFACT_TYPES, ArtifactType
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
     SEMANTIC_ROLE_PRIORITY,
@@ -193,7 +198,7 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v9-analytic-value"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v10-article-density"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v8-relation-support"
@@ -207,7 +212,7 @@ EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50
 DIAGRAM_STAR_REDUNDANT_LABEL_RATIO = 0.80
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v7-editorial-tables"
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v8-article-density"
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
     "CHART": EditorialMediaType.CHART,
@@ -221,14 +226,17 @@ _ENRICHMENT_MEDIA_ARBITRATION_PRIORITY = {
     EditorialMediaType.TABLE: 1,
     EditorialMediaType.NONE: 2,
 }
-SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION = "source-figure-provenance-v1"
+SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION = "source-figure-provenance-v3-inventory-summary"
+SOURCE_FIGURE_INVENTORY_DIAGNOSTICS_VERSION = "source-figure-inventory-diagnostics-v2-reasons"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
     "editorial-enrichment-routing-policy-v2-resource-search-off"
 )
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1-bounded"
 
 MAX_EDITORIAL_ENRICHMENT_TECHNICAL_EVIDENCE = 128
-MAX_ENRICHMENT_FIGURE_PROPOSALS = 3
+# Reconstructed diagrams/charts are independent of source figures. Source-figure
+# selection is bounded by both this hard maximum and the configured inventory.
+MAX_ENRICHMENT_FIGURE_PROPOSALS = MAX_SOURCE_FIGURES
 MAX_ENRICHMENT_RESOURCE_NEEDS = 4
 MAX_ENRICHMENT_RESOURCE_PROPOSALS = 12
 
@@ -655,6 +663,7 @@ class EditorialFigureCatalogEntry:
                 "width": self.metadata.width,
                 "height": self.metadata.height,
             },
+            "archived_sha256": self.figure.sha256,
             "aspect_ratio_warning": self.metadata.aspect_ratio_warning,
             "evidence": list(evidence_handles),
             "in_article_body": self.metadata.in_article_body,
@@ -810,6 +819,7 @@ class EditorialEnrichmentWireParseResult:
     warnings: tuple[str, ...] = ()
     rejected_blocks: tuple[EditorialEnrichmentRejectedBlock, ...] = ()
     accepted_blocks: tuple[EditorialEnrichmentAcceptedBlock, ...] = ()
+    nonproduction_reasons: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2443,6 +2453,8 @@ def parse_editorial_enrichment_proposal_wire(
     block_sequence = 0
     recognized = False
     explicit_empty = False
+    nonproduction_reasons: dict[str, str] = {}
+    current_omission_kind: str | None = None
 
     def reject(block: _EditorialEnrichmentWireBlock, reason: str) -> None:
         rejections.append(
@@ -2535,6 +2547,43 @@ def parse_editorial_enrichment_proposal_wire(
                 if "markdown_fences_removed" not in transformations:
                     transformations.append("markdown_fences_removed")
             continue
+        omission_marker = line.strip().casefold()
+        if omission_marker in {"table minimum not met", "diagram omitted"}:
+            finish_top()
+            recognized = True
+            current_omission_kind = (
+                "tables" if omission_marker == "table minimum not met" else "diagrams"
+            )
+            continue
+        if current_omission_kind is not None:
+            reason_match = re.fullmatch(r"REASON\s*:\s*(.*)", line, re.IGNORECASE)
+            if reason_match is not None:
+                reason = " ".join(reason_match.group(1).split())
+                if not reason or len(reason) > 1000:
+                    warnings.append(
+                        f"editorial_enrichment_nonproduction_reason_invalid:{current_omission_kind}"
+                    )
+                elif current_omission_kind in nonproduction_reasons:
+                    warnings.append(
+                        f"editorial_enrichment_nonproduction_reason_duplicate:{current_omission_kind}"
+                    )
+                else:
+                    nonproduction_reasons[current_omission_kind] = reason
+                current_omission_kind = None
+                recognized = True
+                continue
+            end_omission = (
+                "end table minimum not met"
+                if current_omission_kind == "tables"
+                else "end diagram omitted"
+            )
+            if omission_marker == end_omission:
+                current_omission_kind = None
+                continue
+            warnings.append(
+                f"editorial_enrichment_nonproduction_reason_missing:{current_omission_kind}"
+            )
+            current_omission_kind = None
         empty_marker = re.sub(r"[.!]+$", "", line).strip().casefold()
         if empty_marker in {"no useful enrichment", "no enrichment", "empty"}:
             finish_top()
@@ -2763,11 +2812,17 @@ def parse_editorial_enrichment_proposal_wire(
                 dict.fromkeys((*warnings, "editorial_enrichment_unintelligible_response"))
             ),
         )
+    if current_omission_kind is not None:
+        warnings.append(
+            f"editorial_enrichment_nonproduction_reason_missing:{current_omission_kind}"
+        )
     if explicit_empty and not top_blocks and not rejections:
         return EditorialEnrichmentWireParseResult(
             proposal=EditorialEnrichmentProposalV1(),
             explicit_empty=True,
             transformations=tuple(transformations),
+            warnings=tuple(warnings),
+            nonproduction_reasons=tuple(sorted(nonproduction_reasons.items())),
         )
 
     for block in top_blocks:
@@ -2786,6 +2841,13 @@ def parse_editorial_enrichment_proposal_wire(
     chart_questions: dict[str, str] = {}
     source_figure_questions: dict[str, str] = {}
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
+    maximum_figure_proposals = min(
+        MAX_ENRICHMENT_FIGURE_PROPOSALS,
+        sum(
+            entry.figure.decision is SourceFigureDecision.ACCEPTED
+            for entry in figure_catalog
+        ),
+    )
     proposed_figure_handles: set[str] = set()
     proposed_need_keys: set[str] = set()
     # Source figures are considered first so an equivalent reconstructed form
@@ -2883,7 +2945,7 @@ def parse_editorial_enrichment_proposal_wire(
                     reject(top, "editorial_enrichment_duplicate_figure_handle")
                 elif not question_key or question_key in analytic_questions:
                     reject(top, "editorial_enrichment_duplicate_analytic_purpose")
-                elif len(figures) >= MAX_ENRICHMENT_FIGURE_PROPOSALS:
+                elif len(figures) >= maximum_figure_proposals:
                     reject(top, "editorial_enrichment_figure_limit_exceeded")
                 else:
                     proposed_figure_handles.add(figure.figure_handle)
@@ -2976,6 +3038,7 @@ def parse_editorial_enrichment_proposal_wire(
             warnings=tuple(dict.fromkeys((*warnings, "editorial_enrichment_no_valid_blocks"))),
             rejected_blocks=tuple(rejected_blocks),
             accepted_blocks=tuple(accepted_blocks),
+            nonproduction_reasons=tuple(sorted(nonproduction_reasons.items())),
         )
     return EditorialEnrichmentWireParseResult(
         proposal=EditorialEnrichmentProposalV1(
@@ -2991,6 +3054,7 @@ def parse_editorial_enrichment_proposal_wire(
         warnings=tuple(dict.fromkeys(warnings)),
         rejected_blocks=tuple(rejected_blocks),
         accepted_blocks=tuple(accepted_blocks),
+        nonproduction_reasons=tuple(sorted(nonproduction_reasons.items())),
     )
 
 
@@ -3350,6 +3414,13 @@ def _merge_repaired_editorial_enrichment_proposal(
             warnings=tuple(dict.fromkeys(warnings)),
             rejected_blocks=remaining_rejections,
             accepted_blocks=accepted_blocks,
+            nonproduction_reasons=tuple(
+                sorted(
+                    dict(
+                        (*first_pass.nonproduction_reasons, *repair_pass.nonproduction_reasons)
+                    ).items()
+                )
+            ),
         ),
         tuple(repaired_identities),
         tuple(unexpected),
@@ -4275,6 +4346,96 @@ def build_source_figure_provenance_diagnostics(
     return [item.to_json() for item in diagnostics]
 
 
+def build_source_figure_inventory_diagnostics(
+    inventory: SourceFigureInventoryResult,
+    figure_catalog: tuple[EditorialFigureCatalogEntry, ...],
+    enrichment: EditorialEnrichmentV1 | None = None,
+) -> dict[str, Any]:
+    """Summarize every inventoried decision and bounded truncation detail."""
+    catalog_by_id = {entry.figure.figure_id: entry for entry in figure_catalog}
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "accepted": [],
+        "rejected": [],
+        "pending": [],
+    }
+    reasons: dict[str, dict[str, int]] = {"accepted": {}, "rejected": {}, "pending": {}}
+    for figure in inventory.figures:
+        decision = figure.decision.value
+        entry = catalog_by_id.get(figure.figure_id)
+        item = {
+            "handle": entry.handle if entry is not None else None,
+            "figure_id": str(figure.figure_id),
+            "source_document_id": str(figure.source_document_id),
+            "page": figure.locator.page,
+            "section": figure.locator.section,
+            "figure_label": figure.locator.figure_label,
+            "archived_location": _safe_asset_prompt_url(figure.locator.original_asset_url),
+            "reason_code": figure.decision_reason,
+        }
+        grouped[decision].append(item)
+        counts = reasons[decision]
+        counts[figure.decision_reason] = counts.get(figure.decision_reason, 0) + 1
+
+    handle_by_figure_id = {
+        entry.figure.figure_id: entry.handle
+        for entry in figure_catalog
+    }
+    selected_handles = sorted(
+        handle_by_figure_id.get(candidate.resolved_figure.figure_id, candidate.key)
+        for candidate in (enrichment.source_figures if enrichment is not None else ())
+        if candidate.inclusion_status is SourceFigureInclusionStatus.INCLUDED
+        and candidate.resolved_figure is not None
+    )
+    decision_counts = {
+        decision: len(grouped[decision])
+        + inventory.truncated_decision_counts.get(decision, 0)
+        for decision in (
+            SourceFigureDecision.ACCEPTED.value,
+            SourceFigureDecision.REJECTED.value,
+            SourceFigureDecision.PENDING.value,
+        )
+    }
+    for decision, counts in inventory.truncated_reason_counts.items():
+        if decision in reasons:
+            for reason, count in counts.items():
+                reasons[decision][reason] = reasons[decision].get(reason, 0) + count
+
+    return {
+        "version": SOURCE_FIGURE_INVENTORY_DIAGNOSTICS_VERSION,
+        "inventory_policy_version": SOURCE_FIGURE_INVENTORY_POLICY_VERSION,
+        "counts": {
+            "accepted": decision_counts[SourceFigureDecision.ACCEPTED.value],
+            "rejected": decision_counts[SourceFigureDecision.REJECTED.value],
+            "pending": decision_counts[SourceFigureDecision.PENDING.value],
+            "truncated": inventory.truncated_count,
+            "max_figures": inventory.max_figures,
+        },
+        "accepted": grouped[SourceFigureDecision.ACCEPTED.value],
+        "rejected": grouped[SourceFigureDecision.REJECTED.value],
+        "pending": grouped[SourceFigureDecision.PENDING.value],
+        "reasons": reasons,
+        "truncation": {
+            "is_truncated": inventory.truncated,
+            "reason_code": "source_figure_inventory_max_figure_limit"
+            if inventory.truncated
+            else None,
+            "omitted_unique_candidates": inventory.truncated_count,
+            "omitted_by_decision": dict(inventory.truncated_decision_counts),
+            "omitted_by_reason": {
+                decision: dict(counts)
+                for decision, counts in inventory.truncated_reason_counts.items()
+            },
+            "candidates": [item.to_json() for item in inventory.truncated_candidates],
+        },
+        "selected_source_figure_handles": selected_handles,
+        "accepted_not_selected": [
+            item
+            for item in grouped[SourceFigureDecision.ACCEPTED.value]
+            if item["handle"] not in selected_handles
+        ],
+    }
+
+
 def _source_figure_inventory_warnings(
     inventory: SourceFigureInventoryResult,
 ) -> tuple[str, ...]:
@@ -4808,9 +4969,13 @@ def build_editorial_resource_proposal_model_request(
     )
 
 
-def editorial_enrichment_output_contract_example() -> str:
+def editorial_enrichment_output_contract_example(
+    *,
+    publication_kind: PublicationKind | None = None,
+    maximum_figure_proposals: int = MAX_ENRICHMENT_FIGURE_PROPOSALS,
+) -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
-    return (
+    contract = (
         """Return independent plain-text blocks. Give every block a local id.
 Détermine intérieurement une question analytique pour chaque besoin.
 Ne produis pas de bloc QUESTION.
@@ -5082,6 +5247,58 @@ repli. Sans caption modèle, caption source ou alt exploitable, la figure ne ser
 Choisis un emplacement valide avec PLACEMENT et SECTION_INDEX. NEEDS est facultatif et ne doit
 décrire qu'un média analytique pertinent manquant. Ne renvoie aucune URL dans la réponse."""
     )
+    if publication_kind is PublicationKind.ARTICLE:
+        contract = contract.replace(
+            "Figures : sélectionne zéro ou une image seulement "
+            "si elle améliore réellement la compréhension;",
+            "Figures sources ARTICLE : retiens toutes les images archivées pertinentes, "
+            "jusqu'à la limite effective indiquée. Les figures sources sont distinctes des "
+            "diagrammes et charts reconstruits;",
+        )
+        contract = contract.replace(
+            "Quand\nla recherche Web est disponible, consulte SOURCE_PAGE_URL et identifie "
+            "ce que montre réellement\nchaque figure.",
+            "N'effectue aucune recherche Web; décide à partir des médias et contextes déjà "
+            "archivés, sans ouvrir de page.",
+        )
+        contract = contract.replace(
+            "avec SOURCE_PAGE_URL, ASSET_URL, ALT, SOURCE_CAPTION,",
+            "à partir de ALT, SOURCE_CAPTION,",
+        )
+        contract = contract.replace("dans la langue de publication", "en français")
+        contract = contract.replace(
+            "Le purpose de la figure décrit la question analytique à laquelle le média répond. "
+            "Zéro figure est une\ndécision valide.",
+            "Le purpose de la figure décrit la question analytique à laquelle le média répond.",
+        )
+        contract += (
+            "\n\nRègles ARTICLE R7 : produis au moins deux TABLE utiles si les preuves "
+            "documentent deux questions analytiques distinctes (TTP/capacités, infrastructure, "
+            "protocole, correspondances ou chronologies techniques); produis au moins un "
+            "DIAGRAMME dès que trois étapes ou relations sont documentées. Un CHART est permis "
+            "uniquement pour une timeline à dates exactes. Retiens toutes les FIGURE SOURCE "
+            "archivées pertinentes jusqu'à la limite effective de "
+            f"{maximum_figure_proposals}; elles sont distinctes des diagrammes et charts "
+            "reconstruits. Chaque TITLE et CAPTION est en français; chaque élément, ligne, nœud, "
+            "arête et point conserve ses evidence handles pour l'attribution de la source. "
+            "N'ajoute aucun fait.\n"
+            "Si le minimum de tableaux n'est pas atteint, ajoute :\n"
+            "TABLE MINIMUM NOT MET\nREASON: motif précis en français, sans fait nouveau\n"
+            "END TABLE MINIMUM NOT MET\n"
+            "Si le minimum conditionnel de diagrammes n'est pas atteint, ajoute :\n"
+            "DIAGRAM OMITTED\n"
+            "REASON: motif précis en français, sans fait nouveau\nEND DIAGRAM OMITTED\n"
+        )
+    contract = contract.replace(
+        "Le renderer choisit les couleurs.",
+        "Le renderer choisit les couleurs. Le nombre de propositions FIGURE ne dépasse "
+        f"jamais {maximum_figure_proposals}.",
+    )
+    contract += (
+        f"\n\nLe nombre de FIGURE SOURCE proposées ne dépasse jamais "
+        f"{maximum_figure_proposals}."
+    )
+    return contract
 
 
 def build_editorial_enrichment_model_request(
@@ -5094,6 +5311,7 @@ def build_editorial_enrichment_model_request(
     source_figure_inventory_hash: str | None = None,
     figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
     resource_search_enabled: bool = False,
+    publication_kind: PublicationKind | None = None,
 ) -> ModelRequest:
     if (
         run.id != snapshot.production_run_id
@@ -5131,8 +5349,34 @@ def build_editorial_enrichment_model_request(
         source_figure_inventory_hash=source_figure_inventory_hash,
         projection_hash=evidence_pack.projection_hash,
     )
+    maximum_figure_proposals = min(
+        MAX_ENRICHMENT_FIGURE_PROPOSALS,
+        sum(
+            entry.figure.decision is SourceFigureDecision.ACCEPTED
+            for entry in figure_catalog
+        ),
+    )
+    article_requirements = (
+        "ARTICLE R7 — exigences conditionnelles. Produis au moins deux TABLE utiles quand "
+        "les preuves documentent deux questions analytiques distinctes (TTP/capacités, "
+        "infrastructure, protocole, correspondances ou chronologies techniques). Produis au "
+        "moins un DIAGRAMME dès que trois étapes ou relations sont explicitement documentées, "
+        "sans répéter une assertion déjà lisible dans la synthèse. Un CHART est permis seulement "
+        "pour une timeline fondée sur des dates exactes. Retiens toutes les FIGURE SOURCE "
+        "archivées pertinentes, dans la limite effective indiquée; les figures sources sont "
+        "distinctes des diagrammes et graphiques reconstruits. Les minima ne justifient jamais "
+        "un ajout sans preuve. Pour chaque catégorie sous son minimum, fournis le marqueur de "
+        "non-production du contrat avec un motif précis en français. Les titres et légendes "
+        "sont en français; les handles d'évidence conservés par élément/ligne/nœud/arête/point "
+        "assurent l'attribution canonique de la source, sans imprimer ces handles dans la "
+        "légende.\n\n"
+        if publication_kind is PublicationKind.ARTICLE
+        else ""
+    )
     prompt_payload = {
         "instructions": (
+            article_requirements
+            +
             "Tu es un arbitre de représentations éditoriales, pas un chercheur ni un renderer. "
             "Détermine intérieurement une question analytique pour chaque besoin; ne produis pas "
             "de bloc QUESTION. Pour chaque "
@@ -5152,8 +5396,13 @@ def build_editorial_enrichment_model_request(
             "Les couleurs sont choisies par le renderer. "
             "Une représentation existante de la source est prioritaire sur une représentation "
             "reconstruite, lorsque les deux répondent à la même question analytique. Deux "
-            "enrichissements ne doivent pas répondre à la même question analytique. Aucun quota "
-            "minimal de médias ne s'applique; RIEN est une décision valide. Choisis une "
+            "enrichissements ne doivent pas répondre à la même question analytique. "
+            + (
+                "Les minima conditionnels ARTICLE ci-dessus s'appliquent à l'article. "
+                if publication_kind is PublicationKind.ARTICLE
+                else "Aucun quota minimal ne s'applique; RIEN est une décision valide. "
+            )
+            + "Choisis une "
             "représentation uniquement quand elle clarifie les preuves mieux que la prose. Chaque "
             "FIGURE, chart, table et "
             "diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
@@ -5166,8 +5415,14 @@ def build_editorial_enrichment_model_request(
             "donnée | Canal | Identifiant », « Variant | Payload | C2 » et « Domaine | Date | "
             "Acteur ». Ce dernier tableau sert uniquement à consulter les dates et domaines "
             "exacts; pour comprendre leur répartition dans le temps, choisis CHART. N'impose "
-            "aucun minimum de nœuds et n'ajoute aucune complexité décorative. Zéro table et zéro "
-            "diagramme sont valides lorsque la prose suffit. N'ajoute aucun fait, "
+            "aucun minimum de nœuds et n'ajoute aucune complexité décorative. "
+            + (
+                "Si les conditions ARTICLE ne sont pas remplies, indique explicitement le motif "
+                "de non-production pour chaque catégorie sous son minimum. "
+                if publication_kind is PublicationKind.ARTICLE
+                else "Zéro table et zéro diagramme sont valides lorsque la prose suffit. "
+            )
+            + "N'ajoute aucun fait, "
             "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
             "fournies. Chaque point, ligne, nœud et arête cite des evidence handles existants et "
             "pertinents; garde ces handles dans EVIDENCE ou PURPOSE_EVIDENCE, jamais dans les "
@@ -5224,17 +5479,25 @@ def build_editorial_enrichment_model_request(
             "TikZ, Typst, "
             "SVG, image source, ni corps de règle. Les diagrammes décrivent seulement une "
             "spécification sémantique en blocs. Titres et captions restent descriptifs. Le "
-            "catalogue figure_catalog contient des médias archivés : propose uniquement un "
-            "handle accepté, avec une caption que tu rédiges toi-même dans la langue de "
-            "publication, des evidence handles de la même source, un placement et une raison. "
-            "Juge chaque figure du catalogue d'après son contexte dans l'article (titre de "
-            "section, texte avant et après l'image, nom de fichier) et ouvre source_page_url "
-            "pour la confirmer; ne retiens que celles qui illustrent ce sujet précis. N'inclus "
-            "pas un média rejeté ou en attente d'archivage. Zéro figure est valide. Si une figure "
+            "catalogue figure_catalog contient des métadonnées de médias archivés : propose "
+            "uniquement des handles acceptés, avec une caption française et des evidence handles "
+            "de la même source, un placement et une raison. Évalue chaque média à partir du "
+            "contexte d'article, de la légende source, de l'alt, de la section et des dimensions "
+            "archivés fournis; aucune page ni URL n'est ouverte pendant cet appel. Ne retiens "
+            "pas un média rejeté ou en attente d'archivage. "
+            + (
+                f"Tu peux sélectionner jusqu'à {maximum_figure_proposals} figures sources "
+                "acceptées, et toutes celles qui sont pertinentes. "
+                if publication_kind is PublicationKind.ARTICLE
+                else "Zéro figure est valide. "
+            )
+            + "Si une figure "
             "ou une analyse manque, tu peux émettre un bloc NEEDS MEDIA ou TECHNICAL_ANALYSIS; "
             "indique une raison et un "
             "query_hint borné au sujet. N'inclus aucune URL dans NEEDS."
         ),
+        "publication_kind": publication_kind.value if publication_kind is not None else None,
+        "maximum_figure_proposals": maximum_figure_proposals,
         "publication_language": evidence_pack.publication_language,
         "current_synthesis": dict(evidence_pack.current_synthesis),
         "current_evidence_pack": {
@@ -5252,8 +5515,8 @@ def build_editorial_enrichment_model_request(
         },
         "figure_catalog": [
             entry.prompt_record(
-                include_source_page=True,
-                include_asset_url=True,
+                include_source_page=False,
+                include_asset_url=False,
                 evidence_handles=evidence_pack.evidence_handles_for_source(
                     entry.figure.source_document_id
                 ),
@@ -5288,7 +5551,10 @@ def build_editorial_enrichment_model_request(
             ],
             "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         },
-        "output_contract": editorial_enrichment_output_contract_example(),
+        "output_contract": editorial_enrichment_output_contract_example(
+            publication_kind=publication_kind,
+            maximum_figure_proposals=maximum_figure_proposals,
+        ),
         "output_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
     }
     prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -5317,10 +5583,8 @@ def build_editorial_enrichment_model_request(
         external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
-        # The model must look at the live article's images to pick figures.
-        web_search=any(
-            entry.figure.decision is SourceFigureDecision.ACCEPTED for entry in figure_catalog
-        ),
+        # Figure selection uses archived source context; this stage never browses.
+        web_search=False,
         background=False,
         conversation=None,
         run_id=editorial_enrichment_model_run_id(run, invocation_hash),
@@ -5331,6 +5595,8 @@ def build_editorial_enrichment_model_request(
             "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
             "contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
             "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
+            "publication_kind": publication_kind.value if publication_kind is not None else None,
+            "maximum_figure_proposals": maximum_figure_proposals,
         },
     )
 
@@ -5583,8 +5849,15 @@ def validate_editorial_enrichment_proposal(
             EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
             message="evidence_pack_type_invalid",
         )
+    maximum_figure_proposals = min(
+        MAX_ENRICHMENT_FIGURE_PROPOSALS,
+        sum(
+            entry.figure.decision is SourceFigureDecision.ACCEPTED
+            for entry in figure_catalog
+        ),
+    )
     if (
-        len(parsed.figures) > MAX_ENRICHMENT_FIGURE_PROPOSALS
+        len(parsed.figures) > maximum_figure_proposals
         or len(parsed.resource_needs) > MAX_ENRICHMENT_RESOURCE_NEEDS
         or len(resource_proposals) > MAX_ENRICHMENT_RESOURCE_PROPOSALS
     ):
@@ -6376,6 +6649,7 @@ class ProductionEditorialEnrichmentService:
         diagram_compiler: DiagramCompiler | None = None,
         chart_compiler: AnalyticChartCompiler | None = None,
         source_media_archiver: SourceMediaArchiveService | None = None,
+        source_figure_limit: int = MAX_SOURCE_FIGURES,
         resource_search_enabled: bool = False,
     ) -> None:
         self._uow_factory = uow_factory
@@ -6390,6 +6664,12 @@ class ProductionEditorialEnrichmentService:
         self._diagram_compiler = diagram_compiler
         self._chart_compiler = chart_compiler
         self._source_media_archiver = source_media_archiver
+        if (
+            type(source_figure_limit) is not int
+            or not 1 <= source_figure_limit <= MAX_SOURCE_FIGURES
+        ):
+            raise ValueError(f"source_figure_limit must be between 1 and {MAX_SOURCE_FIGURES}")
+        self._source_figure_limit = source_figure_limit
         self._resource_search_enabled = resource_search_enabled
 
     async def execute(
@@ -6424,13 +6704,31 @@ class ProductionEditorialEnrichmentService:
                         "The exact source access policy for Editorial Enrichment is unavailable",
                         details={"reason": str(exc)},
                     ) from exc
+                routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
+                if run.routing_decision_id is not None and routing_decision is None:
+                    raise _EditorialEnrichmentInputControl(
+                        EditorialEnrichmentStageErrorCode.INPUTS_MISMATCH,
+                        "The adopted publication route is missing or stale.",
+                        details={"routing_decision_id": str(run.routing_decision_id)},
+                    )
+                publication_kind = (
+                    routing_decision.publication_kind
+                    if routing_decision is not None
+                    else PublicationKind.ARTICLE
+                )
                 source_figure_inventory = await load_archived_source_figure_inventory(
                     subject_id=snapshot.subject_id,
                     extraction_sources=extraction.sources,
                     source_document_repository=uow.source_documents,
                     blob_repository=uow.blobs,
                     artifact_store=self._artifact_store,
-                    media_archiver=self._source_media_archiver,
+                    inventory=SourceFigureInventory(max_figures=self._source_figure_limit),
+                    source_media_repository=uow.source_media_candidates,
+                    media_policy_sha256=(
+                        self._source_media_archiver.policy_sha256
+                        if self._source_media_archiver is not None
+                        else None
+                    ),
                 )
             await self._ingest_source_figures(source_figure_inventory)
             figure_catalog = build_editorial_figure_catalog(extraction, source_figure_inventory)
@@ -6492,6 +6790,7 @@ class ProductionEditorialEnrichmentService:
             source_figure_inventory_hash=source_figure_inventory.functional_hash(),
             figure_catalog=figure_catalog,
             resource_search_enabled=self._resource_search_enabled,
+            publication_kind=publication_kind,
         )
         model_run_id = request.run_id
         if model_run_id is None:
@@ -6590,6 +6889,9 @@ class ProductionEditorialEnrichmentService:
             "parse_identity": parse_identity,
             "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
             "contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+            "source_figure_inventory_diagnostics": build_source_figure_inventory_diagnostics(
+                source_figure_inventory, figure_catalog
+            ),
             "rejections": [
                 {
                     "block_id": item.block_id,
@@ -6631,7 +6933,7 @@ class ProductionEditorialEnrichmentService:
         if (
             parsed.proposal is None
             and parsed.error_code == "editorial_enrichment_no_valid_blocks"
-            and parsed.rejections
+            and (parsed.rejections or parsed.nonproduction_reasons)
         ):
             # A readable response whose individual proposals were rejected is a
             # valid empty enrichment; retain every rejection for the artifact trace.
@@ -6662,6 +6964,44 @@ class ProductionEditorialEnrichmentService:
                 details=wire_details,
                 model_calls=model_calls,
             )
+        if publication_kind is PublicationKind.ARTICLE:
+            reported_nonproduction = dict(parsed.nonproduction_reasons)
+            table_count = len(parsed.proposal.tables)
+            diagram_count = len(parsed.proposal.diagrams)
+            missing_reasons = []
+            if table_count < 2 and not reported_nonproduction.get("tables"):
+                missing_reasons.append("tables")
+            if diagram_count == 0 and not reported_nonproduction.get("diagrams"):
+                missing_reasons.append("diagrams")
+            wire_details["article_enrichment_minimum_diagnostics"] = {
+                "required_tables_when_supported": 2,
+                "produced_tables": table_count,
+                "produced_diagrams": diagram_count,
+                "nonproduction_reasons": [
+                    {"category": category, "reason": reason}
+                    for category, reason in parsed.nonproduction_reasons
+                ],
+            }
+            if missing_reasons:
+                wire_details["article_enrichment_minimum_diagnostics"][
+                    "missing_nonproduction_reasons"
+                ] = missing_reasons
+                return self._needs_review(
+                    input_hash=input_hash,
+                    model_run_id=model_run.id,
+                    error_code=EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                    error_message=(
+                        "The ARTICLE enrichment omitted a minimum without a reason: "
+                        + ", ".join(missing_reasons)
+                    ),
+                    details=wire_details,
+                    model_calls=model_calls,
+                )
+            if parsed.nonproduction_reasons:
+                wire_details["nonproduction_reasons"] = [
+                    {"category": category, "reason": reason}
+                    for category, reason in parsed.nonproduction_reasons
+                ]
         resource_proposals: tuple[ResourceProposalV1, ...] = ()
         resource_model_run_id: UUID | None = None
         if parsed.proposal.resource_needs:
@@ -6882,6 +7222,22 @@ class ProductionEditorialEnrichmentService:
             ),
             warnings=(*enrichment.warnings, *annotation_details["warnings"]),
         )
+        if parsed.nonproduction_reasons:
+            enrichment = replace(
+                enrichment,
+                warnings=(
+                    *enrichment.warnings,
+                    *(
+                        f"editorial_enrichment_nonproduction_reason:{category}"
+                        for category, _reason in parsed.nonproduction_reasons
+                    ),
+                ),
+            )
+        wire_details["source_figure_inventory_diagnostics"] = (
+            build_source_figure_inventory_diagnostics(
+                source_figure_inventory, figure_catalog, enrichment
+            )
+        )
         wire_details["semantic_annotation"] = {
             key: value for key, value in annotation_details.items() if key != "warnings"
         }
@@ -6911,6 +7267,12 @@ class ProductionEditorialEnrichmentService:
                 "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
                     source_figure_inventory, figure_catalog, enrichment
                 ),
+                "source_figure_inventory_diagnostics_version": (
+                    SOURCE_FIGURE_INVENTORY_DIAGNOSTICS_VERSION
+                ),
+                "source_figure_inventory_diagnostics": (
+                    wire_details["source_figure_inventory_diagnostics"]
+                ),
             },
         )
         return ProductionEditorialEnrichmentExecution(
@@ -6932,6 +7294,11 @@ class ProductionEditorialEnrichmentService:
                 or wire_details.get("repair")
                 or wire_details.get("diagram_rejections")
                 or wire_details.get("chart_rejections")
+                or wire_details.get("nonproduction_reasons")
+                or any(
+                    wire_details["source_figure_inventory_diagnostics"]["counts"][key]
+                    for key in ("rejected", "pending", "truncated")
+                )
                 or annotation_details["warnings"]
                 or annotation_details["proposal_count"]
                 else None
