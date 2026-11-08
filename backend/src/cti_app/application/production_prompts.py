@@ -23,6 +23,12 @@ SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = (
     "synthesis-targeted-revision-v4-grounded-heading-terms"
 )
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v3-after-formats"
+ARTICLE_SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = (
+    "synthesis-targeted-revision-v5-article-structure"
+)
+ARTICLE_SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = (
+    "synthesis-targeted-patch-v7-article-structure"
+)
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v9-placeholder-token-normalization"
 
 SYNTHESIS_EDITORIAL_CONTRACT_V6 = """EDITORIAL CONTRACT — ARTICLE
