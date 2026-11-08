@@ -331,12 +331,24 @@ def _run(command: Sequence[str]) -> None:
 
 
 def _free_bytes(path: str) -> int:
-    try:
-        return shutil.disk_usage(Path(path)).free
-    except OSError as exc:
-        raise DiskGuardError(
-            f"cannot read free space for {path!r}: {type(exc).__name__}"
-        ) from exc
+    """Free bytes of ``path``'s filesystem.
+
+    Docker data roots are often root-only (``PermissionError``): fall back to the
+    nearest readable parent, which lives on the same filesystem in practice.
+    """
+    candidate = Path(path)
+    last_error: OSError | None = None
+    while True:
+        try:
+            return shutil.disk_usage(candidate).free
+        except OSError as exc:
+            last_error = exc
+            if candidate.parent == candidate:
+                break
+            candidate = candidate.parent
+    raise DiskGuardError(
+        f"cannot read free space for {path!r}: {type(last_error).__name__}"
+    ) from last_error
 
 
 def _thresholds_from_environment() -> DiskThresholds:

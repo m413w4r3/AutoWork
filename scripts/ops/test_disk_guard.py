@@ -176,3 +176,19 @@ def test_preflight_uses_cache_only_gc_between_thresholds_and_rechecks(
     assert len(gc_calls) == 1
     assert gc_calls[0]["include_dangling_images"] is False
     assert gc_calls[0]["dry_run"] is False
+
+
+def test_free_bytes_falls_back_to_readable_parent(monkeypatch, tmp_path):
+    import shutil
+    from collections import namedtuple
+
+    usage = namedtuple("usage", "total used free")
+    root_only = tmp_path / "root-only" / "volume"
+
+    def fake_disk_usage(path):
+        if str(path).startswith(str(root_only)):
+            raise PermissionError("denied")
+        return usage(10, 5, 123)
+
+    monkeypatch.setattr(shutil, "disk_usage", fake_disk_usage)
+    assert disk_guard._free_bytes(str(root_only)) == 123
