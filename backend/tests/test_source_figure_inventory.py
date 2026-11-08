@@ -193,8 +193,18 @@ def test_inventory_applies_figure_count_and_size_limits() -> None:
 
     assert limited.truncated is True
     assert len(limited.figures) == 1
+    assert limited.truncated_count == 1
+    assert limited.truncated_candidates[0].candidate_decision == "pending"
+    assert limited.truncated_candidates[0].candidate_reason == "image_bytes_not_in_blob_store"
+    assert limited.truncated_decision_counts == {"pending": 1}
+    assert limited.truncated_reason_counts == {"pending": {"image_bytes_not_in_blob_store": 1}}
     assert oversized.figures[0].decision is SourceFigureDecision.REJECTED
     assert oversized.figures[0].decision_reason == "figure_exceeds_byte_limit"
+
+
+def test_inventory_figure_limit_cannot_exceed_the_hard_ceiling() -> None:
+    with pytest.raises(ValueError, match="must not exceed"):
+        SourceFigureInventory(max_figures=129)
 
 
 @pytest.mark.parametrize(("width", "height"), [(10_001, 200), (8_000, 6_000)])
