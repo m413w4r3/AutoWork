@@ -25,7 +25,10 @@ from cti_app.application.investigation_figures import (
 )
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
-from cti_app.application.publication_builder import build_publication_document_v5
+from cti_app.application.publication_builder import (
+    build_article_format_v1,
+    build_publication_document_v5,
+)
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
     TypstCompileRequest,
@@ -75,7 +78,12 @@ from cti_app.domain.production_synthesis import (
     SynthesisTimelineEntryV1,
     extraction_evidence_refs_v1,
 )
-from cti_app.domain.publication_document import publication_document_v5_sha256
+from cti_app.domain.publication_document import (
+    PublicationDocumentV7,
+    PublicationDocumentV8,
+    publication_document_v5_sha256,
+)
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
@@ -130,7 +138,9 @@ async def test_draft_preview_response_identifies_unapproved_status_and_hashes() 
     )
 
 
-def _publication_with_timeline(*, archived_image: bytes | None = None):
+def _publication_with_timeline(
+    *, archived_image: bytes | None = None, include_extraction: bool = False
+):
     snapshot, references, extraction, synthesis = _canonical_inputs()
     source_id = extraction.sources[0].source_document_id
     events = tuple(
@@ -213,7 +223,7 @@ def _publication_with_timeline(*, archived_image: bytes | None = None):
                 resolved_figure=resolved,
             ),
         )
-    return build_publication_document_v5(
+    publication = build_publication_document_v5(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
@@ -224,6 +234,7 @@ def _publication_with_timeline(*, archived_image: bytes | None = None):
             source_figures=source_figures,
         ),
     )
+    return (publication, extraction) if include_extraction else publication
 
 
 def test_archived_figure_provenance_survives_v5_and_v6_typst_projection() -> None:
@@ -302,12 +313,42 @@ def test_figures_are_omitted_without_canonical_events_or_cited_observations() ->
     assert build_investigation_chain_figure(v6) is None
 
 
+def test_v8_article_projection_uses_the_native_timeline_contract() -> None:
+    publication, extraction = _publication_with_timeline(include_extraction=True)
+    opinion, context = _approved_opinion(publication)
+    v6 = augment_publication_with_opinion(publication, opinion, context)
+    article = PublicationDocumentV8(
+        base_publication=PublicationDocumentV7(
+            base_publication=v6,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="f" * 64,
+            routing_policy_version="test-routing-v1",
+        ),
+        article_format=build_article_format_v1(publication, extraction),
+    )
+
+    model = project_publication_to_typst_model(article)
+
+    assert model.article_format is not None
+    assert [event["date_iso"] for event in model.article_format["timeline_key_events"]] == [
+        "2025-01-12",
+        "2025-01-16",
+    ]
+    assert all(
+        section["type"] not in {"chronology", "technical_annex", "provenance"}
+        for section in model.content_sections
+    )
+
+
 @pytest.mark.asyncio
-async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
+async def test_real_typst_renders_native_timeline_and_anchored_chain(
     tmp_path: Path,
 ) -> None:
     archived_image = _png(320, 200)
-    publication = _publication_with_timeline(archived_image=archived_image)
+    publication, extraction = _publication_with_timeline(
+        archived_image=archived_image,
+        include_extraction=True,
+    )
     source_id = publication.sources[0].source_document_id
     opinion, context = _approved_opinion(publication)
     observation = AnalystObservationV1(
@@ -418,6 +459,15 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         context,
         infrastructure_graph=infrastructure_graph,
     )
+    publication_v8 = PublicationDocumentV8(
+        base_publication=PublicationDocumentV7(
+            base_publication=publication_v6,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="f" * 64,
+            routing_policy_version="test-routing-v1",
+        ),
+        article_format=build_article_format_v1(publication, extraction),
+    )
     preview_opinion = replace(
         opinion,
         status=AnalystOpinionStatus.DRAFT,
@@ -453,14 +503,29 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         media_path=f"media/{graph_asset_id}.svg",
     )
 
-    first_model = project_publication_to_typst_model(publication_v6)
-    second_model = project_publication_to_typst_model(publication_v6)
+    first_model = project_publication_to_typst_model(publication_v8)
+    second_model = project_publication_to_typst_model(publication_v8)
     assert first_model.content_sections == second_model.content_sections
-    chronology = next(item for item in first_model.content_sections if item["type"] == "chronology")
+    assert first_model.article_format is not None
+    assert first_model.article_format["timeline_key_events"] == [
+        {
+            "date_iso": "2025-01-12",
+            "display_date_fr": "12 janvier 2025",
+            "text": "Premier événement observé",
+        },
+        {
+            "date_iso": "2025-01-16",
+            "display_date_fr": "16 janvier 2025",
+            "text": "Deuxième événement observé",
+        },
+    ]
+    assert all(
+        section["type"] not in {"chronology", "technical_annex", "provenance"}
+        for section in first_model.content_sections
+    )
     opinion_section = next(
         item for item in first_model.content_sections if item["type"] == "analyst_opinion"
     )
-    assert chronology["derived_timeline_figure"]["figure_id"]
     assert opinion_section["investigation_chain_figure"]["figure_id"]
 
     chp_typst_root, font_bundle_root, font_lock_path = typst_bundle_paths()
@@ -526,15 +591,15 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         "v5-preview", preview_document
     )
     assert "BROUILLON NON APPROUVÉ" in preview_text
-    v6_pdf, extracted, render_hash = await render_to_text("v6-final", publication_v6)
+    v8_pdf, extracted, render_hash = await render_to_text("v8-final", publication_v8)
     repeated_source = TypstRenderer().render(
-        publication_v6,
+        publication_v8,
         template_bundle,
         document_label="Publication de test — figures éditoriales",
         infrastructure_graph_media_ref=graph_media_ref,
     )
     repeated_render = TypstRenderer().render(
-        publication_v6,
+        publication_v8,
         template_bundle,
         document_label="Publication de test — figures éditoriales",
         infrastructure_graph_media_ref=graph_media_ref,
@@ -545,17 +610,17 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
     normalized = "".join(
         character for character in extracted.replace("\u00ad", "") if not character.isspace()
     )
-    assert "Événementsdatés" in normalized
-    timeline_start = extracted.index("Événements datés")
+    assert "Chronologie" in normalized
+    timeline_start = extracted.index("Chronologie")
     timeline_end = extracted.index("SYNTHÈSE", timeline_start)
     timeline_text = extracted[timeline_start:timeline_end]
     assert "Jours écoulés" not in timeline_text
-    assert timeline_text.count("2025-01-12") == 1
-    assert timeline_text.count("2025-01-16") == 1
-    assert "Sources" in timeline_text and "1" in timeline_text
+    assert timeline_text.count("12 janvier 2025") == 1
+    assert timeline_text.count("16 janvier 2025") == 1
+    assert "Premier événement observé" in timeline_text
+    assert "Deuxième événement observé" in timeline_text
     assert "Référencesdel'avis" in normalized
     assert "jourcalendaire" not in normalized
-    assert "2025-01-12" in normalized and "2025-01-16" in normalized
     assert observation.text in extracted
     assert str(observation.id) not in extracted
     assert "lead:0001" not in extracted
@@ -620,7 +685,6 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
             for index, lines in enumerate(pages)
             if any("Graphe d'infrastructure et de pivots" in text for _, _, text in lines)
         )
-        all_lines = [line for page in pages for line in page]
         figure_page = next(
             lines for lines in pages if any(text.startswith("Source :") for _, _, text in lines)
         )
@@ -639,15 +703,6 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
                 f"figure metadata lines overlap: {previous} / {current}"
             )
 
-        chronology_heading = next(line for line in all_lines if line[2].strip() == "CHRONOLOGIE")
-        chronology_caption = next(
-            line for line in all_lines if line[2].startswith("Figure 2 : Événements datés")
-        )
-        assert chronology_heading[1] <= chronology_caption[0], (
-            "chronology title overlaps its figure caption: "
-            f"{chronology_heading} / {chronology_caption}"
-        )
-
         graph_caption = next(
             line for line in image_page if "Graphe d'infrastructure et de pivots" in line[2]
         )
@@ -665,8 +720,6 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         legend_start = next(
             i for i, (_, _, text) in enumerate(legend_page) if text.startswith("Légende :")
         )
-        # The technical annex now starts on a new landscape page, so there is
-        # no next-section heading on the legend page to use as a boundary.
         # Keep the footer out of the body spacing check.
         legend_lines = [
             line
@@ -678,11 +731,11 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
             assert previous[1] <= current[0], f"graph legend lines overlap: {previous} / {current}"
         return page_index
 
-    for label, pdf_path in (("v5-preview", preview_pdf), ("v6-final", v6_pdf)):
+    for label, pdf_path in (("v5-preview", preview_pdf), ("v8-final", v8_pdf)):
         bbox_pages = await read_bbox_pages(pdf_path)
         graph_page_index = assert_figure_caption_spacing(bbox_pages)
         page_count = len(PdfReader(pdf_path, strict=True).pages)
-        assert page_count == 3
+        assert 2 <= page_count <= 3
         raster_prefix = tmp_path / f"{label}-page"
         await asyncio.to_thread(
             subprocess.run,
@@ -698,7 +751,7 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
 
         rasterized = await asyncio.to_thread(list_raster_paths, raster_pattern)
         assert len(rasterized) == page_count
-        if label == "v6-final":
-            graph_page = tmp_path / f"v6-final-page-{graph_page_index + 1}.png"
+        if label == "v8-final":
+            graph_page = tmp_path / f"v8-final-page-{graph_page_index + 1}.png"
             assert graph_page in rasterized
             shutil.copy2(graph_page, tmp_path / "v6-infrastructure-graph-page.png")

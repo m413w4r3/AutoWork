@@ -26,6 +26,7 @@ from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     PublicationDocumentV7,
+    PublicationDocumentV8,
     parse_publication_document,
     serialize_publication_document,
 )
@@ -139,7 +140,13 @@ class SubjectContentService:
         document = parse_publication_document(canonical)
         document_version = document.schema_version
         analyst_opinion: dict[str, Any] | None = None
-        if isinstance(document, PublicationDocumentV7):
+        if isinstance(document, PublicationDocumentV8):
+            v7 = document.base_publication
+            v6 = v7.base_publication
+            analyst_opinion = analyst_opinion_view(v6)
+            document = v6.base_publication
+            canonical = serialize_publication_document(document)
+        elif isinstance(document, PublicationDocumentV7):
             v6 = document.base_publication
             analyst_opinion = analyst_opinion_view(v6)
             document = v6.base_publication

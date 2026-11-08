@@ -70,6 +70,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV7,
+    PublicationDocumentV8,
     publication_document_from_json,
     serialize_publication_document,
 )
@@ -740,7 +741,9 @@ class PublicationRenderService:
             ) from exc
 
         publication_v6 = (
-            document.base_publication
+            document.base_publication.base_publication
+            if isinstance(document, PublicationDocumentV8)
+            else document.base_publication
             if isinstance(document, PublicationDocumentV7)
             else document
             if isinstance(document, PublicationDocumentV6)

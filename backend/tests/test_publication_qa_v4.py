@@ -182,15 +182,15 @@ def test_publication_section_order_matrix(monkeypatch: pytest.MonkeyPatch) -> No
             v5_with_ioc_details,
             v5_detail_inputs,
             qa_publication_v5,
-            # C8 adds body IOC lists before the exhaustive technical annex.
-            ("references", "synthesis", "ioc", "technical_annex"),
+            # v33 keeps Brief IOC values in a statusless compact section.
+            ("references", "synthesis", "ioc"),
         ),
         (
             v5_with_chronology,
             timeline_inputs,
             qa_publication_v5,
-            # C8 presents the sole sourced chronology before synthesis.
-            ("references", "chronology", "synthesis"),
+            # v33 projects ARTICLE timeline events through article_format.
+            ("references", "synthesis"),
         ),
         (
             v6_without_opinion,
@@ -206,7 +206,6 @@ def test_publication_section_order_matrix(monkeypatch: pytest.MonkeyPatch) -> No
                 "references",
                 "synthesis",
                 "analyst_opinion",
-                "technical_annex",
             ),
         ),
     )
@@ -316,7 +315,7 @@ def test_v5_qa_excludes_other_case_iocs_from_publication() -> None:
     )
 
     assert result["passed"] is True
-    assert result["checks"]["ioc_groups_separated"] is True
+    assert result["checks"]["reader_ioc_projection"] is True
     assert result["checks"]["ioc_details_scope"] is True
     assert publication.indicators == ()
     assert publication.original_indicators == ()

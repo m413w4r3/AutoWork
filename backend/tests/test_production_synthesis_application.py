@@ -9071,8 +9071,10 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
     )
     assert publication.artifact.canonical_blob_id is not None
     assembled_payload = await artifact_store.read_json(publication.artifact.canonical_blob_id)
-    assembled_timeline = assembled_payload["base_publication"]["base_publication"]["timeline"]
-    assert assembled_payload["publication_kind"] == PublicationKind.BRIEF.value
+    assembled_timeline = assembled_payload["base_publication"]["base_publication"][
+        "base_publication"
+    ]["timeline"]
+    assert assembled_payload["base_publication"]["publication_kind"] == PublicationKind.BRIEF.value
     assert assembled_timeline[0]["evidence_refs"][0]["kind"] == (EvidenceKind.SOURCE_METADATA.value)
 
 

@@ -128,7 +128,7 @@ from cti_app.domain.publication import (
     PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
-    PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
@@ -1250,7 +1250,7 @@ def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_o
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    assert publication_builder.ASSEMBLY_POLICY_VERSION == "15-publication-fuzzy-hash-normalization"
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == "16-publication-v8-article-format"
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
@@ -1261,7 +1261,8 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
         ).hexdigest(),
         "editorial_enrichment_hash": canonical_editorial_enrichment_hash(enrichment),
         "relevance_projection_hash": None,
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+        "article_format_policy_version": publication_builder.ARTICLE_FORMAT_POLICY_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
         "legitimate_services_policy_version": "legitimate-services-v1",
         "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -1395,7 +1396,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
 
     monkeypatch.setattr(
         publication_builder,
-        "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
+        "PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION",
         "changed-schema",
     )
     assert (
@@ -2204,10 +2205,10 @@ def test_assembly_preserves_ssdeep_identity_and_canonicalizes_tlsh_case() -> Non
     model = project_publication_to_typst_model(publication)
     ioc_section = next(section for section in model.content_sections if section["type"] == "ioc")
     rendered_hashes = {
-        item["value"]["text"] if isinstance(item["value"], dict) else str(item["value"])
+        item["value"]["text"]
         for group in ioc_section["source_indicators"]
+        if group["heading"] == "Hashes"
         for item in group["items"]
-        if item["artifact_type"] == ArtifactType.HASH.value
     }
     assert rendered_hashes == {ssdeep, ssdeep_case_variant, tlsh.upper()}
     assert canonical_extraction_hash(extraction) == extraction_hash

@@ -60,7 +60,13 @@ def test_augmentation_projects_ordered_blocks_and_keeps_v5_bytes_unchanged() -> 
     )
     assert opinion_section["blocks"][0]["number"] == "1.1"
     assert opinion_section["blocks"][0]["qualification_label"] == "Fait étayé"
-    assert model.content_sections[-1]["type"] == "technical_annex"
+    assert model.content_sections[-1]["type"] == "analyst_opinion"
+    assert model.article_format is None
+    assert not {
+        "chronology",
+        "technical_annex",
+        "provenance",
+    }.intersection(section["type"] for section in model.content_sections)
     assert serialize_publication_document(augmented)["base_publication"] == base_payload
     assert base_bytes_after == base_bytes
 

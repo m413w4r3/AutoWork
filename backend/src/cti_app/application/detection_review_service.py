@@ -34,6 +34,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV7,
+    PublicationDocumentV8,
     parse_publication_document,
     publication_document_v5_sha256,
 )
@@ -513,12 +514,19 @@ class DetectionReviewService:
             document = parse_publication_document(payload)
         except (KeyError, TypeError, ValueError):
             raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE) from None
-        if document.schema_version not in {"4", "5", "6", "7"}:
+        if document.schema_version not in {"4", "5", "6", "7", "8"}:
             raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
-        if isinstance(document, PublicationDocumentV7):
-            if document.publication_kind is not PublicationKind.ARTICLE:
+        publication_v7 = (
+            document.base_publication
+            if isinstance(document, PublicationDocumentV8)
+            else document
+            if isinstance(document, PublicationDocumentV7)
+            else None
+        )
+        if publication_v7 is not None:
+            if publication_v7.publication_kind is not PublicationKind.ARTICLE:
                 raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
-            v6 = document.base_publication
+            v6 = publication_v7.base_publication
             if v6.analyst_opinion is not None:
                 provenance = v6.provenance
                 augmentation = base.metadata.get("publication_augmentation")
@@ -554,12 +562,19 @@ class DetectionReviewService:
                     raise DetectionReviewError(
                         DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE
                     ) from None
-                if isinstance(parent_document, PublicationDocumentV7):
-                    if parent_document.publication_kind is not PublicationKind.ARTICLE:
+                parent_v7 = (
+                    parent_document.base_publication
+                    if isinstance(parent_document, PublicationDocumentV8)
+                    else parent_document
+                    if isinstance(parent_document, PublicationDocumentV7)
+                    else None
+                )
+                if parent_v7 is not None:
+                    if parent_v7.publication_kind is not PublicationKind.ARTICLE:
                         raise DetectionReviewError(
                             DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE
                         )
-                    parent_v5 = parent_document.base_publication.base_publication
+                    parent_v5 = parent_v7.base_publication.base_publication
                 elif isinstance(parent_document, PublicationDocumentV6):
                     parent_v5 = parent_document.base_publication
                 elif isinstance(parent_document, PublicationDocumentV5):

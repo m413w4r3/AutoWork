@@ -39,6 +39,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6ProvenanceV1,
     PublicationDocumentV6ValidationError,
     PublicationDocumentV7,
+    PublicationDocumentV8,
     publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_v5_sha256,
@@ -117,25 +118,34 @@ _BLOCK_ORDER = {kind: index for index, kind in enumerate(OpinionBlockType)}
 
 
 def augment_publication_with_opinion(
-    base_publication_document: PublicationDocumentV5 | PublicationDocumentV7,
+    base_publication_document: (
+        PublicationDocumentV5 | PublicationDocumentV7 | PublicationDocumentV8
+    ),
     opinion: AnalystOpinionV1,
     citation_context: OpinionCitationContext,
     *,
     infrastructure_graph: InvestigationGraph | None = None,
     detection: PublicationDetectionV1 | None = None,
-) -> PublicationDocumentV6 | PublicationDocumentV7:
-    """Return a V6 wrapper, preserving explicit V7 routing when present."""
-    routed_base = (
+) -> PublicationDocumentV6 | PublicationDocumentV7 | PublicationDocumentV8:
+    """Return a V6 wrapper while preserving V7 routing and any V8 article format."""
+    routed_v8 = (
         base_publication_document
+        if isinstance(base_publication_document, PublicationDocumentV8)
+        else None
+    )
+    routed_v7 = (
+        routed_v8.base_publication
+        if routed_v8 is not None
+        else base_publication_document
         if isinstance(base_publication_document, PublicationDocumentV7)
         else None
     )
-    if routed_base is not None:
-        if routed_base.publication_kind is not PublicationKind.ARTICLE:
+    if routed_v7 is not None:
+        if routed_v7.publication_kind is not PublicationKind.ARTICLE:
             raise PublicationAugmentationError(
                 PublicationAugmentationErrorCode.PUBLICATION_KIND_INVALID
             )
-        base_publication_document = routed_base.base_publication.base_publication
+        base_publication_document = routed_v7.base_publication.base_publication
     if not isinstance(base_publication_document, PublicationDocumentV5):
         raise PublicationAugmentationError(PublicationAugmentationErrorCode.BASE_DOCUMENT_REQUIRED)
     if opinion.status is not AnalystOpinionStatus.APPROVED:
@@ -153,10 +163,14 @@ def augment_publication_with_opinion(
     base_sha256 = (
         hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(
-                serialize_publication_document(routed_base)
+                serialize_publication_document(routed_v8)
             )
         ).hexdigest()
-        if routed_base is not None
+        if routed_v8 is not None
+        else hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(routed_v7))
+        ).hexdigest()
+        if routed_v7 is not None
         else base_body_sha256
     )
     if (
@@ -222,7 +236,7 @@ def augment_publication_with_opinion(
     provenance = PublicationDocumentV6ProvenanceV1(
         base_publication_artifact_id=citation_context.base_publication_artifact_id,
         base_publication_sha256=base_sha256,
-        base_publication_body_sha256=(base_body_sha256 if routed_base is not None else None),
+        base_publication_body_sha256=(base_body_sha256 if routed_v7 is not None else None),
         investigation_id=opinion.investigation_id,
         opinion_id=opinion.id,
         opinion_version=opinion.version,
@@ -239,14 +253,20 @@ def augment_publication_with_opinion(
             infrastructure_graph=infrastructure_graph,
             detection=detection,
         )
-        if routed_base is None:
+        if routed_v7 is None:
             return augmented
-        return PublicationDocumentV7(
+        wrapped_v7 = PublicationDocumentV7(
             base_publication=augmented,
-            publication_kind=routed_base.publication_kind,
-            routing_decision_hash=routed_base.routing_decision_hash,
-            routing_policy_version=routed_base.routing_policy_version,
+            publication_kind=routed_v7.publication_kind,
+            routing_decision_hash=routed_v7.routing_decision_hash,
+            routing_policy_version=routed_v7.routing_policy_version,
         )
+        if routed_v8 is not None:
+            return PublicationDocumentV8(
+                base_publication=wrapped_v7,
+                article_format=routed_v8.article_format,
+            )
+        return wrapped_v7
     except PublicationDocumentV6ValidationError as exc:
         code = {
             PublicationDocumentV6ErrorCode.BASE_IDENTITY_MISMATCH: (
@@ -402,7 +422,10 @@ class PublicationAugmentationArtifactService:
                 raise PublicationAugmentationError(
                     PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
                 ) from exc
-            if not isinstance(base_document, (PublicationDocumentV5, PublicationDocumentV7)):
+            if not isinstance(
+                base_document,
+                (PublicationDocumentV5, PublicationDocumentV7, PublicationDocumentV8),
+            ):
                 raise PublicationAugmentationError(
                     PublicationAugmentationErrorCode.BASE_ARTIFACT_INVALID
                 )

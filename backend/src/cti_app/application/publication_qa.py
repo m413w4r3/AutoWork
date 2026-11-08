@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any
 
 from cti_app.application.brief_publication_builder import build_brief_publication_document_v5
+from cti_app.application.edition_classification import is_brief
 from cti_app.application.publication_builder import (
     build_publication_document_v4,
     build_publication_document_v5,
@@ -30,11 +31,13 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_section_headings,
 )
 from cti_app.domain.publication_document import (
+    ArticleFormatV1,
     CanonicalPublicationDocument,
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV6ValidationError,
     PublicationDocumentV7,
+    PublicationDocumentV8,
     serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
@@ -120,6 +123,31 @@ def _semantic_annotation_has_full_occurrence_coverage(
                 if not semantic_ranges_cover_occurrence(start, end, semantic_ranges):
                     return False
     return True
+
+
+def _contains_reader_hidden_metadata(value: Any) -> bool:
+    """Reject legacy IOC status and provenance fields in reader projections."""
+    hidden_keys = {
+        "indicator_status",
+        "status_label",
+        "type_label",
+        "relationship_status_label",
+        "original_indicator_note",
+        "provenance",
+        "technical_annex",
+        "chronology",
+    }
+    if isinstance(value, dict):
+        return any(
+            key.casefold() in hidden_keys
+            or "sha256" in key.casefold()
+            or "_hash" in key.casefold()
+            or _contains_reader_hidden_metadata(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_reader_hidden_metadata(item) for item in value)
+    return False
 
 
 _PIPELINE_VOCABULARY = re.compile(
@@ -349,45 +377,56 @@ def qa_publication_v5(
         section_types = [section["type"] for section in render_model.content_sections]
         expected_types = list(publication_content_section_types(publication))
         checks["references_then_synthesis"] = section_types == expected_types
-        annex = next(
-            (
-                section
-                for section in render_model.content_sections
-                if section["type"] == "technical_annex"
-            ),
-            None,
+        categories = (
+            render_model.article_format.get("ioc_categories")
+            if isinstance(render_model.article_format, dict)
+            else None
         )
-        rendered_main = {
-            str(item["text"]).casefold()
-            for group in (annex or {}).get("indicators", {}).values()
-            for item in group
-        }
-        rendered_original = {
-            str(item["text"]).casefold()
-            for group in (annex or {}).get("original_indicators", {}).values()
-            for item in group
-        }
-        expected_main = {
-            indicator.normalized_value.casefold()
-            for group in publication.indicators
-            for indicator in group.indicators
-        }
-        expected_original = {
-            indicator.normalized_value.casefold()
-            for group in (v5.original_indicators if v5 else ())
-            for indicator in group.indicators
-        }
-        checks["ioc_groups_separated"] = (
-            rendered_main == expected_main
-            and rendered_original == expected_original
-            and not rendered_main.intersection(rendered_original)
-            and (
-                not expected_original
-                or "pas démontré" in str((annex or {}).get("original_indicator_note", ""))
+        expected_category_names = {"ips", "urls", "domains", "files"}
+        valid_article_format = (
+            isinstance(render_model.article_format, dict)
+            and set(render_model.article_format)
+            == {"overview", "timeline_key_events", "ioc_categories"}
+            and isinstance(categories, dict)
+            and set(categories) == expected_category_names
+            and all(
+                isinstance(values, list)
+                and all(
+                    isinstance(item, dict)
+                    and set(item) == {"value"}
+                    and isinstance(item["value"], dict)
+                    and isinstance(item["value"].get("text"), str)
+                    for item in values
+                )
+                for values in categories.values()
             )
         )
-        if not checks["ioc_groups_separated"]:
-            errors.append("Subject IOCs and unlinked original IOCs are not clearly separated")
+        has_explicit_kind = getattr(publication, "publication_kind", None) is not None
+        article_format_valid = (
+            render_model.article_format is None
+            if is_brief(publication)
+            else valid_article_format
+            if has_explicit_kind
+            else render_model.article_format is None or valid_article_format
+        )
+        forbidden_sections = {
+            "chronology",
+            "technical_annex",
+            "provenance",
+            "publication_provenance",
+        }
+        checks["reader_ioc_projection"] = (
+            article_format_valid
+            and not forbidden_sections.intersection(section_types)
+            and not _contains_reader_hidden_metadata(
+                {
+                    "article_format": render_model.article_format,
+                    "content_sections": render_model.content_sections,
+                }
+            )
+        )
+        if not checks["reader_ioc_projection"]:
+            errors.append("Reader projection contains invalid IOC fields or legacy provenance")
         checks["ioc_details_scope"] = not v5 or all(
             item.relevance_classification is not RelevanceClassification.OUT_OF_SCOPE
             for item in v5.ioc_details
@@ -504,6 +543,9 @@ def qa_publication_v7(
     publication: CanonicalPublicationDocument,
 ) -> dict[str, Any]:
     """Apply input requirements selected by the explicit V7 publication kind."""
+    publication_v8 = publication if isinstance(publication, PublicationDocumentV8) else None
+    if isinstance(publication, PublicationDocumentV8):
+        publication = publication.base_publication
     if not isinstance(publication, PublicationDocumentV7):
         raise PublicationQaValidationError(PublicationQaErrorCode.DOCUMENT_NOT_V7)
 
@@ -529,12 +571,23 @@ def qa_publication_v7(
         result["checks"]["routing_metadata_valid"] = bool(
             publication.routing_decision_hash and publication.routing_policy_version
         )
+        result["checks"]["article_format_present"] = (
+            publication_v8 is None or isinstance(publication_v8.article_format, ArticleFormatV1)
+        )
+        if not result["checks"]["article_format_present"]:
+            result["errors"].append("Article publication requires ArticleFormatV1")
+            result["error_codes"].append(PublicationQaErrorCode.KIND_INPUTS_INVALID.value)
+            result["passed"] = False
         return result
 
     if editorial_enrichment is not None:
         return {
             "passed": False,
-            "checks": {"editorial_enrichment_absent": False},
+            "checks": {
+                "editorial_enrichment_absent": False,
+                "article_format_null": publication_v8 is None
+                or publication_v8.article_format is None,
+            },
             "errors": ["Brief publication must not claim editorial enrichment"],
             "warnings": [],
             "error_codes": [PublicationQaErrorCode.EDITORIAL_ENRICHMENT_FORBIDDEN.value],
@@ -542,7 +595,11 @@ def qa_publication_v7(
     if relevance_projection is None:
         return {
             "passed": False,
-            "checks": {"required_relevance_projection": False},
+            "checks": {
+                "required_relevance_projection": False,
+                "article_format_null": publication_v8 is None
+                or publication_v8.article_format is None,
+            },
             "errors": ["Brief publication requires a relevance projection"],
             "warnings": [],
             "error_codes": [PublicationQaErrorCode.KIND_INPUTS_INVALID.value],
@@ -551,6 +608,7 @@ def qa_publication_v7(
     base = publication.base_publication.base_publication
     checks: dict[str, bool] = {
         "publication_kind_explicit": publication.publication_kind is PublicationKind.BRIEF,
+        "article_format_null": publication_v8 is None or publication_v8.article_format is None,
         "routing_metadata_valid": bool(
             publication.routing_decision_hash and publication.routing_policy_version
         ),
@@ -562,6 +620,8 @@ def qa_publication_v7(
     warnings: list[str] = []
     if not checks["subject_lineage"]:
         errors.append("Publication subject differs from the frozen snapshot")
+    if not checks["article_format_null"]:
+        errors.append("Brief publication requires article_format=null")
     if not checks["publication_language"]:
         errors.append("Publication language differs from the frozen snapshot")
     if not checks["title_format"]:
@@ -664,17 +724,14 @@ def qa_publication_v7(
         errors.append("Brief cannot be projected into the publication renderer")
     else:
         content_types = tuple(section["type"] for section in render_model.content_sections)
-        expected_types = (
-            ("references", "chronology", "synthesis")
-            if document.timeline
-            else ("references", "synthesis")
-        )
+        expected_types = ("references", "synthesis")
         checks["brief_render_sections"] = content_types == expected_types
         checks["no_ioc_annex"] = not any(
-            section_type in {"ioc", "technical_annex"} for section_type in content_types
+            section_type in {"technical_annex", "provenance", "publication_provenance"}
+            for section_type in content_types
         )
         if not checks["brief_render_sections"]:
-            errors.append("Brief renderer sections are not references, chronology, and synthesis")
+            errors.append("Brief renderer sections are not references and synthesis")
         if not checks["no_ioc_annex"]:
             errors.append("Brief renderer contains an IOC annex")
         synthesis_section = next(

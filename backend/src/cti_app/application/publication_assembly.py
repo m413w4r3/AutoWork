@@ -30,7 +30,10 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
 from cti_app.application.publication_builder import (
+    ARTICLE_FORMAT_POLICY_VERSION,
+    ASSEMBLY_POLICY_VERSION,
     PublicationAssemblyValidationError,
+    build_article_format_v1,
     build_publication_document_v5,
     compute_assembly_input_hash,
 )
@@ -49,8 +52,8 @@ from cti_app.domain.production_relevance import RelevanceProjectionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
-    PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
-    PublicationDocumentV7,
+    PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+    PublicationDocumentV8,
     parse_publication_document,
     serialize_publication_document,
 )
@@ -253,15 +256,24 @@ class PublicationAssemblyService:
             else:
                 publication_artifact_id = base_identity
 
-        def canonical_v7(
+        def canonical_v8(
             base_publication_artifact_id: UUID,
-        ) -> tuple[PublicationDocumentV7, dict[str, Any], bytes]:
-            publication = wrap_publication_document_v7(
+        ) -> tuple[PublicationDocumentV8, dict[str, Any], bytes]:
+            base_v7 = wrap_publication_document_v7(
                 base_document,
                 base_publication_artifact_id=base_publication_artifact_id,
                 publication_kind=publication_kind,
                 routing_decision_hash=routing_decision_hash,
                 routing_policy_version=routing_policy_version,
+            )
+            article_format = (
+                build_article_format_v1(base_document, extraction)
+                if publication_kind is PublicationKind.ARTICLE
+                else None
+            )
+            publication = PublicationDocumentV8(
+                base_publication=base_v7,
+                article_format=article_format,
             )
             payload = serialize_publication_document(publication)
             return (
@@ -270,7 +282,7 @@ class PublicationAssemblyService:
                 ProductionArtifactStore.canonical_json_bytes(payload),
             )
 
-        _document, canonical_document, canonical_bytes = canonical_v7(publication_artifact_id)
+        _document, canonical_document, canonical_bytes = canonical_v8(publication_artifact_id)
         metadata = dict(metadata_extra or {})
         if published_figure_diagnostics:
             existing_figure_diagnostics = metadata.get("source_figure_provenance_diagnostics")
@@ -321,7 +333,7 @@ class PublicationAssemblyService:
         if reusable_base is not None and current is not None and reusable_base.id == current.id:
             reusable_base = None
             publication_artifact_id = uuid4()
-            _document, canonical_document, canonical_bytes = canonical_v7(publication_artifact_id)
+            _document, canonical_document, canonical_bytes = canonical_v8(publication_artifact_id)
 
         prior_versions = [
             artifact.version
@@ -343,7 +355,7 @@ class PublicationAssemblyService:
             if stored_candidate != canonical_bytes:
                 reusable_base = None
                 publication_artifact_id = uuid4()
-                _document, canonical_document, canonical_bytes = canonical_v7(
+                _document, canonical_document, canonical_bytes = canonical_v8(
                     publication_artifact_id
                 )
         if reusable_base is not None and reusable_base.id != (current.id if current else None):
@@ -427,9 +439,10 @@ class PublicationAssemblyService:
                         "editorial_enrichment_hash": None,
                         "relevance_projection_hash": relevance_projection.projection_hash,
                         "publication_document_schema_version": (
-                            PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION
+                            PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
                         ),
                         "brief_assembly_policy_version": BRIEF_ASSEMBLY_POLICY_VERSION,
+                        "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
                     }
                 )
             ).hexdigest()
@@ -440,7 +453,9 @@ class PublicationAssemblyService:
                     "publication_kind": publication_kind.value,
                     "routing_decision_hash": routing_decision_hash,
                     "routing_policy_version": routing_policy_version,
-                    "publication_document_schema_version": PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
+                    "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+                    "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
+                    "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
                 }
             )
         ).hexdigest()
@@ -493,7 +508,7 @@ class PublicationAssemblyService:
         return replace(enrichment, diagrams=diagrams)
 
     async def _base_publication_identity(self, artifact: ProductionArtifact) -> UUID | None:
-        """Resolve the stable V6 base identity embedded in a reusable V7 artifact."""
+        """Resolve the stable V6 identity embedded in a reusable V8 artifact."""
         if artifact.canonical_blob_id is None:
             return None
         try:
@@ -501,9 +516,11 @@ class PublicationAssemblyService:
             publication = parse_publication_document(payload)
         except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError, TypeError, ValueError):
             return None
-        if not isinstance(publication, PublicationDocumentV7):
+        if not isinstance(publication, PublicationDocumentV8):
             return None
-        return publication.base_publication.provenance.base_publication_artifact_id
+        return (
+            publication.base_publication.base_publication.provenance.base_publication_artifact_id
+        )
 
     @staticmethod
     def _set_repair_result_id(artifact: ProductionArtifact) -> None:

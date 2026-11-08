@@ -17,7 +17,10 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import references_corpus_hash
-from cti_app.application.production_normalization import normalize_publication_indicator_value
+from cti_app.application.production_normalization import (
+    normalize_publication_indicator_value,
+    publication_indicator_identity_key,
+)
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.semantic_annotation import (
     SemanticAnnotator,
@@ -85,20 +88,27 @@ from cti_app.domain.publication import (
     indicator_source_ids,
 )
 from cti_app.domain.publication_document import (
+    ARTICLE_FORMAT_TIMELINE_MAX_EVENTS,
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
-    PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+    ArticleFormatV1,
+    IOCArticleCategoriesV1,
     PublicationChartV1,
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
     PublicationIOCDetailV1,
     PublicationIOCDisposition,
+    PublicationIOCValueV1,
     PublicationSourceFigureV1,
     PublicationTableColumnV1,
     PublicationTableRowV1,
     PublicationTableV1,
+    TimelineKeyEventV1,
+    extract_article_overview,
     order_publication_references,
     publication_document_text_anchors,
+    select_article_timeline_key_events_v1,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -602,13 +612,170 @@ def _validate_publication_lineage(
             )
 
 
-# V15 preserves publication hash semantics for ssdeep and TLSH. Extraction
-# identities and routing policy remain unchanged.
-ASSEMBLY_POLICY_VERSION: Final[str] = "15-publication-fuzzy-hash-normalization"
+# V16 binds the additive V8 ArticleFormat projection into publication identity.
+ASSEMBLY_POLICY_VERSION: Final[str] = "16-publication-v8-article-format"
+ARTICLE_FORMAT_POLICY_VERSION: Final[str] = "1-deterministic-overview-timeline-ioc-categories"
+ARTICLE_TIMELINE_KEY_EVENT_LIMIT: Final[int] = ARTICLE_FORMAT_TIMELINE_MAX_EVENTS
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
+
+
+def select_article_timeline_key_events(
+    timeline: tuple[PublicationTimelineEntryV1, ...],
+) -> tuple[TimelineKeyEventV1, ...]:
+    """Select exact, evidenced timeline events with a stable eight-event cap."""
+    return select_article_timeline_key_events_v1(timeline)
+
+
+def _article_ioc_category(artifact_type: ArtifactType) -> str | None:
+    if artifact_type is ArtifactType.IP:
+        return "ips"
+    if artifact_type is ArtifactType.URL:
+        return "urls"
+    if artifact_type is ArtifactType.DOMAIN:
+        return "domains"
+    if artifact_type in {ArtifactType.HASH, ArtifactType.FILENAME, ArtifactType.FILEPATH}:
+        return "files"
+    return None
+
+
+def _article_ioc_identity(artifact_type: ArtifactType, normalized_value: str) -> str:
+    if artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}:
+        return normalized_value
+    return publication_indicator_identity_key(normalized_value, artifact_type)
+
+
+def build_article_format_v1(
+    publication: PublicationDocumentV5,
+    extraction: ProductionExtractionV1,
+) -> ArticleFormatV1:
+    """Build the additive reader format from canonical publication and evidence."""
+    if not isinstance(publication, PublicationDocumentV5):
+        raise ValueError("ArticleFormatV1 requires a PublicationDocumentV5 body")
+    overview = extract_article_overview(publication.document.sections)
+    timeline_key_events = select_article_timeline_key_events(publication.document.timeline)
+
+    evidence_by_ioc: dict[
+        tuple[ArtifactType, str], set[PublicationEvidenceRefV1]
+    ] = defaultdict(set)
+    for extraction_ref, payload in extraction_evidence_elements(extraction):
+        if extraction_ref.kind is not EvidenceKind.INDICATOR:
+            continue
+        try:
+            artifact_type = ArtifactType(str(payload["artifact_type"]))
+            normalized_value = normalize_publication_indicator_value(
+                str(payload["value"]), artifact_type
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        evidence_by_ioc[(artifact_type, normalized_value)].add(
+            PublicationEvidenceRefV1(
+                source_document_id=extraction_ref.source_document_id,
+                kind=PublicationEvidenceKind.INDICATOR,
+                evidence_key=extraction_ref.evidence_key,
+            )
+        )
+
+    accumulated: dict[
+        tuple[str, str], tuple[str, str, set[UUID], set[PublicationEvidenceRefV1]]
+    ] = {}
+
+    def add_ioc(
+        artifact_type: ArtifactType,
+        value: str,
+        normalized_value: str,
+        source_document_ids: tuple[UUID, ...],
+    ) -> None:
+        category = _article_ioc_category(artifact_type)
+        if category is None:
+            return
+        source_ids = set(source_document_ids)
+        evidence_refs = {
+            ref
+            for ref in evidence_by_ioc.get((artifact_type, normalized_value), set())
+            if ref.source_document_id in source_ids
+        }
+        if not evidence_refs:
+            raise ValueError(
+                "ArticleFormat IOC has no matching canonical indicator evidence reference"
+            )
+        identity = (category, _article_ioc_identity(artifact_type, normalized_value))
+        existing = accumulated.get(identity)
+        if existing is None:
+            accumulated[identity] = (value, normalized_value, source_ids, evidence_refs)
+            return
+        old_value, old_normalized, old_sources, old_refs = existing
+        old_sources.update(source_ids)
+        old_refs.update(evidence_refs)
+        stable_value = min(
+            (old_value, value),
+            key=lambda candidate: (candidate.casefold(), candidate),
+        )
+        stable_normalized = min(
+            (old_normalized, normalized_value),
+            key=lambda candidate: (candidate.casefold(), candidate),
+        )
+        accumulated[identity] = (stable_value, stable_normalized, old_sources, old_refs)
+
+    for group in (*publication.document.indicators, *publication.original_indicators):
+        for indicator in group.indicators:
+            add_ioc(
+                indicator.artifact_type,
+                indicator.value,
+                indicator.normalized_value,
+                indicator.source_document_ids,
+            )
+    for detail in publication.ioc_details:
+        if detail.disposition is PublicationIOCDisposition.EXCLUDED and not (
+            detail.artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}
+            and detail.disposition_reason == "unsupported_artifact_type"
+        ):
+            continue
+        add_ioc(
+            detail.artifact_type,
+            detail.value,
+            detail.normalized_value,
+            detail.source_document_ids,
+        )
+
+    category_values: dict[str, list[PublicationIOCValueV1]] = {
+        "ips": [],
+        "urls": [],
+        "domains": [],
+        "files": [],
+    }
+    for (category, _identity), (value, normalized_value, source_ids, refs) in accumulated.items():
+        category_values[category].append(
+            PublicationIOCValueV1(
+                value=value,
+                normalized_value=normalized_value,
+                source_document_ids=tuple(sorted(source_ids, key=str)),
+                evidence_refs=tuple(
+                    sorted(refs, key=lambda ref: (str(ref.source_document_id), ref.evidence_key))
+                ),
+            )
+        )
+    for values in category_values.values():
+        values.sort(
+            key=lambda item: (
+                item.normalized_value.casefold(),
+                item.value.casefold(),
+                item.value,
+                tuple(map(str, item.source_document_ids)),
+            )
+        )
+    return ArticleFormatV1(
+        overview=overview,
+        timeline_key_events=timeline_key_events,
+        ioc_categories=IOCArticleCategoriesV1(
+            ips=tuple(category_values["ips"]),
+            urls=tuple(category_values["urls"]),
+            domains=tuple(category_values["domains"]),
+            files=tuple(category_values["files"]),
+        ),
+    )
 
 
 def compute_assembly_input_hash(
@@ -630,7 +797,8 @@ def compute_assembly_input_hash(
         "relevance_projection_hash": (
             relevance_projection.projection_hash if relevance_projection is not None else None
         ),
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+        "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
         "legitimate_services_policy_version": LEGITIMATE_SERVICES_POLICY_VERSION,
         "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,

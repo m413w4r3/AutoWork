@@ -29,6 +29,7 @@ from cti_app.application.publication_assembly import (
 )
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
+    build_article_format_v1,
     build_publication_document_v4,
     build_publication_document_v5,
 )
@@ -100,7 +101,7 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import ArtifactType, PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
-    PublicationDocumentV7,
+    PublicationDocumentV8,
     parse_publication_document,
     serialize_publication_document,
 )
@@ -473,7 +474,7 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
 
 
 @pytest.mark.asyncio
-async def test_assembly_persists_exact_v7_body_and_one_publication_artifact() -> None:
+async def test_assembly_persists_exact_v8_body_and_one_publication_artifact() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     run = _run(snapshot)
     service, catalog, artifacts = _service()
@@ -496,12 +497,16 @@ async def test_assembly_persists_exact_v7_body_and_one_publication_artifact() ->
         editorial_enrichment=enrichment,
     )
 
-    expected_document = wrap_publication_document_v7(
+    expected_v7 = wrap_publication_document_v7(
         document,
         base_publication_artifact_id=artifact.id,
         publication_kind=PublicationKind.ARTICLE,
         routing_decision_hash="a" * 64,
         routing_policy_version="routing-policy-v1",
+    )
+    expected_document = PublicationDocumentV8(
+        base_publication=expected_v7,
+        article_format=build_article_format_v1(document, extraction),
     )
     expected_bytes = ProductionArtifactStore.canonical_json_bytes(
         serialize_publication_document(expected_document)
@@ -533,13 +538,11 @@ async def test_assembly_persists_exact_v7_body_and_one_publication_artifact() ->
         "diagnostics": _expected_diagnostics(references, extraction, synthesis, enrichment)
     }
     document_json = serialize_publication_document(expected_document)
-    assert document_json["schema_version"] == "7"
+    assert document_json["schema_version"] == "8"
     assert set(document_json) == {
         "schema_version",
         "base_publication",
-        "publication_kind",
-        "routing_decision_hash",
-        "routing_policy_version",
+        "article_format",
     }
 
 
@@ -569,7 +572,7 @@ async def test_assembly_persists_editorial_enrichment_in_the_canonical_body() ->
 
 
 @pytest.mark.asyncio
-async def test_brief_assembly_persists_v7_without_editorial_enrichment() -> None:
+async def test_brief_assembly_persists_v8_without_editorial_enrichment() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     relevance = build_relevance_projection(snapshot, extraction)
     service, catalog, artifacts = _service()
@@ -595,8 +598,9 @@ async def test_brief_assembly_persists_v7_without_editorial_enrichment() -> None
     publication = parse_publication_document(
         await ProductionArtifactStore(catalog).read_json(result.artifact.canonical_blob_id)
     )
-    assert isinstance(publication, PublicationDocumentV7)
+    assert isinstance(publication, PublicationDocumentV8)
     assert publication.publication_kind is PublicationKind.BRIEF
+    assert publication.article_format is None
     assert publication.indicators == ()
     assert (
         "editorial_enrichment" not in result.artifact.metadata["diagnostics"]["warnings_by_stage"]
@@ -808,13 +812,17 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
         routing_decision_hash="a" * 64,
         routing_policy_version="routing-policy-v1",
     )
+    expected_v8 = PublicationDocumentV8(
+        base_publication=expected_v7,
+        article_format=build_article_format_v1(expected, extraction),
+    )
     assert (first.version, second.version) == (1, 2)
     assert second.input_hash != first.input_hash
     assert second.reused_from_artifact_id is None
     assert second.canonical_blob_id != first.canonical_blob_id
     assert len(catalog.writes) == 2
     assert catalog.writes[1][0] == ProductionArtifactStore.canonical_json_bytes(
-        serialize_publication_document(expected_v7)
+        serialize_publication_document(expected_v8)
     )
     assert artifacts.appended == [first, second]
 
