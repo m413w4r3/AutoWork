@@ -11,6 +11,16 @@ class BlobStorageUnavailableError(RuntimeError):
     retryable = True
 
 
+class StorageCapacityLowError(BlobStorageUnavailableError):
+    """Object storage rejected a write because its backing capacity is full."""
+
+    code = "storage_capacity_low"
+    diagnostic_code = "XMinioStorageFull"
+
+    def __init__(self) -> None:
+        super().__init__("Object storage capacity is too low to archive data")
+
+
 class BlobReadLimitExceededError(ValueError):
     """A blob is larger than the caller's explicit read limit."""
 

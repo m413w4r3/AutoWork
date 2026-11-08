@@ -12,6 +12,7 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
+from cti_app.application.blob_storage import StorageCapacityLowError
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     ModelConversationTurnTransport,
@@ -835,6 +836,46 @@ async def test_failed_without_verified_no_answer_reconciles_without_retry() -> N
     assert run.status is ModelRunStatus.NEEDS_REVIEW
     assert run.submission_state.value == "external_state_unknown"
     assert run.error_details["diagnostic_code"] == "bridge_server_error"
+
+
+async def test_capacity_failure_archiving_completed_output_keeps_reconciliation_boundary() -> None:
+    class CapacityLimitedOutputStore:
+        async def store(self, content: bytes, *, mime_type: str) -> str:
+            del content, mime_type
+            raise StorageCapacityLowError()
+
+        async def read(self, reference: str, *, max_bytes: int | None) -> bytes:
+            del reference, max_bytes
+            raise AssertionError("output could not have been stored")
+
+    transport = SequencedResponsesTransport(
+        [
+            {
+                "id": "response-completed-before-archive-failure",
+                "status": "completed",
+                "model": "chatgpt-web",
+                "output_text": "completed answer",
+            }
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    gateway._output_store = CapacityLimitedOutputStore()
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert transport.create_calls == 1
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.error_code == "model_submission_reconciliation_required"
+    assert run.error_details["diagnostic_code"] == "storage_capacity_low"
+    assert run.error_details["storage_diagnostic_code"] == "XMinioStorageFull"
+    assert run.error_details["retryable"] is True
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+    assert transport.create_calls == 1
 
 
 @pytest.mark.parametrize(

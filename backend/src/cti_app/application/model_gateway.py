@@ -1910,6 +1910,9 @@ def _error_details(
         "retryable": bool(getattr(exc, "retryable", False)),
         "attempts": max(1, int(getattr(exc, "attempts", 1))),
     }
+    storage_diagnostic_code = getattr(exc, "diagnostic_code", None)
+    if storage_diagnostic_code == "XMinioStorageFull":
+        details["storage_diagnostic_code"] = storage_diagnostic_code
     retry_after = getattr(exc, "retry_after", None)
     if isinstance(retry_after, int | float) and not isinstance(retry_after, bool):
         details["retry_after"] = max(0.0, float(retry_after))

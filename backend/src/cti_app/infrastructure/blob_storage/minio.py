@@ -12,6 +12,7 @@ from cti_app.application.blob_storage import (
     BlobReadLimitExceededError,
     BlobStorageUnavailableError,
     MaterializationMethod,
+    StorageCapacityLowError,
 )
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.errors import BlobIntegrityError
@@ -92,13 +93,18 @@ class MinioBlobStore:
         try:
             if self._exists_sync(descriptor):
                 return descriptor
-            self._client.fput_object(
-                self._physical_bucket,
-                descriptor.object_key,
-                str(temporary),
-                content_type=descriptor.mime_type,
-                metadata={"sha256": descriptor.sha256},
-            )
+            try:
+                self._client.fput_object(
+                    self._physical_bucket,
+                    descriptor.object_key,
+                    str(temporary),
+                    content_type=descriptor.mime_type,
+                    metadata={"sha256": descriptor.sha256},
+                )
+            except S3Error as exc:
+                if exc.code == StorageCapacityLowError.diagnostic_code:
+                    raise StorageCapacityLowError() from exc
+                raise
             return descriptor
         finally:
             temporary.unlink(missing_ok=True)

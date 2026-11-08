@@ -21,6 +21,20 @@ FRONTEND_DIR := frontend
 
 # Keep this in sync with compose.yaml "name:".
 COMPOSE_PROJECT ?= cti-bulletin
+# Keep this in sync with compose.yaml's `name:` and honor Compose's override.
+DISK_COMPOSE_PROJECT ?= $(if $(COMPOSE_PROJECT_NAME),$(COMPOSE_PROJECT_NAME),cti-bulletin)
+DISK_MIN_FREE_GB ?= 25
+DISK_WARN_FREE_GB ?= 50
+DOCKER_GC_KEEP_STORAGE_GB ?= 15
+DOCKER_GC_UNTIL ?= 168h
+AUTO_GC ?= 1
+DRY_RUN ?= 0
+MINIO_VOLUME_NAME ?=
+export DISK_MIN_FREE_GB DISK_WARN_FREE_GB DOCKER_GC_KEEP_STORAGE_GB
+export DOCKER_GC_UNTIL AUTO_GC DRY_RUN MINIO_VOLUME_NAME
+ifneq ($(strip $(COMPOSE_PROJECT_NAME)),)
+export COMPOSE_PROJECT_NAME
+endif
 
 # `yes` confirms only the one-time cleanup of existing local DB data. It cannot
 # bypass target validation or the persistent marker for a started supervised run.
@@ -41,14 +55,16 @@ SMOKE_LIVE_OPERATOR ?=
 MODEL_PROVIDERS_NETWORK ?= metaharness-models
 COMPOSE_MODELS ?= auto
 ifeq ($(COMPOSE_MODELS),auto)
-COMPOSE_MODELS_ACTIVE := $(shell $(DOCKER) network inspect $(MODEL_PROVIDERS_NETWORK) >/dev/null 2>&1 && echo on || echo off)
+# Resolve only when a stack recipe needs it; dry runs skip the daemon probe.
+COMPOSE_MODELS_ACTIVE = $(if $(filter n,$(firstword $(MAKEFLAGS))),unprobed (dry-run),$(shell $(DOCKER) network inspect $(MODEL_PROVIDERS_NETWORK) >/dev/null 2>&1 && echo on || echo off))
+STACK_COMPOSE = $(COMPOSE) -f compose.yaml $(if $(filter on,$(COMPOSE_MODELS_ACTIVE)),-f compose.models.yaml)
 else
 COMPOSE_MODELS_ACTIVE := $(COMPOSE_MODELS)
-endif
 ifeq ($(COMPOSE_MODELS_ACTIVE),on)
 STACK_COMPOSE = $(COMPOSE) -f compose.yaml -f compose.models.yaml
 else
 STACK_COMPOSE = $(COMPOSE) -f compose.yaml
+endif
 endif
 
 # PostgreSQL dedicated to integration tests.
@@ -143,6 +159,9 @@ CLEAN_PATHS := \
 	frontend-sync \
 	stack-clean-stale \
 	reset-backend-env \
+	disk-check \
+	docker-gc \
+	disk-preflight \
 	up \
 	down \
 	dev \
@@ -270,13 +289,30 @@ reset-backend-env: ## Supprime et recrée complètement backend/.venv
 # Docker application stack
 # ==============================================================================
 
+disk-check: ## Affiche l'espace disque Docker/MinIO et bloque sous le seuil minimum
+	python3 scripts/ops/disk_guard.py check \
+		--docker "$(DOCKER)" \
+		--compose-project "$(DISK_COMPOSE_PROJECT)"
+
+# Garbage collection is limited to aged BuildKit cache with a keep-storage cap,
+# plus dangling images. It never prunes volumes, tagged/in-use images, or all
+# images/system state; MinIO data volumes remain canonical application data.
+docker-gc: ## Nettoie le cache BuildKit ancien et les seules images dangling
+	python3 scripts/ops/disk_guard.py gc --docker "$(DOCKER)"
+
+disk-preflight:
+	python3 scripts/ops/disk_guard.py preflight \
+		--docker "$(DOCKER)" \
+		--compose-project "$(DISK_COMPOSE_PROJECT)" \
+		--auto-gc "$(AUTO_GC)"
+
 # Un `up` interrompu laisse un conteneur « Created » (jamais démarré) et des
 # points de terminaison réseau orphelins : Docker refuse alors de recréer le
 # conteneur (« endpoint with name ... already exists in network »). On ne retire
 # que les conteneurs du projet jamais démarrés, donc sans état à perdre ;
 # compose les recrée. Le disconnect est best-effort : « endpoint not found »
 # est le cas normal quand rien n'est orphelin.
-stack-clean-stale: ## Retire les conteneurs jamais démarrés et leurs endpoints réseau orphelins
+stack-clean-stale: disk-preflight ## Retire les conteneurs jamais démarrés et leurs endpoints réseau orphelins
 	@set -eu; \
 	for id in $$($(STACK_COMPOSE) ps -a --status created -q); do \
 		name="$$($(DOCKER) inspect --format '{{.Name}}' "$$id" | sed 's|^/||')"; \
@@ -295,7 +331,7 @@ up: stack-clean-stale ## Démarre la stack applicative
 down: ## Arrête la stack applicative
 	$(STACK_COMPOSE) down
 
-dev: ## Démarre la stack au premier plan
+dev: disk-preflight ## Démarre la stack au premier plan
 	@echo "Stack: compose.models.yaml override = $(COMPOSE_MODELS_ACTIVE)"
 	$(STACK_COMPOSE) up --build
 
@@ -643,6 +679,8 @@ test-workflow-full: ## Émule workflow_fast + workflow_full et vérifie JUnit + 
 test-ci-scripts: ## Teste sans base les scripts de garde CI
 	cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I \
 		../scripts/ci/test_check_workflow_results.py
+	cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I -m pytest \
+		../scripts/ops/test_disk_guard.py -q --tb=short
 
 measure-workflow: ## Mesure trois exécutions de chaque profil workflow
 	./scripts/ci/measure_workflow_profiles.sh

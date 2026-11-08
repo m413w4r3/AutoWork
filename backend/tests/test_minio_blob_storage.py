@@ -9,7 +9,7 @@ import pytest
 from minio import Minio
 from minio.error import S3Error
 
-from cti_app.application.blob_storage import BlobReadLimitExceededError
+from cti_app.application.blob_storage import BlobReadLimitExceededError, StorageCapacityLowError
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 
 
@@ -105,3 +105,48 @@ async def test_minio_read_limit_has_a_specific_error(
 
     assert raised.value.size_bytes == len(b"more than one byte")
     assert raised.value.max_bytes == 1
+
+
+@pytest.mark.asyncio
+async def test_minio_storage_full_is_a_retryable_capacity_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FullMinioClient(FakeMinioClient):
+        def fput_object(
+            self,
+            bucket: str,
+            key: str,
+            path: str,
+            *,
+            content_type: str,
+            metadata: dict[str, str],
+        ) -> SimpleNamespace:
+            del bucket, path, content_type, metadata
+            raise S3Error(
+                cast(Any, None),
+                "XMinioStorageFull",
+                "storage full",
+                key,
+                None,
+                None,
+                "cti-local",
+                key,
+            )
+
+    monkeypatch.setattr(asyncio, "to_thread", _run_inline)
+    store = MinioBlobStore(
+        cast(Minio, FullMinioClient()),
+        physical_bucket="cti-local",
+        temp_directory=tmp_path / "temp",
+    )
+
+    with pytest.raises(StorageCapacityLowError) as raised:
+        await store.put(
+            BytesIO(b"storage is full"),
+            logical_bucket="model-conversation-inputs",
+            mime_type="text/plain",
+        )
+
+    assert raised.value.code == "storage_capacity_low"
+    assert raised.value.retryable is True
+    assert raised.value.diagnostic_code == "XMinioStorageFull"
