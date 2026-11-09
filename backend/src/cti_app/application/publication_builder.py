@@ -699,7 +699,9 @@ def build_article_format_v1(
         }
         if not evidence_refs:
             raise ValueError(
-                "ArticleFormat IOC has no matching canonical indicator evidence reference"
+                "ArticleFormat IOC has no matching canonical indicator evidence reference: "
+                f"type={artifact_type.value} value={normalized_value[:80]!r} "
+                f"sources={len(source_ids)}"
             )
         identity = (category, _article_ioc_identity(artifact_type, normalized_value))
         existing = accumulated.get(identity)
