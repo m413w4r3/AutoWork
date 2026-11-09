@@ -29,6 +29,13 @@
 
 #let render-section-heading(title, level: 1) = heading(level: level)[#title]
 
+#let render-article-section-heading(title, reduce-above: 0pt) = {
+  if reduce-above > 0pt {
+    v(-reduce-above)
+  }
+  heading(level: 1)[#title]
+}
+
 #let render-article-overview(overview) = {
   let fields = (
     ("Victimologie", overview.at("victimology", default: none)),
@@ -40,7 +47,7 @@
     #block(
       width: 100%,
       above: 10pt,
-      below: 8pt,
+      below: 15pt,
       fill: purple-light,
       inset: 12pt,
       radius: 4pt,
@@ -48,11 +55,19 @@
     )[
       #text(size: 14pt, weight: "extrabold", fill: purple)[Vue d'ensemble]
       #v(4pt)
-      #for (label, field) in visible-fields [
+      #set par(leading: 0.65em, spacing: 0pt)
+      #for (index, (label, field)) in visible-fields.enumerate() [
         #let value = if type(field) == str { field } else { field.at("text", default: "") }
-        #block(below: 3pt)[
-          #text(size: 9pt, weight: "semibold", fill: purple)[• #label : ]
-          #text(size: 9pt)[#value]
+        #block(below: if index < visible-fields.len() - 1 { 6pt } else { 0pt })[
+          #grid(
+            columns: (10pt, 1fr),
+            align: (left, left),
+            [#text(size: 10pt)[•]],
+            [
+              #text(size: 10pt, weight: "bold", fill: purple)[#label : ]
+              #text(size: 10pt)[#value]
+            ],
+          )
         ]
       ]
     ]
@@ -62,44 +77,57 @@
 #let render-article-timeline(events) = {
   if events.len() >= 2 [
     #render-section-heading[Chronologie]
-    #for (index, event) in events.enumerate() [
-      #grid(
-        columns: (12pt, 1fr),
-        column-gutter: 8pt,
-        align: (center, left),
-        [#circle(radius: 3pt, fill: purple)],
-        [
-          #block(above: 0pt, below: 4pt)[
-            #text(size: 9pt, weight: "bold", fill: purple)[#event.display_date_fr]
-            #linebreak()
-            #text(size: 10pt)[#text(event.text)]
-          ]
-        ],
-      )
-      #if index < events.len() - 1 [
-        #grid(
-          columns: (12pt, 1fr),
-          column-gutter: 8pt,
-          align: (center, left),
-          [#rect(width: 1.2pt, height: 10pt, fill: purple-light, radius: 0.6pt)],
-          [],
-        )
+    #block(
+      width: 100%,
+      inset: (left: 0pt, right: 0pt, top: 3pt, bottom: 3pt),
+      stroke: (left: 1pt + accent),
+    )[
+      #for (index, event) in events.enumerate() [
+        #block(breakable: false)[
+          #grid(
+            columns: (1pt, 1fr),
+            column-gutter: 8pt,
+            align: (top, left),
+            [#circle(radius: 3pt, fill: accent)],
+            [
+              #text(size: 9pt, weight: "bold", fill: accent)[#event.display_date_fr]
+              #linebreak()
+              #text(size: 9.5pt)[#text(event.text)]
+            ],
+          )
+        ]
+        #if index < events.len() - 1 [#v(8pt)]
       ]
     ]
-    #v(4pt)
   ]
 }
 
 #let render-article-ioc-category(label, values) = {
   if values.len() > 0 [
-    #block(sticky: true)[
-      #block(above: 5pt, below: 3pt)[
+    #if values.len() <= 18 [
+      #block(above: 16pt, breakable: false)[
+        #text(size: 10pt, weight: "bold", fill: purple)[#(label + " :")]
+        #set par(justify: false, leading: 1.2em, spacing: 0pt)
+        #for (index, item) in values.enumerate() [
+          #if index > 0 [#v(7pt)]
+          #block(breakable: false)[
+            #text(font: code-font-families, size: 8.5pt, hyphenate: false)[
+              #publication-display-text(item.value)
+            ]
+          ]
+        ]
+      ]
+    ] else [
+      #block(above: 16pt, sticky: true)[
         #text(size: 10pt, weight: "bold", fill: purple)[#(label + " :")]
       ]
-      #set text(hyphenate: false)
-      #for item in values [
-        #block(above: 0pt, below: 2pt)[
-          #text(size: 8.75pt)[#publication-display-text(item.value)]
+      #set par(justify: false, leading: 1.2em, spacing: 0pt)
+      #for (index, item) in values.enumerate() [
+        #if index > 0 [#v(7pt)]
+        #block(breakable: false)[
+          #text(font: code-font-families, size: 8.5pt, hyphenate: false)[
+            #publication-display-text(item.value)
+          ]
         ]
       ]
     ]
@@ -493,7 +521,7 @@
   }
 }
 
-#let render-table(item) = {
+#let render-table(item, article-style: false) = {
   let title = if has-text(item.title) {
     [#text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]]
   } else {
@@ -564,9 +592,12 @@
   )
   }
 
-  v(4pt)
+  v(if article-style { 6pt } else { 4pt })
   if has-text(item.caption) [
-    #block(above: 2pt, below: 4pt)[
+    #block(
+      above: if article-style { 0pt } else { 2pt },
+      below: if article-style { 12pt } else { 4pt },
+    )[
       #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
     ]
   ]
@@ -858,9 +889,10 @@
   semantic-spans,
   top-space: 0pt,
   bottom-space: 0pt,
+  below-space: 4pt,
 ) = block(
   above: 0pt,
-  below: 4pt,
+  below: below-space,
   [
     #v(top-space)
     #align(center)[
@@ -985,18 +1017,24 @@
 // Typst exposes DPI-derived physical size but not source pixel dimensions. Do
 // not enlarge raster assets with an intrinsic width under 100pt, which keeps
 // small icons and logos from becoming large figures.
-#let render-publication-image(media-path, caption, annotation: [], max-height-fraction: 0.82) = block(
+#let render-publication-image(
+  media-path,
+  caption,
+  annotation: [],
+  max-height-fraction: 0.82,
+  article-style: false,
+) = block(
   breakable: false,
   width: 100%,
   above: 10pt,
-  below: 8pt,
+  below: if article-style { 12pt } else { 8pt },
 )[
   #layout(size => {
     let natural-image = image(media-path)
     let natural-size = measure(natural-image)
     let following-content = [
       #if caption != none [
-        #v(4pt)
+        #v(if article-style { 6pt } else { 4pt })
         #caption
       ]
       #annotation
@@ -1029,7 +1067,7 @@
   })
 ]
 
-#let render-diagram(item) = {
+#let render-diagram(item, article-style: false) = {
   let legacy-renderer = item.at("legacy_renderer", default: false)
   if not legacy-renderer {
   let caption = if legacy-renderer {
@@ -1050,7 +1088,7 @@
   let status-label = item.at("status_label", default: none)
   let caption-content = [
     #if has-text(title) and (has-text(status-label) or item.at("show_title", default: false)) [
-      #block(above: 2pt, below: 2pt)[
+      #block(above: 2pt, below: if article-style { 6pt } else { 2pt})[
         #text(size: 9pt, weight: "bold")[#title]
       ]
     ]
@@ -1060,7 +1098,13 @@
       ]
     ]
     #if has-text(caption) [
-      #render-figure-caption(item.figure_number, caption, semantic-caption)
+      #render-figure-caption(
+        item.figure_number,
+        caption,
+        semantic-caption,
+        bottom-space: if article-style { 6pt } else { 0pt },
+        below-space: if article-style { 0pt } else { 4pt },
+      )
     ]
     #if has-text(item.at("status_legend", default: none)) [
       #block(above: 3pt, below: 2pt)[
@@ -1069,19 +1113,31 @@
     ]
   ]
   if has-text(item.at("status_legend", default: none)) {
-    render-publication-image(item.media_path, caption-content, max-height-fraction: 0.52)
+    render-publication-image(
+      item.media_path,
+      caption-content,
+      max-height-fraction: 0.52,
+      article-style: article-style,
+    )
   } else {
-    render-publication-image(item.media_path, caption-content, max-height-fraction: 0.35)
+    render-publication-image(
+      item.media_path,
+      caption-content,
+      max-height-fraction: 0.35,
+      article-style: article-style,
+    )
   }
   }
 }
 
-#let render-figure(item) = {
+#let render-figure(item, article-style: false) = {
   let caption-content = if has-text(item.caption) {
     render-figure-caption(
       item.figure_number,
       item.caption,
       item.at("semantic_caption", default: none),
+      bottom-space: if article-style { 6pt } else { 0pt },
+      below-space: if article-style { 0pt } else { 4pt },
     )
   } else {
     none
@@ -1105,10 +1161,11 @@
     caption-content,
     annotation: annotation,
     max-height-fraction: 0.36,
+    article-style: article-style,
   )
 }
 
-#let render-chart(item) = {
+#let render-chart(item, article-style: false) = {
   let caption = if has-text(item.caption) { item.caption } else { item.title }
   let semantic-caption = if has-text(item.caption) {
     item.at("semantic_caption", default: none)
@@ -1116,11 +1173,22 @@
     item.at("semantic_title", default: none)
   }
   let caption-content = if has-text(caption) {
-    render-figure-caption(item.figure_number, caption, semantic-caption)
+    render-figure-caption(
+      item.figure_number,
+      caption,
+      semantic-caption,
+      bottom-space: if article-style { 6pt } else { 0pt },
+      below-space: if article-style { 0pt } else { 4pt },
+    )
   } else {
     none
   }
-  render-publication-image(item.media_path, caption-content, max-height-fraction: 0.55)
+  render-publication-image(
+    item.media_path,
+    caption-content,
+    max-height-fraction: 0.55,
+    article-style: article-style,
+  )
 }
 
 #let render-analyst-observation(item, reference-scope: "") = noteAnalyste[
@@ -1136,7 +1204,12 @@
   ]
 ]
 
-#let render-body-block(item, reference-scope: "", paragraph-gap: 5pt) = {
+#let render-body-block(
+  item,
+  reference-scope: "",
+  paragraph-gap: 5pt,
+  article-style: false,
+) = {
   let body = if item.type == "section_heading" {
     heading(level: 2)[#item.text]
   } else if item.type == "paragraph" {
@@ -1152,17 +1225,59 @@
       #render-analyst-observation(item, reference-scope: reference-scope)
     ]
   } else if item.type == "table" {
-    render-table(item)
+    render-table(item, article-style: article-style)
   } else if item.type == "diagram" {
-    render-diagram(item)
+    render-diagram(item, article-style: article-style)
   } else if item.type == "figure" {
-    render-figure(item)
+    render-figure(item, article-style: article-style)
   } else if item.type == "chart" {
-    render-chart(item)
+    render-chart(item, article-style: article-style)
   } else {
     panic("unsupported publication body block type: " + item.type)
   }
   render-target(item.at("target_id", default: none), body)
+}
+
+#let render-publication-references(
+  content-section,
+  brief-publication: false,
+  opinion-publication: false,
+  reference-scope: "",
+) = {
+  let sources = content-section.at("sources", default: ())
+  let entries = content-section.at("entries", default: ())
+  let has-structured-entries = entries.any(entry =>
+    has-text(entry.at("title", default: none))
+    or has-text(entry.at("publisher", default: none))
+  )
+  let entries = if opinion-publication or has-structured-entries {
+    entries
+  } else if sources.len() > 0 {
+    sources
+  } else {
+    entries
+  }
+  let blocks = content-section.at("blocks", default: ())
+  if brief-publication and not opinion-publication {
+    for item in blocks {
+      render-body-block(item, reference-scope: reference-scope)
+    }
+  } else if entries.len() > 0 or blocks.len() > 0 [
+    #if content-section.at("show_heading", default: true) [
+      #render-section-heading[Références]
+    ]
+    #set list(spacing: 4pt, indent: 12pt)
+    #for entry in entries [
+      #render-publication-reference(
+        entry,
+        numbered: opinion-publication,
+        reference-scope: reference-scope,
+      )
+    ]
+    #for item in blocks {
+      render-body-block(item, reference-scope: reference-scope)
+    }
+  ]
 }
 
 #let render-publication-body(publication, reference-scope: "") = {
@@ -1174,56 +1289,41 @@
     opinion-publication
   }
   let article-format = publication.at("article_format", default: none)
-  let article-events = if article-format == none {
-    ()
-  } else {
-    article-format.at("timeline_key_events", default: ())
-  }
-  let has-synthesis-section = publication.content_sections.any(
-    section => section.type == "synthesis",
+  let article-publication = not brief-publication and not opinion-publication
+  let chronology-sections = publication.content_sections.filter(
+    section => section.type == "chronology",
   )
+  let article-events = if article-format != none {
+    article-format.at("timeline_key_events", default: ())
+  } else if chronology-sections.len() > 0 {
+    chronology-sections.first().at("timeline", default: ()).map(event => (
+      display_date_fr: event.at("display_date", default: ""),
+      text: event.text,
+    ))
+  } else {
+    ()
+  }
+  let article-overview = if article-format == none {
+    none
+  } else {
+    article-format.at("overview", default: none)
+  }
+  let has-article-overview = article-overview != none
+  if article-publication [
+    #render-article-timeline(article-events)
+    #if article-overview != none [#render-article-overview(article-overview)]
+  ]
   for content_section in publication.content_sections {
     if content_section.type == "references" {
-      let sources = content_section.at("sources", default: ())
-      let entries = content_section.at("entries", default: ())
-      let has-structured-entries = entries.any(entry =>
-        has-text(entry.at("title", default: none))
-        or has-text(entry.at("publisher", default: none))
-      )
-      let entries = if opinion-publication or has-structured-entries {
-        entries
-      } else if sources.len() > 0 {
-        sources
-      } else {
-        entries
+      if not article-publication {
+        render-publication-references(
+          content_section,
+          brief-publication: brief-publication,
+          opinion-publication: opinion-publication,
+          reference-scope: reference-scope,
+        )
       }
-      let blocks = content_section.at("blocks", default: ())
-      if brief-publication and not opinion-publication {
-        for item in blocks {
-          render-body-block(item, reference-scope: reference-scope)
-        }
-      } else if entries.len() > 0 or blocks.len() > 0 [
-        #if content_section.at("show_heading", default: true) [
-          #render-section-heading[Références]
-        ]
-        #set list(spacing: 4pt, indent: 12pt)
-        #for entry in entries [
-          #render-publication-reference(
-            entry,
-            numbered: opinion-publication,
-            reference-scope: reference-scope,
-          )
-        ]
-        #for item in blocks {
-          render-body-block(item, reference-scope: reference-scope)
-        }
-      ]
     } else if content_section.type == "synthesis" [
-      #if not brief-publication and not opinion-publication and article-format != none [
-        #render-article-timeline(article-events)
-        #let overview = article-format.at("overview", default: none)
-        #if overview != none [#render-article-overview(overview)]
-      ]
       #if brief-publication [
         #render-section-heading[Synthèse]
         #for item in content_section.at("blocks", default: ()) {
@@ -1231,6 +1331,19 @@
             item,
             reference-scope: reference-scope,
             paragraph-gap: 9pt,
+          )
+        }
+      ] else if article-publication [
+        #render-article-section-heading(
+          "Synthèse",
+          reduce-above: if has-article-overview { 13pt } else { 0pt },
+        )
+        #for item in content_section.at("blocks", default: ()) {
+          render-body-block(
+            item,
+            reference-scope: reference-scope,
+            paragraph-gap: 7pt,
+            article-style: true,
           )
         }
       ] else [
@@ -1257,12 +1370,6 @@
           reference-scope: reference-scope,
           date-fill: purple,
         )
-      ] else if article-format == none [
-        #let legacy-events = content_section.at("timeline", default: ()).map(event => (
-          display_date_fr: event.at("display_date", default: ""),
-          text: event.text,
-        ))
-        #render-article-timeline(legacy-events)
       ]
     ] else if content_section.type == "limitations" [
       #render-section-heading[Limites des preuves]
@@ -1459,13 +1566,16 @@
       panic("unsupported publication content section type: " + content_section.type)
     }
   }
-  if not brief-publication and not opinion-publication {
+  if article-publication {
+    for content_section in publication.content_sections {
+      if content_section.type == "references" {
+        render-publication-references(
+          content_section,
+          reference-scope: reference-scope,
+        )
+      }
+    }
     if article-format != none {
-      if not has-synthesis-section [
-        #render-article-timeline(article-events)
-        #let overview = article-format.at("overview", default: none)
-        #if overview != none [#render-article-overview(overview)]
-      ]
       render-article-iocs(article-format)
     } else {
       render-legacy-iocs(publication.content_sections)

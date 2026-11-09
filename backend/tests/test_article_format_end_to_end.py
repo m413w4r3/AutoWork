@@ -365,6 +365,14 @@ async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
     assert "12 janvier 2025" in normalized and "27 janvier 2025" in normalized
     assert "• Example publisher" in text
     assert "https://example.com/report" in re.sub(r"\s+", "", text)
+    assert (
+        normalized.index("chronologie")
+        < normalized.index("vue d'ensemble")
+        < normalized.index("synthèse")
+        < normalized.rindex("pivots de détection")
+        < normalized.index("• example publisher")
+        < normalized.rindex("adresses ip :")
+    )
     for category in ("Adresses IP :", "URL :", "Noms de domaine :", "Fichiers :"):
         assert category.casefold() in normalized, category
     assert normalized.count("vue d'ensemble") == 1

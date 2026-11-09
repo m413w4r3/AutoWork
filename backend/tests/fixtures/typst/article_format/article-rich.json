@@ -11,15 +11,31 @@
   },
   "article_format": {
     "overview": {
-      "victimology": {"text": "Organisations publiques en Europe."},
-      "arsenal": {"text": "Un chargeur et deux modules documentés."},
-      "main_objective": {"text": "Collecte de renseignements."}
+      "victimology": {
+        "text": "Organisations publiques en Europe."
+      },
+      "arsenal": {
+        "text": "Un chargeur et deux modules documentés."
+      },
+      "main_objective": {
+        "text": "Collecte de renseignements."
+      }
     },
     "timeline_key_events": [
       {
         "date_iso": "2026-09-09",
         "display_date_fr": "9 septembre 2026",
         "text": "Un courriel ciblé distribue le chargeur initial."
+      },
+      {
+        "date_iso": "2026-09-15",
+        "display_date_fr": "15 septembre 2026",
+        "text": "Une seconde étape déploie le module intermédiaire."
+      },
+      {
+        "date_iso": "2026-09-18",
+        "display_date_fr": "18 septembre 2026",
+        "text": "Le module contacte ensuite le serveur de commande."
       },
       {
         "date_iso": "2026-09-21",
@@ -29,17 +45,954 @@
     ],
     "ioc_categories": {
       "ips": [
-        {"value": {"text": "192.0.2.77", "break_chunks": ["192.0.2.77"], "break_after": []}}
+        {
+          "value": {
+            "text": "192.0.2.1",
+            "break_chunks": [
+              "192.0.2.1"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.2",
+            "break_chunks": [
+              "192.0.2.2"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.3",
+            "break_chunks": [
+              "192.0.2.3"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.4",
+            "break_chunks": [
+              "192.0.2.4"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.5",
+            "break_chunks": [
+              "192.0.2.5"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.6",
+            "break_chunks": [
+              "192.0.2.6"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.7",
+            "break_chunks": [
+              "192.0.2.7"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.8",
+            "break_chunks": [
+              "192.0.2.8"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.9",
+            "break_chunks": [
+              "192.0.2.9"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.10",
+            "break_chunks": [
+              "192.0.2.10"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.11",
+            "break_chunks": [
+              "192.0.2.11"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.12",
+            "break_chunks": [
+              "192.0.2.12"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.13",
+            "break_chunks": [
+              "192.0.2.13"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.14",
+            "break_chunks": [
+              "192.0.2.14"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.15",
+            "break_chunks": [
+              "192.0.2.15"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.16",
+            "break_chunks": [
+              "192.0.2.16"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.17",
+            "break_chunks": [
+              "192.0.2.17"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.18",
+            "break_chunks": [
+              "192.0.2.18"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.19",
+            "break_chunks": [
+              "192.0.2.19"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.20",
+            "break_chunks": [
+              "192.0.2.20"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.21",
+            "break_chunks": [
+              "192.0.2.21"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.22",
+            "break_chunks": [
+              "192.0.2.22"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.23",
+            "break_chunks": [
+              "192.0.2.23"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.24",
+            "break_chunks": [
+              "192.0.2.24"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.25",
+            "break_chunks": [
+              "192.0.2.25"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.26",
+            "break_chunks": [
+              "192.0.2.26"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.27",
+            "break_chunks": [
+              "192.0.2.27"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.28",
+            "break_chunks": [
+              "192.0.2.28"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.29",
+            "break_chunks": [
+              "192.0.2.29"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.30",
+            "break_chunks": [
+              "192.0.2.30"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.31",
+            "break_chunks": [
+              "192.0.2.31"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.32",
+            "break_chunks": [
+              "192.0.2.32"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.33",
+            "break_chunks": [
+              "192.0.2.33"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.34",
+            "break_chunks": [
+              "192.0.2.34"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.35",
+            "break_chunks": [
+              "192.0.2.35"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.36",
+            "break_chunks": [
+              "192.0.2.36"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.37",
+            "break_chunks": [
+              "192.0.2.37"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.38",
+            "break_chunks": [
+              "192.0.2.38"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.39",
+            "break_chunks": [
+              "192.0.2.39"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.40",
+            "break_chunks": [
+              "192.0.2.40"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.41",
+            "break_chunks": [
+              "192.0.2.41"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.42",
+            "break_chunks": [
+              "192.0.2.42"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.43",
+            "break_chunks": [
+              "192.0.2.43"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.44",
+            "break_chunks": [
+              "192.0.2.44"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.45",
+            "break_chunks": [
+              "192.0.2.45"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.46",
+            "break_chunks": [
+              "192.0.2.46"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.47",
+            "break_chunks": [
+              "192.0.2.47"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.48",
+            "break_chunks": [
+              "192.0.2.48"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.49",
+            "break_chunks": [
+              "192.0.2.49"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.50",
+            "break_chunks": [
+              "192.0.2.50"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.51",
+            "break_chunks": [
+              "192.0.2.51"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.52",
+            "break_chunks": [
+              "192.0.2.52"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.53",
+            "break_chunks": [
+              "192.0.2.53"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.54",
+            "break_chunks": [
+              "192.0.2.54"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.55",
+            "break_chunks": [
+              "192.0.2.55"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.56",
+            "break_chunks": [
+              "192.0.2.56"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.57",
+            "break_chunks": [
+              "192.0.2.57"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.58",
+            "break_chunks": [
+              "192.0.2.58"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.59",
+            "break_chunks": [
+              "192.0.2.59"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "192.0.2.60",
+            "break_chunks": [
+              "192.0.2.60"
+            ],
+            "break_after": []
+          }
+        }
       ],
       "urls": [
-        {"value": {"text": "hxxps://c2[.]example[.]test/api", "break_chunks": ["hxxps://", "c2[.]example[.]test", "/api"], "break_after": [false, true]}}
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/01",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "01"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/02",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "02"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/03",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "03"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/04",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "04"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/05",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "05"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/06",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "06"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/07",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "07"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/08",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "08"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/09",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "09"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "hxxps://updates[.]example[.]test/api/collect/10",
+            "break_chunks": [
+              "hxxps://",
+              "updates[.]example[.]test",
+              "/api",
+              "/collect/",
+              "10"
+            ],
+            "break_after": [
+              true,
+              true,
+              true,
+              true
+            ]
+          }
+        }
       ],
       "domains": [
-        {"value": {"text": "relay[.]example[.]test", "break_chunks": ["relay[.]example[.]test"], "break_after": []}}
+        {
+          "value": {
+            "text": "node-01[.]example[.]test",
+            "break_chunks": [
+              "node-01[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-02[.]example[.]test",
+            "break_chunks": [
+              "node-02[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-03[.]example[.]test",
+            "break_chunks": [
+              "node-03[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-04[.]example[.]test",
+            "break_chunks": [
+              "node-04[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-05[.]example[.]test",
+            "break_chunks": [
+              "node-05[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-06[.]example[.]test",
+            "break_chunks": [
+              "node-06[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-07[.]example[.]test",
+            "break_chunks": [
+              "node-07[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-08[.]example[.]test",
+            "break_chunks": [
+              "node-08[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-09[.]example[.]test",
+            "break_chunks": [
+              "node-09[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "node-10[.]example[.]test",
+            "break_chunks": [
+              "node-10[.]example[.]test"
+            ],
+            "break_after": []
+          }
+        }
       ],
       "files": [
-        {"value": {"text": "8a9f9e24b4f9e2f2f6e578d7fd5a3d70", "break_chunks": ["8a9f9e24b4f9e2f2f6e578d7fd5a3d70"], "break_after": []}},
-        {"value": {"text": "C:\\ProgramData\\agent.dll", "break_chunks": ["C:\\ProgramData\\agent.dll"], "break_after": []}}
+        {
+          "value": {
+            "text": "0101010101010101010101010101010101010101010101010101010101010101",
+            "break_chunks": [
+              "0101010101010101",
+              "0101010101010101",
+              "0101010101010101",
+              "0101010101010101"
+            ],
+            "break_after": [
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "0202020202020202020202020202020202020202020202020202020202020202",
+            "break_chunks": [
+              "0202020202020202",
+              "0202020202020202",
+              "0202020202020202",
+              "0202020202020202"
+            ],
+            "break_after": [
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "0303030303030303030303030303030303030303030303030303030303030303",
+            "break_chunks": [
+              "0303030303030303",
+              "0303030303030303",
+              "0303030303030303",
+              "0303030303030303"
+            ],
+            "break_after": [
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "C:\\ProgramData\\Agent\\component-01.dll",
+            "break_chunks": [
+              "C:\\",
+              "ProgramData\\",
+              "Agent\\",
+              "component-01.dll"
+            ],
+            "break_after": [
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "C:\\ProgramData\\Agent\\component-02.dll",
+            "break_chunks": [
+              "C:\\",
+              "ProgramData\\",
+              "Agent\\",
+              "component-02.dll"
+            ],
+            "break_after": [
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "C:\\ProgramData\\Agent\\component-03.dll",
+            "break_chunks": [
+              "C:\\",
+              "ProgramData\\",
+              "Agent\\",
+              "component-03.dll"
+            ],
+            "break_after": [
+              true,
+              true,
+              true
+            ]
+          }
+        },
+        {
+          "value": {
+            "text": "module-01.bin",
+            "break_chunks": [
+              "module-01.bin"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "module-02.bin",
+            "break_chunks": [
+              "module-02.bin"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "module-03.bin",
+            "break_chunks": [
+              "module-03.bin"
+            ],
+            "break_after": []
+          }
+        },
+        {
+          "value": {
+            "text": "module-04.bin",
+            "break_chunks": [
+              "module-04.bin"
+            ],
+            "break_after": []
+          }
+        }
       ]
     }
   },
@@ -65,18 +1018,26 @@
         {
           "display_date": "9 septembre 2026",
           "text": "Legacy reference text must not replace the editor/title fields.",
-          "source_urls": ["https://example.test/report"]
+          "source_urls": [
+            "https://example.test/report"
+          ]
         }
       ],
       "timeline": [
-        {"display_date": "LEGACY REFERENCE TIMELINE", "text": "MUST NOT RENDER"}
+        {
+          "display_date": "LEGACY REFERENCE TIMELINE",
+          "text": "MUST NOT RENDER"
+        }
       ],
       "blocks": []
     },
     {
       "type": "chronology",
       "timeline": [
-        {"display_date": "LEGACY CHRONOLOGY", "text": "MUST NOT RENDER"}
+        {
+          "display_date": "LEGACY CHRONOLOGY",
+          "text": "MUST NOT RENDER"
+        }
       ],
       "derived_timeline_figure": {
         "title": "LEGACY DATE/TABLE FIGURE MUST NOT RENDER",
@@ -86,7 +1047,10 @@
     {
       "type": "synthesis",
       "blocks": [
-        {"type": "section_heading", "text": "Séquence d’intrusion"},
+        {
+          "type": "section_heading",
+          "text": "Séquence d’intrusion"
+        },
         {
           "type": "paragraph",
           "text": "Les opérateurs envoient un message ciblé puis exécutent le chargeur décrit dans l’analyse."
@@ -94,11 +1058,23 @@
         {
           "type": "table",
           "title": "Composants documentés",
-          "columns": ["Composant", "Rôle observé"],
-          "column_weights": [1.0, 1.6],
+          "columns": [
+            "Composant",
+            "Rôle observé"
+          ],
+          "column_weights": [
+            1.0,
+            1.6
+          ],
           "rows": [
-            ["Loader", "Chargement du module secondaire"],
-            ["Module", "Échange avec l’infrastructure"]
+            [
+              "Loader",
+              "Chargement du module secondaire"
+            ],
+            [
+              "Module",
+              "Échange avec l’infrastructure"
+            ]
           ],
           "caption": "Tableau 1 : Rôles décrits dans les sources."
         },
@@ -109,6 +1085,41 @@
           "media_path": "media/attack-chain.svg",
           "source_note": "Example Research",
           "attribution": "Reconstitution à partir du rapport cité."
+        },
+        {
+          "type": "table",
+          "title": "Correspondance des étapes",
+          "columns": [
+            "Étape",
+            "Élément"
+          ],
+          "column_weights": [
+            1.0,
+            1.6
+          ],
+          "rows": [
+            [
+              "Distribution",
+              "Message ciblé"
+            ],
+            [
+              "Communication",
+              "Serveur de commande"
+            ]
+          ],
+          "caption": "Tableau 2 : Correspondance synthétique."
+        },
+        {
+          "type": "diagram",
+          "figure_number": 2,
+          "title": "Flux entre le chargeur et le module",
+          "caption": "Séquence réseau résumée.",
+          "media_path": "media/attack-chain.svg",
+          "show_title": true
+        },
+        {
+          "type": "paragraph",
+          "text": "Dernier paragraphe de synthèse pour vérifier l’ordre éditorial."
         }
       ]
     },
@@ -119,7 +1130,13 @@
           "heading": "IPv4",
           "items": [
             {
-              "value": {"text": "198.51.100.66", "break_chunks": ["198.51.100.66"], "break_after": []},
+              "value": {
+                "text": "198.51.100.66",
+                "break_chunks": [
+                  "198.51.100.66"
+                ],
+                "break_after": []
+              },
               "indicator_status_label": "Candidat non confirmé",
               "relationship_status_label": "contextual indicator"
             }
@@ -127,7 +1144,20 @@
         }
       ],
       "candidate_indicators": [
-        {"heading": "URLs", "items": [{"value": {"text": "hxxps://candidate[.]invalid", "break_chunks": ["hxxps://candidate[.]invalid"], "break_after": []}}]}
+        {
+          "heading": "URLs",
+          "items": [
+            {
+              "value": {
+                "text": "hxxps://candidate[.]invalid",
+                "break_chunks": [
+                  "hxxps://candidate[.]invalid"
+                ],
+                "break_after": []
+              }
+            }
+          ]
+        }
       ]
     },
     {
