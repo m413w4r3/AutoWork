@@ -692,11 +692,24 @@ def build_article_format_v1(
         if category is None:
             return
         source_ids = set(source_document_ids)
-        evidence_refs = {
-            ref
-            for ref in evidence_by_ioc.get((artifact_type, normalized_value), set())
-            if ref.source_document_id in source_ids
-        }
+        # Publication rows may carry a defanged or otherwise non-canonical
+        # normalized value; match evidence on every canonical spelling.
+        lookup_values = [normalized_value]
+        for raw in (normalized_value, value):
+            try:
+                lookup_values.append(normalize_publication_indicator_value(raw, artifact_type))
+            except ValueError:
+                continue
+        evidence_refs: set[PublicationEvidenceRefV1] = set()
+        for candidate in dict.fromkeys(lookup_values):
+            evidence_refs = {
+                ref
+                for ref in evidence_by_ioc.get((artifact_type, candidate), set())
+                if ref.source_document_id in source_ids
+            }
+            if evidence_refs:
+                normalized_value = candidate
+                break
         if not evidence_refs:
             raise ValueError(
                 "ArticleFormat IOC has no matching canonical indicator evidence reference: "

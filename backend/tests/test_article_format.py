@@ -632,3 +632,43 @@ async def test_article_format_v8_qa_contract_is_checked() -> None:
 
     assert result["checks"]["article_format_present"] is True
     assert result["checks"]["reader_ioc_projection"] is True
+
+
+def test_builder_matches_defanged_publication_value_to_canonical_evidence() -> None:
+    base = _article_with_overview()[0]
+    extraction = _article_with_overview()[3][0]
+    source = extraction.sources[0]
+    canonical = "afterworld.store"
+    extraction = replace(
+        extraction,
+        sources=(
+            replace(
+                source,
+                indicators=(
+                    ExtractionIndicatorV1(
+                        value=canonical,
+                        artifact_type=ArtifactType.DOMAIN,
+                        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                        context="Observed in the source.",
+                        evidence_quote=f"The report includes {canonical}.",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(source.source_document_id,),
+                    ),
+                ),
+            ),
+        ),
+    )
+    indicator = PublicationIndicatorV1(
+        value="afterworld[.]store",
+        normalized_value="afterworld[.]store",
+        artifact_type=ArtifactType.DOMAIN,
+        source_document_ids=(source.source_document_id,),
+    )
+    document = replace(
+        base.document,
+        indicators=(PublicationIndicatorGroupV1(ArtifactType.DOMAIN, (indicator,)),),
+    )
+    article_format = build_article_format_v1(replace(base, document=document), extraction)
+
+    assert [item.normalized_value for item in article_format.ioc_categories.domains] == [canonical]
+    assert article_format.ioc_categories.domains[0].evidence_refs
