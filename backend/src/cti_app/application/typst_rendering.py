@@ -653,8 +653,8 @@ def publication_content_section_types(
     else:
         has_limitations = False
         has_legacy_chronology = bool(document.timeline) or timeline_figure is not None
-    # Standalone BRIEFs keep their legacy section shape; editions request the
-    # dedicated chronology section explicitly for their embedded BRIEFs.
+    # Articles use article_format; opinions and requested BRIEF renders keep
+    # this legacy chronology section.
     if has_legacy_chronology and (
         (opinion_document and not brief_document)
         or (brief_document and include_brief_chronology)
@@ -1276,7 +1276,9 @@ class TypstRenderer:
             )
         source_bytes = entrypoint.content
         model = project_publication_to_typst_model(
-            document, infrastructure_graph_media_ref=infrastructure_graph_media_ref
+            document,
+            infrastructure_graph_media_ref=infrastructure_graph_media_ref,
+            include_brief_chronology=is_brief(document),
         )
         target_descriptors: tuple[dict[str, Any], ...] = ()
         unmapped: tuple[dict[str, Any], ...] = ()
@@ -2859,6 +2861,7 @@ def project_publication_to_typst_model(
             item
             for item in opinion_figures
             if item.compiler_policy_version == PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
+            or draft_preview is not None
         )
         opinion_figure_provenance.extend(
             {
@@ -2946,6 +2949,8 @@ def project_publication_to_typst_model(
                     protocol_figure.compiler_policy_version
                     != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
                 ):
+                    if draft_preview is not None:
+                        return title_prefix, "", None
                     source_title = source_title.partition(". ")[0].rstrip(".").strip()
                     title = f"{title_prefix} — {source_title}" if source_title else title_prefix
                     return title, "", None
@@ -2994,6 +2999,7 @@ def project_publication_to_typst_model(
                     "legacy_renderer": (
                         protocol_figure.compiler_policy_version
                         != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
+                        and draft_preview is None
                     ),
                     "status_legend": (
                         "Observation étayée : vert · inférence : orange · "

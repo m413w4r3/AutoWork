@@ -572,10 +572,31 @@
   ]
 }
 
+#let render-opinion-reference(
+  target-id,
+  display,
+  reference-scope: "",
+  fallback-url: none,
+) = context {
+  let target = label(reference-scope + target-id)
+  if query(target).len() > 0 [
+    #link(target)[#display]
+  ] else if fallback-url != none [
+    #link(fallback-url)[#display]
+  ] else [
+    #display
+  ]
+}
+
 #let render-opinion-references(references, reference-scope: "") = {
   for (index, reference) in references.enumerate() [
     #if index > 0 [ · ]
-    #link(label(reference-scope + reference.target_id))[#reference.label]
+    #render-opinion-reference(
+      reference.target_id,
+      [#reference.label],
+      reference-scope: reference-scope,
+      fallback-url: reference.at("href", default: none),
+    )
   ]
 }
 
@@ -1343,12 +1364,20 @@
           #linebreak()
           #text(size: 7pt)[Emplacement dans l’échantillon : ]
           #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_location)]
-          #linebreak()
-          #text(size: 7pt)[SHA-256 de l’échantillon : ]
-          #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_sha256)]
+          #let sample-sha256 = item.at("sample_sha256", default: none)
+          #if sample-sha256 != none [
+            #linebreak()
+            #text(size: 7pt)[SHA-256 de l’échantillon : ]
+            #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(sample-sha256)]
+          ]
           #linebreak()
           #text(size: 7pt)[Observation de preuve : ]
-          #link(label(reference-scope + item.evidence_ref.target_id))[#text(item.evidence_ref.label)]
+          #render-opinion-reference(
+            item.evidence_ref.target_id,
+            [#text(item.evidence_ref.label)],
+            reference-scope: reference-scope,
+            fallback-url: item.evidence_ref.at("href", default: none),
+          )
         ]
       ]
       #text(size: 7pt, fill: grey)[#text(content_section.attacker_identifier_note)]

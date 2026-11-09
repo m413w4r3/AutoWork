@@ -1448,8 +1448,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
         item for item in render_data["content_sections"] if item["type"] == "technical_materials"
     )
     assert typed_materials["items"][0]["type"] == "aes_key"
-    # This legacy short fixture is classified as a BRIEF; R5/R6 omit sample
-    # provenance from its reader-facing projection.
+    # This short BRIEF omits sample provenance under R5/R6.
     assert "sample_sha256" not in typed_materials["items"][0]
     limitations = next(
         item for item in render_data["content_sections"] if item["type"] == "limitations"
@@ -1539,7 +1538,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     assert "literal ] bracket" in extracted
     assert "Malformed" in extracted and "literal fallback" in extracted
     assert "00112233445566778899aabbccddeeff" in extracted
-    assert material_sha256 in extracted
+    assert material_sha256 not in extracted
     assert "Clé AES" in extracted
     assert "Synthetic fixture decryption key" in extracted
     assert "config/key.bin:0x20-0x2f" in extracted
