@@ -450,6 +450,27 @@ def references_corpus_hash(corpus: ProductionReferenceCorpusV1) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def references_corpus_hash_candidates(corpus: ProductionReferenceCorpusV1) -> tuple[str, ...]:
+    """Return current and exact parsed-payload hashes for lineage validation.
+
+    Old corpus serializers omitted fields later added to the schema-v1 wire
+    shape. Keep the primary identity above unchanged, while allowing an
+    extraction to match the exact canonical payload that was parsed. The
+    parsed hash is usable only while the typed corpus still serializes to the
+    same normalized content captured at parse time.
+    """
+    current_hash = references_corpus_hash(corpus)
+    candidates = [current_hash]
+    parsed_payload_hash = corpus._parsed_payload_sha256
+    if (
+        parsed_payload_hash is not None
+        and corpus._parsed_normalized_payload_sha256 == current_hash
+        and parsed_payload_hash not in candidates
+    ):
+        candidates.append(parsed_payload_hash)
+    return tuple(candidates)
+
+
 def build_extraction_plan(
     corpus: ProductionReferenceCorpusV1,
     *,

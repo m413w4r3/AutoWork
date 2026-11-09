@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import date
 from uuid import UUID
@@ -10,11 +11,16 @@ from cti_app.application.brief_publication_builder import (
     build_brief_publication_document_v5,
     wrap_publication_document_v7,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_brief_synthesis import (
     BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
     brief_timeline_from_extraction,
 )
 from cti_app.application.production_extraction import references_corpus_hash
+from cti_app.application.production_references import (
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
+)
 from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_qa import qa_publication_v7
@@ -110,6 +116,44 @@ def test_brief_assembly_stays_brief_across_narrative_lengths(word_count: int) ->
     assert qa["passed"] is True
     assert qa["checks"]["no_placeholder_markers"] is True
     assert qa["checks"]["no_ioc_annex"] is True
+
+
+def test_brief_assembly_accepts_legacy_references_payload_hash() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    legacy_payload = production_reference_corpus_to_json(references)
+    for source in legacy_payload["sources"]:
+        source.pop("acquisition_method")
+        source.pop("acquisition_attempts")
+    legacy_hash = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(legacy_payload)
+    ).hexdigest()
+    references = production_reference_corpus_from_json(legacy_payload)
+    assert references_corpus_hash(references) != legacy_hash
+    extraction = replace(extraction, references_corpus_hash=legacy_hash)
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+    )
+
+    brief = build_brief_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=build_relevance_projection(snapshot, extraction),
+        synthesis=synthesis,
+    )
+
+    assert brief.document.subject_id == snapshot.subject_id
+
+    changed_references = replace(references, warnings=("changed after extraction",))
+    with pytest.raises(ValueError, match="canonical references corpus"):
+        build_brief_publication_document_v5(
+            snapshot=snapshot,
+            references=changed_references,
+            extraction=extraction,
+            relevance_projection=build_relevance_projection(snapshot, extraction),
+            synthesis=synthesis,
+        )
 
 
 def test_brief_qa_accepts_empty_enrichment_and_requires_relevance_projection() -> None:

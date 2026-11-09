@@ -16,7 +16,10 @@ from cti_app.application.production_editorial_enrichment import (
     canonical_synthesis_hash,
     validate_editorial_enrichment,
 )
-from cti_app.application.production_extraction import references_corpus_hash
+from cti_app.application.production_extraction import (
+    references_corpus_hash,
+    references_corpus_hash_candidates,
+)
 from cti_app.application.production_normalization import (
     normalize_publication_indicator_value,
     publication_indicator_identity_key,
@@ -579,7 +582,7 @@ def _validate_publication_lineage(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
             "Extraction does not match the production input snapshot",
         )
-    if references_corpus_hash(references) != extraction.references_corpus_hash:
+    if extraction.references_corpus_hash not in references_corpus_hash_candidates(references):
         raise PublicationAssemblyValidationError(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
             "Extraction does not match the canonical references corpus",

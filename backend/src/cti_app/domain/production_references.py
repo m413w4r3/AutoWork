@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
 from typing import Protocol
@@ -296,6 +296,10 @@ class ProductionReferenceCorpusV1:
     research_status: ProductionReferenceResearchStatus
     sources: tuple[ProductionReferenceSourceV1, ...]
     warnings: tuple[str, ...]
+    # Parsing provenance supports old schema-v1 wire encodings without
+    # changing the current canonical serialization or identity.
+    _parsed_payload_sha256: str | None = field(default=None, repr=False, compare=False)
+    _parsed_normalized_payload_sha256: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
@@ -318,6 +322,18 @@ class ProductionReferenceCorpusV1:
             not isinstance(warning, str) for warning in self.warnings
         ):
             raise ValueError("Production reference warnings must be a tuple of strings")
+        if (self._parsed_payload_sha256 is None) != (
+            self._parsed_normalized_payload_sha256 is None
+        ):
+            raise ValueError("Parsed reference payload hashes must be provided together")
+        for payload_hash in (
+            self._parsed_payload_sha256,
+            self._parsed_normalized_payload_sha256,
+        ):
+            if payload_hash is not None and (
+                not isinstance(payload_hash, str) or not _SHA256.fullmatch(payload_hash)
+            ):
+                raise ValueError("Parsed reference payload identity must be a lowercase SHA-256")
 
         # Deduplicate solely by canonical URL. A snapshot CORE entry wins over
         # any model proposal; among model proposals the first valid entry wins.

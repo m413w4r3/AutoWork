@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -88,6 +90,17 @@ _SOURCE_KEYS = {
     "acquisition_attempts",
 }
 _SOURCE_BLOCKS = {"source": "source"}
+
+
+def _canonical_payload_sha256(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,7 +472,7 @@ def production_reference_corpus_from_json(
                 ),
             )
         )
-    return ProductionReferenceCorpusV1(
+    corpus = ProductionReferenceCorpusV1(
         schema_version=1,
         subject_id=_uuid(payload["subject_id"], "subject_id"),
         research_date=_date(payload["research_date"], "research_date"),
@@ -471,6 +484,13 @@ def production_reference_corpus_from_json(
         ),
         sources=tuple(sources),
         warnings=tuple(raw_warnings),
+    )
+    return replace(
+        corpus,
+        _parsed_payload_sha256=_canonical_payload_sha256(payload),
+        _parsed_normalized_payload_sha256=_canonical_payload_sha256(
+            production_reference_corpus_to_json(corpus)
+        ),
     )
 
 
