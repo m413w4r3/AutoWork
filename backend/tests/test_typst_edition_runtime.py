@@ -423,7 +423,7 @@ async def test_real_typst_compiles_legacy_and_current_semantic_policies_together
 
 
 @pytest.mark.asyncio
-async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
+async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_annex(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -431,7 +431,6 @@ async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
     publication, *_ = _frontmatter_v6_case()
     finding_id = UUID(int=701)
     evidence_id = UUID(int=702)
-    hash_value = "d" * 64
     table_lines = [
         "Synthetic table preface marker.",
         "| Component | State | Context | Marker |",
@@ -470,6 +469,7 @@ async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
     section_types = [item["type"] for item in render_data["content_sections"]]
     assert section_types[0] == "references"
     assert section_types.index("references") < section_types.index("synthesis")
+    assert "technical_annex" not in section_types
 
     opinion_section = next(
         item for item in render_data["content_sections"] if item["type"] == "analyst_opinion"
@@ -486,34 +486,6 @@ async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
     assert table_block["pipe_table"]["wide"] is True
     assert "Synthetic table note marker." in table_block["pipe_table"]["suffix"]
 
-    annex = next(
-        item for item in render_data["content_sections"] if item["type"] == "technical_annex"
-    )
-    annex["publication_identity_provenance"] = "OPINION_IDENTITY_PROVENANCE_SYNTHETIC"
-    annex["ioc_row_groups"].append(
-        {
-            "heading": "Synthetic hidden values",
-            "rows": [
-                {
-                    "type": "hash",
-                    "type_label": "SHA-256",
-                    "value": hash_value,
-                    "status_label": "Confirmé",
-                    "context_summary": "HASH_CONTEXT_SYNTHETIC",
-                    "source_refs": [{"number": 1}],
-                    "draft_refs": [],
-                },
-                {
-                    "type": "domain",
-                    "type_label": "Domaine",
-                    "value": "hidden.fixture",
-                    "context_summary": "NET_CONTEXT_SYNTHETIC",
-                    "source_refs": [{"number": 1}],
-                    "draft_refs": [],
-                },
-            ],
-        }
-    )
     modified_render_data = json.dumps(
         render_data,
         ensure_ascii=False,
@@ -539,23 +511,15 @@ async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
         )
     )
     reader = PdfReader(BytesIO(compiled.content), strict=True)
-    text, compact_text = _normalized_pdf_text(reader)
+    text, _compact_text = _normalized_pdf_text(reader)
     page_texts = [page.extract_text() or "" for page in reader.pages]
 
     assert "Synthèse" in text
     assert "Synthetic table preface marker." in text
     assert "PIPE_ROW_45" in text and "Synthetic table note marker." in text
     assert "Run token" in text and "[F1]" in text and "[E1]" in text
-    assert hash_value in compact_text
-    for visible in (
-        "PROVENANCE DE PUBLICATION",
-        "OPINION_IDENTITY_PROVENANCE_SYNTHETIC",
-        "ANNEXE TECHNIQUE",
-        "HASH_CONTEXT_SYNTHETIC",
-        "NET_CONTEXT_SYNTHETIC",
-        "hidden.fixture",
-    ):
-        assert visible in text
+    assert "PROVENANCE DE PUBLICATION" not in text
+    assert "ANNEXE TECHNIQUE" not in text
     pages_with_last_row = [
         index for index, page_text in enumerate(page_texts) if "PIPE_ROW_45" in page_text
     ]

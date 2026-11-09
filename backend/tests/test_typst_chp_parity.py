@@ -1448,7 +1448,9 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
         item for item in render_data["content_sections"] if item["type"] == "technical_materials"
     )
     assert typed_materials["items"][0]["type"] == "aes_key"
-    assert typed_materials["items"][0]["sample_sha256"] == material_sha256
+    # This legacy short fixture is classified as a BRIEF; R5/R6 omit sample
+    # provenance from its reader-facing projection.
+    assert "sample_sha256" not in typed_materials["items"][0]
     limitations = next(
         item for item in render_data["content_sections"] if item["type"] == "limitations"
     )

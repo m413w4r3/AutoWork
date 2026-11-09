@@ -132,7 +132,9 @@ class EditionTypstRenderer:
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
         for classified in classify_edition_publications(document.publications):
             publication = classified.publication
-            model = project_publication_to_typst_model(publication.document)
+            model = project_publication_to_typst_model(
+                publication.document, include_brief_chronology=True
+            )
             article_title_target_id = None
             target_identities = (artifact_identities or {}).get(str(publication.subject_id))
             if target_identities is not None:
