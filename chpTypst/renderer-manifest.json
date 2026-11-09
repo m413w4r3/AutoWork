@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v38-article-format",
+  "template_version": "chp-article-v39-m19-format",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

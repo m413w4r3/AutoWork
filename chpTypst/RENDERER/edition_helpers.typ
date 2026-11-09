@@ -12,6 +12,7 @@
 
 #let render-article(publication) = [
   #pagebreak()
+  #counter(footnote).update(0)
   #render-target(
     publication.at("article_title_target_id", default: none),
     [#text(size: 16pt, weight: "regular", fill: purple)[#publication.title] #label(publication.anchor)],
@@ -31,6 +32,7 @@
 
 #let render-brief(publication) = [
   #pagebreak()
+  #counter(footnote).update(0)
   #render-target(
     publication.at("article_title_target_id", default: none),
     [#text(size: 16pt, weight: "regular", fill: purple)[#publication.title] #label(publication.anchor)],
