@@ -675,3 +675,14 @@ def test_v6_qa_requires_editorial_title_format() -> None:
 
         assert rejected["checks"]["title_format"] is False
         assert rejected["passed"] is False
+
+
+def test_reader_hidden_metadata_allows_media_digest_only_on_figure_blocks() -> None:
+    from cti_app.application.publication_qa import _contains_reader_hidden_metadata
+
+    figure = {"type": "figure", "sha256": "a" * 64, "sha256_spans": {"text": "a" * 64}}
+    assert _contains_reader_hidden_metadata({"blocks": [figure]}) is False
+    assert _contains_reader_hidden_metadata({"blocks": [{**figure, "type": "paragraph"}]}) is True
+    assert _contains_reader_hidden_metadata({"blocks": [{**figure, "document_hash": "x"}]}) is True
+    tainted = {"type": "figure", "provenance": "x"}
+    assert _contains_reader_hidden_metadata({"blocks": [tainted]}) is True

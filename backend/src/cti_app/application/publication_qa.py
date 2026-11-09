@@ -138,10 +138,15 @@ def _contains_reader_hidden_metadata(value: Any) -> bool:
         "chronology",
     }
     if isinstance(value, dict):
+        # Figure blocks carry the archived media digest for renderer-side media
+        # resolution; the template never prints it, so it is not reader metadata.
+        media_keys = {"sha256", "sha256_spans"} if value.get("type") == "figure" else set()
         return any(
             key.casefold() in hidden_keys
-            or "sha256" in key.casefold()
-            or "_hash" in key.casefold()
+            or (
+                key not in media_keys
+                and ("sha256" in key.casefold() or "_hash" in key.casefold())
+            )
             or _contains_reader_hidden_metadata(item)
             for key, item in value.items()
         )
