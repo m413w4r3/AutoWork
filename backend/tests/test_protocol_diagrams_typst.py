@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -10,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import anyio
 import pytest
 from pypdf import PdfReader
 
@@ -624,14 +624,13 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     pdf_path = tmp_path / "documented-protocol.pdf"
     pdf_path.write_bytes(pdf.content)
-    extracted = (
-        await asyncio.to_thread(
-            subprocess.run,
-            ("pdftotext", str(pdf_path), "-"),
-            capture_output=True,
-            check=True,
-        )
-    ).stdout.decode("utf-8", errors="replace")
+    extracted = await anyio.run_process(
+        ("pdftotext", str(pdf_path), "-"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    extracted = extracted.stdout.decode("utf-8", errors="replace")
     extracted = " ".join(extracted.split()).casefold()
     assert extracted.count("article_documented") == 3
     assert extracted.count("niveau de preuve") == 3
@@ -696,13 +695,13 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     pdftoppm = shutil.which("pdftoppm")
     assert pdftotext is not None and pdftoppm is not None
     for label, path in (("publication", publication_pdf_path), ("preview", preview_pdf_path)):
-        extracted = await asyncio.to_thread(
-            subprocess.run,
-            (pdftotext, "-layout", str(path), "-"),
-            capture_output=True,
-            check=True,
-            timeout=30,
-        )
+        with anyio.fail_after(30):
+            extracted = await anyio.run_process(
+                (pdftotext, "-layout", str(path), "-"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         pdf_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
         lowered = pdf_text.casefold()
         expected_proof_levels = 3 if label == "publication" else 2
@@ -721,13 +720,13 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         for existing in output_directory.glob("*.png"):
             existing.unlink()
         raster_prefix = output_directory / "page"
-        await asyncio.to_thread(
-            subprocess.run,
-            (pdftoppm, "-png", "-r", "110", str(path), str(raster_prefix)),
-            capture_output=True,
-            check=True,
-            timeout=30,
-        )
+        with anyio.fail_after(30):
+            await anyio.run_process(
+                (pdftoppm, "-png", "-r", "110", str(path), str(raster_prefix)),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         rasters = tuple(output_directory.glob("page-*.png"))
         assert len(rasters) == len(PdfReader(path, strict=True).pages)
         assert all(image.stat().st_size > 1024 for image in rasters)

@@ -445,8 +445,8 @@ def test_annotation_request_is_separate_from_the_table_diagram_request_and_versi
         SEMANTIC_ANNOTATION_CONTRACT_VERSION == "semantic-annotation-term-role-blocks-v2-no-title"
     )
     assert SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION == "semantic-annotation-wire-v3-no-title"
-    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("editorial-tables")
-    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("atomic-diagram-relations")
+    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("article-density")
+    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("article-omission-diagnostics")
     assert "@@ANCHOR title@@" not in annotation_request.text
     assert "@@ANCHOR section:0:paragraph:0001@@" in annotation_request.text
     assert "@@ANCHOR diagram:" not in annotation_request.text

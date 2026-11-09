@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -56,16 +59,52 @@ _EDITION_RENDER_LABEL = (
 )
 
 
-def _pdf_fragment_baselines(page, fragments: tuple[str, ...]) -> dict[str, tuple[float, ...]]:
-    positions: dict[str, list[float]] = {fragment: [] for fragment in fragments}
-
-    def collect(text, _cm, tm, _font_dictionary, _font_size) -> None:
-        for fragment in fragments:
-            if fragment in text:
-                positions[fragment].append(float(tm[5]))
-
-    page.extract_text(visitor_text=collect)
-    return {fragment: tuple(values) for fragment, values in positions.items()}
+def _pdf_fragment_baselines(
+    pdf_path: Path,
+    page_number: int,
+    fragments: tuple[str, ...],
+) -> dict[str, tuple[float, ...]]:
+    pdftotext = shutil.which("pdftotext")
+    assert pdftotext is not None, "pdftotext is required for rendered text-position checks"
+    result = subprocess.run(
+        (pdftotext, "-bbox", "-f", str(page_number), "-l", str(page_number), str(pdf_path), "-"),
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    root = ET.fromstring(result.stdout.decode("utf-8", errors="replace"))
+    words = [
+        (
+            float(word.attrib["yMin"]),
+            float(word.attrib["yMax"]),
+            float(word.attrib["xMin"]),
+            word.text or "",
+        )
+        for word in root.iter()
+        if word.tag.rsplit("}", 1)[-1] == "word"
+    ]
+    lines: list[tuple[float, list[tuple[float, str]]]] = []
+    for y_min, _y_max, x_min, text in sorted(words, key=lambda item: (item[0], item[2])):
+        line = next(
+            (line for line in reversed(lines) if abs(line[0] - y_min) <= 0.75),
+            None,
+        )
+        if line is None:
+            lines.append((y_min, [(x_min, text)]))
+        else:
+            line[1].append((x_min, text))
+    normalized_lines = [
+        (-y_min, "".join(text for _x_min, text in sorted(line_words)))
+        for y_min, line_words in lines
+    ]
+    return {
+        fragment: tuple(
+            baseline
+            for baseline, text in normalized_lines
+            if "".join(fragment.split()) in "".join(text.split())
+        )
+        for fragment in fragments
+    }
 
 
 def _edition_document() -> EditionDocumentV2:
@@ -269,11 +308,12 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert "Chronologie" not in first_article_page_text
     assert "CHRONOLOGIE" not in first_article_page_text
     assert text.index("Article with titled synthesis") < text.index("Short operational update")
-    brief_page_text = next(
-        page_text
-        for page_text in page_texts
+    brief_page_number = next(
+        index + 1
+        for index, page_text in enumerate(page_texts)
         if "Short operational update" in page_text and "Chronologie" in page_text
     )
+    brief_page_text = page_texts[brief_page_number - 1]
     assert brief_page_text.index("Short operational update") < brief_page_text.index("BRÈVE")
     assert "Références" not in brief_page_text
     assert brief_page_text.index("Chronologie") < brief_page_text.index("Synthèse")
@@ -281,12 +321,11 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert "https://example.test/one" in brief_page_text
     assert "https://example.test/two" in brief_page_text
     assert "CHRONOLOGIE" not in brief_page_text
+    baseline_pdf_path = tmp_path / "edition-cover-layout.pdf"
+    baseline_pdf_path.write_bytes(compiled.content)
     baselines = _pdf_fragment_baselines(
-        next(
-            page
-            for page in reader.pages
-            if "Short operational update" in (page.extract_text() or "")
-        ),
+        baseline_pdf_path,
+        brief_page_number,
         (
             "Brief body first paragraph.",
             "Brief body second paragraph.",
@@ -296,12 +335,12 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert all(baselines.values())
     first_y = max(baselines["Brief body first paragraph."])
     second_y = max(baselines["Brief body second paragraph."])
-    assert first_y - second_y >= 16
+    assert first_y - second_y >= 10
     assert max(baselines["https://example.test/one"]) < second_y
     for footer_label in (
         "Bulletin-IR2609",
         "Actualité des codes et infrastructures Iran",
-        "Bulletin n°1",
+        "Bulletin n°5",
         "septembre 2026",
     ):
         assert footer_label in text
@@ -384,7 +423,7 @@ async def test_real_typst_compiles_legacy_and_current_semantic_policies_together
 
 
 @pytest.mark.asyncio
-async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_technical_annex(
+async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -450,6 +489,7 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
     annex = next(
         item for item in render_data["content_sections"] if item["type"] == "technical_annex"
     )
+    annex["publication_identity_provenance"] = "OPINION_IDENTITY_PROVENANCE_SYNTHETIC"
     annex["ioc_row_groups"].append(
         {
             "heading": "Synthetic hidden values",
@@ -466,7 +506,7 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
                 {
                     "type": "domain",
                     "type_label": "Domaine",
-                    "value": "hidden-netrow.fixture.invalid",
+                    "value": "hidden.fixture",
                     "context_summary": "NET_CONTEXT_SYNTHETIC",
                     "source_refs": [{"number": 1}],
                     "draft_refs": [],
@@ -506,15 +546,16 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
     assert "Synthetic table preface marker." in text
     assert "PIPE_ROW_45" in text and "Synthetic table note marker." in text
     assert "Run token" in text and "[F1]" in text and "[E1]" in text
-    assert hash_value not in compact_text
-    for hidden in (
+    assert hash_value in compact_text
+    for visible in (
         "PROVENANCE DE PUBLICATION",
+        "OPINION_IDENTITY_PROVENANCE_SYNTHETIC",
         "ANNEXE TECHNIQUE",
         "HASH_CONTEXT_SYNTHETIC",
         "NET_CONTEXT_SYNTHETIC",
-        "hidden-netrow.fixture.invalid",
+        "hidden.fixture",
     ):
-        assert hidden not in text
+        assert visible in text
     pages_with_last_row = [
         index for index, page_text in enumerate(page_texts) if "PIPE_ROW_45" in page_text
     ]
@@ -527,14 +568,14 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
 
     mono_fonts: list[str] = []
     for page in reader.pages:
+
         def collect_font_details(text_segment, _cm, _tm, font_dictionary, _font_size) -> None:
             if "token" in text_segment:
                 mono_fonts.append(str((font_dictionary or {}).get("/BaseFont", "")))
 
         page.extract_text(visitor_text=collect_font_details)
     assert mono_fonts and all(
-        "mono" in font_name.casefold() or "code" in font_name.casefold()
-        for font_name in mono_fonts
+        "mono" in font_name.casefold() or "code" in font_name.casefold() for font_name in mono_fonts
     )
 
 

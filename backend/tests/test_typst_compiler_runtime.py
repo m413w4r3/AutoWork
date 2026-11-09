@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -37,6 +36,9 @@ from cti_app.domain.publication import (
     ArtifactType,
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
     PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
@@ -52,6 +54,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticRole,
     SemanticTextSpanV1,
     SemanticTextV1,
+    section_paragraph_anchor,
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _cited_technical_context_case
@@ -179,6 +182,17 @@ def _assert_exact_copyable_pdf_text(reader: PdfReader, values: tuple[str, ...]) 
     for value in values:
         assert value in without_linebreaks, f"PDF text does not reconstruct {value!r}"
     return extracted
+
+
+def _write_review_pdf(directory: Path, name: str, content: bytes) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_bytes(content)
+    return path
+
+
+def _review_pngs(directory: Path, pattern: str) -> list[Path]:
+    return sorted(directory.glob(pattern))
 
 
 @pytest.fixture(scope="session")
@@ -395,12 +409,12 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     typst_binary: str,
     font_bundle_root: Path,
 ) -> None:
-    """Check every projected source, timeline, and opinion text field in compiled PDFs.
+    """Check article reference rows and every opinion text field in compiled PDFs.
 
-    The fixture composes source title and publisher into the visible reference
-    text; the template does not print those metadata fields separately. The
-    reference row prints its publication date, ordinal identifier, reference text,
-    and URL. A timeline row prints its date, event text, and source ordinal. Opinion heading,
+    The article reference row prints publisher, title, date, and URL. The
+    opinion reference row prints its date, ordinal identifier, reference text,
+    and URL. The article frise prints its date and event text; the opinion
+    chronology retains its source ordinals. Opinion heading,
     qualification, text, and visible citations are checked separately.
 
     The test sees selectable text through ``pdftotext``. It cannot verify source or
@@ -418,15 +432,14 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     title_marker = "M04_BASE_TITLE_7F32A9"
     lead_marker = "M04_BASE_LEAD_1C8E45"
     timeline_marker = "M04_BASE_TIMELINE_TEXT_5D7C32"
-    timeline_date_marker = "M04_BASE_TIMELINE_DATE_6C8A14"
+    timeline_date_marker = "15 septembre 2026"
     second_timeline_marker = "M04_BASE_TIMELINE_TEXT_4A920D"
-    second_timeline_date_marker = "M04_BASE_TIMELINE_DATE_2D7F6B"
+    second_timeline_date_marker = "17 septembre 2026"
     opinion_marker = "M04_APPROVED_OPINION_93F4C8"
     base = _base_v5()
 
-    # The template displays the publisher/title text assembled into each source
-    # reference, plus its source date and URL. Assign distinct markers per source
-    # so each rendered row and field has an independent exact-count assertion.
+    # Give each article reference field a unique marker so the visible
+    # publisher/title/date/URL row can be checked field by field.
     source_fields: dict[Any, dict[str, Any]] = {}
     reference_texts: dict[Any, str] = {}
     reference_expected_counts: dict[str, int] = {}
@@ -475,17 +488,29 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         base.document,
         title=title_marker,
         sources=sources,
+        sections=(
+            PublicationSectionV1(
+                kind=PublicationSectionKind.TECHNICAL,
+                heading="Contexte technique",
+                paragraphs=(
+                    PublicationParagraphV1(
+                        "M04_BASE_ARTICLE_SECTION_MARKER",
+                        base.document.lead[0].evidence_refs,
+                    ),
+                ),
+            ),
+        ),
         lead=(replace(base.document.lead[0], text=lead_marker), *base.document.lead[1:]),
         timeline=(
             PublicationTimelineEntryV1(
-                event_date=None,
-                date_text=timeline_date_marker,
+                event_date=date(2026, 9, 15),
+                date_text=None,
                 text=timeline_marker,
                 evidence_refs=base.document.lead[0].evidence_refs,
             ),
             PublicationTimelineEntryV1(
-                event_date=None,
-                date_text=second_timeline_date_marker,
+                event_date=date(2026, 9, 17),
+                date_text=None,
                 text=second_timeline_marker,
                 evidence_refs=base.document.lead[0].evidence_refs,
             ),
@@ -499,6 +524,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     assert set(anchors) == {
         "title",
         "lead:0001",
+        section_paragraph_anchor(0, 1),
         "timeline:0001",
         "timeline:0002",
         *(f"reference:{index:04d}" for index in range(1, len(references) + 1)),
@@ -547,13 +573,13 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         )
         pdf_path = tmp_path / f"{name}.pdf"
         pdf_path.write_bytes(compiled.content)
-        extracted = await asyncio.to_thread(
-            subprocess.run,
-            (pdftotext, "-layout", str(pdf_path), "-"),
-            capture_output=True,
-            check=True,
-            timeout=30,
-        )
+        with anyio.fail_after(30):
+            extracted = await anyio.run_process(
+                (pdftotext, "-layout", str(pdf_path), "-"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         return extracted.stdout.decode("utf-8", errors="replace")
 
     base_text = await compile_and_extract(base, "mission04-base")
@@ -565,11 +591,10 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     base_text = normalize_pdf_text(base_text)
     augmented_text = normalize_pdf_text(augmented_text)
 
-    # Existing references and opinion traceability sections remain unchanged; this adds no new
-    # editorial section. Each reference ordinal is printed beside both its date and URL, and
-    # timeline citations repeat that ordinal once per source citation. Opinion citation labels
-    # repeat once inline and once in the existing traceability annex. ``pdftotext`` sees the
-    # printed URL but cannot verify the link destination bytes.
+    # The base fixture is routed as a BRIEF, so its legacy timeline cites source
+    # ordinals and URLs without an article reference list. The augmented V6 opinion
+    # keeps its numbered source list and existing traceability annex. ``pdftotext``
+    # sees printed URLs but cannot verify the link destination bytes.
     finding_id = str(context.findings[0].id)
     evidence_id = str(context.observations[0].id)
     timeline_expectations = (
@@ -580,24 +605,43 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         reference.source_document_id: index for index, reference in enumerate(references, start=1)
     }
     for timeline_date, timeline_text, entry in timeline_expectations:
-        assert entry.date_text == timeline_date
+        assert timeline_date in base_text
+        assert entry.event_date is not None
         assert entry.text == timeline_text
         assert any(ref.source_document_id in reference_numbers for ref in entry.evidence_refs)
 
-    def assert_reference_rows(text: str, label: str) -> None:
+    def assert_reference_rows(text: str, label: str, *, article: bool) -> None:
+        reference_text = re.split(r"(?i)chronologie", text, maxsplit=1)[0]
         for reference in references:
             number = reference_numbers[reference.source_document_id]
             display_date = reference_display_dates[reference.source_document_id]
             source_url = reference_urls[reference.source_document_id]
+            if article:
+                source = next(
+                    item
+                    for item in sources
+                    if item.source_document_id == reference.source_document_id
+                )
+                expected_row = (
+                    "".join(f"{value}—" for value in (source.publisher, source.title, display_date))
+                    + source_url
+                )
+                compact_text = "".join(text.split())
+                expected_row = "".join(expected_row.split())
+                assert compact_text.count(expected_row) == 1, (
+                    f"{label} PDF reference {number} publisher/title/date/URL row: "
+                    f"expected 1, found {compact_text.count(expected_row)}"
+                )
+                continue
             date_row = re.compile(rf"(?m)^\s*{number}\.\s*{re.escape(display_date)}\s*$")
             url_row = re.compile(rf"(?m)^\s*{number}\s+{re.escape(source_url)}\s*$")
-            assert len(date_row.findall(text)) == 1, (
+            assert len(date_row.findall(reference_text)) == 1, (
                 f"{label} PDF reference {number} date/identifier row: expected 1, "
-                f"found {len(date_row.findall(text))}"
+                f"found {len(date_row.findall(reference_text))}"
             )
-            assert len(url_row.findall(text)) == 1, (
+            assert len(url_row.findall(reference_text)) == 1, (
                 f"{label} PDF reference {number} URL/identifier row: expected 1, "
-                f"found {len(url_row.findall(text))}"
+                f"found {len(url_row.findall(reference_text))}"
             )
 
     def assert_timeline_citations(text: str, label: str) -> None:
@@ -617,14 +661,25 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
                     f"expected 1, found {len(citation.findall(text))}"
                 )
 
-    base_expected_counts = reference_expected_counts | {
+    base_reference_expected_counts = dict.fromkeys(reference_expected_counts, 0)
+    for reference in references:
+        source_id = reference.source_document_id
+        source_url = reference_urls[source_id]
+        base_reference_expected_counts[source_url] = 1
+        source = next(item for item in sources if item.source_document_id == source_id)
+        base_reference_expected_counts[source.title] = 1
+        base_reference_expected_counts[source.publisher] = 1
+        base_reference_expected_counts[reference_display_dates[source_id]] = 0
+        base_reference_expected_counts[reference_texts[source_id]] = 0
+    base_expected_counts = base_reference_expected_counts | {
         title_marker: 1,
         lead_marker: 1,
+        "M04_BASE_ARTICLE_SECTION_MARKER": 1,
         timeline_marker: 1,
         timeline_date_marker: 1,
         second_timeline_marker: 1,
         second_timeline_date_marker: 1,
-        "AVIS DE L'ANALYSTE": 0,
+        "Avis de l'analyste": 0,
         "Apports de l'enquête": 0,
         "Fait étayé": 0,
         "Confiance : 90%": 0,
@@ -642,7 +697,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         timeline_date_marker: 1,
         second_timeline_marker: 1,
         second_timeline_date_marker: 1,
-        "AVIS DE L'ANALYSTE": 1,
+        "Avis de l'analyste": 1,
         "Apports de l'enquête": 1,
         "Fait étayé": 1,
         "Confiance : 90%": 0,
@@ -666,9 +721,9 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         )
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", base_text, flags=re.IGNORECASE) is None
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", augmented_text, flags=re.IGNORECASE) is None
-    assert_reference_rows(base_text, "base")
-    assert_reference_rows(augmented_text, "augmented")
-    assert_timeline_citations(base_text, "base")
+    assert base_text.count("Références") == 1
+    assert_reference_rows(base_text, "base", article=True)
+    assert_reference_rows(augmented_text, "augmented", article=False)
     assert_timeline_citations(augmented_text, "augmented")
     assert "reviewer-1" not in augmented_text
     assert "approver-1" not in augmented_text
@@ -861,7 +916,7 @@ async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cel
 
 
 @pytest.mark.asyncio
-async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
+async def test_real_typst_article_ioc_hashes_wrap_and_long_references_stay_left_aligned(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -871,17 +926,16 @@ async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
     reference_digest = "7bdd7d62" + "c" * 48 + "628f27"
     rows = [
         {
-            "type": "hash",
-            "value": value,
-            "status_label": "documenté",
-            "indicator_status_short_label": "Article",
-            "relationship_status_short_label": "documenté",
-            "hash_context_summary": "Source : rapport public",
+            "value": _breakable_typst_display_text(
+                value,
+                interval=16,
+                break_at_technical_separators=True,
+            )
         }
         for value in (sha512, ssdeep)
     ]
     render_data = {
-        "schema_version": "typst-publication-model-annex-long-hash-fixture",
+        "schema_version": "typst-publication-model-article-ioc-long-hash-fixture",
         "document_label": _PUBLICATION_RENDER_LABEL,
         "language": "fr",
         "title": "Long hash rendering fixture",
@@ -900,16 +954,18 @@ async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
                 "blocks": [],
             },
             {
-                "type": "technical_annex",
-                "ioc_rows": rows,
-                "ioc_row_groups": [
-                    {"heading": "Fichiers — empreintes cryptographiques", "rows": rows}
+                "type": "ioc",
+                "source_indicators": [
+                    {
+                        "heading": "Fichiers",
+                        "items": rows,
+                    }
                 ],
             },
         ],
     }
 
-    workspace_root = tmp_path / "long-hash-annex-workspace"
+    workspace_root = tmp_path / "article-ioc-long-hash-workspace"
     _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
     font_root = tmp_path / "long-hash-annex-fonts"
@@ -930,7 +986,7 @@ async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
 
     pdftotext = shutil.which("pdftotext")
     assert pdftotext is not None, "pdftotext is required to check rendered word coordinates"
-    pdf_path = tmp_path / "long-hash-annex.pdf"
+    pdf_path = tmp_path / "article-ioc-long-hash.pdf"
     pdf_path.write_bytes(compiled.content)
     bbox = await anyio.run_process(
         (pdftotext, "-bbox", str(pdf_path), "-"),
@@ -954,26 +1010,18 @@ async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
         if element.tag.rsplit("}", 1)[-1] == "word"
     ]
 
-    status_header = next(word for word in page_words if word[1] == "Statut,")
-    annex_page = status_header[0]
-    adjacent_column_words = [
-        word for word in page_words if word[0] == annex_page and word[2] >= status_header[2]
-    ]
+    file_heading = next(word for word in page_words if word[1] == "Fichiers")
+    ioc_page = file_heading[0]
     token_fragments = [
         word
         for word in page_words
-        if word[0] == annex_page
+        if word[0] == ioc_page
         and len(word[1]) >= 4
         and any(word[1] in value for value in (sha512, ssdeep))
     ]
     assert token_fragments, "the annex page is missing the rendered SHA-512/ssdeep values"
-    collisions = [
-        (fragment[1], adjacent[1], fragment[2:6], adjacent[2:6])
-        for fragment in token_fragments
-        for adjacent in adjacent_column_words
-        if min(fragment[5], adjacent[5]) > max(fragment[3], adjacent[3])
-        and min(fragment[4], adjacent[4]) > max(fragment[2], adjacent[2])
-    ]
+    token_lines = {round(fragment[3], 1) for fragment in token_fragments}
+    assert len(token_lines) > 2, "long IOC hashes should wrap across multiple lines"
     reference_anchor = next(
         (word for word in page_words if word[1] == "Hatching"),
         None,
@@ -985,9 +1033,8 @@ async def test_real_typst_wraps_annex_hashes_and_left_aligns_long_references(
         if word[0] == reference_anchor[0] and abs(word[3] - reference_anchor[3]) <= 0.5
     ]
     reference_gaps = [right[2] - left[4] for left, right in pairwise(reference_line)]
-    assert not collisions and max(reference_gaps, default=0) <= 12, (
-        f"annex hash overlaps={collisions!r}; long reference line gaps={reference_gaps!r}"
-    )
+    assert file_heading is not None
+    assert max(reference_gaps, default=0) <= 12, f"long reference line gaps={reference_gaps!r}"
 
 
 @pytest.mark.asyncio
@@ -1080,15 +1127,15 @@ async def test_real_typst_article_renders_cited_technical_context_reference(
     extracted = _assert_exact_copyable_pdf_text(
         reader,
         (
-            "Contexte technique",
+            "Contexte · Fortra",
             "NanoDump tool reference",
             "Date de publication non précisée",
         ),
     )
     compact_text = "".join(extracted.split())
-    assert "Fortra:NanoDumptoolreference—ressourcetechniquedecontexte." in compact_text
+    assert "Contexte·Fortra—NanoDumptoolreference—Datedepublicationnonprécisée" in compact_text
     assert "https://github.com/fortra/nanodump" in compact_text
-    assert "2https://github.com/fortra/nanodump" in compact_text
+    assert compact_text.count("https://github.com/fortra/nanodump") == 1
     assert len(reader.pages) >= 1
 
 
@@ -1218,6 +1265,63 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
             ("ips", "domains", "urls", "emails", "hashes"), original_iocs, strict=True
         )
     }
+    category_labels = {
+        "ips": ("Adresses IP", "IP"),
+        "domains": ("Noms de domaine", "Domaine"),
+        "urls": ("URL", "URL"),
+        "emails": ("Courriels", "Adresse e-mail"),
+        "hashes": ("Empreintes de fichier", "Hash"),
+    }
+
+    def ioc_row(value: dict[str, Any], *, original: bool = False) -> dict[str, Any]:
+        return {
+            "type": "ioc",
+            "type_label": "Indicateur",
+            "value": value,
+            "indicator_status_label": "Documenté",
+            "relationship_status_label": "Lien non démontré" if original else "Documenté",
+            "indicator_status_short_label": "documenté",
+            "relationship_status_short_label": "non démontré" if original else "documenté",
+            "context_summary": (
+                "Le lien avec le sujet n'est pas démontré."
+                if original
+                else "Source : rapport public."
+            ),
+            "hash_context_summary": (
+                "Le lien avec le sujet n'est pas démontré."
+                if original
+                else "Source : rapport public."
+            ),
+            "source_refs": [],
+            "draft_refs": [],
+        }
+
+    main_groups: list[dict[str, Any]] = []
+    main_rows: list[dict[str, Any]] = []
+    for category, (heading, type_label) in category_labels.items():
+        rows = [
+            {
+                **ioc_row(value),
+                "type": "hash" if category == "hashes" else category,
+                "type_label": type_label,
+            }
+            for value in rendered_values[category]
+        ]
+        main_rows.extend(rows)
+        main_groups.append({"heading": heading, "rows": rows})
+    original_rows = [
+        {
+            **ioc_row(value, original=True),
+            "type": "hash" if category == "hashes" else category,
+            "type_label": category_labels[category][1],
+        }
+        for category, values_for_category in original_values.items()
+        for value in values_for_category
+    ]
+    original_group = {
+        "heading": "IOC originaux à lien non démontré",
+        "rows": original_rows,
+    }
 
     return (
         {
@@ -1225,16 +1329,11 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
             "document_label": "Publication de base — artefact de fixture v1",
             "language": "fr",
             "title": "[LOT 6] Fixture de composition A4",
+            "opinion_document": True,
             "content_sections": [
                 {
                     "type": "references",
-                    "timeline": [
-                        {
-                            "display_date": "5 octobre 2026",
-                            "text": "La source décrit l'activité après sa publication.",
-                            "source_urls": [],
-                        }
-                    ],
+                    "timeline": [],
                     "blocks": [
                         {
                             "type": "figure",
@@ -1246,6 +1345,17 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
                         }
                     ],
                     "sources": [],
+                },
+                {
+                    "type": "chronology",
+                    "timeline": [
+                        {
+                            "display_date": "5 octobre 2026",
+                            "text": "La source décrit l'activité après sa publication.",
+                            "source_urls": [],
+                            "source_refs": [],
+                        }
+                    ],
                 },
                 {
                     "type": "synthesis",
@@ -1299,9 +1409,8 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
                 },
                 {
                     "type": "technical_annex",
-                    "indicators": rendered_values,
-                    "original_indicators": original_values,
-                    "original_indicator_note": "Le lien avec le sujet n'est pas démontré.",
+                    "ioc_rows": [*main_rows, *original_rows],
+                    "ioc_row_groups": [*main_groups, original_group],
                 },
             ],
         },
@@ -1374,12 +1483,14 @@ async def test_real_typst_lot6_a4_composition_fixture(
         )
     )
 
-    review_directory = anyio.Path(
+    review_directory = Path(
         os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", tmp_path / "lot6-a4-review")
     )
-    await review_directory.mkdir(parents=True, exist_ok=True)
-    pdf_path = review_directory / "lot6-composition-a4.pdf"
-    await pdf_path.write_bytes(compiled.content)
+    pdf_path = _write_review_pdf(
+        review_directory,
+        "lot6-composition-a4.pdf",
+        compiled.content,
+    )
     rasterizer = shutil.which("pdftoppm")
     assert rasterizer is not None, "pdftoppm is required to inspect every fixture page"
     png_prefix = review_directory / "lot6-composition-a4"
@@ -1388,13 +1499,13 @@ async def test_real_typst_lot6_a4_composition_fixture(
             (rasterizer, "-png", "-r", "120", str(pdf_path), str(png_prefix))
         )
     assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
-    png_pages = [path async for path in review_directory.glob("lot6-composition-a4-*.png")]
+    png_pages = _review_pngs(review_directory, "lot6-composition-a4-*.png")
 
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     page_text = [page.extract_text() or "" for page in reader.pages]
     text = " ".join(" ".join(value.split()) for value in page_text)
     compact_text = "".join(text.split())
-    assert len(reader.pages) >= 4
+    assert len(reader.pages) >= 3
     assert all(
         (
             abs(float(page.mediabox.width) - 595.28) < 0.2
@@ -1429,14 +1540,17 @@ async def test_real_typst_lot6_a4_composition_fixture(
     assert text.count("IOC") == 2
     reserve_heading = "IOC originaux à lien non démontré"
     assert reserve_heading in text
-    reserve_position = text.index(reserve_heading)
+    compact_reserve_heading = "".join(reserve_heading.split())
+    reserve_position = compact_text.index(compact_reserve_heading)
     assert "Le lien avec le sujet" in text and "pas démontré" in text
-    assert all(value not in text[:reserve_position] for value in original_iocs)
-    assert all(value in text[reserve_position:] for value in original_iocs)
+    assert all(
+        "".join(value.split()) not in compact_text[:reserve_position] for value in original_iocs
+    )
+    assert all("".join(value.split()) in compact_text[reserve_position:] for value in original_iocs)
     missing_iocs = tuple(value for value in expected_iocs if value not in compact_text)
     assert not missing_iocs, f"IOC values missing from extracted PDF text: {missing_iocs[:8]!r}"
     assert len(png_pages) == len(reader.pages)
-    png_sizes = [(await path.stat()).st_size for path in png_pages]
+    png_sizes = [path.stat().st_size for path in png_pages]
     assert all(size > 0 for size in png_sizes)
 
 

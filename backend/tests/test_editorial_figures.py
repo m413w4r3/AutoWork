@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 import re
@@ -13,6 +12,7 @@ from itertools import pairwise
 from pathlib import Path
 from uuid import UUID
 
+import anyio
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -79,6 +79,8 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication_document import (
+    PublicationDocumentV6,
+    PublicationDocumentV6ProvenanceV1,
     PublicationDocumentV7,
     PublicationDocumentV8,
     publication_document_v5_sha256,
@@ -89,6 +91,10 @@ from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
 from tests.test_publication_document_v6 import _approved_opinion
 from tests.test_source_media_collection import _png
+
+
+def _matching_files(directory: Path, pattern: str) -> tuple[Path, ...]:
+    return tuple(sorted(directory.glob(pattern)))
 
 
 @pytest.mark.asyncio
@@ -459,9 +465,17 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         context,
         infrastructure_graph=infrastructure_graph,
     )
+    article_v6 = PublicationDocumentV6(
+        base_publication=publication,
+        provenance=PublicationDocumentV6ProvenanceV1(
+            base_publication_artifact_id=publication_v6.provenance.base_publication_artifact_id,
+            base_publication_sha256=publication_v6.provenance.base_publication_sha256,
+            base_publication_body_sha256=publication_v6.provenance.base_publication_body_sha256,
+        ),
+    )
     publication_v8 = PublicationDocumentV8(
         base_publication=PublicationDocumentV7(
-            base_publication=publication_v6,
+            base_publication=article_v6,
             publication_kind=PublicationKind.ARTICLE,
             routing_decision_hash="f" * 64,
             routing_policy_version="test-routing-v1",
@@ -478,6 +492,16 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         preview_opinion,
         infrastructure_graph=infrastructure_graph,
     )
+    preview_model = project_publication_to_typst_model(preview_document)
+    assert preview_model.article_format is None
+    approved_opinion_model = project_publication_to_typst_model(publication_v6)
+    assert approved_opinion_model.article_format is None
+    approved_opinion_section = next(
+        item
+        for item in approved_opinion_model.content_sections
+        if item["type"] == "analyst_opinion"
+    )
+    assert approved_opinion_section["investigation_chain_figure"]["figure_id"]
 
     graph_figure = build_investigation_graph_figure(publication, infrastructure_graph)
     assert graph_figure is not None
@@ -523,18 +547,17 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         section["type"] not in {"chronology", "technical_annex", "provenance"}
         for section in first_model.content_sections
     )
-    opinion_section = next(
-        item for item in first_model.content_sections if item["type"] == "analyst_opinion"
-    )
-    assert opinion_section["investigation_chain_figure"]["figure_id"]
-
     chp_typst_root, font_bundle_root, font_lock_path = typst_bundle_paths()
     template_bundle = load_template_bundle(chp_typst_root)
     binary = os.environ.get("TYPST_BINARY") or shutil.which("typst")
     assert binary is not None, "Typst 0.15.1 must be installed for this rendering test"
-    version = await asyncio.to_thread(
-        subprocess.run, (binary, "--version"), capture_output=True, check=True, timeout=10
-    )
+    with anyio.fail_after(10):
+        version = await anyio.run_process(
+            (binary, "--version"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
     assert version.stdout.decode().split()[:2] == ["typst", TYPST_COMPILER_VERSION]
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, font_lock_path)
     pdftotext = shutil.which("pdftotext")
@@ -577,13 +600,13 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         )
         pdf_path = tmp_path / f"{label}.pdf"
         pdf_path.write_bytes(compiled.content)
-        extracted_result = await asyncio.to_thread(
-            subprocess.run,
-            (pdftotext, "-raw", str(pdf_path), "-"),
-            capture_output=True,
-            check=True,
-            timeout=10,
-        )
+        with anyio.fail_after(10):
+            extracted_result = await anyio.run_process(
+                (pdftotext, "-raw", str(pdf_path), "-"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         extracted = extracted_result.stdout.decode("utf-8", errors="replace")
         return pdf_path, extracted, render_source.render_data_sha256
 
@@ -591,6 +614,9 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         "v5-preview", preview_document
     )
     assert "BROUILLON NON APPROUVÉ" in preview_text
+    opinion_pdf, approved_opinion_text, _opinion_render_hash = await render_to_text(
+        "v6-opinion", publication_v6
+    )
     v8_pdf, extracted, render_hash = await render_to_text("v8-final", publication_v8)
     repeated_source = TypstRenderer().render(
         publication_v8,
@@ -610,39 +636,50 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
     normalized = "".join(
         character for character in extracted.replace("\u00ad", "") if not character.isspace()
     )
+    normalized_preview = "".join(
+        character for character in preview_text.replace("\u00ad", "") if not character.isspace()
+    )
+    normalized_approved_opinion = "".join(
+        character
+        for character in approved_opinion_text.replace("\u00ad", "")
+        if not character.isspace()
+    )
+    assert "Référencesdel'avis" in normalized_approved_opinion
     assert "Chronologie" in normalized
     timeline_start = extracted.index("Chronologie")
-    timeline_end = extracted.index("SYNTHÈSE", timeline_start)
+    timeline_end = extracted.index("Synthèse", timeline_start)
     timeline_text = extracted[timeline_start:timeline_end]
     assert "Jours écoulés" not in timeline_text
     assert timeline_text.count("12 janvier 2025") == 1
     assert timeline_text.count("16 janvier 2025") == 1
     assert "Premier événement observé" in timeline_text
     assert "Deuxième événement observé" in timeline_text
-    assert "Référencesdel'avis" in normalized
     assert "jourcalendaire" not in normalized
-    assert observation.text in extracted
-    assert str(observation.id) not in extracted
-    assert "lead:0001" not in extracted
+    assert "jourcalendaire" not in normalized_preview
+    assert observation.text in preview_text
+    assert str(observation.id) not in preview_text
+    assert "lead:0001" not in preview_text
     assert "SourceSHA-256" not in normalized
-    assert "Graphed'infrastructureetdepivots" in normalized
-    assert "domainescontactés" in normalized
-    assert "VirusTotal" in normalized
-    assert "Shodan" in normalized
-    assert "Article" in normalized
-    assert "affirmationfournisseur" in normalized
-    assert "confiancerestenonévaluée" in normalized
-    assert re.search(r"confiance\s*:\s*\d+\s*%", extracted, flags=re.IGNORECASE) is None
-    assert "nonévaluée" in normalized
-    assert "pivotverscible" in normalized
-    assert "dns:A" in extracted
-    assert "mentions IOC" in extracted
-    assert "pivot.example" in normalized
-    assert infrastructure_graph.sha256 not in normalized
+    assert "SourceSHA-256" not in normalized_preview
+    assert "Graphed'infrastructureetdepivots" in normalized_preview
+    assert "domainescontactés" in normalized_preview
+    assert "VirusTotal" in normalized_preview
+    assert "Shodan" in normalized_preview
+    assert "Article" in normalized_preview
+    assert "affirmationfournisseur" in normalized_preview
+    assert "confiancerestenonévaluée" in normalized_preview
+    assert re.search(r"confiance\s*:\s*\d+\s*%", preview_text, flags=re.IGNORECASE) is None
+    assert "nonévaluée" in normalized_preview
+    assert "pivotverscible" in normalized_preview
+    assert "dns:A" in preview_text
+    assert "mentions IOC" in preview_text
+    assert "pivot.example" in normalized_preview
+    assert infrastructure_graph.sha256 not in normalized_preview
     assert "PreuveSHA-256" not in normalized
-    assert "c" * 64 not in normalized
-    assert "d" * 64 not in normalized
-    assert "a" * 64 not in normalized
+    assert "PreuveSHA-256" not in normalized_preview
+    assert "c" * 64 not in normalized_preview
+    assert "d" * 64 not in normalized_preview
+    assert "a" * 64 not in normalized_preview
     source_figure = publication.document.figures[0]
     for text in (preview_text, extracted):
         normalized_figure_text = "".join(character for character in text if not character.isspace())
@@ -653,17 +690,17 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         assert "Attribution:" in normalized_figure_text
         assert "SHA-256archivé:" not in normalized_figure_text
         assert "Taille:" not in normalized_figure_text
-    assert publication_v6.analyst_opinion.content_sha256 not in normalized
-    assert publication_document_v5_sha256(publication) not in normalized
+    assert publication_v6.analyst_opinion.content_sha256 not in normalized_approved_opinion
+    assert publication_document_v5_sha256(publication) not in normalized_approved_opinion
 
     async def read_bbox_pages(pdf_path: Path) -> list[list[tuple[float, float, str]]]:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            (pdftotext, "-bbox-layout", str(pdf_path), "-"),
-            capture_output=True,
-            check=True,
-            timeout=10,
-        )
+        with anyio.fail_after(10):
+            result = await anyio.run_process(
+                (pdftotext, "-bbox-layout", str(pdf_path), "-"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         root = ET.fromstring(result.stdout)
         pages = [node for node in root.iter() if node.tag.endswith("page")]
         return [
@@ -731,27 +768,27 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
             assert previous[1] <= current[0], f"graph legend lines overlap: {previous} / {current}"
         return page_index
 
-    for label, pdf_path in (("v5-preview", preview_pdf), ("v8-final", v8_pdf)):
+    for label, pdf_path in (("v5-preview", preview_pdf), ("v6-opinion", opinion_pdf)):
         bbox_pages = await read_bbox_pages(pdf_path)
         graph_page_index = assert_figure_caption_spacing(bbox_pages)
         page_count = len(PdfReader(pdf_path, strict=True).pages)
         assert 2 <= page_count <= 3
         raster_prefix = tmp_path / f"{label}-page"
-        await asyncio.to_thread(
-            subprocess.run,
-            (pdftoppm, "-png", "-r", "100", str(pdf_path), str(raster_prefix)),
-            capture_output=True,
-            check=True,
-            timeout=20,
-        )
+        with anyio.fail_after(20):
+            await anyio.run_process(
+                (pdftoppm, "-png", "-r", "100", str(pdf_path), str(raster_prefix)),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         raster_pattern = f"{label}-page-*.png"
 
-        def list_raster_paths(pattern: str) -> tuple[Path, ...]:
-            return tuple(tmp_path.glob(pattern))
-
-        rasterized = await asyncio.to_thread(list_raster_paths, raster_pattern)
+        rasterized = _matching_files(tmp_path, raster_pattern)
         assert len(rasterized) == page_count
-        if label == "v8-final":
-            graph_page = tmp_path / f"v8-final-page-{graph_page_index + 1}.png"
+        if label == "v6-opinion":
+            graph_page = tmp_path / f"v6-opinion-page-{graph_page_index + 1}.png"
             assert graph_page in rasterized
             shutil.copy2(graph_page, tmp_path / "v6-infrastructure-graph-page.png")
+
+    article_page_count = len(PdfReader(v8_pdf, strict=True).pages)
+    assert 1 <= article_page_count <= 3

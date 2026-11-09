@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 import shutil
@@ -409,7 +408,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
 
     template_root, font_root, fonts_lock = typst_bundle_paths()
     repository_tmp = _repository_temp_root()
-    await asyncio.to_thread(repository_tmp.mkdir, parents=True, exist_ok=True)
+    repository_tmp.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TMPDIR", str(repository_tmp))
     tempfile.tempdir = None
     service = PublicationRenderService(
@@ -433,8 +432,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     capture_path = Path(
         os.environ.get("AUTOWORK_LOTC_PREVIEW_PATH", str(tmp_path / "w17-draft-preview.pdf"))
     )
-    extracted_text, rendered_pages = await asyncio.to_thread(
-        _inspect_rendered_pdf,
+    extracted_text, rendered_pages = _inspect_rendered_pdf(
         compiled.content,
         capture_path,
         pdftotext,
@@ -442,17 +440,32 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     )
     text = " ".join(extracted_text.split())
     normalized_text = text.casefold().replace("\u2019", "'")
+    punctuation_normalized_text = text.replace("\u2019", "'")
+    for heading in (
+        "Synthèse",
+        "Chronologie",
+        "Avis de l'analyste",
+        "Limites des preuves",
+    ):
+        assert heading in punctuation_normalized_text
+    for uppercase_heading in (
+        "CHRONOLOGIE",
+        "SYNTHÈSE",
+        "AVIS DE L'ANALYSTE",
+        "LIMITES DES PREUVES",
+    ):
+        assert uppercase_heading not in text
     for required in (
         "BROUILLON NON APPROUVÉ",
         "Synthèse",
         "Infrastructure réseau",
-        "CHRONOLOGIE",
-        "AVIS DE L'ANALYSTE",
+        "Chronologie",
+        "Avis de l'analyste",
         "Incertitudes et prochaines pistes",
         "15 janvier 2025",
         "alpha.example",
         "Le rapport mentionne alpha.example comme domaine observé",
-        "LIMITES DES PREUVES",
+        "Limites des preuves",
         "La source ne permet pas d'établir l'attribution opérationnelle",
         "Inférence de l'analyste",
         "ne démontre ni contrôle opérationnel ni attribution",
@@ -492,8 +505,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     empty_draft_render = await service.render_draft_preview(document, empty_opinion, synthesis)
     empty_compiled = empty_draft_render.compiled_document
     empty_pdf_path = tmp_path / "w17-empty-opinion-preview.pdf"
-    empty_text, _ = await asyncio.to_thread(
-        _inspect_rendered_pdf,
+    empty_text, _ = _inspect_rendered_pdf(
         empty_compiled.content,
         empty_pdf_path,
         pdftotext,
@@ -502,3 +514,5 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     normalized_empty_text = " ".join(empty_text.split()).casefold().replace("\u2019", "'")
     assert "avis de l'analyste" not in normalized_empty_text
     assert "aucun avis publié" not in normalized_empty_text
+    assert "chronologie" in normalized_empty_text
+    assert "annexe technique" in normalized_empty_text
