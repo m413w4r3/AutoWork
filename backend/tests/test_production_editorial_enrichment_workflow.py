@@ -18,6 +18,7 @@ from cti_app.domain.production import (
     ProductionStage,
 )
 from cti_app.domain.production_extraction import production_extraction_to_json
+from cti_app.domain.production_routing import RoutingStatus
 from cti_app.domain.production_synthesis import production_synthesis_to_json
 from tests.test_production_synthesis_storage import (
     MemoryStore,
@@ -140,8 +141,17 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
         uow_factory(uow), model_gateway=None, artifact_store=store
     )
     workflow._canonical_editorial_enrichment = Service()
+    ensured: list[object] = []
+
+    async def ensure_route(candidate):
+        ensured.append(candidate)
+        return SimpleNamespace(id=run.routing_decision_id, status=RoutingStatus.DECIDED)
+
+    workflow._ensure_current_routing_decision = ensure_route
 
     result = await workflow._execute_editorial_enrichment_stage(run, snapshot=snapshot)
+
+    assert ensured == [run]
 
     assert calls == [
         (
@@ -246,3 +256,4 @@ def test_editorial_enrichment_cross_run_reuse_is_exposed_as_success() -> None:
     assert result["reused"] is True
     assert result["model_calls"] == 0
     assert result["reused_from_artifact_id"] == str(source_artifact_id)
+

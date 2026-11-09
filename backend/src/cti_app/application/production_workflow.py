@@ -7,7 +7,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -2009,6 +2009,23 @@ class ProductionWorkflowOrchestrator:
                 "status": "terminal_error",
                 "error_code": "editorial_enrichment_inputs_missing",
             }
+        # A stage retry bumps the pipeline generation; re-adopt the deterministic
+        # route (as SYNTHESIS and ASSEMBLY do) before the route-dependent service
+        # reads it, then execute against the refreshed run.
+        decision = await self._ensure_current_routing_decision(run)
+        if decision is None:
+            return {
+                "stage": "editorial_enrichment",
+                "status": "needs_review",
+                "error_code": "publication_routing_decision_missing",
+                "error": "La décision de format de publication est indisponible.",
+            }
+        if decision.status is RoutingStatus.NEEDS_REVIEW:
+            return await self._mark_route_review(
+                decision, stage=ProductionStage.EDITORIAL_ENRICHMENT
+            )
+        if run.routing_decision_id != decision.id:
+            run = replace(run, routing_decision_id=decision.id)
         try:
             execution = await service.execute(
                 run, snapshot, extraction_artifact, synthesis_artifact, projection_artifact
