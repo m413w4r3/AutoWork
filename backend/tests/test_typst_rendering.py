@@ -289,7 +289,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v33-article-format"
+    assert data["schema_version"] == "typst-publication-model-v34-m19-format"
     assert data["kind"] == "brief"
     assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
@@ -611,17 +611,22 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
     displayed_domain_texts = [item["value"]["text"] for item in domain_group["items"]]
     assert references["type"] == "references"
     assert model["article_format"] is None
-    assert references["entries"][0]["display_date"] == "10 janvier 2026"
-    assert references["entries"][0]["source_urls"] == ["https://a.example/report"]
+    dated_reference = next(
+        item
+        for item in references["entries"]
+        if item["source_urls"] == ["https://a.example/report"]
+    )
+    assert dated_reference["display_date"] == "10 janvier 2026"
     undated_reference = next(
         item
         for item in references["entries"]
         if item["source_urls"] == ["https://missing.example/article"]
     )
-    assert undated_reference["display_date"] == "Date de publication non précisée"
+    assert undated_reference["date"] is None
+    assert "display_date" not in undated_reference
     assert synthesis["type"] == "synthesis"
     assert len(displayed_domain_texts) == len(set(displayed_domain_texts))
-    assert {"context[.]example", "original[.]example"} <= set(displayed_domain_texts)
+    assert {"context.example", "original.example"} <= set(displayed_domain_texts)
     assert all("type_label" not in item for item in domain_group["items"])
 
 
@@ -638,12 +643,11 @@ def test_v6_render_model_keeps_original_ioc_values_separate_from_subject_values(
         group for group in ioc["source_indicators"] if group["heading"] == "Domaines"
     )
     displayed_texts = [item["value"]["text"] for item in domain_group["items"]]
-    assert original.normalized_value.replace(".", "[.]") in displayed_texts
+    assert original.normalized_value in displayed_texts
     assert len(displayed_texts) == len({value.casefold() for value in displayed_texts})
     assert publication.original_indicators[0].indicators[0] == original
     assert all(
-        "status_label" not in item and "type_label" not in item
-        for item in domain_group["items"]
+        "status_label" not in item and "type_label" not in item for item in domain_group["items"]
     )
 
 
@@ -659,7 +663,7 @@ def test_render_ioc_projection_deduplicates_normalized_values_across_groups() ->
     ]
 
 
-def test_ioc_projection_keeps_defanged_values_in_type_specific_lists() -> None:
+def test_ioc_projection_refangs_values_in_type_specific_lists() -> None:
     values = (
         (ArtifactType.IP, "198.51.100[.]10", "198.51.100.10"),
         (ArtifactType.DOMAIN, "core[.]example", "core.example"),
@@ -692,14 +696,17 @@ def test_ioc_projection_keeps_defanged_values_in_type_specific_lists() -> None:
     assert model.article_format is not None
     indicators = model.article_format["ioc_categories"]
 
-    assert [item["value"]["text"] for item in indicators["ips"]] == [
-        "198[.]51[.]100[.]10"
-    ]
-    assert [item["value"]["text"] for item in indicators["domains"]] == ["core[.]example"]
+    assert [item["value"]["text"] for item in indicators["ips"]] == ["198.51.100.10"]
+    assert [item["value"]["text"] for item in indicators["domains"]] == ["core.example"]
     assert [item["value"]["text"] for item in indicators["urls"]] == [
-        "hxxps://cdn[.]example[.]test/path"
+        "https://cdn.example.test/path"
     ]
     assert [item["value"]["text"] for item in indicators["files"]] == ["a" * 64]
+    assert {
+        (group.artifact_type, indicator.value, indicator.normalized_value)
+        for group in document.indicators
+        for indicator in group.indicators
+    } == {(artifact_type, value, normalized) for artifact_type, value, normalized in values}
 
 
 def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
@@ -729,17 +736,12 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     assert set(article_format["ioc_categories"]) == {"ips", "urls", "domains", "files"}
     ioc_categories = article_format["ioc_categories"]
     assert [item["value"]["text"] for item in ioc_categories["ips"]] == ["Display ip"]
-    assert [item["value"]["text"] for item in ioc_categories["domains"]] == [
-        "normalized-domain"
-    ]
+    assert [item["value"]["text"] for item in ioc_categories["domains"]] == ["normalized-domain"]
     assert [item["value"]["text"] for item in ioc_categories["urls"]] == ["normalized-url"]
-    assert [item["value"]["text"] for item in ioc_categories["files"]] == [
-        "normalized-hash"
-    ]
+    assert [item["value"]["text"] for item in ioc_categories["files"]] == ["normalized-hash"]
     assert not {"chronology", "technical_annex", "provenance"}.intersection(sections)
     assert all(
-        {"publisher", "title", "date", "url", "urls"} <= set(item)
-        for item in references["entries"]
+        {"publisher", "title", "date", "url", "urls"} <= set(item) for item in references["entries"]
     )
     assert "uncertainties" not in data
     assert references["sources"] == [
@@ -750,16 +752,16 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
             "url": "https://example.test/one",
         },
         {
-            "title": None,
-            "publisher": "Contexte · example.test",
-            "date": None,
-            "url": "https://example.test/two",
-        },
-        {
             "title": "Duplicate URL source",
             "publisher": None,
             "date": "2025-03-04",
             "url": "https://example.test/one",
+        },
+        {
+            "title": None,
+            "publisher": "Contexte · example.test",
+            "date": None,
+            "url": "https://example.test/two",
         },
     ]
     assert [(item["type"], item["text"]) for item in synthesis["blocks"][:2]] == [
@@ -865,7 +867,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v33-article-format"
+    assert data["schema_version"] == "typst-publication-model-v34-m19-format"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
@@ -1277,10 +1279,10 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
         f"media/{shared_asset_id}.png",
         f"media/{shared_asset_id}.png",
     ]
-    assert figure_blocks[0]["source_note"] == ("example.test — Bitcoin wallet recovery — p. 1")
-    assert figure_blocks[1]["source_note"] == "example.test"
-    assert figure_blocks[2]["source_note"] == "example.test"
-    assert figure_blocks[0]["attribution"] == "Example Lab"
+    assert all(
+        not {"classification", "source_note", "attribution"}.intersection(block)
+        for block in figure_blocks
+    )
     assert figure_blocks[0]["caption"] == "Caption one"
     assert figure_blocks[0]["sha256"] == first.sha256
     assert figure_blocks[0]["byte_size"] == first.byte_size
