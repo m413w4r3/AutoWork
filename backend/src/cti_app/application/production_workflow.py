@@ -2024,8 +2024,8 @@ class ProductionWorkflowOrchestrator:
             return await self._mark_route_review(
                 decision, stage=ProductionStage.EDITORIAL_ENRICHMENT
             )
-        if run.routing_decision_id != decision.id:
-            run = replace(run, routing_decision_id=decision.id)
+        if run.routing_decision_id != decision.decision_id:
+            run = replace(run, routing_decision_id=decision.decision_id)
         try:
             execution = await service.execute(
                 run, snapshot, extraction_artifact, synthesis_artifact, projection_artifact

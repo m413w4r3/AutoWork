@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -142,10 +143,11 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
     )
     workflow._canonical_editorial_enrichment = Service()
     ensured: list[object] = []
+    readopted_route_id = uuid4()
 
     async def ensure_route(candidate):
         ensured.append(candidate)
-        return SimpleNamespace(id=run.routing_decision_id, status=RoutingStatus.DECIDED)
+        return SimpleNamespace(decision_id=readopted_route_id, status=RoutingStatus.DECIDED)
 
     workflow._ensure_current_routing_decision = ensure_route
 
@@ -155,7 +157,7 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
 
     assert calls == [
         (
-            run,
+            replace(run, routing_decision_id=readopted_route_id),
             snapshot,
             upstream[ProductionArtifactStage.EXTRACTION],
             upstream[ProductionArtifactStage.SYNTHESIS],
