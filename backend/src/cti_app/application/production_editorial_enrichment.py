@@ -204,6 +204,9 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v8-relation-support"
 )
+EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SOURCE_METADATA_POLICY_VERSION = (
+    "editorial-enrichment-evidence-pack-v9-source-metadata-exclusion"
+)
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = (
     "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
 )
@@ -214,6 +217,16 @@ TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50
 DIAGRAM_STAR_REDUNDANT_LABEL_RATIO = 0.80
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v9-brief-enrichment"
+
+
+def _editorial_enrichment_evidence_pack_policy_version(
+    synthesis: ProductionSynthesisV1,
+) -> str:
+    if any(ref.kind is EvidenceKind.SOURCE_METADATA for ref in synthesis_evidence_refs(synthesis)):
+        return EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SOURCE_METADATA_POLICY_VERSION
+    return EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
+
+
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
     "CHART": EditorialMediaType.CHART,
@@ -4740,8 +4753,15 @@ def build_editorial_enrichment_evidence_pack(
 
     entries = _all_evidence_entries(extraction)
     source_by_id = {source.source_document_id: source for source in extraction.sources}
+    synthesis_refs = synthesis_evidence_refs(synthesis)
+    evidence_pack_policy_version = _editorial_enrichment_evidence_pack_policy_version(synthesis)
 
     def admitted(ref: ExtractionEvidenceRefV1) -> bool:
+        # Brief chronology can cite frozen publication metadata as context. It is
+        # not extracted evidence and has no relevance classification, so it can
+        # never receive a primary evidence handle in the enrichment pack.
+        if ref.kind is EvidenceKind.SOURCE_METADATA:
+            return False
         if (
             ref.kind is EvidenceKind.UNCERTAINTY
             and source_by_id[ref.source_document_id].profile is not ExtractionProfile.FULL
@@ -4800,7 +4820,7 @@ def build_editorial_enrichment_evidence_pack(
     included_refs = (
         narrative_refs
         | set(technical_candidates)
-        | {ref for ref in synthesis_evidence_refs(synthesis) if admitted(ref)}
+        | {ref for ref in synthesis_refs if admitted(ref)}
     )
 
     def authority_key(ref: ExtractionEvidenceRefV1) -> tuple[int, int, str, str]:
@@ -4899,6 +4919,7 @@ def build_editorial_enrichment_evidence_pack(
         reserve_evidence=reserve_evidence,
         source_pair_relations=source_pair_relations,
         projection_hash=projection.projection_hash if projection is not None else None,
+        policy_version=evidence_pack_policy_version,
         _projected_ioc_keys=_projected_publication_ioc_keys(extraction, projection),
         _handle_to_ref=MappingProxyType(handle_to_ref),
         _reserve_handle_to_ref=MappingProxyType(
@@ -8249,7 +8270,9 @@ def _editorial_enrichment_identity_payload(
         "policy_version": EDITORIAL_ENRICHMENT_POLICY_VERSION,
         "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
         "evidence_pack_schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
-        "evidence_pack_policy_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION,
+        "evidence_pack_policy_version": _editorial_enrichment_evidence_pack_policy_version(
+            synthesis
+        ),
         "evidence_pack_hash": evidence_pack_hash,
         "relevance_projection_hash": projection_hash,
         "access_policy_hash": access_policy_hash,
