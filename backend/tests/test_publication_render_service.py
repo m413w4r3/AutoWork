@@ -848,8 +848,9 @@ class FakeRenderer:
         *,
         document_label: str,
         target_artifact_identities: dict[str, dict[str, Any]] | None = None,
+        brief_timeline_policy_version: str | None = None,
     ) -> TypstRenderSource:
-        del document, document_label, target_artifact_identities
+        del document, document_label, target_artifact_identities, brief_timeline_policy_version
         self.call_count += 1
         source_bytes = next(
             file.content

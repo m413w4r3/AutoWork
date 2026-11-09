@@ -427,7 +427,7 @@
     none
   }
   if has-text(display-text) [
-    #block(above: 2pt, below: 4pt)[
+    #block(above: 2pt, below: 13pt, breakable: false)[
       #set par(justify: false)
       #if has-text(display-date) [#text(str(display-date) + " : ")]
       #semantic-or-plain(display-text, semantic-spans)

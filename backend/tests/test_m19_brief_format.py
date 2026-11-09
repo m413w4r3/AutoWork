@@ -561,7 +561,7 @@ def test_archived_core_source_cited_in_brief_lead_is_a_publication_reference() -
 
 
 def test_brief_assembly_policy_version_changes_the_reuse_identity(monkeypatch) -> None:
-    assert BRIEF_ASSEMBLY_POLICY_VERSION == "brief-assembly-v3-m19-enrichment"
+    assert BRIEF_ASSEMBLY_POLICY_VERSION == "brief-assembly-v4-m19-publication-events"
     assert len(BRIEF_ASSEMBLY_POLICY_VERSION) <= 64
     snapshot, references, extraction, synthesis = _canonical_inputs()
     relevance = build_relevance_projection(snapshot, extraction)

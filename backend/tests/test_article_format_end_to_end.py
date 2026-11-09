@@ -344,7 +344,7 @@ async def test_l3_article_builds_v8_projects_v34_and_compiles_end_to_end(
         .render_data_bytes
     )
     render_data = json.loads(render_data_bytes)
-    assert render_data["schema_version"] == "typst-publication-model-v35-m19-review"
+    assert render_data["schema_version"] == "typst-publication-model-v36-m19-polish"
     assert (
         render_data["article_format"]["overview"]["victimology"]["text"]
         == _L3_OVERVIEW[0].split(":", 1)[1].strip()

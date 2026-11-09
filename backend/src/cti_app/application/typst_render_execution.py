@@ -26,6 +26,7 @@ from cti_app.application.typst_rendering import (
     TypstRenderSource,
     TypstTemplateBundle,
     load_template_bundle,
+    refang_svg_text_nodes,
 )
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.media_assets import MediaAssetKind
@@ -152,9 +153,16 @@ class TypstRenderExecutor:
                         f"{media_ref.asset_id} does not match its canonical reference"
                     )
             try:
-                resolved_media[media_ref.asset_id] = await self._media_asset_store.read(
-                    media_ref.asset_id
-                )
+                canonical_media = await self._media_asset_store.read(media_ref.asset_id)
+                if media_ref.expected_kind in {
+                    MediaAssetKind.DIAGRAM_SVG,
+                    MediaAssetKind.CHART_SVG,
+                }:
+                    canonical_media = refang_svg_text_nodes(
+                        canonical_media,
+                        render_source.media_refang_iocs,
+                    )
+                resolved_media[media_ref.asset_id] = canonical_media
             except BlobIntegrityError as exc:
                 raise TypstRenderMediaIntegrityMismatchError(
                     f"Media asset {media_ref.asset_id} failed its integrity check"

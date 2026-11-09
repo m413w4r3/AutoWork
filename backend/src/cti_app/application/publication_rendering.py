@@ -970,6 +970,11 @@ class PublicationRenderService:
                     template_bundle,
                     document_label=label,
                     target_artifact_identities=target_artifact_identities,
+                    brief_timeline_policy_version=(
+                        artifact.metadata.get("brief_assembly_policy_version")
+                        if isinstance(artifact.metadata.get("brief_assembly_policy_version"), str)
+                        else None
+                    ),
                     **(
                         {"infrastructure_graph_media_ref": graph_media_ref}
                         if graph_media_ref is not None

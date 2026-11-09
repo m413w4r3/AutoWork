@@ -336,6 +336,8 @@ class PublicationAssemblyService:
 
         _document, canonical_document, canonical_bytes = canonical_v8(publication_artifact_id)
         metadata = dict(assembly_metadata_extra)
+        if publication_kind is PublicationKind.BRIEF:
+            metadata["brief_assembly_policy_version"] = BRIEF_ASSEMBLY_POLICY_VERSION
         if published_figure_diagnostics:
             existing_figure_diagnostics = metadata.get("source_figure_provenance_diagnostics")
             metadata["source_figure_provenance_version"] = (

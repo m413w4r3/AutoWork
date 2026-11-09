@@ -86,6 +86,7 @@ from cti_app.domain.publication_document import (
     publication_document_text_anchors,
     publication_document_v5_sha256,
     select_publication_timeline_key_events_v2,
+    select_publication_timeline_key_events_v3,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ROLE_TYPST_FUNCTION_V1,
@@ -95,8 +96,9 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v35 preserves semantic spans through M19 reader-field projection.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v35-m19-review"
+# v36 binds the M19 polish projection and reference layout to render identity.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v36-m19-polish"
+_BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -271,6 +273,19 @@ def _display_article_ioc_value(
 
 
 _DEFANGED_DOT_WORD = re.compile(r"\[dot\]", re.IGNORECASE)
+_DEFANGED_TOKEN_MARKER = re.compile(
+    r"\[\.\]|\(\.\)|\{\.\}|\[dot\]|\[:\]|\[\s*://\s*\]|"
+    r"hxxps?|\[@\]|\[at\]|\(@\)|\(at\)",
+    re.IGNORECASE,
+)
+_PUBLICATION_REFANG_TYPES = frozenset(
+    {ArtifactType.IP, ArtifactType.URL, ArtifactType.DOMAIN, ArtifactType.EMAIL}
+)
+_SVG_ELEMENT_OPEN = re.compile(r"<\s*(/?)\s*([A-Za-z_][\w:.-]*)")
+_SVG_MARKUP_PART = re.compile(
+    r"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<(?:[^\"'>]|\"[^\"]*\"|'[^']*')*>",
+    re.DOTALL,
+)
 _REFERENCE_URL_TEXT = re.compile(
     r"(?:(?:https?|hxxps?)(?::|\[:\])//|www\.)[^\s<>\"']+|"
     r"(?<![\w.-])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/[^\s<>\"']*",
@@ -296,16 +311,18 @@ _REFERENCE_ENGLISH_DATE = re.compile(
 
 
 def _projection_refang(value: str) -> str:
-    """Use the shared refanger, with the publication alias ``[dot]`` normalized."""
-    return refang(_DEFANGED_DOT_WORD.sub("[.]", value))
+    """Use the shared refanger, normalizing its supported publication aliases."""
+    normalized = _DEFANGED_DOT_WORD.sub("[.]", value)
+    normalized = re.sub(r"\[\s*://\s*\]", "://", normalized, flags=re.IGNORECASE)
+    return refang(normalized)
 
 
 def _publication_refang_pairs(
     document: PublicationDocumentV4,
     publication_v5: PublicationDocumentV5 | None,
     publication_v8: PublicationDocumentV8 | None,
-) -> tuple[tuple[str, str], ...]:
-    """Collect exact display replacements only from IOCs in this publication."""
+) -> tuple[tuple[ArtifactType, str, str], ...]:
+    """Collect projected network IOCs that may authorize a display refang."""
     indicators: list[tuple[ArtifactType, str, str]] = []
     for group in document.indicators:
         indicators.extend(
@@ -335,30 +352,122 @@ def _publication_refang_pairs(
             (ArtifactType.HASH, item.value, item.normalized_value) for item in categories.files
         )
 
-    replacements: dict[str, str] = {}
+    replacements: set[tuple[ArtifactType, str, str]] = set()
     for artifact_type, value, normalized_value in indicators:
-        if artifact_type not in {
-            ArtifactType.IP,
-            ArtifactType.URL,
-            ArtifactType.DOMAIN,
-            ArtifactType.HASH,
-        }:
+        if artifact_type not in _PUBLICATION_REFANG_TYPES:
             continue
-        for raw in (value, normalized_value):
-            restored = _projection_refang(raw)
-            if restored != raw:
-                replacements.setdefault(raw, restored)
+        replacements.add((artifact_type, value, normalized_value))
+    return tuple(
+        sorted(
+            replacements,
+            key=lambda item: (item[0].value, item[2].casefold(), item[1].casefold(), item[1]),
+        )
+    )
+
+
+def _network_token_parts(value: str) -> tuple[str, str, int | None, str, str, str] | None:
+    """Parse a URL or schemeless endpoint while preserving path/query case."""
+    has_scheme = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value) is not None
+    try:
+        parts = urlsplit(value if has_scheme else f"//{value}")
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
+    if hostname is None or parts.username is not None or parts.password is not None:
+        return None
+    return (
+        parts.scheme.casefold(),
+        hostname.rstrip(".").casefold(),
+        port,
+        parts.path,
+        parts.query,
+        parts.fragment,
+    )
+
+
+def _ip_token_host(value: str) -> str | None:
+    parts = _network_token_parts(value)
+    if parts is None:
+        candidate = value
+    else:
+        candidate = parts[1]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _matches_known_publication_ioc(
+    restored: str,
+    known_iocs: tuple[tuple[ArtifactType, str, str], ...],
+) -> bool:
+    for artifact_type, value, normalized_value in known_iocs:
+        if artifact_type is not ArtifactType.EMAIL:
+            continue
         try:
-            canonical = normalize_publication_indicator_value(
-                _projection_refang(normalized_value), artifact_type
-            )
-            restored = display_publication_indicator_value(canonical, artifact_type, defanged=False)
-            defanged = display_publication_indicator_value(canonical, artifact_type, defanged=True)
+            candidate_email = normalize_publication_indicator_value(restored, ArtifactType.EMAIL)
         except ValueError:
             continue
-        if defanged != restored:
-            replacements.setdefault(defanged, restored)
-    return tuple(sorted(replacements.items(), key=lambda item: (-len(item[0]), item[0].casefold())))
+        for raw_known in (value, normalized_value):
+            try:
+                known_email = normalize_publication_indicator_value(
+                    _projection_refang(raw_known), ArtifactType.EMAIL
+                )
+            except ValueError:
+                continue
+            if candidate_email == known_email:
+                return True
+
+    candidate = _network_token_parts(restored)
+    if candidate is None:
+        return False
+    (
+        candidate_scheme,
+        candidate_host,
+        candidate_port,
+        candidate_path,
+        candidate_query,
+        candidate_fragment,
+    ) = candidate
+    candidate_ip = _ip_token_host(restored)
+
+    for artifact_type, value, normalized_value in known_iocs:
+        for raw_known in (value, normalized_value):
+            known = _projection_refang(raw_known)
+            if artifact_type is ArtifactType.IP:
+                try:
+                    known_ip = normalize_publication_indicator_value(known, ArtifactType.IP)
+                except ValueError:
+                    continue
+                if candidate_ip == known_ip:
+                    return True
+            elif artifact_type is ArtifactType.DOMAIN:
+                known_parts = _network_token_parts(known)
+                known_host = (
+                    known_parts[1] if known_parts is not None else known.rstrip(".").casefold()
+                )
+                if candidate_host == known_host:
+                    return True
+            elif artifact_type is ArtifactType.URL:
+                known_parts = _network_token_parts(known)
+                if known_parts is None:
+                    continue
+                known_scheme, known_host, known_port, known_path, known_query, known_fragment = (
+                    known_parts
+                )
+                if (
+                    candidate_host == known_host
+                    and candidate_port == known_port
+                    and candidate_path == known_path
+                    and candidate_query == known_query
+                    and candidate_fragment == known_fragment
+                    and (
+                        not candidate_scheme or not known_scheme or candidate_scheme == known_scheme
+                    )
+                ):
+                    return True
+    return False
 
 
 def _replacement_offset_map(before: str, after: str) -> tuple[int, ...]:
@@ -457,19 +566,30 @@ def _remap_semantic_spans(
 
 def _refang_known_iocs(
     text: str,
-    replacements: tuple[tuple[str, str], ...],
+    known_iocs: tuple[tuple[ArtifactType, str, str], ...],
 ) -> tuple[str, tuple[int, ...]]:
-    """Refang exact known IOC spellings and return an old-to-new offset map."""
-    if not replacements:
+    """Refang defanged network tokens only when their IOC identity is known."""
+    if not known_iocs:
         return text, tuple(range(len(text) + 1))
-    replacement_by_exact = dict(replacements)
-    alternatives = sorted(replacement_by_exact, key=lambda item: (-len(item), item))
-    expression = re.compile(
-        r"(?<![A-Za-z0-9._-])(?:"
-        + "|".join(re.escape(item) for item in alternatives)
-        + r")(?![A-Za-z0-9_-]|\.(?=[A-Za-z0-9]))"
-    )
-    matches = tuple(expression.finditer(text))
+    matches: list[tuple[int, int, str]] = []
+    for token_match in re.finditer(r"""[^\s<>"'“”\u2018\u2019]+""", text):
+        token = token_match.group(0)
+        start = 0
+        while start < len(token) and token[start] in "([{«“":
+            start += 1
+        full_token = token[start:]
+        if not full_token or _DEFANGED_TOKEN_MARKER.search(full_token) is None:
+            continue
+        trimmed_end = len(token)
+        while trimmed_end > start and token[trimmed_end - 1] in ".,;:!?)]}»”":
+            trimmed_end -= 1
+        candidate_ends = (len(token), trimmed_end) if trimmed_end != len(token) else (len(token),)
+        for end in candidate_ends:
+            defanged_token = token[start:end]
+            restored = _projection_refang(defanged_token)
+            if restored != defanged_token and _matches_known_publication_ioc(restored, known_iocs):
+                matches.append((token_match.start() + start, token_match.start() + end, restored))
+                break
     if not matches:
         return text, tuple(range(len(text) + 1))
 
@@ -477,19 +597,18 @@ def _refang_known_iocs(
     offsets: list[int | None] = [None] * (len(text) + 1)
     old_cursor = 0
     new_cursor = 0
-    for match in matches:
-        prefix = text[old_cursor : match.start()]
+    for match_start, match_end, restored in matches:
+        prefix = text[old_cursor:match_start]
         output.append(prefix)
         for index in range(len(prefix) + 1):
             offsets[old_cursor + index] = new_cursor + index
         new_cursor += len(prefix)
-        original = match.group(0)
-        restored = replacement_by_exact[original]
+        original = text[match_start:match_end]
         output.append(restored)
         local_offsets = _replacement_offset_map(original, restored)
         for index, new_offset in enumerate(local_offsets):
-            offsets[match.start() + index] = new_cursor + new_offset
-        old_cursor = match.end()
+            offsets[match_start + index] = new_cursor + new_offset
+        old_cursor = match_end
         new_cursor += len(restored)
     suffix = text[old_cursor:]
     output.append(suffix)
@@ -504,6 +623,68 @@ def _refang_known_iocs(
         else:
             previous = offset
     return "".join(output), tuple(int(offset) for offset in offsets)
+
+
+def refang_svg_text_nodes(
+    svg_bytes: bytes,
+    known_iocs: tuple[tuple[ArtifactType, str, str], ...],
+) -> bytes:
+    """Refang only XML character data inside SVG ``text`` elements.
+
+    Tags, attributes, comments, and all content outside ``text`` nodes are
+    copied byte-for-byte. The original canonical blob is never modified.
+    """
+    if not known_iocs or not _DEFANGED_TOKEN_MARKER.search(
+        svg_bytes.decode("utf-8", errors="ignore")
+    ):
+        return svg_bytes
+    try:
+        svg_text = svg_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return svg_bytes
+    output: list[str] = []
+    cursor = 0
+    element_stack: list[str] = []
+
+    def is_svg_text_content() -> bool:
+        return bool(element_stack) and element_stack[-1].rsplit(":", 1)[-1] in {
+            "text",
+            "tspan",
+        }
+
+    for match in _SVG_MARKUP_PART.finditer(svg_text):
+        raw_text = svg_text[cursor : match.start()]
+        if is_svg_text_content():
+            output.append(_refang_known_iocs(raw_text, known_iocs)[0])
+        else:
+            output.append(raw_text)
+        markup = match.group(0)
+        if markup.startswith("<![CDATA["):
+            if is_svg_text_content():
+                cdata_text = markup[9:-3]
+                output.append(f"<![CDATA[{_refang_known_iocs(cdata_text, known_iocs)[0]}]]>")
+            else:
+                output.append(markup)
+        else:
+            output.append(markup)
+            tag_match = _SVG_ELEMENT_OPEN.match(markup)
+            if tag_match is not None:
+                is_closing, raw_name = tag_match.groups()
+                name = raw_name.casefold()
+                if is_closing:
+                    for index in range(len(element_stack) - 1, -1, -1):
+                        if element_stack[index] == name:
+                            del element_stack[index:]
+                            break
+                elif not markup.rstrip().endswith("/>"):
+                    element_stack.append(name)
+        cursor = match.end()
+    trailing = svg_text[cursor:]
+    output.append(
+        _refang_known_iocs(trailing, known_iocs)[0] if is_svg_text_content() else trailing
+    )
+    projected = "".join(output)
+    return projected.encode("utf-8") if projected != svg_text else svg_bytes
 
 
 def _reader_reference_note(value: str, source: PublicationSourceV1 | None = None) -> str:
@@ -565,7 +746,7 @@ def _project_article_format_render_data(
     publication_v5: PublicationDocumentV5 | None,
     publication_v8: PublicationDocumentV8 | None,
     brief: bool,
-    refang_replacements: tuple[tuple[str, str], ...] = (),
+    refang_replacements: tuple[tuple[ArtifactType, str, str], ...] = (),
     project_text: Callable[[str, str], tuple[str, list[dict[str, Any]] | None]],
 ) -> dict[str, Any] | None:
     """Project ArticleFormatV1 with a deterministic V4-V7 fallback."""
@@ -574,13 +755,9 @@ def _project_article_format_render_data(
     canonical = publication_v8.article_format if publication_v8 is not None else None
     if canonical is not None:
         overview = canonical.overview
-        if publication_v5 is None:
-            timeline = canonical.timeline_key_events
-        else:
-            timeline = select_publication_timeline_key_events_v2(
-                publication_v5.document.timeline,
-                publication_v5.document.sources,
-            )
+        # V8 stores its policy-selected events. Reading them directly preserves
+        # the exact selector result for already persisted publications.
+        timeline = canonical.timeline_key_events
         category_values: dict[str, list[tuple[str, str, ArtifactType | None]]] = {
             "ips": [
                 (item.value, item.normalized_value, ArtifactType.IP)
@@ -961,6 +1138,7 @@ def publication_content_section_types(
     value: CanonicalPublicationDocument | TypstDraftPreviewDocument,
     *,
     include_brief_chronology: bool = False,
+    brief_timeline_policy_version: str | None = None,
 ) -> tuple[str, ...]:
     """Return the ordered sections projected from canonical publication data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
@@ -1023,6 +1201,13 @@ def publication_content_section_types(
         has_limitations = False
     if opinion_document and not brief_document:
         has_legacy_chronology = bool(timeline_entries) or timeline_figure is not None
+    elif brief_document:
+        brief_selector = (
+            select_publication_timeline_key_events_v3
+            if brief_timeline_policy_version == _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION
+            else select_publication_timeline_key_events_v2
+        )
+        has_legacy_chronology = bool(brief_selector(timeline_entries, document.sources))
     else:
         has_legacy_chronology = bool(
             select_publication_timeline_key_events_v2(timeline_entries, document.sources)
@@ -1194,6 +1379,7 @@ class TypstRenderSource:
     render_data_relative_path: str = "RENDERER/render-data.json"
     mapping_targets: tuple[dict[str, Any], ...] = ()
     mapping_unmapped: tuple[dict[str, Any], ...] = ()
+    media_refang_iocs: tuple[tuple[ArtifactType, str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1203,6 +1389,7 @@ class TypstPublicationModelV2:
     media_refs: tuple[TypstMediaRef, ...]
     article_format: dict[str, Any] | None = None
     draft_watermark: str | None = None
+    media_refang_iocs: tuple[tuple[ArtifactType, str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1631,6 +1818,7 @@ class TypstRenderer:
         document_label: str | None = None,
         target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
         infrastructure_graph_media_ref: TypstMediaRef | None = None,
+        brief_timeline_policy_version: str | None = None,
     ) -> TypstRenderSource:
         """Project a publication using its exact service-supplied nature and identity label."""
         if not isinstance(document_label, str) or not document_label.strip():
@@ -1652,6 +1840,7 @@ class TypstRenderer:
             document,
             infrastructure_graph_media_ref=infrastructure_graph_media_ref,
             include_brief_chronology=is_brief(document),
+            brief_timeline_policy_version=brief_timeline_policy_version,
         )
         target_descriptors: tuple[dict[str, Any], ...] = ()
         unmapped: tuple[dict[str, Any], ...] = ()
@@ -1717,6 +1906,7 @@ class TypstRenderer:
             media_refs=model.media_refs,
             mapping_targets=target_descriptors,
             mapping_unmapped=unmapped,
+            media_refang_iocs=model.media_refang_iocs,
         )
 
 
@@ -1829,6 +2019,7 @@ def project_publication_to_typst_model(
     *,
     infrastructure_graph_media_ref: TypstMediaRef | None = None,
     include_brief_chronology: bool = False,
+    brief_timeline_policy_version: str | None = None,
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
@@ -1890,10 +2081,14 @@ def project_publication_to_typst_model(
     else:
         raise ValueError("Unsupported canonical publication document")
 
-    refang_replacements = _publication_refang_pairs(
-        document,
-        publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None,
-        publication_v8,
+    refang_replacements = (
+        ()
+        if opinion_document
+        else _publication_refang_pairs(
+            document,
+            publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None,
+            publication_v8,
+        )
     )
 
     def project_text(anchor: str, text: str) -> tuple[str, list[dict[str, Any]] | None]:
@@ -2220,6 +2415,38 @@ def project_publication_to_typst_model(
                 "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
                 "source_document_ids": [
                     str(reference.source_document_id) for reference in entry.evidence_refs
+                ],
+            }
+            if spans is not None:
+                timeline_row["semantic_spans"] = spans
+            timeline.append(timeline_row)
+    elif brief_document:
+        if brief_timeline_policy_version == _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION:
+            selected_timeline = select_publication_timeline_key_events_v3(
+                source_timeline_entries,
+                document.sources,
+            )
+        else:
+            # Missing and historical policy metadata use the frozen V2 selector so
+            # persisted briefs retain their original reader projection on replay.
+            selected_timeline = select_publication_timeline_key_events_v2(
+                source_timeline_entries,
+                document.sources,
+            )
+        source_anchor_by_event = {
+            (entry.event_date, entry.text): timeline_anchor(index)
+            for index, entry in enumerate(document.timeline, start=1)
+            if entry.event_date is not None
+        }
+        for event in selected_timeline:
+            anchor = source_anchor_by_event.get((event.event_date, event.text), "")
+            display_text, spans = project_text(anchor, event.text)
+            timeline_row = {
+                "display_date": _display_date(None, event.event_date),
+                "text": display_text,
+                "source_urls": _timeline_source_urls(event.evidence_refs, sources_by_id),
+                "source_document_ids": [
+                    str(reference.source_document_id) for reference in event.evidence_refs
                 ],
             }
             if spans is not None:
@@ -3072,7 +3299,9 @@ def project_publication_to_typst_model(
         else None
     )
     expected_section_types = publication_content_section_types(
-        value, include_brief_chronology=include_brief_chronology
+        value,
+        include_brief_chronology=include_brief_chronology,
+        brief_timeline_policy_version=brief_timeline_policy_version,
     )
     reference_section["show_heading"] = bool(
         reference_entries or sources or "chronology" in expected_section_types
@@ -3547,6 +3776,7 @@ def project_publication_to_typst_model(
         media_refs=tuple(media_refs_by_id.values()),
         article_format=article_format_render,
         draft_watermark=("BROUILLON NON APPROUVÉ" if draft_preview is not None else None),
+        media_refang_iocs=refang_replacements,
     )
 
 

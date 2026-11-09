@@ -402,7 +402,7 @@ class EditionRenderService:
                     publication_artifact = await uow.production_artifacts.get(
                         entry.document_artifact_id
                     )
-                    identities[str(entry.subject_id)] = (
+                    identity = (
                         await publication_target_artifact_identities(
                             uow.production_artifacts,
                             publication_artifact,
@@ -412,6 +412,13 @@ class EditionRenderService:
                         if publication_artifact is not None
                         else {}
                     )
+                    if publication_artifact is not None:
+                        policy_version = publication_artifact.metadata.get(
+                            "brief_assembly_policy_version"
+                        )
+                        if isinstance(policy_version, str):
+                            identity["brief_assembly_policy_version"] = policy_version
+                    identities[str(entry.subject_id)] = identity
             return identities
         except Exception:
             # Missing optional location provenance cannot block an immutable PDF render.

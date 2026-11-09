@@ -152,7 +152,7 @@ def _publication_fixture(
     content_sections.append({"type": "synthesis", "blocks": body_blocks})
 
     result: dict[str, Any] = {
-        "schema_version": "typst-publication-model-v33-article-format",
+        "schema_version": "typst-publication-model-v36-m19-polish",
         "document_label": f"m19-{kind}-format-fixture",
         "kind": kind,
         "title": f"Synthetic {kind} publication",
@@ -179,8 +179,8 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v41-m19-review"
-    assert edition.template_version == "chp-edition-v33-m19-review"
+    assert article.template_version == "chp-article-v42-m19-polish"
+    assert edition.template_version == "chp-edition-v34-m19-polish"
 
 
 def _typst_binary() -> str:
@@ -495,6 +495,67 @@ async def test_m19_article_and_brief_render_v2_format_to_real_pdf(
     }
     assert {_REFERENCE_URL, _TIMELINE_URL} <= linked_urls
     _assert_timeline_rail(path, pages, tmp_path)
+
+
+@pytest.mark.parametrize("kind", ("article", "brief"))
+@pytest.mark.asyncio
+async def test_m19_reference_entries_have_separation_and_preserve_other_layout(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    render_data = _publication_fixture(kind, paragraph_count=1, include_figures=True)
+    render_data["content_sections"][0]["entries"] = [
+        {
+            "display_date": "14 octobre 2026",
+            "text": (
+                "First source detail explains the complete analysis and its evidence. " * 5
+            ).strip(),
+            "url": _REFERENCE_URL,
+        },
+        {
+            "display_date": "15 octobre 2026",
+            "text": "Second source confirms the reported activity.",
+            "url": _TIMELINE_URL,
+        },
+    ]
+    path = await _compile_pdf(tmp_path, render_data)
+    text, pages = _extract_layout(path)
+
+    assert text.index("Références") < text.index("Chronologie") < text.index("Synthèse")
+    reference_lines = sorted(
+        [(page_index, line) for page_index, page in enumerate(pages) for line in page["lines"]],
+        key=lambda item: (item[0], item[1]["top"]),
+    )
+    first_start = next(
+        index
+        for index, (_page_index, line) in enumerate(reference_lines)
+        if line["text"].startswith("14 octobre 2026 :")
+    )
+    second_start = next(
+        index
+        for index, (_page_index, line) in enumerate(reference_lines)
+        if line["text"].startswith("15 octobre 2026 :")
+    )
+    first_entry = reference_lines[first_start:second_start]
+    second_entry = reference_lines[second_start]
+    assert len(first_entry) >= 2
+    assert all(page_index == second_entry[0] for page_index, _line in first_entry)
+    internal_gaps = [
+        following["top"] - previous["bottom"]
+        for (_page_a, previous), (_page_b, following) in pairwise(first_entry)
+    ]
+    inter_entry_gap = second_entry[1]["top"] - first_entry[-1][1]["bottom"]
+    assert inter_entry_gap > max(internal_gaps) + 5.0, (inter_entry_gap, internal_gaps)
+
+    caption = next(
+        (line, page)
+        for page in pages
+        for line in page["lines"]
+        if "Figure 1 : Archived figure caption" in line["text"]
+    )
+    caption_line, caption_page = caption
+    caption_center = (caption_line["left"] + caption_line["right"]) / 2
+    assert abs(caption_center - caption_page["width"] / 2) <= 2.0
 
 
 @pytest.mark.parametrize("kind", ("article", "brief"))

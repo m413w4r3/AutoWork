@@ -421,7 +421,7 @@ class EditionPreviewService:
         async with self._uow_factory() as uow:
             for item in preview.artifacts:
                 publication_artifact = await uow.production_artifacts.get(item.artifact_id)
-                artifact_identities[str(item.subject_id)] = (
+                identity = (
                     await publication_target_artifact_identities(
                         uow.production_artifacts,
                         publication_artifact,
@@ -431,6 +431,13 @@ class EditionPreviewService:
                     if publication_artifact is not None
                     else {}
                 )
+                if publication_artifact is not None:
+                    policy_version = publication_artifact.metadata.get(
+                        "brief_assembly_policy_version"
+                    )
+                    if isinstance(policy_version, str):
+                        identity["brief_assembly_policy_version"] = policy_version
+                artifact_identities[str(item.subject_id)] = identity
         content = await self._pdf_renderer.render(
             preview.document,
             artifact_identities=artifact_identities,
