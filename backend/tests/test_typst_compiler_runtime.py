@@ -80,11 +80,11 @@ _COPYABLE_TABLE_URL = "https://example.test/" + "u" * 99
 _COPYABLE_DEFANGED_URL = "hxxps://a[.]b[.]c"
 _COPYABLE_VALUES = (
     _COPYABLE_HASH,
-    _COPYABLE_DEFANGED_LONG_URL,
-    _COPYABLE_DEFANGED_EXACT_URL,
+    _COPYABLE_LONG_URL,
+    _COPYABLE_EXACT_URL,
     _COPYABLE_REGISTRY_PATH,
     _COPYABLE_TABLE_URL,
-    _COPYABLE_DEFANGED_URL,
+    "https://a.b.c",
 )
 
 
@@ -374,10 +374,16 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
 ) -> None:
     typst_root = _REPOSITORY_ROOT / "chpTypst"
     bundle = load_template_bundle(typst_root)
-    source = TypstRenderer().render(
-        _copyable_ioc_document(), bundle, document_label=_PUBLICATION_RENDER_LABEL
-    )
+    document = _copyable_ioc_document()
+    source = TypstRenderer().render(document, bundle, document_label=_PUBLICATION_RENDER_LABEL)
     render_data = json.loads(source.render_data_bytes)
+    canonical_url_values = [
+        indicator.value
+        for group in document.indicators
+        if group.artifact_type is ArtifactType.URL
+        for indicator in group.indicators
+    ]
+    assert _COPYABLE_DEFANGED_URL in canonical_url_values
     _install_narrow_technical_table(render_data)
 
     workspace_root = tmp_path / "copyable-article-workspace"
@@ -409,11 +415,11 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     typst_binary: str,
     font_bundle_root: Path,
 ) -> None:
-    """Check article reference rows and every opinion text field in compiled PDFs.
+    """Check M19 article references and every opinion text field in compiled PDFs.
 
-    The article reference row prints publisher, title, date, and URL. The
-    opinion reference row prints its date, ordinal identifier, reference text,
-    and URL. The article frise prints its date and event text; the opinion
+    The article reference row prints its date and source note, with the URL in
+    a footnote. The opinion reference row prints its date, ordinal identifier,
+    reference text, and URL. The article frise prints its date and event text; the opinion
     chronology retains its source ordinals. Opinion heading,
     qualification, text, and visible citations are checked separately.
 
@@ -617,19 +623,11 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             display_date = reference_display_dates[reference.source_document_id]
             source_url = reference_urls[reference.source_document_id]
             if article:
-                source = next(
-                    item
-                    for item in sources
-                    if item.source_document_id == reference.source_document_id
-                )
-                expected_row = (
-                    "".join(f"{value}—" for value in (source.publisher, source.title, display_date))
-                    + source_url
-                )
+                expected_row = f"{display_date}:{reference_texts[reference.source_document_id]}"
                 compact_text = "".join(text.split())
                 expected_row = "".join(expected_row.split())
                 assert compact_text.count(expected_row) == 1, (
-                    f"{label} PDF reference {number} publisher/title/date/URL row: "
+                    f"{label} PDF reference {number} date/source-note row: "
                     f"expected 1, found {compact_text.count(expected_row)}"
                 )
                 continue
@@ -669,7 +667,9 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         source = next(item for item in sources if item.source_document_id == source_id)
         base_reference_expected_counts[source.title] = 1
         base_reference_expected_counts[source.publisher] = 1
-        base_reference_expected_counts[reference_display_dates[source_id]] = 0
+        base_reference_expected_counts[reference_display_dates[source_id]] = 2
+        # PDF line wrapping can split a source note; the compact row oracle below
+        # proves the date and complete note occur together exactly once.
         base_reference_expected_counts[reference_texts[source_id]] = 0
     base_expected_counts = base_reference_expected_counts | {
         title_marker: 1,
@@ -1127,13 +1127,14 @@ async def test_real_typst_article_renders_cited_technical_context_reference(
     extracted = _assert_exact_copyable_pdf_text(
         reader,
         (
-            "Contexte · Fortra",
+            "Fortra: NanoDump tool reference — ressource technique de contexte.",
             "NanoDump tool reference",
-            "Date de publication non précisée",
         ),
     )
     compact_text = "".join(extracted.split())
-    assert "Contexte·Fortra—NanoDumptoolreference—Datedepublicationnonprécisée" in compact_text
+    assert "Contexte·Fortra" not in compact_text
+    assert "Datedepublicationnonprécisée" not in compact_text
+    assert compact_text.count("NanoDumptoolreference") == 1
     assert "https://github.com/fortra/nanodump" in compact_text
     assert compact_text.count("https://github.com/fortra/nanodump") == 1
     assert len(reader.pages) >= 1

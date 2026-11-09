@@ -471,7 +471,7 @@ def test_context_source_round_trip_qa_and_typst_projection() -> None:
         if item["source_urls"] == [context_source.canonical_url]
     )
     assert reference_row["role_label"] == "Contexte technique"
-    assert reference_row["display_date"] == "Date de publication non précisée"
+    assert "display_date" not in reference_row
 
 
 def test_table_cell_and_diagram_asset_tampering_fail() -> None:

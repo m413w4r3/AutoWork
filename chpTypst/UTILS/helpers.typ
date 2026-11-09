@@ -418,7 +418,7 @@
   }
 }
 
-#let fn(url) = {
+#let publication-url-footnote(url) = {
   footnote[
     #better-link(url)[#url]
   ]

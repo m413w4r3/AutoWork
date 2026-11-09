@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, code-font-families, noteAnalyste, tag, fn
+#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, code-font-families, noteAnalyste, tag, publication-url-footnote
 #import "../UTILS/colors.typ": accent, grey, purple, purple-light
 
 #let has-text(value) = value != none and value != ""
@@ -82,7 +82,7 @@
   let source-urls = unique-urls(event.at("source_urls", default: ()))
   let source-refs = event.at("source_refs", default: ())
   if footnotes and source-urls.len() > 0 [
-    #for source-url in source-urls [#fn(source-url)]
+    #for source-url in source-urls [#publication-url-footnote(source-url)]
   ] else if source-refs.len() > 0 [
     #for (index, source-ref) in source-refs.enumerate() [
       #if index > 0 [, ]
@@ -430,7 +430,7 @@
       #set par(justify: false)
       #if has-text(display-date) [#text(str(display-date) + " : ")]
       #semantic-or-plain(display-text, semantic-spans)
-      #for source-url in urls [#h(0.2em)#fn(source-url)]
+      #for source-url in urls [#h(0.2em)#publication-url-footnote(source-url)]
     ]
   ]
 }

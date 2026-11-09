@@ -32,6 +32,7 @@ _PINNED_ISSUED_SEMANTIC_POLICY_VERSIONS = frozenset(
         "semantic-annotation-policy-v3-attached-placeholders",
         "semantic-annotation-policy-v4-technical-literal-globs",
         "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage",
+        "semantic-annotation-policy-v6-semantic-styles",
     }
 )
 

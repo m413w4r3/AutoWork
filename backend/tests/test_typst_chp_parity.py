@@ -920,6 +920,7 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
         "code-font-families",
         "noteAnalyste",
         "tag",
+        "publication-url-footnote",
     }
     assert "source-list" not in production_helpers_imports[shared_helpers]
     assert production_helpers_imports[colors] == {
@@ -958,15 +959,15 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
 def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> None:
     helpers = (_CHP_TYPST_ROOT / "RENDERER" / "publication_helpers.typ").read_text(encoding="utf-8")
     assert "#let render-body-block(" in helpers
-    assert 'paragraph-gap: 5pt' in helpers
-    assert 'article-style: false' in helpers
-    assert "#block(above: 0pt, below: paragraph-gap)[" in helpers
+    assert "paragraph-gap: 0pt" in helpers
+    assert "article-style: false" in helpers
+    assert "#if paragraph-gap > 0pt [#v(paragraph-gap)]" in helpers
     synthesis_start = helpers.index('} else if content_section.type == "synthesis" [')
     chronology_start = helpers.index('] else if content_section.type == "chronology" [')
     synthesis = helpers[synthesis_start:chronology_start]
-    assert "paragraph-gap: 9pt" in synthesis
+    assert "paragraph-gap: if has-next-paragraph { 9pt } else { 0pt }" in synthesis
     assert synthesis.count("render-body-block(") == 3
-    assert synthesis.count("paragraph-gap: 9pt") == 1
+    assert synthesis.count("paragraph-gap: if has-next-paragraph { 9pt } else { 0pt }") == 2
     assert "render-body-block(item, reference-scope: reference-scope)" in synthesis
     assert "#set par(spacing: 1em)" not in synthesis
 
@@ -1029,10 +1030,9 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Section paragraph describing the observed activity.",
         "Figure 1 : Diagram asset caption.",
         "Figure 2 : Source figure caption.",
-        "Source : example.test — p. 1",
         "Display ip",
         "normalized-domain",
-        "hxxps://display[.]example/path",
+        "https://display.example/path",
         "normalized-hash",
         "Adresses IP :",
         "Noms de domaine :",
@@ -1043,6 +1043,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     )
     for expected in expected_text:
         assert expected in text
+    assert "Source : example.test — p. 1" not in text
     for internal_detail in (
         "Provenance",
         "65d67fad-2db8-4e50-a6a0-6fd09e790000",
@@ -1088,7 +1089,8 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert "Synthèse" in brief_text
     assert "SYNTHÈSE" not in brief_text
     assert "Chronologie" in brief_text
-    assert "Références" not in brief_text
+    assert "Références" in brief_text
+    assert brief_text.index("Références") < brief_text.index("Chronologie")
     assert all(title not in brief_text for title in ("Accès initial", "Persistance", "Détection"))
     assert "extraction_source_skipped" not in text
     assert "synthesis_output_invalid" not in text
@@ -1098,15 +1100,14 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert "Sources complémentaires" not in text
     assert "https://example.test/one" in brief_text
     assert "https://example.test/two" in brief_text
-    assert re.search(r"No display date\s*\d+", brief_text)
-    assert re.search(r"Several source event\s*\d+\s*,?\s*\d+", brief_text)
+    assert "No display date" not in brief_text
+    assert "Several source event" not in brief_text
+    assert re.search(r"3 février 2025\s+One source event", brief_text)
     assert brief_text.index("Chronologie") < brief_text.index("Synthèse")
     assert text.count("Synthesis lead paragraph for parity coverage.") == 1
     assert text.count("A second lead paragraph.") == 1
-    assert re.search(
-        r"• Example Lab — Primary source — 2 janvier 2025 — https://example\.test/one",
-        text,
-    )
+    assert "2 janvier 2025 : Example Lab publie « Primary source »" in text
+    assert "https://example.test/one" in text
     assert {media_ref.expected_mime_type for media_ref in render_source.media_refs} == {
         "image/svg+xml",
         "image/png",
@@ -1152,14 +1153,12 @@ async def test_real_typst_chronology_keeps_month_only_events_beside_derived_figu
                     {
                         "display_date": "18 novembre 2025",
                         "text": exact_text,
-                        "source_urls": [],
-                        "source_refs": [{"number": 4, "target_id": "source-4"}],
+                        "source_urls": ["https://example.invalid/source"],
                     },
                     {
                         "display_date": "début mai 2026",
                         "text": month_text,
-                        "source_urls": [],
-                        "source_refs": [{"number": 4, "target_id": "source-4"}],
+                        "source_urls": ["https://example.invalid/source"],
                     },
                 ],
                 "derived_timeline_figure": {
@@ -1189,6 +1188,26 @@ async def test_real_typst_chronology_keeps_month_only_events_beside_derived_figu
                 ],
             },
         ],
+        "article_format": {
+            "ioc_categories": {"ips": [], "urls": [], "domains": [], "files": []},
+            "timeline_key_events": [
+                {
+                    "display_date_fr": "18 novembre 2025",
+                    "text": exact_text,
+                    "source_urls": ["https://example.invalid/source"],
+                },
+                {
+                    "display_date_fr": "début mai 2026",
+                    "text": month_text,
+                    "source_urls": ["https://example.invalid/source"],
+                },
+                {
+                    "display_date_fr": "1er mai 2026",
+                    "text": "Publication de la source.",
+                    "source_urls": ["https://example.invalid/source"],
+                },
+            ],
+        },
     }
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
     workspace_root = tmp_path / "workspace"
@@ -1545,7 +1564,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     assert "Synthetic fixture decryption key" in extracted
     assert "config/key.bin:0x20-0x2f" in extracted
     assert "Observation de preuve : [E1]" in extracted
-    assert sum(f"fixture-ioc-{index:02d}[.]example" in extracted for index in range(25)) == 25
+    assert sum(f"fixture-ioc-{index:02d}.example" in extracted for index in range(25)) == 25
     typed_material_page = next(
         index
         for index, page_text in enumerate(page_texts)
@@ -1841,7 +1860,11 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
             (len(item["source_refs"]), len(item["evidence"]))
             for item in (*source_iocs, *original_iocs, *candidate_iocs)
         ],
-        "documentary_figure": source_figures[0]["evidence_classification"],
+        "documentary_figure_reader_fields": sorted(
+            set(source_figures[0]).intersection(
+                {"source_note", "attribution", "evidence_classification"}
+            )
+        ),
         "observed_figure_basis": graph_figure["edges"][0]["evidence_basis_label"],
         "ioc_body_has_table": any(
             block["type"] == "table" for block in ioc_section.get("blocks", ())
@@ -1849,7 +1872,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v33-article-format",
+        "schema_version": "typst-publication-model-v34-m19-format",
         "section_types": [
             "references",
             "chronology",
@@ -1865,12 +1888,12 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
             (True, 1, 1),
         ],
         "ioc_values": {
-            "source": ["core[.]example"],
-            "original": ["original[.]example"],
-            "candidate": ["contextual[.]example"],
+            "source": ["core.example"],
+            "original": ["original.example"],
+            "candidate": ["contextual.example"],
         },
         "provenance_counts": [(1, 1), (1, 1), (1, 1)],
-        "documentary_figure": "documented_not_observed",
+        "documentary_figure_reader_fields": [],
         "observed_figure_basis": "fait observé",
         "ioc_body_has_table": False,
         "annex_has_exhaustive_table": True,
@@ -1926,9 +1949,9 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     assert "IOC ORIGINAUX" in normalized_text
     assert "PISTES NON CONFIRMÉES" in normalized_text
     assert "ANNEXE TECHNIQUE — INVENTAIRE EXHAUSTIF DES IOC" in normalized_text
-    assert "CORE[.]EXAMPLE" in normalized_text
-    assert "ORIGINAL[.]EXAMPLE" in normalized_text
-    assert "CONTEXTUAL[.]EXAMPLE" in normalized_text
+    assert "CORE.EXAMPLE" in normalized_text
+    assert "ORIGINAL.EXAMPLE" in normalized_text
+    assert "CONTEXTUAL.EXAMPLE" in normalized_text
     assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
     assert "FAIT OBSERVÉ" in normalized_text
     assert "EMPREINTE DE FICHIER" in normalized_text
@@ -2036,6 +2059,7 @@ async def test_real_typst_scales_raster_figures_to_the_available_frame(
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
 #let tag(content) = content
+#let publication-url-footnote(url) = []
 #let noteAnalyste(content) = block(
   fill: rgb("#F1F1EF"),
   radius: 4pt,
@@ -2320,6 +2344,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
 #let tag(content) = content
+#let publication-url-footnote(url) = []
 #let noteAnalyste(content) = block(
   fill: rgb("#F1F1EF"),
   radius: 4pt,
@@ -2377,7 +2402,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
     assert "Figure 1 : Résolution du C2 iranien via Bitcoin" in normalized
     assert f"Figure 2 : {relationship_caption}" in normalized
     assert "Figure 3 : Capture d'une preuve technique" in normalized
-    assert "Source : example.test" in normalized
+    assert "Source : example.test" not in normalized
     assert "Provenance" not in normalized
     assert "HTML image" not in normalized
 
@@ -2426,7 +2451,8 @@ async def test_real_typst_keeps_references_when_timeline_is_empty(
     assert "Synthèse" in text
     assert "Chronologie" not in text
     assert "Références" in text
-    assert "• Example Lab — Primary source — 2 janvier 2025 — https://example.test/one" in text
+    assert "2 janvier 2025 : Example Lab publie « Primary source »" in text
+    assert "https://example.test/one" in text
 
 
 async def test_real_typst_renders_annotated_literal_content_without_evaluating_it(
@@ -2611,14 +2637,14 @@ async def test_real_typst_frontmatter_hides_internal_and_legacy_annex_indicators
     assert "Technical IOC feed" in text
     assert "Contexte technique" in text
     assert "IOC" in text
-    assert "core[.]example" in text
+    assert "core.example" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Missing Date Lab signale un échantillon associé à l\u2019activité." in text
     assert "https://missing.example/article" in text
     assert "Noms de domaine :" in text
-    assert "original-000[.]example" in compact_text
-    assert "original-119[.]example" in compact_text
+    assert "original-000.example" in compact_text
+    assert "original-119.example" in compact_text
     for hidden in (
         "IOC de l'article",
         "IOC originaux",

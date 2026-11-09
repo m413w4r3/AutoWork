@@ -328,7 +328,7 @@ def _write_pdf_examples(output_root: Path, article_pdf: bytes, brief_pdf: bytes)
 
 
 @pytest.mark.asyncio
-async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
+async def test_l3_article_builds_v8_projects_v34_and_compiles_end_to_end(
     tmp_path: Path,
     typst_binary: str,
     template_bundle,
@@ -344,7 +344,7 @@ async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
         .render_data_bytes
     )
     render_data = json.loads(render_data_bytes)
-    assert render_data["schema_version"] == "typst-publication-model-v33-article-format"
+    assert render_data["schema_version"] == "typst-publication-model-v34-m19-format"
     assert (
         render_data["article_format"]["overview"]["victimology"]["text"]
         == _L3_OVERVIEW[0].split(":", 1)[1].strip()
@@ -363,15 +363,15 @@ async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
         for label in ("Victimologie", "Arsenal", "Objectif principal")
     )
     assert "12 janvier 2025" in normalized and "27 janvier 2025" in normalized
-    assert "• Example publisher" in text
+    assert "example publisher publie" in normalized
     assert "https://example.com/report" in re.sub(r"\s+", "", text)
     assert (
-        normalized.index("chronologie")
+        normalized.index("références")
+        < normalized.index("chronologie")
         < normalized.index("vue d'ensemble")
         < normalized.index("synthèse")
         < normalized.rindex("pivots de détection")
-        < normalized.index("• example publisher")
-        < normalized.rindex("adresses ip :")
+        < normalized.index("adresses ip :")
     )
     for category in ("Adresses IP :", "URL :", "Noms de domaine :", "Fichiers :"):
         assert category.casefold() in normalized, category

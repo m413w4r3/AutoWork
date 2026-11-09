@@ -258,8 +258,11 @@ def _display_article_ioc_value(
     if artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}:
         return value
     try:
+        display_value = _projection_refang(normalized_value)
+        if artifact_type is ArtifactType.URL:
+            display_value = _validated_publication_url(display_value)
         return display_publication_indicator_value(
-            _projection_refang(normalized_value),
+            display_value,
             artifact_type,
             defanged=False,
         )
@@ -601,10 +604,21 @@ def _project_article_format_render_data(
             else None,
         }
 
+    source_timeline = (
+        publication_v5.document.timeline if publication_v5 is not None else document.timeline
+    )
+    timeline_date_text_by_event = {
+        (entry.event_date, entry.text): entry.date_text
+        for entry in source_timeline
+        if entry.event_date is not None and entry.date_text is not None
+    }
     timeline_render = [
         {
             "date_iso": event.event_date.isoformat(),
-            "display_date_fr": _display_date(None, event.event_date),
+            "display_date_fr": _display_date(
+                timeline_date_text_by_event.get((event.event_date, event.text)),
+                event.event_date,
+            ),
             "text": _refang_known_iocs(event.text, refang_replacements)[0],
         }
         for event in timeline
@@ -2163,6 +2177,14 @@ def project_publication_to_typst_model(
             "urls": [source.canonical_url],
             "source_urls": [source.canonical_url],
             "_source_id": reference.source_document_id,
+            "_source_ids": tuple(
+                dict.fromkeys(
+                    (
+                        reference.source_document_id,
+                        *(item.source_document_id for item in reference.evidence_refs),
+                    )
+                )
+            ),
         }
         if source.published_at is not None:
             reference_row["display_date"] = _display_date(None, source.published_at)
@@ -2361,9 +2383,10 @@ def project_publication_to_typst_model(
     # sources and references that have no editorial summary paragraph.
     reference_row_by_source_id: dict[UUID, dict[str, Any]] = {}
     for reference_row in source_references:
-        reference_source_id = reference_row.get("_source_id")
-        if isinstance(reference_source_id, UUID):
-            reference_row_by_source_id.setdefault(reference_source_id, reference_row)
+        reference_source_ids = reference_row.get("_source_ids", (reference_row.get("_source_id"),))
+        for reference_source_id in reference_source_ids:
+            if isinstance(reference_source_id, UUID):
+                reference_row_by_source_id.setdefault(reference_source_id, reference_row)
     for source_id, source in sorted(sources_by_id.items(), key=lambda item: str(item[0])):
         if source_id in reference_row_by_source_id:
             continue
@@ -2404,8 +2427,11 @@ def project_publication_to_typst_model(
         if isinstance(reference_source_id, UUID):
             target_id = f"publication-source-{reference_source_id.hex}-{index:04d}"
             reference_row["target_id"] = target_id
-            reference_target_by_source_id[reference_source_id] = target_id
-            reference_number_by_source_id[reference_source_id] = index
+            reference_source_ids = reference_row.get("_source_ids", (reference_source_id,))
+            for source_id in reference_source_ids:
+                if isinstance(source_id, UUID):
+                    reference_target_by_source_id[source_id] = target_id
+                    reference_number_by_source_id[source_id] = index
     legacy_reference_rows = tuple(source_references)
 
     def source_links_for_ids(source_ids: Any) -> list[dict[str, Any]]:
@@ -2912,6 +2938,7 @@ def project_publication_to_typst_model(
 
     for reference_row in source_references:
         reference_row.pop("_source_id", None)
+        reference_row.pop("_source_ids", None)
 
     reference_section: dict[str, Any] = {
         "type": "references",
@@ -3497,7 +3524,7 @@ def compute_template_bundle_hash(
 
 
 def _display_date(date_text: str | None, event_date: date | None) -> str:
-    if date_text:
+    if date_text and (event_date is None or date_text != event_date.isoformat()):
         return date_text
     if event_date is not None:
         day = "1er" if event_date.day == 1 else str(event_date.day)

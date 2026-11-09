@@ -2615,12 +2615,10 @@ def build_publication_date_events(
             publisher=source.publisher,
             published_at=source.published_at,
         )
-        publisher = " ".join(source.publisher.split())
-        title = " ".join(source.title.split())
-        if len(title) > 96:
-            title_prefix = title[:95].rsplit(" ", 1)[0] or title[:95]
-            title = title_prefix.rstrip(" ,;:") + "…"
-        event_text = f"Publication par {publisher} : {title}."
+        # The source's reader reference already carries its presentation note
+        # and title. Keep the synthetic timeline event about the publication
+        # date without repeating those fields in the body.
+        event_text = "Publication de la source."
         key = (source.published_at, normalize_article_format_text(event_text))
         evidence_ref = PublicationEvidenceRefV1(
             source_document_id=metadata_ref.source_document_id,
