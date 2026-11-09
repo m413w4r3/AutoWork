@@ -384,7 +384,7 @@ async def test_real_typst_compiles_legacy_and_current_semantic_policies_together
 
 
 @pytest.mark.asyncio
-async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_technical_annex(
+async def test_real_typst_opinion_preview_keeps_tables_and_technical_annex(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -450,6 +450,7 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
     annex = next(
         item for item in render_data["content_sections"] if item["type"] == "technical_annex"
     )
+    annex["publication_identity_provenance"] = "OPINION_IDENTITY_PROVENANCE_SYNTHETIC"
     annex["ioc_row_groups"].append(
         {
             "heading": "Synthetic hidden values",
@@ -466,7 +467,7 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
                 {
                     "type": "domain",
                     "type_label": "Domaine",
-                    "value": "hidden-netrow.fixture.invalid",
+                    "value": "hidden.fixture",
                     "context_summary": "NET_CONTEXT_SYNTHETIC",
                     "source_refs": [{"number": 1}],
                     "draft_refs": [],
@@ -506,15 +507,16 @@ async def test_real_typst_publication_keeps_tables_and_hides_provenance_and_tech
     assert "Synthetic table preface marker." in text
     assert "PIPE_ROW_45" in text and "Synthetic table note marker." in text
     assert "Run token" in text and "[F1]" in text and "[E1]" in text
-    assert hash_value not in compact_text
-    for hidden in (
+    assert hash_value in compact_text
+    for visible in (
         "PROVENANCE DE PUBLICATION",
+        "OPINION_IDENTITY_PROVENANCE_SYNTHETIC",
         "ANNEXE TECHNIQUE",
         "HASH_CONTEXT_SYNTHETIC",
         "NET_CONTEXT_SYNTHETIC",
-        "hidden-netrow.fixture.invalid",
+        "hidden.fixture",
     ):
-        assert hidden not in text
+        assert visible in text
     pages_with_last_row = [
         index for index, page_text in enumerate(page_texts) if "PIPE_ROW_45" in page_text
     ]
