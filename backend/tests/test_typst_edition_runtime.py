@@ -301,7 +301,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     # L5: the uncertainty list is no longer published inside the article body.
     assert "Attribution remains uncertain" not in text
     assert text.count("Références") >= 1
-    assert text.index("Références") < text.index("Synthèse")
+    assert text.index("Synthèse") < text.index("Références")
     page_texts = [page.extract_text() or "" for page in reader.pages]
     first_article_page_text = next(page_text for page_text in page_texts if "Synthèse" in page_text)
     assert "Synthèse" in first_article_page_text

@@ -6,6 +6,8 @@ import json
 import os
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +143,37 @@ def _extract_text(pdf_bytes: bytes, path: Path) -> tuple[str, PdfReader]:
     return result.stdout, PdfReader(path, strict=True)
 
 
+def _extract_bbox_lines(path: Path) -> list[list[dict[str, Any]]]:
+    result = subprocess.run(
+        ("pdftotext", "-bbox-layout", str(path), "-"),
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    root = ET.fromstring(result.stdout)
+    namespace = {"xhtml": "http://www.w3.org/1999/xhtml"}
+    pages = []
+    for page in root.findall(".//xhtml:page", namespace):
+        lines = []
+        for line in page.findall(".//xhtml:line", namespace):
+            text = " ".join(
+                word.text or "" for word in line.findall("xhtml:word", namespace)
+            )
+            if text:
+                lines.append(
+                    {
+                        "text": text,
+                        "left": float(line.attrib["xMin"]),
+                        "top": float(line.attrib["yMin"]),
+                        "right": float(line.attrib["xMax"]),
+                        "bottom": float(line.attrib["yMax"]),
+                    }
+                )
+        pages.append(lines)
+    return pages
+
+
 def _save_example(pdf_bytes: bytes, filename: str) -> None:
     output = os.environ.get("M18_L1_ARTIFACT_DIR")
     if output:
@@ -165,7 +198,8 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
         entrypoint="RENDERER/publication.typ",
         render_data=fixture,
     )
-    text, reader = _extract_text(pdf_bytes, tmp_path / "article-rich.pdf")
+    pdf_path = tmp_path / "article-rich.pdf"
+    text, reader = _extract_text(pdf_bytes, pdf_path)
     lowered_text = text.casefold()
     compact_text = "".join(text.split())
 
@@ -184,23 +218,28 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
         "Analyse de la chaîne observée",
         "2026-09-09",
         "Figure 1 : Chaîne d’exécution résumée",  # noqa: RUF001
+        "Figure 2 : Séquence réseau résumée",
         "Composants documentés",
+        "Correspondance des étapes",
+        "Dernier paragraphe de synthèse pour vérifier l’ordre éditorial.",  # noqa: RUF001
         "IOC",
         "Adresses IP :",
         "URL :",
         "Noms de domaine :",
         "Fichiers :",
-        "192.0.2.77",
-        "hxxps://c2[.]example[.]test/api",
-        "relay[.]example[.]test",
-        "C:\\ProgramData\\agent.dll",
+        "192.0.2.1",
+        "hxxps://updates[.]example[.]test/api/collect/01",
+        "node-01[.]example[.]test",
+        "C:\\ProgramData\\Agent\\component-01.dll",
     ):
         assert expected in text, expected
     assert (
-        text.index("Références")
-        < text.index("Chronologie")
+        text.index("Chronologie")
         < text.index("Vue d’ensemble")  # noqa: RUF001
         < text.index("Synthèse")
+        < text.index("Dernier paragraphe de synthèse")
+        < text.index("Références")
+        < text.index("IOC")
     )
     for forbidden in (
         *_BANNED_TEXT,
@@ -228,6 +267,108 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
         for page in reader.pages
         for annotation in page.get("/Annots", ())
     )
+    assert sum(
+        len(values)
+        for values in fixture["article_format"]["ioc_categories"].values()
+    ) == 90
+    compact_text = "".join(text.split())
+    for values in fixture["article_format"]["ioc_categories"].values():
+        for item in values:
+            assert "".join(item["value"]["text"].split()) in compact_text
+
+    bbox_pages = _extract_bbox_lines(pdf_path)
+    bbox_lines = [
+        (page_index, line_index, line)
+        for page_index, lines in enumerate(bbox_pages)
+        for line_index, line in enumerate(lines)
+    ]
+
+    def find_bbox_lines(fragment: str) -> list[tuple[int, int, dict[str, Any]]]:
+        matches = [
+            item for item in bbox_lines if fragment.casefold() in item[2]["text"].casefold()
+        ]
+        assert matches, fragment
+        return matches
+
+    def find_bbox_line(fragment: str) -> tuple[int, int, dict[str, Any]]:
+        matches = find_bbox_lines(fragment)
+        assert len(matches) == 1, (fragment, [item[2]["text"] for item in matches])
+        return matches[0]
+
+    def find_exact_bbox_line(value: str) -> tuple[int, int, dict[str, Any]]:
+        expected = "".join(value.split()).casefold()
+        matches = [
+            item
+            for item in bbox_lines
+            if "".join(item[2]["text"].split()).casefold() == expected
+        ]
+        assert len(matches) == 1, (value, [item[2]["text"] for item in matches])
+        return matches[0]
+
+    event_positions = []
+    for event in fixture["article_format"]["timeline_key_events"]:
+        date_line = find_bbox_line(event["display_date_fr"])
+        text_line = find_bbox_line(event["text"])
+        assert date_line[0] == text_line[0], event
+        assert date_line[1] < text_line[1], event
+        assert date_line[2]["bottom"] <= text_line[2]["top"], event
+        event_positions.append((date_line, text_line))
+    timeline_dates = [
+        event["date_iso"] for event in fixture["article_format"]["timeline_key_events"]
+    ]
+    assert timeline_dates == sorted(timeline_dates)
+    for previous, following in pairwise(event_positions):
+        previous_date, previous_text = previous
+        following_date, _following_text = following
+        assert (previous_date[0], previous_date[1]) < (following_date[0], following_date[1])
+        if previous_text[0] == following_date[0]:
+            assert previous_text[2]["bottom"] <= following_date[2]["top"]
+
+    figure_lines = [
+        find_bbox_line(fragment)
+        for fragment in (
+            "Figure 1 : Chaîne d’exécution résumée",  # noqa: RUF001
+            "Documenté, non observé",
+            "Source : Example Research",
+            "Attribution : Reconstitution à partir du rapport cité.",
+        )
+    ]
+    assert len({line[0] for line in figure_lines}) == 1
+    assert [line[1] for line in figure_lines] == sorted(line[1] for line in figure_lines)
+    for previous, following in pairwise(figure_lines):
+        assert previous[2]["bottom"] <= following[2]["top"]
+
+    categories = fixture["article_format"]["ioc_categories"]
+    category_specs = (
+        ("Adresses IP :", categories["ips"]),
+        ("URL :", categories["urls"]),
+        ("Noms de domaine :", categories["domains"]),
+        ("Fichiers :", categories["files"]),
+    )
+    previous_value_line = None
+    for heading, values in category_specs:
+        heading_lines = find_bbox_lines(heading)
+        heading_line = heading_lines[0]
+        value_lines = [find_exact_bbox_line(item["value"]["text"]) for item in values]
+        value_line = value_lines[-1]
+        assert heading_line[1] < value_lines[0][1]
+        if len(values) > 18:
+            assert len(heading_lines) == 1
+            assert heading_line[0] == value_lines[0][0]
+            assert len({line[0] for line in value_lines}) >= 2
+        else:
+            assert len(heading_lines) == 1
+            assert heading_line[0] == value_line[0]
+            assert all(line[0] == heading_line[0] for line in value_lines)
+        for previous_item, following_item in pairwise(value_lines):
+            if previous_item[0] == following_item[0]:
+                value_gap = following_item[2]["top"] - previous_item[2]["bottom"]
+                assert value_gap >= 2, (heading, value_gap)
+        if previous_value_line is not None and previous_value_line[0] == heading_line[0]:
+            vertical_gap = heading_line[2]["top"] - previous_value_line[2]["bottom"]
+            assert vertical_gap >= 10, (heading, vertical_gap)
+        previous_value_line = value_line
+
     _save_example(pdf_bytes, "article-rich.pdf")
 
 
@@ -362,7 +503,8 @@ async def test_edition_reuses_the_article_format_helpers_for_article_and_brief(
         entrypoint="RENDERER/edition.typ",
         render_data=edition,
     )
-    text, _reader = _extract_text(pdf_bytes, tmp_path / "edition-article-brief.pdf")
+    pdf_path = tmp_path / "edition-article-brief.pdf"
+    text, _reader = _extract_text(pdf_bytes, pdf_path)
     lowered_text = text.casefold()
     for expected in (
         "Bulletin n°3 / Septembre 2026",
@@ -380,4 +522,20 @@ async def test_edition_reuses_the_article_format_helpers_for_article_and_brief(
         assert expected in text, expected
     for forbidden in _BANNED_TEXT:
         assert forbidden.casefold() not in lowered_text, forbidden
+    article_title = "[APT Exemple] Chaîne d’exploitation ciblée"  # noqa: RUF001
+    article_page = next(
+        page
+        for page in _extract_bbox_lines(pdf_path)
+        if any(article_title in line["text"] for line in page)
+        and any(line["text"] == "Chronologie" for line in page)
+    )
+    title_line = next(line for line in article_page if article_title in line["text"])
+    badge_line = next(line for line in article_page if line["text"] == "ARTICLE")
+    number_line = next(line for line in article_page if line["text"] == "01")
+    chronology_line = next(line for line in article_page if line["text"] == "Chronologie")
+    assert title_line["bottom"] < min(badge_line["top"], number_line["top"])
+    assert number_line["left"] > badge_line["right"]
+    assert badge_line["top"] < number_line["bottom"]
+    assert number_line["top"] < badge_line["bottom"]
+    assert max(badge_line["bottom"], number_line["bottom"]) < chronology_line["top"]
     _save_example(pdf_bytes, "edition-article-brief.pdf")

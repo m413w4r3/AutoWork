@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v29-article-format",
+  "template_version": "chp-edition-v30-article-format",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",
