@@ -364,9 +364,16 @@ async def test_real_typst_compiles_mixed_edition_without_empty_annex_or_demo_val
     )
     assert "overview" not in brief_data
     assert brief_data["article_format"] is None
-    assert not any(
-        section["type"] in {"chronology", "technical_annex", "provenance"}
-        for section in brief_data["content_sections"]
+    brief_chronology = next(
+        section for section in brief_data["content_sections"] if section["type"] == "chronology"
+    )
+    assert brief_chronology["timeline"]
+    assert (
+        any(
+            section["type"] in {"technical_annex", "provenance"}
+            for section in brief_data["content_sections"]
+        )
+        is False
     )
     synthesis = next(
         section for section in brief_data["content_sections"] if section["type"] == "synthesis"
@@ -416,11 +423,9 @@ async def test_real_typst_compiles_mixed_edition_without_empty_annex_or_demo_val
         assert expected in text
     page_texts = [page.extract_text() or "" for page in reader.pages]
     article_title = "A technical article without IOC annex"
-    article_page = next(
-        page_text for page_text in page_texts if article_title in page_text
-    )
+    article_page = next(page_text for page_text in page_texts if article_title in page_text)
     brief_page = next(
-        page_text for page_text in page_texts if "A short sourced update" in page_text
+        page_text for page_text in page_texts if "A short sourced update." in page_text
     )
     assert "One source event" not in article_page
     assert "Chronologie" not in article_page
@@ -504,7 +509,7 @@ def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) 
     assert all("type_label" not in item for item in domains["items"])
 
 
-def test_edition_renders_v6_opinion_without_legacy_annex(tmp_path: Path) -> None:
+def test_edition_restores_v6_opinion_legacy_sections(tmp_path: Path) -> None:
     base = _semantic_policy_publication(SEMANTIC_ANNOTATION_POLICY_VERSION, 301)
     opinion, context = _approved_opinion(base)
     augmented = augment_publication_with_opinion(base, opinion, context)
@@ -515,8 +520,21 @@ def test_edition_renders_v6_opinion_without_legacy_annex(tmp_path: Path) -> None
 
     with_opinion = data["publications"][0]["content_sections"]
     section_types = [section["type"] for section in with_opinion]
-    assert section_types == ["references", "synthesis", "analyst_opinion"]
-    assert not {"chronology", "ioc", "technical_annex", "provenance"}.intersection(section_types)
+    assert section_types == [
+        "references",
+        "chronology",
+        "synthesis",
+        "analyst_opinion",
+        "ioc",
+        "technical_annex",
+    ]
+    assert data["publications"][0]["article_format"] is None
+    chronology = next(item for item in with_opinion if item["type"] == "chronology")
+    assert chronology["timeline"]
+    ioc = next(item for item in with_opinion if item["type"] == "ioc")
+    assert ioc["source_indicators"]
+    technical_annex = next(item for item in with_opinion if item["type"] == "technical_annex")
+    assert technical_annex["ioc_rows"]
     opinion_section = next(item for item in with_opinion if item["type"] == "analyst_opinion")
     assert opinion_section["heading"] == "Avis de l'analyste"
     assert opinion_section["blocks"][0]["text"] == "Le constat supplémentaire est corroboré."
@@ -633,8 +651,7 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     assert "uncertainties" not in publication
     assert references["sources"][0]["url"] == "https://example.test/one"
     assert all(
-        {"publisher", "title", "date", "url", "urls"} <= set(item)
-        for item in references["entries"]
+        {"publisher", "title", "date", "url", "urls"} <= set(item) for item in references["entries"]
     )
     assert len(source.media_refs) == 2
     rendered_sections = json.loads(source.render_data_bytes)["publications"][0]["content_sections"]

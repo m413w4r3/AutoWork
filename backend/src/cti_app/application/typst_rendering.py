@@ -286,20 +286,15 @@ def _project_article_format_render_data(
                 for item in canonical.ioc_categories.domains
             ],
             "files": [
-                (item.value, item.normalized_value, None)
-                for item in canonical.ioc_categories.files
+                (item.value, item.normalized_value, None) for item in canonical.ioc_categories.files
             ],
         }
     else:
         overview = extract_article_overview(document.sections)
         timeline = select_article_timeline_key_events(document.timeline)
-        category_candidates: dict[
-            tuple[str, str], tuple[str, str, ArtifactType]
-        ] = {}
+        category_candidates: dict[tuple[str, str], tuple[str, str, ArtifactType]] = {}
 
-        def add_legacy_ioc(
-            artifact_type: ArtifactType, value: str, normalized_value: str
-        ) -> None:
+        def add_legacy_ioc(artifact_type: ArtifactType, value: str, normalized_value: str) -> None:
             category = _article_ioc_category(artifact_type)
             if category is None:
                 return
@@ -323,14 +318,15 @@ def _project_article_format_render_data(
                 )
         if publication_v5 is not None:
             for detail in publication_v5.ioc_details:
-                is_reader_file = detail.artifact_type in {
-                    ArtifactType.FILENAME,
-                    ArtifactType.FILEPATH,
-                } and detail.disposition_reason == "unsupported_artifact_type"
-                if (
-                    detail.disposition is PublicationIOCDisposition.EXCLUDED
-                    and not is_reader_file
-                ):
+                is_reader_file = (
+                    detail.artifact_type
+                    in {
+                        ArtifactType.FILENAME,
+                        ArtifactType.FILEPATH,
+                    }
+                    and detail.disposition_reason == "unsupported_artifact_type"
+                )
+                if detail.disposition is PublicationIOCDisposition.EXCLUDED and not is_reader_file:
                     continue
                 add_legacy_ioc(
                     detail.artifact_type,
@@ -632,7 +628,9 @@ def publication_content_section_types(
         if draft_preview is not None
         else None
     )
-    opinion_document = draft_preview is not None or opinion is not None
+    opinion_document = draft_preview is not None or (
+        isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
+    )
     brief_document = is_brief(value)
     section_types = ["references"]
     timeline_figure = (
@@ -647,7 +645,9 @@ def publication_content_section_types(
     )
     if draft_preview is not None and draft_preview.synthesis is not None:
         has_limitations = bool(draft_preview.synthesis.uncertainties)
-        has_legacy_chronology = bool(draft_preview.synthesis.timeline) or timeline_figure is not None
+        has_legacy_chronology = (
+            bool(draft_preview.synthesis.timeline) or timeline_figure is not None
+        )
     else:
         has_limitations = False
         has_legacy_chronology = bool(document.timeline) or timeline_figure is not None
@@ -1290,6 +1290,11 @@ class TypstRenderer:
         render_data: dict[str, Any] = {
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
             "kind": "brief" if is_brief(classification_document) else "article",
+            "opinion_document": isinstance(document, TypstDraftPreviewDocument)
+            or (
+                isinstance(document, (PublicationDocumentV6, PublicationDocumentV7))
+                and document.analyst_opinion is not None
+            ),
             "document_label": normalized_document_label,
             "document_label_display": _breakable_typst_display_text(
                 normalized_document_label,
@@ -1481,7 +1486,9 @@ def project_publication_to_typst_model(
         if draft_preview is not None
         else None
     )
-    opinion_document = draft_preview is not None or opinion is not None
+    opinion_document = draft_preview is not None or (
+        isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
+    )
     detection = publication_v6.detection if publication_v6 is not None else None
     draft_iocs = _draft_opinion_iocs(draft_preview) if draft_preview is not None else ()
     if isinstance(publication_v5, PublicationDocumentV5):
@@ -1803,6 +1810,7 @@ def project_publication_to_typst_model(
         if spans is not None:
             timeline_row["semantic_spans"] = spans
         timeline.append(timeline_row)
+
     def publisher_label(source: Any) -> str | None:
         if source.editorial_role is None or source.editorial_role.value != "context":
             return cast(str | None, source.publisher)
@@ -2451,9 +2459,7 @@ def project_publication_to_typst_model(
         if row["type"] == ArtifactType.HASH.value:
             context_summary = abbreviated(context_summary, 120)
             contexts = tuple(
-                dict.fromkeys(
-                    item["context"] for item in row["provenance"] if item.get("context")
-                )
+                dict.fromkeys(item["context"] for item in row["provenance"] if item.get("context"))
             )
             hash_context_summary = abbreviated(" / ".join(contexts), 36)
         origins = ioc_origins.get(ioc_key, set())
@@ -2478,8 +2484,10 @@ def project_publication_to_typst_model(
             source = source_for(source_id)
             citation_number = reference_number_by_source_id.get(source_id)
             source_links.append(
-                {"label": source.title or source.publisher or source.canonical_url,
-                 "url": source.canonical_url}
+                {
+                    "label": source.title or source.publisher or source.canonical_url,
+                    "url": source.canonical_url,
+                }
             )
             if citation_number is not None:
                 source_refs.append(
@@ -2530,9 +2538,7 @@ def project_publication_to_typst_model(
         "files": "Fichiers — noms et chemins",
         "other": "Autres identifiants techniques",
     }
-    grouped_ioc_rows: dict[str, list[dict[str, Any]]] = {
-        key: [] for key in ioc_group_titles
-    }
+    grouped_ioc_rows: dict[str, list[dict[str, Any]]] = {key: [] for key in ioc_group_titles}
     for row in ioc_rows:
         artifact_type = ArtifactType(row["type"])
         group_key = (
@@ -2566,10 +2572,10 @@ def project_publication_to_typst_model(
         key=str.casefold,
     )
     original_indicator_note = (
-        "Le lien avec le sujet n’est pas démontré. Sources : "
+        "Le lien avec le sujet n\u2019est pas démontré. Sources : "
         f"{'; '.join(original_publishers)}."
         if original_publishers
-        else "Le lien avec le sujet n’est pas démontré."
+        else "Le lien avec le sujet n\u2019est pas démontré."
     )
 
     for reference_row in source_references:
@@ -2596,7 +2602,7 @@ def project_publication_to_typst_model(
     )
     expected_section_types = publication_content_section_types(value)
     reference_section["show_heading"] = bool(
-        reference_entries or "chronology" in expected_section_types
+        reference_entries or sources or "chronology" in expected_section_types
     )
     if timeline_figure is not None:
         timeline_figure = {
@@ -3073,16 +3079,14 @@ def project_publication_to_typst_model(
     for section in content_sections:
         section_type = section.get("type")
         if section_type in {"technical_annex", "provenance", "publication_provenance"} and not (
-            draft_preview is not None or opinion is not None
+            opinion_document
         ):
             continue
-        if section_type == "chronology" and not (
-            is_brief(value) or draft_preview is not None or opinion is not None
-        ):
+        if section_type == "chronology" and not (is_brief(value) or opinion_document):
             continue
         if section_type == "ioc" and is_brief(value):
             reader_sections.append(_statusless_brief_ioc_section(section))
-        elif draft_preview is not None or opinion is not None:
+        elif opinion_document:
             reader_sections.append(section)
         else:
             clean_section = _strip_render_provenance(section)

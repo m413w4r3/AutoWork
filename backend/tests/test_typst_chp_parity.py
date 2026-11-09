@@ -140,6 +140,12 @@ pytest_plugins = (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _CHP_TYPST_ROOT = _REPOSITORY_ROOT / "chpTypst"
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
+
+
+def _expanded_path(value: str) -> Path:
+    return Path(value).expanduser()
+
+
 _IMPORT_RE = re.compile(r'^\s*#import\s+"([^"]+)"\s*:\s*(.*?)\s*$', re.MULTILINE)
 _IDENTIFIER_RE = re.compile(r"\*|[A-Za-z_][A-Za-z_0-9-]*")
 
@@ -150,6 +156,16 @@ def _render(document, bundle, *, document_label: str = "Libellé de fixture"):
 
 def _run_typst_compile(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(argv, capture_output=True, check=False, timeout=20)
+
+
+def _write_pdf(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _write_test_file_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
 
 
 @pytest.fixture
@@ -561,29 +577,7 @@ def _keep_with_next_sections(
         table.pop("semantic_cells", None)
         sections.append({"type": "synthesis", "blocks": [*filler, table]})
     else:
-        sections.extend(
-            (
-                {"type": "synthesis", "blocks": filler},
-                {
-                    "type": "technical_annex",
-                    "indicators": {
-                        "ips": [f"192.0.2.{index}" for index in range(1, 14)],
-                        "domains": [],
-                        "urls": [],
-                        "emails": [],
-                        "hashes": [],
-                    },
-                    "original_indicators": {
-                        "ips": [],
-                        "domains": [],
-                        "urls": [],
-                        "emails": [],
-                        "hashes": [],
-                    },
-                    "original_indicator_note": "",
-                },
-            )
-        )
+        sections.append({"type": "synthesis", "blocks": filler})
     return sections
 
 
@@ -626,6 +620,14 @@ async def _assert_real_typst_keep_with_next_case(
                 if block["type"] == "table"
             )
         publication["content_sections"] = _keep_with_next_sections(target, filler_count, table)
+        if target == "ioc":
+            assert publication["article_format"] is not None
+            publication["article_format"]["ioc_categories"] = {
+                "ips": [{"value": {"text": f"192.0.2.{index}"}} for index in range(1, 14)],
+                "urls": [],
+                "domains": [],
+                "files": [],
+            }
         return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
     async def prepare_workspace(name: str, files: tuple[TemplateFile, ...]) -> tuple[Path, Path]:
@@ -649,7 +651,7 @@ async def _assert_real_typst_keep_with_next_case(
 
     async def compile_at(workspace: Path, data_path: Path, filler_count: int) -> PdfReader:
         render_data = make_render_data(filler_count)
-        await anyio.Path(data_path).write_bytes(render_data)
+        _write_test_file_bytes(data_path, render_data)
         output_path = workspace / "keep-with-next.pdf"
         argv = [typst_binary, "compile", "--root", str(workspace)]
         for font_path in font_paths:
@@ -663,9 +665,9 @@ async def _assert_real_typst_keep_with_next_case(
                 str(output_path),
             )
         )
-        completed = await anyio.to_thread.run_sync(_run_typst_compile, tuple(argv))
+        completed = _run_typst_compile(tuple(argv))
         assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
-        return PdfReader(BytesIO(await anyio.Path(output_path).read_bytes()), strict=True)
+        return PdfReader(BytesIO(output_path.read_bytes()), strict=True)
 
     marker = (
         "Vulnérabilités cataloguées par système"
@@ -960,9 +962,9 @@ def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> No
     synthesis_start = helpers.index('} else if content_section.type == "synthesis" [')
     chronology_start = helpers.index('] else if content_section.type == "chronology" [')
     synthesis = helpers[synthesis_start:chronology_start]
-    assert "paragraph-gap: 5pt" in synthesis
+    assert "paragraph-gap: 9pt" in synthesis
     assert synthesis.count("render-body-block(") == 2
-    assert synthesis.count("paragraph-gap: 5pt") == 1
+    assert synthesis.count("paragraph-gap: 9pt") == 1
     assert "render-body-block(item, reference-scope: reference-scope)" in synthesis
     assert "#set par(spacing: 1em)" not in synthesis
 
@@ -1027,10 +1029,12 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Figure 2 : Source figure caption.",
         "Source : example.test — p. 1",
         "Display ip",
-        "Display domain",
+        "normalized-domain",
         "hxxps://display[.]example/path",
-        "Display email",
-        "Display hash",
+        "normalized-hash",
+        "Adresses IP :",
+        "Noms de domaine :",
+        "Fichiers :",
         "IOC",
         "https://example.test/one",
         "https://example.test/two",
@@ -1097,7 +1101,10 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert brief_text.index("Chronologie") < brief_text.index("Synthèse")
     assert text.count("Synthesis lead paragraph for parity coverage.") == 1
     assert text.count("A second lead paragraph.") == 1
-    assert "Primary source" not in text
+    assert re.search(
+        r"• Example Lab — Primary source — 2 janvier 2025 — https://example\.test/one",
+        text,
+    )
     assert {media_ref.expected_mime_type for media_ref in render_source.media_refs} == {
         "image/svg+xml",
         "image/png",
@@ -1201,7 +1208,11 @@ async def test_real_typst_chronology_keeps_month_only_events_beside_derived_figu
     compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(request)
     text, _ = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
 
-    assert "Événements datés" in text
+    assert "Chronologie" in text
+    assert "CHRONOLOGIE" not in text
+    assert "Événements datés" not in text
+    assert "18 novembre 2025" in text
+    assert "début mai 2026" in text
     assert text.count(exact_text) == 1
     assert month_text in text
 
@@ -1275,6 +1286,7 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
         )
     extracted = text_result.stdout.decode("utf-8", errors="replace")
     normalized_extracted = extracted.upper().replace("\u2019", "'")
+    assert "Avis de l'analyste" in extracted.replace("\u2019", "'")
     assert "AVIS DE L'ANALYSTE" in normalized_extracted
     assert "1.1 APPORTS DE L'ENQUÊTE" in normalized_extracted
     assert "APPORTS DE L'ENQUÊTE" in normalized_extracted
@@ -1485,10 +1497,11 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     extracted = extracted_result.stdout.decode("utf-8", errors="replace")
 
     limitation_page_text = next(
-        page_text for page_text in page_texts if "LIMITES DES PREUVES" in page_text
+        page_text for page_text in page_texts if "Limites des preuves" in page_text
     )
-    limitation_start = limitation_page_text.index("LIMITES DES PREUVES")
-    opinion_start = limitation_page_text.index("AVIS DE L\u2019ANALYSTE", limitation_start)
+    limitation_page_text = limitation_page_text.replace("\u2019", "'")
+    limitation_start = limitation_page_text.index("Limites des preuves")
+    opinion_start = limitation_page_text.index("Avis de l'analyste", limitation_start)
     limitation_section_text = limitation_page_text[limitation_start:opinion_start]
     assert limitation_section_text.count("https://a.example/report") == 1
     assert limitation_section_text.count("https://example.com/report") == 1
@@ -1833,7 +1846,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v32-brief-kind",
+        "schema_version": "typst-publication-model-v33-article-format",
         "section_types": [
             "references",
             "chronology",
@@ -1887,12 +1900,9 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         )
     )
 
-    output_directory = await anyio.Path(
-        os.environ.get("C8_PREVIEW_OUTPUT_DIR", str(tmp_path))
-    ).expanduser()
-    await output_directory.mkdir(parents=True, exist_ok=True)
+    output_directory = _expanded_path(os.environ.get("C8_PREVIEW_OUTPUT_DIR", str(tmp_path)))
     pdf_path = output_directory / "c8-preview-non-approuve.pdf"
-    await pdf_path.write_bytes(compiled.content)
+    _write_pdf(pdf_path, compiled.content)
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     extracted = await anyio.run_process(
         ("pdftotext", "-layout", str(pdf_path), "-"),
@@ -1907,17 +1917,18 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     )
     assert render_data["title"] in pdf_text
     assert "BROUILLON NON APPROUVÉ" in normalized_text
-    assert "CHRONOLOGIE" not in normalized_text
+    assert re.search(r"(?m)^\s*Chronologie\s*$", pdf_text) is not None
     assert "IOC" in normalized_text
-    assert "IOC DE L'ARTICLE" not in normalized_text
-    assert "IOC ORIGINAUX" not in normalized_text
-    assert "PISTES NON CONFIRMÉES" not in normalized_text
+    assert "IOC DE L'ARTICLE" in normalized_text
+    assert "IOC ORIGINAUX" in normalized_text
+    assert "PISTES NON CONFIRMÉES" in normalized_text
+    assert "ANNEXE TECHNIQUE — INVENTAIRE EXHAUSTIF DES IOC" in normalized_text
     assert "CORE[.]EXAMPLE" in normalized_text
     assert "ORIGINAL[.]EXAMPLE" in normalized_text
     assert "CONTEXTUAL[.]EXAMPLE" in normalized_text
-    assert "DOCUMENTÉ, NON OBSERVÉ" not in normalized_text
-    assert "FAIT OBSERVÉ" not in normalized_text
-    assert "EMPREINTE DE FICHIER" not in normalized_text
+    assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
+    assert "FAIT OBSERVÉ" in normalized_text
+    assert "EMPREINTE DE FICHIER" in normalized_text
     assert "D" * 64 not in normalized_text
     assert "OBSERVED_CONTACT" not in normalized_text
     assert "CONTACT OBSERVÉ" in normalized_text
@@ -2021,6 +2032,7 @@ async def test_real_typst_scales_raster_figures_to_the_available_frame(
 #let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
+#let tag(content) = content
 #let noteAnalyste(content) = block(
   fill: rgb("#F1F1EF"),
   radius: 4pt,
@@ -2081,9 +2093,7 @@ async def test_real_typst_scales_raster_figures_to_the_available_frame(
         if re.match(r"^\s*\d+\s+\d+\s+image\s+\d+", line)
     ]
     assert len(image_rows) == 3, image_listing
-    rendered_widths_pt = {
-        int(row[0]): int(row[3]) * 72 / float(row[12]) for row in image_rows
-    }
+    rendered_widths_pt = {int(row[0]): int(row[3]) * 72 / float(row[12]) for row in image_rows}
 
     assert rendered_widths_pt[1] >= 0.85 * text_width_pt
     assert float(image_rows[0][12]) >= 110
@@ -2306,6 +2316,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
 #let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
+#let tag(content) = content
 #let noteAnalyste(content) = block(
   fill: rgb("#F1F1EF"),
   radius: 4pt,
@@ -2380,7 +2391,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
 
 
 @pytest.mark.asyncio
-async def test_real_typst_omits_references_heading_when_timeline_is_empty(
+async def test_real_typst_keeps_references_when_timeline_is_empty(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -2410,7 +2421,9 @@ async def test_real_typst_omits_references_heading_when_timeline_is_empty(
     text, _ = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
 
     assert "Synthèse" in text
-    assert "Références" not in text
+    assert "Chronologie" not in text
+    assert "Références" in text
+    assert "• Example Lab — Primary source — 2 janvier 2025 — https://example.test/one" in text
 
 
 async def test_real_typst_renders_annotated_literal_content_without_evaluating_it(
@@ -2518,6 +2531,39 @@ async def test_real_typst_frontmatter_hides_internal_and_legacy_annex_indicators
     font_bundle_root: Path,
 ) -> None:
     source_document, *_case = _frontmatter_v6_case()
+    article_document = replace(
+        source_document.document,
+        sections=(
+            PublicationSectionV1(
+                kind=PublicationSectionKind.TECHNICAL,
+                heading="Contexte technique",
+                paragraphs=(
+                    PublicationParagraphV1(
+                        text="Contexte technique cité dans la publication.",
+                        evidence_refs=source_document.document.lead[0].evidence_refs,
+                    ),
+                ),
+            ),
+        ),
+    )
+    source_document = replace(
+        source_document,
+        document=article_document,
+        semantic_text=SemanticTextV1(
+            schema_version=source_document.semantic_text.schema_version,
+            policy_version=source_document.semantic_text.policy_version,
+            paragraphs=tuple(
+                SemanticParagraphV1(
+                    anchor=anchor,
+                    spans=(SemanticTextSpanV1(SemanticRole.TEXT, text),),
+                )
+                for anchor, text in publication_document_text_anchors(
+                    article_document,
+                    references=source_document.references,
+                ).items()
+            ),
+        ),
+    )
     source_id = source_document.original_indicators[0].indicators[0].source_document_ids[0]
     indicators = tuple(
         PublicationIndicatorV1(
@@ -2565,8 +2611,11 @@ async def test_real_typst_frontmatter_hides_internal_and_legacy_annex_indicators
     assert "core[.]example" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
-    assert "Date de publication non précisée" in text
-    assert all(f"original-{index:03d}[.]example" not in compact_text for index in range(120))
+    assert "Missing Date Lab signale un échantillon associé à l\u2019activité." in text
+    assert "https://missing.example/article" in text
+    assert "Noms de domaine :" in text
+    assert "original-000[.]example" in compact_text
+    assert "original-119[.]example" in compact_text
     for hidden in (
         "IOC de l'article",
         "IOC originaux",

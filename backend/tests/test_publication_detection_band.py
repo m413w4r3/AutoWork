@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import re
 import shutil
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import anyio
 import pytest
 from pypdf import PdfReader
 
@@ -602,28 +602,29 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
         pdf_path.write_bytes(compiled.content)
         reader = PdfReader(BytesIO(compiled.content), strict=True)
         assert reader.pages
-        font_result = await asyncio.to_thread(
-            subprocess.run,
-            (pdffonts, str(pdf_path)),
-            capture_output=True,
-            check=True,
-            timeout=10,
-        )
+        with anyio.fail_after(10):
+            font_result = await anyio.run_process(
+                (pdffonts, str(pdf_path)),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         font_rows = font_result.stdout.decode("utf-8", errors="replace").splitlines()
         assert any(
             re.search(r"Cascadia\s*Mono", row, re.IGNORECASE)
             and re.search(r"\byes\s+yes\s+yes\b", row, re.IGNORECASE)
             for row in font_rows
         ), font_result.stdout.decode("utf-8", errors="replace")
-        text_result = await asyncio.to_thread(
-            subprocess.run,
-            (pdftotext, str(pdf_path), "-"),
-            capture_output=True,
-            check=True,
-            timeout=10,
-        )
+        with anyio.fail_after(10):
+            text_result = await anyio.run_process(
+                (pdftotext, str(pdf_path), "-"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         extracted = text_result.stdout.decode("utf-8", errors="replace")
         normalized = re.sub(r"\s+", " ", extracted).upper()
+        assert "Détection" in extracted
         assert "DÉTECTION" in normalized
         assert expected_banner.upper() in normalized
         if expected_reason is not None:
@@ -646,23 +647,23 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
             if "DÉTECTION" in (page.extract_text() or "").upper()
         )
         image_prefix = tmp_path / f"detection-{name}-page"
-        await asyncio.to_thread(
-            subprocess.run,
-            (
-                pdftoppm,
-                "-f",
-                str(detection_page),
-                "-l",
-                str(detection_page),
-                "-singlefile",
-                "-png",
-                str(pdf_path),
-                str(image_prefix),
-            ),
-            capture_output=True,
-            check=True,
-            timeout=15,
-        )
+        with anyio.fail_after(15):
+            await anyio.run_process(
+                (
+                    pdftoppm,
+                    "-f",
+                    str(detection_page),
+                    "-l",
+                    str(detection_page),
+                    "-singlefile",
+                    "-png",
+                    str(pdf_path),
+                    str(image_prefix),
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
         assert image_prefix.with_suffix(".png").is_file()
 
     raw_source = 'rule raw_probe { condition: "' + "x" * 180 + '" }'
@@ -693,13 +694,13 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
     )
     raw_pdf = tmp_path / "raw-font-check.pdf"
     raw_pdf.write_bytes(raw_compiled.content)
-    raw_text = await asyncio.to_thread(
-        subprocess.run,
-        (pdftotext, str(raw_pdf), "-"),
-        capture_output=True,
-        check=True,
-        timeout=10,
-    )
+    with anyio.fail_after(10):
+        raw_text = await anyio.run_process(
+            (pdftotext, str(raw_pdf), "-"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
     raw_extracted = raw_text.stdout.decode("utf-8", errors="replace")
     raw_pages_without_footers = "".join(
         "\n".join(
@@ -708,13 +709,13 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
         for page in raw_extracted.split("\f")
     )
     assert re.sub(r"\s+", "", raw_source) in re.sub(r"\s+", "", raw_pages_without_footers)
-    raw_font_result = await asyncio.to_thread(
-        subprocess.run,
-        (pdffonts, str(raw_pdf)),
-        capture_output=True,
-        check=True,
-        timeout=10,
-    )
+    with anyio.fail_after(10):
+        raw_font_result = await anyio.run_process(
+            (pdffonts, str(raw_pdf)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
     assert re.search(
         r"Cascadia\s*Mono.*\byes\s+yes\s+yes\b",
         raw_font_result.stdout.decode("utf-8", errors="replace"),

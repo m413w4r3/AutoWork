@@ -93,7 +93,7 @@
 #let render-article-ioc-category(label, values) = {
   if values.len() > 0 [
     #block(sticky: true)[
-      #block(above: 5pt, below: 2pt)[
+      #block(above: 5pt, below: 3pt)[
         #text(size: 10pt, weight: "bold", fill: purple)[#(label + " :")]
       ]
       #set text(hyphenate: false)
@@ -136,7 +136,7 @@
       for group in section.at("source_indicators", default: ()) {
         let items = group.at("items", default: ())
         if items.len() > 0 [
-          #block(above: 5pt, below: 2pt, sticky: true)[
+          #block(above: 5pt, below: 3pt, sticky: true)[
             #text(size: 10pt, weight: "bold", fill: purple)[#(group.heading + " :")]
           ]
           #set text(hyphenate: false)
@@ -617,6 +617,11 @@
   ]
 }
 
+#let render-ioc-item(item, reference-scope: "") = render-opinion-ioc-item(
+  item,
+  reference-scope: reference-scope,
+)
+
 #let render-opinion-ioc-groups(
   groups,
   skip-first-heading: false,
@@ -726,7 +731,15 @@
     } else {
       group.rows.map(row => (
         [#text(size: 9pt, weight: "bold")[#row.type_label]],
-        [#text(font: code-font-families, size: 9pt, hyphenate: false)[#semantic-or-plain(row.value, row.at("value_spans", default: none))]],
+        [
+          #text(font: code-font-families, size: 9pt, hyphenate: false)[
+            #if type(row.value) == str {
+              semantic-or-plain(row.value, row.at("value_spans", default: none))
+            } else {
+              publication-display-text(row.value)
+            }
+          ]
+        ],
         [#text(size: 8.5pt, weight: "bold")[#row.at("indicator_status_label", default: "")]],
         [#text(size: 8.5pt, weight: "bold")[#row.at("relationship_status_label", default: row.at("status_label", default: ""))]],
         [
@@ -1133,18 +1146,18 @@
 
 #let render-publication-body(publication, reference-scope: "") = {
   let brief-publication = publication.at("kind", default: "article") == "brief"
-  let opinion-publication = publication.content_sections.any(
-    section => section.type == "analyst_opinion",
-  )
+  let opinion-publication = publication.at("opinion_document", default: none)
+  let opinion-publication = if opinion-publication == none {
+    publication.content_sections.any(section => section.type == "analyst_opinion")
+  } else {
+    opinion-publication
+  }
   let article-format = publication.at("article_format", default: none)
   let article-events = if article-format == none {
     ()
   } else {
     article-format.at("timeline_key_events", default: ())
   }
-  let has-chronology-section = publication.content_sections.any(
-    section => section.type == "chronology",
-  )
   let has-synthesis-section = publication.content_sections.any(
     section => section.type == "synthesis",
   )
@@ -1152,7 +1165,17 @@
     if content_section.type == "references" {
       let sources = content_section.at("sources", default: ())
       let entries = content_section.at("entries", default: ())
-      let entries = if entries.len() > 0 { entries } else { sources }
+      let has-structured-entries = entries.any(entry =>
+        has-text(entry.at("title", default: none))
+        or has-text(entry.at("publisher", default: none))
+      )
+      let entries = if opinion-publication or has-structured-entries {
+        entries
+      } else if sources.len() > 0 {
+        sources
+      } else {
+        entries
+      }
       let blocks = content_section.at("blocks", default: ())
       if brief-publication and not opinion-publication {
         for item in blocks {
@@ -1175,7 +1198,7 @@
         }
       ]
     } else if content_section.type == "synthesis" [
-      #if not brief-publication and not opinion-publication and article-format != none and not has-chronology-section [
+      #if not brief-publication and not opinion-publication and article-format != none [
         #render-article-timeline(article-events)
         #let overview = article-format.at("overview", default: none)
         #if overview != none [#render-article-overview(overview)]
@@ -1186,7 +1209,7 @@
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: 5pt,
+            paragraph-gap: 9pt,
           )
         }
       ] else [
@@ -1213,12 +1236,12 @@
           reference-scope: reference-scope,
           date-fill: purple,
         )
-      ] else [
-        #render-article-timeline(article-events)
-        #if article-format != none [
-          #let overview = article-format.at("overview", default: none)
-          #if overview != none [#render-article-overview(overview)]
-        ]
+      ] else if article-format == none [
+        #let legacy-events = content_section.at("timeline", default: ()).map(event => (
+          display_date_fr: event.at("display_date", default: ""),
+          text: event.text,
+        ))
+        #render-article-timeline(legacy-events)
       ]
     ] else if content_section.type == "limitations" [
       #render-section-heading[Limites des preuves]
@@ -1409,7 +1432,7 @@
   }
   if not brief-publication and not opinion-publication {
     if article-format != none {
-      if not has-chronology-section and not has-synthesis-section [
+      if not has-synthesis-section [
         #render-article-timeline(article-events)
         #let overview = article-format.at("overview", default: none)
         #if overview != none [#render-article-overview(overview)]
@@ -1418,7 +1441,7 @@
     } else {
       render-legacy-iocs(publication.content_sections)
     }
-  } else {
+  } else if brief-publication {
     render-legacy-iocs(publication.content_sections)
   }
 }

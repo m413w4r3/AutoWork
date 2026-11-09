@@ -14,13 +14,13 @@ import pytest
 from pypdf import PdfReader
 
 from cti_app.application.production_normalization import normalize_publication_indicator_value
-from cti_app.application.publication_builder import (
-    build_article_format_v1,
-    build_publication_document_v5,
-)
 from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
     extraction_evidence_refs_v1,
+)
+from cti_app.application.publication_builder import (
+    build_article_format_v1,
+    build_publication_document_v5,
 )
 from cti_app.application.typst_compilation import (
     TypstCompileRequest,
@@ -111,7 +111,10 @@ def _structured_l3_article() -> tuple[Any, Any]:
     )
     extraction = replace(
         extraction,
-        sources=(replace(source, indicators=(*source.indicators, *added_indicators)), *extraction.sources[1:]),
+        sources=(
+            replace(source, indicators=(*source.indicators, *added_indicators)),
+            *extraction.sources[1:],
+        ),
     )
     evidence_refs = extraction_evidence_refs_v1(extraction)
     assert evidence_refs
@@ -123,15 +126,16 @@ def _structured_l3_article() -> tuple[Any, Any]:
         sections=(
             SynthesisSectionV1(
                 SynthesisSectionKind.OVERVIEW,
-                "Vue d’ensemble",
+                "Vue d\u2019ensemble",
                 tuple(SynthesisParagraphV1(text, (primary_ref,)) for text in _L3_OVERVIEW),
             ),
             SynthesisSectionV1(
                 SynthesisSectionKind.TECHNICAL,
-                "Séquence d’intrusion",
+                "Séquence d\u2019intrusion",
                 (
                     SynthesisParagraphV1(
-                        "Le rapport décrit une première exécution suivie du chargement d’un module.",
+                        "Le rapport décrit une première exécution suivie du "
+                        "chargement d\u2019un module.",
                         (primary_ref,),
                     ),
                 ),
@@ -151,7 +155,8 @@ def _structured_l3_article() -> tuple[Any, Any]:
                 "Persistance et exécution",
                 (
                     SynthesisParagraphV1(
-                        "Les éléments disponibles décrivent l’exécution du module sans établir toutes les étapes ultérieures.",
+                        "Les éléments disponibles décrivent l\u2019exécution du module sans "
+                        "établir toutes les étapes ultérieures.",
                         (primary_ref,),
                     ),
                 ),
@@ -161,7 +166,8 @@ def _structured_l3_article() -> tuple[Any, Any]:
                 "Pivots de détection",
                 (
                     SynthesisParagraphV1(
-                        "Les noms de fichiers, l’adresse IP et le domaine constituent des pivots à comparer aux preuves locales.",
+                        "Les noms de fichiers, l\u2019adresse IP et le domaine constituent des "
+                        "pivots à comparer aux preuves locales.",
                         (primary_ref,),
                     ),
                 ),
@@ -266,6 +272,13 @@ def _build_workspace(
         destination.write_bytes(content)
 
 
+def _prepare_workspace_paths(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return workspace
+
+
 async def _compile(
     *,
     tmp_path: Path,
@@ -274,9 +287,7 @@ async def _compile(
     render_data: dict[str, Any],
     assets: dict[str, bytes] | None = None,
 ) -> bytes:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace = _prepare_workspace_paths(tmp_path)
     _build_workspace(
         workspace,
         template_bundle=template_bundle,
@@ -310,6 +321,12 @@ def _pdf_text(pdf_bytes: bytes, path: Path) -> tuple[str, PdfReader]:
     return result.stdout, PdfReader(path, strict=True)
 
 
+def _write_pdf_examples(output_root: Path, article_pdf: bytes, brief_pdf: bytes) -> None:
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "article-riche.pdf").write_bytes(article_pdf)
+    (output_root / "breve.pdf").write_bytes(brief_pdf)
+
+
 @pytest.mark.asyncio
 async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
     tmp_path: Path,
@@ -317,14 +334,21 @@ async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
     template_bundle,
 ) -> None:
     article, base = _structured_l3_article()
-    render_data_bytes = TypstRenderer().render(
-        article,
-        template_bundle,
-        document_label=f"e2e-{publication_document_v5_sha256(base)}",
-    ).render_data_bytes
+    render_data_bytes = (
+        TypstRenderer()
+        .render(
+            article,
+            template_bundle,
+            document_label=f"e2e-{publication_document_v5_sha256(base)}",
+        )
+        .render_data_bytes
+    )
     render_data = json.loads(render_data_bytes)
     assert render_data["schema_version"] == "typst-publication-model-v33-article-format"
-    assert render_data["article_format"]["overview"]["victimology"]["text"] == _L3_OVERVIEW[0].split(":", 1)[1].strip()
+    assert (
+        render_data["article_format"]["overview"]["victimology"]["text"]
+        == _L3_OVERVIEW[0].split(":", 1)[1].strip()
+    )
 
     pdf_bytes = await _compile(
         tmp_path=tmp_path,
@@ -333,11 +357,14 @@ async def test_l3_article_builds_v8_projects_v33_and_compiles_end_to_end(
         render_data=render_data,
     )
     text, _reader = _pdf_text(pdf_bytes, tmp_path / "article-l3-v8.pdf")
-    normalized = " ".join(text.split()).casefold().replace("’", "'")
-    assert all(label.casefold() in normalized for label in ("Victimologie", "Arsenal", "Objectif principal"))
+    normalized = " ".join(text.split()).casefold().replace("\u2019", "'")
+    assert all(
+        label.casefold() in normalized
+        for label in ("Victimologie", "Arsenal", "Objectif principal")
+    )
     assert "12 janvier 2025" in normalized and "27 janvier 2025" in normalized
     assert "• Example publisher" in text
-    assert "https://example.com/report" in text
+    assert "https://example.com/report" in re.sub(r"\s+", "", text)
     for category in ("Adresses IP :", "URL :", "Noms de domaine :", "Fichiers :"):
         assert category.casefold() in normalized, category
     assert normalized.count("vue d'ensemble") == 1
@@ -356,7 +383,7 @@ async def test_m18_visual_article_and_brief_examples_compile_to_tmp(
     )
     synthesis["blocks"].extend(
         [
-            {"type": "section_heading", "text": "Chaîne d’infection"},
+            {"type": "section_heading", "text": "Chaîne d\u2019infection"},
             {
                 "type": "diagram",
                 "figure_number": 2,
@@ -369,34 +396,34 @@ async def test_m18_visual_article_and_brief_examples_compile_to_tmp(
             {
                 "type": "paragraph",
                 "text": (
-                    "Dans cet exemple de mise en page, le chargeur vérifie d’abord la présence "
-                    "des composants attendus, puis transmet le contrôle au module secondaire. "
-                    "Le rapport décrit chaque étape séparément et attribue les noms de fichiers "
-                    "à des observations précises. Cette présentation permet de distinguer une "
-                    "action confirmée d’une hypothèse sur le comportement ultérieur. Les valeurs "
-                    "réservées utilisées ici servent uniquement à illustrer les zones de texte "
-                    "et les retours à la ligne du bulletin."
+                    "Dans cet exemple de mise en page, le chargeur vérifie "
+                    "d\u2019abord la présence des composants attendus, puis transmet le contrôle "
+                    "au module secondaire. Le rapport décrit chaque étape séparément et attribue "
+                    "les noms de fichiers à des observations précises. Cette présentation permet "
+                    "de distinguer une action confirmée d\u2019une hypothèse sur le comportement "
+                    "ultérieur. Les valeurs réservées servent à illustrer les zones de texte et "
+                    "les retours à la ligne du bulletin."
                 ),
             },
             {
                 "type": "paragraph",
                 "text": (
                     "Les opérateurs déposent le composant dans un répertoire décrit par la source. "
-                    "Le lancement dépend ensuite d’un mécanisme documenté, tandis que la durée de "
-                    "présence sur l’hôte demeure inconnue. Les détails disponibles ne justifient "
-                    "pas de conclure à une tâche planifiée, une clé de démarrage ou une modification "
-                    "de service. Un encadré ou un tableau sert à regrouper les faits qui peuvent être "
-                    "comparés, sans étendre la description au-delà des éléments rapportés."
+                    "Le lancement dépend ensuite d\u2019un mécanisme documenté, tandis que la "
+                    "durée de présence sur l\u2019hôte demeure inconnue. Les détails disponibles "
+                    "ne justifient pas de conclure à une tâche planifiée, une clé de démarrage ou "
+                    "de service. Un encadré ou un tableau regroupe les faits comparables sans "
+                    "étendre la description au-delà des éléments rapportés."
                 ),
             },
             {"type": "section_heading", "text": "Infrastructure et protocole C2"},
             {
                 "type": "paragraph",
                 "text": (
-                    "Le domaine et l’adresse du serveur sont présentés comme des indicateurs "
-                    "distincts. La frise conserve les deux dates exactes et ne suggère aucune "
-                    "activité entre ces observations. Le diagramme résume uniquement le passage "
-                    "du chargeur au module, puis l’échange réseau cité dans le rapport. Il ne "
+                    "Le domaine et l\u2019adresse du serveur sont présentés comme des "
+                    "indicateurs distincts. La frise conserve les deux dates exactes et ne suggère "
+                    "aucune activité entre ces observations. Le diagramme résume le passage du "
+                    "chargeur au module, puis l\u2019échange réseau cité dans le rapport. Il ne "
                     "représente ni résolution DNS non observée ni connexion supplémentaire."
                 ),
             },
@@ -404,24 +431,25 @@ async def test_m18_visual_article_and_brief_examples_compile_to_tmp(
                 "type": "paragraph",
                 "text": (
                     "Dans un bulletin réel, chaque flèche doit correspondre à une preuve attribuée "
-                    "et les nœuds doivent reprendre les noms donnés par les analystes. Les légendes "
-                    "françaises gardent des formulations courtes pour rester lisibles à l’impression. "
-                    "Les URL sont affichées défanguées dans la section IOC, tandis que les références "
-                    "restent cliquables. Les catégories distinguent l’adresse IP, l’URL, le domaine "
-                    "et les fichiers afin de faciliter la reprise des pivots de chasse."
+                    "et les nœuds doivent reprendre les noms donnés par les analystes. Les "
+                    "légendes françaises restent courtes pour rester lisibles à l\u2019impression. "
+                    "Les URL sont "
+                    "défanguées dans la section IOC et les références restent cliquables. Les "
+                    "catégories distinguent l\u2019adresse IP, l\u2019URL, le domaine et les "
+                    "fichiers "
+                    "de faciliter la reprise des pivots de chasse."
                 ),
             },
             {"type": "section_heading", "text": "Pivots de détection"},
             {
                 "type": "paragraph",
                 "text": (
-                    "Les pivots proposés dans cette page se limitent aux valeurs explicitement "
-                    "citées : nom de fichier, chemin, empreinte et destination réseau. Les équipes "
-                    "peuvent les confronter aux journaux disponibles et documenter séparément la "
-                    "fenêtre temporelle couverte. La présence d’un indicateur dans une source ne "
-                    "suffit pas à établir une activité sur un hôte particulier. Les observations "
-                    "négatives et les angles morts de la collecte doivent rester visibles dans "
-                    "l’analyse plutôt que d’être comblés par une hypothèse."
+                    "Les pivots proposés ici se limitent aux valeurs citées : nom de fichier, "
+                    "chemin, empreinte et destination réseau. Les équipes peuvent les confronter "
+                    "aux journaux disponibles et documenter séparément la fenêtre temporelle. La "
+                    "présence d\u2019un indicateur dans une source ne suffit pas à établir une "
+                    "sur un hôte. Les observations négatives et les angles morts doivent rester "
+                    "visibles dans l\u2019analyse plutôt que d\u2019être comblés par une hypothèse."
                 ),
             },
             {
@@ -432,12 +460,26 @@ async def test_m18_visual_article_and_brief_examples_compile_to_tmp(
                     "le tableau compare les composants, la figure source conserve son attribution "
                     "et le diagramme montre une relation technique ciblée. Cette combinaison donne "
                     "un exemple de densité éditoriale utilisable pour vérifier la pagination, les "
-                    "légendes et l’équilibre des espaces blancs sur plusieurs pages A4."
+                    "légendes et l\u2019équilibre des espaces blancs sur plusieurs pages A4."
                 ),
             },
         ]
     )
-    protocol_svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="640" height="180" viewBox="0 0 640 180"><rect x="12" y="45" width="170" height="82" rx="8" fill="#E8F0F0" stroke="#5D7374"/><text x="97" y="92" text-anchor="middle" font-family="sans-serif" font-size="18">Chargeur</text><path d="M182 86 H430" stroke="#5D7374" stroke-width="4" marker-end="url(#a)"/><rect x="430" y="45" width="195" height="82" rx="8" fill="#F1F1EF" stroke="#5D7374"/><text x="527" y="92" text-anchor="middle" font-family="sans-serif" font-size="18">Module réseau</text><defs><marker id="a" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8" fill="#5D7374"/></marker></defs></svg>'''.encode("utf-8")
+    protocol_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="180" '
+        'viewBox="0 0 640 180">'
+        '<rect x="12" y="45" width="170" height="82" rx="8" fill="#E8F0F0" '
+        'stroke="#5D7374"/>'
+        '<text x="97" y="92" text-anchor="middle" font-family="sans-serif" '
+        'font-size="18">Chargeur</text>'
+        '<path d="M182 86 H430" stroke="#5D7374" stroke-width="4" marker-end="url(#a)"/>'
+        '<rect x="430" y="45" width="195" height="82" rx="8" fill="#F1F1EF" '
+        'stroke="#5D7374"/>'
+        '<text x="527" y="92" text-anchor="middle" font-family="sans-serif" '
+        'font-size="18">Module réseau</text>'
+        '<defs><marker id="a" markerWidth="10" markerHeight="8" refX="8" refY="4" '
+        'orient="auto"><path d="M0 0 L10 4 L0 8" fill="#5D7374"/></marker></defs></svg>'
+    ).encode()
     article_pdf = await _compile(
         tmp_path=tmp_path / "rich-article",
         typst_binary=typst_binary,
@@ -468,7 +510,4 @@ async def test_m18_visual_article_and_brief_examples_compile_to_tmp(
 
     output = os.environ.get("M18_LI_ARTIFACT_DIR")
     if output:
-        output_root = Path(output)
-        output_root.mkdir(parents=True, exist_ok=True)
-        (output_root / "article-riche.pdf").write_bytes(article_pdf)
-        (output_root / "breve.pdf").write_bytes(brief_pdf)
+        _write_pdf_examples(Path(output), article_pdf, brief_pdf)
