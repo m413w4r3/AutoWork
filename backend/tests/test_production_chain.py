@@ -311,7 +311,7 @@ async def test_successful_stage_queues_the_next_one(
     assert uow.production_runs.items[run.id].current_stage is (ProductionStage.REFERENCES)
 
 
-async def test_brief_synthesis_queues_assembly_without_enrichment(
+async def test_brief_synthesis_queues_editorial_enrichment_before_assembly(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry, jobs, _ = _build(uow, monkeypatch, {"stage": "synthesis", "status": "success"})
@@ -340,9 +340,11 @@ async def test_brief_synthesis_queues_assembly_without_enrichment(
         context,  # type: ignore[arg-type]
     )
 
-    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.ASSEMBLY)]
-    assert run.current_stage is ProductionStage.ASSEMBLY
-    assert context.progress == [(5, 6)]
+    assert [job.kind for job in jobs.submitted] == [
+        stage_job_kind(ProductionStage.EDITORIAL_ENRICHMENT)
+    ]
+    assert run.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
+    assert context.progress == [(5, 7)]
 
 
 async def test_before_dispatch_does_not_cancel_a_duplicate_terminal_job() -> None:

@@ -279,11 +279,13 @@ def test_typst_article_timeline_uses_exact_iso_dates_and_french_display_dates() 
             "date_iso": "2026-03-12",
             "display_date_fr": "12 mars 2026",
             "text": "The first sample appeared.",
+            "semantic_spans": [{"style": "semantic-plain", "text": "The first sample appeared."}],
         },
         {
             "date_iso": "2026-04-01",
             "display_date_fr": "1er avril 2026",
             "text": "The implant was identified.",
+            "semantic_spans": [{"style": "semantic-plain", "text": "The implant was identified."}],
         },
     ]
 

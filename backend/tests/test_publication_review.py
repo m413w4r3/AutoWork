@@ -56,6 +56,7 @@ def test_read_model_retry_stage_uses_the_run_publication_kind() -> None:
             "extraction",
             "relevance_projection",
             "synthesis",
+            "editorial_enrichment",
             "publication",
         ],
         "routing_publication_kind": PublicationKind.BRIEF.value,

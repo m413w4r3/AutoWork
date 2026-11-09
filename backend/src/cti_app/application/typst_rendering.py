@@ -3635,8 +3635,20 @@ def compute_template_bundle_hash(
     return bundle.template_version, bundle.sha256
 
 
+def _is_full_date_text(date_text: str, event_date: date) -> bool:
+    """Whether the text is just another rendering of the exact day (any language)."""
+    numbers = {int(token) for token in re.findall(r"\d+", date_text)}
+    return event_date.year in numbers and event_date.day in numbers
+
+
 def _display_date(date_text: str | None, event_date: date | None) -> str:
-    if date_text and (event_date is None or date_text != event_date.isoformat()):
+    # A coarser label ("début janvier") is preserved; a full-date rendering in
+    # another language is replaced by the French rendering of the exact date.
+    if (
+        date_text
+        and (event_date is None or date_text != event_date.isoformat())
+        and (event_date is None or not _is_full_date_text(date_text, event_date))
+    ):
         return date_text
     if event_date is not None:
         day = "1er" if event_date.day == 1 else str(event_date.day)
