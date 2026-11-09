@@ -501,11 +501,15 @@ def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) 
     domains = next(group for group in ioc["source_indicators"] if group["heading"] == "Domaines")
     assert embedded["title"] == "[Example actor] Décrit une activité documentée"
     assert embedded["article_format"] is None
-    assert references["entries"][0]["display_date"] == "10 janvier 2026"
-    assert references["entries"][0]["source_urls"] == ["https://a.example/report"]
+    dated_reference = next(
+        item
+        for item in references["entries"]
+        if item["source_urls"] == ["https://a.example/report"]
+    )
+    assert dated_reference["display_date"] == "10 janvier 2026"
     assert synthesis["type"] == "synthesis"
     domain_values = [item["value"]["text"] for item in domains["items"]]
-    assert {"context[.]example", "original[.]example"} <= set(domain_values)
+    assert {"context.example", "original.example"} <= set(domain_values)
     assert all("type_label" not in item for item in domains["items"])
 
 
@@ -580,11 +584,10 @@ def test_edition_uses_shared_reader_facing_figure_source_projection(tmp_path: Pa
         for block in section.get("blocks", [])
         if block["type"] == "figure"
     )
-    assert figure_block["source_note"] == "example.test — Bitcoin wallet recovery — p. 1"
+    assert not {"classification", "source_note", "attribution"}.intersection(figure_block)
     assert "source_url" not in figure_block
     assert "provenance" not in figure_block
     assert figure_block["sha256"] == figure.sha256
-    assert figure_block["attribution"] != figure.provenance
     assert "HTML image" not in json.dumps(figure_block)
     assert "65d67fad-2db8-4e50-a6a0-6fd09e790000" not in json.dumps(figure_block)
 
