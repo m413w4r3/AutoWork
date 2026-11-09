@@ -536,11 +536,13 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
             "date_iso": "2025-01-12",
             "display_date_fr": "12 janvier 2025",
             "text": "Premier événement observé",
+            "semantic_spans": [{"style": "semantic-plain", "text": "Premier événement observé"}],
         },
         {
             "date_iso": "2025-01-16",
             "display_date_fr": "16 janvier 2025",
             "text": "Deuxième événement observé",
+            "semantic_spans": [{"style": "semantic-plain", "text": "Deuxième événement observé"}],
         },
     ]
     assert all(

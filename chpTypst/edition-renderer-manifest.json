@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v32-m19-regress",
+  "template_version": "chp-edition-v33-m19-review",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

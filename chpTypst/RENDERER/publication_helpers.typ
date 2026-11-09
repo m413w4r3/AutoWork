@@ -58,6 +58,7 @@
       #set par(leading: 0.65em, spacing: 0pt)
       #for (index, (label, field)) in visible-fields.enumerate() [
         #let value = if type(field) == str { field } else { field.at("text", default: "") }
+        #let semantic-spans = if type(field) == str { none } else { field.at("semantic_spans", default: none) }
         #block(below: if index < visible-fields.len() - 1 { 6pt } else { 0pt })[
           #grid(
             columns: (10pt, 1fr),
@@ -65,7 +66,7 @@
             [#text(size: 10pt)[•]],
             [
               #text(size: 10pt, weight: "bold", fill: purple)[#label : ]
-              #text(size: 10pt)[#value]
+              #text(size: 10pt)[#semantic-or-plain(value, semantic-spans)]
             ],
           )
         ]
@@ -1240,12 +1241,19 @@
   item,
   reference-scope: "",
   paragraph-gap: 0pt,
+  legacy-paragraph-spacing: false,
   article-style: false,
 ) = {
   let body = if item.type == "section_heading" {
     heading(level: 2)[#item.text]
   } else if item.type == "paragraph" {
-    [
+    if legacy-paragraph-spacing [
+      #block(above: 0pt, below: paragraph-gap)[
+        #semantic-or-plain(item.text, item.at("semantic_spans", default: none))
+        #if item.at("anchor_target", default: none) != none [#label(item.anchor_target)]
+      ]
+      #parbreak()
+    ] else [
       #semantic-or-plain(item.text, item.at("semantic_spans", default: none))
       #if item.at("anchor_target", default: none) != none [#label(item.anchor_target)]
       #parbreak()
@@ -1409,7 +1417,12 @@
       ] else [
         #render-section-heading[Synthèse]
         #for item in content_section.at("blocks", default: ()) {
-          render-body-block(item, reference-scope: reference-scope)
+          render-body-block(
+            item,
+            reference-scope: reference-scope,
+            paragraph-gap: 5pt,
+            legacy-paragraph-spacing: true,
+          )
         }
       ]
     ] else if content_section.type == "chronology" [
