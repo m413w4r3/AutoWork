@@ -40,7 +40,6 @@ from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
 from cti_app.api.typst_input_inspection import router as typst_input_inspection_router
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
@@ -73,12 +72,6 @@ from cti_app.application.edition_workspace import (
 )
 from cti_app.application.editions import EditionService
 from cti_app.application.goodware import GoodwareService
-from cti_app.application.http_collection import (
-    CollectionPolicy,
-    SafeHttpCollector,
-    SystemDnsResolver,
-    parse_domain_policy,
-)
 from cti_app.application.identity import (
     PROTECTED_APP_ENVIRONMENTS,
     IdentityScope,
@@ -122,6 +115,7 @@ from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
+from cti_app.infrastructure.collection_runtime import create_subject_collection_service
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.repositories.pdf_inspection import (
     SqlAlchemyPdfInspectionSourceRepository,
@@ -130,7 +124,6 @@ from cti_app.infrastructure.database.session import create_postgres_engine, crea
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.ghidra_mcp import create_ghidra_mcp_http_adapter
 from cti_app.infrastructure.health import InfrastructureReadinessChecker
-from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.investigation_runtime_ports import (
     build_investigation_runtime_composition_factory,
     create_external_effect_coordinator,
@@ -336,47 +329,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     manual_source_edit_service = ManualSourceEditService(
         uow_factory, model_gateway, cumulative_discovery_service
     )
-    collection_service = SubjectCollectionService(
-        uow_factory,
-        SafeHttpCollector(
-            AsyncioPinnedHttpTransport(),
-            SystemDnsResolver(),
-            CollectionPolicy(
-                max_redirects=settings.collection_max_redirects,
-                timeout_seconds=settings.collection_timeout_seconds,
-                max_download_bytes=settings.collection_max_download_bytes,
-                max_expanded_bytes=settings.collection_max_expanded_bytes,
-                max_decompression_ratio=settings.collection_max_decompression_ratio,
-                allowed_domains=parse_domain_policy(settings.collection_allowed_domains),
-                blocked_domains=parse_domain_policy(settings.collection_blocked_domains),
-            ),
-        ),
-        blob_store,
-        fetch_lease_seconds=settings.collection_fetch_lease_seconds,
-        workspace_materializer=SubjectWorkspaceMaterializer(blob_store),
-        workspace_root=settings.subject_workspace_root,
+    collection_service = create_subject_collection_service(
+        settings=settings,
+        uow_factory=uow_factory,
+        blob_store=blob_store,
         model_gateway=model_gateway,
-        fallback_variants_enabled=settings.collection_fallback_variants_enabled,
-        fallback_archive_enabled=settings.collection_fallback_archive_enabled,
-        fallback_bridge_enabled=settings.collection_fallback_bridge_enabled,
-        fallback_max_variants=settings.collection_fallback_max_variants,
-        fallback_strategy_flags=settings.collection_acquisition_strategy_enabled,
-        fallback_strategy_timeouts=settings.collection_acquisition_strategy_timeout_seconds,
-        fallback_min_text_chars=settings.collection_fallback_min_text_chars,
-        fallback_playwright_sidecar_url=settings.collection_playwright_sidecar_url or None,
-        acquisition_deadline_seconds=settings.collection_acquisition_deadline_seconds,
-        acquisition_max_attempts=settings.collection_acquisition_max_attempts,
-        acquisition_per_domain_concurrency=settings.collection_acquisition_per_domain_concurrency,
-        fallback_endpoint_enabled=settings.collection_fallback_endpoint_enabled,
-        browser_navigation_enabled=settings.collection_browser_navigation_enabled,
-        browser_control_socket=settings.collection_browser_control_socket,
-        syndication_domains=settings.collection_syndication_domains,
-        exact_title_search_endpoint=settings.collection_exact_title_search_endpoint,
-        third_party_provider_url=settings.collection_third_party_provider_url,
-        third_party_provider_token=settings.collection_third_party_provider_token,
-        third_party_provider_enabled=settings.collection_third_party_provider_enabled,
-        ocr_command=settings.collection_ocr_command,
-        newsletter_archive_endpoint=settings.collection_official_newsletter_archive_endpoint,
     )
     collection_review_service = CollectionReviewService(
         uow_factory,
