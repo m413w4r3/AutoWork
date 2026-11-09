@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -68,7 +68,10 @@ from cti_app.domain.production_references import (
     ProductionSourceCriticalityReason,
 )
 from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
-from cti_app.domain.production_synthesis import ExtractionEvidenceRefV1
+from cti_app.domain.production_synthesis import (
+    ExtractionEvidenceRefV1,
+    source_metadata_evidence_ref_v1,
+)
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationEvidenceKind,
@@ -2441,9 +2444,9 @@ class PublicationIOCValueV1:
             "evidence_refs",
             _validate_article_format_evidence_refs(self.evidence_refs, "Article IOC"),
         )
-        if not {
-            ref.source_document_id for ref in self.evidence_refs
-        } <= set(self.source_document_ids):
+        if not {ref.source_document_id for ref in self.evidence_refs} <= set(
+            self.source_document_ids
+        ):
             raise ValueError("Article IOC evidence refs must belong to one of its source documents")
 
 
@@ -2520,9 +2523,7 @@ def select_article_timeline_key_events_v1(
     timeline: tuple[PublicationTimelineEntryV1, ...],
 ) -> tuple[TimelineKeyEventV1, ...]:
     """Apply the canonical ARTICLE timeline selection and eight-event cap."""
-    deduplicated: dict[
-        tuple[date, str], tuple[str, set[PublicationEvidenceRefV1]]
-    ] = {}
+    deduplicated: dict[tuple[date, str], tuple[str, set[PublicationEvidenceRefV1]]] = {}
     for entry in timeline:
         if entry.event_date is None or not entry.evidence_refs:
             continue
@@ -2570,6 +2571,179 @@ def select_article_timeline_key_events_v1(
         ),
     )[: ARTICLE_FORMAT_TIMELINE_MAX_EVENTS - 2]
     selected = [first, last, *prioritized]
+    selected.sort(key=lambda event: (event.event_date, normalize_article_format_text(event.text)))
+    return tuple(selected)
+
+
+def build_publication_date_events(
+    sources: Iterable[PublicationSourceV1],
+) -> tuple[TimelineKeyEventV1, ...]:
+    """Build dated source-publication events from complete frozen source metadata.
+
+    A source contributes only when ``published_at``, title and publisher are
+    present, allowing the matching SOURCE_METADATA evidence key to be derived
+    with the shared canonical metadata algorithm. Equal date/text events merge
+    their evidence refs in deterministic order. This helper does not apply the
+    visible-timeline threshold; callers should use
+    ``select_publication_timeline_key_events_v2`` for the final 2-distinct-date
+    gate and eight-event cap.
+    """
+    deduplicated: dict[tuple[date, str], tuple[str, set[PublicationEvidenceRefV1]]] = {}
+    ordered_sources = sorted(
+        sources,
+        key=lambda source: (
+            source.published_at is None,
+            source.published_at or date.max,
+            source.canonical_url,
+            str(source.source_document_id),
+        ),
+    )
+    for source in ordered_sources:
+        if (
+            not isinstance(source, PublicationSourceV1)
+            or source.published_at is None
+            or not isinstance(source.title, str)
+            or not source.title.strip()
+            or not isinstance(source.publisher, str)
+            or not source.publisher.strip()
+        ):
+            continue
+        metadata_ref = source_metadata_evidence_ref_v1(
+            source_document_id=source.source_document_id,
+            canonical_url=source.canonical_url,
+            title=source.title,
+            publisher=source.publisher,
+            published_at=source.published_at,
+        )
+        publisher = " ".join(source.publisher.split())
+        title = " ".join(source.title.split())
+        if len(title) > 96:
+            title_prefix = title[:95].rsplit(" ", 1)[0] or title[:95]
+            title = title_prefix.rstrip(" ,;:") + "…"
+        event_text = f"Publication par {publisher} : {title}."
+        key = (source.published_at, normalize_article_format_text(event_text))
+        evidence_ref = PublicationEvidenceRefV1(
+            source_document_id=metadata_ref.source_document_id,
+            kind=PublicationEvidenceKind(metadata_ref.kind.value),
+            evidence_key=metadata_ref.evidence_key,
+        )
+        existing = deduplicated.get(key)
+        if existing is None:
+            deduplicated[key] = (event_text, {evidence_ref})
+        else:
+            text, refs = existing
+            refs.add(evidence_ref)
+            stable_text = min((text, event_text), key=lambda value: (value.casefold(), value))
+            deduplicated[key] = (stable_text, refs)
+
+    events = [
+        TimelineKeyEventV1(
+            event_date=event_date,
+            text=text,
+            evidence_refs=tuple(
+                sorted(
+                    refs,
+                    key=lambda ref: (
+                        str(ref.source_document_id),
+                        ref.kind.value,
+                        ref.evidence_key,
+                    ),
+                )
+            ),
+        )
+        for (event_date, _normalized_text), (text, refs) in deduplicated.items()
+    ]
+    events.sort(key=lambda event: (event.event_date, normalize_article_format_text(event.text)))
+    return tuple(events)
+
+
+def select_publication_timeline_key_events_v2(
+    timeline: Iterable[PublicationTimelineEntryV1],
+    sources: Iterable[PublicationSourceV1] = (),
+) -> tuple[TimelineKeyEventV1, ...]:
+    """Select publication chronology v2 with metadata dates and a distinct-date gate.
+
+    Canonical, evidenced timeline events are combined with source publication
+    events. A SOURCE_METADATA ref already present for the same source/date
+    covers that source's publication event, avoiding a duplicate. The visible
+    frise is empty unless at least two distinct dates remain, then retains the
+    deterministic eight-event cap used by the historical selector. This public
+    function is shared by ARTICLE projection and the BRIEF builder.
+    """
+    timeline_entries = tuple(timeline)
+    deduplicated: dict[tuple[date, str], tuple[str, set[PublicationEvidenceRefV1]]] = {}
+    existing_metadata_refs = {
+        (entry.event_date, ref.source_document_id, ref.evidence_key)
+        for entry in timeline_entries
+        if entry.event_date is not None
+        for ref in entry.evidence_refs
+        if ref.kind is PublicationEvidenceKind.SOURCE_METADATA
+    }
+
+    def add_event(
+        event_date: date,
+        text: str,
+        evidence_refs: Iterable[PublicationEvidenceRefV1],
+    ) -> None:
+        key = (event_date, normalize_article_format_text(text))
+        refs = set(evidence_refs)
+        existing = deduplicated.get(key)
+        if existing is None:
+            deduplicated[key] = (text, refs)
+            return
+        old_text, old_refs = existing
+        old_refs.update(refs)
+        stable_text = min((old_text, text), key=lambda value: (value.casefold(), value))
+        deduplicated[key] = (stable_text, old_refs)
+
+    for entry in timeline_entries:
+        if entry.event_date is None or not entry.evidence_refs:
+            continue
+        add_event(entry.event_date, entry.text, entry.evidence_refs)
+
+    for event in build_publication_date_events(sources):
+        evidence_refs = tuple(
+            ref
+            for ref in event.evidence_refs
+            if (event.event_date, ref.source_document_id, ref.evidence_key)
+            not in existing_metadata_refs
+        )
+        if evidence_refs:
+            add_event(event.event_date, event.text, evidence_refs)
+
+    events = [
+        TimelineKeyEventV1(
+            event_date=event_date,
+            text=text,
+            evidence_refs=tuple(
+                sorted(
+                    refs,
+                    key=lambda ref: (
+                        str(ref.source_document_id),
+                        ref.kind.value,
+                        ref.evidence_key,
+                    ),
+                )
+            ),
+        )
+        for (event_date, _normalized_text), (text, refs) in deduplicated.items()
+    ]
+    events.sort(key=lambda event: (event.event_date, normalize_article_format_text(event.text)))
+    if len({event.event_date for event in events}) < 2:
+        return ()
+    if len(events) <= ARTICLE_FORMAT_TIMELINE_MAX_EVENTS:
+        return tuple(events)
+
+    first, last = events[0], events[-1]
+    interior = sorted(
+        events[1:-1],
+        key=lambda event: (
+            -len({ref.source_document_id for ref in event.evidence_refs}),
+            event.event_date,
+            normalize_article_format_text(event.text),
+        ),
+    )[: ARTICLE_FORMAT_TIMELINE_MAX_EVENTS - 2]
+    selected = [first, last, *interior]
     selected.sort(key=lambda event: (event.event_date, normalize_article_format_text(event.text)))
     return tuple(selected)
 
@@ -2658,8 +2832,7 @@ def _article_format_to_json(value: ArticleFormatV1 | None) -> dict[str, Any] | N
         ],
         "ioc_categories": {
             category: [
-                _article_ioc_value_to_json(item)
-                for item in getattr(value.ioc_categories, category)
+                _article_ioc_value_to_json(item) for item in getattr(value.ioc_categories, category)
             ]
             for category in ("ips", "urls", "domains", "files")
         },
@@ -2749,8 +2922,15 @@ class PublicationDocumentV8:
         expected_overview = extract_article_overview(base_v5.document.sections)
         if self.article_format.overview != expected_overview:
             raise ValueError("ArticleFormat overview must be extracted from the canonical section")
-        expected_timeline = select_article_timeline_key_events_v1(base_v5.document.timeline)
-        if self.article_format.timeline_key_events != expected_timeline:
+        historical_timeline = select_article_timeline_key_events_v1(base_v5.document.timeline)
+        current_timeline = select_publication_timeline_key_events_v2(
+            base_v5.document.timeline,
+            base_v5.document.sources,
+        )
+        if self.article_format.timeline_key_events not in (
+            historical_timeline,
+            current_timeline,
+        ):
             raise ValueError("ArticleFormat timeline must match deterministic canonical selection")
         known_source_ids = {source.source_document_id for source in base_v5.document.sources}
         for category in ("ips", "urls", "domains", "files"):
@@ -3250,6 +3430,7 @@ __all__ = [
     "PublicationTableRowV1",
     "PublicationTableV1",
     "TimelineKeyEventV1",
+    "build_publication_date_events",
     "extract_article_overview",
     "is_article_overview_heading",
     "normalize_article_format_text",
@@ -3269,6 +3450,7 @@ __all__ = [
     "publication_document_v8_from_json",
     "publication_document_v8_to_json",
     "select_article_timeline_key_events_v1",
+    "select_publication_timeline_key_events_v2",
     "serialize_publication_document",
     "validate_publication_document",
 ]

@@ -9,6 +9,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
+from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -27,11 +28,15 @@ from cti_app.application.production_normalization import (
     normalize_indicator_value,
     normalize_publication_indicator_value,
     publication_indicator_identity_key,
+    refang,
 )
 from cti_app.application.protocol_diagram_projection import (
     PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
 )
-from cti_app.application.publication_builder import select_article_timeline_key_events
+from cti_app.application.publication_builder import (
+    publication_reference_fallback_text,
+    select_article_timeline_key_events,
+)
 from cti_app.application.publication_secret_guard import guard_publication_render_data
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.analyst_opinion import (
@@ -56,8 +61,10 @@ from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKi
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import (
     ArtifactType,
+    PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationSourceV1,
+    PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
@@ -78,6 +85,7 @@ from cti_app.domain.publication_document import (
     is_article_overview_heading,
     publication_document_text_anchors,
     publication_document_v5_sha256,
+    select_publication_timeline_key_events_v2,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ROLE_TYPST_FUNCTION_V1,
@@ -85,9 +93,10 @@ from cti_app.domain.semantic_annotation import (
     section_paragraph_anchor,
     timeline_anchor,
 )
+from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v33 adds the canonical article-format projection shared with edition renders.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v33-article-format"
+# v34 adds the M19 references, IOC, and timeline reader projection.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v34-m19-format"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -250,12 +259,230 @@ def _display_article_ioc_value(
         return value
     try:
         return display_publication_indicator_value(
-            normalized_value,
+            _projection_refang(normalized_value),
             artifact_type,
-            defanged=True,
+            defanged=False,
         )
     except ValueError:
         return None if artifact_type is ArtifactType.URL else value
+
+
+_DEFANGED_DOT_WORD = re.compile(r"\[dot\]", re.IGNORECASE)
+_REFERENCE_URL_TEXT = re.compile(
+    r"(?:(?:https?|hxxps?)(?::|\[:\])//|www\.)[^\s<>\"']+|"
+    r"(?<![\w.-])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/[^\s<>\"']*",
+    re.IGNORECASE,
+)
+_REFERENCE_ISO_DATE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
+_REFERENCE_NUMERIC_DATE = re.compile(
+    r"(?<!\d)(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|"
+    r"\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)"
+)
+_REFERENCE_FRENCH_DATE = re.compile(
+    r"(?<!\d)(?:le\s+)?(?:1er|\d{1,2})\s+(?:janvier|février|mars|avril|mai|juin|juillet|août|"
+    r"septembre|octobre|novembre|décembre)\s+\d{4}(?!\d)",
+    re.IGNORECASE,
+)
+_REFERENCE_ENGLISH_DATE = re.compile(
+    r"(?<!\d)(?:(?:1st|2nd|3rd|\d{1,2})(?:\s+of)?\s+"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"|(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?[,]?)\s+\d{4}(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def _projection_refang(value: str) -> str:
+    """Use the shared refanger, with the publication alias ``[dot]`` normalized."""
+    return refang(_DEFANGED_DOT_WORD.sub("[.]", value))
+
+
+def _publication_refang_pairs(
+    document: PublicationDocumentV4,
+    publication_v5: PublicationDocumentV5 | None,
+    publication_v8: PublicationDocumentV8 | None,
+) -> tuple[tuple[str, str], ...]:
+    """Collect exact display replacements only from IOCs in this publication."""
+    indicators: list[tuple[ArtifactType, str, str]] = []
+    for group in document.indicators:
+        indicators.extend(
+            (item.artifact_type, item.value, item.normalized_value) for item in group.indicators
+        )
+    if publication_v5 is not None:
+        for group in publication_v5.original_indicators:
+            indicators.extend(
+                (item.artifact_type, item.value, item.normalized_value) for item in group.indicators
+            )
+        indicators.extend(
+            (item.artifact_type, item.value, item.normalized_value)
+            for item in publication_v5.ioc_details
+        )
+    if publication_v8 is not None and publication_v8.article_format is not None:
+        categories = publication_v8.article_format.ioc_categories
+        indicators.extend(
+            (ArtifactType.IP, item.value, item.normalized_value) for item in categories.ips
+        )
+        indicators.extend(
+            (ArtifactType.URL, item.value, item.normalized_value) for item in categories.urls
+        )
+        indicators.extend(
+            (ArtifactType.DOMAIN, item.value, item.normalized_value) for item in categories.domains
+        )
+        indicators.extend(
+            (ArtifactType.HASH, item.value, item.normalized_value) for item in categories.files
+        )
+
+    replacements: dict[str, str] = {}
+    for artifact_type, value, normalized_value in indicators:
+        for raw in (value, normalized_value):
+            restored = _projection_refang(raw)
+            if restored != raw:
+                replacements.setdefault(raw, restored)
+        try:
+            canonical = normalize_publication_indicator_value(
+                _projection_refang(normalized_value), artifact_type
+            )
+            restored = display_publication_indicator_value(canonical, artifact_type, defanged=False)
+            defanged = display_publication_indicator_value(canonical, artifact_type, defanged=True)
+        except ValueError:
+            continue
+        if defanged != restored:
+            replacements.setdefault(defanged, restored)
+    return tuple(sorted(replacements.items(), key=lambda item: (-len(item[0]), item[0].casefold())))
+
+
+def _replacement_offset_map(before: str, after: str) -> tuple[int, ...]:
+    """Map every old string boundary to a deterministic boundary in new text."""
+    mapping: list[int | None] = [None] * (len(before) + 1)
+    matcher = SequenceMatcher(a=before, b=after, autojunk=False)
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if operation == "equal":
+            for offset in range(old_end - old_start + 1):
+                mapping[old_start + offset] = new_start + offset
+        elif operation == "delete":
+            for boundary in range(old_start, old_end + 1):
+                mapping[boundary] = new_start
+        elif operation == "insert":
+            mapping[old_start] = new_end
+        else:
+            old_width = old_end - old_start
+            new_width = new_end - new_start
+            for offset in range(old_width + 1):
+                mapping[old_start + offset] = new_start + round(offset * new_width / old_width)
+    mapping[0] = 0
+    mapping[-1] = len(after)
+    previous = 0
+    for index, value in enumerate(mapping):
+        if value is None:
+            mapping[index] = previous
+        else:
+            previous = value
+    return tuple(int(value) for value in mapping)
+
+
+def _refang_known_iocs(
+    text: str,
+    replacements: tuple[tuple[str, str], ...],
+) -> tuple[str, tuple[int, ...]]:
+    """Refang exact known IOC spellings and return an old-to-new offset map."""
+    if not replacements:
+        return text, tuple(range(len(text) + 1))
+    replacement_by_casefold = {source.casefold(): target for source, target in replacements}
+    alternatives = sorted(replacement_by_casefold, key=lambda item: (-len(item), item))
+    expression = re.compile(
+        r"(?<![A-Za-z0-9._-])(?:"
+        + "|".join(re.escape(item) for item in alternatives)
+        + r")(?![A-Za-z0-9_-]|\.(?=[A-Za-z0-9]))",
+        re.IGNORECASE,
+    )
+    matches = tuple(expression.finditer(text))
+    if not matches:
+        return text, tuple(range(len(text) + 1))
+
+    output: list[str] = []
+    offsets: list[int | None] = [None] * (len(text) + 1)
+    old_cursor = 0
+    new_cursor = 0
+    for match in matches:
+        prefix = text[old_cursor : match.start()]
+        output.append(prefix)
+        for index in range(len(prefix) + 1):
+            offsets[old_cursor + index] = new_cursor + index
+        new_cursor += len(prefix)
+        original = match.group(0)
+        restored = replacement_by_casefold[original.casefold()]
+        output.append(restored)
+        local_offsets = _replacement_offset_map(original, restored)
+        for index, new_offset in enumerate(local_offsets):
+            offsets[match.start() + index] = new_cursor + new_offset
+        old_cursor = match.end()
+        new_cursor += len(restored)
+    suffix = text[old_cursor:]
+    output.append(suffix)
+    for index in range(len(suffix) + 1):
+        offsets[old_cursor + index] = new_cursor + index
+    offsets[0] = 0
+    offsets[-1] = new_cursor + len(suffix)
+    previous = 0
+    for index, offset in enumerate(offsets):
+        if offset is None:
+            offsets[index] = previous
+        else:
+            previous = offset
+    return "".join(output), tuple(int(offset) for offset in offsets)
+
+
+def _reader_reference_note(value: str, source: PublicationSourceV1 | None = None) -> str:
+    """Remove display-only dates and literal links from a source-note sentence."""
+    text = value
+    if source is not None:
+        bare_url = re.sub(r"^https?://", "", source.canonical_url, flags=re.IGNORECASE)
+        for candidate in (source.canonical_url, bare_url):
+            text = re.sub(re.escape(candidate), " ", text, flags=re.IGNORECASE)
+    text = _REFERENCE_URL_TEXT.sub(" ", text)
+    text = _REFERENCE_ISO_DATE.sub(" ", text)
+    text = _REFERENCE_NUMERIC_DATE.sub(" ", text)
+    text = _REFERENCE_FRENCH_DATE.sub(" ", text)
+    text = _REFERENCE_ENGLISH_DATE.sub(" ", text)
+    text = re.sub(r"\s+([,;:!?])", r"\1", text)
+    text = re.sub(r"(?:\s*[.,;:!?]){2,}", ".", text)
+    text = re.sub(r"\s+([.])\s*$", r"\1", text)
+    text = " ".join(text.split()).strip(" ,;:")
+    if len(text) > 260:
+        text = text[:259].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    return text
+
+
+def _reader_reference_fallback(source: PublicationSourceV1) -> str:
+    """Sanitize the canonical fallback into a short sentence for reader JSON."""
+    title = (source.title or "").strip()
+    if not title or _REFERENCE_URL_TEXT.fullmatch(title):
+        publisher = (source.publisher or "").strip()
+        if not publisher:
+            publisher = (urlsplit(source.canonical_url).hostname or "").removeprefix("www.")
+        publisher = _reader_reference_note(publisher, source) or "la source"
+        return f"Publication par {publisher}."
+    return _reader_reference_note(publication_reference_fallback_text(source), source)
+
+
+def _publication_timeline_from_synthesis(entries: Any) -> tuple[PublicationTimelineEntryV1, ...]:
+    """Adapt draft synthesis events to publication evidence refs for projection."""
+    return tuple(
+        PublicationTimelineEntryV1(
+            event_date=entry.event_date,
+            date_text=entry.date_text,
+            text=entry.text,
+            evidence_refs=tuple(
+                PublicationEvidenceRefV1(
+                    source_document_id=ref.source_document_id,
+                    kind=PublicationEvidenceKind(ref.kind.value),
+                    evidence_key=ref.evidence_key,
+                )
+                for ref in entry.evidence_refs
+            ),
+        )
+        for entry in entries
+    )
 
 
 def _project_article_format_render_data(
@@ -264,6 +491,7 @@ def _project_article_format_render_data(
     publication_v5: PublicationDocumentV5 | None,
     publication_v8: PublicationDocumentV8 | None,
     brief: bool,
+    refang_replacements: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, Any] | None:
     """Project ArticleFormatV1 with a deterministic V4-V7 fallback."""
     if brief:
@@ -271,7 +499,13 @@ def _project_article_format_render_data(
     canonical = publication_v8.article_format if publication_v8 is not None else None
     if canonical is not None:
         overview = canonical.overview
-        timeline = canonical.timeline_key_events
+        if publication_v5 is None:
+            timeline = canonical.timeline_key_events
+        else:
+            timeline = select_publication_timeline_key_events_v2(
+                publication_v5.document.timeline,
+                publication_v5.document.sources,
+            )
         category_values: dict[str, list[tuple[str, str, ArtifactType | None]]] = {
             "ips": [
                 (item.value, item.normalized_value, ArtifactType.IP)
@@ -286,12 +520,17 @@ def _project_article_format_render_data(
                 for item in canonical.ioc_categories.domains
             ],
             "files": [
-                (item.value, item.normalized_value, None) for item in canonical.ioc_categories.files
+                (item.value, item.normalized_value, ArtifactType.HASH)
+                for item in canonical.ioc_categories.files
+                if is_supported_publication_ioc_hash(ArtifactType.HASH, item.normalized_value)
             ],
         }
     else:
         overview = extract_article_overview(document.sections)
-        timeline = select_article_timeline_key_events(document.timeline)
+        timeline = select_article_timeline_key_events(
+            document.timeline,
+            publication_v5.document.sources if publication_v5 is not None else (),
+        )
         category_candidates: dict[tuple[str, str], tuple[str, str, ArtifactType]] = {}
 
         def add_legacy_ioc(artifact_type: ArtifactType, value: str, normalized_value: str) -> None:
@@ -339,18 +578,25 @@ def _project_article_format_render_data(
             normalized,
             artifact_type,
         ) in category_candidates.items():
+            if category == "files" and artifact_type is not ArtifactType.HASH:
+                continue
             category_values[category].append((value, normalized, artifact_type))
         for values in category_values.values():
             values.sort(key=lambda item: (item[1].casefold(), item[0].casefold(), item[0]))
 
     overview_render: dict[str, Any] | None = None
     if overview is not None:
+
+        def overview_field(value: Any) -> dict[str, str]:
+            text, _offsets = _refang_known_iocs(value.text, refang_replacements)
+            return {"text": text}
+
         overview_render = {
-            "victimology": {"text": overview.victimology.text}
+            "victimology": overview_field(overview.victimology)
             if overview.victimology is not None
             else None,
-            "arsenal": {"text": overview.arsenal.text} if overview.arsenal is not None else None,
-            "main_objective": {"text": overview.main_objective.text}
+            "arsenal": overview_field(overview.arsenal) if overview.arsenal is not None else None,
+            "main_objective": overview_field(overview.main_objective)
             if overview.main_objective is not None
             else None,
         }
@@ -359,7 +605,7 @@ def _project_article_format_render_data(
         {
             "date_iso": event.event_date.isoformat(),
             "display_date_fr": _display_date(None, event.event_date),
-            "text": event.text,
+            "text": _refang_known_iocs(event.text, refang_replacements)[0],
         }
         for event in timeline
     ]
@@ -645,19 +891,22 @@ def publication_content_section_types(
         )
         else None
     )
+    timeline_entries = document.timeline
     if draft_preview is not None and draft_preview.synthesis is not None:
+        timeline_entries = _publication_timeline_from_synthesis(draft_preview.synthesis.timeline)
         has_limitations = bool(draft_preview.synthesis.uncertainties)
-        has_legacy_chronology = (
-            bool(draft_preview.synthesis.timeline) or timeline_figure is not None
-        )
     else:
         has_limitations = False
-        has_legacy_chronology = bool(document.timeline) or timeline_figure is not None
+    if opinion_document and not brief_document:
+        has_legacy_chronology = bool(timeline_entries) or timeline_figure is not None
+    else:
+        has_legacy_chronology = bool(
+            select_publication_timeline_key_events_v2(timeline_entries, document.sources)
+        )
     # Articles use article_format; opinions and requested BRIEF renders keep
     # this legacy chronology section.
     if has_legacy_chronology and (
-        (opinion_document and not brief_document)
-        or (brief_document and include_brief_chronology)
+        (opinion_document and not brief_document) or (brief_document and include_brief_chronology)
     ):
         section_types.append("chronology")
     section_types.append("synthesis")
@@ -1517,6 +1766,11 @@ def project_publication_to_typst_model(
     else:
         raise ValueError("Unsupported canonical publication document")
 
+    refang_replacements = _publication_refang_pairs(
+        document,
+        publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None,
+        publication_v8,
+    )
     article_format_render = _project_article_format_render_data(
         document=document,
         publication_v5=(
@@ -1524,30 +1778,39 @@ def project_publication_to_typst_model(
         ),
         publication_v8=publication_v8,
         brief=is_brief(value) or opinion_document,
+        refang_replacements=refang_replacements,
     )
 
-    def semantic_spans(anchor: str, text: str) -> list[dict[str, str]] | None:
+    def project_text(anchor: str, text: str) -> tuple[str, list[dict[str, Any]] | None]:
         paragraph = semantic_by_anchor.get(anchor)
         if paragraph is None:
-            return None
+            display_text, _offsets = _refang_known_iocs(text, refang_replacements)
+            return display_text, None
         if paragraph.text != text:
             raise ValueError(f"Semantic text differs from publication content at {anchor}")
+        display_text, offsets = _refang_known_iocs(text, refang_replacements)
         result: list[dict[str, Any]] = []
+        source_offset = 0
         for span in paragraph.spans:
+            source_start = source_offset
+            source_offset += len(span.text)
+            projected_text = display_text[offsets[source_start] : offsets[source_offset]]
             projected_span: dict[str, Any] = {
                 "style": SEMANTIC_ROLE_TYPST_FUNCTION_V1[span.role],
-                "text": span.text,
+                "text": projected_text,
             }
             if span.role.value in _BREAKABLE_SEMANTIC_ROLES:
-                breakable_text = _breakable_typst_display_text(span.text)
+                breakable_text = _breakable_typst_display_text(projected_text)
                 projected_span["break_chunks"] = breakable_text["break_chunks"]
                 if "break_after" in breakable_text:
                     projected_span["break_after"] = breakable_text["break_after"]
             result.append(projected_span)
-        return result
+        return display_text, result
 
     def rich_block(block: dict[str, Any], field_name: str, anchor: str, text: str) -> None:
-        spans = semantic_spans(anchor, text)
+        display_text, spans = project_text(anchor, text)
+        base_field = field_name.removeprefix("semantic_")
+        block[base_field] = display_text
         if spans is not None:
             block[field_name] = spans
 
@@ -1597,27 +1860,36 @@ def project_publication_to_typst_model(
         rich_block(block, "semantic_title", f"table:{table.key}:title", table.title)
         if table.caption is not None:
             rich_block(block, "semantic_caption", f"table:{table.key}:caption", table.caption)
-        column_spans = [
-            semantic_spans(f"table:{table.key}:column:{column_index:04d}", column.label)
-            for column_index, column in enumerate(table.columns, start=1)
-        ]
+        column_spans = []
+        for column_index, column in enumerate(table.columns, start=1):
+            display_label, spans = project_text(
+                f"table:{table.key}:column:{column_index:04d}", column.label
+            )
+            block["columns"][column_index - 1] = display_label
+            column_spans.append(spans)
         if column_spans and all(item is not None for item in column_spans):
             block["semantic_columns"] = column_spans
-        cell_spans = [
-            _table_cell_render_spans(
-                cell,
-                semantic_spans(
+        cell_spans = []
+        for row_index, row in enumerate(table.rows, start=1):
+            for cell_index, cell in enumerate(row.cells, start=1):
+                display_cell, spans = project_text(
                     f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}",
                     cell,
-                ),
-            )
-            for row_index, row in enumerate(table.rows, start=1)
-            for cell_index, cell in enumerate(row.cells, start=1)
-        ]
+                )
+                block["rows"][row_index - 1][cell_index - 1] = display_cell
+                cell_spans.append(_table_cell_render_spans(display_cell, spans))
         if cell_spans:
             # Keep the renderer's flat row-cell sequence; each entry is one cell's
             # semantic spans, not a recursively flattened span array.
             block["semantic_cells"] = cell_spans
+        if "card_display_cells" in block:
+            block["card_display_cells"] = [
+                [
+                    _component_path_display_text(cell) if "/" in cell or "\\" in cell else None
+                    for cell in row
+                ]
+                for row in block["rows"]
+            ]
         add_rich(
             table.placement.kind,
             table.placement.section_index,
@@ -1749,6 +2021,7 @@ def project_publication_to_typst_model(
             notes_by_anchor.setdefault(observation.anchor, []).append(note)
 
     def append_paragraph(text: str, anchor: str) -> None:
+        display_text, spans = project_text(anchor, text)
         anchor_target = (
             "publication-paragraph-" + hashlib.sha256(anchor.encode("utf-8")).hexdigest()[:20]
             if anchor in body_anchor_texts
@@ -1757,13 +2030,9 @@ def project_publication_to_typst_model(
         body_blocks.append(
             {
                 "type": "paragraph",
-                "text": text,
+                "text": display_text,
                 **({"anchor_target": anchor_target} if anchor_target is not None else {}),
-                **(
-                    {"semantic_spans": spans}
-                    if (spans := semantic_spans(anchor, text)) is not None
-                    else {}
-                ),
+                **({"semantic_spans": spans} if spans is not None else {}),
             }
         )
         body_blocks.extend(notes_by_anchor.get(anchor, ()))
@@ -1773,9 +2042,7 @@ def project_publication_to_typst_model(
         append_paragraph(lead_paragraph.text, lead_paragraph_anchor(index))
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
     overview_render = (
-        article_format_render.get("overview")
-        if article_format_render is not None
-        else None
+        article_format_render.get("overview") if article_format_render is not None else None
     )
     has_projected_overview = isinstance(overview_render, dict) and any(
         value is not None for value in overview_render.values()
@@ -1793,7 +2060,8 @@ def project_publication_to_typst_model(
             if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
         ]
         if section.heading and paragraph_blocks:
-            body_blocks.append({"type": "section_heading", "text": section.heading})
+            display_heading, _heading_spans = project_text("", section.heading)
+            body_blocks.append({"type": "section_heading", "text": display_heading})
         for paragraph_index, paragraph in paragraph_blocks:
             append_paragraph(
                 paragraph.text,
@@ -1810,25 +2078,51 @@ def project_publication_to_typst_model(
             figure_number += 1
             block["figure_number"] = figure_number
 
+    source_timeline_entries = document.timeline
+    if draft_preview is not None and draft_preview.synthesis is not None:
+        source_timeline_entries = _publication_timeline_from_synthesis(
+            draft_preview.synthesis.timeline
+        )
+
     timeline: list[dict[str, Any]] = []
-    for index, publication_timeline_entry in enumerate(document.timeline, start=1):
-        timeline_row: dict[str, Any] = {
-            "display_date": _display_date(
-                publication_timeline_entry.date_text, publication_timeline_entry.event_date
-            ),
-            "text": publication_timeline_entry.text,
-            "source_urls": _timeline_source_urls(
-                publication_timeline_entry.evidence_refs, sources_by_id
-            ),
-            "source_document_ids": [
-                str(reference.source_document_id)
-                for reference in publication_timeline_entry.evidence_refs
-            ],
+    if opinion_document:
+        for index, entry in enumerate(source_timeline_entries, start=1):
+            display_text, spans = project_text(timeline_anchor(index), entry.text)
+            timeline_row: dict[str, Any] = {
+                "display_date": _display_date(entry.date_text, entry.event_date),
+                "text": display_text,
+                "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
+                "source_document_ids": [
+                    str(reference.source_document_id) for reference in entry.evidence_refs
+                ],
+            }
+            if spans is not None:
+                timeline_row["semantic_spans"] = spans
+            timeline.append(timeline_row)
+    else:
+        selected_timeline = select_publication_timeline_key_events_v2(
+            source_timeline_entries,
+            document.sources,
+        )
+        source_anchor_by_event = {
+            (entry.event_date, entry.text): timeline_anchor(index)
+            for index, entry in enumerate(document.timeline, start=1)
+            if entry.event_date is not None
         }
-        spans = semantic_spans(timeline_anchor(index), publication_timeline_entry.text)
-        if spans is not None:
-            timeline_row["semantic_spans"] = spans
-        timeline.append(timeline_row)
+        for event in selected_timeline:
+            anchor = source_anchor_by_event.get((event.event_date, event.text), "")
+            display_text, spans = project_text(anchor, event.text)
+            timeline_row = {
+                "display_date": _display_date(None, event.event_date),
+                "text": display_text,
+                "source_urls": _timeline_source_urls(event.evidence_refs, sources_by_id),
+                "source_document_ids": [
+                    str(reference.source_document_id) for reference in event.evidence_refs
+                ],
+            }
+            if spans is not None:
+                timeline_row["semantic_spans"] = spans
+            timeline.append(timeline_row)
 
     def publisher_label(source: Any) -> str | None:
         if source.editorial_role is None or source.editorial_role.value != "context":
@@ -1838,6 +2132,19 @@ def project_publication_to_typst_model(
         ).removeprefix("www.")
         return f"Contexte · {publisher}"
 
+    def reader_source_note(
+        source: PublicationSourceV1,
+        value: str,
+        anchor: str = "",
+    ) -> tuple[str, list[dict[str, Any]] | None]:
+        display_text, spans = project_text(anchor, value)
+        clean_text = _reader_reference_note(display_text, source)
+        if not clean_text:
+            clean_text = _reader_reference_fallback(source)
+        if not clean_text:
+            clean_text = "Publication de la source."
+        return clean_text[:260], spans if clean_text == display_text else None
+
     source_references: list[dict[str, Any]] = []
     for index, reference in enumerate(reference_entries, start=1):
         source = sources_by_id.get(reference.source_document_id)
@@ -1846,13 +2153,9 @@ def project_publication_to_typst_model(
                 "Publication reference identifies an unknown source document: "
                 f"{reference.source_document_id}"
             )
+        note_text, note_spans = reader_source_note(source, reference.text, f"reference:{index:04d}")
         reference_row: dict[str, Any] = {
-            "display_date": (
-                _display_date(None, source.published_at)
-                if source.published_at is not None
-                else "Date de publication non précisée"
-            ),
-            "text": reference.text,
+            "text": note_text,
             "title": source.title,
             "publisher": publisher_label(source),
             "date": source.published_at.isoformat() if source.published_at is not None else None,
@@ -1861,14 +2164,13 @@ def project_publication_to_typst_model(
             "source_urls": [source.canonical_url],
             "_source_id": reference.source_document_id,
         }
+        if source.published_at is not None:
+            reference_row["display_date"] = _display_date(None, source.published_at)
         if source.kind.value == "technical_resource":
             reference_row["role_label"] = "Contexte technique"
-        spans = semantic_spans(f"reference:{index:04d}", reference.text)
-        if spans is not None:
-            reference_row["semantic_spans"] = spans
+        if note_spans is not None:
+            reference_row["semantic_spans"] = note_spans
         source_references.append(reference_row)
-
-    legacy_reference_rows = tuple(source_references)
 
     sources = [
         {
@@ -1877,7 +2179,15 @@ def project_publication_to_typst_model(
             "date": source.published_at.isoformat() if source.published_at is not None else None,
             "url": source.canonical_url,
         }
-        for source in document.sources
+        for source in sorted(
+            document.sources,
+            key=lambda item: (
+                item.published_at is None,
+                item.published_at or date.max,
+                item.canonical_url,
+                str(item.source_document_id),
+            ),
+        )
     ]
 
     # Merge canonical indicators and source detail rows by type-aware, refanged
@@ -1903,17 +2213,19 @@ def project_publication_to_typst_model(
     ) -> str | None:
         if artifact_type is ArtifactType.URL:
             try:
-                canonical_url = _validated_publication_url(normalized_value)
+                canonical_url = _validated_publication_url(_projection_refang(normalized_value))
             except ValueError:
                 omitted_invalid_urls.add(value)
                 return None
-            return display_publication_indicator_value(canonical_url, artifact_type, defanged=True)
+            return display_publication_indicator_value(canonical_url, artifact_type, defanged=False)
         try:
-            canonical = normalize_publication_indicator_value(normalized_value, artifact_type)
+            canonical = normalize_publication_indicator_value(
+                _projection_refang(normalized_value), artifact_type
+            )
             normalized_source_value = normalize_publication_indicator_value(value, artifact_type)
             if normalized_source_value != canonical:
                 return value.strip()
-            return display_publication_indicator_value(canonical, artifact_type, defanged=True)
+            return display_publication_indicator_value(canonical, artifact_type, defanged=False)
         except ValueError:
             return value.strip()
 
@@ -2048,31 +2360,16 @@ def project_publication_to_typst_model(
     # Keep every evidence source addressable from citations, including technical
     # sources and references that have no editorial summary paragraph.
     reference_row_by_source_id: dict[UUID, dict[str, Any]] = {}
-    reference_row_by_url: dict[str, dict[str, Any]] = {}
     for reference_row in source_references:
         reference_source_id = reference_row.get("_source_id")
         if isinstance(reference_source_id, UUID):
             reference_row_by_source_id.setdefault(reference_source_id, reference_row)
-        for source_url in reference_row.get("source_urls", ()):
-            reference_row_by_url.setdefault(source_url, reference_row)
     for source_id, source in sorted(sources_by_id.items(), key=lambda item: str(item[0])):
         if source_id in reference_row_by_source_id:
             continue
-        existing_reference = reference_row_by_url.get(source.canonical_url)
-        if existing_reference is not None:
-            reference_row_by_source_id[source_id] = existing_reference
-            continue
+        note_text, _note_spans = reader_source_note(source, _reader_reference_fallback(source))
         reference_row = {
-            "display_date": (
-                _display_date(None, source.published_at)
-                if source.published_at is not None
-                else "Date de publication non précisée"
-            ),
-            "text": (
-                source.title or source.canonical_url
-                if source.kind.value == "technical_resource"
-                else source.canonical_url
-            ),
+            "text": note_text,
             "title": source.title,
             "publisher": publisher_label(source),
             "date": source.published_at.isoformat() if source.published_at is not None else None,
@@ -2081,11 +2378,23 @@ def project_publication_to_typst_model(
             "source_urls": [source.canonical_url],
             "_source_id": source_id,
         }
+        if source.published_at is not None:
+            reference_row["display_date"] = _display_date(None, source.published_at)
         if source.kind.value == "technical_resource":
             reference_row["role_label"] = "Contexte technique"
         source_references.append(reference_row)
         reference_row_by_source_id[source_id] = reference_row
-        reference_row_by_url[source.canonical_url] = reference_row
+
+    # Reader references sort dated sources by date, then URL and stable source id;
+    # undated sources follow in the same URL/id order.
+    source_references.sort(
+        key=lambda row: (
+            sources_by_id[row["_source_id"]].published_at is None,
+            sources_by_id[row["_source_id"]].published_at or date.max,
+            sources_by_id[row["_source_id"]].canonical_url,
+            str(row["_source_id"]),
+        )
+    )
 
     reference_target_by_source_id: dict[UUID, str] = {}
     reference_number_by_source_id: dict[UUID, int] = {}
@@ -2095,10 +2404,9 @@ def project_publication_to_typst_model(
         if isinstance(reference_source_id, UUID):
             target_id = f"publication-source-{reference_source_id.hex}-{index:04d}"
             reference_row["target_id"] = target_id
-            for source_id, mapped_row in reference_row_by_source_id.items():
-                if mapped_row is reference_row:
-                    reference_target_by_source_id.setdefault(source_id, target_id)
-                    reference_number_by_source_id.setdefault(source_id, index)
+            reference_target_by_source_id[reference_source_id] = target_id
+            reference_number_by_source_id[reference_source_id] = index
+    legacy_reference_rows = tuple(source_references)
 
     def source_links_for_ids(source_ids: Any) -> list[dict[str, Any]]:
         return [
@@ -2417,6 +2725,11 @@ def project_publication_to_typst_model(
             key=lambda item: (item["type_label"], item["value"]["text"].casefold()),
         )
         for item in items:
+            if brief_document and item["artifact_type"] in {
+                ArtifactType.FILENAME.value,
+                ArtifactType.FILEPATH.value,
+            }:
+                continue
             source_ids = sorted(item.pop("_source_ids"), key=lambda value: str(value))
             item["source_refs"] = [
                 {
@@ -2644,44 +2957,7 @@ def project_publication_to_typst_model(
             ],
         }
 
-    if draft_preview is not None and draft_preview.synthesis is not None:
-        chronology: list[dict[str, Any]] = []
-        for synthesis_timeline_entry in draft_preview.synthesis.timeline:
-            source_urls = sorted(
-                {
-                    sources_by_id[reference.source_document_id].canonical_url
-                    for reference in synthesis_timeline_entry.evidence_refs
-                    if reference.source_document_id in sources_by_id
-                }
-            )
-            if not source_urls:
-                raise ValueError(
-                    "Draft preview chronology has no source represented in the pinned V5"
-                )
-            chronology.append(
-                {
-                    "display_date": _display_date(
-                        synthesis_timeline_entry.date_text,
-                        synthesis_timeline_entry.event_date,
-                    ),
-                    "text": synthesis_timeline_entry.text,
-                    "source_urls": source_urls,
-                    "source_document_ids": sorted(
-                        {
-                            str(reference.source_document_id)
-                            for reference in synthesis_timeline_entry.evidence_refs
-                            if reference.source_document_id in sources_by_id
-                        }
-                    ),
-                }
-            )
-            add_source_links(chronology[-1])
-    elif isinstance(publication_v5, PublicationDocumentV5) or isinstance(
-        value, PublicationDocumentV4
-    ):
-        chronology = timeline
-    else:
-        chronology = []
+    chronology = timeline
     # ARTICLE timelines use article_format. Direct BRIEF projections keep the
     # legacy section shape; edition rendering opts back into its chronology row.
     if "chronology" in expected_section_types:
@@ -3338,13 +3614,6 @@ def _figure_block(
         "type": "figure",
         "key": figure.key,
         "caption": figure.caption,
-        "evidence_classification": "documented_not_observed",
-        "source_note": _reader_facing_figure_source(figure, source),
-        "attribution": (
-            _reader_facing_editorial_text(figure.provenance)
-            or _reader_facing_editorial_text(source.publisher)
-            or _reader_facing_editorial_text(source.title)
-        ),
         "sha256": figure.sha256,
         "sha256_spans": _breakable_typst_display_text(figure.sha256, interval=8),
         "byte_size": figure.byte_size,
