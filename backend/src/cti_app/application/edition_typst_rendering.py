@@ -25,6 +25,7 @@ from cti_app.application.typst_rendering import (
     project_publication_to_typst_model,
 )
 from cti_app.domain.edition_publication import EditionDocumentV2
+from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import CanonicalPublicationDocument
 
 # Resolve the runtime PEP 695 alias dynamically so a new canonical version is
@@ -130,13 +131,22 @@ class EditionTypstRenderer:
         mapping_targets: list[dict[str, Any]] = []
         mapping_unmapped: list[dict[str, Any]] = []
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
+        media_refang_iocs: set[tuple[ArtifactType, str, str]] = set()
         for classified in classify_edition_publications(document.publications):
             publication = classified.publication
+            target_identities = (artifact_identities or {}).get(str(publication.subject_id))
+            brief_timeline_policy_version = (
+                target_identities.get("brief_assembly_policy_version")
+                if isinstance(target_identities, dict)
+                and isinstance(target_identities.get("brief_assembly_policy_version"), str)
+                else None
+            )
             model = project_publication_to_typst_model(
-                publication.document, include_brief_chronology=True
+                publication.document,
+                include_brief_chronology=True,
+                brief_timeline_policy_version=brief_timeline_policy_version,
             )
             article_title_target_id = None
-            target_identities = (artifact_identities or {}).get(str(publication.subject_id))
             if target_identities is not None:
                 targets, unmapped, article_title_target_id = instrument_publication_targets(
                     model,
@@ -152,6 +162,7 @@ class EditionTypstRenderer:
                         f"Edition asset {media_ref.asset_id} has conflicting media metadata"
                     )
                 media_refs_by_id.setdefault(media_ref.asset_id, media_ref)
+            media_refang_iocs.update(model.media_refang_iocs)
             item: dict[str, Any] = {
                 "position": publication.position,
                 "subject_id": str(publication.subject_id),
@@ -201,4 +212,15 @@ class EditionTypstRenderer:
             render_data_relative_path="RENDERER/edition-render-data.json",
             mapping_targets=tuple(mapping_targets),
             mapping_unmapped=tuple(mapping_unmapped),
+            media_refang_iocs=tuple(
+                sorted(
+                    media_refang_iocs,
+                    key=lambda item: (
+                        item[0].value,
+                        item[2].casefold(),
+                        item[1].casefold(),
+                        item[1],
+                    ),
+                )
+            ),
         )

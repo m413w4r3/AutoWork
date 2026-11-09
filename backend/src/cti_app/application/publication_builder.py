@@ -109,6 +109,7 @@ from cti_app.domain.publication_document import (
     order_publication_references,
     publication_document_text_anchors,
     select_publication_timeline_key_events_v2,
+    select_publication_timeline_key_events_v3,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -612,9 +613,9 @@ def _validate_publication_lineage(
             )
 
 
-# V17 binds the M19 v2 ArticleFormat projection into publication identity.
+# V17 binds the versioned ArticleFormat projection into publication identity.
 ASSEMBLY_POLICY_VERSION: Final[str] = "17-publication-v8-m19-format"
-ARTICLE_FORMAT_POLICY_VERSION: Final[str] = "2-m19-reference-date-ioc-projection"
+ARTICLE_FORMAT_POLICY_VERSION: Final[str] = "3-m19-publication-events"
 ARTICLE_TIMELINE_KEY_EVENT_LIMIT: Final[int] = ARTICLE_FORMAT_TIMELINE_MAX_EVENTS
 
 
@@ -626,7 +627,7 @@ def select_article_timeline_key_events(
     timeline: tuple[PublicationTimelineEntryV1, ...],
     sources: tuple[PublicationSourceV1, ...] = (),
 ) -> tuple[TimelineKeyEventV1, ...]:
-    """Select evidenced v2 events with published source dates and a stable cap."""
+    """Select historical v2 events for legacy publication readers."""
     return select_publication_timeline_key_events_v2(timeline, sources)
 
 
@@ -656,7 +657,7 @@ def build_article_format_v1(
     if not isinstance(publication, PublicationDocumentV5):
         raise ValueError("ArticleFormatV1 requires a PublicationDocumentV5 body")
     overview = extract_article_overview(publication.document.sections)
-    timeline_key_events = select_article_timeline_key_events(
+    timeline_key_events = select_publication_timeline_key_events_v3(
         publication.document.timeline,
         publication.document.sources,
     )

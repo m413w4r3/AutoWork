@@ -289,7 +289,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v35-m19-review"
+    assert data["schema_version"] == "typst-publication-model-v36-m19-polish"
     assert data["kind"] == "brief"
     assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
@@ -884,7 +884,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v35-m19-review"
+    assert data["schema_version"] == "typst-publication-model-v36-m19-polish"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])

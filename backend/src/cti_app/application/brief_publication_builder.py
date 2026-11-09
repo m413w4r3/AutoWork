@@ -55,11 +55,10 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     PublicationDocumentV6ProvenanceV1,
     PublicationDocumentV7,
-    build_publication_date_events,
     order_publication_references,
     publication_document_text_anchors,
     publication_document_v5_sha256,
-    select_publication_timeline_key_events_v2,
+    select_publication_timeline_key_events_v3,
 )
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
@@ -69,7 +68,7 @@ from cti_app.domain.semantic_annotation import (
 )
 
 # M19 changes reader references and source-date timelines; this invalidates old brief assemblies.
-BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v3-m19-enrichment"
+BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 
 
 def build_brief_publication_document_v5(
@@ -249,18 +248,7 @@ def build_brief_publication_document_v5(
         references=references,
         used_source_document_ids=used_source_document_ids,
     )
-    publication_date_events = tuple(
-        PublicationTimelineEntryV1(
-            event_date=event.event_date,
-            date_text=None,
-            text=event.text,
-            evidence_refs=event.evidence_refs,
-        )
-        for event in build_publication_date_events(sources)
-    )
-    selected_timeline = select_publication_timeline_key_events_v2(
-        (*source_timeline, *publication_date_events)
-    )
+    selected_timeline = select_publication_timeline_key_events_v3(source_timeline, sources)
     # Apply the two-distinct-date gate after merging cited events and archived
     # source publication dates. A lone source date remains visible in Références.
     timeline = tuple(

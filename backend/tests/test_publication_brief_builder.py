@@ -327,6 +327,7 @@ def test_single_metadata_derived_brief_date_stays_in_references_without_chronolo
     render_model = project_publication_to_typst_model(
         publication,
         include_brief_chronology=True,
+        brief_timeline_policy_version="brief-assembly-v4-m19-publication-events",
     )
     section_types = [item["type"] for item in render_model.content_sections]
     references_section = render_model.content_sections[0]
@@ -339,7 +340,7 @@ def test_single_metadata_derived_brief_date_stays_in_references_without_chronolo
     assert qa["passed"] is True
 
 
-def test_brief_timeline_adds_distinct_archived_source_publication_dates() -> None:
+def test_brief_timeline_excludes_context_source_and_hides_single_publication_date() -> None:
     snapshot, references, extraction, synthesis = _publication_case_with_content_variants(
         ("d" * 64,)
     )
@@ -362,19 +363,13 @@ def test_brief_timeline_adds_distinct_archived_source_publication_dates() -> Non
     render_model = project_publication_to_typst_model(
         publication,
         include_brief_chronology=True,
+        brief_timeline_policy_version="brief-assembly-v4-m19-publication-events",
     )
 
-    assert {entry.event_date for entry in publication.timeline} == {
-        date(2025, 1, 6),
-        date(2025, 1, 10),
-    }
-    assert all(
-        ref.kind.value == "source_metadata"
-        for entry in publication.timeline
-        for ref in entry.evidence_refs
-    )
+    # The second archived source is editorial context, so only the core
+    # publication date remains; C1 suppresses a one-date chronology.
+    assert publication.timeline == ()
     assert [section["type"] for section in render_model.content_sections] == [
         "references",
-        "chronology",
         "synthesis",
     ]

@@ -64,6 +64,7 @@ _ARTICLE_ID = UUID("00000000-0000-0000-0000-00000000000a")
 _KNOWN_URL = "http://bad.example/path"
 _KNOWN_DEFANGED_URL = "hxxp[:]//bad[dot]example/path"
 _KNOWN_EMAIL = "analyst[@]bad[dot]example"
+_KNOWN_EMAIL_REFANGED = "analyst@bad.example"
 
 
 def _source(
@@ -416,17 +417,17 @@ def test_reader_projection_refangs_only_known_iocs_and_keeps_canonical_data() ->
         "Alert from "
         + _KNOWN_URL
         + "; contact "
-        + _KNOWN_EMAIL
+        + _KNOWN_EMAIL_REFANGED
         + "; literal [.] without an IOC remains."
     )
     assert paragraph["text"] == expected_lead
-    assert _KNOWN_EMAIL in paragraph["text"]
+    assert _KNOWN_EMAIL_REFANGED in paragraph["text"]
     assert "".join(span["text"] for span in paragraph["semantic_spans"]) == expected_lead
     assert [span["text"] for span in paragraph["semantic_spans"]] == [
         "Alert from ",
         _KNOWN_URL,
         "; contact ",
-        _KNOWN_EMAIL,
+        _KNOWN_EMAIL_REFANGED,
         "; literal [.] without an IOC remains.",
     ]
     table_block = next(block for block in synthesis["blocks"] if block["type"] == "table")
@@ -653,9 +654,9 @@ def test_v8_policy_v1_timeline_payload_roundtrips_with_identical_canonical_hash(
 
 
 def test_m19_contract_versions_are_bumped_and_bounded() -> None:
-    assert ARTICLE_FORMAT_POLICY_VERSION.startswith("2-")
+    assert ARTICLE_FORMAT_POLICY_VERSION == "3-m19-publication-events"
     assert ASSEMBLY_POLICY_VERSION.startswith("17-")
-    assert _RENDER_DATA_SCHEMA_VERSION == "typst-publication-model-v35-m19-review"
+    assert _RENDER_DATA_SCHEMA_VERSION == "typst-publication-model-v36-m19-polish"
     assert all(
         len(value) <= 64
         for value in (
