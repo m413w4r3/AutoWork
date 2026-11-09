@@ -18,6 +18,7 @@ from cti_app.application.publication_builder import (
     select_article_timeline_key_events,
 )
 from cti_app.application.publication_qa import qa_publication_v7
+from cti_app.application.semantic_annotation import SemanticAnnotator
 from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_extraction import (
@@ -56,10 +57,12 @@ from cti_app.domain.publication_document import (
     TimelineKeyEventV1,
     extract_article_overview,
     parse_publication_document,
+    publication_document_text_anchors,
     publication_document_v5_to_json,
     serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.domain.semantic_annotation import SemanticTextV1
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
 from tests.test_publication_document_v7 import _v6
 
@@ -545,6 +548,69 @@ def test_typst_v33_projection_removes_overview_duplication_and_legacy_sections()
         for category in model.article_format["ioc_categories"].values()
         for item in category
     )
+
+
+def test_legacy_overview_section_is_removed_only_when_overview_is_projected() -> None:
+    base, *_ = _article_with_overview()
+    evidence_ref = base.sections[0].paragraphs[0].evidence_refs[0]
+
+    def project_with_overview(paragraph_texts: tuple[str, str, str]):
+        overview_section = PublicationSectionV1(
+            PublicationSectionKind.OVERVIEW,
+            "Vue d'ensemble",
+            tuple(PublicationParagraphV1(text, (evidence_ref,)) for text in paragraph_texts),
+        )
+        legacy_document = replace(
+            base.document,
+            sections=(overview_section, *base.sections[1:]),
+        )
+        semantic_text = SemanticTextV1(
+            schema_version=base.semantic_text.schema_version,
+            policy_version=base.semantic_text.policy_version,
+            paragraphs=SemanticAnnotator().annotate_paragraphs(
+                tuple(
+                    publication_document_text_anchors(
+                        legacy_document,
+                        references=base.references,
+                    ).items()
+                ),
+                entities=(),
+            ),
+        )
+        legacy_base = replace(
+            base,
+            document=legacy_document,
+            semantic_text=semantic_text,
+        )
+        v7 = PublicationDocumentV7(
+            base_publication=_v6(legacy_base),
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="b" * 64,
+            routing_policy_version="routing-policy-v1",
+        )
+        return project_publication_to_typst_model(v7)
+
+    unlabelled_model = project_with_overview(
+        ("Contexte narratif libre.", "Activité observée.", "Impact décrit.")
+    )
+    unlabelled_synthesis = next(
+        section for section in unlabelled_model.content_sections if section["type"] == "synthesis"
+    )
+    unlabelled_text = " ".join(block.get("text", "") for block in unlabelled_synthesis["blocks"])
+    assert "Vue d'ensemble" in unlabelled_text
+    assert unlabelled_model.article_format is not None
+    assert unlabelled_model.article_format["overview"] is None
+
+    labelled_model = project_with_overview(
+        ("Victimologie : Hôpitaux.", "Activité observée.", "Impact décrit.")
+    )
+    labelled_synthesis = next(
+        section for section in labelled_model.content_sections if section["type"] == "synthesis"
+    )
+    labelled_text = " ".join(block.get("text", "") for block in labelled_synthesis["blocks"])
+    assert "Vue d'ensemble" not in labelled_text
+    assert labelled_model.article_format is not None
+    assert labelled_model.article_format["overview"]["victimology"]["text"] == "Hôpitaux."
 
 
 @pytest.mark.asyncio

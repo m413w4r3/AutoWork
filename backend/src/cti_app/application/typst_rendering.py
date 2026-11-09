@@ -589,6 +589,8 @@ def _publication_detection_section(detection: PublicationDetectionV1) -> dict[st
 
 def publication_content_section_types(
     value: CanonicalPublicationDocument | TypstDraftPreviewDocument,
+    *,
+    include_brief_chronology: bool = False,
 ) -> tuple[str, ...]:
     """Return the ordered sections projected from canonical publication data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
@@ -651,7 +653,12 @@ def publication_content_section_types(
     else:
         has_limitations = False
         has_legacy_chronology = bool(document.timeline) or timeline_figure is not None
-    if (brief_document or opinion_document) and has_legacy_chronology:
+    # Standalone BRIEFs keep their legacy section shape; editions request the
+    # dedicated chronology section explicitly for their embedded BRIEFs.
+    if has_legacy_chronology and (
+        (opinion_document and not brief_document)
+        or (brief_document and include_brief_chronology)
+    ):
         section_types.append("chronology")
     section_types.append("synthesis")
 
@@ -735,7 +742,7 @@ def publication_content_section_types(
         section_types.append("detection")
     if has_iocs and (brief_document or opinion_document):
         section_types.append("ioc")
-    if opinion_document and (has_iocs or has_opinion_provenance):
+    if opinion_document and not brief_document and (has_iocs or has_opinion_provenance):
         section_types.append("technical_annex")
     return tuple(section_types)
 
@@ -1446,6 +1453,7 @@ def project_publication_to_typst_model(
     value: CanonicalPublicationDocument | TypstDraftPreviewDocument,
     *,
     infrastructure_graph_media_ref: TypstMediaRef | None = None,
+    include_brief_chronology: bool = False,
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
@@ -1489,6 +1497,7 @@ def project_publication_to_typst_model(
     opinion_document = draft_preview is not None or (
         isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
     )
+    brief_document = is_brief(value)
     detection = publication_v6.detection if publication_v6 is not None else None
     draft_iocs = _draft_opinion_iocs(draft_preview) if draft_preview is not None else ()
     if isinstance(publication_v5, PublicationDocumentV5):
@@ -1761,9 +1770,17 @@ def project_publication_to_typst_model(
     for index, lead_paragraph in enumerate(document.lead, start=1):
         append_paragraph(lead_paragraph.text, lead_paragraph_anchor(index))
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
+    overview_render = (
+        article_format_render.get("overview")
+        if article_format_render is not None
+        else None
+    )
+    has_projected_overview = isinstance(overview_render, dict) and any(
+        value is not None for value in overview_render.values()
+    )
     for section_index, section in enumerate(document.sections):
         if (
-            article_format_render is not None
+            has_projected_overview
             and section_index == 0
             and is_article_overview_heading(section.heading)
         ):
@@ -2600,7 +2617,9 @@ def project_publication_to_typst_model(
         )
         else None
     )
-    expected_section_types = publication_content_section_types(value)
+    expected_section_types = publication_content_section_types(
+        value, include_brief_chronology=include_brief_chronology
+    )
     reference_section["show_heading"] = bool(
         reference_entries or sources or "chronology" in expected_section_types
     )
@@ -2661,8 +2680,8 @@ def project_publication_to_typst_model(
         chronology = timeline
     else:
         chronology = []
-    # ARTICLES use article_format's native timeline. BRIEFS and analyst-opinion
-    # previews retain their legacy chronology sections.
+    # ARTICLE timelines use article_format. Direct BRIEF projections keep the
+    # legacy section shape; edition rendering opts back into its chronology row.
     if "chronology" in expected_section_types:
         chronology_section: dict[str, Any] = {
             "type": "chronology",
@@ -3037,10 +3056,11 @@ def project_publication_to_typst_model(
                     "value": material.value,
                     "role": material.role,
                     "sample_location": material.sample_location,
-                    "sample_sha256": material.sample_sha256,
                     "evidence_ref": opinion_citation("evidence", material.evidence_observation_id),
                 }
             )
+            if not brief_document:
+                implant_material_rows[-1]["sample_sha256"] = material.sample_sha256
         content_sections.append(
             {
                 "type": "technical_materials",
@@ -3078,13 +3098,16 @@ def project_publication_to_typst_model(
     reader_sections: list[dict[str, Any]] = []
     for section in content_sections:
         section_type = section.get("type")
-        if section_type in {"technical_annex", "provenance", "publication_provenance"} and not (
-            opinion_document
+        if section_type in {"technical_annex", "provenance", "publication_provenance"} and (
+            brief_document or not opinion_document
         ):
             continue
-        if section_type == "chronology" and not (is_brief(value) or opinion_document):
+        if section_type == "chronology" and not (
+            (opinion_document and not brief_document)
+            or (brief_document and include_brief_chronology)
+        ):
             continue
-        if section_type == "ioc" and is_brief(value):
+        if section_type == "ioc" and brief_document:
             reader_sections.append(_statusless_brief_ioc_section(section))
         elif opinion_document:
             reader_sections.append(section)
