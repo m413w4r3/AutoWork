@@ -114,11 +114,17 @@ class SourceMediaArchiveService:
         blob_store: BlobStore,
         *,
         policy: SourceMediaPolicy | None = None,
+        max_images_per_subject: int | None = None,
+        stop_on_policy_block: bool = False,
     ) -> None:
+        if max_images_per_subject is not None and max_images_per_subject < 1:
+            raise ValueError("max_images_per_subject must be positive")
         self._uow_factory = uow_factory
         self._collector = collector
         self._catalog = BlobCatalogService(blob_store, uow_factory)
         self.policy = policy or SourceMediaPolicy()
+        self._max_images_per_subject = max_images_per_subject
+        self._stop_on_policy_block = stop_on_policy_block
 
     @property
     def policy_sha256(self) -> str:
@@ -136,6 +142,8 @@ class SourceMediaArchiveService:
             tracking_pattern=self.policy.tracking_pattern,
             related_content_heading_pattern=self.policy.related_content_heading_pattern,
         )
+        if self._max_images_per_subject is not None:
+            observations = observations[: self._max_images_per_subject]
         async with self._uow_factory() as uow:
             existing = tuple(
                 await uow.source_media_candidates.list_for_subject_policy(
@@ -159,6 +167,10 @@ class SourceMediaArchiveService:
             prior = by_id.get(candidate_id)
             if prior is not None:
                 resolved.append(prior)
+                if self._stop_on_policy_block and (
+                    prior.collection_diagnostics.get("outcome") == "blocked"
+                ):
+                    break
                 continue
             if observation.is_page_excerpt:
                 record = self._base_record(
@@ -251,6 +263,10 @@ class SourceMediaArchiveService:
                             diagnostics=_error_diagnostics(exc),
                         )
                     )
+                    if self._stop_on_policy_block and (
+                        getattr(exc.outcome, "value", "") == "blocked"
+                    ):
+                        break
                     continue
                 content = response.decoded_body
                 response_metadata = _response_diagnostics(response)

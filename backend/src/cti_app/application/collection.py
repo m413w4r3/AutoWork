@@ -513,6 +513,8 @@ class SubjectCollectionService:
         third_party_provider_enabled: bool = False,
         ocr_command: str = "",
         newsletter_archive_endpoint: str = "",
+        source_media_max_images_per_subject: int | None = None,
+        stop_on_source_media_policy_block: bool = False,
     ) -> None:
         self._uow_factory = uow_factory
         self._collector = collector
@@ -522,6 +524,8 @@ class SubjectCollectionService:
             uow_factory,
             collector,
             blob_store,
+            max_images_per_subject=source_media_max_images_per_subject,
+            stop_on_policy_block=stop_on_source_media_policy_block,
         )
         self._policy = self._collector.policy
         self._workspace_materializer = workspace_materializer

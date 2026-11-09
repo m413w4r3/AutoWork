@@ -38,6 +38,7 @@ COPY chpTypst /app/chpTypst
 COPY scripts/typst_edition_smoke.py /app/scripts/typst_edition_smoke.py
 COPY scripts/ops/supervised_first_run_preflight.py /app/scripts/ops/supervised_first_run_preflight.py
 COPY scripts/ops/live_smoke.py /app/scripts/ops/live_smoke.py
+COPY scripts/ops/m19_archive_source_media.py /app/scripts/ops/m19_archive_source_media.py
 
 COPY backend/pyproject.toml backend/uv.lock backend/README.md backend/alembic.ini ./
 COPY backend/migrations ./migrations

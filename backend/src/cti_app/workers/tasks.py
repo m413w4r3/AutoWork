@@ -8,7 +8,6 @@ from minio import Minio
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.confined_analysis import CONFINED_ANALYSIS_JOB_KIND
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
@@ -37,12 +36,6 @@ from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
 )
-from cti_app.application.http_collection import (
-    CollectionPolicy,
-    SafeHttpCollector,
-    SystemDnsResolver,
-    parse_domain_policy,
-)
 from cti_app.application.investigation_jobs import (
     make_investigation_runner,
 )
@@ -64,7 +57,6 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
-from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import (
     VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST,
     Settings,
@@ -74,11 +66,11 @@ from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, JobStatus
 from cti_app.domain.production_pipeline import production_stages
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
+from cti_app.infrastructure.collection_runtime import create_subject_collection_service
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.ghidra_mcp import create_ghidra_mcp_http_adapter
-from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.investigation_runtime_ports import (
     build_investigation_runtime_composition_factory,
     create_external_effect_coordinator,
@@ -308,47 +300,11 @@ async def _execute_job(job_id: UUID) -> int | None:
             after_persisted_batch=enqueue_discovery_reconciliation,
             background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
         )
-        collection_service = SubjectCollectionService(
-            uow_factory,
-            SafeHttpCollector(
-                AsyncioPinnedHttpTransport(),
-                SystemDnsResolver(),
-                CollectionPolicy(
-                    max_redirects=settings.collection_max_redirects,
-                    timeout_seconds=settings.collection_timeout_seconds,
-                    max_download_bytes=settings.collection_max_download_bytes,
-                    max_expanded_bytes=settings.collection_max_expanded_bytes,
-                    max_decompression_ratio=settings.collection_max_decompression_ratio,
-                    allowed_domains=parse_domain_policy(settings.collection_allowed_domains),
-                    blocked_domains=parse_domain_policy(settings.collection_blocked_domains),
-                ),
-            ),
-            blob_store,
-            fetch_lease_seconds=settings.collection_fetch_lease_seconds,
-            workspace_materializer=SubjectWorkspaceMaterializer(blob_store),
-            workspace_root=settings.subject_workspace_root,
+        collection_service = create_subject_collection_service(
+            settings=settings,
+            uow_factory=uow_factory,
+            blob_store=blob_store,
             model_gateway=model_gateway,
-            fallback_variants_enabled=settings.collection_fallback_variants_enabled,
-            fallback_archive_enabled=settings.collection_fallback_archive_enabled,
-            fallback_bridge_enabled=settings.collection_fallback_bridge_enabled,
-            fallback_max_variants=settings.collection_fallback_max_variants,
-            fallback_strategy_flags=settings.collection_acquisition_strategy_enabled,
-            fallback_strategy_timeouts=settings.collection_acquisition_strategy_timeout_seconds,
-            fallback_min_text_chars=settings.collection_fallback_min_text_chars,
-            fallback_playwright_sidecar_url=settings.collection_playwright_sidecar_url or None,
-            acquisition_deadline_seconds=settings.collection_acquisition_deadline_seconds,
-            acquisition_max_attempts=settings.collection_acquisition_max_attempts,
-            acquisition_per_domain_concurrency=settings.collection_acquisition_per_domain_concurrency,
-            fallback_endpoint_enabled=settings.collection_fallback_endpoint_enabled,
-            browser_navigation_enabled=settings.collection_browser_navigation_enabled,
-            browser_control_socket=settings.collection_browser_control_socket,
-            syndication_domains=settings.collection_syndication_domains,
-            exact_title_search_endpoint=settings.collection_exact_title_search_endpoint,
-            third_party_provider_url=settings.collection_third_party_provider_url,
-            third_party_provider_token=settings.collection_third_party_provider_token,
-            third_party_provider_enabled=settings.collection_third_party_provider_enabled,
-            ocr_command=settings.collection_ocr_command,
-            newsletter_archive_endpoint=settings.collection_official_newsletter_archive_endpoint,
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.
