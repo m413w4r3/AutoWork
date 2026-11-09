@@ -672,3 +672,42 @@ def test_builder_matches_defanged_publication_value_to_canonical_evidence() -> N
 
     assert [item.normalized_value for item in article_format.ioc_categories.domains] == [canonical]
     assert article_format.ioc_categories.domains[0].evidence_refs
+
+
+def test_builder_keeps_range_ioc_with_document_level_evidence_instead_of_failing() -> None:
+    base = _article_with_overview()[0]
+    extraction = _article_with_overview()[3][0]
+    source = extraction.sources[0]
+    extraction = replace(
+        extraction,
+        sources=(
+            replace(
+                source,
+                indicators=(
+                    ExtractionIndicatorV1(
+                        value="198.51.100.7",
+                        artifact_type=ArtifactType.IP,
+                        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                        context="Observed in the source.",
+                        evidence_quote="The report includes 198.51.100.7.",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(source.source_document_id,),
+                    ),
+                ),
+            ),
+        ),
+    )
+    indicator = PublicationIndicatorV1(
+        value="198.51.100.0/24",
+        normalized_value="198.51.100.0/24",
+        artifact_type=ArtifactType.IP,
+        source_document_ids=(source.source_document_id,),
+    )
+    document = replace(
+        base.document,
+        indicators=(PublicationIndicatorGroupV1(ArtifactType.IP, (indicator,)),),
+    )
+    article_format = build_article_format_v1(replace(base, document=document), extraction)
+
+    assert [item.value for item in article_format.ioc_categories.ips] == ["198.51.100.0/24"]
+    assert article_format.ioc_categories.ips[0].evidence_refs

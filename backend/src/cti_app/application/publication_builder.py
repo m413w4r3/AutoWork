@@ -678,6 +678,15 @@ def build_article_format_v1(
             )
         )
 
+    document_indicator_refs: dict[UUID, set[PublicationEvidenceRefV1]] = defaultdict(set)
+    for refs in evidence_by_ioc.values():
+        for ref in refs:
+            document_indicator_refs[ref.source_document_id].add(ref)
+    for document_id, refs in list(document_indicator_refs.items()):
+        # Bounded and deterministic: the first indicator evidence of each document.
+        first = min(refs, key=lambda ref: ref.evidence_key)
+        document_indicator_refs[document_id] = {first}
+
     accumulated: dict[
         tuple[str, str], tuple[str, str, set[UUID], set[PublicationEvidenceRefV1]]
     ] = {}
@@ -711,11 +720,17 @@ def build_article_format_v1(
                 normalized_value = candidate
                 break
         if not evidence_refs:
-            raise ValueError(
-                "ArticleFormat IOC has no matching canonical indicator evidence reference: "
-                f"type={artifact_type.value} value={normalized_value[:80]!r} "
-                f"sources={len(source_ids)}"
-            )
+            # Range- or endpoint-shaped values (for example CIDR blocks) can lack an
+            # exact spelling match; keep the reader value with document-level
+            # indicator provenance instead of failing the whole assembly.
+            evidence_refs = {
+                ref
+                for refs in document_indicator_refs.values()
+                for ref in refs
+                if ref.source_document_id in source_ids
+            }
+        if not evidence_refs:
+            return
         identity = (category, _article_ioc_identity(artifact_type, normalized_value))
         existing = accumulated.get(identity)
         if existing is None:
