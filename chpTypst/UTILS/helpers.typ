@@ -36,42 +36,31 @@
 }
 
 #let semantic-plain(body) = body
-#let semantic-actor(body) = text(weight: "bold", fill: accent)[#body]
-#let semantic-campaign(body) = text(weight: "bold", fill: purple)[#body]
+#let semantic-actor(body) = emph(body)
+#let semantic-campaign(body) = emph(body)
 #let semantic-malware(body) = text(weight: "bold", fill: purple-dark)[#body]
 #let semantic-tool(body) = text(weight: "bold", fill: accent)[#body]
 #let semantic-product(body) = text(weight: "bold", fill: dark)[#body]
+#let semantic-proper-name(body) = emph(body)
 #let semantic-english-term(body) = emph(body)
-#let semantic-technical(body) = text(size: 10pt, fill: purple-dark)[#body]
-#let semantic-technical-literal(body) = text(
-  font: code-font-families,
-  size: 9pt,
-  fill: purple-dark,
-  hyphenate: false,
-)[#body]
-#let semantic-table-technical(body) = text(
-  font: code-font-families,
-  size: 9pt,
-  fill: purple-dark,
-  hyphenate: false,
-)[#body]
-#let semantic-ioc(body) = text(font: code-font-families, size: 9pt, fill: accent, hyphenate: false)[#body]
-#let semantic-table-ioc(body) = text(
-  font: code-font-families,
-  size: 9pt,
-  fill: accent,
-  hyphenate: false,
-)[#body]
-#let semantic-path(body) = text(font: code-font-families, size: 9pt, hyphenate: false)[#body]
-#let semantic-table-path(body) = text(font: code-font-families, size: 9pt, hyphenate: false)[#body]
-#let semantic-command(body) = text(font: code-font-families, size: 9pt, fill: dark, hyphenate: false)[#body]
-#let semantic-table-command(body) = text(
-  font: code-font-families,
-  size: 9pt,
-  fill: dark,
-  hyphenate: false,
-)[#body]
-#let semantic-protocol-field(body) = text(font: code-font-families, size: 9pt, fill: purple-dark, hyphenate: false)[#body]
+#let semantic-inline-technical(body) = highlight(fill: luma(190), radius: 2pt)[
+  #text(
+    font: code-font-families,
+    size: 10pt,
+    hyphenate: false,
+  )[#body]
+]
+#let semantic-technical(body) = semantic-inline-technical(body)
+#let semantic-technical-literal(body) = semantic-inline-technical(body)
+#let semantic-table-technical(body) = semantic-inline-technical(body)
+#let semantic-ioc(body) = semantic-inline-technical(body)
+#let semantic-table-ioc(body) = semantic-inline-technical(body)
+#let semantic-path(body) = semantic-inline-technical(body)
+#let semantic-table-path(body) = semantic-inline-technical(body)
+#let semantic-command(body) = semantic-inline-technical(body)
+#let semantic-table-command(body) = semantic-inline-technical(body)
+#let semantic-protocol-field(body) = semantic-inline-technical(body)
+
 #let semantic-source(body) = text(size: 9pt, fill: accent)[#body]
 #let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#body]
 
@@ -84,6 +73,7 @@
   else if style == "semantic-malware" { semantic-malware(body) }
   else if style == "semantic-tool" { semantic-tool(body) }
   else if style == "semantic-product" { semantic-product(body) }
+  else if style == "semantic-proper-name" { semantic-proper-name(body) }
   else if style == "semantic-english-term" { semantic-english-term(body) }
   else if style == "semantic-technical" { semantic-technical(body) }
   else if style == "semantic-technical-literal" { semantic-technical-literal(body) }

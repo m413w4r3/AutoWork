@@ -138,7 +138,7 @@ TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (
     "targeted-synthesis-patch-validator-v6-source-waivers"
 )
 ARTICLE_TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (
-    "targeted-synthesis-patch-validator-v7-article-structure"
+    "targeted-synthesis-patch-validator-v8-article-overview"
 )
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -2199,9 +2199,7 @@ class ProductionSynthesisRevisionService:
                 raise TargetedEditorialRevisionConflictError(
                     "The requested production run is no longer current"
                 )
-            routing_decision = await get_adopted_production_routing_decision(
-                uow=uow, run=route_run
-            )
+            routing_decision = await get_adopted_production_routing_decision(uow=uow, run=route_run)
             if routing_decision is None:
                 publication_kind = PublicationKind.ARTICLE
             else:
@@ -2220,9 +2218,7 @@ class ProductionSynthesisRevisionService:
                 # Reuse it only when its stored route is ARTICLE or absent (the
                 # historical default), never when a routed BRIEF happens to collide.
                 legacy_identity = _sha256(
-                    self._request_identity_payload(
-                        request, publication_kind=PublicationKind.BRIEF
-                    )
+                    self._request_identity_payload(request, publication_kind=PublicationKind.BRIEF)
                 )
                 legacy_revision_id = uuid5(
                     NAMESPACE_URL, f"targeted-synthesis-revision:{legacy_identity}"
@@ -2355,9 +2351,8 @@ class ProductionSynthesisRevisionService:
                     "revision_requires_one_section",
                     "revision_requires_one_section_claim",
                 }
-                if (
-                    exc.reason_code not in deterministic_refusals
-                    and not exc.reason_code.startswith("article_structure:")
+                if exc.reason_code not in deterministic_refusals and not exc.reason_code.startswith(
+                    "article_structure:"
                 ):
                     raise
                 refusal_details = _bounded_claim_grounding_details(exc.details)
@@ -2461,9 +2456,7 @@ class ProductionSynthesisRevisionService:
             raise TargetedEditorialRevisionConflictError(
                 "The requested production run is no longer current"
             )
-        routing_decision = await get_adopted_production_routing_decision(
-            uow=uow, run=route_run
-        )
+        routing_decision = await get_adopted_production_routing_decision(uow=uow, run=route_run)
         if routing_decision is None:
             publication_kind = PublicationKind.ARTICLE
         else:
@@ -2784,9 +2777,7 @@ class ProductionSynthesisRevisionService:
                 "targeted_revision_request_identity": request_identity,
                 "targeted_revision_contract_version": contract_version,
                 "targeted_revision_parser_version": TARGETED_SYNTHESIS_REVISION_PARSER_VERSION,
-                "targeted_revision_validator_version": (
-                    validator_version
-                ),
+                "targeted_revision_validator_version": (validator_version),
                 "targeted_revision_source_additions_hash": request.source_additions_hash,
                 "targeted_revision_base_artifact_fences": (
                     [
@@ -3155,9 +3146,7 @@ class ProductionSynthesisRevisionService:
     ) -> TargetedSynthesisRevisionResult | None:
         if uow is None:
             async with self._synthesis._uow_factory() as active_uow:
-                return await self._existing_result(
-                    subject_id, revision_id, uow=active_uow
-                )
+                return await self._existing_result(subject_id, revision_id, uow=active_uow)
         artifact = await uow.production_artifacts.get(revision_id)
         if artifact is None:
             return None
@@ -3294,9 +3283,9 @@ class ProductionSynthesisRevisionService:
                 "`Arsenal :`, and `Objectif principal :` in that order. "
                 "When rewriting one, keep its exact "
                 "label and a non-empty value; do not leave a fourth paragraph or remove a label.",
-                "Keep at least four further sections after the overview, each with a non-empty "
-                "editorial heading and at least one paragraph. Edits to those sections are allowed "
-                "while these outline rules remain true.",
+                "Keep any further sections non-empty and grounded. Add, edit, or remove them only "
+                "when the evidence-backed analysis benefits; no section count or heading list is "
+                "required.",
                 "",
             )
             if publication_kind is PublicationKind.ARTICLE

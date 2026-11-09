@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
-SEMANTIC_ANNOTATION_SCHEMA_VERSION = "1"
-SEMANTIC_ANNOTATION_POLICY_VERSION = (
-    "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage"
-)
+SEMANTIC_ANNOTATION_SCHEMA_VERSION = "2"
+SUPPORTED_SEMANTIC_ANNOTATION_SCHEMA_VERSIONS = frozenset({"1", SEMANTIC_ANNOTATION_SCHEMA_VERSION})
+SEMANTIC_ANNOTATION_POLICY_VERSION = "semantic-annotation-policy-v6-semantic-styles"
 
 # New documents are always written with the current policy. Verified historical
 # artifacts are immutable, so parsing them must not apply rules introduced by a
@@ -22,6 +21,7 @@ LEGACY_SEMANTIC_TEXT_POLICY_VERSIONS = frozenset(
         "semantic-annotation-policy-v2-document-lexicon",
         "semantic-annotation-policy-v3-attached-placeholders",
         "semantic-annotation-policy-v4-technical-literal-globs",
+        "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage",
     }
 )
 SUPPORTED_SEMANTIC_TEXT_POLICY_VERSIONS = LEGACY_SEMANTIC_TEXT_POLICY_VERSIONS | frozenset(
@@ -48,6 +48,7 @@ class SemanticRole(StrEnum):
     MALWARE = "malware"
     TOOL = "tool"
     PRODUCT = "product"
+    PROPER_NAME = "proper_name"
     ENGLISH_TERM = "english_term"
     TECHNICAL = "technical"
     TECHNICAL_LITERAL = "technical_literal"
@@ -66,18 +67,19 @@ SEMANTIC_ROLE_PRIORITY = MappingProxyType(
         SemanticRole.TEXT: 0,
         SemanticRole.ENGLISH_TERM: 10,
         SemanticRole.TECHNICAL: 20,
-        SemanticRole.TECHNICAL_LITERAL: 40,
         SemanticRole.ACTOR: 30,
         SemanticRole.CAMPAIGN: 30,
-        SemanticRole.MALWARE: 30,
-        SemanticRole.TOOL: 30,
-        SemanticRole.PRODUCT: 30,
-        SemanticRole.IOC: 40,
-        SemanticRole.PATH: 40,
-        SemanticRole.COMMAND: 40,
-        SemanticRole.PROTOCOL_FIELD: 40,
-        SemanticRole.SOURCE: 50,
-        SemanticRole.PROOF: 50,
+        SemanticRole.PROPER_NAME: 30,
+        SemanticRole.MALWARE: 40,
+        SemanticRole.TOOL: 40,
+        SemanticRole.PRODUCT: 40,
+        SemanticRole.TECHNICAL_LITERAL: 50,
+        SemanticRole.IOC: 50,
+        SemanticRole.PATH: 50,
+        SemanticRole.COMMAND: 50,
+        SemanticRole.PROTOCOL_FIELD: 50,
+        SemanticRole.SOURCE: 60,
+        SemanticRole.PROOF: 60,
     }
 )
 
@@ -92,6 +94,7 @@ SEMANTIC_ROLE_TYPST_FUNCTION_V1 = MappingProxyType(
         SemanticRole.MALWARE: "semantic-malware",
         SemanticRole.TOOL: "semantic-tool",
         SemanticRole.PRODUCT: "semantic-product",
+        SemanticRole.PROPER_NAME: "semantic-proper-name",
         SemanticRole.ENGLISH_TERM: "semantic-english-term",
         SemanticRole.TECHNICAL: "semantic-technical",
         SemanticRole.TECHNICAL_LITERAL: "semantic-technical-literal",
@@ -212,7 +215,7 @@ class SemanticTextV1:
     paragraphs: tuple[SemanticParagraphV1, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != SEMANTIC_ANNOTATION_SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_SEMANTIC_ANNOTATION_SCHEMA_VERSIONS:
             raise ValueError("Semantic text schema version is unsupported")
         if self.policy_version not in SUPPORTED_SEMANTIC_TEXT_POLICY_VERSIONS:
             raise ValueError("Semantic text policy version is unsupported")
@@ -223,6 +226,12 @@ class SemanticTextV1:
         anchors = tuple(paragraph.anchor for paragraph in self.paragraphs)
         if len(set(anchors)) != len(anchors):
             raise ValueError("Semantic text paragraph anchors must be unique")
+        if self.schema_version == "1" and any(
+            span.role is SemanticRole.PROPER_NAME
+            for paragraph in self.paragraphs
+            for span in paragraph.spans
+        ):
+            raise ValueError("Semantic text schema version 1 cannot contain proper_name")
 
 
 def semantic_annotation_proposal_to_json(

@@ -53,7 +53,7 @@ from cti_app.application.production_brief_synthesis import (
 from cti_app.application.production_parsers import sanitize_bridge_output_text
 from cti_app.application.production_prompts import (
     ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
-    SYNTHESIS_EDITORIAL_CONTRACT_V6,
+    SYNTHESIS_EDITORIAL_CONTRACT_V7,
     SYNTHESIS_PROMPT_VERSION,
     SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
     SYNTHESIS_WIRE_PARSER_VERSION,
@@ -134,36 +134,20 @@ SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 3
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
 BRIEF_SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v8-event-quote-dates"
-SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v9-article-structure"
+SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v10-article-overview"
 SYNTHESIS_CORRECTIVE_PROMPT_VERSION = "production-synthesis-corrective-v2-plain-text"
-ARTICLE_SYNTHESIS_CORRECTIVE_PROMPT_VERSION = (
-    "production-synthesis-corrective-v3-multi-violation"
-)
+ARTICLE_SYNTHESIS_CORRECTIVE_PROMPT_VERSION = "production-synthesis-corrective-v4-overview"
 ARTICLE_SYNTHESIS_MAX_OUTPUT_TOKENS = 12_000
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
 MAX_TECHNICAL_EVIDENCE_V1 = 128
-ARTICLE_SYNTHESIS_MIN_WORDS = 1_500
-ARTICLE_SYNTHESIS_MIN_FOLLOW_ON_SECTIONS = 4
 ARTICLE_SYNTHESIS_OVERVIEW_LABELS = (
     "Victimologie :",
     "Arsenal :",
     "Objectif principal :",
 )
-ARTICLE_SYNTHESIS_REQUIRED_HEADINGS = frozenset(
-    {
-        "Contexte et victimologie",
-        "Chaîne d'attaque par étapes",
-        "Capacités et techniques",
-        "Infrastructure et protocole C2",
-        "Artefacts hôte/réseau",
-        "Détection et hunting",
-        "Limites d'attribution",
-    }
-)
 ARTICLE_SYNTHESIS_OVERVIEW_VALUE_MAX_CHARS = 320
-_ARTICLE_SYNTHESIS_WORD = re.compile(r"\b[^\W_]+(?:[-\u2019'][^\W_]+)*\b", re.UNICODE)
 
 
 class SynthesisProposalErrorCode(StrEnum):
@@ -1634,9 +1618,7 @@ def _build_synthesis_corrective_request(
     if violation is None:
         return None
     is_article = request.prompt_template_id == "production-synthesis"
-    corrective_violations = (
-        tuple((violations or (violation,))[:25]) if is_article else (violation,)
-    )
+    corrective_violations = tuple((violations or (violation,))[:25]) if is_article else (violation,)
     fingerprint_payload: object = list(corrective_violations) if is_article else violation
     fingerprint = hashlib.sha256(_canonical_json_bytes(fingerprint_payload)).hexdigest()
     violation_json = json.dumps(
@@ -1669,7 +1651,7 @@ def _build_synthesis_corrective_request(
             "sans année ; ne devine jamais une année ; ne cite que des dates et valeurs présentes "
             "dans les preuves déjà citées par ce claim) ; ne change aucun autre claim ; renvoie "
             "la proposition complète au même format fil.",
-            "For any listed ARTICLE structure violation, restore the required ARTICLE structure "
+            "For any listed ARTICLE structure violation, restore the required overview structure "
             "while preserving unrelated claim text and evidence handles.",
             "Do not add facts, dates, values, sources, handles, or web research. Return no "
             "explanation outside the proposal blocks.",
@@ -1682,30 +1664,24 @@ def _build_synthesis_corrective_request(
                 "syntaxes avec des mots (par exemple « le marqueur d'ouverture de commentaire "
                 "HTML ») au lieu de les citer. Garde tous les autres claims inchangés."
             )
-        if any(
-            item.get("literal_kind") == "evidence_handle" for item in corrective_violations
-        ):
+        if any(item.get("literal_kind") == "evidence_handle" for item in corrective_violations):
             instructions.append(
                 "Pour un handle d'evidence invalide, utilise seulement des valid evidence handles "
                 "from the current evidence pack qui soutiennent le claim, ou supprime ce claim."
             )
         if is_article_structure_violation:
             instructions.append(
-                "Pour une violation article_structure, rétablis les sections et titres requis, "
-                "sans ajouter de fait ni modifier les claims sans rapport."
+                "Pour une violation article_structure, rétablis la section Vue d'ensemble et ses "
+                "trois libellés ordonnés, sans ajouter de fait ni modifier les claims sans rapport."
             )
             instructions.extend(
                 (
                     "Return the complete ARTICLE proposal in the same wire format. Start the "
                     "first section with the exact heading Vue d'ensemble and exactly three "
                     "claims beginning, in order, Victimologie :, Arsenal :, Objectif principal :.",
-                    "Include at least four further non-empty sections with distinct headings "
-                    "chosen exactly from these labels: Contexte et victimologie; Chaîne d'attaque "
-                    "par étapes; Capacités et techniques; Infrastructure et protocole C2; "
-                    "Artefacts "
-                    "hôte/réseau; Détection et hunting; Limites d'attribution.",
-                    "Aim for 2,500-5,000 words and reach 1,500 words only with distinct details "
-                    "directly supported by the evidence already present in this request.",
+                    "Include only non-empty sections that add distinct analysis supported by the "
+                    "evidence already present in this request; do not add sections to satisfy a "
+                    "quota or expand the prose to a target length.",
                     "Never pad, repeat a fact to inflate length, or add facts, dates, values, "
                     "causal links, sources, handles, or web research.",
                 )
@@ -1735,18 +1711,16 @@ def _build_synthesis_corrective_request(
             "Return the complete ARTICLE proposal in the same wire format. Start the first section "
             "with the exact heading Vue d'ensemble and exactly three claims beginning, in order, "
             "Victimologie :, Arsenal :, Objectif principal :.",
-            "Include at least four further non-empty sections with distinct headings chosen "
-            "exactly from these labels: Contexte et victimologie; Chaîne d'attaque par étapes; "
-            "Capacités et techniques; Infrastructure et protocole C2; Artefacts hôte/réseau; "
-            "Détection et hunting; Limites d'attribution.",
-            "Aim for 2,500-5,000 words and reach 1,500 words only with distinct details directly "
-            "supported by the evidence already present in this request.",
+            "Include only non-empty sections that add distinct analysis supported by the evidence "
+            "already present in this request; do not add sections to satisfy a quota or expand the "
+            "prose to a target length.",
             "Never pad, repeat a fact to inflate length, or add facts, dates, values, "
             "causal links, "
             "sources, handles, or web research. Preserve exact technical literals and their "
             "supporting handles.",
-            "If the evidence cannot support the target length, keep the prose accurate and concise "
-            "rather than inventing detail. Return no explanation outside the proposal blocks.",
+            "Keep the prose accurate and concise when the evidence is sparse. "
+            "Return no explanation "
+            "outside the proposal blocks.",
         ]
     else:
         instructions = [
@@ -1774,9 +1748,7 @@ def _build_synthesis_corrective_request(
         ]
     corrective_text = f"{request.text.rstrip()}\n" + "\n".join(instructions)
     prompt_fingerprint = hashlib.sha256(corrective_text.encode("utf-8")).hexdigest()
-    corrective_version = (
-        "v3" if is_article else ("v2" if is_plain_text_violation else "v1")
-    )
+    corrective_version = "v4" if is_article else ("v2" if is_plain_text_violation else "v1")
     identity = (
         f"production-synthesis-corrective-model-run-{corrective_version}:{request.run_id}:"
         f"{fingerprint}:{prompt_fingerprint}"
@@ -2472,10 +2444,10 @@ def build_synthesis_model_request(
         f"Actor or campaign: {snapshot.actor_or_campaign}",
         f"Period: {snapshot.period_start.isoformat()} to {snapshot.period_end.isoformat()}",
         "",
-        *SYNTHESIS_EDITORIAL_CONTRACT_V6.strip().splitlines(),
+        *SYNTHESIS_EDITORIAL_CONTRACT_V7.strip().splitlines(),
         f"Allowed section kinds: {', '.join(kind.value for kind in SynthesisSectionKind)}",
-        "Do not return @@EMPTY@@ for ARTICLE; if evidence is sparse, retain the required "
-        "outline and state only source-grounded coverage limits without padding.",
+        "Do not return @@EMPTY@@ for ARTICLE; preserve the required overview and, when evidence "
+        "is sparse, state only source-grounded coverage limits without padding.",
         "",
         "CURRENT EVIDENCE PACK",
     ]
@@ -2639,9 +2611,7 @@ def _contains_markdown_or_html(
     if _FORBIDDEN_XML_MARKUP.search(value):
         return True
     return (
-        _markdown_or_html_violation_match(
-            value, extracted_evidence_texts=extracted_evidence_texts
-        )
+        _markdown_or_html_violation_match(value, extracted_evidence_texts=extracted_evidence_texts)
         is not None
     )
 
@@ -2808,7 +2778,7 @@ def _proposal_from_payload(value: Any) -> SynthesisProposalV1:
 def validate_article_synthesis_outline(
     sections: Sequence[tuple[str, Sequence[str]]],
 ) -> None:
-    """Validate the ARTICLE overview and minimum titled follow-on sections."""
+    """Validate the required ARTICLE overview and any optional follow-on sections."""
     if not sections:
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
@@ -2840,11 +2810,6 @@ def validate_article_synthesis_outline(
             )
 
     follow_on_sections = sections[1:]
-    if len(follow_on_sections) < ARTICLE_SYNTHESIS_MIN_FOLLOW_ON_SECTIONS:
-        raise SynthesisProposalControlError(
-            SynthesisProposalErrorCode.OUTPUT_INVALID,
-            "article_structure:too_few_sections",
-        )
     if any(not claims for _, claims in follow_on_sections):
         raise SynthesisProposalControlError(
             SynthesisProposalErrorCode.OUTPUT_INVALID,
@@ -2870,9 +2835,7 @@ def _article_structure_violation_reasons(
         reasons.append("article_structure:overview_heading_invalid")
     if len(overview.claims) != len(ARTICLE_SYNTHESIS_OVERVIEW_LABELS):
         reasons.append("article_structure:overview_field_count_invalid")
-    for label, claim in zip(
-        ARTICLE_SYNTHESIS_OVERVIEW_LABELS, overview.claims, strict=False
-    ):
+    for label, claim in zip(ARTICLE_SYNTHESIS_OVERVIEW_LABELS, overview.claims, strict=False):
         field_name = label[:-1].strip().casefold()
         if not claim.text.startswith(label):
             reasons.append(f"article_structure:overview_field_missing:{field_name}")
@@ -2882,30 +2845,15 @@ def _article_structure_violation_reasons(
             reasons.append(f"article_structure:overview_value_invalid:{field_name}")
 
     follow_on_sections = proposal.sections[1:]
-    required_headings = {
-        section.heading for section in follow_on_sections
-    } & ARTICLE_SYNTHESIS_REQUIRED_HEADINGS
-    if len(follow_on_sections) < ARTICLE_SYNTHESIS_MIN_FOLLOW_ON_SECTIONS:
-        reasons.append("article_structure:too_few_sections")
     if any(not section.claims for section in follow_on_sections):
         reasons.append("article_structure:empty_section")
     if any(not section.heading.strip() for section in follow_on_sections):
         reasons.append("article_structure:section_heading_missing")
-    if len(required_headings) < ARTICLE_SYNTHESIS_MIN_FOLLOW_ON_SECTIONS:
-        reasons.append("article_structure:required_heading_coverage")
-
-    prose = (
-        *(claim.text for claim in proposal.lead),
-        *(claim.text for section in proposal.sections for claim in section.claims),
-    )
-    word_count = sum(len(_ARTICLE_SYNTHESIS_WORD.findall(text)) for text in prose)
-    if word_count < ARTICLE_SYNTHESIS_MIN_WORDS:
-        reasons.append(f"article_structure:word_floor:{word_count}:{ARTICLE_SYNTHESIS_MIN_WORDS}")
     return tuple(reasons)
 
 
 def validate_article_synthesis_structure(proposal: SynthesisProposalV1) -> None:
-    """Enforce the versioned ARTICLE outline and supported minimum prose length."""
+    """Enforce the versioned ARTICLE overview and non-empty optional sections."""
     reasons = _article_structure_violation_reasons(proposal)
     if reasons:
         raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID, reasons[0])
@@ -2918,9 +2866,7 @@ def _validate_plain_text(
     extracted_evidence_texts: tuple[str, ...] | None = None,
     collected_errors: list[SynthesisProposalControlError] | None = None,
 ) -> None:
-    violation = _plain_text_violation(
-        value, extracted_evidence_texts=extracted_evidence_texts
-    )
+    violation = _plain_text_violation(value, extracted_evidence_texts=extracted_evidence_texts)
     if violation is not None:
         if claim_id is None:
             _invalid_proposal("plain_text_violation")
@@ -3583,9 +3529,7 @@ def collect_synthesis_proposal_violations(
         claim_id = violation.get("claim_id", "")
         kind = violation.get("literal_kind") or violation.get("trigger") or "article_structure"
         value = (
-            violation.get("literal_value")
-            or violation.get("span")
-            or violation.get("reason", "")
+            violation.get("literal_value") or violation.get("span") or violation.get("reason", "")
         )
         key = (claim_id, kind, value)
         if key in seen:
@@ -5270,9 +5214,7 @@ class ProductionSynthesisService:
                     parsed.proposal,
                     evidence_pack,
                     extraction,
-                    removed_evidence=(
-                        () if revision is None else revision.delta.removed_evidence
-                    ),
+                    removed_evidence=(() if revision is None else revision.delta.removed_evidence),
                     publication_kind=publication_kind,
                 )
                 if not article_corrective_violations:
