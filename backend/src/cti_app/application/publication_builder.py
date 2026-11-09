@@ -108,7 +108,7 @@ from cti_app.domain.publication_document import (
     extract_article_overview,
     order_publication_references,
     publication_document_text_anchors,
-    select_article_timeline_key_events_v1,
+    select_publication_timeline_key_events_v2,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -612,9 +612,9 @@ def _validate_publication_lineage(
             )
 
 
-# V16 binds the additive V8 ArticleFormat projection into publication identity.
-ASSEMBLY_POLICY_VERSION: Final[str] = "16-publication-v8-article-format"
-ARTICLE_FORMAT_POLICY_VERSION: Final[str] = "1-deterministic-overview-timeline-ioc-categories"
+# V17 binds the M19 v2 ArticleFormat projection into publication identity.
+ASSEMBLY_POLICY_VERSION: Final[str] = "17-publication-v8-m19-format"
+ARTICLE_FORMAT_POLICY_VERSION: Final[str] = "2-m19-reference-date-ioc-projection"
 ARTICLE_TIMELINE_KEY_EVENT_LIMIT: Final[int] = ARTICLE_FORMAT_TIMELINE_MAX_EVENTS
 
 
@@ -624,9 +624,10 @@ def _canonical_digest(payload: dict[str, Any]) -> str:
 
 def select_article_timeline_key_events(
     timeline: tuple[PublicationTimelineEntryV1, ...],
+    sources: tuple[PublicationSourceV1, ...] = (),
 ) -> tuple[TimelineKeyEventV1, ...]:
-    """Select exact, evidenced timeline events with a stable eight-event cap."""
-    return select_article_timeline_key_events_v1(timeline)
+    """Select evidenced v2 events with published source dates and a stable cap."""
+    return select_publication_timeline_key_events_v2(timeline, sources)
 
 
 def _article_ioc_category(artifact_type: ArtifactType) -> str | None:
@@ -655,11 +656,14 @@ def build_article_format_v1(
     if not isinstance(publication, PublicationDocumentV5):
         raise ValueError("ArticleFormatV1 requires a PublicationDocumentV5 body")
     overview = extract_article_overview(publication.document.sections)
-    timeline_key_events = select_article_timeline_key_events(publication.document.timeline)
+    timeline_key_events = select_article_timeline_key_events(
+        publication.document.timeline,
+        publication.document.sources,
+    )
 
-    evidence_by_ioc: dict[
-        tuple[ArtifactType, str], set[PublicationEvidenceRefV1]
-    ] = defaultdict(set)
+    evidence_by_ioc: dict[tuple[ArtifactType, str], set[PublicationEvidenceRefV1]] = defaultdict(
+        set
+    )
     for extraction_ref, payload in extraction_evidence_elements(extraction):
         if extraction_ref.kind is not EvidenceKind.INDICATOR:
             continue
@@ -910,8 +914,14 @@ def _project_publication_sources(
     return tuple(publication_sources)
 
 
-def _reference_fallback_text(source: ProductionReferenceSourceV1) -> str:
-    """Deterministic note for a source whose synthesis note is missing."""
+def publication_reference_fallback_text(
+    source: ProductionReferenceSourceV1 | PublicationSourceV1,
+) -> str:
+    """Return the canonical deterministic fallback when synthesis has no SOURCE NOTES.
+
+    Reader projections sanitize this text for display; canonical publication
+    references preserve the established fallback wording.
+    """
     publisher = (source.publisher or "").strip() or (
         urlsplit(source.canonical_url).hostname or "Publication"
     ).removeprefix("www.")
@@ -922,6 +932,11 @@ def _reference_fallback_text(source: ProductionReferenceSourceV1) -> str:
     ):
         return f"{publisher} : {title} — ressource technique de contexte."
     return f"{publisher} publie « {title} »."
+
+
+def _reference_fallback_text(source: ProductionReferenceSourceV1) -> str:
+    """Compatibility wrapper for the canonical source-note fallback."""
+    return publication_reference_fallback_text(source)
 
 
 def _publication_reference_source_order(source: ProductionReferenceSourceV1) -> tuple[Any, ...]:
