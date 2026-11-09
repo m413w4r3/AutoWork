@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, code-font-families, noteAnalyste, tag
+#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, code-font-families, noteAnalyste, tag, fn
 #import "../UTILS/colors.typ": accent, grey, purple, purple-light
 
 #let has-text(value) = value != none and value != ""
@@ -74,8 +74,39 @@
   ]
 }
 
-#let render-article-timeline(events) = {
-  if events.len() >= 2 [
+#let unique-urls(urls) = urls.fold((), (result, url) => {
+  if url in result { result } else { result + (url,) }
+})
+
+#let render-timeline-source-notes(event, reference-scope: "", footnotes: false) = {
+  let source-urls = unique-urls(event.at("source_urls", default: ()))
+  let source-refs = event.at("source_refs", default: ())
+  if footnotes and source-urls.len() > 0 [
+    #for source-url in source-urls [#fn(source-url)]
+  ] else if source-refs.len() > 0 [
+    #for (index, source-ref) in source-refs.enumerate() [
+      #if index > 0 [, ]
+      #let source-number = source-ref.at("number", default: index + 1)
+      #let target-id = source-ref.at("target_id", default: none)
+      #let source-url = source-ref.at("url", default: none)
+      #if target-id != none [
+        #link(label(reference-scope + target-id))[#super[#str(source-number)]]
+      ] else if source-url != none [
+        #super[#link(source-url)[#str(source-number)]]
+      ] else [
+        #super[#str(source-number)]
+      ]
+    ]
+  ] else if source-urls.len() > 0 [
+    #for (index, source-url) in source-urls.enumerate() [
+      #if index > 0 [, ]
+      #super[#link(source-url)[#str(index + 1)]]
+    ]
+  ]
+}
+
+#let render-publication-timeline-rail(events, reference-scope: "", footnotes: false) = {
+  if events.len() > 0 [
     #render-section-heading[Chronologie]
     #block(
       width: 100%,
@@ -90,9 +121,17 @@
             align: (top, left),
             [#circle(radius: 3pt, fill: accent)],
             [
-              #text(size: 9pt, weight: "bold", fill: accent)[#event.display_date_fr]
-              #linebreak()
-              #text(size: 9.5pt)[#text(event.text)]
+              #let display-date = event.at("display_date_fr", default: event.at("display_date", default: ""))
+              #if has-text(display-date) [
+                #text(size: 9pt, weight: "bold", fill: accent)[#display-date]
+                #linebreak()
+              ]
+              #text(size: 9.5pt)[#semantic-or-plain(event.text, event.at("semantic_spans", default: none))]
+              #render-timeline-source-notes(
+                event,
+                reference-scope: reference-scope,
+                footnotes: footnotes,
+              )
             ],
           )
         ]
@@ -233,10 +272,6 @@
   }
 }
 
-#let unique-urls(urls) = urls.fold((), (result, url) => {
-  if url in result { result } else { result + (url,) }
-})
-
 #let render-publication-timeline(
   events,
   ordered: false,
@@ -269,26 +304,9 @@
       ]
       #semantic-or-plain(event.text, event.at("semantic_spans", default: none))
       #if footnotes [
-        #for (index, source-url) in source-urls.enumerate() [
-          #if index > 0 [, ]
-          #footnote[
-            #text(size: 7pt, fill: grey)[#link(source-url)[#source-url]]
-          ]
-        ]
+        #render-timeline-source-notes(event, reference-scope: reference-scope, footnotes: true)
       ] else if source-refs.len() > 0 [
-        #for (index, source-ref) in source-refs.enumerate() [
-          #if index > 0 [, ]
-          #let source-number = source-ref.at("number", default: index + 1)
-          #let target-id = source-ref.at("target_id", default: none)
-          #let source-url = source-ref.at("url", default: none)
-          #if target-id != none [
-            #link(label(reference-scope + target-id))[#super[#str(source-number)]]
-          ] else if source-url != none [
-            #super[#link(source-url)[#str(source-number)]]
-          ] else [
-            #super[#str(source-number)]
-          ]
-        ]
+        #render-timeline-source-notes(event, reference-scope: reference-scope)
       ] else if source-indices.len() > 0 [
         #for (index, source-index) in source-indices.enumerate() [
           #if index > 0 [, ]
@@ -387,6 +405,34 @@
   ]
   list.item(reference-content)
   }
+}
+
+#let render-m19-publication-reference(entry) = {
+  let entry-text = entry.at("text", default: none)
+  let title = entry.at("title", default: none)
+  let has-source-text = has-text(entry-text)
+  let display-text = if has-source-text { entry-text } else { title }
+  let display-date = entry.at("display_date", default: none)
+  let url = entry.at("url", default: none)
+  let source-urls = entry.at("source_urls", default: ())
+  let urls = if has-text(url) {
+    unique-urls((url,) + source-urls)
+  } else {
+    unique-urls(source-urls)
+  }
+  let semantic-spans = if has-source-text {
+    entry.at("semantic_spans", default: none)
+  } else {
+    none
+  }
+  if has-text(display-text) [
+    #block(above: 2pt, below: 4pt)[
+      #set par(justify: false)
+      #if has-text(display-date) [#text(str(display-date) + " : ")]
+      #semantic-or-plain(display-text, semantic-spans)
+      #for source-url in urls [#h(0.2em)#fn(source-url)]
+    ]
+  ]
 }
 
 #let publication-styled-table(
@@ -891,6 +937,7 @@
   bottom-space: 0pt,
   below-space: 4pt,
 ) = block(
+  width: 100%,
   above: 0pt,
   below: below-space,
   [
@@ -1142,24 +1189,9 @@
   } else {
     none
   }
-  let render-figure-annotation(body) = block(above: 1pt, below: 5pt)[
-    #set par(leading: 1.4em, spacing: 0pt)
-    #text(size: 7pt, fill: grey)[#body]
-  ]
-  let annotation = [
-    #render-figure-annotation[Documenté, non observé — visuel reproduit depuis une source.]
-    #if has-text(item.source_note) [
-      #render-figure-annotation[Source : #item.source_note]
-    ]
-    #let attribution = item.at("attribution", default: none)
-    #if has-text(attribution) [
-      #render-figure-annotation[Attribution : #attribution]
-    ]
-  ]
   render-publication-image(
     item.media_path,
     caption-content,
-    annotation: annotation,
     max-height-fraction: 0.36,
     article-style: article-style,
   )
@@ -1207,18 +1239,17 @@
 #let render-body-block(
   item,
   reference-scope: "",
-  paragraph-gap: 5pt,
+  paragraph-gap: 0pt,
   article-style: false,
 ) = {
   let body = if item.type == "section_heading" {
     heading(level: 2)[#item.text]
   } else if item.type == "paragraph" {
     [
-      #block(above: 0pt, below: paragraph-gap)[
-        #semantic-or-plain(item.text, item.at("semantic_spans", default: none))
-        #if item.at("anchor_target", default: none) != none [#label(item.anchor_target)]
-      ]
+      #semantic-or-plain(item.text, item.at("semantic_spans", default: none))
+      #if item.at("anchor_target", default: none) != none [#label(item.anchor_target)]
       #parbreak()
+      #if paragraph-gap > 0pt [#v(paragraph-gap)]
     ]
   } else if item.type == "analyst_observation" {
     block(above: 10pt, below: 8pt)[
@@ -1236,6 +1267,21 @@
     panic("unsupported publication body block type: " + item.type)
   }
   render-target(item.at("target_id", default: none), body)
+}
+
+#let render-m19-publication-references(content-section) = {
+  let entries = content-section.at("entries", default: ())
+  let sources = content-section.at("sources", default: ())
+  let entries = if entries.len() > 0 { entries } else { sources }
+  let visible-entries = entries.filter(entry =>
+    has-text(entry.at("text", default: none)) or has-text(entry.at("title", default: none))
+  )
+  let blocks = content-section.at("blocks", default: ())
+  if visible-entries.len() > 0 or blocks.len() > 0 [
+    #render-section-heading[Références]
+    #for entry in visible-entries [#render-m19-publication-reference(entry)]
+    #for item in blocks {render-body-block(item)}
+  ]
 }
 
 #let render-publication-references(
@@ -1290,16 +1336,15 @@
   }
   let article-format = publication.at("article_format", default: none)
   let article-publication = not brief-publication and not opinion-publication
-  let chronology-sections = publication.content_sections.filter(
-    section => section.type == "chronology",
-  )
+  if not opinion-publication [
+    #for content-section in publication.content_sections [
+      #if content-section.type == "references" [
+        #render-m19-publication-references(content-section)
+      ]
+    ]
+  ]
   let article-events = if article-format != none {
     article-format.at("timeline_key_events", default: ())
-  } else if chronology-sections.len() > 0 {
-    chronology-sections.first().at("timeline", default: ()).map(event => (
-      display_date_fr: event.at("display_date", default: ""),
-      text: event.text,
-    ))
   } else {
     ()
   }
@@ -1310,15 +1355,18 @@
   }
   let has-article-overview = article-overview != none
   if article-publication [
-    #render-article-timeline(article-events)
+    #render-publication-timeline-rail(
+      article-events,
+      reference-scope: reference-scope,
+      footnotes: true,
+    )
     #if article-overview != none [#render-article-overview(article-overview)]
   ]
   for content_section in publication.content_sections {
     if content_section.type == "references" {
-      if not article-publication {
+      if opinion-publication {
         render-publication-references(
           content_section,
-          brief-publication: brief-publication,
           opinion-publication: opinion-publication,
           reference-scope: reference-scope,
         )
@@ -1326,11 +1374,17 @@
     } else if content_section.type == "synthesis" [
       #if brief-publication [
         #render-section-heading[Synthèse]
-        #for item in content_section.at("blocks", default: ()) {
+        #let synthesis-blocks = content_section.at("blocks", default: ())
+        #for (index, item) in synthesis-blocks.enumerate() {
+          let has-next-paragraph = if index + 1 < synthesis-blocks.len() {
+            synthesis-blocks.at(index + 1).type == "paragraph"
+          } else {
+            false
+          }
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: 9pt,
+            paragraph-gap: if has-next-paragraph { 9pt } else { 0pt },
           )
         }
       ] else if article-publication [
@@ -1338,11 +1392,17 @@
           "Synthèse",
           reduce-above: if has-article-overview { 13pt } else { 0pt },
         )
-        #for item in content_section.at("blocks", default: ()) {
+        #let synthesis-blocks = content_section.at("blocks", default: ())
+        #for (index, item) in synthesis-blocks.enumerate() {
+          let has-next-paragraph = if index + 1 < synthesis-blocks.len() {
+            synthesis-blocks.at(index + 1).type == "paragraph"
+          } else {
+            false
+          }
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: 7pt,
+            paragraph-gap: if has-next-paragraph { 9pt } else { 0pt },
             article-style: true,
           )
         }
@@ -1355,11 +1415,9 @@
     ] else if content_section.type == "chronology" [
       #let brief-chronology = publication.at("kind", default: "article") == "brief"
       #if brief-chronology [
-        #render-section-heading[Chronologie]
-        #render-publication-timeline(
-          content_section.timeline,
+        #render-publication-timeline-rail(
+          content_section.at("timeline", default: ()),
           reference-scope: reference-scope,
-          date-fill: purple,
           footnotes: brief-chronology,
         )
       ] else if opinion-publication [
@@ -1567,14 +1625,6 @@
     }
   }
   if article-publication {
-    for content_section in publication.content_sections {
-      if content_section.type == "references" {
-        render-publication-references(
-          content_section,
-          reference-scope: reference-scope,
-        )
-      }
-    }
     if article-format != none {
       render-article-iocs(article-format)
     } else {

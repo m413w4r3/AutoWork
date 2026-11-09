@@ -214,9 +214,7 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
         "9 septembre 2026",
         "21 septembre 2026",
         "Références",
-        "Example Research",
-        "Analyse de la chaîne observée",
-        "2026-09-09",
+        "9 septembre 2026 : Legacy reference text must not replace the editor/title fields.",
         "Figure 1 : Chaîne d’exécution résumée",  # noqa: RUF001
         "Figure 2 : Séquence réseau résumée",
         "Composants documentés",
@@ -234,11 +232,11 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
     ):
         assert expected in text, expected
     assert (
-        text.index("Chronologie")
+        text.index("Références")
+        < text.index("Chronologie")
         < text.index("Vue d’ensemble")  # noqa: RUF001
         < text.index("Synthèse")
         < text.index("Dernier paragraphe de synthèse")
-        < text.index("Références")
         < text.index("IOC")
     )
     for forbidden in (
@@ -254,13 +252,13 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
     reference_lines = [
         line.strip()
         for line in text.splitlines()
-        if line.strip().startswith("• Example Research")
+        if "Legacy reference text must not replace" in line
     ]
     assert len(reference_lines) == 1
-    assert reference_lines[0].startswith("•")
+    assert reference_lines[0].startswith("9 septembre 2026 : ")
+    assert "https://example.test/report" not in reference_lines[0]
     assert "https://example.test/report" in compact_text
-    assert "Threat Desk" in text
-    assert "https://threat.example.test/analysis" in compact_text
+    assert "Threat Desk" not in text
     assert any(
         str(annotation.get_object().get("/A", {}).get("/URI", ""))
         == "https://example.test/report"
@@ -307,7 +305,7 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
 
     event_positions = []
     for event in fixture["article_format"]["timeline_key_events"]:
-        date_line = find_bbox_line(event["display_date_fr"])
+        date_line = find_exact_bbox_line(event["display_date_fr"])
         text_line = find_bbox_line(event["text"])
         assert date_line[0] == text_line[0], event
         assert date_line[1] < text_line[1], event
@@ -324,19 +322,9 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
         if previous_text[0] == following_date[0]:
             assert previous_text[2]["bottom"] <= following_date[2]["top"]
 
-    figure_lines = [
-        find_bbox_line(fragment)
-        for fragment in (
-            "Figure 1 : Chaîne d’exécution résumée",  # noqa: RUF001
-            "Documenté, non observé",
-            "Source : Example Research",
-            "Attribution : Reconstitution à partir du rapport cité.",
-        )
-    ]
-    assert len({line[0] for line in figure_lines}) == 1
-    assert [line[1] for line in figure_lines] == sorted(line[1] for line in figure_lines)
-    for previous, following in pairwise(figure_lines):
-        assert previous[2]["bottom"] <= following[2]["top"]
+    assert "Documenté, non observé" not in text
+    assert "Source :" not in text
+    assert "Attribution :" not in text
 
     categories = fixture["article_format"]["ioc_categories"]
     category_specs = (
@@ -392,7 +380,12 @@ async def test_legacy_article_fallback_suppresses_legacy_chronology_and_statuses
     text, _reader = _extract_text(pdf_bytes, tmp_path / "article-legacy.pdf")
     lowered_text = text.casefold()
     assert "Références" in text
-    assert "•" in text and "Legacy Lab" in text
+    assert "Rapport conservé" in text
+    assert "Legacy Lab" not in text
+    assert "2026-08-02" not in text
+    legacy_reference_line = next(line for line in text.splitlines() if "Rapport conservé" in line)
+    assert "https://legacy.example.test/report" not in legacy_reference_line
+    assert "https://legacy.example.test/report" in "".join(text.split())
     assert "IOC" in text and "IPv4" in text and "203.0.113.19" in text
     assert "Chronologie" not in text
     for forbidden in (*_BANNED_TEXT, "LEGACY CHRONOLOGY", "contextual indicator"):
@@ -400,7 +393,7 @@ async def test_legacy_article_fallback_suppresses_legacy_chronology_and_statuses
 
 
 @pytest.mark.asyncio
-async def test_article_with_fewer_than_two_key_events_has_no_empty_timeline_or_ioc(
+async def test_article_with_one_projected_key_event_renders_it_without_threshold_logic(
     tmp_path: Path,
     typst_binary: str,
     font_path: Path,
@@ -416,8 +409,9 @@ async def test_article_with_fewer_than_two_key_events_has_no_empty_timeline_or_i
         render_data=fixture,
     )
     text, _reader = _extract_text(pdf_bytes, tmp_path / "article-one-event.pdf")
-    assert "Chronologie" not in text
-    assert "9 septembre 2026" not in text
+    assert "Chronologie" in text
+    assert "9 septembre 2026" in text
+    assert "LEGACY EMPTY TEST" not in text
     assert "IOC" not in text
     assert "Une brève séquence documentée." in text
 
