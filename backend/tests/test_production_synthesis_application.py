@@ -1670,8 +1670,77 @@ def test_output_invalid_carries_a_diagnosable_reason():
     with pytest.raises(SynthesisProposalControlError) as shape:
         validate_synthesis_proposal(malformed, pack, extraction)
 
-    assert plain.value.reason == "plain_text_violation"
+    assert plain.value.reason.startswith("plain_text_violation:claim=unknown:trigger=")
     assert shape.value.reason == "malformed_proposal"
+
+
+@pytest.mark.parametrize(
+    ("text", "trigger", "span"),
+    (
+        ("Le marqueur <!-- apparaît.", "xml_markup", "<!--"),
+        ("Un terme **important** est cité.", "markdown_or_html", "**"),
+        ("| A | B |\n| --- | --- |", "table", "| --- | --- |"),
+        ("Texte\n@@END CLAIM@@", "wire_marker", "@@END CLAIM@@"),
+        ("Voir [E001] pour le détail.", "source_marker", "[E001]"),
+    ),
+)
+def test_plain_text_violation_reason_localizes_claim_trigger_and_bounded_span(
+    text: str, trigger: str, span: str
+) -> None:
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        synthesis_module._validate_plain_text(text, claim_id="C007")
+
+    assert invalid.value.reason == (
+        f"plain_text_violation:claim=C007:trigger={trigger}:span={span}"
+    )
+    excerpt = invalid.value.reason.rsplit(":span=", maxsplit=1)[1]
+    assert len(excerpt) <= 80
+    assert "\n" not in excerpt and "\r" not in excerpt
+
+
+def test_plain_text_corrective_request_keeps_brief_prompt_hash_and_base_version() -> None:
+    prompt = build_brief_synthesis_prompt(
+        subject_title="Fixture article",
+        publication_language="fr",
+        tlp="clear",
+        discovery_summary="Fixture summary.",
+        actor_or_campaign="Fixture actor",
+        period_start="2026-01-01",
+        period_end="2026-02-01",
+        evidence_blocks=(("@@EVIDENCE E001@@", "TEXT:", "Observation de test."),),
+        reserve_blocks=(),
+    )
+    request = ModelRequest(
+        text=prompt,
+        prompt_template_id="production-synthesis-brief",
+        prompt_template_version=BRIEF_SYNTHESIS_PROMPT_VERSION,
+        evidence_pack_hash="a" * 64,
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
+        metadata={"synthesis_input_hash": "b" * 64},
+        run_id=uuid4(),
+    )
+    error = SynthesisProposalControlError(
+        SynthesisProposalErrorCode.OUTPUT_INVALID,
+        "plain_text_violation:claim=L001:trigger=xml_markup:span=<!--",
+    )
+
+    corrective = synthesis_module._build_synthesis_corrective_request(request, error)
+    corrective_replay = synthesis_module._build_synthesis_corrective_request(request, error)
+
+    assert corrective is not None and corrective_replay is not None
+    correction_request, _fingerprint, _violation = corrective
+    replay_request, _replay_fingerprint, _replay_violation = corrective_replay
+    assert hashlib.sha256(request.text.encode("utf-8")).hexdigest() == (
+        "afc38a756093b0337fc5d54467f45a6b4928177e19fec7468cadd8333381bba0"
+    )
+    assert correction_request.text.startswith(request.text)
+    assert correction_request.metadata["synthesis_input_hash"] == "b" * 64
+    assert correction_request.prompt_template_version == BRIEF_SYNTHESIS_PROMPT_VERSION
+    assert correction_request.metadata["synthesis_corrective_prompt_version"] == (
+        "production-synthesis-corrective-v2-plain-text"
+    )
+    assert replay_request.run_id == correction_request.run_id
 
 
 def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
@@ -2685,14 +2754,14 @@ def test_extracted_configuration_xml_literal_is_allowed_in_synthesis_text(
         validate_synthesis_proposal(
             make_proposal(case_variant_text, cited_handle), pack, extraction
         )
-    assert case_variant.value.reason == "plain_text_violation"
+    assert case_variant.value.reason.startswith("plain_text_violation:claim=unknown:trigger=")
 
     backticked_text = claim_text.replace(
         '<etwEnable enabled="false"/>', '`<etwEnable enabled="false"/>`'
     )
     with pytest.raises(SynthesisProposalControlError) as backticked:
         validate_synthesis_proposal(make_proposal(backticked_text, cited_handle), pack, extraction)
-    assert backticked.value.reason == "plain_text_violation"
+    assert backticked.value.reason.startswith("plain_text_violation:claim=unknown:trigger=")
 
 
 def test_other_extracted_configuration_xml_literal_is_allowed_in_synthesis_text() -> None:
@@ -2762,7 +2831,7 @@ def test_extracted_active_or_formatting_markup_is_still_rejected(fragment: str) 
             extraction,
         )
 
-    assert invalid.value.reason == "plain_text_violation", fragment
+    assert invalid.value.reason.startswith("plain_text_violation:claim=unknown:trigger="), fragment
 
 
 def test_unextracted_other_configuration_xml_literal_is_rejected() -> None:
@@ -2782,7 +2851,7 @@ def test_unextracted_other_configuration_xml_literal_is_rejected() -> None:
             extraction,
         )
 
-    assert invalid.value.reason == "plain_text_violation"
+    assert invalid.value.reason.startswith("plain_text_violation:claim=unknown:trigger=")
 
 
 def test_unextracted_configuration_xml_literal_is_still_rejected() -> None:
@@ -2812,7 +2881,7 @@ def test_unextracted_configuration_xml_literal_is_still_rejected() -> None:
             extraction,
         )
 
-    assert invalid.value.reason == "plain_text_violation"
+    assert invalid.value.reason.startswith("plain_text_violation:claim=unknown:trigger=")
 
 
 def test_domain_indicator_keeps_handle_requirement_when_name_is_also_a_file() -> None:
@@ -5079,6 +5148,132 @@ async def test_article_structure_failure_gets_exactly_one_corrective_turn() -> N
     synthesis = world.writer.calls[0]["synthesis"]
     assert isinstance(synthesis, ProductionSynthesisV1)
     assert synthesis.sections[0].heading == "Vue d'ensemble"
+
+
+@pytest.mark.asyncio
+async def test_inline_html_comment_gets_one_corrective_turn_and_validates_again() -> None:
+    world = _fresh_setup()
+    corrected = _proposal_wire(_articleize_test_proposal(world.proposal))
+    marker_line = "TEXT: Victimologie : FooRAT was identified in the report."
+    invalid = corrected.replace(
+        marker_line,
+        "TEXT: Victimologie : FooRAT was identified using the `<!--` marker.",
+        1,
+    )
+    assert invalid != corrected
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        if request.metadata.get("synthesis_corrective_turn") == 1:
+            return _succeeded(request, None, text=corrected)
+        return _succeeded(request, None, text=invalid)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    first_request, corrective_request = (call[0] for call in world.gateway.calls)
+    assert corrective_request.run_id != first_request.run_id
+    assert corrective_request.metadata["synthesis_parent_model_run_id"] == str(
+        first_request.run_id
+    )
+    assert corrective_request.metadata["synthesis_corrective_prompt_version"] == (
+        "production-synthesis-corrective-v2-plain-text"
+    )
+    assert '"claim_id": "S001C001"' in corrective_request.text
+    assert '"trigger": "xml_markup"' in corrective_request.text
+    assert '"span": "<!--"' in corrective_request.text
+    assert "Réécris le claim concerné en prose française simple" in corrective_request.text
+    assert "le marqueur d'ouverture de commentaire HTML" in corrective_request.text
+    assert "sans explication hors des blocs" in corrective_request.text
+    assert corrective_request.evidence_pack_hash == first_request.evidence_pack_hash
+    assert corrective_request.metadata["synthesis_input_hash"] == first_request.metadata[
+        "synthesis_input_hash"
+    ]
+    assert result.model_run_id == corrective_request.run_id
+    assert len(world.writer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_plain_text_corrective_failure_needs_review_without_a_third_call() -> None:
+    world = _fresh_setup()
+    article = _proposal_wire(_articleize_test_proposal(world.proposal))
+    marker_line = "TEXT: Victimologie : FooRAT was identified in the report."
+    first_invalid = article.replace(
+        marker_line,
+        "TEXT: Victimologie : FooRAT was identified using the `<!--` marker.",
+        1,
+    )
+    second_invalid = article.replace(
+        marker_line,
+        "TEXT: Victimologie : **FooRAT** was identified in the report.",
+        1,
+    )
+    outputs = iter((first_invalid, second_invalid))
+
+    world.gateway._responder = lambda request: _succeeded(
+        request, None, text=next(outputs)
+    )
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.OUTPUT_INVALID.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert len(result.details["correction_errors"]) == 2
+    assert result.details["correction_errors"][0]["reason"] == (
+        "plain_text_violation:claim=S001C001:trigger=xml_markup:span=<!--"
+    )
+    assert result.details["correction_errors"][1]["reason"].startswith(
+        "plain_text_violation:claim=S001C001:trigger=markdown_or_html:span="
+    )
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_plain_text_corrective_turn_still_rechecks_grounding() -> None:
+    world = _fresh_setup()
+    event_handle = next(
+        str(record["handle"])
+        for record in world.pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    supported_proposal = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began.", event_handle)
+    )
+    article = _proposal_wire(_articleize_test_proposal(supported_proposal))
+    marker_line = "TEXT: Victimologie : The campaign began."
+    first_invalid = article.replace(
+        marker_line,
+        "TEXT: Victimologie : The campaign began using the `<!--` marker.",
+        1,
+    )
+    unsupported_proposal = SynthesisProposalV1.model_validate(
+        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    )
+    corrected_but_unsupported = _proposal_wire(
+        _articleize_test_proposal(unsupported_proposal)
+    )
+    outputs = iter((first_invalid, corrected_but_unsupported))
+    world.gateway._responder = lambda request: _succeeded(
+        request, None, text=next(outputs)
+    )
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_DATE.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert result.details["correction_errors"][0]["reason"].startswith(
+        "plain_text_violation:claim=S001C001:trigger=xml_markup:span="
+    )
+    assert result.details["correction_errors"][1]["error_code"] == (
+        SynthesisProposalErrorCode.UNKNOWN_DATE.value
+    )
+    assert "literal_value=2026-07-03" in result.details["correction_errors"][1]["reason"]
+    assert world.writer.calls == []
 
 
 @pytest.mark.asyncio
