@@ -22,6 +22,7 @@ from cti_app.application.persistence import ProductionArtifactRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
+    canonical_editorial_enrichment_hash,
     canonical_synthesis_hash,
     validate_editorial_enrichment,
 )
@@ -102,6 +103,8 @@ class PublicationAssemblyService:
         editorial_enrichment: EditorialEnrichmentV1 | None,
         relevance_projection: RelevanceProjectionV1 | None = None,
         publication_kind: PublicationKind | None = None,
+        editorial_enrichment_artifact_id: UUID | None = None,
+        editorial_enrichment_artifact_input_hash: str | None = None,
         routing_decision_hash: str | None = None,
         routing_policy_version: str | None = None,
         metadata_extra: Mapping[str, Any] | None = None,
@@ -157,15 +160,30 @@ class PublicationAssemblyService:
                 editorial_enrichment=editorial_enrichment,
             )
         else:
-            if editorial_enrichment is not None:
-                raise PublicationAssemblyValidationError(
-                    PublicationAssemblyErrorCode.INPUTS_MISMATCH,
-                    "Brief assembly must not claim editorial enrichment",
-                )
             if relevance_projection is None:
                 raise PublicationAssemblyValidationError(
                     PublicationAssemblyErrorCode.INPUTS_MISMATCH,
                     "Brief assembly requires a relevance projection",
+                )
+            if editorial_enrichment is not None:
+                if (editorial_enrichment_artifact_id is None) != (
+                    editorial_enrichment_artifact_input_hash is None
+                ):
+                    raise PublicationAssemblyValidationError(
+                        PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+                        "Brief enrichment artifact identity is incomplete",
+                    )
+                validate_editorial_enrichment(
+                    editorial_enrichment, extraction=extraction, synthesis=synthesis
+                )
+                if editorial_enrichment.production_input_hash != snapshot.input_hash:
+                    raise PublicationAssemblyValidationError(
+                        PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+                        "Editorial enrichment does not match the production input snapshot",
+                    )
+                editorial_enrichment = await self._refresh_diagram_assets(
+                    editorial_enrichment,
+                    production_run_id=run.id,
                 )
             base_document = build_brief_publication_document_v5(
                 snapshot=snapshot,
@@ -173,7 +191,39 @@ class PublicationAssemblyService:
                 extraction=extraction,
                 relevance_projection=relevance_projection,
                 synthesis=synthesis,
+                editorial_enrichment=editorial_enrichment,
             )
+            if editorial_enrichment is not None and not (
+                base_document.document.tables
+                or base_document.document.diagrams
+                or base_document.document.figures
+                or base_document.document.charts
+            ):
+                empty_document = build_brief_publication_document_v5(
+                    snapshot=snapshot,
+                    references=references,
+                    extraction=extraction,
+                    relevance_projection=relevance_projection,
+                    synthesis=synthesis,
+                )
+                if base_document.semantic_text == empty_document.semantic_text:
+                    base_document = empty_document
+                    editorial_enrichment = None
+                    editorial_enrichment_artifact_id = None
+                    editorial_enrichment_artifact_input_hash = None
+
+        assembly_metadata_extra = dict(metadata_extra or {})
+        if publication_kind is PublicationKind.BRIEF and editorial_enrichment is None:
+            input_artifacts = assembly_metadata_extra.get("input_artifacts")
+            if isinstance(input_artifacts, Mapping):
+                filtered_artifacts = dict(input_artifacts)
+                filtered_artifacts.pop("editorial_enrichment_artifact_id", None)
+                assembly_metadata_extra["input_artifacts"] = filtered_artifacts
+            diagnostics = assembly_metadata_extra.get("diagnostics")
+            if isinstance(diagnostics, Mapping):
+                filtered_diagnostics = dict(diagnostics)
+                filtered_diagnostics.pop("editorial_enrichment", None)
+                assembly_metadata_extra["diagnostics"] = filtered_diagnostics
 
         assembly_input_hash = self._assembly_input_hash(
             publication_kind=publication_kind,
@@ -182,6 +232,8 @@ class PublicationAssemblyService:
             extraction=extraction,
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
+            editorial_enrichment_artifact_id=editorial_enrichment_artifact_id,
+            editorial_enrichment_artifact_input_hash=editorial_enrichment_artifact_input_hash,
             relevance_projection=relevance_projection,
             routing_decision_hash=routing_decision_hash,
             routing_policy_version=routing_policy_version,
@@ -283,7 +335,7 @@ class PublicationAssemblyService:
             )
 
         _document, canonical_document, canonical_bytes = canonical_v8(publication_artifact_id)
-        metadata = dict(metadata_extra or {})
+        metadata = dict(assembly_metadata_extra)
         if published_figure_diagnostics:
             existing_figure_diagnostics = metadata.get("source_figure_provenance_diagnostics")
             metadata["source_figure_provenance_version"] = (
@@ -320,7 +372,8 @@ class PublicationAssemblyService:
             and current.canonical_blob_id is not None
             and (
                 metadata_extra is None
-                or current.metadata.get("input_artifacts") == metadata_extra.get("input_artifacts")
+                or current.metadata.get("input_artifacts")
+                == assembly_metadata_extra.get("input_artifacts")
             )
             and current.metadata.get("diagnostics") == metadata.get("diagnostics")
         ):
@@ -411,6 +464,8 @@ class PublicationAssemblyService:
         extraction: ProductionExtractionV1,
         synthesis: ProductionSynthesisV1,
         editorial_enrichment: EditorialEnrichmentV1 | None,
+        editorial_enrichment_artifact_id: UUID | None = None,
+        editorial_enrichment_artifact_input_hash: str | None = None,
         relevance_projection: RelevanceProjectionV1 | None,
         routing_decision_hash: str,
         routing_policy_version: str,
@@ -429,22 +484,30 @@ class PublicationAssemblyService:
         else:
             if relevance_projection is None:
                 raise ValueError("Brief assembly input hash requires relevance projection")
-            content_hash = hashlib.sha256(
-                ProductionArtifactStore.canonical_json_bytes(
-                    {
-                        "snapshot_input_hash": snapshot.input_hash,
-                        "references_hash": references_corpus_hash(references),
-                        "extraction_hash": canonical_extraction_hash(extraction),
-                        "synthesis_hash": canonical_synthesis_hash(synthesis),
-                        "editorial_enrichment_hash": None,
-                        "relevance_projection_hash": relevance_projection.projection_hash,
-                        "publication_document_schema_version": (
-                            PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
-                        ),
-                        "brief_assembly_policy_version": BRIEF_ASSEMBLY_POLICY_VERSION,
-                        "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
-                    }
+            brief_identity: dict[str, Any] = {
+                "snapshot_input_hash": snapshot.input_hash,
+                "references_hash": references_corpus_hash(references),
+                "extraction_hash": canonical_extraction_hash(extraction),
+                "synthesis_hash": canonical_synthesis_hash(synthesis),
+                "relevance_projection_hash": relevance_projection.projection_hash,
+                "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+                "brief_assembly_policy_version": BRIEF_ASSEMBLY_POLICY_VERSION,
+                "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
+            }
+            if editorial_enrichment is not None:
+                brief_identity["editorial_enrichment_hash"] = canonical_editorial_enrichment_hash(
+                    editorial_enrichment
                 )
+                if editorial_enrichment_artifact_input_hash is not None:
+                    brief_identity["editorial_enrichment_input_hash"] = (
+                        editorial_enrichment_artifact_input_hash
+                    )
+                if editorial_enrichment_artifact_id is not None:
+                    brief_identity["editorial_enrichment_artifact_id"] = str(
+                        editorial_enrichment_artifact_id
+                    )
+            content_hash = hashlib.sha256(
+                ProductionArtifactStore.canonical_json_bytes(brief_identity)
             ).hexdigest()
         return hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(
@@ -518,9 +581,7 @@ class PublicationAssemblyService:
             return None
         if not isinstance(publication, PublicationDocumentV8):
             return None
-        return (
-            publication.base_publication.base_publication.provenance.base_publication_artifact_id
-        )
+        return publication.base_publication.base_publication.provenance.base_publication_artifact_id
 
     @staticmethod
     def _set_repair_result_id(artifact: ProductionArtifact) -> None:

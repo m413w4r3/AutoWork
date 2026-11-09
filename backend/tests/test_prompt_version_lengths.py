@@ -18,6 +18,8 @@ def test_prompt_and_contract_version_constants_fit_database_columns() -> None:
         },
         synthesis_revision: {"ARTICLE_TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION"},
         editorial_enrichment: {
+            "EDITORIAL_ENRICHMENT_GENERATOR_VERSION",
+            "EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION",
             "SEMANTIC_ANNOTATION_PROMPT_VERSION",
             "SEMANTIC_ANNOTATION_CONTRACT_VERSION",
             "SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION",

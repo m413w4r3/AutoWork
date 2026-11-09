@@ -493,10 +493,15 @@ def _archived_article_figure_inventory(
     figure_count: int = 8,
 ) -> SourceFigureInventoryResult:
     extraction_source = extraction.sources[0]
-    navigation = "<nav>" + "".join(
-        f'<img src="/navigation/{index}.png" alt="menu icon {index}">'
-        for index in range(navigation_count)
-    ) + "</nav>"
+    navigation = (
+        "<nav>"
+        + "".join(
+            f'<img src="/navigation/{index}.png" alt="menu icon {index}">'
+            for index in range(navigation_count)
+        )
+        + "</nav>"
+    )
+
     def figure_markup(index: int) -> str:
         caption = (
             "ExampleRAT execution architecture"
@@ -510,10 +515,7 @@ def _archived_article_figure_inventory(
 
     article_figures = "".join(figure_markup(index) for index in range(figure_count))
     content = (
-        "<html><body>"
-        + navigation
-        + f"<article>{article_figures}</article>"
-        + "</body></html>"
+        "<html><body>" + navigation + f"<article>{article_figures}</article>" + "</body></html>"
     ).encode()
     archived_source = ArchivedFigureSource(
         source_document_id=extraction_source.source_document_id,
@@ -1059,7 +1061,9 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "ne dépasse jamais 9" in article_contract
     assert "Règles ARTICLE R7" not in brief_contract
     assert "TABLE MINIMUM NOT MET" not in brief_contract
-    assert "FIGURE SOURCE proposées ne dépasse jamais" not in brief_contract
+    assert "FIGURE SOURCE proposées ne dépasse jamais 3" in brief_contract
+    assert "aucun minimum de table" in brief_contract.casefold()
+    assert "N'effectue aucune recherche Web" in brief_contract
 
 
 def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
@@ -3172,9 +3176,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert inventory.functional_hash() is not None
     assert inventory.rejected_before_limit_count == 700
     assert inventory.truncated_count == 0
-    inventory_diagnostics = build_source_figure_inventory_diagnostics(
-        inventory, figure_catalog
-    )
+    inventory_diagnostics = build_source_figure_inventory_diagnostics(inventory, figure_catalog)
     assert inventory_diagnostics["counts"]["accepted"] == 8
     assert inventory_diagnostics["counts"]["rejected"] == 700
     assert inventory_diagnostics["counts"]["rejected_before_limit"] == 700
@@ -3190,12 +3192,8 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     proxy_catalog = build_editorial_figure_catalog(extraction, proxy_inventory)
     assert len({entry.figure.locator.original_asset_url for entry in proxy_catalog}) == 1
     assert [entry.handle for entry in proxy_catalog] == ["F001", "F002"]
-    proxy_diagnostics = build_source_figure_inventory_diagnostics(
-        proxy_inventory, proxy_catalog
-    )
-    assert len(
-        {item["archived_location"] for item in proxy_diagnostics["accepted"]}
-    ) == 1
+    proxy_diagnostics = build_source_figure_inventory_diagnostics(proxy_inventory, proxy_catalog)
+    assert len({item["archived_location"] for item in proxy_diagnostics["accepted"]}) == 1
     assert [item["handle"] for item in proxy_diagnostics["accepted"]] == ["F001", "F002"]
     reversed_proxy_inventory = replace(
         proxy_inventory, figures=tuple(reversed(proxy_inventory.figures))
@@ -3226,11 +3224,15 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
         pack,
         access_policy,
         figure_catalog=figure_catalog,
+        resource_search_enabled=True,
         publication_kind=PublicationKind.BRIEF,
     )
-    assert brief_request.web_search is True
+    assert brief_request.web_search is False
     assert brief_request.parameters["maximum_figure_proposals"] == 3
-    assert extraction.sources[0].canonical_url in brief_request.text
+    assert extraction.sources[0].canonical_url not in brief_request.text
+    assert '"source_page_url":null' in brief_request.text
+    assert '"asset_url":null' in brief_request.text
+    assert "n'effectue aucune recherche Web" in brief_request.text
     assert '"source_page_url":null' in request.text
     assert '"source_caption":"ExampleRAT execution architecture"' in request.text
     assert '"evidence":["E001"]' in request.text
@@ -3238,7 +3240,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "ExampleRAT execution architecture" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v10-article-density"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v11-brief-enrichment"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
         "editorial-enrichment-block-contract-v14-article-density"
     )
@@ -4480,6 +4482,57 @@ async def test_resource_search_opt_in_uses_separate_call_and_persists_proposals_
 
 
 @pytest.mark.asyncio
+async def test_brief_resource_search_stays_disabled_even_when_configuration_enables_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    needs_wire = (
+        "NEEDS N001\nKIND: MEDIA\n"
+        "REASON: No relevant execution figure is archived.\n"
+        "QUERY_HINT: Example incident execution diagram\nEND NEEDS"
+    )
+    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, needs_wire)))
+
+    async def brief_route(**_kwargs: object):
+        return SimpleNamespace(publication_kind=PublicationKind.BRIEF)
+
+    monkeypatch.setattr(enrichment_module, "get_adopted_production_routing_decision", brief_route)
+    world.service._resource_search_enabled = True
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert all(request.web_search is False for request, _schema in world.gateway.calls)
+    assert result.details["resource_proposal_search"]["status"] == "disabled_for_brief"
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert enrichment.resource_needs  # type: ignore[attr-defined]
+    assert enrichment.resource_proposals == ()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_brief_access_policy_denial_makes_no_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, "NO USEFUL ENRICHMENT")),
+        documents=(replace(_document(), external_llm_allowed=False),),
+    )
+
+    async def brief_route(**_kwargs: object):
+        return SimpleNamespace(publication_kind=PublicationKind.BRIEF)
+
+    monkeypatch.setattr(enrichment_module, "get_adopted_production_routing_decision", brief_route)
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == EditorialEnrichmentStageErrorCode.POLICY_BLOCKED
+    assert result.model_calls == 0
+    assert world.gateway.calls == []
+
+
+@pytest.mark.asyncio
 async def test_document_access_policy_blocks_enrichment_before_gateway() -> None:
     needs_wire = (
         "NEEDS N001\nKIND: MEDIA\nREASON: Missing figure.\n"
@@ -4830,8 +4883,7 @@ async def test_invalid_structured_output_needs_review_without_artifact(failure: 
         responder = StructuredOutputError("schema mismatch")
     else:
         unknown_wire = (
-            _proposal_to_wire(_proposal("E999"))
-            + "\nDIAGRAM OMITTED\n"
+            _proposal_to_wire(_proposal("E999")) + "\nDIAGRAM OMITTED\n"
             "REASON: The candidate diagram uses an unknown evidence handle.\n"
             "END DIAGRAM OMITTED"
         )
@@ -4869,16 +4921,13 @@ async def test_key_collision_rejects_only_the_conflicting_wire_block(
 ) -> None:
     proposal = EditorialEnrichmentProposalV1.model_validate(_colliding_proposal(collision))
     collision_wire = (
-        _proposal_to_wire(proposal)
-        + "\nTABLE MINIMUM NOT MET\n"
+        _proposal_to_wire(proposal) + "\nTABLE MINIMUM NOT MET\n"
         "REASON: Les propositions en collision ne donnent qu'un tableau distinct conservable.\n"
         "END TABLE MINIMUM NOT MET\nDIAGRAM OMITTED\n"
         "REASON: Le diagramme du test entre en collision avec la clé du tableau.\n"
         "END DIAGRAM OMITTED"
     )
-    world = _world(
-        _RecordingGateway(lambda request: _succeeded_text(request, collision_wire))
-    )
+    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, collision_wire)))
 
     result = await _execute(world)
 

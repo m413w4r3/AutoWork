@@ -2115,12 +2115,8 @@ class ProductionWorkflowOrchestrator:
                 run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
             )
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
-            enrichment = (
-                await uow.production_artifacts.get_current(
-                    run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
-                )
-                if publication_kind is PublicationKind.ARTICLE
-                else None
+            enrichment = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
             )
 
             if (
@@ -2235,6 +2231,10 @@ class ProductionWorkflowOrchestrator:
                     synthesis=canonical_synthesis,
                     editorial_enrichment=canonical_enrichment,
                     publication_kind=publication_kind,
+                    editorial_enrichment_artifact_id=(enrichment.id if enrichment else None),
+                    editorial_enrichment_artifact_input_hash=(
+                        enrichment.input_hash if enrichment else None
+                    ),
                     routing_decision_hash=routing_decision.decision_hash,
                     routing_policy_version=routing_decision.policy_version,
                     metadata_extra={

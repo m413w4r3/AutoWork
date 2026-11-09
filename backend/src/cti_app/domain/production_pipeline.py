@@ -64,15 +64,12 @@ def production_stages(
     """Return the stages for an explicit route, defaulting to ARTICLE pre-route.
 
     Before routing is adopted the article path is the conservative superset.
-    Once a BRIEF decision exists, EDITORIAL_ENRICHMENT is not registered for
-    that run and therefore cannot acquire a fake artifact.
+    Both publication kinds run EDITORIAL_ENRICHMENT after synthesis; a brief
+    may still be assembled from an empty or absent historical enrichment.
     """
     if publication_kind is not None and not isinstance(publication_kind, PublicationKind):
         raise TypeError("publication_kind must be a PublicationKind or None")
-    stages = tuple(spec.stage for spec in PRODUCTION_PIPELINE)
-    if publication_kind is PublicationKind.BRIEF:
-        return tuple(stage for stage in stages if stage is not ProductionStage.EDITORIAL_ENRICHMENT)
-    return stages
+    return tuple(spec.stage for spec in PRODUCTION_PIPELINE)
 
 
 def production_artifact_stages(
