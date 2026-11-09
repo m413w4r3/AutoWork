@@ -452,7 +452,9 @@ MISSING COVERAGE: <thème absent des preuves fournies, en une phrase française>
 """
 # Editorial-only prompt changes preserve REFERENCES, EXTRACTION, RELEVANCE_PROJECTION,
 # and SYNTHESIS; only EDITORIAL_ENRICHMENT and its downstream PUBLICATION need rebuilding.
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v20-article-density"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = (
+    "editorial-enrichment-text-blocks-v21-content-prioritized-source-figures"
+)
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
     "editorial-enrichment-block-contract-v14-article-density"
 )

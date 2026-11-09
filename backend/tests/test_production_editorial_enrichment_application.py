@@ -486,6 +486,124 @@ def _figure_inventory(
     )
 
 
+def _archived_article_figure_inventory(
+    extraction: ProductionExtractionV1,
+    *,
+    navigation_count: int = 700,
+    figure_count: int = 8,
+) -> SourceFigureInventoryResult:
+    extraction_source = extraction.sources[0]
+    navigation = "<nav>" + "".join(
+        f'<img src="/navigation/{index}.png" alt="menu icon {index}">'
+        for index in range(navigation_count)
+    ) + "</nav>"
+    def figure_markup(index: int) -> str:
+        caption = (
+            "ExampleRAT execution architecture"
+            if index == 0
+            else f"ExampleRAT architecture graph {index}"
+        )
+        return (
+            f'<figure><img src="figure-{index}.png" alt="Infrastructure graph {index}">'
+            f"<figcaption>{caption}</figcaption></figure>"
+        )
+
+    article_figures = "".join(figure_markup(index) for index in range(figure_count))
+    content = (
+        "<html><body>"
+        + navigation
+        + f"<article>{article_figures}</article>"
+        + "</body></html>"
+    ).encode()
+    archived_source = ArchivedFigureSource(
+        source_document_id=extraction_source.source_document_id,
+        source_url=extraction_source.canonical_url,
+        mime_type="text/html",
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(content).hexdigest(),
+        byte_size=len(content),
+        content=content,
+    )
+    source_directory = extraction_source.canonical_url.rsplit("/", 1)[0]
+    assets = tuple(
+        ArchivedFigureAsset(
+            source_document_id=extraction_source.source_document_id,
+            source_url=f"{source_directory}/figure-{index}.png",
+            blob_id=UUID(int=700 + index),
+            sha256=hashlib.sha256(f"archived content graph {index}".encode()).hexdigest(),
+            mime_type="image/png",
+            byte_size=4096,
+            width=800,
+            height=600,
+        )
+        for index in range(figure_count)
+    )
+    return SourceFigureInventory().inventory((archived_source,), assets)
+
+
+def _shared_proxy_figure_inventory(
+    extraction: ProductionExtractionV1,
+) -> SourceFigureInventoryResult:
+    source = extraction.sources[0]
+    proxy_url = "https://images.example.test/_next/image?url=%2Fgraph.png&w=1200&q=75"
+    figures = []
+    metadata = {}
+    for index in range(2):
+        digest = hashlib.sha256(f"different archived graph {index}".encode()).hexdigest()
+        locator = SourceFigureLocatorV1(
+            page=2,
+            section="Infrastructure",
+            figure_label=f"Infrastructure graph {index}",
+            original_asset_url=proxy_url,
+        )
+        figure = ResolvedSourceFigureV1(
+            figure_id=source_figure_id(
+                source_document_id=source.source_document_id,
+                sha256=digest,
+                source=source.canonical_url,
+                locator=locator,
+            ),
+            blob_id=UUID(int=801 + index),
+            sha256=digest,
+            mime_type="image/png",
+            byte_size=4096,
+            source_document_id=source.source_document_id,
+            source=source.canonical_url,
+            provenance="archived proxy response with occurrence hash",
+            locator=locator,
+            decision=SourceFigureDecision.ACCEPTED,
+            decision_reason="accepted_for_review",
+        )
+        figures.append(figure)
+        metadata[figure.figure_id] = SourceFigureCatalogMetadata(
+            alt_text=locator.figure_label,
+            caption_text=locator.figure_label,
+            nearby_heading_text=locator.section,
+            width=800,
+            height=600,
+            in_article_body=True,
+        )
+    return SourceFigureInventoryResult(figures=tuple(figures), catalog_metadata=metadata)
+
+
+def test_accepted_ioc_profile_source_figure_gets_a_catalog_handle() -> None:
+    snapshot = _snapshot()
+    source = _source(
+        facts=(),
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        profile=ExtractionProfile.IOC_RULES,
+    )
+    extraction = _extraction(sources=(source,), input_hash=snapshot.input_hash)
+    inventory = _figure_inventory(extraction)
+
+    catalog = build_editorial_figure_catalog(extraction, inventory)
+    diagnostics = build_source_figure_inventory_diagnostics(inventory, catalog)
+
+    assert [entry.handle for entry in catalog] == ["F001"]
+    assert diagnostics["accepted"][0]["handle"] == "F001"
+
+
 def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
     return EditorialEnrichmentProposalV1(
         tables=(
@@ -3016,7 +3134,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
 
     access_policy = asyncio.run(create_policy())
     pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
-    inventory = _figure_inventory(extraction)
+    inventory = _archived_article_figure_inventory(extraction)
     figure_catalog = build_editorial_figure_catalog(extraction, inventory)
     request = build_editorial_enrichment_model_request(
         run,
@@ -3042,7 +3160,63 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     # The model receives archived context and evidence, with no page or asset URL.
     assert extraction.sources[0].canonical_url not in request.text
     assert "F001" in request.text
+    prompt_figures = json.loads(request.text)["figure_catalog"]
+    accepted_prompt_figures = [
+        item for item in prompt_figures if item["decision"] == SourceFigureDecision.ACCEPTED.value
+    ]
+    assert [item["handle"] for item in accepted_prompt_figures] == [
+        f"F{index:03d}" for index in range(1, 9)
+    ]
+    assert len(inventory.accepted) == 8
+    assert len(inventory.figures) <= 128 + 128
+    assert inventory.functional_hash() is not None
+    assert inventory.rejected_before_limit_count == 700
+    assert inventory.truncated_count == 0
+    inventory_diagnostics = build_source_figure_inventory_diagnostics(
+        inventory, figure_catalog
+    )
+    assert inventory_diagnostics["counts"]["accepted"] == 8
+    assert inventory_diagnostics["counts"]["rejected"] == 700
+    assert inventory_diagnostics["counts"]["rejected_before_limit"] == 700
+    assert inventory_diagnostics["counts"]["truncated"] == 0
+    assert inventory_diagnostics["rejected_before_limit"]["by_reason"] == {
+        "navigation_landmark": 700
+    }
+    assert len(inventory_diagnostics["rejected_before_limit"]["candidates"]) == 128
+    assert all(item["handle"] is not None for item in inventory_diagnostics["accepted"])
     assert '"asset_url":null' in request.text
+
+    proxy_inventory = _shared_proxy_figure_inventory(extraction)
+    proxy_catalog = build_editorial_figure_catalog(extraction, proxy_inventory)
+    assert len({entry.figure.locator.original_asset_url for entry in proxy_catalog}) == 1
+    assert [entry.handle for entry in proxy_catalog] == ["F001", "F002"]
+    proxy_diagnostics = build_source_figure_inventory_diagnostics(
+        proxy_inventory, proxy_catalog
+    )
+    assert len(
+        {item["archived_location"] for item in proxy_diagnostics["accepted"]}
+    ) == 1
+    assert [item["handle"] for item in proxy_diagnostics["accepted"]] == ["F001", "F002"]
+    reversed_proxy_inventory = replace(
+        proxy_inventory, figures=tuple(reversed(proxy_inventory.figures))
+    )
+    assert [
+        (entry.figure.sha256, entry.handle)
+        for entry in build_editorial_figure_catalog(extraction, reversed_proxy_inventory)
+    ] == [(entry.figure.sha256, entry.handle) for entry in proxy_catalog]
+    proxy_request = build_editorial_enrichment_model_request(
+        run,
+        snapshot,
+        extraction,
+        synthesis,
+        pack,
+        access_policy,
+        figure_catalog=proxy_catalog,
+        publication_kind=PublicationKind.ARTICLE,
+    )
+    proxy_prompt_figures = json.loads(proxy_request.text)["figure_catalog"]
+    assert [item["handle"] for item in proxy_prompt_figures] == ["F001", "F002"]
+    assert len({item["archived_sha256"] for item in proxy_prompt_figures}) == 2
 
     brief_request = build_editorial_enrichment_model_request(
         run,
@@ -3055,12 +3229,12 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
         publication_kind=PublicationKind.BRIEF,
     )
     assert brief_request.web_search is True
-    assert brief_request.parameters["maximum_figure_proposals"] == 1
+    assert brief_request.parameters["maximum_figure_proposals"] == 3
     assert extraction.sources[0].canonical_url in brief_request.text
     assert '"source_page_url":null' in request.text
     assert '"source_caption":"ExampleRAT execution architecture"' in request.text
     assert '"evidence":["E001"]' in request.text
-    assert '"width":640' in request.text and '"height":400' in request.text
+    assert '"width":800' in request.text and '"height":600' in request.text
     assert "ExampleRAT execution architecture" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
@@ -7160,11 +7334,13 @@ def test_source_figure_inventory_diagnostics_report_decisions_and_bounded_trunca
 
     diagnostic = build_source_figure_inventory_diagnostics(inventory, catalog)
 
+    assert diagnostic["version"] == "source-figure-inventory-diagnostics-v3-prelimit-rejections"
     assert diagnostic["counts"] == {
         "accepted": 2,
         "rejected": 1,
         "pending": 2,
         "truncated": 2,
+        "rejected_before_limit": 1,
         "max_figures": 1,
     }
     assert diagnostic["reasons"] == {
@@ -7183,6 +7359,7 @@ def test_source_figure_inventory_diagnostics_report_decisions_and_bounded_trunca
     assert diagnostic["truncation"]["candidates"][0]["candidate_reason"] == (
         "inventory_max_figure_limit"
     )
+    assert diagnostic["rejected_before_limit"]["by_reason"] == {"decorative_asset": 1}
     assert diagnostic["accepted_not_selected"][0]["handle"] == "F001"
 
 

@@ -48,9 +48,10 @@ from cti_app.domain.source_media import (
     SourceMediaStatus,
 )
 
-SOURCE_FIGURE_INVENTORY_POLICY_VERSION = "source-figure-inventory-v3-bounded-diagnostics"
+SOURCE_FIGURE_INVENTORY_POLICY_VERSION = "source-figure-inventory-v4-content-priority"
 MAX_SOURCE_FIGURES = 128
 MAX_SOURCE_FIGURE_TRUNCATION_DIAGNOSTICS = 128
+MAX_SOURCE_FIGURE_REJECTION_DIAGNOSTICS = 128
 MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_FIGURE_BYTES = 5 * 1024 * 1024
 MAX_SOURCE_FIGURE_TOTAL_BYTES = 50 * 1024 * 1024
@@ -133,6 +134,9 @@ class SourceFigureInventoryResult:
     policy_sha256: str | None = None
     catalog_metadata: Mapping[UUID, SourceFigureCatalogMetadata] = field(default_factory=dict)
     provenance_diagnostics: tuple[SourceFigureProvenanceDiagnostic, ...] = ()
+    rejected_before_limit_count: int = 0
+    rejected_before_limit_reason_counts: Mapping[str, int] = field(default_factory=dict)
+    rejected_before_limit_candidates: tuple[SourceFigureTruncationDiagnostic, ...] = ()
 
     @property
     def accepted(self) -> tuple[ResolvedSourceFigureV1, ...]:
@@ -162,6 +166,13 @@ class SourceFigureInventoryResult:
             "inventory_policy_version": SOURCE_FIGURE_INVENTORY_POLICY_VERSION,
             "truncated": self.truncated,
             "truncated_count": self.truncated_count,
+            "rejected_before_limit_count": self.rejected_before_limit_count,
+            "rejected_before_limit_reason_counts": dict(
+                self.rejected_before_limit_reason_counts
+            ),
+            "rejected_before_limit_candidates": [
+                item.to_json() for item in self.rejected_before_limit_candidates
+            ],
             "max_figures": self.max_figures,
             "truncated_decision_counts": dict(self.truncated_decision_counts),
             "truncated_reason_counts": {
@@ -199,7 +210,12 @@ class SourceFigureInventoryResult:
         return hashlib.sha256(encoded).hexdigest()
 
     def functional_hash(self) -> str | None:
-        if not self.figures and not self.truncated and not self.warnings:
+        if (
+            not self.figures
+            and not self.truncated
+            and not self.rejected_before_limit_count
+            and not self.warnings
+        ):
             return None
         return self.content_hash()
 
@@ -270,8 +286,13 @@ class SourceFigureInventory:
         indices_by_hash: dict[str, int] = {}
         seen_locations: set[tuple[UUID, str]] = set()
         total_figure_bytes = 0
+        content_candidate_count = 0
+        stored_rejected_count = 0
         truncated = False
         truncated_count = 0
+        rejected_before_limit_count = 0
+        rejected_before_limit_reason_counts: dict[str, int] = {}
+        rejected_before_limit_candidates: list[SourceFigureTruncationDiagnostic] = []
         truncated_decision_counts: dict[str, int] = {}
         truncated_reason_counts: dict[str, dict[str, int]] = {}
         truncated_candidates: list[SourceFigureTruncationDiagnostic] = []
@@ -279,6 +300,53 @@ class SourceFigureInventory:
         truncated_locations: set[tuple[UUID, str]] = set()
         warnings: set[str] = set()
         catalog_metadata: dict[UUID, SourceFigureCatalogMetadata] = {}
+
+        def record_pre_limit_rejection(
+            *,
+            source: ArchivedFigureSource,
+            locator: SourceFigureLocatorV1,
+            reason: str,
+        ) -> None:
+            nonlocal rejected_before_limit_count
+            rejected_before_limit_count += 1
+            rejected_before_limit_reason_counts[reason] = (
+                rejected_before_limit_reason_counts.get(reason, 0) + 1
+            )
+            if len(rejected_before_limit_candidates) < MAX_SOURCE_FIGURE_REJECTION_DIAGNOSTICS:
+                rejected_before_limit_candidates.append(
+                    SourceFigureTruncationDiagnostic(
+                        source_document_id=source.source_document_id,
+                        page=locator.page,
+                        section=locator.section,
+                        figure_label=locator.figure_label,
+                        candidate_decision=SourceFigureDecision.REJECTED.value,
+                        candidate_reason=reason,
+                    )
+                )
+
+        def clear_replaced_rejection(
+            *,
+            source: ArchivedFigureSource,
+            locator: SourceFigureLocatorV1,
+            reason: str,
+        ) -> None:
+            nonlocal rejected_before_limit_count
+            rejected_before_limit_count = max(0, rejected_before_limit_count - 1)
+            reason_count = rejected_before_limit_reason_counts.get(reason, 0) - 1
+            if reason_count > 0:
+                rejected_before_limit_reason_counts[reason] = reason_count
+            else:
+                rejected_before_limit_reason_counts.pop(reason, None)
+            for index, candidate in enumerate(rejected_before_limit_candidates):
+                if (
+                    candidate.source_document_id == source.source_document_id
+                    and candidate.page == locator.page
+                    and candidate.section == locator.section
+                    and candidate.figure_label == locator.figure_label
+                    and candidate.candidate_reason == reason
+                ):
+                    del rejected_before_limit_candidates[index]
+                    break
 
         def add(
             *,
@@ -303,7 +371,8 @@ class SourceFigureInventory:
             in_article_body: bool = False,
             anchor: str | None = None,
         ) -> bool:
-            nonlocal total_figure_bytes, truncated, truncated_count
+            nonlocal content_candidate_count, stored_rejected_count, total_figure_bytes
+            nonlocal truncated, truncated_count
             observed_width = width
             observed_height = height
             if media_record is not None:
@@ -343,6 +412,10 @@ class SourceFigureInventory:
                             "inventory_exceeds_total_byte_limit",
                         }
                     ):
+                        if decision is SourceFigureDecision.REJECTED:
+                            record_pre_limit_rejection(
+                                source=source, locator=locator, reason=reason
+                            )
                         return True
                 if sha256 in truncated_hashes:
                     return True
@@ -364,8 +437,19 @@ class SourceFigureInventory:
                     reason = "inventory_exceeds_total_byte_limit"
                     blob = None
                 else:
-                    count_total_bytes = not duplicate
-            if not duplicate and len(found) >= self._max_figures:
+                    count_total_bytes = (
+                        not duplicate and decision is not SourceFigureDecision.REJECTED
+                    )
+            if decision is SourceFigureDecision.REJECTED:
+                record_pre_limit_rejection(source=source, locator=locator, reason=reason)
+            replaces_rejected = duplicate and (
+                found[indices_by_hash[sha256]].decision is SourceFigureDecision.REJECTED
+            )
+            # Rejected outcomes are summarized separately and never consume content slots.
+            needs_content_slot = decision is not SourceFigureDecision.REJECTED and (
+                not duplicate or replaces_rejected
+            )
+            if needs_content_slot and content_candidate_count >= self._max_figures:
                 truncated = True
                 truncated_count += 1
                 decision_key = decision.value
@@ -392,6 +476,15 @@ class SourceFigureInventory:
                         )
                     )
                 warnings.add("source_figure_inventory_max_figure_limit")
+                return True
+            if (
+                decision is SourceFigureDecision.REJECTED
+                and stored_rejected_count >= MAX_SOURCE_FIGURE_REJECTION_DIAGNOSTICS
+            ):
+                if sha256 is None:
+                    seen_locations.add(
+                        (source.source_document_id, asset_url or locator.figure_label or "")
+                    )
                 return True
             if byte_size is not None and count_total_bytes:
                 total_figure_bytes += byte_size
@@ -439,15 +532,33 @@ class SourceFigureInventory:
             )
             if sha256 is not None:
                 if duplicate:
+                    if replaces_rejected:
+                        clear_replaced_rejection(
+                            source=source,
+                            locator=found[indices_by_hash[sha256]].locator,
+                            reason=found[indices_by_hash[sha256]].decision_reason,
+                        )
                     found[indices_by_hash[sha256]] = figure
+                    if replaces_rejected:
+                        stored_rejected_count -= 1
+                    if needs_content_slot:
+                        content_candidate_count += 1
                 else:
                     indices_by_hash[sha256] = len(found)
                     found.append(figure)
+                    if needs_content_slot:
+                        content_candidate_count += 1
+                    elif decision is SourceFigureDecision.REJECTED:
+                        stored_rejected_count += 1
             else:
                 seen_locations.add(
                     (source.source_document_id, asset_url or locator.figure_label or "")
                 )
                 found.append(figure)
+                if needs_content_slot:
+                    content_candidate_count += 1
+                elif decision is SourceFigureDecision.REJECTED:
+                    stored_rejected_count += 1
             return True
 
         observations_by_source: dict[UUID, list[SourceMediaObservation]] = {}
@@ -692,7 +803,13 @@ class SourceFigureInventory:
                     ):
                         break
                     continue
-                matched_asset = assets_by_url.get(_canonical_http_url(asset_url) or "")
+                matched_asset = (
+                    assets_by_hash.get(media_record.sha256)
+                    if media_record is not None and media_record.sha256 is not None
+                    else None
+                )
+                if media_record is None or media_record.sha256 is None:
+                    matched_asset = assets_by_url.get(_canonical_http_url(asset_url) or "")
                 decision, reason = _resolve_archived_asset(
                     matched_asset,
                     self._max_figure_bytes,
@@ -803,7 +920,10 @@ class SourceFigureInventory:
             figures=ordered,
             truncated=truncated,
             truncated_count=truncated_count,
+            rejected_before_limit_count=rejected_before_limit_count,
             max_figures=self._max_figures,
+            rejected_before_limit_reason_counts=rejected_before_limit_reason_counts,
+            rejected_before_limit_candidates=tuple(rejected_before_limit_candidates),
             truncated_decision_counts=truncated_decision_counts,
             truncated_reason_counts=truncated_reason_counts,
             truncated_candidates=tuple(truncated_candidates),

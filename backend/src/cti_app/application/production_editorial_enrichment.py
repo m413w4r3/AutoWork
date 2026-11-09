@@ -87,6 +87,7 @@ from cti_app.application.production_wire_archive import (
     verified_raw_output_text,
 )
 from cti_app.application.source_figure_inventory import (
+    MAX_SOURCE_FIGURE_REJECTION_DIAGNOSTICS,
     MAX_SOURCE_FIGURES,
     SOURCE_FIGURE_INVENTORY_POLICY_VERSION,
     SourceFigureCatalogMetadata,
@@ -227,7 +228,9 @@ _ENRICHMENT_MEDIA_ARBITRATION_PRIORITY = {
     EditorialMediaType.NONE: 2,
 }
 SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION = "source-figure-provenance-v3-inventory-summary"
-SOURCE_FIGURE_INVENTORY_DIAGNOSTICS_VERSION = "source-figure-inventory-diagnostics-v2-reasons"
+SOURCE_FIGURE_INVENTORY_DIAGNOSTICS_VERSION = (
+    "source-figure-inventory-diagnostics-v3-prelimit-rejections"
+)
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
     "editorial-enrichment-routing-policy-v2-resource-search-off"
 )
@@ -4254,17 +4257,31 @@ def build_editorial_figure_catalog(
     extraction: ProductionExtractionV1,
     inventory: SourceFigureInventoryResult,
 ) -> tuple[EditorialFigureCatalogEntry, ...]:
-    """Assign prompt-local handles to every full-source media decision."""
-    full_sources = {
+    """Assign stable prompt-local handles to accepted and full-source decisions."""
+    sources_by_id = {
         source.source_document_id: source
         for source in extraction.sources
-        if source.profile is ExtractionProfile.FULL
     }
-    figures = [figure for figure in inventory.figures if figure.source_document_id in full_sources]
+    accepted_source_ids = {
+        figure.source_document_id
+        for figure in inventory.figures
+        if figure.decision is SourceFigureDecision.ACCEPTED
+    }
+    if accepted_source_ids - sources_by_id.keys():
+        raise ValueError("accepted_source_figure_missing_from_extraction")
+    figures = [
+        figure
+        for figure in inventory.figures
+        if figure.source_document_id in sources_by_id
+        and (
+            sources_by_id[figure.source_document_id].profile is ExtractionProfile.FULL
+            or figure.decision is SourceFigureDecision.ACCEPTED
+        )
+    ]
     figures.sort(
         key=lambda item: (
-            full_sources[item.source_document_id].canonical_url,
-            full_sources[item.source_document_id].role.value,
+            sources_by_id[item.source_document_id].canonical_url,
+            sources_by_id[item.source_document_id].role.value,
             item.locator.page or 0,
             item.locator.section or "",
             item.locator.figure_label or "",
@@ -4273,12 +4290,17 @@ def build_editorial_figure_catalog(
         )
     )
     entries: list[EditorialFigureCatalogEntry] = []
-    for index, figure in enumerate(figures, start=1):
-        source = full_sources[figure.source_document_id]
+    rejected_entries = 0
+    for figure in figures:
+        if figure.decision is SourceFigureDecision.REJECTED:
+            rejected_entries += 1
+            if rejected_entries > MAX_SOURCE_FIGURE_REJECTION_DIAGNOSTICS:
+                continue
+        source = sources_by_id[figure.source_document_id]
         editorial_role = source.editorial_role or source.role
         entries.append(
             EditorialFigureCatalogEntry(
-                handle=f"F{index:03d}",
+                handle=f"F{len(entries) + 1:03d}",
                 source_role=source.role.value,
                 editorial_role=editorial_role.value,
                 figure=figure,
@@ -4287,6 +4309,13 @@ def build_editorial_figure_catalog(
                 ),
             )
         )
+    catalogued_ids = {entry.figure.figure_id for entry in entries}
+    if not {
+        figure.figure_id
+        for figure in inventory.figures
+        if figure.decision is SourceFigureDecision.ACCEPTED
+    } <= catalogued_ids:
+        raise ValueError("accepted_source_figure_missing_catalog_handle")
     return tuple(entries)
 
 
@@ -4356,12 +4385,21 @@ def build_source_figure_inventory_diagnostics(
 ) -> dict[str, Any]:
     """Summarize every inventoried decision and bounded truncation detail."""
     catalog_by_id = {entry.figure.figure_id: entry for entry in figure_catalog}
+    accepted_figure_ids = {
+        figure.figure_id
+        for figure in inventory.figures
+        if figure.decision is SourceFigureDecision.ACCEPTED
+    }
+    if not accepted_figure_ids <= catalog_by_id.keys():
+        raise ValueError("accepted_source_figure_missing_catalog_handle")
     grouped: dict[str, list[dict[str, Any]]] = {
         "accepted": [],
         "rejected": [],
         "pending": [],
     }
     reasons: dict[str, dict[str, int]] = {"accepted": {}, "rejected": {}, "pending": {}}
+    observed_rejected_count = 0
+    observed_rejected_reasons: dict[str, int] = {}
     for figure in inventory.figures:
         decision = figure.decision.value
         entry = catalog_by_id.get(figure.figure_id)
@@ -4375,9 +4413,31 @@ def build_source_figure_inventory_diagnostics(
             "archived_location": _safe_asset_prompt_url(figure.locator.original_asset_url),
             "reason_code": figure.decision_reason,
         }
-        grouped[decision].append(item)
-        counts = reasons[decision]
-        counts[figure.decision_reason] = counts.get(figure.decision_reason, 0) + 1
+        if figure.decision is SourceFigureDecision.REJECTED:
+            observed_rejected_count += 1
+            observed_rejected_reasons[figure.decision_reason] = (
+                observed_rejected_reasons.get(figure.decision_reason, 0) + 1
+            )
+            if len(grouped[decision]) < MAX_SOURCE_FIGURE_REJECTION_DIAGNOSTICS:
+                grouped[decision].append(item)
+        else:
+            grouped[decision].append(item)
+            counts = reasons[decision]
+            counts[figure.decision_reason] = counts.get(figure.decision_reason, 0) + 1
+
+    rejected_before_limit_count = max(
+        inventory.rejected_before_limit_count, observed_rejected_count
+    )
+    rejected_before_limit_reason_counts = dict(
+        inventory.rejected_before_limit_reason_counts
+    )
+    for reason, count in observed_rejected_reasons.items():
+        rejected_before_limit_reason_counts[reason] = max(
+            rejected_before_limit_reason_counts.get(reason, 0), count
+        )
+    reasons[SourceFigureDecision.REJECTED.value] = dict(
+        rejected_before_limit_reason_counts
+    )
 
     handle_by_figure_id = {
         entry.figure.figure_id: entry.handle
@@ -4398,6 +4458,12 @@ def build_source_figure_inventory_diagnostics(
             SourceFigureDecision.PENDING.value,
         )
     }
+    decision_counts[SourceFigureDecision.REJECTED.value] = (
+        rejected_before_limit_count
+        + inventory.truncated_decision_counts.get(
+            SourceFigureDecision.REJECTED.value, 0
+        )
+    )
     for decision, counts in inventory.truncated_reason_counts.items():
         if decision in reasons:
             for reason, count in counts.items():
@@ -4411,12 +4477,20 @@ def build_source_figure_inventory_diagnostics(
             "rejected": decision_counts[SourceFigureDecision.REJECTED.value],
             "pending": decision_counts[SourceFigureDecision.PENDING.value],
             "truncated": inventory.truncated_count,
+            "rejected_before_limit": rejected_before_limit_count,
             "max_figures": inventory.max_figures,
         },
         "accepted": grouped[SourceFigureDecision.ACCEPTED.value],
         "rejected": grouped[SourceFigureDecision.REJECTED.value],
         "pending": grouped[SourceFigureDecision.PENDING.value],
         "reasons": reasons,
+        "rejected_before_limit": {
+            "count": rejected_before_limit_count,
+            "by_reason": dict(sorted(rejected_before_limit_reason_counts.items())),
+            "candidates": [
+                item.to_json() for item in inventory.rejected_before_limit_candidates
+            ],
+        },
         "truncation": {
             "is_truncated": inventory.truncated,
             "reason_code": "source_figure_inventory_max_figure_limit"

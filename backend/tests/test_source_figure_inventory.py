@@ -202,6 +202,144 @@ def test_inventory_applies_figure_count_and_size_limits() -> None:
     assert oversized.figures[0].decision_reason == "figure_exceeds_byte_limit"
 
 
+def test_inventory_classifies_navigation_before_applying_content_limit() -> None:
+    navigation = "<nav>" + "".join(
+        f'<img src="/navigation/{index}.png" alt="Navigation graphic {index}">'
+        for index in range(549)
+    ) + "</nav>"
+    decorative = '<div class="modal">' + "".join(
+        f'<img class="modal-close" src="/close/{index}.png" alt="Close icon {index}">'
+        for index in range(61)
+    ) + "</div>"
+    related = '<section><h2>Recent posts</h2>' + "".join(
+        f'<img src="/related/{index}.png" alt="Related report {index}">'
+        for index in range(47)
+    ) + "</section>"
+    boilerplate = "<div><h2>Publisher information</h2>" + "".join(
+        f'<img src="/brand/{index}.png" alt="Publisher logo {index}">'
+        for index in range(42)
+    ) + "</div>"
+    article_figures = "".join(
+        f'<figure><img src="figure-{index}.png" alt="Infrastructure graph {index}"></figure>'
+        for index in range(8)
+    )
+    source = _source(
+        _html(
+            navigation
+            + decorative
+            + related
+            + boilerplate
+            + '<article><h2>Infrastructure</h2>'
+            + '<img src="/duplicate.png" alt="Duplicate archived visual">'
+            + article_figures
+            + "</article>"
+        )
+    )
+    duplicate_observation = next(
+        item
+        for item in extract_source_media_observations((source,))
+        if item.alt_text == "Duplicate archived visual"
+    )
+    duplicate_record = SourceMediaRecord(
+        subject_id=_DOCUMENT_ID,
+        source_document_id=_DOCUMENT_ID,
+        policy_version="source-media-v1",
+        policy_sha256="b" * 64,
+        status=SourceMediaStatus.EXCLUDED_BY_RULE,
+        reason_code=SourceMediaReasonCode.DUPLICATE_PERCEPTUAL_HASH,
+        dom_locator=duplicate_observation.dom_locator,
+    )
+    assets = tuple(
+        ArchivedFigureAsset(
+            source_document_id=_IMAGE_DOCUMENT_ID,
+            source_url=f"https://publisher.test/reports/figure-{index}.png",
+            blob_id=UUID(int=400 + index),
+            sha256=hashlib.sha256(f"archived figure {index}".encode()).hexdigest(),
+            mime_type="image/png",
+            byte_size=4096,
+            width=800,
+            height=600,
+        )
+        for index in range(8)
+    )
+
+    result = SourceFigureInventory(max_figures=128).inventory(
+        (source,), assets, media_candidates=(duplicate_record,)
+    )
+
+    assert len(result.accepted) == 8
+    assert result.truncated is False
+    assert result.truncated_count == 0
+    assert result.rejected_before_limit_count == 700
+    assert result.rejected_before_limit_reason_counts == {
+        "boilerplate_pattern": 42,
+        "decorative_asset": 61,
+        "duplicate_perceptual_hash": 1,
+        "navigation_landmark": 549,
+        "related_content_card": 47,
+    }
+
+
+def test_inventory_resolves_distinct_archived_blobs_for_a_shared_proxy_url() -> None:
+    proxy_url = "https://images.publisher.test/_next/image?url=%2Fgraph.png&w=1200&q=75"
+    source = _source(
+        _html(
+            f'<article><img src="{proxy_url}" alt="First infrastructure graph">'
+            f'<img src="{proxy_url}" alt="Second infrastructure graph"></article>'
+        )
+    )
+    observations = extract_source_media_observations((source,))
+    assets: list[ArchivedFigureAsset] = []
+    media_candidates: list[SourceMediaRecord] = []
+    for index, observation in enumerate(observations, start=1):
+        content = f"archived image bytes {index}".encode()
+        digest = hashlib.sha256(content).hexdigest()
+        blob_id = UUID(int=500 + index)
+        assets.append(
+            ArchivedFigureAsset(
+                source_document_id=_IMAGE_DOCUMENT_ID,
+                source_url=proxy_url,
+                blob_id=blob_id,
+                sha256=digest,
+                mime_type="image/png",
+                byte_size=len(content),
+                width=800,
+                height=600,
+            )
+        )
+        media_candidates.append(
+            SourceMediaRecord(
+                subject_id=_DOCUMENT_ID,
+                source_document_id=_DOCUMENT_ID,
+                policy_version="source-media-v1",
+                policy_sha256="b" * 64,
+                status=SourceMediaStatus.ACCEPTED_FOR_REVIEW,
+                reason_code=SourceMediaReasonCode.ELIGIBLE_FOR_REVIEW,
+                blob_id=blob_id,
+                sha256=digest,
+                mime_type="image/png",
+                width=800,
+                height=600,
+                byte_size=len(content),
+                dom_locator=observation.dom_locator,
+                requested_url=proxy_url,
+                final_url=proxy_url,
+            )
+        )
+
+    result = SourceFigureInventory().inventory(
+        (source,), tuple(assets), media_candidates=tuple(media_candidates)
+    )
+
+    assert len(result.accepted) == 2
+    assert len({figure.locator.original_asset_url for figure in result.accepted}) == 1
+    assert len({figure.sha256 for figure in result.accepted}) == 2
+    assert {figure.blob_id for figure in result.accepted} == {
+        UUID(int=501),
+        UUID(int=502),
+    }
+
+
 def test_inventory_figure_limit_cannot_exceed_the_hard_ceiling() -> None:
     with pytest.raises(ValueError, match="must not exceed"):
         SourceFigureInventory(max_figures=129)
@@ -469,6 +607,8 @@ def test_inventory_cap_keeps_article_body_images_before_page_chrome() -> None:
 
     result = SourceFigureInventory(max_figures=2).inventory((source,), assets)
 
-    assert result.truncated is True
+    assert result.truncated is False
     assert len(result.accepted) == 2
+    assert result.rejected_before_limit_count == 1
+    assert result.truncated_count == 0
     assert all(result.catalog_metadata[item.figure_id].in_article_body for item in result.accepted)
