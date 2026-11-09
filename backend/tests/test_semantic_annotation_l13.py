@@ -348,13 +348,24 @@ TERM: Necurs
 ROLE: malware
 PARAGRAPH_ANCHOR: timeline:0001
 END TERM
+
+TERM A003
+TERM: Example Research Group
+ROLE: proper_name
+PARAGRAPH_ANCHOR: section:0:paragraph:0001
+END TERM
 """,
-        {"lead:0001": "Chainalysis wrote the report.", "timeline:0001": "Necurs stored domains."},
+        {
+            "lead:0001": "Chainalysis wrote the report.",
+            "timeline:0001": "Necurs stored domains.",
+            "section:0:paragraph:0001": "Example Research Group published a report.",
+        },
     )
 
     assert parsed.error_code is None
     assert [(item.text, item.role) for item in parsed.proposals] == [
-        ("Necurs", SemanticRole.MALWARE)
+        ("Necurs", SemanticRole.MALWARE),
+        ("Example Research Group", SemanticRole.PROPER_NAME),
     ]
     assert parsed.rejections == (("A001", "semantic_annotation_role_unknown"),)
 
@@ -442,9 +453,13 @@ def test_annotation_request_is_separate_from_the_table_diagram_request_and_versi
         table_diagram_request.prompt_template_version != annotation_request.prompt_template_version
     )
     assert (
-        SEMANTIC_ANNOTATION_CONTRACT_VERSION == "semantic-annotation-term-role-blocks-v2-no-title"
+        SEMANTIC_ANNOTATION_CONTRACT_VERSION
+        == "semantic-annotation-term-role-blocks-v3-semantic-styles"
     )
-    assert SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION == "semantic-annotation-wire-v3-no-title"
+    assert SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION == "semantic-annotation-wire-v4-proper-name-role"
+    assert SEMANTIC_ANNOTATION_PROMPT_VERSION == (
+        "semantic-annotation-document-lexicon-v3-semantic-styles"
+    )
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("article-density")
     assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("article-omission-diagnostics")
     assert "@@ANCHOR title@@" not in annotation_request.text
@@ -452,9 +467,14 @@ def test_annotation_request_is_separate_from_the_table_diagram_request_and_versi
     assert "@@ANCHOR diagram:" not in annotation_request.text
     assert "-v" in EDITORIAL_ENRICHMENT_GENERATOR_VERSION
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION != SEMANTIC_ANNOTATION_PROMPT_VERSION
-    assert SEMANTIC_ANNOTATION_POLICY_VERSION.endswith(
-        "technical-literal-globs-exact-occurrence-coverage"
-    )
+    assert SEMANTIC_ANNOTATION_POLICY_VERSION == "semantic-annotation-policy-v6-semantic-styles"
+    for instruction in (
+        "proper_name",
+        "software/products with product; these are bold",
+        "technical roles use gray inline code",
+        "Resolve overlaps deterministically",
+    ):
+        assert instruction in annotation_request.text
 
 
 def test_annotation_call_failure_returns_warning_without_aborting_enrichment() -> None:

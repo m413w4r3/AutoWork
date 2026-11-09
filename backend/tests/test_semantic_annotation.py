@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from types import SimpleNamespace
 
 from cti_app.application.semantic_annotation import (
@@ -8,7 +10,13 @@ from cti_app.application.semantic_annotation import (
     semantic_entities_from_extraction,
 )
 from cti_app.domain.production import ProductionEvidenceBasis
-from cti_app.domain.semantic_annotation import SemanticRole
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SEMANTIC_ROLE_TYPST_FUNCTION_V1,
+    SemanticRole,
+    semantic_text_from_json,
+    semantic_text_to_json,
+)
 
 
 def test_typed_entities_win_over_english_terms_and_preserve_every_character() -> None:
@@ -204,6 +212,100 @@ def test_command_path_ioc_protocol_literal_and_technical_roles_are_distinct() ->
         ("C2 profile", SemanticRole.TECHNICAL),
     ):
         assert any(span.text == literal and span.role is role for span in annotated.spans)
+
+
+def test_semantic_style_roles_resolve_overlaps_by_specificity() -> None:
+    text = "Cobalt Strike, APT Étoile, lateral movement, port 443."
+    annotated = SemanticAnnotator(
+        EnglishTermDetector(("Cobalt Strike", "APT Étoile", "lateral movement", "443"))
+    ).annotate_paragraph(
+        anchor="lead:0001",
+        text=text,
+        entities=(
+            (SemanticRole.TOOL, "Cobalt Strike"),
+            (SemanticRole.PROPER_NAME, "APT Étoile"),
+            (SemanticRole.TECHNICAL, "lateral movement"),
+        ),
+    )
+
+    assert "".join(span.text for span in annotated.spans) == text
+    assert [
+        (span.text, span.role) for span in annotated.spans if span.role is not SemanticRole.TEXT
+    ] == [
+        ("Cobalt Strike", SemanticRole.TOOL),
+        ("APT Étoile", SemanticRole.PROPER_NAME),
+        ("lateral movement", SemanticRole.TECHNICAL),
+        ("443", SemanticRole.TECHNICAL_LITERAL),
+    ]
+    assert {
+        role: SEMANTIC_ROLE_TYPST_FUNCTION_V1[role]
+        for role in (
+            SemanticRole.ACTOR,
+            SemanticRole.CAMPAIGN,
+            SemanticRole.MALWARE,
+            SemanticRole.TOOL,
+            SemanticRole.PRODUCT,
+            SemanticRole.PROPER_NAME,
+            SemanticRole.ENGLISH_TERM,
+            SemanticRole.TECHNICAL,
+            SemanticRole.TECHNICAL_LITERAL,
+            SemanticRole.IOC,
+            SemanticRole.PATH,
+            SemanticRole.COMMAND,
+            SemanticRole.PROTOCOL_FIELD,
+        )
+    } == {
+        SemanticRole.ACTOR: "semantic-actor",
+        SemanticRole.CAMPAIGN: "semantic-campaign",
+        SemanticRole.MALWARE: "semantic-malware",
+        SemanticRole.TOOL: "semantic-tool",
+        SemanticRole.PRODUCT: "semantic-product",
+        SemanticRole.PROPER_NAME: "semantic-proper-name",
+        SemanticRole.ENGLISH_TERM: "semantic-english-term",
+        SemanticRole.TECHNICAL: "semantic-technical",
+        SemanticRole.TECHNICAL_LITERAL: "semantic-technical-literal",
+        SemanticRole.IOC: "semantic-ioc",
+        SemanticRole.PATH: "semantic-path",
+        SemanticRole.COMMAND: "semantic-command",
+        SemanticRole.PROTOCOL_FIELD: "semantic-protocol-field",
+    }
+
+
+def test_schema_v1_semantic_annotation_round_trips_without_changing_its_hash() -> None:
+    legacy_payload = {
+        "schema_version": "1",
+        "policy_version": (
+            "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage"
+        ),
+        "paragraphs": [
+            {
+                "anchor": "lead:0001",
+                "spans": [
+                    {"role": "actor", "text": "APT Étoile"},
+                    {"role": "text", "text": " was observed."},
+                ],
+            }
+        ],
+    }
+
+    def canonical(value: object) -> bytes:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    original_bytes = canonical(legacy_payload)
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
+
+    reloaded = semantic_text_from_json(json.loads(original_bytes))
+    reserialized = canonical(semantic_text_to_json(reloaded))
+
+    assert SEMANTIC_ANNOTATION_SCHEMA_VERSION == "2"
+    assert reloaded.schema_version == "1"
+    assert reserialized == original_bytes
+    assert hashlib.sha256(reserialized).hexdigest() == original_hash
 
 
 def test_extended_english_lexicon_contains_conservative_cti_phrases() -> None:

@@ -16,24 +16,24 @@ REFERENCES_PROMPT_VERSION = "10"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v15-article-date-grounding"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v16-article-evidence-length"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
-ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-article-structured-v1-overview-hunting"
-SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = (
-    "synthesis-targeted-revision-v4-grounded-heading-terms"
-)
+ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-article-structured-v2-overview-evidence"
+SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = "synthesis-targeted-revision-v4-grounded-heading-terms"
 SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v3-after-formats"
 ARTICLE_SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = (
-    "synthesis-targeted-revision-v5-article-structure"
+    "synthesis-targeted-revision-v6-article-overview"
 )
 ARTICLE_SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = (
-    "synthesis-targeted-patch-v7-article-structure"
+    "synthesis-targeted-patch-v8-article-overview"
 )
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v9-placeholder-token-normalization"
 
-SYNTHESIS_EDITORIAL_CONTRACT_V6 = """EDITORIAL CONTRACT — ARTICLE
+SYNTHESIS_EDITORIAL_CONTRACT_V7 = """EDITORIAL CONTRACT — ARTICLE
 
-Write a detailed, technically rich CTI synthesis in the publication language.
+Write a technically detailed CTI synthesis in the publication language, at the
+depth the supplied evidence supports. Keep it concise when the evidence is
+sparse; do not fill space or repeat facts to make the article longer.
 For French publications, write in French except for source names, quotations
 and exact technical literals. Preserve names, commands, paths, keys, fields,
 ports, user-agents, hashes and formats exactly as documented, using inline
@@ -55,11 +55,11 @@ data extraction, or a CI/CD pipeline.
 
 Return the lead first. It is one concise opening paragraph that identifies the
 subject and its CTI significance without repeating the article title or adding
-a second introduction. Then return the required sections in this order:
-Continue with campaign, victimology, and infection/execution chain details;
-documented TTPs, tools and components; the C2 protocol and infrastructure; and
-brief confidence limits and CTI analyst observations in the closing prose.
-State the confidence level and its basis where the evidence supports them.
+a second introduction. Then develop the analysis in a clear order, covering
+campaign, victimology, infection/execution chain, documented TTPs, tools and
+components, C2 protocol and infrastructure, and confidence limits where the
+evidence supports them. State the confidence level and its basis in closing
+prose where appropriate.
 
 1. The first titled section is exactly `Vue d'ensemble`. It contains exactly
    three short paragraphs, each a separate claim and in this exact order:
@@ -68,21 +68,16 @@ State the confidence level and its basis where the evidence supports them.
    value. Do not omit, rename, combine, or reorder these labels. If evidence
    does not establish a value, state that briefly and precisely without
    guessing.
-2. Add at least four further titled sections. Choose at least four distinct
-   headings exactly from this list: `Contexte et victimologie`, `Chaîne
-   d'attaque par étapes`, `Capacités et techniques`, `Infrastructure et
-   protocole C2`, `Artefacts hôte/réseau`, `Détection et hunting`, and
-   `Limites d'attribution`. These are editorial labels, not claims. Do not
-   create empty or duplicative sections.
+2. Add titled sections only where they help organize distinct, evidence-backed
+   analysis. Possible editorial headings include `Contexte et victimologie`,
+   `Chaîne d'attaque par étapes`, `Capacités et techniques`, `Infrastructure
+   et protocole C2`, `Artefacts hôte/réseau`, `Détection et hunting`, and
+   `Limites d'attribution`. These are examples, not a required taxonomy. Do
+   not create empty or duplicative sections.
 
-Develop the article as a technical analysis, not a short brief. Where the
-evidence allows, aim for 2,500-5,000 words of synthesis prose; 1,500 words is
-the minimum target. Expand with supported mechanisms, steps, variants,
-observables and source-qualified detail. Never pad, repeat the same fact, or
-invent material to reach a word count. If the evidence is too sparse to support
-the target, preserve accuracy and state only the concrete coverage limits.
-Keep paragraphs short to medium, usually focused on one mechanism or attack
-step; use additional headings to make longer analyses easy to scan.
+Explain supported mechanisms, steps, variants, observables and source-qualified
+detail. Keep paragraphs short to medium, usually focused on one mechanism or
+attack step; use headings when they make the analysis easier to scan.
 
 In `Chaîne d'attaque par étapes`, order steps only when the evidence establishes
 that order. Keep alternative branches separate and do not invent causal links.
@@ -101,12 +96,11 @@ Use a consistent French technical vocabulary. Explain specialized terms on
 first use when that helps the analyst. Avoid vague defensive advice, generic
 claims that replace observed detail, and repeated IOC inventories.
 
-Headings are required for ARTICLE. The exact headings listed above are
-editorial labels, not evidence claims. Other headings must remain concise,
-describe their section, and must not add a name, number, indicator, or other
-fact absent from that section's claims. Keep all headings free of internal
-production vocabulary and evidence handles. Do not add prose to explain the
-structure.
+The overview is required for ARTICLE. Headings are editorial labels, not
+evidence claims. Keep any other heading concise, descriptive of its section,
+and free of names, numbers, indicators or other facts absent from that
+section's claims. Keep all headings free of internal production vocabulary
+and evidence handles. Do not add prose to explain the structure.
 
 Section kinds are internal placement anchors only. A paragraph may cite several
 evidence handles when they all support its full account. Keep lineage fine
@@ -209,8 +203,9 @@ signal établit le comportement observé, pas l'identité de l'opérateur.
 
 OUTPUT FORMAT
 Use only the text-block wire format below. Do not return JSON. Do not write any
-text outside these blocks. The lead and required ARTICLE sections must be
-present. Each claim becomes one paragraph. Every section must have one
+text outside these blocks. The lead and overview must be present; add other
+sections only where supported analysis benefits from them. Each claim becomes
+one paragraph. Every section must have one
 `HEADING: <short descriptive title>` field immediately after its header and
 before its first claim. Section kinds are stable internal placement anchors;
 the heading is the displayed h2. Keep source notes in their own blocks.
@@ -245,9 +240,8 @@ EVIDENCE: E006
 TEXT: one plain-text synthesis paragraph in the publication language
 @@END SECTION@@
 
-Return at least four additional titled sections after this overview, each with
-one or more grounded claims. Keep literal technical values exact and inline in
-backticks.
+Add further titled sections after this overview only when they carry distinct,
+grounded analysis. Keep literal technical values exact and inline in backticks.
 
 @@SOURCE_NOTE S001@@
 EVIDENCE: E004, E005
@@ -452,26 +446,24 @@ MISSING COVERAGE: <thème absent des preuves fournies, en une phrase française>
 """
 # Editorial-only prompt changes preserve REFERENCES, EXTRACTION, RELEVANCE_PROJECTION,
 # and SYNTHESIS; only EDITORIAL_ENRICHMENT and its downstream PUBLICATION need rebuilding.
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = (
-    "editorial-enrichment-text-blocks-v21-content-first-figures"
-)
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v21-content-first-figures"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
     "editorial-enrichment-block-contract-v14-article-density"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v15-article-omission-diagnostics"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = (
+    "editorial-enrichment-wire-v15-article-omission-diagnostics"
+)
 EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v8-article-density"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = (
     "editorial-enrichment-repair-contract-v7-article-density"
 )
-SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v2-no-title"
-SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v2-no-title"
-SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v3-no-title"
+SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v3-semantic-styles"
+SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v3-semantic-styles"
+SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v4-proper-name-role"
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
-EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
-    "editorial-enrichment-revision-v6-article-density"
-)
+EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = "editorial-enrichment-revision-v6-article-density"
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
     "editorial-enrichment-revision-contract-v7-article-density"
 )
@@ -490,6 +482,7 @@ campaign: named operation or campaign. Example: Operation Example.
 malware: malware family or component. Example: Necurs.
 tool: named offensive or defensive utility. Example: Cobalt Strike.
 product: named commercial or software product. Example: Microsoft Defender.
+proper_name: named person, organization, place, media outlet, or campaign when it is not a tool, malware, or software product. Example: Example Research Group.
 english_term: English editorial term retained in French prose. Example: infostealer.
 technical: technical mechanism, platform, protocol, or concept. Example: Namecoin.
 technical_literal: exact identifier or code-like technical token. Example: T1102.002.
@@ -500,12 +493,30 @@ protocol_field: exact protocol field or transaction field. Example: OP_RETURN.
 source: source marker or citation label. Example: [S3].
 proof: exact proof/evidence marker when it appears in publication text. Example: E001.
 
-List each distinct proper noun, tool, malware family, protocol, and technical
-element once. Do not add facts, infer an entity absent from the text, browse,
-or conduct research. Use only exact text copied from one of the supplied
-anchors. Keep the anchor as provenance. Prefer the narrowest useful role; a
-named blockchain/protocol is technical, while a literal field/identifier uses
-technical_literal or protocol_field as defined above."""
+STYLE RULES (ARTICLE AND BRIEF)
+Annotate named tools with tool, malware families/components with malware, and
+software/products with product; these are bold. Annotate people, organizations,
+places, media outlets, and named campaigns with proper_name when they are not
+tools, malware, or software/products; actor and campaign roles use the same
+italic style. Annotate English
+editorial terms retained in French prose with english_term; these are italic.
+Annotate mechanisms, platforms, protocols, and concepts with technical, and
+exact paths, commands, keys, filenames, values, ports, user-agents, hashes,
+indicators, and literal protocol fields with technical_literal, path, command,
+ioc, or protocol_field as appropriate; technical roles use gray inline code.
+
+Resolve overlaps deterministically. Exact literal or indicator roles win over
+all name or language roles. Tool, malware, and product roles win over
+proper_name and english_term. proper_name wins over english_term. technical
+wins over english_term when the text names a technical concept. Use
+english_term only for editorial English wording that is not a proper name,
+product, malware, tool, or technical concept. Source and proof markers keep
+their own roles. Prefer the narrowest useful role and never nest or duplicate
+overlapping annotations.
+
+List each distinct eligible term once. Do not add facts, infer an entity absent
+from the text, browse, or conduct research. Use only exact text copied from
+one of the supplied anchors. Keep the anchor as provenance."""
 
 SEMANTIC_ANNOTATION_OUTPUT_CONTRACT = """OUTPUT FORMAT
 Return only independent text blocks. Do not return JSON or prose outside blocks.
