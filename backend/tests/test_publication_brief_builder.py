@@ -22,6 +22,18 @@ from cti_app.application.typst_rendering import project_publication_to_typst_mod
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import ProductionInputSource
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialAnalyticPurposeV1,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    SourceFigureCandidateV1,
+    SourceFigureInclusionStatus,
+    SourceFigureLocatorV1,
+    TableColumnV1,
+    TableRowV1,
+    TableSpecV1,
+)
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     SynthesisParagraphV1,
@@ -29,6 +41,11 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.domain.semantic_annotation import (
+    SemanticAnnotationProposalV1,
+    SemanticRole,
+    lead_paragraph_anchor,
+)
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_publication_builder_v4 import (
     _canonical_inputs,
@@ -95,7 +112,7 @@ def test_brief_assembly_stays_brief_across_narrative_lengths(word_count: int) ->
     assert qa["checks"]["no_ioc_annex"] is True
 
 
-def test_brief_qa_rejects_claimed_enrichment_and_requires_relevance_projection() -> None:
+def test_brief_qa_accepts_empty_enrichment_and_requires_relevance_projection() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     relevance = build_relevance_projection(snapshot, extraction)
     brief = build_brief_publication_document_v5(
@@ -114,7 +131,7 @@ def test_brief_qa_rejects_claimed_enrichment_and_requires_relevance_projection()
     )
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
 
-    rejected_enrichment = qa_publication_v7(
+    accepted_empty_enrichment = qa_publication_v7(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
@@ -133,10 +150,97 @@ def test_brief_qa_rejects_claimed_enrichment_and_requires_relevance_projection()
         publication=publication,
     )
 
-    assert rejected_enrichment["passed"] is False
-    assert rejected_enrichment["error_codes"] == ["publication_qa_editorial_enrichment_forbidden"]
+    assert accepted_empty_enrichment["passed"] is True
+    assert accepted_empty_enrichment["checks"]["exact_projection"] is True
     assert missing_relevance["passed"] is False
     assert missing_relevance["error_codes"] == ["publication_qa_kind_inputs_invalid"]
+
+
+def test_brief_enrichment_rejects_more_than_three_source_figures() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    relevance = build_relevance_projection(snapshot, extraction)
+    source = extraction.sources[0]
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        source_figures=tuple(
+            SourceFigureCandidateV1(
+                key=f"archived_figure_{index}",
+                source_document_id=source.source_document_id,
+                source_url=source.canonical_url,
+                caption=f"Archived figure {index}",
+                provenance="Archived figure from the source",
+                locator=SourceFigureLocatorV1(page=index + 1),
+                inclusion_status=SourceFigureInclusionStatus.PROPOSED,
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+            )
+            for index in range(4)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds the archived figure limit"):
+        build_brief_publication_document_v5(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            relevance_projection=relevance,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+        )
+
+
+def test_brief_enrichment_projects_evidence_table_and_exact_semantic_annotation() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    synthesis = replace(
+        synthesis,
+        lead=(replace(synthesis.lead[0], text="Example actor is documented by Example Lab."),),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=(
+            TableSpecV1(
+                key="observations",
+                kind=EnrichmentTableKind.CUSTOM,
+                title="Observed actor",
+                caption="The source names the actor.",
+                columns=(
+                    TableColumnV1("entity", "Entity"),
+                    TableColumnV1("role", "Role"),
+                ),
+                rows=(TableRowV1(("Example actor", "Reported actor"), (evidence_ref,)),),
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+                purpose=EditorialAnalyticPurposeV1(
+                    question="Which actor is named?",
+                    available_data="The source names Example actor.",
+                    comprehension_gain="The row pairs the name and its reported role.",
+                    scope="The actor named by this source.",
+                    evidence_refs=(evidence_ref,),
+                    knowledge_limits="No additional identity is asserted.",
+                    placement_reason="Place beside the lead that names the actor.",
+                ),
+            ),
+        ),
+        annotations=(
+            SemanticAnnotationProposalV1(
+                lead_paragraph_anchor(1), SemanticRole.PROPER_NAME, "Example Lab"
+            ),
+        ),
+    )
+
+    brief = build_brief_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=build_relevance_projection(snapshot, extraction),
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert brief.document.tables[0].rows[0].evidence_refs == (evidence_ref,)
+    lead = next(item for item in brief.semantic_text.paragraphs if item.anchor == "lead:0001")
+    assert any(
+        span.role is SemanticRole.PROPER_NAME and span.text == "Example Lab" for span in lead.spans
+    )
 
 
 def test_single_metadata_derived_brief_date_stays_in_references_without_chronology() -> None:

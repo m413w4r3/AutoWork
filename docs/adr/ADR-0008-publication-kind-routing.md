@@ -2,6 +2,9 @@
 
 Statut : accepté — 2026-11-05 (amende ADR-0006 sur les points ci-dessous)
 
+La décision du point 4 sur le saut de `EDITORIAL_ENRICHMENT` pour BRIEF est
+amendée par ADR-0009; consulter cette décision pour le pipeline courant.
+
 ## Contexte
 
 ADR-0006 fait de V4 le contrat unique, rejette un branchement « brève » et fige

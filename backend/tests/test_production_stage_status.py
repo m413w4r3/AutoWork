@@ -87,12 +87,12 @@ def test_failed_run_marks_the_stage_it_stopped_on() -> None:
     assert stages["sources"]["status"] == "succeeded"
 
 
-def test_brief_status_omits_editorial_enrichment() -> None:
+def test_brief_status_includes_optional_editorial_enrichment_stage() -> None:
     run = _run(ProductionStage.ASSEMBLY)
 
     stages = build_stage_statuses(run, {}, publication_kind=PublicationKind.BRIEF)
 
-    assert "editorial_enrichment" not in stages
+    assert stages["editorial_enrichment"]["status"] == "succeeded"
     assert stages["synthesis"]["status"] == "succeeded"
     assert stages["assembly"]["status"] == "running"
 
@@ -115,9 +115,9 @@ async def test_subject_production_status_uses_the_routed_publication_kind() -> N
 
     result = await get_subject_production(run.subject_id, request)
 
-    assert "editorial_enrichment" not in result.stages
-    assert result.progress_current == 5
-    assert result.progress_total == 6
+    assert result.stages["editorial_enrichment"].status == "succeeded"
+    assert result.progress_current == 6
+    assert result.progress_total == 7
 
 
 class _StatusUow:

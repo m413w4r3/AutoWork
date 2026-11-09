@@ -8,12 +8,20 @@ from cti_app.application.production_brief_synthesis import (
     BRIEF_CHRONOLOGY_METADATA_PUBLICATION_FALLBACK_WARNING,
     brief_timeline_from_extraction,
 )
+from cti_app.application.production_editorial_enrichment import (
+    MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS,
+)
 from cti_app.application.production_synthesis import build_synthesis_timeline
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
+    _project_publication_charts,
+    _project_publication_diagrams,
+    _project_publication_figures,
     _project_publication_references,
     _project_publication_sources,
+    _project_publication_tables,
     _project_synthesis_publication,
+    _validate_publication_enrichment,
     _validate_publication_lineage,
 )
 from cti_app.application.semantic_annotation import (
@@ -21,6 +29,10 @@ from cti_app.application.semantic_annotation import (
     semantic_entities_from_extraction,
 )
 from cti_app.domain.production import ProductionInputSnapshot
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentV1,
+    editorial_enrichment_evidence_refs,
+)
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_relevance import RelevanceProjectionV1
@@ -57,7 +69,7 @@ from cti_app.domain.semantic_annotation import (
 )
 
 # M19 changes reader references and source-date timelines; this invalidates old brief assemblies.
-BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v2-m19-timeline-references"
+BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v3-m19-enrichment"
 
 
 def build_brief_publication_document_v5(
@@ -67,8 +79,9 @@ def build_brief_publication_document_v5(
     extraction: ProductionExtractionV1,
     relevance_projection: RelevanceProjectionV1 | None,
     synthesis: ProductionSynthesisV1,
+    editorial_enrichment: EditorialEnrichmentV1 | None = None,
 ) -> PublicationDocumentV5:
-    """Project a brief without creating or requiring editorial enrichment."""
+    """Project a brief with optional, evidence-validated editorial enrichment."""
     if relevance_projection is None:
         raise PublicationAssemblyValidationError(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
@@ -81,6 +94,17 @@ def build_brief_publication_document_v5(
         synthesis=synthesis,
         relevance_projection=relevance_projection,
     )
+    if editorial_enrichment is not None:
+        if len(editorial_enrichment.source_figures) > MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.VALIDATION_FAILED,
+                "Brief editorial enrichment exceeds the archived figure limit",
+            )
+        _validate_publication_enrichment(
+            editorial_enrichment=editorial_enrichment,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
     metadata_refs = frozenset(
         ref
         for ref in synthesis_evidence_refs(synthesis)
@@ -141,6 +165,27 @@ def build_brief_publication_document_v5(
         synthesis=synthesis,
     )
 
+    tables = (
+        _project_publication_tables(editorial_enrichment.tables)
+        if editorial_enrichment is not None
+        else ()
+    )
+    diagrams = (
+        _project_publication_diagrams(editorial_enrichment.diagrams)
+        if editorial_enrichment is not None
+        else ()
+    )
+    figures = (
+        _project_publication_figures(editorial_enrichment.source_figures)
+        if editorial_enrichment is not None
+        else ()
+    )
+    charts = (
+        _project_publication_charts(editorial_enrichment.charts)
+        if editorial_enrichment is not None
+        else ()
+    )
+
     lead = list(narrative.lead)
     sections: list[PublicationSectionV1] = []
     lead_fingerprints = {" ".join(item.text.casefold().split()) for item in lead}
@@ -189,6 +234,12 @@ def build_brief_publication_document_v5(
     additional_source_ids.update(
         ref.source_document_id for item in reference_entries for ref in item.evidence_refs
     )
+    if editorial_enrichment is not None:
+        additional_source_ids.update(
+            ref.source_document_id
+            for ref in editorial_enrichment_evidence_refs(editorial_enrichment)
+        )
+    additional_source_ids.update(figure.source_document_id for figure in figures)
     used_source_document_ids = set(narrative.used_source_document_ids)
     used_source_document_ids.update(
         ref.source_document_id for entry in source_timeline for ref in entry.evidence_refs
@@ -233,10 +284,11 @@ def build_brief_publication_document_v5(
         indicators=(),
         sources=sources,
         uncertainties=(),
-        tables=(),
-        diagrams=(),
-        figures=(),
+        tables=tables,
+        diagrams=diagrams,
+        figures=figures,
         additional_source_ids=frozenset(additional_source_ids),
+        charts=charts,
     )
     anchors = publication_document_text_anchors(document, references=ordered_references)
     semantic_text = SemanticTextV1(
@@ -245,6 +297,9 @@ def build_brief_publication_document_v5(
         paragraphs=SemanticAnnotator().annotate_paragraphs(
             tuple(anchors.items()),
             entities=semantic_entities_from_extraction(extraction),
+            proposals=(
+                editorial_enrichment.annotations if editorial_enrichment is not None else ()
+            ),
         ),
     )
     return PublicationDocumentV5(

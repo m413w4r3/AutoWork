@@ -4,7 +4,14 @@ from uuid import uuid4
 
 import pytest
 
-from cti_app.domain.production import ProductionArtifactStage, ProductionRun, ProductionStage
+from cti_app.application.production_resume import plan_production_resume, resolve_retry_stage
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
+)
 from cti_app.domain.production_pipeline import (
     PRODUCTION_PIPELINE,
     ProductionStageSpec,
@@ -99,29 +106,77 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
     assert next_stage(stage) is successor
 
 
-def test_brief_route_skips_enrichment_and_its_artifact() -> None:
+def test_brief_route_includes_enrichment_and_its_artifact() -> None:
     brief_stages = production_stages(PublicationKind.BRIEF)
-    assert ProductionStage.EDITORIAL_ENRICHMENT not in brief_stages
+    assert ProductionStage.EDITORIAL_ENRICHMENT in brief_stages
     assert production_artifact_stages(PublicationKind.BRIEF) == (
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
         ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
     )
     assert next_stage(ProductionStage.SYNTHESIS, publication_kind=PublicationKind.BRIEF) is (
-        ProductionStage.ASSEMBLY
+        ProductionStage.EDITORIAL_ENRICHMENT
     )
     assert downstream_artifacts_from_pipeline_stage(
         ProductionStage.SYNTHESIS, publication_kind=PublicationKind.BRIEF
-    ) == (ProductionArtifactStage.PUBLICATION,)
+    ) == (
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        ProductionArtifactStage.PUBLICATION,
+    )
+
+
+def test_brief_retry_and_resume_target_missing_enrichment_after_synthesis() -> None:
+    run = ProductionRun(
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        status=ProductionRunStatus.CANCELLED,
+        current_stage=ProductionStage.ASSEMBLY,
+    )
+    completed_stages = (
+        ProductionArtifactStage.REFERENCES,
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
+        ProductionArtifactStage.SYNTHESIS,
+    )
+    artifacts = {
+        stage.value: ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=1,
+            input_hash="a" * 64,
+        )
+        for stage in completed_stages
+    }
+
+    resume = plan_production_resume(
+        run,
+        artifacts=artifacts,
+        archived_source_count=1,
+        publication_kind=PublicationKind.BRIEF,
+    )
+
+    assert resume.resume_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
+    assert resume.reused_artifacts == tuple(stage.value for stage in completed_stages)
+    assert resume.model_calls_expected == 1
+    assert (
+        resolve_retry_stage(
+            set(artifacts),
+            current_stage=ProductionStage.ASSEMBLY,
+            publication_kind=PublicationKind.BRIEF,
+        )
+        is ProductionStage.EDITORIAL_ENRICHMENT
+    )
 
 
 @pytest.mark.parametrize(
     ("publication_kind", "expected_stage"),
     [
         (PublicationKind.ARTICLE, ProductionStage.EDITORIAL_ENRICHMENT),
-        (PublicationKind.BRIEF, ProductionStage.ASSEMBLY),
+        (PublicationKind.BRIEF, ProductionStage.EDITORIAL_ENRICHMENT),
     ],
 )
 def test_run_transition_uses_adopted_publication_route(
@@ -160,10 +215,10 @@ def test_mixed_batch_routes_each_subject_independently() -> None:
 
     assert tuple(run.current_stage for run in runs) == (
         ProductionStage.EDITORIAL_ENRICHMENT,
-        ProductionStage.ASSEMBLY,
         ProductionStage.EDITORIAL_ENRICHMENT,
-        ProductionStage.ASSEMBLY,
-        ProductionStage.ASSEMBLY,
+        ProductionStage.EDITORIAL_ENRICHMENT,
+        ProductionStage.EDITORIAL_ENRICHMENT,
+        ProductionStage.EDITORIAL_ENRICHMENT,
     )
     assert tuple(run.status.value for run in runs) == (
         "running",

@@ -620,6 +620,163 @@ async def test_brief_assembly_persists_v8_without_editorial_enrichment() -> None
 
 
 @pytest.mark.asyncio
+async def test_brief_assembly_projects_valid_enrichment_and_records_its_identity() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    enrichment = _enrichment_citing(extraction, synthesis, evidence)
+    relevance = build_relevance_projection(snapshot, extraction)
+    enrichment_artifact_id = UUID(int=9901)
+    enrichment_artifact_input_hash = "e" * 64
+    service, catalog, _artifacts = _service()
+
+    result = await _assemble(
+        service,
+        run=_run(snapshot),
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        relevance_projection=relevance,
+        publication_kind=PublicationKind.BRIEF,
+        editorial_enrichment_artifact_id=enrichment_artifact_id,
+        editorial_enrichment_artifact_input_hash=enrichment_artifact_input_hash,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+        metadata_extra={
+            "input_artifacts": {
+                "editorial_enrichment_artifact_id": str(enrichment_artifact_id),
+            },
+            "diagnostics": {"editorial_enrichment": {"inventory": "archived"}},
+        },
+    )
+
+    assert result.editorial_enrichment is enrichment
+    assert result.artifact.canonical_blob_id is not None
+    publication = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(result.artifact.canonical_blob_id)
+    )
+    assert publication.tables[0].key == "observations"
+    assert (
+        qa_publication_v7(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            relevance_projection=relevance,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+            publication=publication,
+        )["passed"]
+        is True
+    )
+    consumed_identity = PublicationAssemblyService._assembly_input_hash(
+        publication_kind=PublicationKind.BRIEF,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=enrichment_artifact_id,
+        editorial_enrichment_artifact_input_hash=enrichment_artifact_input_hash,
+        relevance_projection=relevance,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    changed_input_identity = PublicationAssemblyService._assembly_input_hash(
+        publication_kind=PublicationKind.BRIEF,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=enrichment_artifact_id,
+        editorial_enrichment_artifact_input_hash="f" * 64,
+        relevance_projection=relevance,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    ignored_identity = PublicationAssemblyService._assembly_input_hash(
+        publication_kind=PublicationKind.BRIEF,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=None,
+        editorial_enrichment_artifact_id=enrichment_artifact_id,
+        editorial_enrichment_artifact_input_hash=enrichment_artifact_input_hash,
+        relevance_projection=relevance,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    identity_without_consumption = PublicationAssemblyService._assembly_input_hash(
+        publication_kind=PublicationKind.BRIEF,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=None,
+        relevance_projection=relevance,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    changed_artifact_identity = PublicationAssemblyService._assembly_input_hash(
+        publication_kind=PublicationKind.BRIEF,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=UUID(int=9902),
+        editorial_enrichment_artifact_input_hash=enrichment_artifact_input_hash,
+        relevance_projection=relevance,
+        routing_decision_hash="b" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+
+    assert result.artifact.input_hash == consumed_identity
+    assert consumed_identity != changed_input_identity
+    assert consumed_identity != changed_artifact_identity
+    assert ignored_identity == identity_without_consumption
+
+
+@pytest.mark.asyncio
+async def test_empty_brief_enrichment_is_not_consumed_or_added_to_assembly_identity() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    relevance = build_relevance_projection(snapshot, extraction)
+    empty_enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    arguments = {
+        "run": _run(snapshot),
+        "snapshot": snapshot,
+        "references": references,
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "relevance_projection": relevance,
+        "publication_kind": PublicationKind.BRIEF,
+        "routing_decision_hash": "b" * 64,
+        "routing_policy_version": "routing-policy-v1",
+    }
+    absent_service, _absent_catalog, _ = _service()
+    empty_service, _empty_catalog, _ = _service()
+
+    absent = await _assemble(absent_service, editorial_enrichment=None, **arguments)
+    empty = await _assemble(
+        empty_service,
+        editorial_enrichment=empty_enrichment,
+        editorial_enrichment_artifact_id=UUID(int=9903),
+        editorial_enrichment_artifact_input_hash="a" * 64,
+        metadata_extra={
+            "input_artifacts": {"editorial_enrichment_artifact_id": str(UUID(int=9903))},
+            "diagnostics": {"editorial_enrichment": {"pending": 1}},
+        },
+        **arguments,
+    )
+
+    assert empty.editorial_enrichment is None
+    assert empty.artifact.input_hash == absent.artifact.input_hash
+    assert "editorial_enrichment_artifact_id" not in empty.artifact.metadata["input_artifacts"]
+
+
+@pytest.mark.asyncio
 async def test_identical_inputs_in_the_same_run_return_the_current_publication() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     service, catalog, artifacts = _service()

@@ -143,10 +143,7 @@ def _contains_reader_hidden_metadata(value: Any) -> bool:
         media_keys = {"sha256", "sha256_spans"} if value.get("type") == "figure" else set()
         return any(
             key.casefold() in hidden_keys
-            or (
-                key not in media_keys
-                and ("sha256" in key.casefold() or "_hash" in key.casefold())
-            )
+            or (key not in media_keys and ("sha256" in key.casefold() or "_hash" in key.casefold()))
             or _contains_reader_hidden_metadata(item)
             for key, item in value.items()
         )
@@ -576,8 +573,8 @@ def qa_publication_v7(
         result["checks"]["routing_metadata_valid"] = bool(
             publication.routing_decision_hash and publication.routing_policy_version
         )
-        result["checks"]["article_format_present"] = (
-            publication_v8 is None or isinstance(publication_v8.article_format, ArticleFormatV1)
+        result["checks"]["article_format_present"] = publication_v8 is None or isinstance(
+            publication_v8.article_format, ArticleFormatV1
         )
         if not result["checks"]["article_format_present"]:
             result["errors"].append("Article publication requires ArticleFormatV1")
@@ -585,18 +582,6 @@ def qa_publication_v7(
             result["passed"] = False
         return result
 
-    if editorial_enrichment is not None:
-        return {
-            "passed": False,
-            "checks": {
-                "editorial_enrichment_absent": False,
-                "article_format_null": publication_v8 is None
-                or publication_v8.article_format is None,
-            },
-            "errors": ["Brief publication must not claim editorial enrichment"],
-            "warnings": [],
-            "error_codes": [PublicationQaErrorCode.EDITORIAL_ENRICHMENT_FORBIDDEN.value],
-        }
     if relevance_projection is None:
         return {
             "passed": False,
@@ -614,6 +599,7 @@ def qa_publication_v7(
     checks: dict[str, bool] = {
         "publication_kind_explicit": publication.publication_kind is PublicationKind.BRIEF,
         "article_format_null": publication_v8 is None or publication_v8.article_format is None,
+        "editorial_enrichment_accepted": True,
         "routing_metadata_valid": bool(
             publication.routing_decision_hash and publication.routing_policy_version
         ),
@@ -639,9 +625,12 @@ def qa_publication_v7(
             extraction=extraction,
             relevance_projection=relevance_projection,
             synthesis=synthesis,
+            editorial_enrichment=editorial_enrichment,
         )
     except ValueError as exc:
         checks["canonical_inputs_valid"] = False
+        if editorial_enrichment is not None:
+            checks["editorial_enrichment_accepted"] = False
         errors.append(str(exc))
     else:
         checks["canonical_inputs_valid"] = True
@@ -698,6 +687,36 @@ def qa_publication_v7(
         *(paragraph.text for section in document.sections for paragraph in section.paragraphs),
         *(entry.text for entry in document.timeline),
         *(item.text for item in base.references),
+        *(
+            text
+            for table in document.tables
+            for text in (
+                table.title,
+                table.caption,
+                *(column.label for column in table.columns),
+                *(cell for row in table.rows for cell in row.cells),
+            )
+            if text is not None
+        ),
+        *(
+            text
+            for diagram in document.diagrams
+            for text in (
+                diagram.title,
+                diagram.caption,
+                *(node.label for node in diagram.nodes),
+                *(edge.label for edge in diagram.edges),
+                *(group.label for group in diagram.groups),
+            )
+            if text is not None
+        ),
+        *(
+            text
+            for chart in document.charts
+            for text in (chart.title, chart.caption)
+            if text is not None
+        ),
+        *(figure.caption for figure in document.figures),
     )
     checks["no_placeholder_markers"] = not any(
         _BRIEF_PLACEHOLDER_MARKER.search(text) for text in editorial_text

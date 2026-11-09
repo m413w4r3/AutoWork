@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
+import xml.etree.ElementTree as ET
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +19,7 @@ from cti_app.application.brief_publication_builder import (
     wrap_publication_document_v7,
 )
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
+from cti_app.application.media_assets import media_asset_id
 from cti_app.application.production_relevance import (
     RelevanceProjectionExecution,
     RelevanceProjectionExecutionStatus,
@@ -32,9 +36,16 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
 from cti_app.domain.production import ProductionRun, ProductionStage
+from cti_app.domain.production_editorial_enrichment import (
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    SourceFigureLocatorV1,
+)
 from cti_app.domain.production_pipeline import production_stages
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_routing import RoutingStatus
+from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
@@ -47,7 +58,15 @@ from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV8,
+    PublicationSourceFigureV1,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
+    PublicationTableV1,
+    order_publication_references,
+    parse_publication_document,
     publication_document_text_anchors,
+    serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
@@ -67,6 +86,17 @@ _REFERENCE_URLS = (
     "https://openai.example.test/report",
     "https://cnn.example.test/report",
 )
+
+
+async def _run_pdf_command(*arguments: str) -> bytes:
+    process = await asyncio.create_subprocess_exec(
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+    assert process.returncode == 0, stderr.decode(errors="replace")
+    return stdout
 
 
 def _assert_brief_timeline_rail(path: Path, pages, tmp_path: Path) -> None:
@@ -121,6 +151,7 @@ def _brief_v7_fixture(
     *,
     source_dates: tuple[date | None, date | None],
     include_sample_events: bool = False,
+    include_enrichment: bool = False,
 ):
     source_ids = (UUID(int=8101), UUID(int=8102))
     publishers = ("OpenAI", "CNN")
@@ -155,7 +186,11 @@ def _brief_v7_fixture(
         title="Brève synthétique",
         lead=(
             PublicationParagraphV1(
-                "Two archived sources support this short update.",
+                (
+                    "SentinelTool records a payload for Example Lab using a technical field."
+                    if include_enrichment
+                    else "Two archived sources support this short update."
+                ),
                 (
                     PublicationEvidenceRefV1(
                         source_document_id=source_ids[0],
@@ -200,14 +235,70 @@ def _brief_v7_fixture(
         figures=(),
         additional_source_ids=frozenset(source_ids),
     )
-    anchors = publication_document_text_anchors(document, references=references)
+    if include_enrichment:
+        source = sources[0]
+        evidence_ref = ExtractionEvidenceRefV1(
+            source.source_document_id, EvidenceKind.FACT, "e" * 64
+        )
+        locator = SourceFigureLocatorV1(page=1, figure_label="Archived source capture")
+        document = replace(
+            document,
+            tables=(
+                PublicationTableV1(
+                    key="archived_observation",
+                    kind=EnrichmentTableKind.CUSTOM,
+                    title="Archived observation",
+                    caption="Evidence recorded in the source.",
+                    columns=(
+                        PublicationTableColumnV1("entity", "Entity"),
+                        PublicationTableColumnV1("role", "Role"),
+                    ),
+                    rows=(
+                        PublicationTableRowV1(
+                            ("Example Lab", "Reported organization"), (evidence_ref,)
+                        ),
+                    ),
+                    placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+                ),
+            ),
+            figures=(
+                PublicationSourceFigureV1(
+                    key="archived_capture",
+                    asset_id=media_asset_id("f" * 64, "image/svg+xml"),
+                    sha256="f" * 64,
+                    mime_type="image/svg+xml",
+                    byte_size=256,
+                    source_document_id=source.source_document_id,
+                    source_url=source.canonical_url,
+                    caption="Archived source capture of Example Lab.",
+                    provenance="Archived original media with source attribution.",
+                    locator=locator,
+                    placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+                ),
+            ),
+        )
+    ordered_references = order_publication_references(references, document.sources)
+    anchors = publication_document_text_anchors(document, references=ordered_references)
     semantic_text = SemanticTextV1(
         schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
         policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
         paragraphs=tuple(
             SemanticParagraphV1(
                 anchor=anchor,
-                spans=(SemanticTextSpanV1(SemanticRole.TEXT, text),),
+                spans=(
+                    (
+                        SemanticTextSpanV1(SemanticRole.TOOL, "SentinelTool"),
+                        SemanticTextSpanV1(SemanticRole.TEXT, " records a "),
+                        SemanticTextSpanV1(SemanticRole.ENGLISH_TERM, "payload"),
+                        SemanticTextSpanV1(SemanticRole.TEXT, " for "),
+                        SemanticTextSpanV1(SemanticRole.PROPER_NAME, "Example Lab"),
+                        SemanticTextSpanV1(SemanticRole.TEXT, " using a "),
+                        SemanticTextSpanV1(SemanticRole.TECHNICAL, "technical field"),
+                        SemanticTextSpanV1(SemanticRole.TEXT, "."),
+                    )
+                    if include_enrichment and anchor == "lead:0001"
+                    else (SemanticTextSpanV1(SemanticRole.TEXT, text),)
+                ),
             )
             for anchor, text in anchors.items()
         ),
@@ -215,7 +306,7 @@ def _brief_v7_fixture(
     base = PublicationDocumentV5(
         document=document,
         semantic_text=semantic_text,
-        references=references,
+        references=ordered_references,
     )
     publication = wrap_publication_document_v7(
         base,
@@ -225,6 +316,22 @@ def _brief_v7_fixture(
         routing_policy_version="routing-policy-v1",
     )
     return publication
+
+
+@pytest.mark.parametrize("wrap_v8", (False, True), ids=("v7", "v8"))
+def test_historical_brief_publications_round_trip_without_enrichment(wrap_v8: bool) -> None:
+    publication = _brief_v7_fixture(source_dates=(None, None))
+    historical = (
+        PublicationDocumentV8(base_publication=publication, article_format=None)
+        if wrap_v8
+        else publication
+    )
+
+    payload = serialize_publication_document(historical)
+    reread = parse_publication_document(payload)
+
+    assert reread == historical
+    assert serialize_publication_document(reread) == payload
 
 
 async def _render_brief_pdf(tmp_path, publication, *, edition: bool):
@@ -257,6 +364,7 @@ async def _render_brief_pdf(tmp_path, publication, *, edition: bool):
         )
         render_data = json.loads(source.render_data_bytes)
         render_publication = render_data["publications"][0]
+        media_paths = tuple(item.media_path for item in source.media_refs)
         entrypoint = "RENDERER/edition.typ"
     else:
         source = TypstRenderer().render(
@@ -266,12 +374,14 @@ async def _render_brief_pdf(tmp_path, publication, *, edition: bool):
         )
         render_data = json.loads(source.render_data_bytes)
         render_publication = render_data
+        media_paths = tuple(item.media_path for item in source.media_refs)
         entrypoint = "RENDERER/publication.typ"
     path = await _compile_pdf(
         tmp_path,
         render_data,
         entrypoint=entrypoint,
         manifest_name=manifest_name,
+        media_paths=media_paths,
     )
     return render_publication, path
 
@@ -323,6 +433,98 @@ async def test_brief_with_one_source_publication_date_has_no_chronology_pdf(tmp_
     assert "Chronologie" not in text
 
 
+@pytest.mark.parametrize("edition", (False, True), ids=("standalone", "edition"))
+@pytest.mark.asyncio
+async def test_enriched_brief_renders_archived_figure_table_and_semantic_styles(
+    tmp_path, edition: bool
+) -> None:
+    publication = _brief_v7_fixture(
+        source_dates=(None, None),
+        include_enrichment=True,
+    )
+    render_publication, pdf_path = await _render_brief_pdf(tmp_path, publication, edition=edition)
+    text, pages = _extract_layout(pdf_path)
+
+    synthesis = next(
+        section
+        for section in render_publication["content_sections"]
+        if section["type"] == "synthesis"
+    )
+    paragraph = next(
+        block
+        for block in synthesis["blocks"]
+        if block["type"] == "paragraph" and "SentinelTool" in block["text"]
+    )
+    style_by_text = {span["text"]: span["style"] for span in paragraph["semantic_spans"]}
+    assert style_by_text["SentinelTool"] == "semantic-tool"
+    assert style_by_text["payload"] == "semantic-english-term"
+    assert style_by_text["Example Lab"] == "semantic-proper-name"
+    assert style_by_text["technical field"] == "semantic-technical"
+    assert "Archived observation" in text
+    assert "Reported organization" in text
+    assert "Archived source capture of Example Lab." in text
+    assert "Figure 1 : Archived source capture of Example Lab." in text
+    for absent in ("Documenté, non observé", "Archived original media", "Attribution :"):
+        assert absent not in text
+
+    caption_line, caption_page = next(
+        (line, page)
+        for page in pages
+        for line in page["lines"]
+        if "Figure 1 : Archived source capture of Example Lab." in line["text"]
+    )
+    caption_center = (caption_line["left"] + caption_line["right"]) / 2
+    assert abs(caption_center - caption_page["width"] / 2) <= 2.0
+
+    xml_output = await _run_pdf_command(
+        "pdftohtml", "-xml", "-stdout", "-fontfullname", str(pdf_path)
+    )
+    xml_root = ET.fromstring(xml_output.decode())
+    font_names = {
+        item.attrib["id"]: item.attrib.get("family", "").casefold()
+        for item in xml_root.iter("fontspec")
+    }
+    rendered_fonts = [
+        (
+            "".join(item.itertext()).strip(),
+            font_names.get(item.attrib.get("font", ""), ""),
+        )
+        for item in xml_root.iter("text")
+    ]
+    assert any(text == "SentinelTool" and "bold" in font for text, font in rendered_fonts)
+    assert any(text == "payload" and "italic" in font for text, font in rendered_fonts)
+    assert any(text == "Example Lab" and "italic" in font for text, font in rendered_fonts)
+    assert any(text == "technical field" and "cascadia" in font for text, font in rendered_fonts)
+
+    technical_line = next(
+        line for page in pages for line in page["lines"] if "technical field" in line["text"]
+    )
+    technical_page_index = next(
+        index for index, page in enumerate(pages) if technical_line in page["lines"]
+    )
+    image_prefix = tmp_path / "brief-enrichment-page"
+    await _run_pdf_command(
+        "pdftoppm",
+        "-r",
+        "72",
+        "-f",
+        str(technical_page_index + 1),
+        "-singlefile",
+        str(pdf_path),
+        str(image_prefix),
+    )
+    width, height, pixels = _read_ppm(image_prefix.with_suffix(".ppm"))
+    x_start = max(0, int(technical_line["left"]) - 3)
+    x_end = min(width, int(technical_line["right"]) + 4)
+    y_start = max(0, int(technical_line["top"]) - 3)
+    y_end = min(height, int(technical_line["bottom"]) + 4)
+    assert any(
+        pixels[(y * width + x) * 3 : (y * width + x) * 3 + 3] == bytes((190, 190, 190))
+        for x in range(x_start, x_end)
+        for y in range(y_start, y_end)
+    )
+
+
 def test_archived_core_source_cited_in_brief_lead_is_a_publication_reference() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     relevance = build_relevance_projection(snapshot, extraction)
@@ -359,7 +561,7 @@ def test_archived_core_source_cited_in_brief_lead_is_a_publication_reference() -
 
 
 def test_brief_assembly_policy_version_changes_the_reuse_identity(monkeypatch) -> None:
-    assert BRIEF_ASSEMBLY_POLICY_VERSION == "brief-assembly-v2-m19-timeline-references"
+    assert BRIEF_ASSEMBLY_POLICY_VERSION == "brief-assembly-v3-m19-enrichment"
     assert len(BRIEF_ASSEMBLY_POLICY_VERSION) <= 64
     snapshot, references, extraction, synthesis = _canonical_inputs()
     relevance = build_relevance_projection(snapshot, extraction)
@@ -383,10 +585,17 @@ def test_brief_assembly_policy_version_changes_the_reuse_identity(monkeypatch) -
     monkeypatch.setattr(
         publication_assembly_module,
         "BRIEF_ASSEMBLY_POLICY_VERSION",
+        "brief-assembly-v2-m19-timeline-references",
+    )
+    m4a_identity = PublicationAssemblyService._assembly_input_hash(**identity_args)
+    monkeypatch.setattr(
+        publication_assembly_module,
+        "BRIEF_ASSEMBLY_POLICY_VERSION",
         BRIEF_ASSEMBLY_POLICY_VERSION,
     )
     new_identity = PublicationAssemblyService._assembly_input_hash(**identity_args)
     assert old_identity != new_identity
+    assert m4a_identity != new_identity
 
 
 @pytest.mark.parametrize("publication_kind", (PublicationKind.ARTICLE, PublicationKind.BRIEF))

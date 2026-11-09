@@ -199,7 +199,7 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v10-article-density"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v11-brief-enrichment"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v8-relation-support"
@@ -213,7 +213,7 @@ EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50
 DIAGRAM_STAR_REDUNDANT_LABEL_RATIO = 0.80
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v8-article-density"
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v9-brief-enrichment"
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
     "CHART": EditorialMediaType.CHART,
@@ -2849,10 +2849,7 @@ def parse_editorial_enrichment_proposal_wire(
     maximum_figure_proposals = min(
         maximum_figure_proposals,
         MAX_ENRICHMENT_FIGURE_PROPOSALS,
-        sum(
-            entry.figure.decision is SourceFigureDecision.ACCEPTED
-            for entry in figure_catalog
-        ),
+        sum(entry.figure.decision is SourceFigureDecision.ACCEPTED for entry in figure_catalog),
     )
     proposed_figure_handles: set[str] = set()
     proposed_need_keys: set[str] = set()
@@ -4258,10 +4255,7 @@ def build_editorial_figure_catalog(
     inventory: SourceFigureInventoryResult,
 ) -> tuple[EditorialFigureCatalogEntry, ...]:
     """Assign stable prompt-local handles to accepted and full-source decisions."""
-    sources_by_id = {
-        source.source_document_id: source
-        for source in extraction.sources
-    }
+    sources_by_id = {source.source_document_id: source for source in extraction.sources}
     accepted_source_ids = {
         figure.source_document_id
         for figure in inventory.figures
@@ -4310,11 +4304,14 @@ def build_editorial_figure_catalog(
             )
         )
     catalogued_ids = {entry.figure.figure_id for entry in entries}
-    if not {
-        figure.figure_id
-        for figure in inventory.figures
-        if figure.decision is SourceFigureDecision.ACCEPTED
-    } <= catalogued_ids:
+    if (
+        not {
+            figure.figure_id
+            for figure in inventory.figures
+            if figure.decision is SourceFigureDecision.ACCEPTED
+        }
+        <= catalogued_ids
+    ):
         raise ValueError("accepted_source_figure_missing_catalog_handle")
     return tuple(entries)
 
@@ -4428,21 +4425,14 @@ def build_source_figure_inventory_diagnostics(
     rejected_before_limit_count = max(
         inventory.rejected_before_limit_count, observed_rejected_count
     )
-    rejected_before_limit_reason_counts = dict(
-        inventory.rejected_before_limit_reason_counts
-    )
+    rejected_before_limit_reason_counts = dict(inventory.rejected_before_limit_reason_counts)
     for reason, count in observed_rejected_reasons.items():
         rejected_before_limit_reason_counts[reason] = max(
             rejected_before_limit_reason_counts.get(reason, 0), count
         )
-    reasons[SourceFigureDecision.REJECTED.value] = dict(
-        rejected_before_limit_reason_counts
-    )
+    reasons[SourceFigureDecision.REJECTED.value] = dict(rejected_before_limit_reason_counts)
 
-    handle_by_figure_id = {
-        entry.figure.figure_id: entry.handle
-        for entry in figure_catalog
-    }
+    handle_by_figure_id = {entry.figure.figure_id: entry.handle for entry in figure_catalog}
     selected_handles = sorted(
         handle_by_figure_id.get(candidate.resolved_figure.figure_id, candidate.key)
         for candidate in (enrichment.source_figures if enrichment is not None else ())
@@ -4450,8 +4440,7 @@ def build_source_figure_inventory_diagnostics(
         and candidate.resolved_figure is not None
     )
     decision_counts = {
-        decision: len(grouped[decision])
-        + inventory.truncated_decision_counts.get(decision, 0)
+        decision: len(grouped[decision]) + inventory.truncated_decision_counts.get(decision, 0)
         for decision in (
             SourceFigureDecision.ACCEPTED.value,
             SourceFigureDecision.REJECTED.value,
@@ -4460,9 +4449,7 @@ def build_source_figure_inventory_diagnostics(
     }
     decision_counts[SourceFigureDecision.REJECTED.value] = (
         rejected_before_limit_count
-        + inventory.truncated_decision_counts.get(
-            SourceFigureDecision.REJECTED.value, 0
-        )
+        + inventory.truncated_decision_counts.get(SourceFigureDecision.REJECTED.value, 0)
     )
     for decision, counts in inventory.truncated_reason_counts.items():
         if decision in reasons:
@@ -4487,9 +4474,7 @@ def build_source_figure_inventory_diagnostics(
         "rejected_before_limit": {
             "count": rejected_before_limit_count,
             "by_reason": dict(sorted(rejected_before_limit_reason_counts.items())),
-            "candidates": [
-                item.to_json() for item in inventory.rejected_before_limit_candidates
-            ],
+            "candidates": [item.to_json() for item in inventory.rejected_before_limit_candidates],
         },
         "truncation": {
             "is_truncated": inventory.truncated,
@@ -5052,6 +5037,10 @@ def editorial_enrichment_output_contract_example(
     maximum_figure_proposals: int | None = None,
 ) -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
+    if publication_kind is PublicationKind.BRIEF and maximum_figure_proposals is not None:
+        maximum_figure_proposals = min(
+            maximum_figure_proposals, MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS
+        )
     if maximum_figure_proposals is None:
         maximum_figure_proposals = (
             MAX_ENRICHMENT_FIGURE_PROPOSALS
@@ -5382,6 +5371,29 @@ décrire qu'un média analytique pertinent manquant. Ne renvoie aucune URL dans 
             f"\n\nLe nombre de FIGURE SOURCE proposées ne dépasse jamais "
             f"{maximum_figure_proposals}."
         )
+    elif publication_kind is PublicationKind.BRIEF:
+        contract = contract.replace(
+            "Figures : sélectionne zéro ou une image seulement "
+            "si elle améliore réellement la compréhension;",
+            "Figures sources BRIEF : sélectionne zéro à trois images archivées, seulement "
+            "si chacune améliore réellement la compréhension et répond à un besoin distinct;",
+        )
+        contract = contract.replace(
+            "Quand\nla recherche Web est disponible, consulte SOURCE_PAGE_URL et identifie "
+            "ce que montre réellement\nchaque figure.",
+            "N'effectue aucune recherche Web; décide uniquement à partir des médias et "
+            "contextes déjà archivés, sans ouvrir de page.",
+        )
+        contract = contract.replace(
+            "avec SOURCE_PAGE_URL, ASSET_URL, ALT, SOURCE_CAPTION,",
+            "à partir de ALT, SOURCE_CAPTION,",
+        )
+        contract += (
+            "\n\nAucun minimum de table, diagramme, graphique ou figure ne s'applique. "
+            "RIEN est une décision valide si les preuves ne soutiennent aucune représentation. "
+            "Le nombre de FIGURE SOURCE proposées ne dépasse jamais "
+            f"{maximum_figure_proposals}."
+        )
     return contract
 
 
@@ -5414,6 +5426,11 @@ def build_editorial_enrichment_model_request(
         or evidence_pack.publication_language != synthesis.publication_language
     ):
         raise ValueError("Editorial enrichment request policy does not match its inputs")
+    # Brief enrichment never initiates resource discovery. The archived source
+    # inventory and evidence pack are the only media and fact inputs.
+    resource_search_enabled = bool(
+        resource_search_enabled and publication_kind is not PublicationKind.BRIEF
+    )
     pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
     access_hash = synthesis_access_policy_hash(access_policy)
     input_hash = compute_editorial_enrichment_input_hash(
@@ -5439,8 +5456,7 @@ def build_editorial_enrichment_model_request(
         else MAX_BRIEF_ENRICHMENT_FIGURE_PROPOSALS
     )
     accepted_figure_count = sum(
-        entry.figure.decision is SourceFigureDecision.ACCEPTED
-        for entry in figure_catalog
+        entry.figure.decision is SourceFigureDecision.ACCEPTED for entry in figure_catalog
     )
     maximum_figure_proposals = min(
         figure_proposal_ceiling,
@@ -5463,11 +5479,19 @@ def build_editorial_enrichment_model_request(
         if publication_kind is PublicationKind.ARTICLE
         else ""
     )
+    brief_requirements = (
+        "BRIEF : aucun minimum de tables, diagrammes, graphiques, figures ou annotations. "
+        "RIEN est valide si aucun élément n'est suffisamment étayé. Sélectionne au plus trois "
+        "figures déjà archivées, uniquement depuis le catalogue fourni; n'ouvre aucune page, "
+        "n'effectue aucune recherche Web et ne demande aucune acquisition. N'ajoute aucun fait. "
+        if publication_kind is PublicationKind.BRIEF
+        else ""
+    )
     prompt_payload = {
         "instructions": (
             article_requirements
-            +
-            "Tu es un arbitre de représentations éditoriales, pas un chercheur ni un renderer. "
+            + brief_requirements
+            + "Tu es un arbitre de représentations éditoriales, pas un chercheur ni un renderer. "
             "Détermine intérieurement une question analytique pour chaque besoin; ne produis pas "
             "de bloc QUESTION. Pour chaque "
             "question analytique : 1. Une figure de la publication source répond-elle déjà "
@@ -5605,8 +5629,8 @@ def build_editorial_enrichment_model_request(
         },
         "figure_catalog": [
             entry.prompt_record(
-                include_source_page=publication_kind is not PublicationKind.ARTICLE,
-                include_asset_url=publication_kind is not PublicationKind.ARTICLE,
+                include_source_page=publication_kind is None,
+                include_asset_url=publication_kind is None,
                 evidence_handles=evidence_pack.evidence_handles_for_source(
                     entry.figure.source_document_id
                 ),
@@ -5673,11 +5697,9 @@ def build_editorial_enrichment_model_request(
         external_llm_allowed=access_policy.external_llm_allowed,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
-        # ARTICLE figure selection uses archived context only. Preserve the
-        # legacy BRIEF lookup against source pages when accepted figures exist.
-        web_search=(
-            publication_kind is not PublicationKind.ARTICLE and accepted_figure_count > 0
-        ),
+        # Explicit routes use archived context only. Unrouted requests retain
+        # the legacy source-page lookup when accepted figures exist.
+        web_search=(publication_kind is None and accepted_figure_count > 0),
         background=False,
         conversation=None,
         run_id=editorial_enrichment_model_run_id(run, invocation_hash),
@@ -5946,10 +5968,7 @@ def validate_editorial_enrichment_proposal(
     maximum_figure_proposals = min(
         maximum_figure_proposals,
         MAX_ENRICHMENT_FIGURE_PROPOSALS,
-        sum(
-            entry.figure.decision is SourceFigureDecision.ACCEPTED
-            for entry in figure_catalog
-        ),
+        sum(entry.figure.decision is SourceFigureDecision.ACCEPTED for entry in figure_catalog),
     )
     if (
         len(parsed.figures) > maximum_figure_proposals
@@ -6814,6 +6833,9 @@ class ProductionEditorialEnrichmentService:
                     if routing_decision is not None
                     else PublicationKind.ARTICLE
                 )
+                resource_search_enabled = (
+                    self._resource_search_enabled and publication_kind is not PublicationKind.BRIEF
+                )
                 source_figure_inventory = await load_archived_source_figure_inventory(
                     subject_id=snapshot.subject_id,
                     extraction_sources=extraction.sources,
@@ -6842,7 +6864,7 @@ class ProductionEditorialEnrichmentService:
                 access_policy_hash=access_policy_hash,
                 projection_hash=projection.projection_hash if projection is not None else None,
                 source_figure_inventory_hash=source_figure_inventory.functional_hash(),
-                resource_search_enabled=self._resource_search_enabled,
+                resource_search_enabled=resource_search_enabled,
             )
         except _EditorialEnrichmentInputControl as control:
             return ProductionEditorialEnrichmentExecution(
@@ -6887,7 +6909,7 @@ class ProductionEditorialEnrichmentService:
             access_policy,
             source_figure_inventory_hash=source_figure_inventory.functional_hash(),
             figure_catalog=figure_catalog,
-            resource_search_enabled=self._resource_search_enabled,
+            resource_search_enabled=resource_search_enabled,
             publication_kind=publication_kind,
         )
         maximum_figure_proposals = request.parameters.get(
@@ -7114,8 +7136,14 @@ class ProductionEditorialEnrichmentService:
             wire_details["resource_needs"] = [
                 item.model_dump(mode="json") for item in parsed.proposal.resource_needs
             ]
-            if not self._resource_search_enabled:
-                wire_details["resource_proposal_search"] = {"status": "disabled_by_configuration"}
+            if not resource_search_enabled:
+                wire_details["resource_proposal_search"] = {
+                    "status": (
+                        "disabled_for_brief"
+                        if publication_kind is PublicationKind.BRIEF
+                        else "disabled_by_configuration"
+                    )
+                }
             elif not access_policy.external_llm_allowed:
                 wire_details["resource_proposal_search"] = {"status": "blocked_by_access_policy"}
             else:

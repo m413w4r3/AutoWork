@@ -40,6 +40,7 @@ observations are canonical only in their authorized application stores.
 | ORM module ownership | [`../backend/src/cti_app/infrastructure/database/models/AGENTS.md`](../backend/src/cti_app/infrastructure/database/models/AGENTS.md) | ACTIVE_AUTHORITATIVE (scoped) |
 | Repository module ownership | [`../backend/src/cti_app/infrastructure/database/repositories/AGENTS.md`](../backend/src/cti_app/infrastructure/database/repositories/AGENTS.md) | ACTIVE_AUTHORITATIVE (scoped) |
 | Frozen baseline / additive C2 migration | [`adr/ADR-0007-frozen-baseline-and-c2-migration.md`](adr/ADR-0007-frozen-baseline-and-c2-migration.md) | ACTIVE_AUTHORITATIVE |
+| Optional BRIEF Editorial Enrichment | [`adr/ADR-0009-brief-editorial-enrichment.md`](adr/ADR-0009-brief-editorial-enrichment.md) | ACTIVE_AUTHORITATIVE (amends ADR-0008 point 4) |
 | Exact DB DDL | [`../backend/migrations/versions/0001_baseline.py`](../backend/migrations/versions/0001_baseline.py) and [`0002_c2_experiments.py`](../backend/migrations/versions/0002_c2_experiments.py) | VERSIONED_CODE; inspect before any change |
 
 `0001_baseline` is frozen. `0002_c2_experiments` is additive and handles only
