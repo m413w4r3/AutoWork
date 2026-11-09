@@ -265,9 +265,16 @@ def test_canonical_ioc_details_keep_independent_source_roles_without_reader_rows
     model = project_publication_to_typst_model(document)
     assert all(section["type"] != "technical_annex" for section in model.content_sections)
     assert model.article_format is None
-    assert len(
-        [item for item in document.ioc_details if item.normalized_value == primary.normalized_value]
-    ) == 2
+    assert (
+        len(
+            [
+                item
+                for item in document.ioc_details
+                if item.normalized_value == primary.normalized_value
+            ]
+        )
+        == 2
+    )
     assert "Preuve, contexte et décision" not in str(model.content_sections[0])
 
 
@@ -312,7 +319,7 @@ def test_scheme_less_c2_url_reaches_ioc_list_and_invalid_urls_are_counted() -> N
         for item in article_items
     }
 
-    assert "www[.]xionamiconm[.]com:8050/ws/" in displayed_values
+    assert "www.xionamiconm.com:8050/ws/" in displayed_values
     assert "omitted_invalid_url_count" not in ioc_section
     assert all(
         set(item).issubset({"value", "value_spans"})
@@ -410,8 +417,8 @@ def test_ioc_groups_deduplicate_candidate_against_article_and_original_statuses(
         return value["text"] if isinstance(value, dict) else str(value)
 
     projected_values = {display_value(item) for item in display_items}
-    assert "dedup[.]example[.]invalid" in projected_values
-    assert "198[.]51[.]100[.]42" in projected_values
+    assert "dedup.example.invalid" in projected_values
+    assert "198.51.100.42" in projected_values
     assert all(set(item).issubset({"value", "value_spans"}) for item in display_items)
 
 
@@ -437,7 +444,6 @@ def test_reader_projection_hides_ioc_disposition_while_canonical_keeps_it() -> N
     assert isinstance(restored, PublicationDocumentV5)
     assert restored.ioc_details == document.ioc_details
     assert any(
-        item.disposition is PublicationIOCDisposition.RETAINED
-        for item in restored.ioc_details
+        item.disposition is PublicationIOCDisposition.RETAINED for item in restored.ioc_details
     )
     assert any(item.evidence_quote for item in restored.ioc_details)

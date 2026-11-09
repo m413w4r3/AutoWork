@@ -10063,7 +10063,9 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
         "base_publication"
     ]["timeline"]
     assert assembled_payload["base_publication"]["publication_kind"] == PublicationKind.BRIEF.value
-    assert assembled_timeline[0]["evidence_refs"][0]["kind"] == (EvidenceKind.SOURCE_METADATA.value)
+    # C1 suppresses a brief chronology with only the publication-date event.
+    # The revised synthesis above still proves that its canonical metadata event persisted.
+    assert assembled_timeline == []
 
 
 @pytest.mark.parametrize(

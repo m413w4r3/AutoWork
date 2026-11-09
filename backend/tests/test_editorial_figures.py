@@ -261,7 +261,7 @@ def test_archived_figure_provenance_survives_v5_and_v6_typst_projection() -> Non
         assert "source_url" not in figure_block
         assert "provenance" not in figure_block
         assert figure_block["sha256"] == figure.sha256
-        assert "source_note" in figure_block
+        assert {"source_note", "attribution", "evidence_classification"}.isdisjoint(figure_block)
         canonical_publication = getattr(value, "base_publication", value)
         assert canonical_publication.document.figures[0].provenance == figure.provenance
 
@@ -684,10 +684,10 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
     for text in (preview_text, extracted):
         normalized_figure_text = "".join(character for character in text if not character.isspace())
         assert "".join(source_figure.caption.split()) in normalized_figure_text
-        assert "".join(source_figure.provenance.split()) in normalized_figure_text
+        assert "".join(source_figure.provenance.split()) not in normalized_figure_text
         assert source_figure.sha256 not in normalized_figure_text
         assert "Sourcearchivée" not in normalized_figure_text
-        assert "Attribution:" in normalized_figure_text
+        assert "Attribution:" not in normalized_figure_text
         assert "SHA-256archivé:" not in normalized_figure_text
         assert "Taille:" not in normalized_figure_text
     assert publication_v6.analyst_opinion.content_sha256 not in normalized_approved_opinion
@@ -722,23 +722,11 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
             for index, lines in enumerate(pages)
             if any("Graphe d'infrastructure et de pivots" in text for _, _, text in lines)
         )
-        figure_page = next(
-            lines for lines in pages if any(text.startswith("Source :") for _, _, text in lines)
-        )
         image_page = pages[page_index]
-
-        source_index = next(
-            i for i, (_, _, text) in enumerate(figure_page) if text.startswith("Source :")
+        assert all(
+            not text.startswith(("Source :", "Attribution :"))
+            for _y_min, _y_max, text in image_page
         )
-        attribution_index = next(
-            i for i, (_, _, text) in enumerate(figure_page) if text.startswith("Attribution :")
-        )
-        metadata_lines = figure_page[source_index : attribution_index + 1]
-        assert "Attribution :" in figure_page[attribution_index][2]
-        for previous, current in pairwise(metadata_lines):
-            assert previous[1] <= current[0], (
-                f"figure metadata lines overlap: {previous} / {current}"
-            )
 
         graph_caption = next(
             line for line in image_page if "Graphe d'infrastructure et de pivots" in line[2]

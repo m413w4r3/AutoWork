@@ -262,7 +262,7 @@ def test_publication_date_events_require_metadata_proof_and_two_distinct_dates()
     first_events = build_events((first, undated, missing_metadata_proof))
     assert len(first_events) == 1
     assert first_events[0].event_date == date(2026, 10, 14)
-    assert first_events[0].text == "Publication par Example : First report."
+    assert first_events[0].text == "Publication de la source."
     expected_ref = source_metadata_evidence_ref_v1(
         source_document_id=first.source_document_id,
         canonical_url=first.canonical_url,
@@ -482,8 +482,31 @@ def test_article_format_overview_and_timeline_refang_known_iocs() -> None:
     publication = _publication(
         sources=sources,
         sections=sections,
-        timeline=(PublicationTimelineEntryV1(date(2026, 1, 4), None, event_text, refs),),
-        indicators=(_indicator(ArtifactType.URL, _KNOWN_DEFANGED_URL, _KNOWN_URL),),
+        timeline=(
+            PublicationTimelineEntryV1(date(2026, 1, 4), None, event_text, refs),
+            PublicationTimelineEntryV1(
+                date(2026, 1, 5), "début janvier 2026", "Month-only event.", refs
+            ),
+        ),
+        indicators=(
+            PublicationIndicatorGroupV1(
+                ArtifactType.URL,
+                (
+                    PublicationIndicatorV1(
+                        value=_KNOWN_DEFANGED_URL,
+                        normalized_value=_KNOWN_URL,
+                        artifact_type=ArtifactType.URL,
+                        source_document_ids=(_SOURCE_ID,),
+                    ),
+                    PublicationIndicatorV1(
+                        value=r"C:\ProgramData\malicious.exe",
+                        normalized_value=r"C:\ProgramData\malicious.exe",
+                        artifact_type=ArtifactType.URL,
+                        source_document_ids=(_SOURCE_ID,),
+                    ),
+                ),
+            ),
+        ),
     )
 
     model = project_publication_to_typst_model(publication)
@@ -495,6 +518,12 @@ def test_article_format_overview_and_timeline_refang_known_iocs() -> None:
         event["text"] == f"Premier accès observé via {_KNOWN_URL}."
         for event in model.article_format["timeline_key_events"]
     )
+    month_only_event = next(
+        event
+        for event in model.article_format["timeline_key_events"]
+        if event["text"] == "Month-only event."
+    )
+    assert month_only_event["display_date_fr"] == "début janvier 2026"
 
 
 def test_reference_fallback_is_deterministic_bounded_and_contains_no_url() -> None:

@@ -714,6 +714,21 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
 ) -> None:
     renderer, bundle = _renderer(tmp_path)
     document = _full_document()
+    document = replace(
+        document,
+        indicators=tuple(
+            replace(
+                group,
+                indicators=tuple(
+                    replace(indicator, normalized_value="https://normalized.example/path")
+                    for indicator in group.indicators
+                ),
+            )
+            if group.artifact_type is ArtifactType.URL
+            else group
+            for group in document.indicators
+        ),
+    )
     contextual_source = replace(document.sources[1], editorial_role=ProductionEditorialRole.CONTEXT)
     document = replace(
         document,
@@ -737,7 +752,9 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     ioc_categories = article_format["ioc_categories"]
     assert [item["value"]["text"] for item in ioc_categories["ips"]] == ["Display ip"]
     assert [item["value"]["text"] for item in ioc_categories["domains"]] == ["normalized-domain"]
-    assert [item["value"]["text"] for item in ioc_categories["urls"]] == ["normalized-url"]
+    assert [item["value"]["text"] for item in ioc_categories["urls"]] == [
+        "https://normalized.example/path"
+    ]
     assert [item["value"]["text"] for item in ioc_categories["files"]] == ["normalized-hash"]
     assert not {"chronology", "technical_annex", "provenance"}.intersection(sections)
     assert all(

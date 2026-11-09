@@ -468,9 +468,11 @@ def test_cited_technical_context_is_a_dated_ordered_reader_reference() -> None:
         for item in render_model.content_sections[0]["timeline"]
         if item["source_urls"] == ["https://github.com/fortra/nanodump"]
     )
-    assert rendered_reference["display_date"] == "Date de publication non précisée"
+    assert "display_date" not in rendered_reference
     assert rendered_reference["role_label"] == "Contexte technique"
-    assert rendered_reference["text"] == context_reference.text
+    assert rendered_reference["text"] == (
+        "Fortra: NanoDump tool reference — ressource technique de contexte."
+    )
 
     # A source note, when supplied by Synthesis, remains authoritative.
     noted_synthesis = replace(
@@ -1250,7 +1252,7 @@ def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_o
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    assert publication_builder.ASSEMBLY_POLICY_VERSION == "16-publication-v8-article-format"
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == "17-publication-v8-m19-format"
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,

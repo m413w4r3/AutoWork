@@ -187,10 +187,10 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
         "Edition command table",
         "Edition diagram",
         "Edition figure",
-        "Source :",
         "Display ip",
     ):
         assert expected in text
+    assert "Source :" not in text
 
 
 @pytest.mark.asyncio
@@ -295,15 +295,26 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert "Chronologie" in text
     assert "Vue d'ensemble" not in text
     assert "Note de l'analyste" not in text
-    # The reader sees a source note, never the internal provenance string.
+    # The reader sees the figure caption without internal provenance notes.
     assert "Figure 1 from the source publication" not in text
     assert "Provenance :" not in text
     # L5: the uncertainty list is no longer published inside the article body.
     assert "Attribution remains uncertain" not in text
     assert text.count("Références") >= 1
-    assert text.index("Synthèse") < text.index("Références")
     page_texts = [page.extract_text() or "" for page in reader.pages]
-    first_article_page_text = next(page_text for page_text in page_texts if "Synthèse" in page_text)
+    first_article_page_text = next(
+        page_text
+        for page_text in page_texts
+        if "Article with titled synthesis" in page_text and "ARTICLE 01" in page_text
+    )
+    assert first_article_page_text.index("Références") < first_article_page_text.index("Synthèse")
+    if "Chronologie" in first_article_page_text:
+        assert first_article_page_text.index("Références") < first_article_page_text.index(
+            "Chronologie"
+        )
+        assert first_article_page_text.index("Chronologie") < first_article_page_text.index(
+            "Synthèse"
+        )
     assert "Synthèse" in first_article_page_text
     assert "Chronologie" not in first_article_page_text
     assert "CHRONOLOGIE" not in first_article_page_text
@@ -315,7 +326,8 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     )
     brief_page_text = page_texts[brief_page_number - 1]
     assert brief_page_text.index("Short operational update") < brief_page_text.index("BRÈVE")
-    assert "Références" not in brief_page_text
+    assert "Références" in brief_page_text
+    assert brief_page_text.index("Références") < brief_page_text.index("Chronologie")
     assert brief_page_text.index("Chronologie") < brief_page_text.index("Synthèse")
     assert "SYNTHÈSE" not in brief_page_text
     assert "https://example.test/one" in brief_page_text

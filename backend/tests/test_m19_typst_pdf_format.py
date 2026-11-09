@@ -179,8 +179,8 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v39-m19-format"
-    assert edition.template_version == "chp-edition-v31-m19-format"
+    assert article.template_version == "chp-article-v40-m19-regress"
+    assert edition.template_version == "chp-edition-v32-m19-regress"
 
 
 def _typst_binary() -> str:
@@ -205,9 +205,7 @@ def _build_workspace(
     renderer_root = workspace / "RENDERER"
     renderer_root.mkdir(parents=True, exist_ok=True)
     data_name = (
-        "edition-render-data.json"
-        if entrypoint.endswith("edition.typ")
-        else "render-data.json"
+        "edition-render-data.json" if entrypoint.endswith("edition.typ") else "render-data.json"
     )
     (renderer_root / data_name).write_text(
         json.dumps(render_data, ensure_ascii=False),
@@ -370,9 +368,7 @@ def _assert_timeline_rail(
     page = pages[page_index]
     heading = next(line for line in page["lines"] if line["text"] == "Chronologie")
     last_event = next(
-        line
-        for line in page["lines"]
-        if line["text"] == "Synthetic second event is documented."
+        line for line in page["lines"] if line["text"] == "Synthetic second event is documented."
     )
     image_prefix = tmp_path / "timeline-page"
     subprocess.run(
@@ -433,12 +429,12 @@ async def test_m19_article_and_brief_render_v2_format_to_real_pdf(
     assert text.index("Références") < text.index("Chronologie") < text.index("Synthèse")
     if kind == "article":
         assert (
-            text.index("Chronologie")
-            < text.index("Vue d\u2019ensemble")
-            < text.index("Synthèse")
+            text.index("Chronologie") < text.index("Vue d\u2019ensemble") < text.index("Synthèse")
         )
     reference_line = next(
-        line["text"] for page in pages for line in page["lines"]
+        line["text"]
+        for page in pages
+        for line in page["lines"]
         if "Synthetic source summary sentence." in line["text"]
     )
     assert reference_line.startswith("14 octobre 2026 : Synthetic source summary sentence.")
@@ -466,10 +462,7 @@ async def test_m19_article_and_brief_render_v2_format_to_real_pdf(
     )
     for caption in captions:
         line, page = next(
-            (line, page)
-            for page in pages
-            for line in page["lines"]
-            if caption in line["text"]
+            (line, page) for page in pages for line in page["lines"] if caption in line["text"]
         )
         caption_center = (line["left"] + line["right"]) / 2
         # The text area has symmetric margins; 2 pt allows bbox glyph extents.
@@ -561,21 +554,20 @@ async def test_edition_resets_footnote_numbers_per_publication_without_timeline_
     _xml, pages = _extract_layout(path)
     for title in ("Synthetic article publication", "Synthetic brief publication"):
         publication_page = next(
-            page for page in pages
+            page
+            for page in pages
             if any(title in line["text"] for line in page["lines"])
-            and any(
-                "Synthetic source summary sentence." in line["text"]
-                for line in page["lines"]
-            )
+            and any("Synthetic source summary sentence." in line["text"] for line in page["lines"])
         )
         reference_line = next(
-            line["text"] for line in publication_page["lines"]
+            line["text"]
+            for line in publication_page["lines"]
             if "Synthetic source summary sentence." in line["text"]
         )
         event_line = next(
-            line["text"] for line in publication_page["lines"]
+            line["text"]
+            for line in publication_page["lines"]
             if "Synthetic first event is documented." in line["text"]
         )
         assert reference_line.rstrip().endswith("1"), reference_line
         assert event_line.rstrip().endswith("2"), event_line
-
