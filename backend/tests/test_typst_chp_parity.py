@@ -17,6 +17,7 @@ import signal
 import struct
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import replace
 from io import BytesIO
@@ -100,6 +101,7 @@ from cti_app.domain.publication import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV7,
     PublicationIOCDisposition,
     PublicationTableColumnV1,
     PublicationTableRowV1,
@@ -107,6 +109,7 @@ from cti_app.domain.publication_document import (
     publication_document_v5_sha256,
     serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
     SEMANTIC_ANNOTATION_SCHEMA_VERSION,
@@ -968,7 +971,8 @@ def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> No
     assert "paragraph-gap: if has-next-paragraph { 9pt } else { 0pt }" in synthesis
     assert synthesis.count("render-body-block(") == 3
     assert synthesis.count("paragraph-gap: if has-next-paragraph { 9pt } else { 0pt }") == 2
-    assert "render-body-block(item, reference-scope: reference-scope)" in synthesis
+    assert "paragraph-gap: 5pt" in synthesis
+    assert "legacy-paragraph-spacing: true" in synthesis
     assert "#set par(spacing: 1em)" not in synthesis
 
 
@@ -1342,6 +1346,126 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
             check=True,
         )
     assert page_prefix.with_suffix(".png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_opinion_paragraph_spacing_matches_b421f486_pdf_baseline(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    base = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    opinion, citation_context = _approved_opinion(base)
+    augmented = augment_publication_with_opinion(base, opinion, citation_context)
+    article_opinion = PublicationDocumentV7(
+        base_publication=augmented,
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="c" * 64,
+        routing_policy_version="test-routing-v1",
+    )
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    rendered = _render(article_opinion, template_bundle)
+    render_data = json.loads(rendered.render_data_bytes)
+    assert render_data["kind"] == "article"
+    assert render_data["opinion_document"] is True
+    synthesis_section = next(
+        item for item in render_data["content_sections"] if item["type"] == "synthesis"
+    )
+    synthesis_section["blocks"] = [
+        {
+            "type": "paragraph",
+            "text": "First analyst paragraph checks the historical spacing.",
+        },
+        {
+            "type": "paragraph",
+            "text": "Second analyst paragraph checks the same paragraph gap.",
+        },
+    ]
+    render_data_bytes = json.dumps(render_data, ensure_ascii=False).encode("utf-8")
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+
+    baseline_root = Path("/tmp/m19-m7/base")
+    baseline_helper = baseline_root / "RENDERER" / "publication_helpers.typ"
+    baseline_helper.parent.mkdir(parents=True, exist_ok=True)
+    with anyio.fail_after(10):
+        baseline_result = await anyio.run_process(
+            ("git", "show", "b421f486:chpTypst/RENDERER/publication_helpers.typ"),
+            cwd=_REPOSITORY_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    baseline_source = baseline_result.stdout
+    baseline_helper.write_bytes(baseline_source)
+
+    async def compile_fixture(name: str, helper_source: bytes | None = None) -> Path:
+        root = tmp_path / name
+        workspace_root = root / "workspace"
+        root.mkdir(parents=True)
+        _build_workspace(
+            workspace_root,
+            bundle_files=template_bundle.files,
+            render_data_bytes=render_data_bytes,
+            media_refs=rendered.media_refs,
+        )
+        if helper_source is not None:
+            (workspace_root / "RENDERER" / "publication_helpers.typ").write_bytes(helper_source)
+        font_root = root / "font-snapshot"
+        font_root.mkdir()
+        result = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+            TypstCompileRequest(
+                workspace_root=workspace_root,
+                entrypoint_relative_path="RENDERER/publication.typ",
+                font_paths=materialize_font_bundle(font_snapshot, font_root),
+            )
+        )
+        pdf_path = root / "opinion-spacing.pdf"
+        pdf_path.write_bytes(result.content)
+        return pdf_path
+
+    baseline_pdf = await compile_fixture("b421-baseline", baseline_source)
+    current_pdf = await compile_fixture("current-renderer")
+
+    def paragraph_gap(pdf_path: Path) -> float:
+        result = subprocess.run(
+            ("pdftotext", "-bbox-layout", str(pdf_path), "-"),
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+        root = ET.fromstring(result.stdout)
+        lines = []
+        for line in root.findall(".//{http://www.w3.org/1999/xhtml}line"):
+            text = " ".join(
+                word.text or "" for word in line.findall("{http://www.w3.org/1999/xhtml}word")
+            )
+            if text:
+                lines.append((text, float(line.attrib["yMin"]), float(line.attrib["yMax"])))
+        first_index = next(
+            index
+            for index, (text, _top, _bottom) in enumerate(lines)
+            if "First analyst paragraph" in text
+        )
+        second_index = next(
+            index
+            for index, (text, _top, _bottom) in enumerate(lines)
+            if "Second analyst paragraph" in text
+        )
+        assert second_index == first_index + 1
+        return lines[second_index][1] - lines[first_index][2]
+
+    baseline_gap = paragraph_gap(baseline_pdf)
+    current_gap = paragraph_gap(current_pdf)
+    assert abs(current_gap - baseline_gap) <= 0.5
 
 
 @pytest.mark.asyncio
@@ -1872,7 +1996,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v34-m19-format",
+        "schema_version": "typst-publication-model-v35-m19-review",
         "section_types": [
             "references",
             "chronology",

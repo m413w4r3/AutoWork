@@ -3034,6 +3034,8 @@ class ProductionEditorialEnrichmentRevisionService:
                 relevance_projection=projection,
                 synthesis=synthesis,
                 editorial_enrichment=enrichment,
+                editorial_enrichment_artifact_id=enrichment_artifact.id,
+                editorial_enrichment_artifact_input_hash=enrichment_artifact.input_hash,
                 publication_kind=(
                     routing_decision.publication_kind if routing_decision is not None else None
                 ),

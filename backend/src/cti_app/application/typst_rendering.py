@@ -95,8 +95,8 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v34 adds the M19 references, IOC, and timeline reader projection.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v34-m19-format"
+# v35 preserves semantic spans through M19 reader-field projection.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v35-m19-review"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -337,6 +337,13 @@ def _publication_refang_pairs(
 
     replacements: dict[str, str] = {}
     for artifact_type, value, normalized_value in indicators:
+        if artifact_type not in {
+            ArtifactType.IP,
+            ArtifactType.URL,
+            ArtifactType.DOMAIN,
+            ArtifactType.HASH,
+        }:
+            continue
         for raw in (value, normalized_value):
             restored = _projection_refang(raw)
             if restored != raw:
@@ -383,6 +390,71 @@ def _replacement_offset_map(before: str, after: str) -> tuple[int, ...]:
     return tuple(int(value) for value in mapping)
 
 
+def _semantic_span_with_text(span: Mapping[str, Any], text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    projected: dict[str, Any] = {"style": span["style"], "text": text}
+    if "break_chunks" in span:
+        breakable = _breakable_typst_display_text(text)
+        projected["break_chunks"] = breakable["break_chunks"]
+        if "break_after" in breakable:
+            projected["break_after"] = breakable["break_after"]
+    return projected
+
+
+def _clip_semantic_spans(
+    source_text: str,
+    spans: list[dict[str, Any]] | None,
+    start: int,
+    end: int,
+) -> list[dict[str, Any]] | None:
+    if spans is None:
+        return None
+    if "".join(str(span["text"]) for span in spans) != source_text:
+        raise ValueError("Semantic spans do not cover their source text")
+    clipped: list[dict[str, Any]] = []
+    offset = 0
+    for span in spans:
+        span_text = str(span["text"])
+        span_start = offset
+        span_end = offset + len(span_text)
+        offset = span_end
+        overlap_start = max(start, span_start)
+        overlap_end = min(end, span_end)
+        if overlap_start >= overlap_end:
+            continue
+        projected = _semantic_span_with_text(
+            span,
+            span_text[overlap_start - span_start : overlap_end - span_start],
+        )
+        if projected is not None:
+            clipped.append(projected)
+    return clipped
+
+
+def _remap_semantic_spans(
+    before: str,
+    spans: list[dict[str, Any]] | None,
+    after: str,
+) -> list[dict[str, Any]] | None:
+    if spans is None:
+        return None
+    if "".join(str(span["text"]) for span in spans) != before:
+        raise ValueError("Semantic spans do not cover their source text")
+    offsets = _replacement_offset_map(before, after)
+    remapped: list[dict[str, Any]] = []
+    source_start = 0
+    for span in spans:
+        source_end = source_start + len(str(span["text"]))
+        target_start = offsets[source_start]
+        target_end = offsets[source_end]
+        projected = _semantic_span_with_text(span, after[target_start:target_end])
+        if projected is not None:
+            remapped.append(projected)
+        source_start = source_end
+    return remapped
+
+
 def _refang_known_iocs(
     text: str,
     replacements: tuple[tuple[str, str], ...],
@@ -390,13 +462,12 @@ def _refang_known_iocs(
     """Refang exact known IOC spellings and return an old-to-new offset map."""
     if not replacements:
         return text, tuple(range(len(text) + 1))
-    replacement_by_casefold = {source.casefold(): target for source, target in replacements}
-    alternatives = sorted(replacement_by_casefold, key=lambda item: (-len(item), item))
+    replacement_by_exact = dict(replacements)
+    alternatives = sorted(replacement_by_exact, key=lambda item: (-len(item), item))
     expression = re.compile(
         r"(?<![A-Za-z0-9._-])(?:"
         + "|".join(re.escape(item) for item in alternatives)
-        + r")(?![A-Za-z0-9_-]|\.(?=[A-Za-z0-9]))",
-        re.IGNORECASE,
+        + r")(?![A-Za-z0-9_-]|\.(?=[A-Za-z0-9]))"
     )
     matches = tuple(expression.finditer(text))
     if not matches:
@@ -413,7 +484,7 @@ def _refang_known_iocs(
             offsets[old_cursor + index] = new_cursor + index
         new_cursor += len(prefix)
         original = match.group(0)
-        restored = replacement_by_casefold[original.casefold()]
+        restored = replacement_by_exact[original]
         output.append(restored)
         local_offsets = _replacement_offset_map(original, restored)
         for index, new_offset in enumerate(local_offsets):
@@ -495,6 +566,7 @@ def _project_article_format_render_data(
     publication_v8: PublicationDocumentV8 | None,
     brief: bool,
     refang_replacements: tuple[tuple[str, str], ...] = (),
+    project_text: Callable[[str, str], tuple[str, list[dict[str, Any]] | None]],
 ) -> dict[str, Any] | None:
     """Project ArticleFormatV1 with a deterministic V4-V7 fallback."""
     if brief:
@@ -590,16 +662,45 @@ def _project_article_format_render_data(
     overview_render: dict[str, Any] | None = None
     if overview is not None:
 
-        def overview_field(value: Any) -> dict[str, str]:
+        def overview_field(value: Any, label: str) -> dict[str, Any]:
             text, _offsets = _refang_known_iocs(value.text, refang_replacements)
+            if not document.sections:
+                return {"text": text}
+            for paragraph_index, paragraph in enumerate(document.sections[0].paragraphs, start=1):
+                source_label, separator, source_value = paragraph.text.partition(":")
+                if (
+                    not separator
+                    or source_label.strip().casefold() != label.casefold()
+                    or source_value.strip() != value.text
+                ):
+                    continue
+                anchor = section_paragraph_anchor(0, paragraph_index)
+                display_source, spans = project_text(anchor, paragraph.text)
+                _display_source, offsets = _refang_known_iocs(paragraph.text, refang_replacements)
+                source_start = paragraph.text.index(":") + 1
+                while source_start < len(paragraph.text) and paragraph.text[source_start].isspace():
+                    source_start += 1
+                source_end = source_start + len(value.text)
+                display_start = offsets[source_start]
+                display_end = offsets[source_end]
+                text = display_source[display_start:display_end]
+                semantic_spans = _clip_semantic_spans(
+                    display_source, spans, display_start, display_end
+                )
+                return {
+                    "text": text,
+                    **({"semantic_spans": semantic_spans} if semantic_spans is not None else {}),
+                }
             return {"text": text}
 
         overview_render = {
-            "victimology": overview_field(overview.victimology)
+            "victimology": overview_field(overview.victimology, "Victimologie")
             if overview.victimology is not None
             else None,
-            "arsenal": overview_field(overview.arsenal) if overview.arsenal is not None else None,
-            "main_objective": overview_field(overview.main_objective)
+            "arsenal": overview_field(overview.arsenal, "Arsenal")
+            if overview.arsenal is not None
+            else None,
+            "main_objective": overview_field(overview.main_objective, "Objectif principal")
             if overview.main_objective is not None
             else None,
         }
@@ -612,17 +713,26 @@ def _project_article_format_render_data(
         for entry in source_timeline
         if entry.event_date is not None and entry.date_text is not None
     }
-    timeline_render = [
-        {
+    source_anchor_by_event = {
+        (entry.event_date, entry.text): timeline_anchor(index)
+        for index, entry in enumerate(source_timeline, start=1)
+    }
+    timeline_render = []
+    for event in timeline:
+        display_text, spans = project_text(
+            source_anchor_by_event.get((event.event_date, event.text), ""), event.text
+        )
+        timeline_row: dict[str, Any] = {
             "date_iso": event.event_date.isoformat(),
             "display_date_fr": _display_date(
                 timeline_date_text_by_event.get((event.event_date, event.text)),
                 event.event_date,
             ),
-            "text": _refang_known_iocs(event.text, refang_replacements)[0],
+            "text": display_text,
         }
-        for event in timeline
-    ]
+        if spans is not None:
+            timeline_row["semantic_spans"] = spans
+        timeline_render.append(timeline_row)
     ioc_render: dict[str, list[dict[str, Any]]] = {
         "ips": [],
         "urls": [],
@@ -1785,15 +1895,6 @@ def project_publication_to_typst_model(
         publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None,
         publication_v8,
     )
-    article_format_render = _project_article_format_render_data(
-        document=document,
-        publication_v5=(
-            publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None
-        ),
-        publication_v8=publication_v8,
-        brief=is_brief(value) or opinion_document,
-        refang_replacements=refang_replacements,
-    )
 
     def project_text(anchor: str, text: str) -> tuple[str, list[dict[str, Any]] | None]:
         paragraph = semantic_by_anchor.get(anchor)
@@ -1820,6 +1921,17 @@ def project_publication_to_typst_model(
                     projected_span["break_after"] = breakable_text["break_after"]
             result.append(projected_span)
         return display_text, result
+
+    article_format_render = _project_article_format_render_data(
+        document=document,
+        publication_v5=(
+            publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None
+        ),
+        publication_v8=publication_v8,
+        brief=is_brief(value) or opinion_document,
+        refang_replacements=refang_replacements,
+        project_text=project_text,
+    )
 
     def rich_block(block: dict[str, Any], field_name: str, anchor: str, text: str) -> None:
         display_text, spans = project_text(anchor, text)
@@ -2154,10 +2266,10 @@ def project_publication_to_typst_model(
         display_text, spans = project_text(anchor, value)
         clean_text = _reader_reference_note(display_text, source)
         if not clean_text:
-            clean_text = _reader_reference_fallback(source)
-        if not clean_text:
-            clean_text = "Publication de la source."
-        return clean_text[:260], spans if clean_text == display_text else None
+            fallback = _reader_reference_fallback(source) or "Publication de la source."
+            return fallback[:260], None
+        bounded_text = clean_text[:260]
+        return bounded_text, _remap_semantic_spans(display_text, spans, bounded_text)
 
     source_references: list[dict[str, Any]] = []
     for index, reference in enumerate(reference_entries, start=1):

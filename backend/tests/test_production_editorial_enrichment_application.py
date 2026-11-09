@@ -4428,7 +4428,6 @@ async def test_resource_need_is_persisted_and_search_stays_off_by_default() -> N
         "REASON: No three-step sequence or relation is documented.\nEND DIAGRAM OMITTED"
     )
     world = _world(_RecordingGateway(lambda request: _succeeded_text(request, needs_wire)))
-
     result = await _execute(world)
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
@@ -4491,6 +4490,9 @@ async def test_brief_resource_search_stays_disabled_even_when_configuration_enab
         "QUERY_HINT: Example incident execution diagram\nEND NEEDS"
     )
     world = _world(_RecordingGateway(lambda request: _succeeded_text(request, needs_wire)))
+    lineage_writer = _LineageCheckingWriter()
+    world.writer = lineage_writer
+    world.service._editorial_enrichment_service = lineage_writer
 
     async def brief_route(**_kwargs: object):
         return SimpleNamespace(publication_kind=PublicationKind.BRIEF)
@@ -4505,6 +4507,7 @@ async def test_brief_resource_search_stays_disabled_even_when_configuration_enab
     assert len(world.gateway.calls) == 2
     assert all(request.web_search is False for request, _schema in world.gateway.calls)
     assert result.details["resource_proposal_search"]["status"] == "disabled_for_brief"
+    assert lineage_writer.calls[0]["resource_search_enabled"] is False
     enrichment = world.writer.calls[0]["enrichment"]
     assert enrichment.resource_needs  # type: ignore[attr-defined]
     assert enrichment.resource_proposals == ()  # type: ignore[attr-defined]

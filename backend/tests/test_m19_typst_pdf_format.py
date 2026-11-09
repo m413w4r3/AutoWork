@@ -179,8 +179,8 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v40-m19-regress"
-    assert edition.template_version == "chp-edition-v32-m19-regress"
+    assert article.template_version == "chp-article-v41-m19-review"
+    assert edition.template_version == "chp-edition-v33-m19-review"
 
 
 def _typst_binary() -> str:
