@@ -1749,7 +1749,7 @@ def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
         "synthesis-validator-v9-article-structure"
     )
     assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
-        "synthesis-draft-v14-article-structured"
+        "synthesis-draft-v15-article-date-grounding"
     )
     assert "toujours chaque observation en français" in SYNTHESIS_EDITORIAL_CONTRACT_V6
     assert "quelle que soit la langue des" in SYNTHESIS_EDITORIAL_CONTRACT_V6
@@ -1772,7 +1772,7 @@ async def test_article_prompt_contract_and_output_budget_are_structured_and_abst
     assert result.status is SynthesisExecutionStatus.SUCCEEDED
     request = world.gateway.calls[0][0]
     prompt = request.text
-    assert request.prompt_template_version == "synthesis-draft-v14-article-structured"
+    assert request.prompt_template_version == "synthesis-draft-v15-article-date-grounding"
     assert "Contract version: synthesis-article-structured-v1-overview-hunting" in prompt
     assert "HEADING: Vue d'ensemble" in prompt
     assert "Victimologie :" in prompt
@@ -1781,6 +1781,8 @@ async def test_article_prompt_contract_and_output_budget_are_structured_and_abst
     assert "Détection et hunting" in prompt
     assert "Choose at least four distinct" in prompt
     assert "Do not return @@EMPTY@@ for ARTICLE" in prompt
+    assert "Write a date only when its year appears in evidence cited by that claim" in prompt
+    assert "write the day and month without a year" in prompt
     assert "host or network paths, registry keys, mutexes, user-agents, ports, commands" in (
         " ".join(prompt.split())
     )
@@ -2001,7 +2003,17 @@ def test_brief_prompt_and_input_hash_remain_at_the_pre_article_versions(
         publication_kind=PublicationKind.ARTICLE,
         **routing_identity,
     )
+    article_v14_hash = synthesis_input_hash(
+        snapshot,
+        extraction,
+        pack,
+        "a" * 64,
+        prompt_version="synthesis-draft-v14-article-structured",
+        publication_kind=PublicationKind.ARTICLE,
+        **routing_identity,
+    )
     assert brief_hash == "38c9d023f721bc3045221bea4bdabc84bfbd3298a0c6669110c9a2bc117a75b9"
+    assert article_hash != article_v14_hash
     assert article_hash != "d5639be5170bdbeaa54d1da8c52e92e108adba015a834887bdd1509d6597878c"
 
 
@@ -5179,7 +5191,7 @@ async def test_inline_html_comment_gets_one_corrective_turn_and_validates_again(
         first_request.run_id
     )
     assert corrective_request.metadata["synthesis_corrective_prompt_version"] == (
-        "production-synthesis-corrective-v2-plain-text"
+        "production-synthesis-corrective-v3-multi-violation"
     )
     assert '"claim_id": "S001C001"' in corrective_request.text
     assert '"trigger": "xml_markup"' in corrective_request.text
@@ -5277,6 +5289,133 @@ async def test_plain_text_corrective_turn_still_rechecks_grounding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_article_corrective_turn_lists_all_unsupported_dates_and_converges() -> None:
+    world = _fresh_setup()
+    initial = _proposal_wire(
+        _article_with_unsupported_dates(
+            world.proposal,
+            ("2099-02-14", "2099-03-15", "2099-04-16"),
+        )
+    )
+    corrected = _proposal_wire(_articleize_test_proposal(world.proposal))
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        text = corrected if request.metadata.get("synthesis_corrective_turn") == 1 else initial
+        return _succeeded(request, None, text=text)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    corrective_request = world.gateway.calls[1][0]
+    encoded = corrective_request.text.split("VALIDATOR VIOLATIONS: ", 1)[1].splitlines()[0]
+    violations = json.loads(encoded)
+    assert [item["claim_id"] for item in violations] == [
+        "S001C001",
+        "S001C002",
+        "S001C003",
+    ]
+    assert [item["literal_value"] for item in violations] == [
+        "2099-02-14",
+        "2099-03-15",
+        "2099-04-16",
+    ]
+    assert corrective_request.metadata["synthesis_corrective_prompt_version"] == (
+        "production-synthesis-corrective-v3-multi-violation"
+    )
+    assert "ne change aucun autre claim" in corrective_request.text
+
+
+@pytest.mark.asyncio
+async def test_article_persistent_correction_failure_lists_all_remaining_violations() -> None:
+    world = _fresh_setup()
+    initial = _proposal_wire(
+        _article_with_unsupported_dates(
+            world.proposal,
+            ("2099-02-14", "2099-03-15", "2099-04-16"),
+        )
+    )
+    corrected_but_invalid = _proposal_wire(
+        _article_with_unsupported_dates(world.proposal, ("2098-05-17", "2098-06-18", None))
+    )
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        text = (
+            corrected_but_invalid
+            if request.metadata.get("synthesis_corrective_turn") == 1
+            else initial
+        )
+        return _succeeded(request, None, text=text)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.model_calls == 2
+    errors = result.details["correction_errors"]
+    assert len(errors[0]["violations"]) == 3
+    assert len(errors[1]["violations"]) == 2
+    assert [item["literal_value"] for item in errors[1]["violations"]] == [
+        "2098-05-17",
+        "2098-06-18",
+    ]
+
+
+def test_grounding_violation_collection_is_ordered_deduplicated_and_bounded() -> None:
+    world = _fresh_setup()
+    claims: list[SynthesisClaimProposalV1] = []
+    for index in range(30):
+        unsupported_date = date.fromordinal(date(2099, 1, 1).toordinal() + index).isoformat()
+        claim = SynthesisClaimProposalV1(
+            text=f"The report dates the activity {unsupported_date}.",
+            evidence_handles=(world.handle,),
+        )
+        claim._block_id = f"C{index:03d}"
+        claims.append(claim)
+    claims.append(claims[0])
+    proposal = SynthesisProposalV1(lead=tuple(claims), sections=())
+
+    violations = synthesis_module.collect_synthesis_proposal_violations(
+        proposal,
+        world.pack,
+        world.extraction,
+    )
+
+    assert len(violations) == 25
+    assert [item["claim_id"] for item in violations] == [f"C{index:03d}" for index in range(25)]
+    unique_keys = {
+        (item["claim_id"], item["literal_kind"], item["literal_value"])
+        for item in violations
+    }
+    assert len(unique_keys) == 25
+
+
+def _article_with_unsupported_dates(
+    proposal: SynthesisProposalV1,
+    dates: tuple[str | None, str | None, str | None],
+) -> SynthesisProposalV1:
+    article = _articleize_test_proposal(proposal)
+    overview = article.sections[0]
+    labels = ("Victimologie :", "Arsenal :", "Objectif principal :")
+    claims = tuple(
+        claim.model_copy(
+            update={
+                "text": (
+                    f"{label} Observation rapportée par la source consultée le {value}."
+                    if value is not None
+                    else f"{label} Observation rapportée par la source consultée sans date."
+                )
+            }
+        )
+        for claim, label, value in zip(overview.claims, labels, dates, strict=True)
+    )
+    sections = (overview.model_copy(update={"claims": claims}), *article.sections[1:])
+    return article.model_copy(update={"sections": sections})
+
+
+@pytest.mark.asyncio
 async def test_unsupported_date_gets_one_corrective_turn_and_replay_reuses_both_runs():
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
@@ -5314,7 +5453,11 @@ async def test_unsupported_date_gets_one_corrective_turn_and_replay_reuses_both_
     assert '"claim_id": "L001"' in correction_request.text
     assert '"literal_value": "2026-07-03"' in correction_request.text
     assert '"reason": "not_in_extraction"' in correction_request.text
-    assert "without a year" in correction_request.text
+    assert "sans année ; ne devine jamais une année" in correction_request.text
+    assert correction_request.metadata["synthesis_corrective_prompt_version"] == (
+        "production-synthesis-corrective-v3-multi-violation"
+    )
+    assert "VALIDATOR VIOLATIONS: [" in correction_request.text
     assert correction_request.evidence_pack_hash == first_request.evidence_pack_hash
     assert correction_request.external_llm_allowed is first_request.external_llm_allowed
     assert correction_request.sensitivity == first_request.sensitivity

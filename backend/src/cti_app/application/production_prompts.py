@@ -16,7 +16,7 @@ REFERENCES_PROMPT_VERSION = "10"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v14-article-structured"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v15-article-date-grounding"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
 ARTICLE_SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-article-structured-v1-overview-hunting"
 SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = (
@@ -152,6 +152,9 @@ Do not duplicate recommendations or add vague defensive advice. Do not repeat
 the references merely to restate them. Mention dates in the synthesis only
 when they explain technical evolution, scope, attribution, or a material
 analytical limit. Preserve the source's exact date precision.
+Write a date only when its year appears in evidence cited by that claim;
+otherwise use wording without a date. When a source gives only day and month,
+write the day and month without a year.
 
 EDITORIAL TITLE
 Write one French editorial title in exactly this format: [Groupe] Titre.
