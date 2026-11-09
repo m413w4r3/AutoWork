@@ -30,7 +30,10 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication_kind import PublicationKind
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
-from tests.test_publication_builder_v4 import _canonical_inputs
+from tests.test_publication_builder_v4 import (
+    _canonical_inputs,
+    _publication_case_with_content_variants,
+)
 
 
 @pytest.mark.parametrize("word_count", [80, 800])
@@ -74,11 +77,7 @@ def test_brief_assembly_stays_brief_across_narrative_lengths(word_count: int) ->
 
     assert publication.publication_kind is PublicationKind.BRIEF
     assert len(publication.lead[0].text.split()) == word_count
-    assert [entry.event_date for entry in publication.timeline] == [date(2026, 10, 18)]
-    assert (
-        publication.timeline[0].evidence_refs[0].source_document_id
-        == evidence_ref.source_document_id
-    )
+    assert publication.timeline == ()
     assert publication.indicators == ()
     assert brief.original_indicators == ()
     assert brief.ioc_details == ()
@@ -140,7 +139,7 @@ def test_brief_qa_rejects_claimed_enrichment_and_requires_relevance_projection()
     assert missing_relevance["error_codes"] == ["publication_qa_kind_inputs_invalid"]
 
 
-def test_metadata_derived_brief_timeline_keeps_source_footnote_and_typst_chronology() -> None:
+def test_single_metadata_derived_brief_date_stays_in_references_without_chronology() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     published_at = date(2025, 1, 10)
     source_url = extraction.sources[0].canonical_url
@@ -221,17 +220,57 @@ def test_metadata_derived_brief_timeline_keeps_source_footnote_and_typst_chronol
         editorial_enrichment=None,
         publication=publication,
     )
-    render_model = project_publication_to_typst_model(publication)
+    render_model = project_publication_to_typst_model(
+        publication,
+        include_brief_chronology=True,
+    )
     section_types = [item["type"] for item in render_model.content_sections]
     references_section = render_model.content_sections[0]
 
-    assert publication.timeline[0].event_date == published_at
-    assert publication.timeline[0].evidence_refs[0].kind.value == "source_metadata"
+    assert publication.timeline == ()
     assert section_types == ["references", "synthesis"]
     assert render_model.article_format is None
-    assert any(
-        source_url in entry.get("urls", ())
-        for entry in references_section["entries"]
-    )
+    assert any(source_url in entry.get("urls", ()) for entry in references_section["entries"])
     assert publication.indicators == ()
     assert qa["passed"] is True
+
+
+def test_brief_timeline_adds_distinct_archived_source_publication_dates() -> None:
+    snapshot, references, extraction, synthesis = _publication_case_with_content_variants(
+        ("d" * 64,)
+    )
+    relevance = build_relevance_projection(snapshot, extraction)
+
+    brief = build_brief_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance,
+        synthesis=synthesis,
+    )
+    publication = wrap_publication_document_v7(
+        brief,
+        base_publication_artifact_id=UUID(int=5200),
+        publication_kind=PublicationKind.BRIEF,
+        routing_decision_hash="f" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    render_model = project_publication_to_typst_model(
+        publication,
+        include_brief_chronology=True,
+    )
+
+    assert {entry.event_date for entry in publication.timeline} == {
+        date(2025, 1, 6),
+        date(2025, 1, 10),
+    }
+    assert all(
+        ref.kind.value == "source_metadata"
+        for entry in publication.timeline
+        for ref in entry.evidence_refs
+    )
+    assert [section["type"] for section in render_model.content_sections] == [
+        "references",
+        "chronology",
+        "synthesis",
+    ]

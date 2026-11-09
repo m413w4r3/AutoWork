@@ -43,9 +43,11 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     PublicationDocumentV6ProvenanceV1,
     PublicationDocumentV7,
+    build_publication_date_events,
     order_publication_references,
     publication_document_text_anchors,
     publication_document_v5_sha256,
+    select_publication_timeline_key_events_v2,
 )
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
@@ -54,7 +56,8 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
 )
 
-BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v1-sourced-timeline-no-ioc-annex"
+# M19 changes reader references and source-date timelines; this invalidates old brief assemblies.
+BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v2-m19-timeline-references"
 
 
 def build_brief_publication_document_v5(
@@ -172,7 +175,7 @@ def build_brief_publication_document_v5(
         include_timeline=True,
         allowed_source_metadata_refs=allowed_metadata_refs,
     )
-    timeline = tuple(
+    source_timeline = tuple(
         PublicationTimelineEntryV1(
             event_date=entry.event_date,
             date_text=entry.date_text,
@@ -188,12 +191,35 @@ def build_brief_publication_document_v5(
     )
     used_source_document_ids = set(narrative.used_source_document_ids)
     used_source_document_ids.update(
-        ref.source_document_id for entry in timeline for ref in entry.evidence_refs
+        ref.source_document_id for entry in source_timeline for ref in entry.evidence_refs
     )
     used_source_document_ids.update(additional_source_ids)
     sources = _project_publication_sources(
         references=references,
         used_source_document_ids=used_source_document_ids,
+    )
+    publication_date_events = tuple(
+        PublicationTimelineEntryV1(
+            event_date=event.event_date,
+            date_text=None,
+            text=event.text,
+            evidence_refs=event.evidence_refs,
+        )
+        for event in build_publication_date_events(sources)
+    )
+    selected_timeline = select_publication_timeline_key_events_v2(
+        (*source_timeline, *publication_date_events)
+    )
+    # Apply the two-distinct-date gate after merging cited events and archived
+    # source publication dates. A lone source date remains visible in Références.
+    timeline = tuple(
+        PublicationTimelineEntryV1(
+            event_date=event.event_date,
+            date_text=None,
+            text=event.text,
+            evidence_refs=event.evidence_refs,
+        )
+        for event in selected_timeline
     )
     ordered_references = order_publication_references(reference_entries, sources)
     document = PublicationDocumentV4(
