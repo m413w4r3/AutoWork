@@ -2053,6 +2053,10 @@ def test_plain_text_validator_still_rejects_markup_and_markdown(text: str) -> No
             "Le lanceur `cmd.exe /c whoami.exe` est mentionné.",
             "Le lanceur cmd.exe /c whoami.exe est mentionné.",
         ),
+        (
+            "La description `Microsoft® Windows® Operating System.` est trompeuse.",
+            "La description Microsoft® Windows® Operating System. est trompeuse.",
+        ),
     ),
 )
 def test_wire_parser_unwraps_technical_inline_code_spans(text: str, expected: str) -> None:

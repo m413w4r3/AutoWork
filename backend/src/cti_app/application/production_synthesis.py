@@ -352,7 +352,11 @@ def _wire_line(line: str) -> str:
     return value
 
 
-_INLINE_CODE_TECHNICAL_PUNCTUATION = frozenset(" ._:/\\@%+=,#?&~$(){}[]'\";-*|!<>")
+_INLINE_CODE_TECHNICAL_PUNCTUATION = frozenset(
+    " ._:/\\@%+=,#?&~$(){}[]'\";-*|!<>"
+    # Typographic marks that appear in product names and version strings.
+    "\u00ae\u2122\u00a9\u00b0\u00b7\u2013\u2014\u2019\u2018\u201c\u201d\u00ab\u00bb\u2026"
+)
 _INLINE_CODE_MAX_LENGTH = 200
 _INLINE_PLACEHOLDER_TOKEN = re.compile(r"<([A-Za-z0-9 _.-]{1,40})>")
 _INLINE_PLACEHOLDER_TAG_NAMES = frozenset(
