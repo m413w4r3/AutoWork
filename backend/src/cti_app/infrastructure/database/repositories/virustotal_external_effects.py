@@ -144,6 +144,11 @@ def _source_refs_for_family(
                 sha256=normalized_hash,
             ),
         )
+        permitted_hash_reference_kinds = {"sample_hash", "evidence_observation"}
+        if family in _VT_HASH_READ_FAMILIES:
+            permitted_hash_reference_kinds.update({"source_document", "document"})
+        elif family == "vt.download_sample":
+            permitted_hash_reference_kinds.add("source_document")
         if (
             family in _VT_HASH_READ_FAMILIES
             and metadata
@@ -159,15 +164,7 @@ def _source_refs_for_family(
         if (
             sum(reference.kind == "sample_hash" for reference in metadata) == 1
             and expected[0] in metadata
-            and all(
-                reference.kind
-                in (
-                    {"sample_hash", "evidence_observation", "source_document", "document"}
-                    if family in _VT_HASH_READ_FAMILIES
-                    else {"sample_hash", "evidence_observation"}
-                )
-                for reference in metadata
-            )
+            and all(reference.kind in permitted_hash_reference_kinds for reference in metadata)
         ):
             return metadata
         return ()

@@ -24,6 +24,7 @@ from cti_app.application.investigation_composition import (
 from cti_app.application.investigation_contracts import ConfirmedIOCContextV1
 from cti_app.application.investigation_operator_view import build_investigation_operator_view
 from cti_app.application.investigation_rule_tools import RULE_PROPOSE_SCHEMA
+from cti_app.application.investigation_service import _vt_source_refs_from_parameters
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
@@ -49,7 +50,7 @@ from cti_app.application.operator_tool_invocation import (
 from cti_app.application.research_context_builder import blocked_capabilities_from_history
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import SourceDocument
-from cti_app.domain.external_effects import invocation_arguments_digest
+from cti_app.domain.external_effects import EvidenceReference, invocation_arguments_digest
 from cti_app.domain.investigation import (
     BudgetDimension,
     EnvelopeAuthorityKind,
@@ -66,7 +67,10 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     tool_operation_key,
 )
-from tests.test_investigation_service import _Fixture
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    _source_refs_for_family,
+)
+from tests.test_investigation_service import _enable_osint_vt_hash_reads, _Fixture
 
 
 def test_dotnet_field_data_tool_is_composed_under_the_existing_dotnet_capability() -> None:
@@ -887,6 +891,199 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
     assert "vt.file_report" in result_data["correction"]
     assert refused.output["error"]["reason"] == result_data["correction"]
     assert len(tools["vt.download_sample"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_osint_documented_hash_read_relationship_download_behaviour_sources_match() -> None:
+    (
+        fixture,
+        state,
+        registry,
+        _summaries,
+        operator_service,
+        tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+    definition, adapter = _schema_tool(
+        "vt.download_sample",
+        VT_DOWNLOAD_SAMPLE_SCHEMA,
+        ToolEffect.ACQUIRE,
+        VT_FILE_DOWNLOAD_CAPABILITY,
+    )
+    definition = replace(
+        definition,
+        cost_model={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+    )
+    registry.register(definition, adapter)
+    tools["vt.download_sample"] = adapter
+    capabilities = frozenset((*fixture.available_capabilities, VT_FILE_DOWNLOAD_CAPABILITY))
+    fixture.available_capabilities = capabilities
+    fixture.service._available_capabilities = capabilities
+    operator_service._available_capabilities = capabilities
+
+    envelope, _effective_policy = _enable_osint_vt_hash_reads(fixture)
+    envelope = replace(envelope, acquire_hits_allowed=True)
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+    operator_service._effective_policy_for = fixture.service._effective_policy_for
+
+    sample_hash = "f" * 64
+    document_id = uuid4()
+    fixture.snapshot = replace(
+        fixture.snapshot,
+        confirmed_iocs=(
+            *fixture.snapshot.confirmed_iocs,
+            ConfirmedIOCContextV1(
+                indicator_type="sha256",
+                value=sample_hash,
+                extraction_artifact_id=uuid4(),
+                extraction_artifact_version=1,
+                source_document_ids=(document_id,),
+            ),
+        ),
+    )
+    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+
+    source_document = SourceDocument(
+        id=document_id,
+        subject_id=fixture.subject_id,
+        blob_id=uuid4(),
+        original_name="synthetic-article.html",
+        origin="synthetic-test",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.GREEN,
+        do_not_submit=False,
+        external_llm_allowed=True,
+    )
+
+    class _SourceDocuments:
+        async def get(self, requested_id: UUID):
+            return source_document if requested_id == document_id else None
+
+    fixture.service._source_documents = _SourceDocuments()
+
+    async def add_hash_observations(source: str, kind: EvidenceKind) -> None:
+        for suffix in ("raw", "summary"):
+            payload_hash = hashlib.sha256(f"{source}:{suffix}".encode()).hexdigest()
+            await fixture.observations.append_if_absent(
+                EvidenceObservation(
+                    investigation_id=fixture.investigation_id,
+                    kind=kind,
+                    blob_id=uuid4(),
+                    sha256=payload_hash,
+                    source="VirusTotal",
+                    source_version="proxy:v3",
+                    observed_at=datetime.now(UTC),
+                    object_type="file",
+                    object_id=sample_hash,
+                )
+            )
+
+    context = await _build_context(fixture, state, registry, osint_policy_authorized=True)
+    assert "vt.download_sample" in {tool.name for tool in context.available_tools}
+    assert not any(
+        observation.object_id.casefold() == sample_hash
+        for observation in await fixture.observations.list_for_investigation(
+            fixture.investigation_id
+        )
+    )
+
+    reported = await operator_service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"file_hash": sample_hash},
+        purpose="Read the documented synthetic hash report.",
+        expected_version=state.version,
+        idempotency_key="osint-documented-vt-file-report",
+    )
+    await add_hash_observations("file-report", EvidenceKind.VT_FILE_REPORT)
+
+    relationship_results = []
+    expected_version = reported.working_state_version
+    for index, relation in enumerate(
+        (
+            "contacted_domains",
+            "contacted_ips",
+            "contacted_urls",
+            "dropped_files",
+            "bundled_files",
+            "execution_parents",
+            "similar_files",
+        )
+    ):
+        related = await operator_service.invoke(
+            tool_name="vt.relationships",
+            schema_version="1",
+            arguments={
+                "object_type": "file",
+                "object_id": sample_hash,
+                "relation": relation,
+            },
+            purpose="Read documented synthetic hash relationships.",
+            expected_version=expected_version,
+            idempotency_key=f"osint-documented-vt-relationships-{index}",
+        )
+        relationship_results.append(related)
+        expected_version = related.working_state_version
+        await add_hash_observations(f"relationships-{index}", EvidenceKind.VT_RELATIONSHIP)
+
+    downloaded = await operator_service.invoke(
+        tool_name="vt.download_sample",
+        schema_version="1",
+        arguments={
+            "sha256": sample_hash,
+            "purpose": "Acquire the documented synthetic sample.",
+            "evidence_refs": [],
+        },
+        purpose="Acquire the documented synthetic sample.",
+        expected_version=expected_version,
+        idempotency_key="osint-documented-vt-download",
+    )
+    await add_hash_observations("download", EvidenceKind.OTHER)
+    behaved = await operator_service.invoke(
+        tool_name="vt.behaviour",
+        schema_version="1",
+        arguments={"file_hash": sample_hash},
+        purpose="Read documented synthetic behaviour reports.",
+        expected_version=downloaded.working_state_version,
+        idempotency_key="osint-documented-vt-behaviour",
+    )
+
+    invocations = (reported, *relationship_results, downloaded, behaved)
+    assert all(item.invocation.status is ToolInvocationStatus.SUCCEEDED for item in invocations)
+    for family, item in (
+        ("vt.file_report", reported),
+        *(("vt.relationships", item) for item in relationship_results),
+        ("vt.download_sample", downloaded),
+        ("vt.behaviour", behaved),
+    ):
+        references = tuple(
+            EvidenceReference(
+                kind=raw["kind"],
+                id=raw["id"],
+                version=raw["version"],
+                sha256=raw["sha256"],
+            )
+            for raw in item.invocation.normalized_parameters["_vt_external_effect_source_refs"]
+        )
+        assert len(references) <= 16, family
+        assert _vt_source_refs_from_parameters(item.invocation.normalized_parameters) == references
+        assert (
+            _source_refs_for_family(family, item.invocation.normalized_parameters) == references
+        ), family
+
+    download_references = downloaded.invocation.normalized_parameters[
+        "_vt_external_effect_source_refs"
+    ]
+    behaviour_references = behaved.invocation.normalized_parameters[
+        "_vt_external_effect_source_refs"
+    ]
+    assert len(download_references) == 16
+    assert download_references == behaviour_references
+    assert download_references[0]["kind"] == "sample_hash"
+    assert download_references[-1]["kind"] == "source_document"
+    assert [call["sha256"] for call in tools["vt.download_sample"].calls] == [sample_hash]
 
 
 @pytest.mark.asyncio
