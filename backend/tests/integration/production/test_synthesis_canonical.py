@@ -238,13 +238,11 @@ def _proposal_from_prompt(prompt_text: str) -> str:
         if record.get("kind") == "rule" and record.get("name")
     ]
     overview_text = "The selected publications document this activity."
-    overview_claims = [
+    overview_claims: list[tuple[str, tuple[str, ...]]] = [
         (f"{label} {overview_text}", (fact["handle"],))
         for label in ("Victimologie :", "Arsenal :", "Objectif principal :")
     ]
-    sections: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
-        ("overview", overview_claims)
-    ]
+    sections: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [("overview", overview_claims)]
     if domains:
         sections.append(("infrastructure", domains))
     if rules:

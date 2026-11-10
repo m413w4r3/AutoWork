@@ -601,7 +601,7 @@ def create_confined_analysis_job_registry(handler: JobHandler | None = None) -> 
 def deterministic_confined_analysis_key(
     request: ConfinedAnalysisRequest, *, worker_versions: Mapping[str, str | None]
 ) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "schema": "confined-analysis-operation.v2",
         "result_schema_version": CONFINED_ANALYSIS_RESULT_SCHEMA,
         "investigation_id": str(request.investigation_id),

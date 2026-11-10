@@ -433,10 +433,7 @@ async def test_complete_production_pipeline_reaches_ready(
         for indicator in source["indicators"]
     }
     assert indicators["core-c2.security-lab.io"]["indicator_status"] == "confirmed_ioc"
-    assert (
-        indicators["secondary-c2.security-lab.io"]["indicator_status"]
-        == "unverified_contextual"
-    )
+    assert indicators["secondary-c2.security-lab.io"]["indicator_status"] == "unverified_contextual"
     assert all(indicator["evidence_quote"] for indicator in indicators.values())
     # Model provenance is source-level: each source names its checkpoint, whose
     # ModelRun is one of the extraction calls.

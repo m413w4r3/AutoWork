@@ -103,15 +103,16 @@ from tests.discovery_support import make_discovery_run_for_edition
 
 from ..edition_codes import reserve_edition_code
 
-
 NO_USEFUL_ARTICLE_ENRICHMENT = "\n".join(
     (
         "NO USEFUL ENRICHMENT",
         "TABLE MINIMUM NOT MET",
-        "REASON: Le scénario ne documente pas deux questions analytiques distinctes sans répétition.",
+        "REASON: Le scénario ne documente pas deux questions analytiques "
+        "distinctes sans répétition.",
         "END TABLE MINIMUM NOT MET",
         "DIAGRAM OMITTED",
-        "REASON: Les éléments du scénario n'établissent ni trois étapes ordonnées ni plusieurs relations à représenter.",
+        "REASON: Les éléments du scénario n'établissent ni trois étapes ordonnées "
+        "ni plusieurs relations à représenter.",
         "END DIAGRAM OMITTED",
     )
 )
@@ -1174,7 +1175,8 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
             "END RELATION",
             "END DIAGRAM",
             "TABLE MINIMUM NOT MET",
-            "REASON: Les preuves retenues étayent un tableau transversal, mais aucune seconde question distincte n'est documentée.",
+            "REASON: Les preuves retenues étayent un tableau transversal, mais "
+            "aucune seconde question distincte n'est documentée.",
             "END TABLE MINIMUM NOT MET",
         )
     )
@@ -1187,9 +1189,9 @@ def _canonical_url(url: str) -> str:
 
 
 __all__ = [
+    "NO_USEFUL_ARTICLE_ENRICHMENT",
     "DeterministicProductionJobRunner",
     "DeterministicSourceTransport",
-    "NO_USEFUL_ARTICLE_ENRICHMENT",
     "ProductionScenario",
     "ScriptedModelCall",
     "ScriptedModelGateway",

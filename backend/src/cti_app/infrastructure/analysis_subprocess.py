@@ -51,7 +51,7 @@ def get_process_dumpable() -> int:
     if value < 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), "prctl(PR_GET_DUMPABLE)")
-    return value
+    return int(value)
 
 
 class AnalysisSubprocessStatus(StrEnum):
