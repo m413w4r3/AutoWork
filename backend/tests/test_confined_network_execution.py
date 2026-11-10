@@ -234,7 +234,11 @@ class _InProcessWorkerPort:
         return self._attestation
 
     async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
-        operation_key = deterministic_confined_analysis_key(request, worker_versions=self._versions)
+        operation_key = deterministic_confined_analysis_key(
+            request,
+            worker_versions=self._versions,
+            worker_resource_limits=self._attestation.resource_limits,
+        )
         parameters = ConfinedAnalysisJobParameters(
             investigation_id=request.investigation_id,
             association_id=request.association_id,

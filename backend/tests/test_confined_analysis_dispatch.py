@@ -22,6 +22,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisTool,
     ConfinedAnalysisWorkerAttestation,
     confined_analysis_operation_cache_identity,
+    deterministic_confined_analysis_key,
 )
 from cti_app.application.evidence_recorder import EvidenceKind
 from cti_app.application.investigation_acquisition import HitAcquisitionService
@@ -442,6 +443,7 @@ def _attestation(
     reachable: bool = True,
     confined: bool = True,
     families: dict[str, ConfinedAnalysisFamilyStatus] | None = None,
+    resource_limits: dict[str, int | float] | None = None,
     available_reason: str | None = None,
 ) -> ConfinedAnalysisWorkerAttestation:
     versions = {
@@ -465,6 +467,7 @@ def _attestation(
         families=families or default_families,
         dependencies_ready=True,
         available_reason=available_reason,
+        resource_limits=resource_limits or {},
     )
 
 
@@ -533,6 +536,37 @@ def test_worker_resource_limits_are_attested_and_version_operation_reuse() -> No
     legacy_attestation = _attestation_from_response(json.dumps(legacy_payload).encode(), settings)
     assert legacy_attestation.reachable is True
     assert legacy_attestation.resource_limits == {}
+
+
+def test_operation_key_includes_sorted_effective_worker_resource_limits() -> None:
+    request = _request()
+    versions = {"capa": "9.4.0", "smda": "4.5.0"}
+    limits = {"smda_max_memory_bytes": 1_073_741_824, "capa_max_memory_bytes": 2_147_483_648}
+
+    first = deterministic_confined_analysis_key(
+        request,
+        worker_versions=versions,
+        worker_resource_limits=limits,
+    )
+    same_limits_different_order = deterministic_confined_analysis_key(
+        request,
+        worker_versions=versions,
+        worker_resource_limits=dict(reversed(tuple(limits.items()))),
+    )
+    changed_limits = deterministic_confined_analysis_key(
+        request,
+        worker_versions=versions,
+        worker_resource_limits={**limits, "capa_max_memory_bytes": 4_294_967_296},
+    )
+
+    assert first == same_limits_different_order
+    assert first != changed_limits
+    assert first != deterministic_confined_analysis_key(request, worker_versions=versions)
+    assert deterministic_confined_analysis_key(
+        request,
+        worker_versions=versions,
+        worker_resource_limits={},
+    ) == deterministic_confined_analysis_key(request, worker_versions=versions)
 
 
 def test_worker_resource_limit_attestation_rejects_unbounded_or_malformed_values() -> None:
@@ -968,6 +1002,44 @@ async def test_operation_key_makes_replay_idempotent() -> None:
     assert first.operation_key == second.operation_key
     assert jobs.submissions == 2  # second submit is resolved as DuplicateJobError
     assert len(dispatcher.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_worker_resource_limits_submit_a_new_job() -> None:
+    jobs = _MemoryJobService()
+    blobs = _MemoryBlobCatalog(FakeDatabase())
+    dispatcher = _CompletingDispatcher(jobs, blobs)
+    request = _request()
+    initial_limits = {"analysis_capa_max_memory_bytes": 512 * 1024 * 1024}
+    initial_port, _, _, _ = _port(
+        attestation=_attestation(resource_limits=initial_limits),
+        jobs=jobs,
+        dispatcher=dispatcher,
+        blobs=blobs,
+    )
+
+    first = await initial_port.execute(request)
+    replay = await initial_port.execute(request)
+
+    increased_limits = {"analysis_capa_max_memory_bytes": 2 * 1024 * 1024 * 1024}
+    increased_port, _, _, _ = _port(
+        attestation=_attestation(resource_limits=increased_limits),
+        jobs=jobs,
+        dispatcher=dispatcher,
+        blobs=blobs,
+    )
+    after_limit_change = await increased_port.execute(request)
+
+    assert first.status is ToolInvocationStatus.SUCCEEDED
+    assert replay.status is ToolInvocationStatus.SUCCEEDED
+    assert after_limit_change.status is ToolInvocationStatus.SUCCEEDED
+    assert replay.operation_key == first.operation_key
+    assert replay.result_blob_id == first.result_blob_id
+    assert after_limit_change.operation_key != first.operation_key
+    assert after_limit_change.result_blob_id != first.result_blob_id
+    assert jobs.submissions == 3
+    assert len(jobs.by_key) == 2
+    assert len(dispatcher.calls) == 2
 
 
 @pytest.mark.asyncio
