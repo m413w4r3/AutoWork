@@ -67,6 +67,10 @@ async def run_analysis_subprocess(
             "NUGET_PACKAGES",
             "JAVA_HOME",
             "JAVA_OPTS",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
         }
     }
 

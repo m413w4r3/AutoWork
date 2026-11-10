@@ -40,6 +40,40 @@ async def test_subprocess_caps_each_stream_while_producing_many_megabytes() -> N
 
 
 @pytest.mark.asyncio
+async def test_subprocess_passes_home_and_xdg_directories_but_not_other_variables() -> None:
+    # jadx (HotSpot) creates config/cache directories under HOME/XDG_*; the worker root
+    # filesystem is read-only, so the caller must be able to redirect them to its tmpfs.
+    script = (
+        "import json, os; "
+        "print(json.dumps({key: os.environ.get(key) for key in "
+        "('HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'HTTPS_PROXY')}))"
+    )
+
+    result = await run_analysis_subprocess(
+        [sys.executable, "-c", script],
+        timeout_seconds=5,
+        output_limit=1024,
+        environment={
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/tmp/jadx-home",
+            "XDG_CONFIG_HOME": "/tmp/jadx-home/config",
+            "XDG_CACHE_HOME": "/tmp/jadx-home/cache",
+            "XDG_DATA_HOME": "/tmp/jadx-home/data",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+        },
+    )
+
+    assert result.status is AnalysisSubprocessStatus.SUCCEEDED
+    assert json.loads(result.stdout) == {
+        "HOME": "/tmp/jadx-home",
+        "XDG_CONFIG_HOME": "/tmp/jadx-home/config",
+        "XDG_CACHE_HOME": "/tmp/jadx-home/cache",
+        "XDG_DATA_HOME": "/tmp/jadx-home/data",
+        "HTTPS_PROXY": None,
+    }
+
+
+@pytest.mark.asyncio
 async def test_subprocess_applies_dotnet_address_space_and_gc_environment() -> None:
     address_space_limit_bytes = 8 * 1024**3
     script = (

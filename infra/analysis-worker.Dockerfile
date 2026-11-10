@@ -43,7 +43,7 @@ RUN apt-get update \
         > /etc/apt/sources.list.d/bookworm-backports.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        tshark file binutils xxd coreutils p7zip-full openjdk-17-jre-headless \
+        tshark file binutils xxd coreutils p7zip-full openjdk-17-jre-headless=17.0.21+9-1~deb12u1 \
         mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
         dotnet-runtime-8.0=8.0.32-1 \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \

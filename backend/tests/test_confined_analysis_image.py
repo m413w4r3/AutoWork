@@ -27,6 +27,9 @@ def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
     from tests.dotnet_fixture import MINIMAL_DOTNET_ASSEMBLY
 
     fixture_b64 = base64.b64encode(MINIMAL_DOTNET_ASSEMBLY).decode("ascii")
+    apk_b64 = base64.b64encode(
+        (root / "backend/tests/fixtures/apk/autowork-apk-fixture.apk").read_bytes()
+    ).decode("ascii")
     code = "\n".join(
         (
             "import asyncio, base64, hashlib, importlib.metadata, re, shutil, subprocess",
@@ -66,6 +69,21 @@ def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
             "assert jadx and jadx['jadx'] == JADX_VERSION",
             "assert jadx['jadx_zip_sha256'] == JADX_ZIP_SHA256",
             "assert jadx['jadx_jre_version'].startswith('17.')",
+            "from cti_app.workers.apk_analysis import run_apk_analysis",
+            "from cti_app.application.confined_analysis import ConfinedAnalysisJobParameters as _P",
+            "from cti_app.application.confined_analysis import ConfinedAnalysisTool as _T",
+            "from cti_app.config import Settings as _S",
+            "from uuid import uuid4 as _u",
+            f"apk = base64.b64decode({apk_b64!r})",
+            "apk_sha256 = hashlib.sha256(apk).hexdigest()",
+            "for _op, _extra in (('apk.manifest', {}), ('apk.classes.list', {}), "
+            "('apk.source.search', {'pattern': 'AUTOWORK_APK_FIXTURE'})):",
+            " _r = asyncio.run(run_apk_analysis(_P(investigation_id=_u(), artifact_id=_u(), "
+            "artifact_sha256=apk_sha256, operation_key='confined-analysis:' + 'd' * 64, "
+            "tool=_T.APK_JADX, timeout_seconds=90, max_output_bytes=400000, "
+            "analysis_parameters={'operation': _op, **_extra}), apk, _S(_env_file=None)))",
+            " assert _r['status'] == 'SUCCEEDED', _r",
+            " assert _r['jadx_version'] == '1.5.6'",
             "from cti_app.infrastructure.ilspycmd import (ILSPYCMD_VERSION, ",
             "ILSPYCMD_PACKAGE_SHA512, ilspycmd_provenance)",
             "provenance = ilspycmd_provenance()",

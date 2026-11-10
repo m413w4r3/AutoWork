@@ -201,6 +201,12 @@ async def run_apk_analysis(
             sample_path.chmod(0o400)
             output_dir = root / "output"
             output_dir.mkdir(mode=0o700)
+            # jadx writes config/cache/plugin directories under the user's home and XDG
+            # directories; the worker root filesystem is read-only, so keep them in the
+            # per-call temporary tree that is removed with the decompilation output.
+            jadx_home = root / "home"
+            for name in ("", "config", "cache", "data"):
+                (jadx_home / name).mkdir(mode=0o700, parents=True, exist_ok=True)
             execution = await run_analysis_subprocess(
                 [binary, "--threads-count", "1", "--output-dir", str(output_dir), str(sample_path)],
                 timeout_seconds=min(
@@ -208,7 +214,13 @@ async def run_apk_analysis(
                     settings.analysis_apk_timeout_seconds,
                 ),
                 output_limit=256 * 1024,
-                environment=_SUBPROCESS_ENV,
+                environment={
+                    **_SUBPROCESS_ENV,
+                    "HOME": str(jadx_home),
+                    "XDG_CONFIG_HOME": str(jadx_home / "config"),
+                    "XDG_CACHE_HOME": str(jadx_home / "cache"),
+                    "XDG_DATA_HOME": str(jadx_home / "data"),
+                },
                 memory_limit_bytes=settings.apk_analysis_address_space_limit_bytes,
                 deny_network=True,
                 directory_limit_path=output_dir,
