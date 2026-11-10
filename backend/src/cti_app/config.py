@@ -15,6 +15,9 @@ DOTNET_ANALYSIS_MIN_ADDRESS_SPACE_LIMIT_BYTES = 8 * 1024**3
 DOTNET_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES = 32 * 1024**3
 DOTNET_GC_HEAP_HARD_LIMIT = "0x10000000"
 DOTNET_GC_CONCURRENT = "0"
+APK_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES = 8 * 1024**3
+APK_ANALYSIS_MIN_ADDRESS_SPACE_LIMIT_BYTES = 8 * 1024**3
+APK_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES = 32 * 1024**3
 
 
 def _normalize_download_host_list(value: str) -> frozenset[str]:
@@ -408,6 +411,15 @@ class Settings(BaseSettings):
         ge=DOTNET_ANALYSIS_MIN_ADDRESS_SPACE_LIMIT_BYTES,
         le=DOTNET_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES,
     )
+    # HotSpot reserves substantial virtual address space. This 8 GiB RLIMIT_AS
+    # ceiling is not an RSS limit; jadx's fixed 768 MiB heap and the worker's
+    # 2 GiB Compose cgroup bound resident memory. The worker /tmp tmpfs is 512 MiB.
+    apk_analysis_address_space_limit_bytes: int = Field(
+        default=APK_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES,
+        ge=APK_ANALYSIS_MIN_ADDRESS_SPACE_LIMIT_BYTES,
+        le=APK_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES,
+    )
+    analysis_apk_timeout_seconds: float = Field(default=90.0, gt=0, le=120)
     local_analysis_file_size_limit_bytes: int = Field(
         default=1 * 1024 * 1024, ge=4096, le=100 * 1024 * 1024
     )

@@ -417,6 +417,45 @@ def test_dotnet_address_space_limit_is_bounded_and_passed_to_worker(
     assert "DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES" in example_names
 
 
+def test_apk_jadx_virtual_address_limit_and_timeout_are_configured_for_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("ANALYSIS_APK_TIMEOUT_SECONDS", raising=False)
+    defaults = Settings(_env_file=None)
+    assert defaults.apk_analysis_address_space_limit_bytes == 8 * 1024**3
+    assert defaults.analysis_apk_timeout_seconds == 90
+
+    monkeypatch.setenv("APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", str(16 * 1024**3))
+    monkeypatch.setenv("ANALYSIS_APK_TIMEOUT_SECONDS", "60")
+    configured = Settings(_env_file=None)
+    assert configured.apk_analysis_address_space_limit_bytes == 16 * 1024**3
+    assert configured.analysis_apk_timeout_seconds == 60
+    for invalid in (4 * 1024**3, 64 * 1024**3):
+        monkeypatch.setenv("APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", str(invalid))
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+    monkeypatch.setenv("APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", str(8 * 1024**3))
+    monkeypatch.setenv("ANALYSIS_APK_TIMEOUT_SECONDS", "121")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((repo_root / "compose.yaml").read_text(encoding="utf-8"))
+    worker = compose["services"]["analysis-worker"]
+    assert worker["environment"]["APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES"] == (
+        "${APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES:-8589934592}"
+    )
+    assert worker["environment"]["ANALYSIS_APK_TIMEOUT_SECONDS"] == (
+        "${ANALYSIS_APK_TIMEOUT_SECONDS:-90}"
+    )
+    example_names = set(_parse_fake_dotenv(repo_root / ".env.example"))
+    assert {
+        "APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES",
+        "ANALYSIS_APK_TIMEOUT_SECONDS",
+    } <= example_names
+
+
 def test_investigation_runtime_settings_are_documented_with_safe_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

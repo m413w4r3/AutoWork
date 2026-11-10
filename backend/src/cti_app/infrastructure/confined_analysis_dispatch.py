@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import UUID, uuid4
 
+from cti_app.application.apk_analysis import JADX_JRE_VERSION, JADX_VERSION, JADX_ZIP_SHA256
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.confined_analysis import (
     CONFINED_ANALYSIS_JOB_KIND,
@@ -29,6 +30,7 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
 from cti_app.domain.investigation import ToolInvocationStatus
 from cti_app.domain.jobs import JobStatus
+from cti_app.infrastructure.jadx import supported_jre_version
 from cti_app.infrastructure.jobs import DramatiqAnalysisJobDispatcher
 
 _PROBE_KEY_PREFIX = "autowork:analysis-worker-probe:"
@@ -95,6 +97,9 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
             request, worker_versions=self._attestation.versions
         )
         family = (
+            "apk"
+            if request.tool is ConfinedAnalysisTool.APK_JADX
+            else
             "dotnet"
             if request.tool is ConfinedAnalysisTool.DOTNET_ILSPY
             else "archive_tools"
@@ -406,6 +411,9 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
                 "zip_members",
                 "ilspycmd",
                 "ilspycmd_package_sha512",
+                "jadx",
+                "jadx_zip_sha256",
+                "jadx_jre_version",
             }
             or key.startswith("mwcp_parser:")
         },
@@ -504,6 +512,17 @@ def _family_statuses(
     ):
         dotnet = ConfinedAnalysisFamilyStatus(
             "dotnet", False, dotnet.version, "monodis_package_version_unattested"
+        )
+    apk = status("apk", versions.get("jadx"), JADX_VERSION)
+    if apk.available and versions.get("jadx_zip_sha256") != JADX_ZIP_SHA256:
+        apk = ConfinedAnalysisFamilyStatus(
+            "apk", False, apk.version, "jadx_package_hash_unattested"
+        )
+    if apk.available and not supported_jre_version(
+        _safe_version(versions.get("jadx_jre_version"))
+    ):
+        apk = ConfinedAnalysisFamilyStatus(
+            "apk", False, apk.version, f"jadx_jre_version_unattested_{JADX_JRE_VERSION}"
         )
     mwcp_parser_families: dict[str, ConfinedAnalysisFamilyStatus] = {}
     for parser_id, configured_version in settings.mwcp_parser_versions.items():
@@ -604,6 +623,7 @@ def _family_statuses(
             archive_tools,
             sample,
             dotnet,
+            apk,
         )
     }
 
@@ -624,6 +644,7 @@ def _unavailable_families(reason: str) -> dict[str, ConfinedAnalysisFamilyStatus
         "archive_tools",
         "sample_analysis",
         "dotnet",
+        "apk",
     )
     return {
         name: ConfinedAnalysisFamilyStatus(name, False, available_reason=reason) for name in names
