@@ -10,6 +10,7 @@ import pytest
 
 from cti_app.api.investigation import _operator_status_tool_inventory
 from cti_app.application.confined_analysis import ConfinedAnalysisFamilyStatus
+from cti_app.application.investigation_apk_tools import APK_TOOL_NAMES
 from cti_app.application.investigation_composition import (
     InvestigationToolDependencies,
     build_investigation_composition,
@@ -467,6 +468,22 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
         uow_factory=runtime_inputs["uow_factory"],  # type: ignore[arg-type]
         artifact_store=runtime_inputs["artifact_store"],  # type: ignore[arg-type]
     )
+    from cti_app.application.apk_analysis import JADX_JRE_VERSION, JADX_VERSION, JADX_ZIP_SHA256
+
+    worker_attestation = worker.port.attestation
+    worker.port._attestation = replace(
+        worker_attestation,
+        versions={
+            **worker_attestation.versions,
+            "jadx": JADX_VERSION,
+            "jadx_zip_sha256": JADX_ZIP_SHA256,
+            "jadx_jre_version": JADX_JRE_VERSION,
+        },
+        families={
+            **worker_attestation.families,
+            "apk": ConfinedAnalysisFamilyStatus("apk", True, JADX_VERSION),
+        },
+    )
     runtime_inputs["confined_analysis_execution"] = worker.port
 
     async def read_capture(*_args: object, **_kwargs: object) -> None:
@@ -483,6 +500,11 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
     uow = _uow()
     uow.detection_candidates = SimpleNamespace()
     composition = runtime.composition_factory.build(uow, investigation_id)
+    assert set(APK_TOOL_NAMES) <= set(composition.available_tools)
+    operator_composition = runtime.composition_factory.build(
+        _uow(), investigation_id, operator_mode=True
+    )
+    assert set(APK_TOOL_NAMES) <= set(operator_composition.available_tools)
     assert runtime.ports.optional_tool_ports.confined_analysis_execution is worker.port
     runtime_families = {item.family: item for item in runtime.ports.statuses}
     assert runtime_families["local_filesystem_confinement"].state.value == "unavailable"
@@ -552,12 +574,22 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
         "network.capture.inspect": "tshark",
         "network.suricata_replay": "suricata",
         "network.suricata_validate_rules": "suricata",
+        **dict.fromkeys(
+            (
+                "apk.manifest",
+                "apk.classes.list",
+                "apk.strings.extract",
+                "apk.source.read",
+                "apk.source.search",
+            ),
+            "apk",
+        ),
     }
     assert set(expected_families) <= set(composition.available_tools) | set(
         composition.unavailable_tools
     )
     for name, family in expected_families.items():
-        worker_status = worker.attestation.families.get(family)
+        worker_status = worker.port.attestation.families.get(family)
         if worker_status is not None and worker_status.available:
             assert name in composition.available_tools
         else:
@@ -565,7 +597,7 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
             assert composition.unavailable_tool_reasons[name] == (
                 worker_status.available_reason
                 if worker_status is not None and worker_status.available_reason
-                else worker.attestation.available_reason or f"{family}_unavailable"
+                else worker.port.attestation.available_reason or f"{family}_unavailable"
             )
 
     unavailable_families = {
@@ -575,11 +607,11 @@ async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operat
             status.version,
             f"{family}_missing_from_worker_probe",
         )
-        for family, status in worker.attestation.families.items()
+        for family, status in worker.port.attestation.families.items()
     }
     unavailable_port = copy.copy(worker.port)
     unavailable_port._attestation = replace(
-        worker.attestation,
+        worker.port.attestation,
         families=unavailable_families,
     )
     unavailable_inputs = dict(runtime_inputs)
