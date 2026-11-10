@@ -21,6 +21,52 @@ from cti_app.domain.local_analysis import (
 
 CONFINED_ANALYSIS_JOB_KIND = "sample.confined_analysis.v1"
 CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v2"
+CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS: Mapping[str, int | float] = {
+    "analysis_max_sample_bytes": 1 << 40,
+    "analysis_string_min_length": 1024,
+    "analysis_max_strings": 1_000_000,
+    "analysis_capa_timeout_seconds": 3600.0,
+    "analysis_capa_max_output_bytes": 1 << 40,
+    "analysis_capa_max_memory_bytes": 1 << 40,
+    "analysis_yara_timeout_seconds": 30.0,
+    "analysis_yara_max_strings_per_rule": 10_000,
+    "analysis_floss_max_output_bytes": 16 * 1024 * 1024,
+    "analysis_local_monodis_max_sample_bytes": 200 * 1024 * 1024,
+    "analysis_local_monodis_max_output_bytes": 32 * 1024 * 1024,
+    "analysis_local_monodis_timeout_seconds": 120.0,
+    "smda_timeout_seconds": 3600.0,
+    "smda_max_output_bytes": 1 << 40,
+    "smda_max_memory_bytes": 1 << 40,
+    "local_analysis_timeout_seconds": 600.0,
+    "local_analysis_max_output_bytes": 20 * 1024 * 1024,
+    "local_analysis_memory_limit_bytes": 4 * 1024 * 1024 * 1024,
+    "analysis_local_command_max_range_bytes": 1024 * 1024,
+    "analysis_suricata_timeout_seconds": 120.0,
+    "analysis_suricata_max_eve_bytes": 16 * 1024 * 1024,
+    "analysis_suricata_max_events": 100,
+    "dotnet_analysis_address_space_limit_bytes": 32 * 1024**3,
+    "apk_analysis_address_space_limit_bytes": 32 * 1024**3,
+    "analysis_apk_timeout_seconds": 120.0,
+}
+CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MINIMUMS: Mapping[str, int] = {
+    "local_analysis_memory_limit_bytes": 64 * 1024 * 1024,
+    "dotnet_analysis_address_space_limit_bytes": 8 * 1024**3,
+    "apk_analysis_address_space_limit_bytes": 8 * 1024**3,
+}
+CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS = tuple(
+    CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS
+)
+CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_TIMEOUT_FIELDS = frozenset(
+    {
+        "analysis_capa_timeout_seconds",
+        "analysis_yara_timeout_seconds",
+        "analysis_local_monodis_timeout_seconds",
+        "smda_timeout_seconds",
+        "local_analysis_timeout_seconds",
+        "analysis_suricata_timeout_seconds",
+        "analysis_apk_timeout_seconds",
+    }
+)
 ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX = "archive-member"
 _ARCHIVE_MEMBER_TRANSFER_BUCKET_MAX_LENGTH = 63
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -73,6 +119,7 @@ class ConfinedAnalysisWorkerAttestation:
     families: Mapping[str, ConfinedAnalysisFamilyStatus]
     dependencies_ready: bool = True
     available_reason: str | None = None
+    resource_limits: Mapping[str, int | float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,6 +598,7 @@ def confined_analysis_operation_cache_identity(
             "dependencies_ready": attestation.dependencies_ready,
             "isolation_profile": attestation.isolation_profile,
             "versions": dict(sorted(attestation.versions.items())),
+            "resource_limits": dict(sorted(attestation.resource_limits.items())),
             "families": {
                 name: {
                     "available": status.available,

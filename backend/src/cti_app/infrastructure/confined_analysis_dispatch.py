@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 from collections.abc import Mapping
@@ -14,6 +15,10 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.confined_analysis import (
     CONFINED_ANALYSIS_JOB_KIND,
     CONFINED_ANALYSIS_RESULT_SCHEMA,
+    CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS,
+    CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS,
+    CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MINIMUMS,
+    CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_TIMEOUT_FIELDS,
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisFamilyStatus,
     ConfinedAnalysisJobParameters,
@@ -355,6 +360,14 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
     versions = payload.get("versions")
     if not isinstance(versions, dict):
         return _unavailable_attestation("analysis_worker_probe_response_invalid")
+    if "resource_limits" in payload:
+        resource_limits = _parse_worker_resource_limits(payload["resource_limits"])
+        if resource_limits is None:
+            return _unavailable_attestation("analysis_worker_probe_response_invalid")
+    else:
+        # Older workers predate resource-limit attestation. Keep their probe usable;
+        # a worker that reports malformed limits must fail closed.
+        resource_limits = {}
     worker_confined = bool(
         payload.get("uid") == 10001
         and payload.get("no_new_privileges") is True
@@ -418,6 +431,7 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
         },
         families=families,
         dependencies_ready=dependencies_ready,
+        resource_limits=resource_limits,
         available_reason=(
             None
             if worker_confined and dependencies_ready
@@ -426,6 +440,26 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
             else "analysis_worker_dependencies_unavailable"
         ),
     )
+
+
+def _parse_worker_resource_limits(raw: Any) -> dict[str, int | float] | None:
+    if not isinstance(raw, dict) or set(raw) != set(CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS):
+        return None
+    limits: dict[str, int | float] = {}
+    for name, maximum in CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS.items():
+        value = raw[name]
+        minimum = CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MINIMUMS.get(name, 0)
+        if name in CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_TIMEOUT_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                return None
+            if value < minimum or value <= 0 or value > maximum or not math.isfinite(float(value)):
+                return None
+            limits[name] = float(value)
+        else:
+            if type(value) is not int or value < minimum or value <= 0 or value > maximum:
+                return None
+            limits[name] = value
+    return limits
 
 
 def _family_statuses(
