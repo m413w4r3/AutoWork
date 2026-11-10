@@ -88,6 +88,11 @@ _COPYABLE_VALUES = (
 )
 
 
+def _run_blocking(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    # Short Poppler/Typst probes in tests; thread offloading adds nothing here.
+    return subprocess.run(*args, **kwargs)
+
+
 def _copyable_ioc_document():
     groups = (
         (ArtifactType.IP, ("198.51.100.42",)),
@@ -556,6 +561,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     augmented = augment_publication_with_opinion(base, opinion, context)
     template_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+
     async def compile_and_extract(document, name: str) -> str:
         source = TypstRenderer().render(
             document,
@@ -581,11 +587,11 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
                 str(pdf_path),
             )
         )
-        compile_result = subprocess.run(argv, capture_output=True, check=False, timeout=20)
+        compile_result = _run_blocking(argv, capture_output=True, check=False, timeout=20)
         assert compile_result.returncode == 0, compile_result.stderr.decode(
             "utf-8", errors="replace"
         )
-        extracted = subprocess.run(
+        extracted = _run_blocking(
             (pdftotext, "-layout", str(pdf_path), "-"),
             capture_output=True,
             check=True,

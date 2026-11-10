@@ -68,6 +68,11 @@ _FORBIDDEN = re.compile(
 )
 
 
+def _run_blocking(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    # Short Poppler/Typst probes in tests; thread offloading adds nothing here.
+    return subprocess.run(*args, **kwargs)
+
+
 @pytest.fixture(scope="session")
 def typst_binary() -> str:
     binary = os.environ.get("TYPST_BINARY") or shutil.which("typst")
@@ -295,7 +300,7 @@ async def _compile(
     font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", _TEMPLATE_ROOT))
     fonts = load_font_bundle_snapshot(font_root, _REPO / "infra" / "typst-fonts.lock")
     font_paths = materialize_font_bundle(fonts, tmp_path / "font-snapshot")
-    version = subprocess.run(
+    version = _run_blocking(
         (typst_binary, "--version"), capture_output=True, check=True, timeout=10
     )
     assert version.stdout.decode("utf-8", errors="replace").startswith("typst 0.15.1")
@@ -312,7 +317,7 @@ async def _compile(
             str(pdf_path),
         )
     )
-    compiled = subprocess.run(argv, capture_output=True, check=False, timeout=20)
+    compiled = _run_blocking(argv, capture_output=True, check=False, timeout=20)
     assert compiled.returncode == 0, compiled.stderr.decode("utf-8", errors="replace")
     return pdf_path.read_bytes()
 

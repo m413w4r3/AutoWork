@@ -18,6 +18,15 @@ install_jadx = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(install_jadx)
 
 
+@pytest.fixture(autouse=True)
+def _restore_tree_permissions(tmp_path: Path):
+    """The installer makes its tree read-only; pytest and `rm` must still clean it up."""
+    yield
+    for path in [tmp_path, *tmp_path.rglob("*")]:
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o700)
+
+
 def _zip_package(entries: list[tuple[str, bytes]]) -> bytes:
     stream = BytesIO()
     with zipfile.ZipFile(stream, "w") as archive:

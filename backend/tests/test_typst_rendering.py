@@ -135,10 +135,7 @@ def test_opinion_pipe_table_parser_handles_alignment_inline_code_and_safe_limits
 
 
 def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals() -> None:
-    code_text = (
-        '#import "inert-fixture.typ" $x$ @name <tag> & `literal`\n'
-        "#set page(margin: 0pt)"
-    )
+    code_text = '#import "inert-fixture.typ" $x$ @name <tag> & `literal`\n#set page(margin: 0pt)'
     source = f"Before `inline`.\n```\n{code_text}\n```\nAfter."
 
     spans = _opinion_text_spans(source, parse_fenced_code=True)
@@ -156,11 +153,11 @@ def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals
     ]
     assert spans[-1]["text"] == "After."
 
-    unclosed = "Before `inline`.\n```\n#import \"still inert.typ\" $x$ @name"
+    unclosed = 'Before `inline`.\n```\n#import "still inert.typ" $x$ @name'
     unclosed_spans = _opinion_text_spans(unclosed, parse_fenced_code=True)
     assert not any(span.get("code_block") for span in unclosed_spans)
     assert unclosed_spans[-1] == {
-        "text": "```\n#import \"still inert.typ\" $x$ @name",
+        "text": '```\n#import "still inert.typ" $x$ @name',
         "technical": False,
     }
 

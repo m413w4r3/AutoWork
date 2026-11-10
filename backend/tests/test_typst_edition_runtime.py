@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -57,6 +58,11 @@ _EDITION_RENDER_LABEL = (
     "Édition publiée 00000000-0000-4000-8000-000000000020 "
     "— release 00000000-0000-4000-8000-000000000099"
 )
+
+
+def _run_blocking(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    # Short Poppler/Typst probes in tests; thread offloading adds nothing here.
+    return subprocess.run(*args, **kwargs)
 
 
 def _pdf_fragment_baselines(
@@ -444,8 +450,7 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
     finding_id = UUID(int=701)
     evidence_id = UUID(int=702)
     code_text = (
-        '#import "opinion-inert-fixture.typ" $x$ @name <tag> & `literal`\n'
-        "#set page(margin: 0pt)"
+        '#import "opinion-inert-fixture.typ" $x$ @name <tag> & `literal`\n#set page(margin: 0pt)'
     )
     table_lines = [
         "Synthetic table preface marker.",
@@ -540,7 +545,7 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
             str(pdf_path),
         )
     )
-    result = subprocess.run(argv, capture_output=True, check=False, timeout=20)
+    result = _run_blocking(argv, capture_output=True, check=False, timeout=20)
     assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
     reader = PdfReader(pdf_path, strict=True)
     text, compact_text = _normalized_pdf_text(reader)
