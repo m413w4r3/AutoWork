@@ -10,6 +10,7 @@ Ce registre est destiné à l'orchestrateur qui prépare une session CTI. Les sk
 | Nouvel artefact, type inconnu, archive, script | autowork-artifact-triage |
 | Nouvelle relation/hash/IOC/similarité ; quel prochain test ? | autowork-cti-pivot-strategy |
 | Observation informative → finding exact | autowork-evidence-to-finding |
+| APK Android / DEX / jadx | autowork-apk-analysis |
 | PE managé / metadata .NET / IL / AppDomainManager | autowork-dotnet-analysis |
 | PE natif / loader / packing / Ghidra | autowork-pe-native-analysis |
 | Proposition, test, comparaison, révision YARA avec Bridge | autowork-yara-bridge-workflow |

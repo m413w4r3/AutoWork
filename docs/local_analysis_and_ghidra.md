@@ -71,6 +71,9 @@ Le résultat est une capacité locale : une commande absente ou désactivée,
 un type de fichier non admis ou une erreur d'exécution n'empêche pas les autres
 outils ni l'avis de l'analyste.
 
+Pour l’analyse statique d’APK avec jadx et ses limites de confinement, voir
+[les outils APK de l’enquête](investigation_local_tools.md#rétro-conception-dapk-jadx).
+
 ## GhidraMCP derrière un port lecture seule
 
 Le seul contrat applicatif est `GhidraAnalysisPort`. Il accepte les opérations

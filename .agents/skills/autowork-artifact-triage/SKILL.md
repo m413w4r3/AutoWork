@@ -18,6 +18,7 @@ Ne déduire ni le format ni le comportement d'une simple extension, d'un nom VT 
 
 | Signature ou structure constatée | Première voie | Limite à garder |
 | --- | --- | --- |
+| APK Android avec manifeste et DEX | autowork-apk-analysis (jadx) | Permissions, chaînes et source décompilée sont des constats statiques, pas une preuve d’exécution ou de C2 |
 | PE avec CLI metadata | autowork-dotnet-analysis | Une méthode InitializeNewDomain n'est pas la preuve de son invocation |
 | PE natif / COFF | autowork-pe-native-analysis | Imports et chemins statiques ne sont pas des appels observés |
 | PE packé/opaque | autowork-pe-native-analysis (et .NET si CLI) | Manque de strings ≠ absence de code ou config |

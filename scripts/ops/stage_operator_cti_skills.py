@@ -21,6 +21,7 @@ SKILL_NAMES = (
     "autowork-cti-pivot-strategy",
     "autowork-evidence-to-finding",
     "autowork-dotnet-analysis",
+    "autowork-apk-analysis",
     "autowork-pe-native-analysis",
     "autowork-yara-bridge-workflow",
     "autowork-network-protocol-detection",
