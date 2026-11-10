@@ -28,11 +28,10 @@ ANALYSIS_WORKER_IMAGE_TEST=1 \
   uv run --no-sync --python 3.12 pytest tests/test_confined_analysis_image.py -q
 ```
 
-Avant le premier build, relever la version exacte du paquet Debian
-`openjdk-17-jre-headless` dans le dépôt Bookworm utilisé, puis épingler cette
-version dans `infra/analysis-worker.Dockerfile`. Le Dockerfile installe
-actuellement ce paquet sans numéro de version ; le tag majeur 17 et le test
-`java -version` ne garantissent pas à eux seuls une construction reproductible.
+La JRE est épinglée dans `infra/analysis-worker.Dockerfile` à
+`openjdk-17-jre-headless=17.0.21+9-1~deb12u1` (version relevée au premier build
+du 2026-11-10). Le tag majeur 17 et `java -version` seuls ne suffisaient pas à
+garantir la reproductibilité.
 Le test `ANALYSIS_WORKER_IMAGE_TEST=1` vérifie notamment la présence de Java,
 la version jadx `1.5.6`, son hash attesté et une JRE 17. Il démarre un processus
 éphémère de vérification, pas le service complet.
@@ -74,10 +73,21 @@ complète est dans le README de la fixture.
 
 ## Vérifié et restant à vérifier
 
-Le contrat applicatif, les limites du worker, l’épinglage SHA de jadx, la
-recette de fixture et les contrôles présents dans le test d’image ont été lus.
-Dans ce lot, l’image `analysis-worker` n’a pas été construite et le test
-`ANALYSIS_WORKER_IMAGE_TEST=1` n’a pas été lancé. Aucun APK malveillant réel
-n’a été exécuté. La vérification du schéma/noms des outils opérateur et de la
-persistance de leurs observations canoniques attend l’intégration E1b ; le
-code E1b n’est pas présent dans le checkout de base de ce lot.
+**Vérifié (2026-11-10, orchestrateur M20)** :
+- zip jadx 1.5.6 téléchargé après autorisation de l'utilisateur ; sha256 recalculé
+  `545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974` (identique à l'API GitHub) ;
+- image `analysis-worker` construite (JRE 17.0.21, `/opt/jadx` racine en lecture seule, `jadx --version` = `1.5.6`) ;
+- les 5 opérations `apk.*` exécutées de bout en bout sur la fixture dans un conteneur aux contraintes de
+  production (`--read-only`, `/tmp` tmpfs 512 MiB `noexec`, `--network none`, 2 GiB, 128 PID, `cap-drop ALL`) :
+  toutes `SUCCEEDED` ; `ANALYSIS_WORKER_IMAGE_TEST=1 pytest tests/test_confined_analysis_image.py` : 1 passed
+  (inclut maintenant une vraie décompilation de la fixture) ;
+- défaut trouvé et corrigé grâce à ce test : jadx crée ses répertoires de config/cache sous `$HOME`/`XDG_*`
+  (lecture seule dans l'image) et échouait avec `apk_decompilation_failed` ; le worker redirige maintenant
+  `HOME`/`XDG_*` vers l'arborescence temporaire par appel (liste d'environnement de
+  `analysis_subprocess.py` étendue, test dédié) ;
+- schéma et noms des outils opérateur (E1b) : `apk.manifest`, `apk.classes.list`, `apk.strings.extract`,
+  `apk.source.read`, `apk.source.search`, famille `investigation.apk`, 157 tests ciblés hors-ligne.
+
+**Non vérifié** : aucun APK réel (a fortiori malveillant) n'a été décompilé ; comportement de jadx sur de
+gros APK/obfuscation/multi-DEX (plafonds : 128 MiB d'arbre de sortie, 90 s) ; redéploiement de la pile avec la
+nouvelle image (voir le rapport de mission).
