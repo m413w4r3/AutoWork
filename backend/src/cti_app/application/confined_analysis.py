@@ -647,8 +647,16 @@ def create_confined_analysis_job_registry(handler: JobHandler | None = None) -> 
 
 
 def deterministic_confined_analysis_key(
-    request: ConfinedAnalysisRequest, *, worker_versions: Mapping[str, str | None]
+    request: ConfinedAnalysisRequest,
+    *,
+    worker_versions: Mapping[str, str | None],
+    worker_resource_limits: Mapping[str, int | float] | None = None,
 ) -> str:
+    """Build the durable job key from request and effective worker identity.
+
+    Omit the resource-limits field when absent or empty to preserve the legacy
+    key for workers that do not attest limits.
+    """
     payload: dict[str, Any] = {
         "schema": "confined-analysis-operation.v2",
         "result_schema_version": CONFINED_ANALYSIS_RESULT_SCHEMA,
@@ -663,6 +671,8 @@ def deterministic_confined_analysis_key(
         "analysis_parameters": dict(sorted(request.analysis_parameters.items())),
         "versions": dict(sorted(worker_versions.items())),
     }
+    if worker_resource_limits:
+        payload["resource_limits"] = dict(sorted(worker_resource_limits.items()))
     if request.tool is ConfinedAnalysisTool.APK_JADX:
         payload["timeout_seconds"] = request.timeout_seconds
         payload["max_output_bytes"] = request.max_output_bytes

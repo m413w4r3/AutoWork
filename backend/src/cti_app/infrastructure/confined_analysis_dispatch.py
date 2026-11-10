@@ -99,7 +99,9 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
 
     async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
         operation_key = deterministic_confined_analysis_key(
-            request, worker_versions=self._attestation.versions
+            request,
+            worker_versions=self._attestation.versions,
+            worker_resource_limits=self._attestation.resource_limits,
         )
         family = (
             "apk"

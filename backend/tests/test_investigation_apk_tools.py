@@ -459,15 +459,22 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
         adapter.operation_cache_identity["worker_attestation"]["versions"]["jadx"] == JADX_VERSION
     )
     worker_versions = execution.attestation.versions
+    worker_resource_limits = execution.attestation.resource_limits
     first_operation_key = deterministic_confined_analysis_key(
-        execution.requests[0], worker_versions=worker_versions
+        execution.requests[0],
+        worker_versions=worker_versions,
+        worker_resource_limits=worker_resource_limits,
     )
     changed_parameters = replace(
         execution.requests[0],
         analysis_parameters={**execution.requests[0].analysis_parameters, "offset": "3"},
     )
     assert (
-        deterministic_confined_analysis_key(changed_parameters, worker_versions=worker_versions)
+        deterministic_confined_analysis_key(
+            changed_parameters,
+            worker_versions=worker_versions,
+            worker_resource_limits=worker_resource_limits,
+        )
         != first_operation_key
     )
     assert (
@@ -477,6 +484,7 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
                 timeout_seconds=execution.requests[0].timeout_seconds + 1,
             ),
             worker_versions=worker_versions,
+            worker_resource_limits=worker_resource_limits,
         )
         != first_operation_key
     )
@@ -487,6 +495,7 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
                 max_output_bytes=execution.requests[0].max_output_bytes + 1,
             ),
             worker_versions=worker_versions,
+            worker_resource_limits=worker_resource_limits,
         )
         != first_operation_key
     )
@@ -498,12 +507,17 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
                 max_output_bytes=execution.requests[0].max_output_bytes,
             ),
             worker_versions=worker_versions,
+            worker_resource_limits=worker_resource_limits,
         )
         == first_operation_key
     )
     changed_versions = {**worker_versions, "jadx_jre_version": "17.0.15"}
     assert (
-        deterministic_confined_analysis_key(execution.requests[0], worker_versions=changed_versions)
+        deterministic_confined_analysis_key(
+            execution.requests[0],
+            worker_versions=changed_versions,
+            worker_resource_limits=worker_resource_limits,
+        )
         != first_operation_key
     )
 
