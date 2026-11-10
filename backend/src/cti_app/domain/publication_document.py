@@ -360,6 +360,14 @@ def _publication_evidence_refs_from_json(value: Any) -> tuple[PublicationEvidenc
     )
 
 
+def _publication_evidence_ref_to_json(ref: PublicationEvidenceRefV1) -> dict[str, str]:
+    return {
+        "source_document_id": str(ref.source_document_id),
+        "kind": ref.kind.value,
+        "evidence_key": ref.evidence_key,
+    }
+
+
 def _source_ids_from_json(value: Any, label: str) -> tuple[UUID, ...]:
     return tuple(json_uuid(item, label) for item in json_array(value, label))
 
@@ -2996,7 +3004,9 @@ def _article_overview_to_json(value: ArticleOverviewV1 | None) -> dict[str, Any]
             return None
         return {
             "text": field.text,
-            "evidence_refs": [evidence_ref_to_json(ref) for ref in field.evidence_refs],
+            "evidence_refs": [
+                _publication_evidence_ref_to_json(ref) for ref in field.evidence_refs
+            ],
         }
 
     return {
@@ -3036,7 +3046,7 @@ def _article_ioc_value_to_json(value: PublicationIOCValueV1) -> dict[str, Any]:
         "value": value.value,
         "normalized_value": value.normalized_value,
         "source_document_ids": [str(source_id) for source_id in value.source_document_ids],
-        "evidence_refs": [evidence_ref_to_json(ref) for ref in value.evidence_refs],
+        "evidence_refs": [_publication_evidence_ref_to_json(ref) for ref in value.evidence_refs],
     }
 
 
@@ -3065,7 +3075,9 @@ def _article_format_to_json(value: ArticleFormatV1 | None) -> dict[str, Any] | N
             {
                 "event_date": event.event_date.isoformat(),
                 "text": event.text,
-                "evidence_refs": [evidence_ref_to_json(ref) for ref in event.evidence_refs],
+                "evidence_refs": [
+                    _publication_evidence_ref_to_json(ref) for ref in event.evidence_refs
+                ],
             }
             for event in value.timeline_key_events
         ],

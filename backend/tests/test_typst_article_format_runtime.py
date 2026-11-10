@@ -72,7 +72,10 @@ def edition_template_bundle():
 
 
 def _read_fixture(name: str) -> dict[str, Any]:
-    return json.loads((_FIXTURE_ROOT / name).read_text(encoding="utf-8"))
+    fixture = json.loads((_FIXTURE_ROOT / name).read_text(encoding="utf-8"))
+    if not isinstance(fixture, dict):
+        raise ValueError(f"Fixture {name} must contain a JSON object")
+    return fixture
 
 
 def _build_workspace(
@@ -90,9 +93,7 @@ def _build_workspace(
     renderer_root = workspace / "RENDERER"
     renderer_root.mkdir(parents=True, exist_ok=True)
     data_name = (
-        "edition-render-data.json"
-        if entrypoint.endswith("edition.typ")
-        else "render-data.json"
+        "edition-render-data.json" if entrypoint.endswith("edition.typ") else "render-data.json"
     )
     (renderer_root / data_name).write_text(
         json.dumps(render_data, ensure_ascii=False), encoding="utf-8"
@@ -157,9 +158,7 @@ def _extract_bbox_lines(path: Path) -> list[list[dict[str, Any]]]:
     for page in root.findall(".//xhtml:page", namespace):
         lines = []
         for line in page.findall(".//xhtml:line", namespace):
-            text = " ".join(
-                word.text or "" for word in line.findall("xhtml:word", namespace)
-            )
+            text = " ".join(word.text or "" for word in line.findall("xhtml:word", namespace))
             if text:
                 lines.append(
                     {
@@ -260,15 +259,11 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
     assert "https://example.test/report" in compact_text
     assert "Threat Desk" not in text
     assert any(
-        str(annotation.get_object().get("/A", {}).get("/URI", ""))
-        == "https://example.test/report"
+        str(annotation.get_object().get("/A", {}).get("/URI", "")) == "https://example.test/report"
         for page in reader.pages
         for annotation in page.get("/Annots", ())
     )
-    assert sum(
-        len(values)
-        for values in fixture["article_format"]["ioc_categories"].values()
-    ) == 90
+    assert sum(len(values) for values in fixture["article_format"]["ioc_categories"].values()) == 90
     compact_text = "".join(text.split())
     for values in fixture["article_format"]["ioc_categories"].values():
         for item in values:
@@ -282,9 +277,7 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
     ]
 
     def find_bbox_lines(fragment: str) -> list[tuple[int, int, dict[str, Any]]]:
-        matches = [
-            item for item in bbox_lines if fragment.casefold() in item[2]["text"].casefold()
-        ]
+        matches = [item for item in bbox_lines if fragment.casefold() in item[2]["text"].casefold()]
         assert matches, fragment
         return matches
 
@@ -296,9 +289,7 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
     def find_exact_bbox_line(value: str) -> tuple[int, int, dict[str, Any]]:
         expected = "".join(value.split()).casefold()
         matches = [
-            item
-            for item in bbox_lines
-            if "".join(item[2]["text"].split()).casefold() == expected
+            item for item in bbox_lines if "".join(item[2]["text"].split()).casefold() == expected
         ]
         assert len(matches) == 1, (value, [item[2]["text"] for item in matches])
         return matches[0]
@@ -465,7 +456,7 @@ async def test_edition_reuses_the_article_format_helpers_for_article_and_brief(
             "country_code": "CN",
             "bulletin_number": "3",
             "bulletin_identifier": "APT-CN2609",
-            "tlp": "TLP:CLEAR"
+            "tlp": "TLP:CLEAR",
         },
         "file_ioc_count": 0,
         "publications": [
@@ -476,7 +467,7 @@ async def test_edition_reuses_the_article_format_helpers_for_article_and_brief(
                 "anchor": "article-01",
                 "title": article["title"],
                 "article_format": article["article_format"],
-                "content_sections": article["content_sections"]
+                "content_sections": article["content_sections"],
             },
             {
                 "position": 2,
@@ -485,9 +476,9 @@ async def test_edition_reuses_the_article_format_helpers_for_article_and_brief(
                 "anchor": "brief-02",
                 "title": brief["title"],
                 "article_format": None,
-                "content_sections": brief["content_sections"]
-            }
-        ]
+                "content_sections": brief["content_sections"],
+            },
+        ],
     }
     pdf_bytes = await _compile(
         tmp_path=tmp_path,

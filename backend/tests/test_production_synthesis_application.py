@@ -1925,7 +1925,7 @@ def test_article_wire_contract_accepts_and_rejects_required_structure() -> None:
     synthesis_module.validate_article_synthesis_structure(arbitrary_heading_article)
 
     overview_labels = ("Victimologie :", "Arsenal :", "Objectif principal :")
-    short_sections = tuple(
+    short_proposal_sections = tuple(
         section.model_copy(
             update={
                 "claims": tuple(
@@ -1945,7 +1945,7 @@ def test_article_wire_contract_accepts_and_rejects_required_structure() -> None:
         for section_index, section in enumerate(article.sections)
     )
     synthesis_module.validate_article_synthesis_structure(
-        article.model_copy(update={"sections": short_sections[:1]})
+        article.model_copy(update={"sections": short_proposal_sections[:1]})
     )
 
 

@@ -490,13 +490,15 @@ def _replacement_offset_map(before: str, after: str) -> tuple[int, ...]:
                 mapping[old_start + offset] = new_start + round(offset * new_width / old_width)
     mapping[0] = 0
     mapping[-1] = len(after)
+    resolved: list[int] = []
     previous = 0
-    for index, value in enumerate(mapping):
+    for value in mapping:
         if value is None:
-            mapping[index] = previous
+            value = previous
         else:
             previous = value
-    return tuple(int(value) for value in mapping)
+        resolved.append(value)
+    return tuple(resolved)
 
 
 def _semantic_span_with_text(span: Mapping[str, Any], text: str) -> dict[str, Any] | None:
@@ -616,13 +618,15 @@ def _refang_known_iocs(
         offsets[old_cursor + index] = new_cursor + index
     offsets[0] = 0
     offsets[-1] = new_cursor + len(suffix)
+    resolved_offsets: list[int] = []
     previous = 0
-    for index, offset in enumerate(offsets):
+    for offset in offsets:
         if offset is None:
-            offsets[index] = previous
+            offset = previous
         else:
             previous = offset
-    return "".join(output), tuple(int(offset) for offset in offsets)
+        resolved_offsets.append(offset)
+    return "".join(output), tuple(resolved_offsets)
 
 
 def refang_svg_text_nodes(
@@ -922,8 +926,8 @@ def _project_article_format_render_data(
         "domains": ArtifactType.DOMAIN,
     }
     for category, values in category_values.items():
-        for value, normalized_value, artifact_type in values:
-            resolved_type = artifact_type or category_types.get(category)
+        for value, normalized_value, category_artifact_type in values:
+            resolved_type = category_artifact_type or category_types.get(category)
             display_value = (
                 value
                 if resolved_type is None
@@ -1181,7 +1185,11 @@ def publication_content_section_types(
     opinion_document = draft_preview is not None or (
         isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
     )
-    brief_document = is_brief(value)
+    brief_document = (
+        is_brief(value.base_publication)
+        if isinstance(value, TypstDraftPreviewDocument)
+        else is_brief(value)
+    )
     section_types = ["references"]
     timeline_figure = (
         build_publication_timeline_figure(publication_v5)
@@ -1839,7 +1847,11 @@ class TypstRenderer:
         model = project_publication_to_typst_model(
             document,
             infrastructure_graph_media_ref=infrastructure_graph_media_ref,
-            include_brief_chronology=is_brief(document),
+            include_brief_chronology=(
+                is_brief(document.base_publication)
+                if isinstance(document, TypstDraftPreviewDocument)
+                else is_brief(document)
+            ),
             brief_timeline_policy_version=brief_timeline_policy_version,
         )
         target_descriptors: tuple[dict[str, Any], ...] = ()
@@ -2063,7 +2075,11 @@ def project_publication_to_typst_model(
     opinion_document = draft_preview is not None or (
         isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
     )
-    brief_document = is_brief(value)
+    brief_document = (
+        is_brief(value.base_publication)
+        if isinstance(value, TypstDraftPreviewDocument)
+        else is_brief(value)
+    )
     detection = publication_v6.detection if publication_v6 is not None else None
     draft_iocs = _draft_opinion_iocs(draft_preview) if draft_preview is not None else ()
     if isinstance(publication_v5, PublicationDocumentV5):
@@ -2123,7 +2139,12 @@ def project_publication_to_typst_model(
             publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None
         ),
         publication_v8=publication_v8,
-        brief=is_brief(value) or opinion_document,
+        brief=(
+            is_brief(value.base_publication)
+            if isinstance(value, TypstDraftPreviewDocument)
+            else is_brief(value)
+        )
+        or opinion_document,
         refang_replacements=refang_replacements,
         project_text=project_text,
     )
@@ -2191,8 +2212,8 @@ def project_publication_to_typst_model(
         if column_spans and all(item is not None for item in column_spans):
             block["semantic_columns"] = column_spans
         cell_spans = []
-        for row_index, row in enumerate(table.rows, start=1):
-            for cell_index, cell in enumerate(row.cells, start=1):
+        for row_index, table_row in enumerate(table.rows, start=1):
+            for cell_index, cell in enumerate(table_row.cells, start=1):
                 display_cell, spans = project_text(
                     f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}",
                     cell,
@@ -2306,8 +2327,8 @@ def project_publication_to_typst_model(
         lead_paragraph_anchor(index): lead_paragraph.text
         for index, lead_paragraph in enumerate(document.lead, start=1)
     }
-    for section_index, section in enumerate(document.sections):
-        for paragraph_index, paragraph in enumerate(section.paragraphs, start=1):
+    for section_index, publication_section in enumerate(document.sections):
+        for paragraph_index, paragraph in enumerate(publication_section.paragraphs, start=1):
             if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints:
                 body_anchor_texts[section_paragraph_anchor(section_index, paragraph_index)] = (
                     paragraph.text
@@ -2368,20 +2389,20 @@ def project_publication_to_typst_model(
     has_projected_overview = isinstance(overview_render, dict) and any(
         value is not None for value in overview_render.values()
     )
-    for section_index, section in enumerate(document.sections):
+    for section_index, publication_section in enumerate(document.sections):
         if (
             has_projected_overview
             and section_index == 0
-            and is_article_overview_heading(section.heading)
+            and is_article_overview_heading(publication_section.heading)
         ):
             continue
         paragraph_blocks = [
             (paragraph_index, paragraph)
-            for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
+            for paragraph_index, paragraph in enumerate(publication_section.paragraphs, start=1)
             if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
         ]
-        if section.heading and paragraph_blocks:
-            display_heading, _heading_spans = project_text("", section.heading)
+        if publication_section.heading and paragraph_blocks:
+            display_heading, _heading_spans = project_text("", publication_section.heading)
             body_blocks.append({"type": "section_heading", "text": display_heading})
         for paragraph_index, paragraph in paragraph_blocks:
             append_paragraph(
@@ -2438,15 +2459,15 @@ def project_publication_to_typst_model(
             for index, entry in enumerate(document.timeline, start=1)
             if entry.event_date is not None
         }
-        for event in selected_timeline:
-            anchor = source_anchor_by_event.get((event.event_date, event.text), "")
-            display_text, spans = project_text(anchor, event.text)
+        for source_event in selected_timeline:
+            anchor = source_anchor_by_event.get((source_event.event_date, source_event.text), "")
+            display_text, spans = project_text(anchor, source_event.text)
             timeline_row = {
-                "display_date": _display_date(None, event.event_date),
+                "display_date": _display_date(None, source_event.event_date),
                 "text": display_text,
-                "source_urls": _timeline_source_urls(event.evidence_refs, sources_by_id),
+                "source_urls": _timeline_source_urls(source_event.evidence_refs, sources_by_id),
                 "source_document_ids": [
-                    str(reference.source_document_id) for reference in event.evidence_refs
+                    str(reference.source_document_id) for reference in source_event.evidence_refs
                 ],
             }
             if spans is not None:
@@ -2462,15 +2483,15 @@ def project_publication_to_typst_model(
             for index, entry in enumerate(document.timeline, start=1)
             if entry.event_date is not None
         }
-        for event in selected_timeline:
-            anchor = source_anchor_by_event.get((event.event_date, event.text), "")
-            display_text, spans = project_text(anchor, event.text)
+        for source_event in selected_timeline:
+            anchor = source_anchor_by_event.get((source_event.event_date, source_event.text), "")
+            display_text, spans = project_text(anchor, source_event.text)
             timeline_row = {
-                "display_date": _display_date(None, event.event_date),
+                "display_date": _display_date(None, source_event.event_date),
                 "text": display_text,
-                "source_urls": _timeline_source_urls(event.evidence_refs, sources_by_id),
+                "source_urls": _timeline_source_urls(source_event.evidence_refs, sources_by_id),
                 "source_document_ids": [
-                    str(reference.source_document_id) for reference in event.evidence_refs
+                    str(reference.source_document_id) for reference in source_event.evidence_refs
                 ],
             }
             if spans is not None:
@@ -2670,13 +2691,13 @@ def project_publication_to_typst_model(
     add_indicator_group(document.indicators, "Retenu")
     add_indicator_group(original_indicator_groups, "Lien non démontré")
     for item in ioc_details:
-        row = ensure_ioc_row(item.artifact_type, item.value, item.normalized_value)
-        if row is None:
+        detail_row = ensure_ioc_row(item.artifact_type, item.value, item.normalized_value)
+        if detail_row is None:
             continue
-        row["_source_ids"].update(item.source_document_ids)
-        row["roles"].add(item.source_role.value)
+        detail_row["_source_ids"].update(item.source_document_ids)
+        detail_row["roles"].add(item.source_role.value)
         status_label = _IOC_DISPOSITION_LABELS[item.disposition]
-        row["statuses"].add(status_label)
+        detail_row["statuses"].add(status_label)
         for source_id in item.source_document_ids:
             source_for(source_id)
         provenance = {
@@ -2702,7 +2723,7 @@ def project_publication_to_typst_model(
             ),
             "source_document_ids": item.source_document_ids,
             "source_role": item.source_role.value,
-            "value": row["value"],
+            "value": detail_row["value"],
         }
         for source_id in item.source_document_ids:
             key = (
@@ -2713,10 +2734,10 @@ def project_publication_to_typst_model(
                     if field not in {"source_document_ids", "value"}
                 ),
             )
-            if key in row["_provenance_keys"]:
+            if key in detail_row["_provenance_keys"]:
                 continue
-            row["_provenance_keys"].add(key)
-            row["provenance"].append(provenance)
+            detail_row["_provenance_keys"].add(key)
+            detail_row["provenance"].append(provenance)
 
     # Keep every evidence source addressable from citations, including technical
     # sources and references that have no editorial summary paragraph.
@@ -2786,8 +2807,8 @@ def project_publication_to_typst_model(
     def add_source_links(event: dict[str, Any]) -> None:
         event["source_refs"] = source_links_for_ids(event.pop("source_document_ids", ()))
 
-    for event in timeline:
-        add_source_links(event)
+    for rendered_event in timeline:
+        add_source_links(rendered_event)
 
     def abbreviated(value: str, limit: int) -> str:
         cleaned = " ".join(value.split())
@@ -3074,14 +3095,18 @@ def project_publication_to_typst_model(
         )
         draft_ioc_item["qualifications"].add(draft_ioc.qualification)
 
-        row = ensure_ioc_row(draft_ioc.artifact_type, display_value, draft_ioc.normalized_value)
-        if row is not None:
-            row["statuses"].add(
+        draft_ioc_row = ensure_ioc_row(
+            draft_ioc.artifact_type, display_value, draft_ioc.normalized_value
+        )
+        if draft_ioc_row is not None:
+            draft_ioc_row["statuses"].add(
                 "IOC original — finding étayé" if status == "originals" else "Candidat non confirmé"
             )
-            row["_draft_contexts"].append(draft_ioc.context)
+            draft_ioc_row["_draft_contexts"].append(draft_ioc.context)
             reference_count = len(draft_ioc.finding_refs) + len(draft_ioc.observation_refs)
-            row["_draft_references"].extend(draft_ioc_item["_draft_references"][-reference_count:])
+            draft_ioc_row["_draft_references"].extend(
+                draft_ioc_item["_draft_references"][-reference_count:]
+            )
 
     def project_ioc_list_groups(status: str) -> list[dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -3147,16 +3172,18 @@ def project_publication_to_typst_model(
     # legacy technical annex remains part of the document contract. Article and
     # brief PDFs do not render this section.
     ioc_rows: list[dict[str, Any]] = []
-    for ioc_key, row in sorted(
+    for ioc_key, ioc_detail_row in sorted(
         ioc_by_key.items(),
         key=lambda item: (item[1]["type"], item[1]["value"].casefold()),
     ):
-        context_summary = compact_ioc_provenance(row)
+        context_summary = compact_ioc_provenance(ioc_detail_row)
         hash_context_summary = None
-        if row["type"] == ArtifactType.HASH.value:
+        if ioc_detail_row["type"] == ArtifactType.HASH.value:
             context_summary = abbreviated(context_summary, 120)
             contexts = tuple(
-                dict.fromkeys(item["context"] for item in row["provenance"] if item.get("context"))
+                dict.fromkeys(
+                    item["context"] for item in ioc_detail_row["provenance"] if item.get("context")
+                )
             )
             hash_context_summary = abbreviated(" / ".join(contexts), 36)
         origins = ioc_origins.get(ioc_key, set())
@@ -3167,14 +3194,14 @@ def project_publication_to_typst_model(
             if "original" in origins
             else "Piste non confirmée"
         )
-        draft_contexts = tuple(dict.fromkeys(row.pop("_draft_contexts")))
-        draft_references = row.pop("_draft_references")
+        draft_contexts = tuple(dict.fromkeys(ioc_detail_row.pop("_draft_contexts")))
+        draft_references = ioc_detail_row.pop("_draft_references")
         if draft_contexts:
             context_summary += " · Contexte du finding : " + " / ".join(draft_contexts)
-        source_ids = sorted(row.pop("_source_ids"), key=str)
-        row.pop("_provenance_keys")
-        row.pop("provenance")
-        statuses = sorted(row.pop("statuses"), key=str.casefold)
+        source_ids = sorted(ioc_detail_row.pop("_source_ids"), key=str)
+        ioc_detail_row.pop("_provenance_keys")
+        ioc_detail_row.pop("provenance")
+        statuses = sorted(ioc_detail_row.pop("statuses"), key=str.casefold)
         source_links = []
         source_refs = []
         for source_id in source_ids:
@@ -3194,12 +3221,12 @@ def project_publication_to_typst_model(
                         "target_id": reference_target_by_source_id[source_id],
                     }
                 )
-        row.update(
+        ioc_detail_row.update(
             {
                 "source_role": ", ".join(
-                    sorted(row["roles"], key=lambda role: str(role).casefold())
+                    sorted(ioc_detail_row["roles"], key=lambda role: str(role).casefold())
                 ),
-                "roles": sorted(row["roles"], key=lambda role: str(role).casefold()),
+                "roles": sorted(ioc_detail_row["roles"], key=lambda role: str(role).casefold()),
                 "status": ", ".join(statuses),
                 "status_label": ", ".join(statuses),
                 "indicator_status_label": indicator_status_label,
@@ -3227,7 +3254,7 @@ def project_publication_to_typst_model(
                 ),
             }
         )
-        ioc_rows.append(row)
+        ioc_rows.append(ioc_detail_row)
 
     ioc_group_titles = {
         "network": "Réseau — domaines, adresses IP, URL et courriels",
@@ -3236,8 +3263,8 @@ def project_publication_to_typst_model(
         "other": "Autres identifiants techniques",
     }
     grouped_ioc_rows: dict[str, list[dict[str, Any]]] = {key: [] for key in ioc_group_titles}
-    for row in ioc_rows:
-        artifact_type = ArtifactType(row["type"])
+    for projected_ioc_row in ioc_rows:
+        artifact_type = ArtifactType(projected_ioc_row["type"])
         group_key = (
             "network"
             if artifact_type
@@ -3248,10 +3275,12 @@ def project_publication_to_typst_model(
             if artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}
             else "other"
         )
-        row["type_label"] = artifact_type.value
-        row["group_label"] = ioc_group_titles[group_key]
-        row["source_numbers"] = ", ".join(f"[{ref['number']}]" for ref in row["source_refs"])
-        grouped_ioc_rows[group_key].append(row)
+        projected_ioc_row["type_label"] = artifact_type.value
+        projected_ioc_row["group_label"] = ioc_group_titles[group_key]
+        projected_ioc_row["source_numbers"] = ", ".join(
+            f"[{ref['number']}]" for ref in projected_ioc_row["source_refs"]
+        )
+        grouped_ioc_rows[group_key].append(projected_ioc_row)
     ioc_row_groups = [
         {"heading": ioc_group_titles[key], "rows": grouped_ioc_rows[key]}
         for key in ioc_group_titles
@@ -3746,8 +3775,8 @@ def project_publication_to_typst_model(
             technical_annex["protocol_figure_provenance"] = opinion_figure_provenance
         content_sections.append(technical_annex)
     reader_sections: list[dict[str, Any]] = []
-    for section in content_sections:
-        section_type = section.get("type")
+    for content_section in content_sections:
+        section_type = content_section.get("type")
         if section_type in {"technical_annex", "provenance", "publication_provenance"} and (
             brief_document or not opinion_document
         ):
@@ -3758,11 +3787,11 @@ def project_publication_to_typst_model(
         ):
             continue
         if section_type == "ioc" and brief_document:
-            reader_sections.append(_statusless_brief_ioc_section(section))
+            reader_sections.append(_statusless_brief_ioc_section(content_section))
         elif opinion_document:
-            reader_sections.append(section)
+            reader_sections.append(content_section)
         else:
-            clean_section = _strip_render_provenance(section)
+            clean_section = _strip_render_provenance(content_section)
             if isinstance(clean_section, dict):
                 reader_sections.append(clean_section)
     # Legacy projection consumers index every section's block list directly.

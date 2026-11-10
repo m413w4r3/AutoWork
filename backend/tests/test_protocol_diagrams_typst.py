@@ -624,19 +624,20 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     pdf_path = tmp_path / "documented-protocol.pdf"
     pdf_path.write_bytes(pdf.content)
-    extracted = await anyio.run_process(
+    process_result = await anyio.run_process(
         ("pdftotext", str(pdf_path), "-"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=True,
     )
-    extracted = extracted.stdout.decode("utf-8", errors="replace")
-    extracted = " ".join(extracted.split()).casefold()
-    assert extracted.count("article_documented") == 3
-    assert extracted.count("niveau de preuve") == 3
-    assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted
+    extracted_text = process_result.stdout.decode("utf-8", errors="replace")
+    extracted_text = " ".join(extracted_text.split()).casefold()
+    assert extracted_text.count("article_documented") == 3
+    assert extracted_text.count("niveau de preuve") == 3
+    assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted_text
     assert all(
-        title in extracted for title in ("séquence réseau", "machine à états", "format de message")
+        title in extracted_text
+        for title in ("séquence réseau", "machine à états", "format de message")
     )
 
     audit_root = (

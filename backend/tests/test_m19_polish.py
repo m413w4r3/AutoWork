@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import date
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -552,7 +552,8 @@ def test_brief_timeline_policy_replays_legacy_and_projects_v4_for_both_renderers
 
     def timeline(model: Any) -> list[dict[str, object]]:
         section = next(item for item in model.content_sections if item["type"] == "chronology")
-        return section["timeline"]
+        # Typst projection sections use dynamic JSON-shaped dictionaries.
+        return cast(list[dict[str, object]], section["timeline"])
 
     legacy_model = project_publication_to_typst_model(brief, include_brief_chronology=True)
     v4_model = project_publication_to_typst_model(

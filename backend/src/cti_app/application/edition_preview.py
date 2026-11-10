@@ -421,7 +421,7 @@ class EditionPreviewService:
         async with self._uow_factory() as uow:
             for item in preview.artifacts:
                 publication_artifact = await uow.production_artifacts.get(item.artifact_id)
-                identity = (
+                identity: dict[str, Any] = (
                     await publication_target_artifact_identities(
                         uow.production_artifacts,
                         publication_artifact,
