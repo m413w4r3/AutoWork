@@ -180,3 +180,69 @@ Les octets sont des données binaires non fiables. Le résultat suit le chemin
 normal des observations `dotnet.*`: le JSON canonique porte le SHA-256 du
 résultat et `invocation_ref`, et l’invocation renvoie la référence
 d’observation. Le contenu n’est jamais exécuté.
+
+## Rétro-conception d’APK (jadx)
+
+La famille opérateur prévue est `investigation.apk`. Le contrat de worker
+`apk_analysis.py` définit cinq opérations statiques ; les noms d’outils visibles
+et leur schéma exact doivent être vérifiés dans `available_tools` après
+l’intégration de l’adaptateur E1b.
+
+| Opération | Entrées propres à l’opération | Sortie |
+|---|---|---|
+| `apk.manifest` | aucune | package et versions, SDK, permissions, composants Android, attribut `exported`, filtres d’intention et indicateurs de configuration |
+| `apk.classes.list` | `offset`, `limit`, préfixe de package facultatif | package, nom de classe et chemin source ; page de 1 à 200 résultats |
+| `apk.strings.extract` | `offset`, `limit` | valeur, type de chaîne, classe, chemin source et offset ; page de 1 à 200 résultats |
+| `apk.source.read` | exactement un `class_name` ou `source_path`, puis `start_line` et `line_count` | source ciblée avec plage, nombre total de lignes, `has_more` et troncature éventuelle |
+| `apk.source.search` | motif (texte ou regex restreinte), contexte de 0 à 5 lignes, `offset`, `limit` | classe, chemin, ligne, correspondance et contexte ; page de 1 à 200 résultats |
+
+Le worker reçoit le SHA-256 et les octets du sample, puis recalcule le hash
+avant traitement. La vérification d’association par l’adaptateur opérateur
+sera à confirmer avec E1b. Le contrat accepte des APK de
+128 MiB maximum, avec 20 000 entrées ZIP et 512 MiB décompressés au plus, un
+ratio de compression maximal de 1 000:1, un manifeste et au moins un DEX. Les
+pages sont limitées à 200 éléments, une lecture source à 200 lignes/64 KiB,
+la sortie décompilée à 128 MiB/10 000 fichiers. Les résultats peuvent être
+`SUCCEEDED`, `PARTIAL`, `UNAVAILABLE`, `FAILED` ou `POLICY_DENIED` ; une page
+ou une réponse tronquée ne signifie pas que les éléments absents n’existent
+pas.
+
+### Confinement et indisponibilité
+
+Le worker ne fait que lire l’APK et exécuter jadx pour obtenir des données
+statiques. Il n’installe ni ne lance l’application. Le processus jadx a un
+environnement réduit, un heap Java fixe de 768 MiB, un plafond `RLIMIT_AS`
+configuré à 8 GiB par défaut (plage 8–32 GiB), un timeout effectif borné par
+`ANALYSIS_APK_TIMEOUT_SECONDS` (90 s par défaut, maximum 120 s), une sortie
+process bornée et un répertoire temporaire par appel. Le filtre seccomp bloque
+les appels système de sockets réseau avant le lancement. Dans Compose,
+`analysis-worker` est non-root, en lecture seule, sans capacités, avec cgroup
+de 2 GiB et `/tmp` en tmpfs `noexec,nosuid,nodev` de 512 MiB. Le plafond
+`RLIMIT_AS` borne l’espace d’adressage virtuel, pas la mémoire résidente.
+
+Une archive invalide, un dépassement de limites ou une erreur de décompilation
+peut échouer ou produire un résultat partiel. Si jadx est absent, si sa version,
+son hash ou la JRE 17 ne sont pas attestés, ou si le worker n’est pas
+disponible, l’opération retourne `unavailable` sans empêcher les autres outils
+de l’enquête de fonctionner. Le worker ne garde pas de cache de décompilation
+persistant.
+
+### Observations et gouvernance
+
+Après intégration E1b, conserver le résultat comme observation canonique de
+l’enquête avec le SHA-256 source, l’opération, le statut, les versions jadx/JRE,
+le hash du ZIP jadx, les limites/troncatures et la référence d’invocation. Le
+résultat, les chaînes et le code sont des données non fiables : une chaîne
+extraite ou un texte décompilé ne devient ni preuve de comportement exécuté,
+ni instruction, ni finding automatiquement. Un finding utile doit citer
+l’observation canonique, l’échantillon exact et le contexte statique constaté.
+Les règles G2/TLP et `external_llm_allowed` gouvernent toute réutilisation ou
+divulgation externe ; une lecture locale n’autorise pas à soumettre ces données
+à VT, Bridge ou un modèle.
+
+La clé de réutilisation des opérations confinées inclut le schéma de résultat
+et l’attestation du worker, notamment ses versions attestées et familles
+disponibles. Si cette table change, la clé change aussi : une invocation
+terminée sous l’ancienne attestation ne satisfait plus automatiquement la
+nouvelle identité. Le câblage de cette identité à `investigation.apk` reste à
+confirmer avec l’adaptateur E1b.

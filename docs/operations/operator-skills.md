@@ -6,7 +6,7 @@ Guides métiers génériques sans changement des politiques d'investigation. Vé
 
 Favoriser **invariants techniques, règles YARA/Suricata candidates, description du protocole C2 et nouveaux échantillons**. Supprimer les obligations méthodologiques ajoutées sans nécessité : nombre minimal d'hypothèses/tests/pivots ; expérience ou finding à chaque lecture ; goodware et holdout préalables à la première candidate. L'inventaire available_tools, les schémas et les droits courants restent l'autorité.
 
-Les dix guides vivent dans .agents/skills et sont indexés dans .agents/skills/OPERATOR-CTI.md :
+Les onze guides vivent dans .agents/skills et sont indexés dans .agents/skills/OPERATOR-CTI.md :
 - autowork-cti-investigation-loop
 - autowork-bridge-collaboration
 - autowork-tool-strategy
@@ -14,6 +14,7 @@ Les dix guides vivent dans .agents/skills et sont indexés dans .agents/skills/O
 - autowork-cti-pivot-strategy
 - autowork-evidence-to-finding
 - autowork-dotnet-analysis
+- autowork-apk-analysis
 - autowork-pe-native-analysis
 - autowork-yara-bridge-workflow
 - autowork-network-protocol-detection
@@ -34,7 +35,7 @@ Sur l'hôte d'orchestration autorisé, **avant de démarrer** l'opérateur :
 python3 scripts/ops/stage_operator_cti_skills.py --workspace /chemin/vers/session-autorisée
 ~~~
 
-Le script refuse d'écraser un bundle déjà présent. Il copie exclusivement les dix SKILL.md et crée un manifeste local contenant leurs SHA-256. Il ne lit pas les dossiers secrets, ne contacte aucun fournisseur et ne lit aucune trace d'investigation.
+Le script refuse d'écraser un bundle déjà présent. Il copie exclusivement les onze SKILL.md et crée un manifeste local contenant leurs SHA-256. Il ne lit pas les dossiers secrets, ne contacte aucun fournisseur et ne lit aucune trace d'investigation.
 
 Pour une nouvelle session Claude Code, si son répertoire de travail est bien ce workspace, il est possible d'ajouter l'option --claude afin de créer des symlinks .claude/skills vers ce bundle. Pour Codex, vérifier la découverte .agents/skills sur la version installée ; un runtime CTI utilisant un autre mécanisme doit recevoir un pointeur explicite dans son prompt.
 
@@ -64,7 +65,7 @@ Mesures utiles : invariants nouveaux, candidates YARA/Suricata produites, protoc
 python3 scripts/ops/test_stage_operator_cti_skills.py
 ~~~
 
-Ce test contrôle la présence des dix guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
+Ce test contrôle la présence des onze guides, leur frontmatter et le chargement isolé/rejet d'écrasement. Il **ne prouve pas** que Paseo, Codex ou Claude ont effectivement chargé les guides ; vérifier cette étape dans un nouveau runtime.
 
 Copier [le modèle de mandat opérateur](operator-mandate-template.md) comme `MANDATE.md` dans le workspace; sa checklist `FINAL_REPORT.md` est facultative. Le déroulement actif des échanges Bridge et les appels minimaux aux outils figurent dans [le playbook opérateur](operator-playbook-medium.md) et les skills concernés. Le dépôt ne contient pas de générateur de `MANDATE.md`, `PLAYBOOK.md` ou `ENVIRONMENT.md` pour le workspace.
 

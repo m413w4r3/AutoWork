@@ -22,6 +22,7 @@ Une phrase en `purpose` peut noter l’objectif et le résultat recherché; une 
 
 | Question | Familles à inspecter | Préflight décisif |
 | --- | --- | --- |
+| APK / DEX Android | `investigation.apk` ; autowork-apk-analysis | SHA associé, worker jadx annoncé, pagination/troncature et observation canonique |
 | Texte article / preuve | article.get_claims, evidence.get, graph.neighbors | Claim/observation exacts et lisibles |
 | Statique PE/ELF | sample.get_feature_pack, sample.analyze, strings.list, local.run_command | Association + bytes + worker |
 | IL .NET | assembly.inspect, types.list, methods.list, method.decompile, resources.list, references.imports | Assembly managé, couverture de méthode |

@@ -18,6 +18,7 @@ SPEC.loader.exec_module(module)
 
 class StageSkillsTests(unittest.TestCase):
     def test_stage_all_skills_with_exact_hash_manifest(self) -> None:
+        self.assertIn("autowork-apk-analysis", module.SKILL_NAMES)
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)
             hashes = module.stage(workspace)
