@@ -47,6 +47,11 @@ from cti_app.application.investigation_advisor_tools import (
     register_advisor_reparse_tool,
     register_investigation_advisor_tool,
 )
+from cti_app.application.investigation_apk_tools import (
+    APK_TOOL_NAMES,
+    apk_tool_capabilities,
+    register_apk_tools,
+)
 from cti_app.application.investigation_article_snapshot import ProductionArticleSnapshotAdapter
 from cti_app.application.investigation_dotnet_tools import (
     DOTNET_TOOL_NAMES,
@@ -222,6 +227,7 @@ OPTIONAL_CAPABILITIES = {
     "ghidra": "investigation.ghidra",
     "acquisition": "investigation.acquisition",
     "dotnet": "investigation.dotnet",
+    "apk": "investigation.apk",
 }
 OPTIONAL_TOOL_NAMES = (
     "finding.propose",
@@ -280,6 +286,7 @@ OPTIONAL_TOOL_NAMES = (
     "network.protocol.render",
     "network.protocol.document",
     *DOTNET_TOOL_NAMES,
+    *APK_TOOL_NAMES,
     NATIVE_TOOL_NAME,
 )
 FAMILY_CAPABILITY_KEYS = frozenset(
@@ -299,7 +306,9 @@ FAMILY_CAPABILITY_KEYS = frozenset(
         "network.protocol.render",
         "network.protocol.document",
         "investigation.dotnet",
+        "investigation.apk",
         *DOTNET_TOOL_NAMES,
+        *APK_TOOL_NAMES,
         NATIVE_TOOL_NAME,
     }
 )
@@ -740,6 +749,21 @@ def _register_native_tool_family(
     )
     enabled.update(
         dotnet_tool_capabilities(
+            execution=dependencies.confined_analysis_execution,
+            sample_associations=dependencies.sample_associations,
+            recorder=recorder,
+        )
+    )
+    register_apk_tools(
+        registry,
+        execution=dependencies.confined_analysis_execution,
+        sample_associations=dependencies.sample_associations,
+        recorder=recorder,
+        uow_factory=uow_factory,
+        settings=settings,
+    )
+    enabled.update(
+        apk_tool_capabilities(
             execution=dependencies.confined_analysis_execution,
             sample_associations=dependencies.sample_associations,
             recorder=recorder,
@@ -1839,6 +1863,12 @@ def _unavailable_tool_reasons(
             reason = "native_analysis_unavailable"
         elif name in DOTNET_TOOL_NAMES:
             reason = worker_reason("dotnet", "dotnet_ilspy_unavailable")
+        elif name in APK_TOOL_NAMES:
+            reason = (
+                "sample_associations_unavailable"
+                if dependencies.sample_associations is None
+                else worker_reason("apk", "apk_jadx_unavailable")
+            )
         elif name == "sandbox.report.import":
             reason = "behavior_report_import_unavailable"
         elif name.startswith(("features.", "samples.")) or name == "signatures.candidates":
