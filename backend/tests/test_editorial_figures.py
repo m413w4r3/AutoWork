@@ -90,6 +90,7 @@ from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
 from tests.test_publication_document_v6 import _approved_opinion
+from tests.test_publication_document_v7 import _v6
 from tests.test_source_media_collection import _png
 
 
@@ -321,11 +322,9 @@ def test_figures_are_omitted_without_canonical_events_or_cited_observations() ->
 
 def test_v8_article_projection_uses_the_native_timeline_contract() -> None:
     publication, extraction = _publication_with_timeline(include_extraction=True)
-    opinion, context = _approved_opinion(publication)
-    v6 = augment_publication_with_opinion(publication, opinion, context)
     article = PublicationDocumentV8(
         base_publication=PublicationDocumentV7(
-            base_publication=v6,
+            base_publication=_v6(publication),
             publication_kind=PublicationKind.ARTICLE,
             routing_decision_hash="f" * 64,
             routing_policy_version="test-routing-v1",
@@ -344,6 +343,32 @@ def test_v8_article_projection_uses_the_native_timeline_contract() -> None:
         section["type"] not in {"chronology", "technical_annex", "provenance"}
         for section in model.content_sections
     )
+
+
+def test_v8_publication_with_an_approved_opinion_keeps_the_opinion_document_contract() -> None:
+    # An analyst opinion is not part of the M18/M19 article redesign: a V8 envelope that
+    # carries an approved opinion renders as an opinion document (legacy chronology and
+    # traceability annex), without a duplicate native ArticleFormat timeline.
+    publication, extraction = _publication_with_timeline(include_extraction=True)
+    opinion, context = _approved_opinion(publication)
+    v6 = augment_publication_with_opinion(publication, opinion, context)
+    document = PublicationDocumentV8(
+        base_publication=PublicationDocumentV7(
+            base_publication=v6,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="f" * 64,
+            routing_policy_version="test-routing-v1",
+        ),
+        article_format=build_article_format_v1(publication, extraction),
+    )
+
+    model = project_publication_to_typst_model(document)
+
+    section_types = [section["type"] for section in model.content_sections]
+    assert model.article_format is None
+    assert "analyst_opinion" in section_types
+    assert "technical_annex" in section_types
+    assert section_types.count("chronology") == 1
 
 
 @pytest.mark.asyncio
