@@ -441,6 +441,31 @@ async def test_ghidra_decompile_returns_precise_unsupported_function_status() ->
 
 
 @pytest.mark.asyncio
+async def test_ghidra_decompile_accepts_service_nested_function_shape_and_records_source() -> None:
+    harness = _Harness()
+    function = {
+        "name": "FUN_140007890",
+        "address": "140007890",
+        "decompilation": "int FUN_140007890(void) { return 42; }",
+    }
+    harness.ghidra.data = {"status": "succeeded", "reason": None, "function": function}
+
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key="ghidra-nested-decompile"),
+        "ghidra.decompile_function",
+        {"sample_sha256": _SAMPLE_SHA256, "address": "140007890"},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["data"]["function"] == function
+    observation = await harness.observations.get(result.observation_refs[0])
+    assert observation is not None
+    payload = harness.artifact_store.payloads[observation.blob_id]
+    assert payload["data"]["function"] == function
+
+
+@pytest.mark.asyncio
 async def test_unknown_command_and_non_catalogued_options_are_refused() -> None:
     harness = _Harness()
     context = harness.context()
