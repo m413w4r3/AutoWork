@@ -50,6 +50,20 @@
     hyphenate: false,
   )[#body]
 ]
+#let semantic-technical-code-block(lines) = block(
+  width: 100%,
+  breakable: true,
+  fill: rgb("#F8FAFC"),
+  stroke: 0.4pt + light-grey,
+  radius: 2pt,
+  inset: (x: 6pt, y: 4pt),
+)[
+  #set par(justify: false, leading: 0.95em, spacing: 0pt)
+  #for (index, line) in lines.enumerate() [
+    #text(font: code-font-families, size: 8pt, hyphenate: false)[#display-text(line)]
+    #if index < lines.len() - 1 [#linebreak()]
+  ]
+]
 #let semantic-technical(body) = semantic-inline-technical(body)
 #let semantic-technical-literal(body) = semantic-inline-technical(body)
 #let semantic-table-technical(body) = semantic-inline-technical(body)
@@ -213,23 +227,25 @@
   }
 ]
 
-#let noteAnalyste(content) = {
+#let noteAnalyste(content, title: [Note de l'analyste], breakable: false) = {
   block(
     fill: notion-gray-bg,
     radius: 4pt,
     width: 100%,
     inset: 8pt,
-    breakable: false,
+    breakable: breakable,
   )[
     #pad(
       top: 6pt,
       bottom: 8pt
     )[
-      #text(
-        size: 14pt,
-        weight: "extrabold",
-        fill: purple-dark,
-      )[Note de l'analyste]
+      #if title != none [
+        #text(
+          size: 14pt,
+          weight: "extrabold",
+          fill: purple-dark,
+        )[#title]
+      ]
       
       #content
     ]

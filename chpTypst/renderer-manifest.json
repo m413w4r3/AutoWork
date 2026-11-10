@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v42-m19-polish",
+  "template_version": "chp-article-v43-m20-opinion-render",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

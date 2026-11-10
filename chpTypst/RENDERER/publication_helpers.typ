@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, code-font-families, noteAnalyste, tag, publication-url-footnote
+#import "../UTILS/helpers.typ": semantic-text, semantic-or-plain, semantic-technical-literal, semantic-technical-code-block, code-font-families, noteAnalyste, tag, publication-url-footnote
 #import "../UTILS/colors.typ": accent, grey, purple, purple-light
 
 #let has-text(value) = value != none and value != ""
@@ -512,7 +512,7 @@
         #publication-display-text(segment.display)
       ]
     } else {
-      text(size: 8pt)[#publication-display-text(segment.display)]
+      text(size: 8pt, hyphenate: false)[#publication-display-text(segment.display)]
     }
   }
 }
@@ -535,7 +535,44 @@
   )
 }
 
-#let render-opinion-text(spans, fallback, pipe-table: none) = {
+#let render-opinion-reference(
+  target-id,
+  display,
+  reference-scope: "",
+  fallback-url: none,
+) = context {
+  let target = label(reference-scope + target-id)
+  if query(target).len() > 0 [
+    #link(target)[#display]
+  ] else if fallback-url != none [
+    #link(fallback-url)[#display]
+  ] else [
+    #display
+  ]
+}
+
+#let render-opinion-note-markers(references, reference-scope: "") = {
+  if references.len() > 0 [
+    #super[
+      #for (index, reference) in references.enumerate() [
+        #if index > 0 [,]
+        #render-opinion-reference(
+          reference.target_id,
+          [#str(reference.at("note_number", default: reference.label))],
+          reference-scope: reference-scope,
+          fallback-url: reference.at("href", default: none),
+        )
+      ]
+    ]
+  ]
+}
+
+#let render-opinion-text(
+  spans,
+  fallback,
+  pipe-table: none,
+  analyst-opinion-style: false,
+) = {
   if pipe-table != none {
     let prefix = pipe-table.at("prefix", default: "")
     let suffix = pipe-table.at("suffix", default: "")
@@ -559,8 +596,14 @@
       #set par(justify: false)
       #if spans == none [#text(fallback)] else [
         #for span in spans [
-          #if span.at("technical", default: false) [
-            #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
+          #if analyst-opinion-style and span.at("code_block", default: false) [
+            #semantic-technical-code-block(span.at("code_lines", default: (span,)))
+          ] else if span.at("technical", default: false) [
+            #if analyst-opinion-style [
+              #semantic-technical-literal[#publication-display-text(span)]
+            ] else [
+              #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
+            ]
           ] else [#text(span.text)]
         ]
       ]
@@ -647,22 +690,6 @@
     )[
       #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
     ]
-  ]
-}
-
-#let render-opinion-reference(
-  target-id,
-  display,
-  reference-scope: "",
-  fallback-url: none,
-) = context {
-  let target = label(reference-scope + target-id)
-  if query(target).len() > 0 [
-    #link(target)[#display]
-  ] else if fallback-url != none [
-    #link(fallback-url)[#display]
-  ] else [
-    #display
   ]
 }
 
@@ -903,7 +930,7 @@
             row-gutter: 2pt,
             ..refs.map(item => [
               #block(breakable: false)[
-                #text(size: 7.5pt, weight: "bold")[#item.label #label(reference-scope + item.target_id)]
+                #text(size: 7.5pt, weight: "bold")[#super[#str(item.note_number)] #item.label #label(reference-scope + item.target_id)]
                 #h(0.35em)
                 #link(item.href)[#text(font: code-font-families, size: 7.5pt, hyphenate: false)[#publication-display-text(item.reference_id_spans)]]
               ]
@@ -1224,18 +1251,35 @@
   )
 }
 
-#let render-analyst-observation(item, reference-scope: "") = noteAnalyste[
-  #render-opinion-text(item.at("text_spans", default: none), item.text)
-  #let finding-refs = item.at("finding_refs", default: ())
-  #let evidence-refs = item.at("evidence_refs", default: ())
-  #if finding-refs.len() > 0 or evidence-refs.len() > 0 [
-    #v(3pt)
-    #text(size: 7pt, fill: grey)[Références : ]
-    #render-opinion-references(finding-refs, reference-scope: reference-scope)
-    #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
-    #render-opinion-references(evidence-refs, reference-scope: reference-scope)
+#let render-analyst-observation(
+  item,
+  reference-scope: "",
+  panel: true,
+  analyst-opinion-style: false,
+) = {
+  let finding-refs = item.at("finding_refs", default: ())
+  let evidence-refs = item.at("evidence_refs", default: ())
+  let content = [
+    #render-opinion-text(
+      item.at("text_spans", default: none),
+      item.text,
+      analyst-opinion-style: analyst-opinion-style,
+    )
+    #if analyst-opinion-style [
+      #render-opinion-note-markers(
+        finding-refs + evidence-refs,
+        reference-scope: reference-scope,
+      )
+    ] else if finding-refs.len() > 0 or evidence-refs.len() > 0 [
+      #v(3pt)
+      #text(size: 7pt, fill: grey)[Références : ]
+      #render-opinion-references(finding-refs, reference-scope: reference-scope)
+      #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
+      #render-opinion-references(evidence-refs, reference-scope: reference-scope)
+    ]
   ]
-]
+  if panel { noteAnalyste(content) } else { content }
+}
 
 #let render-body-block(
   item,
@@ -1481,46 +1525,118 @@
         or content_section.at("infrastructure_graph_figure", default: none) != none
       )
       #if has-opinion-content [
-      #render-section-heading[Avis de l'analyste]
-      #for item in opinion-blocks [
-        #heading(level: 3)[#item.number #text(item.heading)]
-        #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
-        #parbreak()
-        #render-opinion-text(
-          item.at("text_spans", default: none),
-          item.text,
-          pipe-table: item.at("pipe_table", default: none),
-        )
-        #parbreak()
-        #if item.finding_refs.len() > 0 or item.evidence_refs.len() > 0 [
-          #text(size: 7pt, fill: grey)[Références : ]
-          #render-opinion-references(item.finding_refs, reference-scope: reference-scope)
-          #if item.finding_refs.len() > 0 and item.evidence_refs.len() > 0 [ · ]
-          #render-opinion-references(item.evidence_refs, reference-scope: reference-scope)
-          #parbreak()
+      #let has-opinion-extras = (
+        protocol-figures.len() > 0
+        or unresolved-points.len() > 0
+        or unanchored-observations.len() > 0
+        or content_section.at("investigation_chain_figure", default: none) != none
+        or content_section.at("infrastructure_graph_figure", default: none) != none
+      )
+      #let opinion-extras = [
+          #for figure in protocol-figures [
+            #v(8pt)
+            #render-diagram(figure)
+          ]
+          #if content_section.at("investigation_chain_figure", default: none) != none [
+            #v(8pt)
+            #render-investigation-chain-figure(content_section.investigation_chain_figure, reference-scope: reference-scope)
+          ]
+          #if content_section.at("infrastructure_graph_figure", default: none) != none [
+            #v(8pt)
+            #render-infrastructure-graph-figure(content_section.infrastructure_graph_figure, reference-scope: reference-scope)
+          ]
+          #if unresolved-points.len() > 0 [
+            #heading(level: 3)[Points non résolus]
+            #for point in unresolved-points [
+              #list.item[#point]
+            ]
+          ]
+          #for item in unanchored-observations [
+            #v(6pt)
+            #render-analyst-observation(
+              item,
+              reference-scope: reference-scope,
+              panel: false,
+              analyst-opinion-style: true,
+            )
+          ]
+      ]
+      #let has-wide-opinion-table = opinion-blocks.filter(
+        item => item.at("pipe_table", default: none) != none and item.pipe_table.wide,
+      ).len() > 0
+      #if not has-wide-opinion-table and opinion-blocks.len() > 0 [
+        #noteAnalyste(title: [Avis de l'analyste], breakable: true)[
+          #for item in opinion-blocks [
+            #let pipe-table = item.at("pipe_table", default: none)
+            #heading(level: 3)[#item.number #text(item.heading)]
+            #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
+            #parbreak()
+            #render-opinion-text(
+              item.at("text_spans", default: none),
+              item.text,
+              pipe-table: pipe-table,
+              analyst-opinion-style: true,
+            )
+            #render-opinion-note-markers(
+              item.finding_refs + item.evidence_refs,
+              reference-scope: reference-scope,
+            )
+            #parbreak()
+          ]
+          #opinion-extras
         ]
-      ]
-      #for figure in protocol-figures [
-        #v(8pt)
-        #render-diagram(figure)
-      ]
-      #if content_section.at("investigation_chain_figure", default: none) != none [
-        #v(8pt)
-        #render-investigation-chain-figure(content_section.investigation_chain_figure, reference-scope: reference-scope)
-      ]
-      #if content_section.at("infrastructure_graph_figure", default: none) != none [
-        #v(8pt)
-        #render-infrastructure-graph-figure(content_section.infrastructure_graph_figure, reference-scope: reference-scope)
-      ]
-      #if unresolved-points.len() > 0 [
-        #heading(level: 3)[Points non résolus]
-        #for point in unresolved-points [
-          #list.item[#point]
+      ] else [
+        #for (index, item) in opinion-blocks.enumerate() [
+          #let opinion-title = if index == 0 { [Avis de l'analyste] } else { none }
+          #let pipe-table = item.at("pipe_table", default: none)
+          #if pipe-table != none and pipe-table.wide [
+            #noteAnalyste(title: opinion-title, breakable: true)[
+              #heading(level: 3)[#item.number #text(item.heading)]
+              #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
+              #let prefix = pipe-table.at("prefix", default: "")
+              #if prefix != "" [
+                #block(sticky: true, below: 4pt)[
+                  #set par(justify: false)
+                  #text(prefix)
+                ]
+              ]
+            ]
+            #set page(flipped: true)
+            #noteAnalyste(title: none, breakable: true)[
+              #render-opinion-pipe-table(
+                pipe-table,
+                footer-note: pipe-table.at("suffix", default: none),
+              )
+              #render-opinion-note-markers(
+                item.finding_refs + item.evidence_refs,
+                reference-scope: reference-scope,
+              )
+            ]
+            #set page(flipped: false)
+            #parbreak()
+          ] else [
+            #noteAnalyste(title: opinion-title, breakable: true)[
+              #heading(level: 3)[#item.number #text(item.heading)]
+              #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
+              #parbreak()
+              #render-opinion-text(
+                item.at("text_spans", default: none),
+                item.text,
+                pipe-table: pipe-table,
+                analyst-opinion-style: true,
+              )
+              #render-opinion-note-markers(
+                item.finding_refs + item.evidence_refs,
+                reference-scope: reference-scope,
+              )
+            ]
+            #parbreak()
+          ]
         ]
-      ]
-      #for item in unanchored-observations [
-        #v(6pt)
-        #render-analyst-observation(item, reference-scope: reference-scope)
+        #if has-opinion-extras or opinion-blocks.len() == 0 [
+          #let extras-title = if opinion-blocks.len() == 0 { [Avis de l'analyste] } else { none }
+          #noteAnalyste(title: extras-title, breakable: true)[#opinion-extras]
+        ]
       ]
       ]
     ] else if content_section.type == "technical_materials" [

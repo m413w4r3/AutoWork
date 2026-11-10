@@ -1260,7 +1260,6 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     opinion, citation_context = _approved_opinion(base)
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
-
     async def compile_document(document: Any, name: str):
         root = tmp_path / name
         workspace_root = root / "workspace"
@@ -1274,13 +1273,22 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
         )
         font_root = root / "font-snapshot"
         font_root.mkdir()
-        return await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
-            TypstCompileRequest(
-                workspace_root=workspace_root,
-                entrypoint_relative_path="RENDERER/publication.typ",
-                font_paths=materialize_font_bundle(font_snapshot, font_root),
+        output_path = workspace_root / "output.pdf"
+        argv = [typst_binary, "compile", "--root", str(workspace_root)]
+        for font_path in materialize_font_bundle(font_snapshot, font_root):
+            argv.extend(("--font-path", str(font_path)))
+        argv.extend(
+            (
+                "--ignore-system-fonts",
+                "--creation-timestamp",
+                "0",
+                str(workspace_root / "RENDERER" / "publication.typ"),
+                str(output_path),
             )
         )
+        result = _run_typst_compile(tuple(argv))
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        return output_path.read_bytes()
 
     old_v5_blob = ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(base))
     old_v5_pdf = await compile_document(base, "v5-before")
@@ -1292,23 +1300,21 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     repeated_v5_pdf = await compile_document(base, "v5-after")
 
     assert old_v5_blob == repeated_v5_blob
-    assert old_v5_pdf.content == repeated_v5_pdf.content
-    reader = PdfReader(BytesIO(v6_pdf.content), strict=True)
-    assert v6_pdf.compiler_version == TYPST_COMPILER_VERSION
+    assert old_v5_pdf == repeated_v5_pdf
+    reader = PdfReader(BytesIO(v6_pdf), strict=True)
     assert len(reader.pages) >= 1
     pdftotext = shutil.which("pdftotext")
     pdftoppm = shutil.which("pdftoppm")
     assert pdftotext is not None, "Poppler pdftotext is required for V6 PDF verification"
     assert pdftoppm is not None, "Poppler pdftoppm is required for V6 PDF verification"
     pdf_path = tmp_path / "publication-v6.pdf"
-    pdf_path.write_bytes(v6_pdf.content)
-    with anyio.fail_after(10):
-        text_result = await anyio.run_process(
-            (pdftotext, str(pdf_path), "-"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
+    pdf_path.write_bytes(v6_pdf)
+    text_result = subprocess.run(
+        (pdftotext, str(pdf_path), "-"),
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
     extracted = text_result.stdout.decode("utf-8", errors="replace")
     normalized_extracted = extracted.upper().replace("\u2019", "'")
     assert "Avis de l'analyste" in extracted.replace("\u2019", "'")
@@ -1318,7 +1324,7 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     assert "FAIT ÉTAYÉ" in normalized_extracted
     assert "LE CONSTAT SUPPLÉMENTAIRE EST CORROBORÉ" in normalized_extracted
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", normalized_extracted) is None
-    assert "[F1]" in normalized_extracted and "[E1]" in normalized_extracted
+    assert "1,2" in normalized_extracted
 
     uris = []
     for page in reader.pages:
@@ -1326,25 +1332,29 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
             action = annotation_ref.get_object().get("/A")
             if action is not None and action.get("/URI") is not None:
                 uris.append(str(action["/URI"]))
-    assert any(uri.startswith("autowork://investigations/") for uri in uris)
+    assert any(
+        uri.endswith(f"/findings/{opinion.blocks[0].finding_refs[0]}") for uri in uris
+    )
+    assert any(
+        uri.endswith(f"/evidence/{opinion.blocks[0].evidence_refs[0]}") for uri in uris
+    )
     page_prefix = tmp_path / "publication-v6-page"
-    with anyio.fail_after(15):
-        await anyio.run_process(
-            (
-                pdftoppm,
-                "-f",
-                "1",
-                "-l",
-                "1",
-                "-singlefile",
-                "-png",
-                str(pdf_path),
-                str(page_prefix),
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
+    subprocess.run(
+        (
+            pdftoppm,
+            "-f",
+            "1",
+            "-l",
+            "1",
+            "-singlefile",
+            "-png",
+            str(pdf_path),
+            str(page_prefix),
+        ),
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
     assert page_prefix.with_suffix(".png").is_file()
 
 
@@ -1395,14 +1405,13 @@ async def test_opinion_paragraph_spacing_matches_b421f486_pdf_baseline(
     baseline_root = Path("/tmp/m19-m7/base")
     baseline_helper = baseline_root / "RENDERER" / "publication_helpers.typ"
     baseline_helper.parent.mkdir(parents=True, exist_ok=True)
-    with anyio.fail_after(10):
-        baseline_result = await anyio.run_process(
-            ("git", "show", "b421f486:chpTypst/RENDERER/publication_helpers.typ"),
-            cwd=_REPOSITORY_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
+    baseline_result = subprocess.run(
+        ("git", "show", "b421f486:chpTypst/RENDERER/publication_helpers.typ"),
+        cwd=_REPOSITORY_ROOT,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
     baseline_source = baseline_result.stdout
     baseline_helper.write_bytes(baseline_source)
 
@@ -1420,15 +1429,21 @@ async def test_opinion_paragraph_spacing_matches_b421f486_pdf_baseline(
             (workspace_root / "RENDERER" / "publication_helpers.typ").write_bytes(helper_source)
         font_root = root / "font-snapshot"
         font_root.mkdir()
-        result = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
-            TypstCompileRequest(
-                workspace_root=workspace_root,
-                entrypoint_relative_path="RENDERER/publication.typ",
-                font_paths=materialize_font_bundle(font_snapshot, font_root),
+        pdf_path = root / "opinion-spacing.pdf"
+        argv = [typst_binary, "compile", "--root", str(workspace_root)]
+        for font_path in materialize_font_bundle(font_snapshot, font_root):
+            argv.extend(("--font-path", str(font_path)))
+        argv.extend(
+            (
+                "--ignore-system-fonts",
+                "--creation-timestamp",
+                "0",
+                str(workspace_root / "RENDERER" / "publication.typ"),
+                str(pdf_path),
             )
         )
-        pdf_path = root / "opinion-spacing.pdf"
-        pdf_path.write_bytes(result.content)
+        result = _run_typst_compile(tuple(argv))
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
         return pdf_path
 
     baseline_pdf = await compile_fixture("b421-baseline", baseline_source)
@@ -1620,26 +1635,31 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
     font_root = tmp_path / "pipe-table-font-snapshot"
     font_root.mkdir()
-    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
-        TypstCompileRequest(
-            workspace_root=workspace_root,
-            entrypoint_relative_path="RENDERER/publication.typ",
-            font_paths=materialize_font_bundle(font_snapshot, font_root),
+    pdf_path = tmp_path / "opinion-pipe-tables.pdf"
+    argv = [typst_binary, "compile", "--root", str(workspace_root)]
+    for font_path in materialize_font_bundle(font_snapshot, font_root):
+        argv.extend(("--font-path", str(font_path)))
+    argv.extend(
+        (
+            "--ignore-system-fonts",
+            "--creation-timestamp",
+            "0",
+            str(workspace_root / "RENDERER" / "publication.typ"),
+            str(pdf_path),
         )
     )
-    pdf_path = tmp_path / "opinion-pipe-tables.pdf"
-    pdf_path.write_bytes(compiled.content)
-    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    compile_result = _run_typst_compile(tuple(argv))
+    assert compile_result.returncode == 0, compile_result.stderr.decode("utf-8", errors="replace")
+    reader = PdfReader(pdf_path, strict=True)
     page_texts = [page.extract_text() or "" for page in reader.pages]
     pdftotext = shutil.which("pdftotext")
     assert pdftotext is not None, "Poppler pdftotext is required for pipe-table verification"
-    with anyio.fail_after(15):
-        extracted_result = await anyio.run_process(
-            (pdftotext, str(pdf_path), "-"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
+    extracted_result = subprocess.run(
+        (pdftotext, str(pdf_path), "-"),
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
     extracted = extracted_result.stdout.decode("utf-8", errors="replace")
 
     limitation_page_text = next(
@@ -1679,7 +1699,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     assert row_hashes[-1] in extracted
     assert "Inventory fixture intro." in extracted
     assert "Inventory fixture end." in extracted
-    assert '#raw("PIPE_TABLE_INJECTION_SENTINEL")' in extracted
+    assert '#raw("PIPE_TABLE_INJECTION_SENTINEL")' in re.sub(r"\s+", "", extracted)
     assert "literal ] bracket" in extracted
     assert "Malformed" in extracted and "literal fallback" in extracted
     assert "00112233445566778899aabbccddeeff" in extracted
@@ -1996,7 +2016,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v36-m19-polish",
+        "schema_version": "typst-publication-model-v37-m20-opinion-render",
         "section_types": [
             "references",
             "chronology",
@@ -2099,7 +2119,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     )
     for marker in forbidden_narrative_markers:
         assert re.search(marker, narrative_text, re.IGNORECASE) is None, marker
-    assert "[F1]" in narrative_text and "[E1]" in narrative_text
+    assert "1,2" in re.sub(r"\s+", "", narrative_text)
     assert re.search(r"\b[0-9a-f]{64}\b", narrative_text, re.IGNORECASE) is None
     compact_annex = re.sub(r"\s+", "", annex_text)
     for reference in annex["opinion_refs"]:

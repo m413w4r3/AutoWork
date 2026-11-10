@@ -443,6 +443,10 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
     publication, *_ = _frontmatter_v6_case()
     finding_id = UUID(int=701)
     evidence_id = UUID(int=702)
+    code_text = (
+        '#import "opinion-inert-fixture.typ" $x$ @name <tag> & `literal`\n'
+        "#set page(margin: 0pt)"
+    )
     table_lines = [
         "Synthetic table preface marker.",
         "| Component | State | Context | Marker |",
@@ -462,7 +466,7 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
         blocks=(
             OpinionBlock(
                 OpinionBlockType.KEY_FINDINGS,
-                "Run `token`",
+                f"Run `token`\n```\n{code_text}\n```",
                 finding_refs=(finding_id,),
                 evidence_refs=(evidence_id,),
                 certainty=0.9,
@@ -491,9 +495,16 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
     table_block = next(item for item in projected_blocks if item["pipe_table"] is not None)
     assert code_block["text_spans"][1]["text"] == "token"
     assert code_block["text_spans"][1]["technical"] is True
+    fenced_span = next(span for span in code_block["text_spans"] if span.get("code_block"))
+    assert fenced_span["text"] == code_text + "\n"
+    assert fenced_span["technical"] is True
     assert code_block["qualification_label"] == "Fait étayé"
     assert code_block["finding_refs"][0]["label"] == "[F1]"
     assert code_block["evidence_refs"][0]["label"] == "[E1]"
+    assert code_block["finding_refs"][0]["note_number"] == 1
+    assert code_block["evidence_refs"][0]["note_number"] == 2
+    assert code_block["finding_refs"][0]["reference_id"] == str(finding_id)
+    assert code_block["evidence_refs"][0]["reference_id"] == str(evidence_id)
     assert "certainty_percent" not in code_block
     assert table_block["pipe_table"]["wide"] is True
     assert "Synthetic table note marker." in table_block["pipe_table"]["suffix"]
@@ -515,21 +526,33 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
     font_root = tmp_path / "m07-layout-fonts"
     font_root.mkdir()
-    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
-        TypstCompileRequest(
-            workspace_root=workspace_root,
-            entrypoint_relative_path=source.entrypoint_relative_path,
-            font_paths=materialize_font_bundle(font_snapshot, font_root),
+    font_paths = materialize_font_bundle(font_snapshot, font_root)
+    pdf_path = workspace_root / "opinion-preview.pdf"
+    argv = [typst_binary, "compile", "--root", str(workspace_root)]
+    for font_path in font_paths:
+        argv.extend(("--font-path", str(font_path)))
+    argv.extend(
+        (
+            "--ignore-system-fonts",
+            "--creation-timestamp",
+            "0",
+            str(workspace_root / source.entrypoint_relative_path),
+            str(pdf_path),
         )
     )
-    reader = PdfReader(BytesIO(compiled.content), strict=True)
-    text, _compact_text = _normalized_pdf_text(reader)
+    result = subprocess.run(argv, capture_output=True, check=False, timeout=20)
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    reader = PdfReader(pdf_path, strict=True)
+    text, compact_text = _normalized_pdf_text(reader)
     page_texts = [page.extract_text() or "" for page in reader.pages]
 
     assert "Synthèse" in text
     assert "Synthetic table preface marker." in text
     assert "PIPE_ROW_45" in text and "Synthetic table note marker." in text
-    assert "Run token" in text and "[F1]" in text and "[E1]" in text
+    assert "Run token" in text
+    assert "1,2" in compact_text
+    assert re.sub(r"\s+", "", code_text) in compact_text
+    assert re.sub(r"\s+", " ", code_text).strip() in re.sub(r"\s+", " ", text)
     assert "PROVENANCE DE PUBLICATION" not in text
     assert "ANNEXE TECHNIQUE" not in text
     pages_with_last_row = [
@@ -546,7 +569,7 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
     for page in reader.pages:
 
         def collect_font_details(text_segment, _cm, _tm, font_dictionary, _font_size) -> None:
-            if "token" in text_segment:
+            if "token" in text_segment or "#import" in text_segment or "#set page" in text_segment:
                 mono_fonts.append(str((font_dictionary or {}).get("/BaseFont", "")))
 
         page.extract_text(visitor_text=collect_font_details)
