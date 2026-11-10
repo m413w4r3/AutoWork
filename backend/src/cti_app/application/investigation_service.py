@@ -221,12 +221,29 @@ _VT_HASH_READ_TOOLS = frozenset(
     {"vt.file_report", "vt.relationships", "vt.behaviour", "vt.behaviour_pcap"}
 )
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
+_MAX_VT_SOURCE_REFERENCES = 16
 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER = "_advisor_preflight_refusal_expected"
 _VT_HASH_NOT_GROUNDED_REASON = "vt_hash_not_grounded"
 _VT_HASH_NOT_GROUNDED_CORRECTION = (
     "Cite an observation or a source-documented SHA-256 IOC, or associate the hash through "
     "vt.file_report before retrying."
 )
+
+
+def _bounded_vt_source_references(
+    references: Iterable[EvidenceReference],
+) -> tuple[EvidenceReference, ...]:
+    resolved = tuple(references)
+    if len(resolved) <= _MAX_VT_SOURCE_REFERENCES:
+        return resolved
+    documents = tuple(item for item in resolved if item.kind == "source_document")
+    if len(documents) > _MAX_VT_SOURCE_REFERENCES:
+        return ()
+    other_references = tuple(item for item in resolved if item.kind != "source_document")
+    return (
+        *documents,
+        *other_references[: _MAX_VT_SOURCE_REFERENCES - len(documents)],
+    )
 
 
 class _BudgetSnapshotPersistenceError(RuntimeError):
@@ -2571,7 +2588,7 @@ class InvestigationService:
                         sha256=item.sha256,
                     )
                     resolved[(reference.kind, reference.id)] = reference
-                return tuple(resolved[key] for key in sorted(resolved))
+                return _bounded_vt_source_references(resolved[key] for key in sorted(resolved))
             if len(normalized_hash) != 64:
                 return ()
             hash_reference = EvidenceReference(
@@ -2622,6 +2639,23 @@ class InvestigationService:
                 )
                 for item in sorted(matching_observations, key=lambda value: str(value.id))
             )
+            if len(observation_refs) + len(document_refs) + 1 > _MAX_VT_SOURCE_REFERENCES:
+                observation_limit = _MAX_VT_SOURCE_REFERENCES - len(document_refs) - 1
+                if observation_limit < 0:
+                    return ()
+                oldest_observations = sorted(
+                    matching_observations,
+                    key=lambda value: (value.observed_at, str(value.id)),
+                )[:observation_limit]
+                observation_refs = tuple(
+                    EvidenceReference(
+                        kind="evidence_observation",
+                        id=str(item.id),
+                        version=item.source_version,
+                        sha256=item.sha256,
+                    )
+                    for item in oldest_observations
+                )
             associations = (
                 await self._sample_associations.list_for_investigation(investigation.id)
                 if self._sample_associations is not None
@@ -2629,10 +2663,12 @@ class InvestigationService:
             )
             associated = any(item.sample_sha256 == normalized_hash for item in associations)
             if associated or observation_refs or document_refs:
-                return (
-                    hash_reference,
-                    *observation_refs,
-                    *(document_refs[key] for key in sorted(document_refs)),
+                return _bounded_vt_source_references(
+                    (
+                        hash_reference,
+                        *observation_refs,
+                        *(document_refs[key] for key in sorted(document_refs)),
+                    )
                 )
             if await self._osint_open_vt_hash_reads_allowed(investigation, envelope):
                 return (hash_reference,)
@@ -2750,7 +2786,7 @@ class InvestigationService:
             (reference.kind, reference.id): reference
             for reference in (*object_document_refs.values(), *object_observation_refs.values())
         }
-        return tuple(references[key] for key in sorted(references))
+        return _bounded_vt_source_references(references[key] for key in sorted(references))
 
     async def _osint_open_vt_hash_reads_allowed(
         self,
@@ -5165,7 +5201,7 @@ def _vt_source_refs_from_parameters(
     parameters: Mapping[str, Any],
 ) -> tuple[EvidenceReference, ...]:
     raw = parameters.get(_VT_SOURCE_REFS_PARAMETER)
-    if not isinstance(raw, (list, tuple)) or len(raw) > 16:
+    if not isinstance(raw, (list, tuple)) or len(raw) > _MAX_VT_SOURCE_REFERENCES:
         return ()
 
     references: list[EvidenceReference] = []
