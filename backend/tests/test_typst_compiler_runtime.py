@@ -556,8 +556,6 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     augmented = augment_publication_with_opinion(base, opinion, context)
     template_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
-    compiler = TypstSubprocessCompiler(binary=typst_binary)
-
     async def compile_and_extract(document, name: str) -> str:
         source = TypstRenderer().render(
             document,
@@ -570,22 +568,29 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             workspace,
             render_data=json.loads(source.render_data_bytes),
         )
-        compiled = await compiler.compile(
-            TypstCompileRequest(
-                workspace_root=workspace,
-                entrypoint_relative_path="RENDERER/publication.typ",
-                font_paths=materialize_font_bundle(font_snapshot, tmp_path / f"{name}-fonts"),
+        pdf_path = tmp_path / f"{name}.pdf"
+        argv = [typst_binary, "compile", "--root", str(workspace)]
+        for font_path in materialize_font_bundle(font_snapshot, tmp_path / f"{name}-fonts"):
+            argv.extend(("--font-path", str(font_path)))
+        argv.extend(
+            (
+                "--ignore-system-fonts",
+                "--creation-timestamp",
+                "0",
+                str(workspace / "RENDERER" / "publication.typ"),
+                str(pdf_path),
             )
         )
-        pdf_path = tmp_path / f"{name}.pdf"
-        pdf_path.write_bytes(compiled.content)
-        with anyio.fail_after(30):
-            extracted = await anyio.run_process(
-                (pdftotext, "-layout", str(pdf_path), "-"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
+        compile_result = subprocess.run(argv, capture_output=True, check=False, timeout=20)
+        assert compile_result.returncode == 0, compile_result.stderr.decode(
+            "utf-8", errors="replace"
+        )
+        extracted = subprocess.run(
+            (pdftotext, "-layout", str(pdf_path), "-"),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
         return extracted.stdout.decode("utf-8", errors="replace")
 
     base_text = await compile_and_extract(base, "mission04-base")
@@ -702,9 +707,9 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         "Fait étayé": 1,
         "Confiance : 90%": 0,
         opinion_marker: 1,
-        # The inline citations repeat as identifiers in the existing traceability annex.
-        "[F1]": 2,
-        "[E1]": 2,
+        # Short IDs remain in the traceability annex; body references use note numbers.
+        "[F1]": 1,
+        "[E1]": 1,
         finding_id: 1,
         evidence_id: 1,
         "ANNEXE DE TRAÇABILITÉ": 1,
@@ -719,6 +724,8 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             f"augmented PDF marker {marker!r}: expected {expected_count}, "
             f"found {augmented_text.count(marker)}"
         )
+    compact_augmented_text = re.sub(r"\s+", "", augmented_text)
+    assert re.search(re.escape(opinion_marker) + r".{0,8}1,2", compact_augmented_text)
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", base_text, flags=re.IGNORECASE) is None
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", augmented_text, flags=re.IGNORECASE) is None
     assert base_text.count("Références") == 1

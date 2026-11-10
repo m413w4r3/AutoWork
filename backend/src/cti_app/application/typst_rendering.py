@@ -96,8 +96,8 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v36 binds the M19 polish projection and reference layout to render identity.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v36-m19-polish"
+# v37 binds the M20 analyst-opinion projection to render identity.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v37-m20-opinion-render"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -1481,12 +1481,18 @@ _OPINION_TECHNICAL_TOKEN = re.compile(
     re.IGNORECASE,
 )
 _OPINION_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_OPINION_FENCED_CODE_OPEN = re.compile(r"(?m)^[ \t]*```[ \t]*\r?\n")
+_OPINION_FENCED_CODE_CLOSE = re.compile(r"(?m)^[ \t]*```[ \t]*(?:\r?\n|$)")
 _PIPE_TABLE_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 _PIPE_TABLE_SHA256 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE)
 
 
-def _opinion_text_spans(value: str) -> list[dict[str, Any]]:
-    """Mark inline code, hashes, and UUIDs for non-justified Typst rendering."""
+def _opinion_text_spans(
+    value: str,
+    *,
+    parse_fenced_code: bool = False,
+) -> list[dict[str, Any]]:
+    """Project opinion literals and balanced fenced code for inert Typst rendering."""
     spans: list[dict[str, Any]] = []
 
     def add_plain_text(plain_text: str) -> None:
@@ -1506,19 +1512,58 @@ def _opinion_text_spans(value: str) -> list[dict[str, Any]]:
         if cursor < len(plain_text):
             spans.append({"text": plain_text[cursor:], "technical": False})
 
-    cursor = 0
-    for match in _OPINION_INLINE_CODE.finditer(value):
-        add_plain_text(value[cursor : match.start()])
-        spans.append(
-            {
-                **_breakable_typst_display_text(
-                    match.group(1), interval=8, break_at_technical_separators=True
-                ),
-                "technical": True,
-            }
-        )
-        cursor = match.end()
-    add_plain_text(value[cursor:])
+    def add_inline_and_plain_text(plain_text: str) -> None:
+        cursor = 0
+        for match in _OPINION_INLINE_CODE.finditer(plain_text):
+            add_plain_text(plain_text[cursor : match.start()])
+            spans.append(
+                {
+                    **_breakable_typst_display_text(
+                        match.group(1), interval=8, break_at_technical_separators=True
+                    ),
+                    "technical": True,
+                }
+            )
+            cursor = match.end()
+        add_plain_text(plain_text[cursor:])
+
+    if not parse_fenced_code:
+        add_inline_and_plain_text(value)
+    else:
+        cursor = 0
+        while cursor < len(value):
+            opening = _OPINION_FENCED_CODE_OPEN.search(value, cursor)
+            if opening is None:
+                add_inline_and_plain_text(value[cursor:])
+                break
+
+            closing = _OPINION_FENCED_CODE_CLOSE.search(value, opening.end())
+            add_inline_and_plain_text(value[cursor : opening.start()])
+            if closing is None:
+                # An unclosed fence and its contents remain ordinary, unparsed text.
+                spans.append({"text": value[opening.start() :], "technical": False})
+                cursor = len(value)
+                break
+
+            code_text = value[opening.end() : closing.start()]
+            code_lines = code_text.split("\n")
+            spans.append(
+                {
+                    **_breakable_typst_display_text(
+                        code_text, interval=8, break_at_technical_separators=True
+                    ),
+                    "technical": True,
+                    "code_block": True,
+                    "code_lines": [
+                        _breakable_typst_display_text(
+                            line, interval=8, break_at_technical_separators=True
+                        )
+                        for line in code_lines
+                    ],
+                }
+            )
+            cursor = closing.end()
+
     if not spans:
         spans.append({"text": "", "technical": False})
     return spans
@@ -2278,7 +2323,7 @@ def project_publication_to_typst_model(
     )
     investigation_id = opinion.investigation_id if opinion is not None else None
 
-    def opinion_citation(kind: str, reference_id: UUID) -> dict[str, str]:
+    def opinion_citation(kind: str, reference_id: UUID) -> dict[str, Any]:
         noun = "Finding" if kind == "finding" else "Évidence"
         uri_kind = "findings" if kind == "finding" else "evidence"
         reference_text = str(reference_id)
@@ -2289,9 +2334,11 @@ def project_publication_to_typst_model(
         opinion_reference_numbers[kind] += 1
         short_label = f"[{kind[0].upper()}{opinion_reference_numbers[kind]}]"
         target_id = f"trace-{kind[0]}-{opinion_reference_numbers[kind]:03d}"
+        note_number = len(opinion_provenance_entries) + 1
         reference = {
             "label": short_label,
             "target_id": target_id,
+            "note_number": note_number,
             "href": f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}",
             "reference_id": reference_text,
             "kind": kind,
@@ -2301,6 +2348,7 @@ def project_publication_to_typst_model(
             {
                 "label": short_label,
                 "target_id": target_id,
+                "note_number": note_number,
                 "kind_label": noun,
                 "reference_id": reference_text,
                 "reference_id_spans": _breakable_typst_display_text(reference_text, interval=8),
@@ -2310,14 +2358,14 @@ def project_publication_to_typst_model(
         return reference
 
     opinion_provenance_entries: list[dict[str, Any]] = []
-    opinion_reference_by_id: dict[tuple[str, UUID], dict[str, str]] = {}
+    opinion_reference_by_id: dict[tuple[str, UUID], dict[str, Any]] = {}
     opinion_reference_numbers = {"finding": 0, "evidence": 0}
 
     def collect_opinion_references(
         _context_label: str,
         kind: str,
         reference_ids: tuple[UUID, ...],
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         return [opinion_citation(kind, reference_id) for reference_id in reference_ids]
 
     lead_fingerprints = {
@@ -3579,7 +3627,7 @@ def project_publication_to_typst_model(
                     "number": f"1.{index + 1}",
                     "heading": heading,
                     "text": text,
-                    "text_spans": _opinion_text_spans(text),
+                    "text_spans": _opinion_text_spans(text, parse_fenced_code=True),
                     "pipe_table": _opinion_pipe_table(text),
                     "qualification": qualification,
                     "qualification_label": qualification_labels[qualification],

@@ -152,7 +152,7 @@ def _publication_fixture(
     content_sections.append({"type": "synthesis", "blocks": body_blocks})
 
     result: dict[str, Any] = {
-        "schema_version": "typst-publication-model-v36-m19-polish",
+        "schema_version": "typst-publication-model-v37-m20-opinion-render",
         "document_label": f"m19-{kind}-format-fixture",
         "kind": kind,
         "title": f"Synthetic {kind} publication",
@@ -179,8 +179,8 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v42-m19-polish"
-    assert edition.template_version == "chp-edition-v34-m19-polish"
+    assert article.template_version == "chp-article-v43-m20-opinion-render"
+    assert edition.template_version == "chp-edition-v35-m20-opinion-render"
 
 
 def _typst_binary() -> str:

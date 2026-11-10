@@ -23,7 +23,6 @@ from cti_app.application.publication_builder import (
     build_publication_document_v5,
 )
 from cti_app.application.typst_compilation import (
-    TypstCompileRequest,
     load_font_bundle_snapshot,
     materialize_font_bundle,
 )
@@ -49,7 +48,6 @@ from cti_app.domain.publication_document import (
     PublicationIOCDisposition,
     publication_document_v5_sha256,
 )
-from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_article_format import _routed_v8
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
 
@@ -297,16 +295,26 @@ async def _compile(
     font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", _TEMPLATE_ROOT))
     fonts = load_font_bundle_snapshot(font_root, _REPO / "infra" / "typst-fonts.lock")
     font_paths = materialize_font_bundle(fonts, tmp_path / "font-snapshot")
-    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
-        TypstCompileRequest(
-            workspace_root=workspace,
-            entrypoint_relative_path="RENDERER/publication.typ",
-            font_paths=font_paths,
+    version = subprocess.run(
+        (typst_binary, "--version"), capture_output=True, check=True, timeout=10
+    )
+    assert version.stdout.decode("utf-8", errors="replace").startswith("typst 0.15.1")
+    pdf_path = tmp_path / "publication.pdf"
+    argv = [typst_binary, "compile", "--root", str(workspace)]
+    for font_path in font_paths:
+        argv.extend(("--font-path", str(font_path)))
+    argv.extend(
+        (
+            "--ignore-system-fonts",
+            "--creation-timestamp",
+            "0",
+            str(workspace / "RENDERER" / "publication.typ"),
+            str(pdf_path),
         )
     )
-    assert compiled.media_type == "application/pdf"
-    assert compiled.compiler_version == "0.15.1"
-    return compiled.content
+    compiled = subprocess.run(argv, capture_output=True, check=False, timeout=20)
+    assert compiled.returncode == 0, compiled.stderr.decode("utf-8", errors="replace")
+    return pdf_path.read_bytes()
 
 
 def _pdf_text(pdf_bytes: bytes, path: Path) -> tuple[str, PdfReader]:
@@ -344,7 +352,7 @@ async def test_l3_article_builds_v8_projects_v34_and_compiles_end_to_end(
         .render_data_bytes
     )
     render_data = json.loads(render_data_bytes)
-    assert render_data["schema_version"] == "typst-publication-model-v36-m19-polish"
+    assert render_data["schema_version"] == "typst-publication-model-v37-m20-opinion-render"
     assert (
         render_data["article_format"]["overview"]["victimology"]["text"]
         == _L3_OVERVIEW[0].split(":", 1)[1].strip()

@@ -18,6 +18,7 @@ from cti_app.application.typst_rendering import (
     _display_date,
     _indicator_values,
     _opinion_pipe_table,
+    _opinion_text_spans,
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
@@ -131,6 +132,47 @@ def test_opinion_pipe_table_parser_handles_alignment_inline_code_and_safe_limits
     assert _opinion_pipe_table(too_many_columns) is None
     too_many_rows = "| A |\n| --- |\n" + "| row |\n" * 201
     assert _opinion_pipe_table(too_many_rows) is None
+
+
+def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals() -> None:
+    code_text = (
+        '#import "inert-fixture.typ" $x$ @name <tag> & `literal`\n'
+        "#set page(margin: 0pt)"
+    )
+    source = f"Before `inline`.\n```\n{code_text}\n```\nAfter."
+
+    spans = _opinion_text_spans(source, parse_fenced_code=True)
+
+    assert spans[0]["text"] == "Before "
+    assert spans[1]["text"] == "inline"
+    assert spans[1]["technical"] is True
+    code_span = next(span for span in spans if span.get("code_block"))
+    assert code_span["text"] == code_text + "\n"
+    assert code_span["technical"] is True
+    assert [line["text"] for line in code_span["code_lines"]] == [
+        '#import "inert-fixture.typ" $x$ @name <tag> & `literal`',
+        "#set page(margin: 0pt)",
+        "",
+    ]
+    assert spans[-1]["text"] == "After."
+
+    unclosed = "Before `inline`.\n```\n#import \"still inert.typ\" $x$ @name"
+    unclosed_spans = _opinion_text_spans(unclosed, parse_fenced_code=True)
+    assert not any(span.get("code_block") for span in unclosed_spans)
+    assert unclosed_spans[-1] == {
+        "text": "```\n#import \"still inert.typ\" $x$ @name",
+        "technical": False,
+    }
+
+    malformed = "Before.\n````\nnot a triple fence\n````"
+    malformed_spans = _opinion_text_spans(malformed, parse_fenced_code=True)
+    assert not any(span.get("code_block") for span in malformed_spans)
+    assert "````" in "".join(span["text"] for span in malformed_spans)
+
+    # Other renderers use the same parser for observations; fences remain plain text there.
+    observation_spans = _opinion_text_spans(source)
+    assert not any(span.get("code_block") for span in observation_spans)
+    assert "```" in "".join(span["text"] for span in observation_spans)
 
 
 def _full_document(
@@ -289,7 +331,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v36-m19-polish"
+    assert data["schema_version"] == "typst-publication-model-v37-m20-opinion-render"
     assert data["kind"] == "brief"
     assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
@@ -884,7 +926,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v36-m19-polish"
+    assert data["schema_version"] == "typst-publication-model-v37-m20-opinion-render"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
