@@ -184,7 +184,14 @@ def _canonical_proposal(request_text: str) -> str:
         for record in records
         if record.get("kind") == "indicator"
     ]
-    return synthesis_proposal_wire([lead], [("infrastructure", domains or [lead])])
+    overview_text = "The selected publications document this activity."
+    overview = [
+        (f"{label} {overview_text}", (fact["handle"],))
+        for label in ("Victimologie :", "Arsenal :", "Objectif principal :")
+    ]
+    return synthesis_proposal_wire(
+        [lead], [("overview", overview), ("infrastructure", domains or [lead])]
+    )
 
 
 def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModelRequest]:
@@ -426,7 +433,10 @@ async def test_complete_production_pipeline_reaches_ready(
         for indicator in source["indicators"]
     }
     assert indicators["core-c2.security-lab.io"]["indicator_status"] == "confirmed_ioc"
-    assert indicators["secondary-c2.security-lab.io"]["indicator_status"] == "contextual"
+    assert (
+        indicators["secondary-c2.security-lab.io"]["indicator_status"]
+        == "unverified_contextual"
+    )
     assert all(indicator["evidence_quote"] for indicator in indicators.values())
     # Model provenance is source-level: each source names its checkpoint, whose
     # ModelRun is one of the extraction calls.
@@ -446,8 +456,10 @@ async def test_complete_production_pipeline_reaches_ready(
     assert "secondary-c2.security-lab.io" in synthesis_text
     assert "core-c2.security-lab.io" in str(publication_payload)
     assert "secondary-c2.security-lab.io" in str(publication_payload)
-    assert publication_payload["schema_version"] == "7"
-    publication_document_payload = publication_payload["base_publication"]["base_publication"]
+    assert publication_payload["schema_version"] == "8"
+    publication_document_payload = publication_payload["base_publication"]["base_publication"][
+        "base_publication"
+    ]
     assert publication_document_payload["title"] == synthesis_payload["title"]
     assert publication_document_payload["lead"] == synthesis_payload["lead"]
     assert publication_document_payload["sections"] == synthesis_payload["sections"]

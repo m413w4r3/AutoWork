@@ -165,6 +165,7 @@ from cti_app.integrations.models import BlobModelOutputStore
 from tests.discovery_support import make_discovery_run_for_edition
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.integration.production.support import (
+    NO_USEFUL_ARTICLE_ENRICHMENT,
     synthesis_prompt_records,
     synthesis_proposal_wire,
 )
@@ -266,7 +267,11 @@ def _synthesis_wire_from_canonical_prompt(prompt_text: str) -> str:
         f"{fact['value']} is documented by the selected publication.",
         (fact["handle"],),
     )
-    return synthesis_proposal_wire([claim], [("overview", [claim])])
+    overview = [
+        (f"{label} {claim[0]}", claim[1])
+        for label in ("Victimologie :", "Arsenal :", "Objectif principal :")
+    ]
+    return synthesis_proposal_wire([claim], [("overview", overview)])
 
 
 class _CountingRetryModelAdapter:
@@ -309,7 +314,7 @@ class _CountingRetryModelAdapter:
             "production-relevance-classifier",
         }:
             empty = (
-                "NO USEFUL ENRICHMENT"
+                NO_USEFUL_ARTICLE_ENRICHMENT
                 if request.prompt_template_id == "production-editorial-enrichment"
                 else "@@NONE@@"
             )
@@ -1725,9 +1730,15 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         assert persisted_b.routing_decision_id is not None
         routing_b = await uow.production_routing_decisions.get(persisted_b.routing_decision_id)
     assert routing_b is not None
-    assert publication_b_payload["schema_version"] == "7"
-    assert publication_b_payload["publication_kind"] == PublicationKind.ARTICLE.value
-    assert publication_b_payload["routing_decision_hash"] == routing_b.decision_hash
+    assert publication_b_payload["schema_version"] == "8"
+    assert (
+        publication_b_payload["base_publication"]["publication_kind"]
+        == PublicationKind.ARTICLE.value
+    )
+    assert (
+        publication_b_payload["base_publication"]["routing_decision_hash"]
+        == routing_b.decision_hash
+    )
 
     retry = await production.retry_from_stage(run_b.id, ProductionStage.EXTRACTION)
     assert retry.previous_status is ProductionRunStatus.READY
@@ -2138,13 +2149,13 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     release = await EditionAssemblyService(uow_factory, store).assemble(accepted.manifest.id)
     edition_json = await store.read_json(release.edition_document_blob_id)
     publication_documents = [item["document"] for item in edition_json["publications"]]
-    assert all(document["schema_version"] == "7" for document in publication_documents)
+    assert all(document["schema_version"] == "8" for document in publication_documents)
     assert all(
-        document["publication_kind"] == PublicationKind.ARTICLE.value
+        document["base_publication"]["publication_kind"] == PublicationKind.ARTICLE.value
         for document in publication_documents
     )
     assert [
-        document["base_publication"]["base_publication"]["title"]
+        document["base_publication"]["base_publication"]["base_publication"]["title"]
         for document in publication_documents
     ] == [
         "[Example publisher] Article A",

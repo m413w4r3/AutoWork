@@ -104,6 +104,19 @@ from tests.discovery_support import make_discovery_run_for_edition
 from ..edition_codes import reserve_edition_code
 
 
+NO_USEFUL_ARTICLE_ENRICHMENT = "\n".join(
+    (
+        "NO USEFUL ENRICHMENT",
+        "TABLE MINIMUM NOT MET",
+        "REASON: Le scénario ne documente pas deux questions analytiques distinctes sans répétition.",
+        "END TABLE MINIMUM NOT MET",
+        "DIAGRAM OMITTED",
+        "REASON: Les éléments du scénario n'établissent ni trois étapes ordonnées ni plusieurs relations à représenter.",
+        "END DIAGRAM OMITTED",
+    )
+)
+
+
 class DeterministicSourceTransport(HttpTransport):
     """HTTP transport fake; SafeHttpCollector still owns all collection rules."""
 
@@ -243,7 +256,7 @@ class ScriptedModelScript:
 
     def __init__(self) -> None:
         self._references: str | None = None
-        self._editorial_enrichment: str | Callable[[str], str] = "NO USEFUL ENRICHMENT"
+        self._editorial_enrichment: str | Callable[[str], str] | None = None
         self._q2: dict[str, str | Q2SourceOutput | Exception] = {}
         self._url_by_sha256: dict[str, str] = {}
 
@@ -304,10 +317,17 @@ class ScriptedModelScript:
             # The deterministic L3b-1 baseline stays authoritative in these scenarios.
             return "@@NONE@@"
 
+        if request.prompt_template_id == "production-brief-synthesis":
+            return _grounded_brief_synthesis_proposal(request.text)
+
         if request.prompt_template_id == "production-synthesis":
             return _grounded_synthesis_proposal(request.text)
 
         if request.prompt_template_id == "production-editorial-enrichment":
+            if self._editorial_enrichment is None:
+                if request.parameters.get("publication_kind") == "brief":
+                    return "NO USEFUL ENRICHMENT"
+                return NO_USEFUL_ARTICLE_ENRICHMENT
             return (
                 self._editorial_enrichment(request.text)
                 if callable(self._editorial_enrichment)
@@ -949,13 +969,19 @@ def synthesis_proposal_wire(
     sections: Sequence[tuple[str, Sequence[tuple[str, Sequence[str]]]]] = (),
 ) -> str:
     """Render ``(text, handles)`` claims as the text-block Synthesis wire format."""
+    headings = {
+        "overview": "Vue d'ensemble",
+        "infrastructure": "Infrastructure",
+        "detection": "Détection",
+    }
     lines = ["@@LEAD@@"]
     for index, (text, handles) in enumerate(lead, start=1):
         lines.extend(
             (f"@@CLAIM L{index:03d}@@", f"EVIDENCE: {', '.join(handles)}", f"TEXT: {text}")
         )
     for section_index, (kind, claims) in enumerate(sections, start=1):
-        lines.append(f"@@SECTION {kind} S{section_index:03d}@@")
+        heading = headings.get(kind, kind.replace("_", " ").capitalize())
+        lines.extend((f"@@SECTION {kind} S{section_index:03d}@@", f"HEADING: {heading}"))
         for claim_index, (text, handles) in enumerate(claims, start=1):
             lines.extend(
                 (
@@ -982,7 +1008,34 @@ def _grounded_synthesis_proposal(prompt_text: str) -> str:
     if not narrative:
         raise AssertionError("The canonical evidence pack exposes no narrative evidence")
     claim = ("The selected publications document this activity.", (narrative[0],))
-    return synthesis_proposal_wire([claim], [("overview", [claim])])
+    overview = [
+        (f"{label} The selected publications document this activity.", (narrative[0],))
+        for label in ("Victimologie :", "Arsenal :", "Objectif principal :")
+    ]
+    return synthesis_proposal_wire([claim], [("overview", overview)])
+
+
+def _grounded_brief_synthesis_proposal(prompt_text: str) -> str:
+    """Return the prompt's shared TITLE/LEAD wire shape without article sections."""
+    narrative = [
+        record["handle"]
+        for record in synthesis_prompt_records(prompt_text)
+        if record.get("kind") in {"fact", "event"}
+    ]
+    if not narrative:
+        raise AssertionError("The brief synthesis prompt exposes no narrative evidence")
+    actor_match = re.search(r"(?m)^Actor or campaign:\s*(.+)$", prompt_text)
+    actor = actor_match.group(1).strip() if actor_match is not None else "Example actor"
+    return "\n".join(
+        (
+            "@@TITLE@@",
+            f"[{actor}] Activité documentée par les sources",
+            "@@END TITLE@@",
+            synthesis_proposal_wire(
+                [("Les publications sélectionnées documentent cette activité.", (narrative[0],))]
+            ),
+        )
+    )
 
 
 def grounded_editorial_proposal(prompt_text: str) -> str:
@@ -1120,6 +1173,9 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
             f"EVIDENCE: {diagram_handle}",
             "END RELATION",
             "END DIAGRAM",
+            "TABLE MINIMUM NOT MET",
+            "REASON: Les preuves retenues étayent un tableau transversal, mais aucune seconde question distincte n'est documentée.",
+            "END TABLE MINIMUM NOT MET",
         )
     )
 
@@ -1133,6 +1189,7 @@ def _canonical_url(url: str) -> str:
 __all__ = [
     "DeterministicProductionJobRunner",
     "DeterministicSourceTransport",
+    "NO_USEFUL_ARTICLE_ENRICHMENT",
     "ProductionScenario",
     "ScriptedModelCall",
     "ScriptedModelGateway",

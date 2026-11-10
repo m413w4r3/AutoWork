@@ -1183,7 +1183,8 @@ def publication_content_section_types(
         else None
     )
     opinion_document = draft_preview is not None or (
-        isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
+        isinstance(value, (PublicationDocumentV6, PublicationDocumentV7, PublicationDocumentV8))
+        and opinion is not None
     )
     brief_document = (
         is_brief(value.base_publication)
@@ -1920,7 +1921,10 @@ class TypstRenderer:
             "kind": "brief" if is_brief(classification_document) else "article",
             "opinion_document": isinstance(document, TypstDraftPreviewDocument)
             or (
-                isinstance(document, (PublicationDocumentV6, PublicationDocumentV7))
+                isinstance(
+                    document,
+                    (PublicationDocumentV6, PublicationDocumentV7, PublicationDocumentV8),
+                )
                 and document.analyst_opinion is not None
             ),
             "document_label": normalized_document_label,
@@ -2118,7 +2122,8 @@ def project_publication_to_typst_model(
         else None
     )
     opinion_document = draft_preview is not None or (
-        isinstance(value, (PublicationDocumentV6, PublicationDocumentV7)) and opinion is not None
+        isinstance(value, (PublicationDocumentV6, PublicationDocumentV7, PublicationDocumentV8))
+        and opinion is not None
     )
     brief_document = (
         is_brief(value.base_publication)
