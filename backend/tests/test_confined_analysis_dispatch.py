@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.apk_analysis import JADX_VERSION, JADX_ZIP_SHA256
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisArtifactKind,
     ConfinedAnalysisFamilyStatus,
@@ -62,6 +63,7 @@ from cti_app.infrastructure.analysis_subprocess import (
 from cti_app.infrastructure.confined_analysis_dispatch import (
     DramatiqConfinedAnalysisExecutionPort,
     _attestation_from_response,
+    _family_statuses,
 )
 from cti_app.workers.analysis_tasks import build_confined_analysis_job_handler
 from cti_app.workers.confined_analysis import (
@@ -754,6 +756,74 @@ def test_archive_capabilities_require_worker_and_7z_attestations() -> None:
     old_worker = _attestation_from_response(json.dumps(payload).encode(), settings)
     assert old_worker.families["zip_members"].available is False
     assert old_worker.families["archive_tools"].available is False
+
+
+def test_apk_family_requires_pinned_jadx_hash_and_supported_jre() -> None:
+    settings = Settings(_env_file=None)
+    supported = frozenset({"apk"})
+    common = {
+        "jadx": JADX_VERSION,
+        "jadx_zip_sha256": JADX_ZIP_SHA256,
+        "jadx_jre_version": "17.0.14",
+    }
+    family = _family_statuses(
+        common,
+        worker_confined=True,
+        dependencies_ready=True,
+        supported_families=supported,
+        settings=settings,
+    )["apk"]
+    assert family.available is True
+    assert family.version == JADX_VERSION
+
+    wrong_hash = _family_statuses(
+        {**common, "jadx_zip_sha256": "0" * 64},
+        worker_confined=True,
+        dependencies_ready=True,
+        supported_families=supported,
+        settings=settings,
+    )["apk"]
+    assert wrong_hash.available is False
+    assert wrong_hash.available_reason == "jadx_package_hash_unattested"
+
+    wrong_jre = _family_statuses(
+        {**common, "jadx_jre_version": "11.0.22"},
+        worker_confined=True,
+        dependencies_ready=True,
+        supported_families=supported,
+        settings=settings,
+    )["apk"]
+    assert wrong_jre.available is False
+    assert wrong_jre.available_reason == "jadx_jre_version_unattested_17"
+
+
+def test_worker_probe_attests_jadx_version_archive_and_jre(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.workers import confined_analysis as worker_module
+
+    expected = {
+        "jadx": JADX_VERSION,
+        "jadx_zip_sha256": JADX_ZIP_SHA256,
+        "jadx_jre_version": "17.0.14",
+    }
+    monkeypatch.setattr(worker_module, "probe_ilspycmd", lambda _settings: (None, None))
+    monkeypatch.setattr(worker_module, "jadx_provenance", lambda **_kwargs: expected)
+    monkeypatch.setattr(worker_module, "_distribution_version", lambda _name: "1.0")
+    monkeypatch.setattr(worker_module, "_read_marker", lambda _path: None)
+    monkeypatch.setattr(worker_module, "_binary_version", lambda *_args: None)
+    monkeypatch.setattr(worker_module, "_local_binary_version", lambda *_args: None)
+    monkeypatch.setattr(worker_module, "_seven_zip_version", lambda: None)
+    monkeypatch.setattr(worker_module, "_monodis_package_version", lambda: None)
+    monkeypatch.setattr(worker_module, "_probe_suricata_version", lambda _binary: None)
+    monkeypatch.setattr(worker_module, "_file_sha256", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_module, "_registered_mwcp_parsers", lambda _path: frozenset())
+    monkeypatch.setattr(worker_module, "_proc_status", lambda: {"NoNewPrivs": "1"})
+    monkeypatch.setattr(worker_module, "_root_mount_is_read_only", lambda: True)
+
+    payload = build_analysis_worker_probe_payload(Settings(_env_file=None))
+    assert "apk" in payload["supported_families"]
+    assert {key: payload["versions"][key] for key in expected} == expected
 
 
 @pytest.mark.asyncio

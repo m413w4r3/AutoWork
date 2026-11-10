@@ -3,17 +3,22 @@ from __future__ import annotations
 import asyncio
 import os
 import resource
+import stat
+import subprocess
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from cti_app.infrastructure.seccomp_network import install_network_seccomp_filter
+
 
 class AnalysisSubprocessStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     TIMED_OUT = "TIMED_OUT"
     OUTPUT_LIMIT = "OUTPUT_LIMIT"
+    DIRECTORY_LIMIT = "DIRECTORY_LIMIT"
     FAILED_TO_START = "FAILED_TO_START"
     NON_ZERO_EXIT = "NON_ZERO_EXIT"
 
@@ -34,7 +39,15 @@ async def run_analysis_subprocess(
     output_limit: int = 1_000_000,
     environment: dict[str, str] | None = None,
     memory_limit_bytes: int = 512 * 1024 * 1024,
+    deny_network: bool = False,
+    directory_limit_path: Path | None = None,
+    directory_max_bytes: int = 0,
+    directory_max_files: int = 0,
 ) -> AnalysisSubprocessResult:
+    if directory_limit_path is not None and (directory_max_bytes <= 0 or directory_max_files <= 0):
+        raise ValueError("directory limits must be positive when a watched directory is set")
+    if directory_limit_path is None and (directory_max_bytes or directory_max_files):
+        raise ValueError("directory size limits require a watched directory")
     env = {
         key: value
         for key, value in (environment or {}).items()
@@ -51,11 +64,15 @@ async def run_analysis_subprocess(
             "DOTNET_GCHeapHardLimit",
             "DOTNET_gcConcurrent",
             "NUGET_PACKAGES",
+            "JAVA_HOME",
+            "JAVA_OPTS",
         }
     }
 
     def limit() -> None:
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+        if deny_network:
+            install_network_seccomp_filter()
 
     with tempfile.TemporaryDirectory(prefix="cti-analysis-") as cwd:
         try:
@@ -68,7 +85,7 @@ async def run_analysis_subprocess(
                 env=env,
                 preexec_fn=limit if os.name == "posix" else None,
             )
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             return AnalysisSubprocessResult(
                 AnalysisSubprocessStatus.FAILED_TO_START,
                 None,
@@ -113,29 +130,71 @@ async def run_analysis_subprocess(
             if transport is not None:
                 transport.close()
 
-        async def collect() -> tuple[bytes, bytes, int | None, bool]:
+        async def watch_directory() -> bool:
+            assert directory_limit_path is not None
+            while True:
+                if _directory_exceeds_limits(
+                    directory_limit_path,
+                    max_bytes=directory_max_bytes,
+                    max_files=directory_max_files,
+                ):
+                    return True
+                await asyncio.sleep(0.05)
+
+        async def collect() -> tuple[bytes, bytes, int | None, bool, bool]:
             assert process.stdout is not None
             assert process.stderr is not None
             stdout_task = asyncio.create_task(read_stream(process.stdout))
             stderr_task = asyncio.create_task(read_stream(process.stderr))
-            tasks = {stdout_task, stderr_task}
+            directory_task = (
+                asyncio.create_task(watch_directory())
+                if directory_limit_path is not None
+                else None
+            )
             try:
-                while tasks:
-                    done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    if any(task.result()[1] for task in done):
+                while True:
+                    watched = {stdout_task, stderr_task}
+                    if directory_task is not None:
+                        watched.add(directory_task)
+                    done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+                    directory_limited = (
+                        directory_task is not None
+                        and directory_task in done
+                        and directory_task.result()
+                    )
+                    output_limited = any(
+                        task in done and task.result()[1]
+                        for task in (stdout_task, stderr_task)
+                    )
+                    if directory_limited or output_limited:
                         await kill_and_wait((stdout_task, stderr_task))
                         output = [task.result()[0] for task in (stdout_task, stderr_task)]
-                        return output[0], output[1], process.returncode, True
-                exit_code = await process.wait()
-                stdout, _ = stdout_task.result()
-                stderr, _ = stderr_task.result()
-                return stdout, stderr, exit_code, False
+                        if directory_task is not None and not directory_task.done():
+                            directory_task.cancel()
+                            await asyncio.gather(directory_task, return_exceptions=True)
+                        return (
+                            output[0],
+                            output[1],
+                            process.returncode,
+                            output_limited,
+                            directory_limited,
+                        )
+                    if stdout_task.done() and stderr_task.done():
+                        exit_code = await process.wait()
+                        stdout, _ = stdout_task.result()
+                        stderr, _ = stderr_task.result()
+                        if directory_task is not None:
+                            directory_task.cancel()
+                            await asyncio.gather(directory_task, return_exceptions=True)
+                        return stdout, stderr, exit_code, False, False
             except asyncio.CancelledError:
+                if directory_task is not None:
+                    directory_task.cancel()
                 await kill_and_wait((stdout_task, stderr_task))
                 raise
 
         try:
-            stdout, stderr, exit_code, output_limited = await asyncio.wait_for(
+            stdout, stderr, exit_code, output_limited, directory_limited = await asyncio.wait_for(
                 collect(), timeout_seconds
             )
         except TimeoutError:
@@ -148,6 +207,11 @@ async def run_analysis_subprocess(
             return AnalysisSubprocessResult(
                 AnalysisSubprocessStatus.OUTPUT_LIMIT, exit_code, stdout, stderr
             )
+    if directory_limited:
+        close_transport()
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.DIRECTORY_LIMIT, exit_code, stdout, stderr
+        )
     if len(stdout) > output_limit or len(stderr) > output_limit:
         close_transport()
         return AnalysisSubprocessResult(
@@ -165,3 +229,39 @@ async def run_analysis_subprocess(
         stdout,
         stderr,
     )
+
+
+def _directory_exceeds_limits(path: Path, *, max_bytes: int, max_files: int) -> bool:
+    """Measure a tool output tree without following links or traversing outside it."""
+    try:
+        if path.is_symlink():
+            return True
+        if not path.exists():
+            return False
+        if not path.is_dir():
+            return True
+        pending = [path]
+        entry_count = 0
+        total_bytes = 0
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > max_files:
+                        return True
+                    if entry.is_symlink():
+                        return True
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        total_bytes += entry.stat(follow_symlinks=False).st_size
+                        if total_bytes > max_bytes:
+                            return True
+                    else:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                        if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+                            return True
+        return False
+    except OSError:
+        return True

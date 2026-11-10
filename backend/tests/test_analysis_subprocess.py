@@ -75,3 +75,39 @@ async def test_subprocess_applies_dotnet_address_space_and_gc_environment() -> N
     assert payload["dotnet_root"] == "/usr/share/dotnet"
     assert payload["nuget_packages"] == "/nonexistent"
     assert payload["unexpected"] is None
+
+
+@pytest.mark.asyncio
+async def test_subprocess_can_deny_network_syscalls() -> None:
+    script = (
+        "import socket; "
+        "s = socket.socket(); s.close(); print('opened')"
+    )
+    result = await run_analysis_subprocess(
+        [sys.executable, "-c", script],
+        timeout_seconds=5,
+        output_limit=1024,
+        environment={"PATH": "/usr/bin:/bin"},
+        deny_network=True,
+    )
+    assert result.status is AnalysisSubprocessStatus.NON_ZERO_EXIT
+    assert b"PermissionError" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_subprocess_stops_when_output_tree_exceeds_limits(tmp_path) -> None:
+    output = tmp_path / "tool-output"
+    output.mkdir()
+    script = (
+        "import pathlib, sys, time; p=pathlib.Path(sys.argv[1]); "
+        "(p/'large.bin').write_bytes(b'x'*4096); time.sleep(2)"
+    )
+    result = await run_analysis_subprocess(
+        [sys.executable, "-c", script, str(output)],
+        timeout_seconds=5,
+        output_limit=1024,
+        directory_limit_path=output,
+        directory_max_bytes=1024,
+        directory_max_files=10,
+    )
+    assert result.status is AnalysisSubprocessStatus.DIRECTORY_LIMIT

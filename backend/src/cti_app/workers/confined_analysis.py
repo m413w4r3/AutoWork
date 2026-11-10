@@ -55,10 +55,12 @@ from cti_app.infrastructure.analysis_subprocess import (
 from cti_app.infrastructure.capa import CapaRunner, parse_capa_output, ruleset_manifest
 from cti_app.infrastructure.confined_suricata import validate_suricata_rule_source
 from cti_app.infrastructure.floss_adapter import _parse_floss_payload
+from cti_app.infrastructure.jadx import jadx_provenance
 from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
 from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.static_analysis import StaticFeatureExtractor, build_packing_signals
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLimits
+from cti_app.workers.apk_analysis import run_apk_analysis
 from cti_app.workers.archive_commands import run_7z_archive_command, run_zip_members
 from cti_app.workers.dotnet_analysis import probe_ilspycmd, run_dotnet_analysis
 
@@ -450,6 +452,10 @@ async def _execute_tool(
             monodis_version=_monodis_package_version,
             extract_monodis_method_body=_extract_monodis_method_body,
         )
+    if tool is ConfinedAnalysisTool.APK_JADX:
+        if sample is None:
+            raise ConfinedAnalysisArtifactMismatch("analysis_tool_requires_sample_artifact")
+        return await run_apk_analysis(parameters, payload, settings)
     if tool in {
         ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
         ConfinedAnalysisTool.SURICATA_REPLAY,
@@ -2198,6 +2204,9 @@ def _reduce_family_result(family: Mapping[str, Any]) -> dict[str, Any]:
 def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
     capa_rules = settings.analysis_capa_rules_path
     ilspy_version, ilspy_package_sha512 = probe_ilspycmd(settings)
+    jadx_attestation = jadx_provenance(
+        address_space_limit_bytes=settings.apk_analysis_address_space_limit_bytes
+    )
     versions = {
         "static": "autowork-static-v1"
         if _distribution_version("pefile") and _distribution_version("pyelftools")
@@ -2219,6 +2228,13 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         "local_monodis": _monodis_package_version() if shutil.which("monodis") else None,
         "ilspycmd": ilspy_version,
         "ilspycmd_package_sha512": ilspy_package_sha512,
+        "jadx": jadx_attestation.get("jadx") if jadx_attestation else None,
+        "jadx_zip_sha256": (
+            jadx_attestation.get("jadx_zip_sha256") if jadx_attestation else None
+        ),
+        "jadx_jre_version": (
+            jadx_attestation.get("jadx_jre_version") if jadx_attestation else None
+        ),
         "suricata": _probe_suricata_version(shutil.which("suricata") or "suricata"),
         "suricata_ruleset_revision": _read_marker(
             settings.analysis_suricata_rules_path / "AUTOWORK_RULESET_REVISION"
@@ -2263,6 +2279,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
             "mwcp",
             "yara",
             "dotnet",
+            "apk",
         ],
         "versions": versions,
     }

@@ -430,8 +430,9 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=512m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    # This cgroup limit bounds aggregate resident memory; .NET's 256 MiB GC heap
-    # cap is per managed subprocess. The 8 GiB RLIMIT_AS only bounds virtual space.
+    # This cgroup limit bounds aggregate resident memory. .NET and HotSpot
+    # subprocesses also have fixed heap caps; their 8 GiB RLIMIT_AS only bounds
+    # virtual address space. The worker /tmp tmpfs is limited to 512 MiB.
     mem_limit: 2g
     pids_limit: 128
     cpus: 2.0
@@ -468,6 +469,8 @@ services:
       LOCAL_ANALYSIS_MAX_SAMPLE_BYTES: ${LOCAL_ANALYSIS_MAX_SAMPLE_BYTES:-209715200}
       LOCAL_ANALYSIS_MEMORY_LIMIT_BYTES: ${LOCAL_ANALYSIS_MEMORY_LIMIT_BYTES:-536870912}
       DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES: ${DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES:-8589934592}
+      APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES: ${APK_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES:-8589934592}
+      ANALYSIS_APK_TIMEOUT_SECONDS: ${ANALYSIS_APK_TIMEOUT_SECONDS:-90}
       ANALYSIS_LOCAL_FILE_EXPECTED_VERSION: ${ANALYSIS_LOCAL_FILE_EXPECTED_VERSION:-5.44}
       ANALYSIS_LOCAL_BINUTILS_EXPECTED_VERSION: ${ANALYSIS_LOCAL_BINUTILS_EXPECTED_VERSION:-2.40}
       ANALYSIS_LOCAL_XXD_EXPECTED_VERSION: ${ANALYSIS_LOCAL_XXD_EXPECTED_VERSION:-2022-01-14}

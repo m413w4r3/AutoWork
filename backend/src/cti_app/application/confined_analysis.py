@@ -47,6 +47,7 @@ class ConfinedAnalysisTool(StrEnum):
     SURICATA_VALIDATE_RULES = "suricata_validate_rules"
     SURICATA_REPLAY = "suricata_replay"
     DOTNET_ILSPY = "dotnet_ilspy"
+    APK_JADX = "apk_jadx"
 
 
 class ConfinedAnalysisArtifactKind(StrEnum):
@@ -162,6 +163,19 @@ class ConfinedAnalysisRequest:
                 "limit",
                 "max_chars",
             },
+            ConfinedAnalysisTool.APK_JADX: {
+                "operation",
+                "offset",
+                "limit",
+                "prefix",
+                "class_name",
+                "source_path",
+                "start_line",
+                "line_count",
+                "pattern",
+                "regex",
+                "context_lines",
+            },
         }.get(self.tool, set())
         if set(self.analysis_parameters) - allowed_parameters:
             raise ValueError("analysis parameters are not supported for this tool")
@@ -235,6 +249,14 @@ class ConfinedAnalysisRequest:
                 key in parameters for key in ("field_token", "type_name", "field_name", "length")
             ):
                 raise ValueError("dotnet field parameters require field_data")
+        if self.tool is ConfinedAnalysisTool.APK_JADX:
+            from cti_app.application.apk_analysis import ApkAnalysisParameters
+
+            if self.arguments:
+                raise ValueError("APK analysis does not accept command arguments")
+            if self.artifact_kind is not ConfinedAnalysisArtifactKind.SAMPLE:
+                raise ValueError("APK analysis requires an associated sample artifact")
+            ApkAnalysisParameters.from_worker_parameters(dict(self.analysis_parameters))
         if self.tool is ConfinedAnalysisTool.LOCAL_COMMAND:
             if len(self.arguments) != 1 or self.arguments[0] not in {
                 "file",
@@ -559,7 +581,7 @@ class ConfinedAnalysisJobParameters(JobParameters):
     association_id: UUID | None = None
     sample_id: UUID | None = None
     arguments: tuple[str, ...] = Field(default=(), max_length=128)
-    analysis_parameters: dict[str, str] = Field(default_factory=dict, max_length=4)
+    analysis_parameters: dict[str, str] = Field(default_factory=dict, max_length=12)
 
 
 def create_confined_analysis_job_registry(handler: JobHandler | None = None) -> JobRegistry:

@@ -3,7 +3,7 @@
     docker compose build analysis-worker
     cd backend
     ANALYSIS_WORKER_IMAGE_TEST=1 \
-        uv run --python 3.12 pytest tests/test_confined_analysis_image.py -q
+        uv run --no-sync --python 3.12 pytest tests/test_confined_analysis_image.py -q
 
 The opt-in test starts only a one-off verification process, never the service stack.
 """
@@ -54,6 +54,18 @@ def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
             "assert '9.1' in subprocess.check_output(['sha256sum', '--version'], text=True)",
             "assert shutil.which('monodis')",
             "assert shutil.which('ilspycmd') and shutil.which('dotnet')",
+            "assert shutil.which('java') and shutil.which('jadx')",
+            "jadx_version = subprocess.check_output(['jadx', '--version'], text=True).strip()",
+            "assert jadx_version == '1.5.6'",
+            "java_version = subprocess.run(['java', '-version'], capture_output=True, ",
+            " text=True, check=True).stderr",
+            "assert 'version \\\"17.' in java_version",
+            "from cti_app.infrastructure.jadx import jadx_provenance",
+            "from cti_app.application.apk_analysis import JADX_VERSION, JADX_ZIP_SHA256",
+            "jadx = jadx_provenance()",
+            "assert jadx and jadx['jadx'] == JADX_VERSION",
+            "assert jadx['jadx_zip_sha256'] == JADX_ZIP_SHA256",
+            "assert jadx['jadx_jre_version'].startswith('17.')",
             "from cti_app.infrastructure.ilspycmd import (ILSPYCMD_VERSION, ",
             "ILSPYCMD_PACKAGE_SHA512, ilspycmd_provenance)",
             "provenance = ilspycmd_provenance()",

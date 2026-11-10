@@ -27,6 +27,7 @@ COPY --from=builder /app/.venv /app/.venv
 COPY backend/src ./src
 COPY backend/tools ./tools
 COPY infra/install_ilspycmd.py /app/tools/install_ilspycmd.py
+COPY infra/install_jadx.py /app/tools/install_jadx.py
 COPY --from=builder --chown=root:root /app/rules/capa /app/rules/capa
 # Suricata is not in bookworm main; the pinned 7.0.x build comes from bookworm-backports.
 RUN apt-get update \
@@ -42,7 +43,8 @@ RUN apt-get update \
         > /etc/apt/sources.list.d/bookworm-backports.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        tshark file binutils xxd coreutils p7zip-full mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
+        tshark file binutils xxd coreutils p7zip-full openjdk-17-jre-headless \
+        mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
         dotnet-runtime-8.0=8.0.32-1 \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         -t bookworm-backports suricata=1:7.0.10-1~bpo12+1 \
@@ -51,6 +53,9 @@ RUN apt-get update \
     && dotnet --list-runtimes | grep -q 'Microsoft.NETCore.App 8.0.32 ' \
     && PYTHONPATH=/app/src python /app/tools/install_ilspycmd.py \
     && ilspycmd --disable-updatecheck --version \
+    && java -version 2>&1 | grep -Eq 'version "17\.' \
+    && PYTHONPATH=/app/src python /app/tools/install_jadx.py \
+    && jadx --version | grep -Fx '1.5.6' \
     && chmod -R a-w /app/rules/capa \
     && file --version \
     && strings --version \
