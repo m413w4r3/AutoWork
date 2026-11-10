@@ -347,14 +347,90 @@ def _validate_source_path(value: str) -> None:
 
 
 def _validate_safe_regex(pattern: str) -> None:
-    """Allow a small linear-time regex subset to prevent catastrophic backtracking."""
-    if any(token in pattern for token in ("(", ")", "|", "{", "}", "(?")):
-        raise ValueError("APK regex uses unsupported grouping or alternation")
-    if re.search(r"\\[1-9]", pattern):
+    """Allow a bounded regex subset that cannot trigger catastrophic backtracking."""
+    if re.search(r"\\(?:[1-9]|g<|k<)", pattern):
         raise ValueError("APK regex backreferences are unsupported")
-    unescaped_quantifiers = len(re.findall(r"(?<!\\)[*+?]", pattern))
-    if unescaped_quantifiers > 1:
+
+    if "(?" in pattern:
+        raise ValueError("APK regex lookarounds and extensions are unsupported")
+
+    quantifier_count = 0
+    branch_factor = 1
+    group_quantifiers: list[int] = []
+    closed_group_quantifiers: int | None = None
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\":
+            closed_group_quantifiers = None
+            index += 2
+            continue
+        if character == "[":
+            closed_group_quantifiers = None
+            index += 1
+            while index < len(pattern):
+                if pattern[index] == "\\":
+                    index += 2
+                elif pattern[index] == "]":
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        if character == "(":
+            group_quantifiers.append(0)
+            closed_group_quantifiers = None
+            index += 1
+            continue
+        if character == ")":
+            if not group_quantifiers:
+                raise ValueError("APK regex grouping is invalid")
+            closed_group_quantifiers = group_quantifiers.pop()
+            if group_quantifiers and closed_group_quantifiers > 0:
+                group_quantifiers[-1] += 1
+            index += 1
+            continue
+        if character == "|":
+            raise ValueError("APK regex alternation is unsupported")
+        if character in "*+":
+            raise ValueError("APK regex unbounded repetition is unsupported")
+
+        span = 1
+        if character == "?":
+            lower, upper = 0, 1
+        elif character == "{":
+            bounded = re.match(r"\{([0-9]+)(?:,([0-9]*))?\}", pattern[index:])
+            if bounded is None:
+                index += 1
+                continue
+            lower = int(bounded.group(1))
+            upper_text = bounded.group(2)
+            if "," in bounded.group(0) and not upper_text:
+                raise ValueError("APK regex unbounded repetition is unsupported")
+            upper = int(upper_text) if upper_text is not None else lower
+            if lower > upper or upper > 32:
+                raise ValueError("APK regex repetition bound is invalid")
+            span = len(bounded.group(0))
+        else:
+            closed_group_quantifiers = None
+            index += 1
+            continue
+
+        if closed_group_quantifiers:
+            raise ValueError("APK regex cannot repeat a group containing repetition")
+        quantifier_count += 1
+        branch_factor *= upper - lower + 1
+        if group_quantifiers:
+            group_quantifiers[-1] += 1
+        closed_group_quantifiers = None
+        index += span
+
+    if group_quantifiers:
+        raise ValueError("APK regex grouping is invalid")
+    if quantifier_count > 3:
         raise ValueError("APK regex has too many repetition operators")
+    if branch_factor > 256:
+        raise ValueError("APK regex repetition combination is too large")
     try:
         re.compile(pattern)
     except re.error as exc:

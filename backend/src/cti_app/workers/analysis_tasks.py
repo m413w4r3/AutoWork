@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import sys
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from cti_app.application.jobs import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.static_analysis import StaticAnalysisService, create_analysis_job_registry
 from cti_app.config import Settings, get_settings
+from cti_app.infrastructure.analysis_subprocess import set_process_dumpable
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
@@ -30,6 +32,12 @@ from cti_app.workers.confined_analysis import (
     build_analysis_worker_probe_payload,
     execute_confined_analysis_job,
 )
+
+# Dramatiq imports this module before starting worker processes. Make the master
+# and every forked task process non-dumpable before same-UID children can inspect
+# their environment or memory through procfs.
+if sys.platform.startswith("linux"):
+    set_process_dumpable(0)
 
 _PROBE_ID = re.compile(r"^[0-9a-f]{32}$")
 _PROBE_KEY_PREFIX = "autowork:analysis-worker-probe:"

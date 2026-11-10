@@ -6,7 +6,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -18,6 +18,8 @@ from cti_app.application.apk_analysis import (
 )
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisTool,
     ConfinedAnalysisWorkerAttestation,
     deterministic_confined_analysis_key,
 )
@@ -218,6 +220,7 @@ def _register(
     associations: Any = None,
     recorder: _Recorder | None = None,
     uow: SimpleNamespace | None = None,
+    settings: Settings | None = None,
 ) -> InMemoryToolRegistry:
     registry = InMemoryToolRegistry()
     register_apk_tools(
@@ -226,7 +229,7 @@ def _register(
         sample_associations=associations,
         recorder=recorder,
         uow_factory=lambda: _UowContext(uow or SimpleNamespace()),
-        settings=Settings(_env_file=None),
+        settings=settings or Settings(_env_file=None),
     )
     return registry
 
@@ -414,10 +417,14 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
     assert evidence["kind"] is EvidenceKind.BINARY_ANALYSIS
     assert evidence["source"] == "apk.jadx"
     assert evidence["source_version"].startswith(
-        f"apk-analysis-observation.v1:jadx:{JADX_VERSION}:archive:{JADX_ZIP_SHA256}:jre:"
+        f"apk-analysis-observation.v2:jadx:{JADX_VERSION}:archive:{JADX_ZIP_SHA256}:jre:"
     )
     payload = evidence["payload"]
-    assert payload["schema_version"] == "apk-analysis-observation.v1"
+    assert payload["schema_version"] == "apk-analysis-observation.v2"
+    assert payload["execution_budget"] == {
+        "timeout_seconds": 60,
+        "max_output_bytes": 192 * 1024,
+    }
     assert payload["sample_sha256"] == SAMPLE_SHA256
     assert payload["parameters"] == execution.requests[0].analysis_parameters
     canonical_result = json.dumps(
@@ -463,6 +470,37 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
         deterministic_confined_analysis_key(changed_parameters, worker_versions=worker_versions)
         != first_operation_key
     )
+    assert (
+        deterministic_confined_analysis_key(
+            replace(
+                execution.requests[0],
+                timeout_seconds=execution.requests[0].timeout_seconds + 1,
+            ),
+            worker_versions=worker_versions,
+        )
+        != first_operation_key
+    )
+    assert (
+        deterministic_confined_analysis_key(
+            replace(
+                execution.requests[0],
+                max_output_bytes=execution.requests[0].max_output_bytes + 1,
+            ),
+            worker_versions=worker_versions,
+        )
+        != first_operation_key
+    )
+    assert (
+        deterministic_confined_analysis_key(
+            replace(
+                execution.requests[0],
+                timeout_seconds=execution.requests[0].timeout_seconds,
+                max_output_bytes=execution.requests[0].max_output_bytes,
+            ),
+            worker_versions=worker_versions,
+        )
+        == first_operation_key
+    )
     changed_versions = {**worker_versions, "jadx_jre_version": "17.0.15"}
     assert (
         deterministic_confined_analysis_key(execution.requests[0], worker_versions=changed_versions)
@@ -476,6 +514,82 @@ async def test_apk_tool_paginates_persists_canonical_observation_and_reuses_iden
     before = adapter.operation_cache_identity
     execution._attestation = changed_attestation
     assert adapter.operation_cache_identity != before
+
+
+def test_non_apk_confined_analysis_key_keeps_its_existing_identity() -> None:
+    request = ConfinedAnalysisRequest(
+        investigation_id=UUID(int=1),
+        association_id=UUID(int=3),
+        sample_id=UUID(int=4),
+        artifact_id=UUID(int=2),
+        sha256="b" * 64,
+        tool=ConfinedAnalysisTool.STATIC,
+        timeout_seconds=30,
+        max_output_bytes=100,
+    )
+    assert (
+        deterministic_confined_analysis_key(
+            request,
+            worker_versions={"engine": "1.2"},
+        )
+        == "confined-analysis:37182e3765d201c832e15fe585ca662b17419349dec4d6583aa07276ef1fe399"
+    )
+
+
+@pytest.mark.asyncio
+async def test_apk_observation_identity_includes_effective_execution_budgets() -> None:
+    fixture, associations, _blob, _sample, uow = _sample_fixture()
+    execution = _Execution()
+    execution.result = _worker_result(operation="apk.manifest")
+    recorder = _Recorder()
+    first_settings = Settings(_env_file=None).model_copy(
+        update={
+            "analysis_apk_timeout_seconds": 30,
+            "analysis_worker_result_max_bytes": 64_000,
+        }
+    )
+    second_settings = Settings(_env_file=None).model_copy(
+        update={
+            "analysis_apk_timeout_seconds": 45,
+            "analysis_worker_result_max_bytes": 96_000,
+        }
+    )
+    arguments = {"sample_sha256": SAMPLE_SHA256}
+    context = _context(fixture.investigation_id)
+
+    first_registry = _register(execution, associations, recorder, uow, first_settings)
+    first_found = first_registry.get("apk.manifest", "1")
+    assert first_found is not None
+    _first_definition, first_adapter = first_found
+    first = await first_adapter.execute(arguments, context)
+
+    second_registry = _register(execution, associations, recorder, uow, second_settings)
+    second_found = second_registry.get("apk.manifest", "1")
+    assert second_found is not None
+    _second_definition, second_adapter = second_found
+    second = await second_adapter.execute(arguments, context)
+
+    assert first.status is ToolInvocationStatus.SUCCEEDED
+    assert second.status is ToolInvocationStatus.SUCCEEDED
+    assert execution.requests[0].timeout_seconds == 30
+    assert execution.requests[0].max_output_bytes == 64_000
+    assert execution.requests[1].timeout_seconds == 45
+    assert execution.requests[1].max_output_bytes == 96_000
+    assert recorder.calls[0]["idempotency_key"] != recorder.calls[1]["idempotency_key"]
+    assert recorder.calls[0]["object_id"] != recorder.calls[1]["object_id"]
+    first_observation = recorder.calls[0]["payload"]
+    second_observation = recorder.calls[1]["payload"]
+    assert first_observation["execution_budget"] == {
+        "timeout_seconds": 30,
+        "max_output_bytes": 64_000,
+    }
+    assert second_observation["execution_budget"] == {
+        "timeout_seconds": 45,
+        "max_output_bytes": 96_000,
+    }
+    assert (
+        first.output["evidence_observation_sha256"] != second.output["evidence_observation_sha256"]
+    )
 
 
 @pytest.mark.asyncio

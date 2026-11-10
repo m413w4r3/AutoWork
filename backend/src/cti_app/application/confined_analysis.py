@@ -615,6 +615,9 @@ def deterministic_confined_analysis_key(
         "analysis_parameters": dict(sorted(request.analysis_parameters.items())),
         "versions": dict(sorted(worker_versions.items())),
     }
+    if request.tool is ConfinedAnalysisTool.APK_JADX:
+        payload["timeout_seconds"] = request.timeout_seconds
+        payload["max_output_bytes"] = request.max_output_bytes
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"confined-analysis:{hashlib.sha256(encoded).hexdigest()}"
 

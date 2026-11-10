@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import time
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
@@ -34,6 +35,7 @@ from cti_app.config import Settings
 from cti_app.workers.apk_analysis import (
     _fit_result_budget,
     _run_operation,
+    _search_sources,
     _validate_apk_archive,
     run_apk_analysis,
 )
@@ -88,10 +90,10 @@ def test_apk_contract_round_trips_and_enforces_operation_bounds() -> None:
             operation=ApkAnalysisOperation.SOURCE_READ,
             source_path="sources/../../outside.java",
         )
-    with pytest.raises(ValueError, match="repetition operators"):
+    with pytest.raises(ValueError):
         ApkAnalysisParameters(
             operation=ApkAnalysisOperation.SOURCE_SEARCH,
-            pattern="a.*b.*c",
+            pattern="a*~",
             regex=True,
         )
     with pytest.raises(ValueError, match="exactly one"):
@@ -122,6 +124,112 @@ def test_confined_request_accepts_only_associated_sample_and_typed_apk_operation
             artifact_kind=ConfinedAnalysisArtifactKind.CORPUS_SAMPLE,
             analysis_parameters={"operation": "apk.manifest"},
         )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ("(a+)+$", "(a|aa)+", "(ab{2})?", "(?=a)a", r"(a)\1", "a{8,}"),
+)
+def test_apk_search_rejects_backtracking_constructs(pattern: str) -> None:
+    with pytest.raises(ValueError):
+        ApkAnalysisParameters(
+            operation=ApkAnalysisOperation.SOURCE_SEARCH,
+            pattern=pattern,
+            regex=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    (
+        "https?://",
+        "[A-Za-z0-9]{8,32}",
+        "AUTOWORK_[A-Z_]{1,20}",
+        "a?b?c?",
+    ),
+)
+def test_apk_search_accepts_bounded_regex_patterns(pattern: str) -> None:
+    assert (
+        ApkAnalysisParameters(
+            operation=ApkAnalysisOperation.SOURCE_SEARCH,
+            pattern=pattern,
+            regex=True,
+        ).pattern
+        == pattern
+    )
+
+
+def test_apk_search_caps_a_four_megabyte_line_and_marks_partial(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "org" / "example" / "Large.java"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"needle" + b"x" * (4 * 1024 * 1024 - 13) + b"needle\n")
+    request = ApkAnalysisParameters(
+        operation=ApkAnalysisOperation.SOURCE_SEARCH,
+        pattern="needle",
+    )
+
+    started = time.monotonic()
+    matches, truncated = _search_sources(tmp_path, request)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    assert truncated is True
+    assert len(matches) == 1
+    assert matches[0].text_truncated is True
+
+
+def test_apk_search_stops_at_cumulative_volume_budget(tmp_path: Path, monkeypatch) -> None:
+    from cti_app.workers import apk_analysis
+
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir()
+    (source_dir / "First.java").write_text("x\n" * 20, encoding="utf-8")
+    (source_dir / "Second.java").write_text("x\n" * 20, encoding="utf-8")
+    monkeypatch.setattr(apk_analysis, "_MAX_SEARCH_BYTES", 16)
+    request = ApkAnalysisParameters(
+        operation=ApkAnalysisOperation.SOURCE_SEARCH,
+        pattern="missing",
+    )
+
+    matches, truncated = _search_sources(tmp_path, request)
+
+    assert matches == []
+    assert truncated is True
+
+
+def test_apk_search_stops_at_cumulative_time_budget(tmp_path: Path, monkeypatch) -> None:
+    from cti_app.workers import apk_analysis
+
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir()
+    (source_dir / "First.java").write_text("first\nsecond\n", encoding="utf-8")
+    moments = iter((0.0, 0.0, 0.0, 2.0))
+
+    class _Clock:
+        @staticmethod
+        def monotonic() -> float:
+            return next(moments)
+
+    monkeypatch.setattr(apk_analysis, "time", _Clock())
+    request = ApkAnalysisParameters(
+        operation=ApkAnalysisOperation.SOURCE_SEARCH,
+        pattern="missing",
+    )
+
+    matches, truncated = _search_sources(tmp_path, request)
+
+    assert matches == []
+    assert truncated is True
+
+
+def test_apk_search_rejects_too_many_or_too_wide_bounded_repetitions() -> None:
+    for pattern in ("a?b?c?d?", "a{8,33}"):
+        with pytest.raises(ValueError):
+            ApkAnalysisParameters(
+                operation=ApkAnalysisOperation.SOURCE_SEARCH,
+                pattern=pattern,
+                regex=True,
+            )
 
 
 def test_fixture_hash_and_archive_contract_are_stable() -> None:
