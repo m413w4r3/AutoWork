@@ -24,6 +24,7 @@ from cti_app.application.capabilities import CapabilitiesService
 from cti_app.application.code_features import CodeFeatureService
 from cti_app.application.confined_analysis import (
     CONFINED_ANALYSIS_RESULT_SCHEMA,
+    CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS,
     ConfinedAnalysisArtifactKind,
     ConfinedAnalysisJobParameters,
     ConfinedAnalysisTool,
@@ -2280,6 +2281,9 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
             "apk",
         ],
         "versions": versions,
+        "resource_limits": {
+            name: getattr(settings, name) for name in CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS
+        },
     }
 
 

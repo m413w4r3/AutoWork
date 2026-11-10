@@ -21,6 +21,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisRequest,
     ConfinedAnalysisTool,
     ConfinedAnalysisWorkerAttestation,
+    confined_analysis_operation_cache_identity,
 )
 from cti_app.application.evidence_recorder import EvidenceKind
 from cti_app.application.investigation_acquisition import HitAcquisitionService
@@ -90,6 +91,33 @@ from tests.investigation_c2_fakes import (
 )
 
 _MARKER = "SAFE_CONFined_ANALYSIS_FIXTURE"
+_WORKER_RESOURCE_LIMIT_FIELDS = (
+    "analysis_max_sample_bytes",
+    "analysis_string_min_length",
+    "analysis_max_strings",
+    "analysis_capa_timeout_seconds",
+    "analysis_capa_max_output_bytes",
+    "analysis_capa_max_memory_bytes",
+    "analysis_yara_timeout_seconds",
+    "analysis_yara_max_strings_per_rule",
+    "analysis_floss_max_output_bytes",
+    "analysis_local_monodis_max_sample_bytes",
+    "analysis_local_monodis_max_output_bytes",
+    "analysis_local_monodis_timeout_seconds",
+    "smda_timeout_seconds",
+    "smda_max_output_bytes",
+    "smda_max_memory_bytes",
+    "local_analysis_timeout_seconds",
+    "local_analysis_max_output_bytes",
+    "local_analysis_memory_limit_bytes",
+    "analysis_local_command_max_range_bytes",
+    "analysis_suricata_timeout_seconds",
+    "analysis_suricata_max_eve_bytes",
+    "analysis_suricata_max_events",
+    "dotnet_analysis_address_space_limit_bytes",
+    "apk_analysis_address_space_limit_bytes",
+    "analysis_apk_timeout_seconds",
+)
 
 
 def _floss_parameters(*, max_output_bytes: int = 8_000_000) -> ConfinedAnalysisJobParameters:
@@ -477,7 +505,56 @@ def _worker_probe_payload(
             "archive_tools",
         ],
         "versions": versions,
+        "resource_limits": {
+            name: getattr(settings, name) for name in _WORKER_RESOURCE_LIMIT_FIELDS
+        },
     }
+
+
+def test_worker_resource_limits_are_attested_and_version_operation_reuse() -> None:
+    settings = Settings(_env_file=None, analysis_capa_max_memory_bytes=512 * 1024 * 1024)
+    payload = _worker_probe_payload(settings)
+    first_attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+    first_port, _, _, _ = _port(attestation=first_attestation)
+    first_identity = confined_analysis_operation_cache_identity(first_port)
+
+    replay_attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+    replay_port, _, _, _ = _port(attestation=replay_attestation)
+    assert confined_analysis_operation_cache_identity(replay_port) == first_identity
+
+    payload["resource_limits"]["analysis_capa_max_memory_bytes"] = 2 * 1024 * 1024 * 1024
+    changed_attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+    changed_port, _, _, _ = _port(attestation=changed_attestation)
+    changed_identity = confined_analysis_operation_cache_identity(changed_port)
+    assert changed_identity != first_identity
+
+    legacy_payload = _worker_probe_payload(settings)
+    legacy_payload.pop("resource_limits")
+    legacy_attestation = _attestation_from_response(json.dumps(legacy_payload).encode(), settings)
+    assert legacy_attestation.reachable is True
+    assert legacy_attestation.resource_limits == {}
+
+
+def test_worker_resource_limit_attestation_rejects_unbounded_or_malformed_values() -> None:
+    settings = Settings(_env_file=None)
+    for invalid_value in (True, 1 << 41, 512.0):
+        payload = _worker_probe_payload(settings)
+        payload["resource_limits"]["analysis_capa_max_memory_bytes"] = invalid_value
+
+        attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+
+        assert attestation.reachable is False
+        assert attestation.available_reason == "analysis_worker_probe_response_invalid"
+
+    payload = _worker_probe_payload(settings)
+    payload["resource_limits"]["local_analysis_memory_limit_bytes"] = 1
+    attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+    assert attestation.reachable is False
+
+    payload = _worker_probe_payload(settings)
+    payload["resource_limits"].pop("smda_max_memory_bytes")
+    attestation = _attestation_from_response(json.dumps(payload).encode(), settings)
+    assert attestation.reachable is False
 
 
 def _request(
@@ -821,9 +898,15 @@ def test_worker_probe_attests_jadx_version_archive_and_jre(
     monkeypatch.setattr(worker_module, "_proc_status", lambda: {"NoNewPrivs": "1"})
     monkeypatch.setattr(worker_module, "_root_mount_is_read_only", lambda: True)
 
-    payload = build_analysis_worker_probe_payload(Settings(_env_file=None))
+    settings = Settings(_env_file=None)
+    payload = build_analysis_worker_probe_payload(settings)
     assert "apk" in payload["supported_families"]
     assert {key: payload["versions"][key] for key in expected} == expected
+    assert payload["resource_limits"] == {
+        name: getattr(settings, name) for name in _WORKER_RESOURCE_LIMIT_FIELDS
+    }
+    assert payload["resource_limits"]["analysis_capa_max_memory_bytes"] == 512 * 1024 * 1024
+    assert payload["resource_limits"]["local_analysis_memory_limit_bytes"] == 512 * 1024 * 1024
 
 
 @pytest.mark.asyncio
