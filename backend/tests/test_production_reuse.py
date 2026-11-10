@@ -1761,9 +1761,7 @@ def _article_synthesis_proposal(handles: dict[str, str]) -> dict[str, object]:
     follow_on_sections: list[dict[str, Any]] = []
     for index, heading in enumerate(follow_on_headings):
         text = (
-            " ".join([short_claim] * 500)
-            if index == len(follow_on_headings) - 1
-            else short_claim
+            " ".join([short_claim] * 500) if index == len(follow_on_headings) - 1 else short_claim
         )
         follow_on_sections.append(
             {

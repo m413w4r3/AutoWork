@@ -167,17 +167,14 @@ class SourceFigureInventoryResult:
             "truncated": self.truncated,
             "truncated_count": self.truncated_count,
             "rejected_before_limit_count": self.rejected_before_limit_count,
-            "rejected_before_limit_reason_counts": dict(
-                self.rejected_before_limit_reason_counts
-            ),
+            "rejected_before_limit_reason_counts": dict(self.rejected_before_limit_reason_counts),
             "rejected_before_limit_candidates": [
                 item.to_json() for item in self.rejected_before_limit_candidates
             ],
             "max_figures": self.max_figures,
             "truncated_decision_counts": dict(self.truncated_decision_counts),
             "truncated_reason_counts": {
-                decision: dict(counts)
-                for decision, counts in self.truncated_reason_counts.items()
+                decision: dict(counts) for decision, counts in self.truncated_reason_counts.items()
             },
             "truncated_candidates": [item.to_json() for item in self.truncated_candidates],
             "warnings": list(self.warnings),
@@ -442,8 +439,10 @@ class SourceFigureInventory:
                     )
             if decision is SourceFigureDecision.REJECTED:
                 record_pre_limit_rejection(source=source, locator=locator, reason=reason)
-            replaces_rejected = duplicate and (
-                found[indices_by_hash[sha256]].decision is SourceFigureDecision.REJECTED
+            replaces_rejected = (
+                sha256 is not None
+                and duplicate
+                and (found[indices_by_hash[sha256]].decision is SourceFigureDecision.REJECTED)
             )
             # Rejected outcomes are summarized separately and never consume content slots.
             needs_content_slot = decision is not SourceFigureDecision.REJECTED and (

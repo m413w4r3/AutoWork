@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -3108,7 +3108,7 @@ def _date_supported_by_payload(
         event_date = payload["event_date"]
         # Keep date_text's asserted precision above; synthesis may otherwise
         # use only this event's own source quote as the date fallback.
-        supporting_texts = (event_date or "", date_text or "")
+        supporting_texts: tuple[Any, ...] = (event_date or "", date_text or "")
         if include_event_evidence_quote:
             supporting_texts += (payload.get("evidence_quote", ""),)
         return any(
@@ -3420,8 +3420,23 @@ def _validate_synthesis_proposal(
                 )
             return (), ()
 
+        def convert_claim_or_raise(
+            claim: SynthesisClaimProposalV1,
+            *,
+            section_kind: str,
+            allow_technical: bool,
+        ) -> SynthesisParagraphV1:
+            paragraph = convert_claim(
+                claim,
+                section_kind=section_kind,
+                allow_technical=allow_technical,
+            )
+            if paragraph is None:
+                raise AssertionError("Claim conversion only returns None while collecting errors")
+            return paragraph
+
         lead = tuple(
-            convert_claim(claim, section_kind="lead", allow_technical=False)
+            convert_claim_or_raise(claim, section_kind="lead", allow_technical=False)
             for claim in parsed.lead
         )
         try:
@@ -3439,7 +3454,7 @@ def _validate_synthesis_proposal(
         sections: list[SynthesisSectionV1] = []
         for section in parsed.sections:
             paragraphs = tuple(
-                convert_claim(
+                convert_claim_or_raise(
                     claim,
                     section_kind=section.kind.value,
                     allow_technical=True,
@@ -3504,8 +3519,8 @@ def collect_synthesis_proposal_violations(
             publication_kind=publication_kind,
             collected_errors=collected,
         )
-    except SynthesisProposalControlError as error:
-        collected.append(error)
+    except SynthesisProposalControlError as caught_error:
+        collected.append(caught_error)
 
     try:
         parsed = _proposal_from_payload(proposal)
@@ -3522,8 +3537,8 @@ def collect_synthesis_proposal_violations(
 
     violations: list[tuple[int, int, dict[str, str]]] = []
     seen: set[tuple[str, str, str]] = set()
-    for sequence, error in enumerate(collected):
-        violation = _corrective_grounding_violation(error)
+    for sequence, collected_error in enumerate(collected):
+        violation = _corrective_grounding_violation(collected_error)
         if violation is None:
             continue
         claim_id = violation.get("claim_id", "")
@@ -4993,7 +5008,7 @@ class ProductionSynthesisService:
             second_violations: Sequence[dict[str, str]] | None = None,
         ) -> ProductionSynthesisExecution:
             """Keep the initial validation failure and corrective outcome visible."""
-            first_record = {
+            first_record: dict[str, Any] = {
                 "turn": "initial",
                 "model_run_id": str(first_run.id),
                 "error_code": first_error.code.value,
@@ -5001,7 +5016,7 @@ class ProductionSynthesisService:
             }
             if initial_corrective_violations:
                 first_record["violations"] = list(initial_corrective_violations)
-            second_record = {
+            second_record: dict[str, Any] = {
                 "turn": "corrective",
                 "model_run_id": str(corrective_run_id),
                 "error_code": error_code,
@@ -5253,6 +5268,11 @@ class ProductionSynthesisService:
                     },
                 )
             corrective_request, violation_fingerprint, _ = corrective
+            corrective_request_run_id = corrective_request.run_id
+            if corrective_request_run_id is None:
+                raise AssertionError(
+                    "Corrective synthesis requests always have a deterministic run ID"
+                ) from None
             corrective_violation_fingerprint = violation_fingerprint
             first_error = exc
             first_model_run = model_run
@@ -5266,12 +5286,12 @@ class ProductionSynthesisService:
                     "The archived corrective synthesis response could not be verified.",
                     first_error=first_error,
                     first_run=first_model_run,
-                    corrective_run_id=corrective_request.run_id,
+                    corrective_run_id=corrective_request_run_id,
                     second_reason=str(corrective_archive_error.get("error_code")),
                     details=corrective_archive_error,
                 )
             if corrective_execution is None:
-                prior_corrective_run = await self._model_gateway.get_run(corrective_request.run_id)
+                prior_corrective_run = await self._model_gateway.get_run(corrective_request_run_id)
                 if prior_corrective_run is not None and (
                     _synthesis_model_run_is_ambiguous(prior_corrective_run)
                     or prior_corrective_run.status is ModelRunStatus.NEEDS_REVIEW
@@ -5351,7 +5371,7 @@ class ProductionSynthesisService:
                         self._model_gateway, corrective_request
                     )
                 except ModelSubmissionReconciliationRequiredError as corrective_exc:
-                    corrective_run_id = corrective_exc.model_run_id or corrective_request.run_id
+                    corrective_run_id = corrective_exc.model_run_id or corrective_request_run_id
                     return corrective_review(
                         SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value,
                         "The corrective provider submission may have been accepted "
@@ -5369,7 +5389,7 @@ class ProductionSynthesisService:
                         "The source access policy blocked the corrective model route.",
                         first_error=first_error,
                         first_run=first_model_run,
-                        corrective_run_id=corrective_request.run_id,
+                        corrective_run_id=corrective_request_run_id,
                         second_reason=corrective_exc.code,
                         details={"error_code": corrective_exc.code},
                     )
@@ -5381,7 +5401,7 @@ class ProductionSynthesisService:
                         "The corrective synthesis model call failed.",
                         first_error=first_error,
                         first_run=first_model_run,
-                        corrective_run_id=corrective_request.run_id,
+                        corrective_run_id=corrective_request_run_id,
                         second_reason=corrective_exc.code,
                         details={"error_code": corrective_exc.code},
                     )
@@ -5641,7 +5661,8 @@ class ProductionSynthesisService:
                     },
                 )
 
-        model_title = parsed.proposal.title
+        proposal = cast(SynthesisProposalV1, parsed.proposal)
+        model_title = proposal.title
         title_is_valid = is_valid_editorial_title(model_title)
         editorial_title = model_title if title_is_valid and model_title is not None else None
         if editorial_title is None:
@@ -5656,7 +5677,7 @@ class ProductionSynthesisService:
             if editorial_title is None:
                 editorial_title = _fallback_editorial_title(snapshot, extraction)
         source_notes, source_note_warnings = validate_synthesis_source_notes(
-            parsed.proposal, evidence_pack
+            proposal, evidence_pack
         )
         timeline_warnings: list[str] = []
         projected_timeline = build_synthesis_timeline(

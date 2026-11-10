@@ -20,12 +20,16 @@ from cti_app.application.publication_builder import (
 from cti_app.application.publication_qa import qa_publication_v7
 from cti_app.application.semantic_annotation import SemanticAnnotator
 from cti_app.application.typst_rendering import project_publication_to_typst_model
-from cti_app.domain.production import ProductionEvidenceBasis
+from cti_app.domain.production import ProductionEvidenceBasis, ProductionInputSnapshot
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
+    ProductionExtractionV1,
 )
+from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import (
+    ProductionSynthesisV1,
     SynthesisParagraphV1,
     SynthesisSectionKind,
     SynthesisSectionV1,
@@ -87,7 +91,12 @@ def _overview_section(ref: PublicationEvidenceRefV1) -> PublicationSectionV1:
     )
 
 
-def _article_with_overview() -> tuple[PublicationDocumentV5, object, object, object]:
+def _article_with_overview() -> tuple[
+    PublicationDocumentV5,
+    ProductionInputSnapshot,
+    ProductionReferenceCorpusV1,
+    tuple[ProductionExtractionV1, ProductionSynthesisV1, EditorialEnrichmentV1],
+]:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     evidence_refs = extraction_evidence_refs_v1(extraction)
     assert evidence_refs

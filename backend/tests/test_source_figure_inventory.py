@@ -203,22 +203,36 @@ def test_inventory_applies_figure_count_and_size_limits() -> None:
 
 
 def test_inventory_classifies_navigation_before_applying_content_limit() -> None:
-    navigation = "<nav>" + "".join(
-        f'<img src="/navigation/{index}.png" alt="Navigation graphic {index}">'
-        for index in range(549)
-    ) + "</nav>"
-    decorative = '<div class="modal">' + "".join(
-        f'<img class="modal-close" src="/close/{index}.png" alt="Close icon {index}">'
-        for index in range(61)
-    ) + "</div>"
-    related = '<section><h2>Recent posts</h2>' + "".join(
-        f'<img src="/related/{index}.png" alt="Related report {index}">'
-        for index in range(47)
-    ) + "</section>"
-    boilerplate = "<div><h2>Publisher information</h2>" + "".join(
-        f'<img src="/brand/{index}.png" alt="Publisher logo {index}">'
-        for index in range(42)
-    ) + "</div>"
+    navigation = (
+        "<nav>"
+        + "".join(
+            f'<img src="/navigation/{index}.png" alt="Navigation graphic {index}">'
+            for index in range(549)
+        )
+        + "</nav>"
+    )
+    decorative = (
+        '<div class="modal">'
+        + "".join(
+            f'<img class="modal-close" src="/close/{index}.png" alt="Close icon {index}">'
+            for index in range(61)
+        )
+        + "</div>"
+    )
+    related = (
+        "<section><h2>Recent posts</h2>"
+        + "".join(
+            f'<img src="/related/{index}.png" alt="Related report {index}">' for index in range(47)
+        )
+        + "</section>"
+    )
+    boilerplate = (
+        "<div><h2>Publisher information</h2>"
+        + "".join(
+            f'<img src="/brand/{index}.png" alt="Publisher logo {index}">' for index in range(42)
+        )
+        + "</div>"
+    )
     article_figures = "".join(
         f'<figure><img src="figure-{index}.png" alt="Infrastructure graph {index}"></figure>'
         for index in range(8)
@@ -229,7 +243,7 @@ def test_inventory_classifies_navigation_before_applying_content_limit() -> None
             + decorative
             + related
             + boilerplate
-            + '<article><h2>Infrastructure</h2>'
+            + "<article><h2>Infrastructure</h2>"
             + '<img src="/duplicate.png" alt="Duplicate archived visual">'
             + article_figures
             + "</article>"

@@ -162,9 +162,7 @@ def augment_publication_with_opinion(
     base_body_sha256 = publication_document_v5_sha256(base_publication_document)
     base_sha256 = (
         hashlib.sha256(
-            ProductionArtifactStore.canonical_json_bytes(
-                serialize_publication_document(routed_v8)
-            )
+            ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(routed_v8))
         ).hexdigest()
         if routed_v8 is not None
         else hashlib.sha256(

@@ -4464,9 +4464,9 @@ def build_source_figure_inventory_diagnostics(
         rejected_before_limit_count
         + inventory.truncated_decision_counts.get(SourceFigureDecision.REJECTED.value, 0)
     )
-    for decision, counts in inventory.truncated_reason_counts.items():
+    for decision, inventory_counts in inventory.truncated_reason_counts.items():
         if decision in reasons:
-            for reason, count in counts.items():
+            for reason, count in inventory_counts.items():
                 reasons[decision][reason] = reasons[decision].get(reason, 0) + count
 
     return {

@@ -258,4 +258,3 @@ def test_editorial_enrichment_cross_run_reuse_is_exposed_as_success() -> None:
     assert result["reused"] is True
     assert result["model_calls"] == 0
     assert result["reused_from_artifact_id"] == str(source_artifact_id)
-

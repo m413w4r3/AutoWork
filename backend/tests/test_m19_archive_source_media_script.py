@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 import pytest
@@ -236,6 +236,10 @@ class _ArtifactStore:
         return await self.catalog.read(blob_id, max_bytes=max_bytes)
 
 
+class _OperatorRuntime(Protocol):
+    artifact_store: _ArtifactStore
+
+
 class _FakeSafeHttpCollector:
     def __init__(self, responses: dict[str, bytes]) -> None:
         self.responses = responses
@@ -296,7 +300,7 @@ def _make_runtime(
     stop_on_policy_block: bool = False,
     has_extraction: bool = True,
     never_collect: bool = False,
-) -> tuple[script.OperatorRuntime, _FakeSafeHttpCollector | None, _State]:
+) -> tuple[_OperatorRuntime, _FakeSafeHttpCollector | None, _State]:
     state = _State()
     factory = _Factory(state)
     blob_store = _BlobStore()

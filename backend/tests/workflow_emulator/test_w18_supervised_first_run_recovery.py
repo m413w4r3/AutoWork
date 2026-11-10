@@ -791,9 +791,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
     publication_envelope = publication_document_from_json(json.loads(publication_bytes))
     assert isinstance(publication_envelope, PublicationDocumentV8)
-    document = (
-        publication_envelope.base_publication.base_publication.base_publication
-    )
+    document = publication_envelope.base_publication.base_publication.base_publication
     assert isinstance(document, PublicationDocumentV5)
     publication_body_sha256 = publication_document_v5_sha256(document)
     document_payload = serialize_publication_document(document)
