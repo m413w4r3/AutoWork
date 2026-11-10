@@ -11,6 +11,10 @@ UV ?= uv
 PNPM ?= pnpm
 D2_BINARY ?= d2
 TYPST_BINARY ?= typst
+# Pinned (infra/typst.lock) non-snap Typst/tool binaries, when installed for the
+# host test suite; the snap Typst cannot read pytest's /tmp directories.
+AUTOWORK_TOOLS_BIN ?= $(HOME)/.local/share/autowork-tools/bin
+TEST_PATH_PREFIX := $(if $(wildcard $(AUTOWORK_TOOLS_BIN)),$(AUTOWORK_TOOLS_BIN):,)
 FONT_BUNDLE_ROOT ?= $(CURDIR)/chpTypst
 export FONT_BUNDLE_ROOT
 
@@ -380,7 +384,7 @@ up-clean: clean up ## Réinitialise les données puis redémarre la stack
 #
 test-backend: backend-sync ## Lance les tests backend hors intégration
 	cd $(BACKEND_DIR) && \
-		$(UV_RUN) pytest \
+		PATH="$(TEST_PATH_PREFIX)$$PATH" $(UV_RUN) pytest \
 			--ignore=tests/integration \
 			-m "not integration" \
 			$(PYTEST_ARGS)

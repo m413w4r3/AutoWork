@@ -52,6 +52,20 @@ Do not run frontend checks for a backend-only change.
 
 Use the full backend suite only when targeted tests are insufficient.
 
+### Test environment (mandatory)
+
+Backend tests run only in the locked project environment `backend/.venv`
+(Python 3.12, `uv.lock`, groups `dev` + `analysis`). `make test-backend`,
+`make lint-backend` and `make typecheck-backend` first run
+`uv sync --locked --python 3.12 --group dev --group analysis` (works offline
+from the uv cache once synced). Never run the suite with `/usr/bin/python3.12`,
+the system `pytest` or Conda: they lack the declared dependencies and produce
+phantom failures (`pefile`/`yara`/`multipart` missing => collection errors,
+`engine_crashed`, `offline_simulated`, multipart route failures).
+`tests/conftest.py` aborts with that diagnosis when the environment is wrong.
+Real-Typst tests also need `TYPST_BINARY` and `FONT_BUNDLE_ROOT`
+(see `docs/mission20/E0_TEST_ENVIRONMENT.md`).
+
 ## Advisor evidence and disclosure
 
 Advisor and Bridge dossiers are **permissive by default for CTI evidence** in
