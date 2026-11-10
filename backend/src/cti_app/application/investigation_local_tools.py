@@ -933,7 +933,12 @@ class _GhidraReadAdapter(_LocalAdapterBase):
                     message="Ghidra returned an unknown decompilation status.",
                     sample_sha256=sample_sha256,
                 )
-            decompilation = observation.data.get("decompilation")
+            function = observation.data.get("function")
+            decompilation = (
+                function.get("decompilation", observation.data.get("decompilation"))
+                if isinstance(function, Mapping)
+                else observation.data.get("decompilation")
+            )
             if not isinstance(decompilation, str) or not decompilation.strip():
                 unsupported = (
                     "function" in observation.data and observation.data["function"] is None
