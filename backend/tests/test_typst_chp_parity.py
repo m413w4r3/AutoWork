@@ -157,6 +157,11 @@ def _render(document, bundle, *, document_label: str = "Libellé de fixture"):
     return TypstRenderer().render(document, bundle, document_label=document_label)
 
 
+def _run_blocking(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    # Short Poppler/git helpers in tests; the thread-offloading ceremony adds nothing here.
+    return subprocess.run(*args, **kwargs)
+
+
 def _run_typst_compile(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(argv, capture_output=True, check=False, timeout=20)
 
@@ -1260,6 +1265,7 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     opinion, citation_context = _approved_opinion(base)
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+
     async def compile_document(document: Any, name: str):
         root = tmp_path / name
         workspace_root = root / "workspace"
@@ -1309,7 +1315,7 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     assert pdftoppm is not None, "Poppler pdftoppm is required for V6 PDF verification"
     pdf_path = tmp_path / "publication-v6.pdf"
     pdf_path.write_bytes(v6_pdf)
-    text_result = subprocess.run(
+    text_result = _run_blocking(
         (pdftotext, str(pdf_path), "-"),
         capture_output=True,
         check=True,
@@ -1332,14 +1338,10 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
             action = annotation_ref.get_object().get("/A")
             if action is not None and action.get("/URI") is not None:
                 uris.append(str(action["/URI"]))
-    assert any(
-        uri.endswith(f"/findings/{opinion.blocks[0].finding_refs[0]}") for uri in uris
-    )
-    assert any(
-        uri.endswith(f"/evidence/{opinion.blocks[0].evidence_refs[0]}") for uri in uris
-    )
+    assert any(uri.endswith(f"/findings/{opinion.blocks[0].finding_refs[0]}") for uri in uris)
+    assert any(uri.endswith(f"/evidence/{opinion.blocks[0].evidence_refs[0]}") for uri in uris)
     page_prefix = tmp_path / "publication-v6-page"
-    subprocess.run(
+    _run_blocking(
         (
             pdftoppm,
             "-f",
@@ -1405,7 +1407,7 @@ async def test_opinion_paragraph_spacing_matches_b421f486_pdf_baseline(
     baseline_root = Path("/tmp/m19-m7/base")
     baseline_helper = baseline_root / "RENDERER" / "publication_helpers.typ"
     baseline_helper.parent.mkdir(parents=True, exist_ok=True)
-    baseline_result = subprocess.run(
+    baseline_result = _run_blocking(
         ("git", "show", "b421f486:chpTypst/RENDERER/publication_helpers.typ"),
         cwd=_REPOSITORY_ROOT,
         capture_output=True,
@@ -1654,7 +1656,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     page_texts = [page.extract_text() or "" for page in reader.pages]
     pdftotext = shutil.which("pdftotext")
     assert pdftotext is not None, "Poppler pdftotext is required for pipe-table verification"
-    extracted_result = subprocess.run(
+    extracted_result = _run_blocking(
         (pdftotext, str(pdf_path), "-"),
         capture_output=True,
         check=True,
@@ -2202,6 +2204,8 @@ async def test_real_typst_scales_raster_figures_to_the_available_frame(
 #let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
+#let semantic-technical-literal(body) = body
+#let semantic-technical-code-block(lines) = lines.map(line => line.text).join(linebreak())
 #let tag(content) = content
 #let publication-url-footnote(url) = []
 #let noteAnalyste(content) = block(
@@ -2487,6 +2491,8 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
 #let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
+#let semantic-technical-literal(body) = body
+#let semantic-technical-code-block(lines) = lines.map(line => line.text).join(linebreak())
 #let tag(content) = content
 #let publication-url-footnote(url) = []
 #let noteAnalyste(content) = block(
