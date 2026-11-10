@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import os
 import resource
 import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,6 +16,42 @@ from pathlib import Path
 from typing import Any
 
 from cti_app.infrastructure.seccomp_network import install_network_seccomp_filter
+
+_PR_SET_DUMPABLE = 4
+_PR_GET_DUMPABLE = 3
+_LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
+_PRCTL = getattr(_LIBC, "prctl", None) if _LIBC is not None else None
+if _PRCTL is not None:
+    _PRCTL.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    _PRCTL.restype = ctypes.c_int
+
+
+def set_process_dumpable(dumpable: int) -> None:
+    """Set Linux dumpability, which also gates same-UID access to procfs data."""
+    if dumpable not in {0, 1}:
+        raise ValueError("dumpable must be zero or one")
+    if _PRCTL is None:
+        raise OSError(errno.ENOSYS, "prctl(PR_SET_DUMPABLE) is unavailable")
+    if _PRCTL(_PR_SET_DUMPABLE, dumpable, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), "prctl(PR_SET_DUMPABLE)")
+
+
+def get_process_dumpable() -> int:
+    """Read the current process dumpability value for focused Linux tests."""
+    if _PRCTL is None:
+        raise OSError(errno.ENOSYS, "prctl(PR_GET_DUMPABLE) is unavailable")
+    value = _PRCTL(_PR_GET_DUMPABLE, 0, 0, 0, 0)
+    if value < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), "prctl(PR_GET_DUMPABLE)")
+    return value
 
 
 class AnalysisSubprocessStatus(StrEnum):
@@ -75,6 +114,8 @@ async def run_analysis_subprocess(
     }
 
     def limit() -> None:
+        if sys.platform.startswith("linux"):
+            set_process_dumpable(0)
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
         if deny_network:
             install_network_seccomp_filter()

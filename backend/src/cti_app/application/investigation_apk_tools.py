@@ -254,7 +254,7 @@ class _ApkToolAdapter(ToolAdapter):
     def operation_cache_identity(self) -> Mapping[str, Any]:
         return confined_analysis_operation_cache_identity(
             self._execution,
-            result_schema_version="apk-analysis-observation.v1",
+            result_schema_version="apk-analysis-observation.v2",
         )
 
     async def execute(
@@ -414,13 +414,18 @@ class _ApkToolAdapter(ToolAdapter):
             "runtime_jre_version": normalized_result.get("jre_version"),
         }
         limitations = list(_LIMITATIONS)
+        execution_budget = {
+            "timeout_seconds": timeout_seconds,
+            "max_output_bytes": max_output_bytes,
+        }
         observation = {
-            "schema_version": "apk-analysis-observation.v1",
+            "schema_version": "apk-analysis-observation.v2",
             "tool": self._name,
             "operation": self._operation.value,
             "sample_sha256": sample_sha256,
             "sample_size_bytes": size_bytes,
             "parameters": worker_parameters,
+            "execution_budget": execution_budget,
             "status": worker_status.lower(),
             "source": source,
             "result": operator_result,
@@ -439,6 +444,7 @@ class _ApkToolAdapter(ToolAdapter):
                 "tool": self._name,
                 "sample_sha256": sample_sha256,
                 "parameters": worker_parameters,
+                "execution_budget": execution_budget,
                 "cache_identity": cache_identity,
             },
             ensure_ascii=False,
@@ -448,7 +454,7 @@ class _ApkToolAdapter(ToolAdapter):
         ).encode("utf-8")
         request_fingerprint = hashlib.sha256(identity_payload).hexdigest()
         source_version = (
-            "apk-analysis-observation.v1:jadx:"
+            "apk-analysis-observation.v2:jadx:"
             f"{source['version']}:archive:{source['archive_sha256']}:jre:{source['jre_version']}"
         )
         try:

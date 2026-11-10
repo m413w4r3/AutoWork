@@ -1,11 +1,15 @@
+import errno
 import json
+import os
 import sys
 
 import pytest
 
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessStatus,
+    get_process_dumpable,
     run_analysis_subprocess,
+    set_process_dumpable,
 )
 
 
@@ -142,3 +146,51 @@ async def test_subprocess_stops_when_output_tree_exceeds_limits(tmp_path) -> Non
         directory_max_files=10,
     )
     assert result.status is AnalysisSubprocessStatus.DIRECTORY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_worker_and_child_cannot_read_parent_proc_environment_or_memory() -> None:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("PR_SET_DUMPABLE and procfs checks require Linux")
+    try:
+        fd = os.open("/proc/self/environ", os.O_RDONLY)
+        os.close(fd)
+        original_dumpable = get_process_dumpable()
+    except OSError as exc:
+        pytest.skip(f"prctl or /proc is unavailable: {exc}")
+
+    script = """
+import errno
+import json
+import os
+
+fd = os.open("/proc/self/environ", os.O_RDONLY)
+os.close(fd)
+parent_errors = []
+for name in ("environ", "mem"):
+    try:
+        fd = os.open(f"/proc/{os.getppid()}/{name}", os.O_RDONLY)
+        os.close(fd)
+        parent_errors.append(None)
+    except OSError as exc:
+        parent_errors.append(exc.errno)
+print(json.dumps({"self_environ_readable": True, "parent_errors": parent_errors}))
+"""
+
+    try:
+        # Importing the actual Dramatiq module applies the startup hardening.
+        from cti_app.workers import analysis_tasks  # noqa: F401
+
+        assert get_process_dumpable() == 0
+        result = await run_analysis_subprocess(
+            [sys.executable, "-c", script],
+            timeout_seconds=10,
+            output_limit=2048,
+        )
+        assert result.status is AnalysisSubprocessStatus.SUCCEEDED, result.stderr
+        observed = json.loads(result.stdout)
+        assert observed["self_environ_readable"] is True
+        assert len(observed["parent_errors"]) == 2
+        assert all(error in {errno.EACCES, errno.EPERM} for error in observed["parent_errors"])
+    finally:
+        set_process_dumpable(original_dumpable)

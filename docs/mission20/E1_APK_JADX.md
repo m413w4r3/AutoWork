@@ -91,3 +91,35 @@ complète est dans le README de la fixture.
 **Non vérifié** : aucun APK réel (a fortiori malveillant) n'a été décompilé ; comportement de jadx sur de
 gros APK/obfuscation/multi-DEX (plafonds : 128 MiB d'arbre de sortie, 90 s) ; redéploiement de la pile avec la
 nouvelle image (voir le rapport de mission).
+
+## Correctifs E1d
+
+- `apk.source.search` refuse les répétitions non bornées, limite les bornes à 32, les quantificateurs à trois,
+  leur facteur de combinaison à 256 et rejette lookarounds, backreferences, alternations et groupes répétés contenant une répétition. Chaque
+  ligne envoyée au moteur est limitée à 4096 caractères ; une ligne ou une recherche arrêtée par le budget
+  cumulé de 16 MiB / 2 secondes rend le résultat `PARTIAL`.
+- Mesure locale : le moteur `re.finditer` sur `a*~` et une ligne de 80 000 caractères a pris 2,225 s avant
+  validation ; `_search_sources` sur une ligne de 4 MiB avec le motif borné `https?://` a pris 0,025 s,
+  trouvé le préfixe et signalé `PARTIAL` ainsi que `text_truncated`.
+- Le worker appelle `prctl(PR_SET_DUMPABLE, 0)` lors de l'import du module Dramatiq, avant le démarrage de ses
+  processus de travail. Les sous-processus Linux appliquent aussi ce réglage dans leur fonction pré-exec.
+- La clé de réutilisation des opérations `apk_jadx` inclut les budgets effectifs de timeout et de sortie ; les
+  clés des autres outils gardent leur forme historique. L'observation APK est versionnée en v2 et enregistre
+  les deux budgets avec le résultat.
+
+## Limites résiduelles
+
+Le test Linux vérifie que, après l'import du module Dramatiq, un enfant de même UID ne peut ouvrir ni
+`/proc/<pid-parent>/environ` ni `/proc/<pid-parent>/mem`, et que `/proc/self/environ` reste lisible par le
+processus enfant. Le Dockerfile lance Dramatiq directement et Compose remplace sa commande par un autre appel
+direct à Dramatiq ; ce chemin importe `analysis_tasks` avant que le maître ne crée ses workers. Je n'ai pas
+ajouté de wrapper PID 1 : un wrapper qui fait `exec` ne garantit pas la conservation du réglage, tandis qu'un
+wrapper qui reste PID 1 devrait gérer le transfert des signaux et la récolte des enfants. La protection du
+maître dépend donc du maintien de l'import `analysis_tasks` avant le démarrage des processus Dramatiq.
+
+`PR_SET_DUMPABLE` bloque l'accès procfs selon les contrôles Linux entre UID identiques ; il ne protège pas
+contre une compromission du processus worker lui-même, le superutilisateur ou l'hôte. L'environnement filtré
+du sous-processus reste également limité à la liste explicitement autorisée par `analysis_subprocess.py`.
+Un essai a observé que `PR_SET_DUMPABLE` appliqué au pré-exec peut être réinitialisé par l'exécutable après
+`exec` (`PR_GET_DUMPABLE` valait alors 1 dans un enfant Python) ; le contrôle mesuré ici est le worker parent
+non dumpable, qui bloque l'accès de l'enfant à ses propres fichiers procfs.

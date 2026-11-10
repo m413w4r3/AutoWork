@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 import zipfile
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
@@ -76,6 +77,9 @@ _SAFE_ARCHIVE_NAME = re.compile(r"^[^\x00-\x1f\x7f]+$")
 _MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_RESULT_TEXT_CHARS = 16 * 1024
+_MAX_SEARCH_LINE_CHARS = 4096
+_MAX_SEARCH_BYTES = 16 * 1024 * 1024
+_MAX_SEARCH_SECONDS = 2.0
 _JAVA_OPTS = (
     "-Xms128m -Xmx768m -XX:+UseSerialGC -XX:ActiveProcessorCount=1 "
     "-XX:ReservedCodeCacheSize=128m -XX:CompressedClassSpaceSize=256m "
@@ -671,7 +675,13 @@ def _search_sources(
     pattern = re.compile(request.pattern if request.regex else re.escape(request.pattern))
     matches: list[ApkSearchMatch] = []
     truncated = False
+    started = time.monotonic()
+    searched_bytes = 0
+    stopped = False
     for source_path in _source_files(output_dir):
+        if time.monotonic() - started >= _MAX_SEARCH_SECONDS or searched_bytes >= _MAX_SEARCH_BYTES:
+            truncated = True
+            break
         raw = _read_source_bytes(source_path)
         if raw is None:
             truncated = True
@@ -682,7 +692,21 @@ def _search_sources(
         lines = raw.decode("utf-8", errors="replace").splitlines(keepends=True)
         byte_offset = 0
         for line_number, raw_line in enumerate(lines, start=1):
-            line = raw_line.rstrip("\r\n")
+            if time.monotonic() - started >= _MAX_SEARCH_SECONDS:
+                truncated = True
+                stopped = True
+                break
+            raw_line_bytes = raw_line.encode("utf-8", errors="replace")
+            if searched_bytes + len(raw_line_bytes) > _MAX_SEARCH_BYTES:
+                truncated = True
+                stopped = True
+                break
+            searched_bytes += len(raw_line_bytes)
+            full_line = raw_line.rstrip("\r\n")
+            line = full_line[:_MAX_SEARCH_LINE_CHARS]
+            line_truncated = len(full_line) > len(line)
+            if line_truncated:
+                truncated = True
             for match in pattern.finditer(line):
                 context_start = max(0, line_number - 1 - request.context_lines)
                 context_end = min(len(lines), line_number + request.context_lines)
@@ -701,7 +725,8 @@ def _search_sources(
                         match=raw_match[:512],
                         context=context,
                         text_truncated=(
-                            len(raw_match) > 512
+                            line_truncated
+                            or len(raw_match) > 512
                             or any(
                                 len(lines[index].rstrip("\r\n")) > 256
                                 for index in range(context_start, context_end)
@@ -714,8 +739,8 @@ def _search_sources(
                     break
             if len(matches) >= APK_MAX_SEARCH_MATCHES:
                 break
-            byte_offset += len(raw_line.encode("utf-8", errors="replace"))
-        if len(matches) >= APK_MAX_SEARCH_MATCHES:
+            byte_offset += len(raw_line_bytes)
+        if stopped or len(matches) >= APK_MAX_SEARCH_MATCHES:
             break
     matches.sort(key=lambda item: (item.source_path, item.offset, item.line))
     return matches, truncated
