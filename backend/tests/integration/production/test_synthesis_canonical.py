@@ -237,13 +237,18 @@ def _proposal_from_prompt(prompt_text: str) -> str:
         for record in records
         if record.get("kind") == "rule" and record.get("name")
     ]
-    sections: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = []
+    overview_text = "The selected publications document this activity."
+    overview_claims = [
+        (f"{label} {overview_text}", (fact["handle"],))
+        for label in ("Victimologie :", "Arsenal :", "Objectif principal :")
+    ]
+    sections: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
+        ("overview", overview_claims)
+    ]
     if domains:
         sections.append(("infrastructure", domains))
     if rules:
         sections.append(("detection", rules))
-    if not sections:
-        sections.append(("overview", [lead]))
     return synthesis_proposal_wire([lead], sections)
 
 
@@ -564,8 +569,10 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
     publication_payload = await scenario.artifact_store.read_json(
         publication_artifact.canonical_blob_id
     )
-    assert publication_payload["schema_version"] == "7"
-    publication_document_payload = publication_payload["base_publication"]["base_publication"]
+    assert publication_payload["schema_version"] == "8"
+    publication_document_payload = publication_payload["base_publication"]["base_publication"][
+        "base_publication"
+    ]
     publication_text = json.dumps(publication_payload)
     assert publication_document_payload["title"] == synthesis.title
     assert [item["text"] for item in publication_document_payload["lead"]] == [

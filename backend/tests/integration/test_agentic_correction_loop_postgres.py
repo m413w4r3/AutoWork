@@ -134,8 +134,8 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
     async def compile_tiny_diagram(diagram: Any) -> Any:
         compiled = await compile_diagram(diagram)
         media = (
-            b'<svg xmlns="http://www.w3.org/2000/svg" width="30" height="10" '
-            b'viewBox="0 0 30 10"><rect width="30" height="10" fill="#607d8b"/></svg>'
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="200" height="10" '
+            b'viewBox="0 0 200 10"><rect width="200" height="10" fill="#607d8b"/></svg>'
         )
         return replace(compiled, media_bytes=media, media_sha256=hashlib.sha256(media).hexdigest())
 
@@ -185,9 +185,9 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
     canonical_document_before = await scenario.artifact_store.read_json(
         publication_before.canonical_blob_id  # type: ignore[arg-type]
     )
-    assert canonical_document_before["base_publication"]["base_publication"]["subject_id"] == str(
-        run.subject_id
-    )
+    assert canonical_document_before["base_publication"]["base_publication"][
+        "base_publication"
+    ]["subject_id"] == str(run.subject_id)
     assert diagram_key in json.dumps(canonical_document_before)
     table_before = next(
         item
@@ -285,11 +285,13 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
             "family": "synthesis",
             "operations": ["rewrite_title"],
         }
-        small_finding = next(
+        small_findings = [
             item
             for item in before_inspection["diagnostics"]["items"]
             if item["code"] == "block_too_small" and item["target"]["block_key"] == diagram_key
-        )
+        ]
+        assert small_findings, diagram_mapping["locations"]
+        small_finding = small_findings[0]
         assert small_finding["class"].value == "deterministic"
         old_page = diagram_mapping["locations"][0]["page"]
         old_png = await inspection.page_png(old_hash, old_page, PdfInspectionProfile.PREVIEW)

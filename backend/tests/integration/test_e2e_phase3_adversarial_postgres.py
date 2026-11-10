@@ -85,6 +85,9 @@ from cti_app.domain.production import ProductionArtifactStage
 from cti_app.domain.publication import (
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
     PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
@@ -467,10 +470,20 @@ async def _add_timeline_to_seeded_publication(
             evidence_refs=(second_ref,),
         ),
     )
+    overview = PublicationParagraphV1(
+        text=parsed.document.lead[0].text,
+        evidence_refs=parsed.document.lead[0].evidence_refs,
+    )
+    overview_section = PublicationSectionV1(
+        kind=PublicationSectionKind.OVERVIEW,
+        heading="Vue d'ensemble",
+        paragraphs=(overview,),
+    )
     document = replace(
         parsed,
         document=replace(
             parsed.document,
+            sections=(overview_section,),
             timeline=timeline,
         ),
         semantic_text=SemanticTextV1(
@@ -481,6 +494,11 @@ async def _add_timeline_to_seeded_publication(
                     paragraph
                     for paragraph in parsed.semantic_text.paragraphs
                     if not paragraph.anchor.startswith("timeline:")
+                    and not paragraph.anchor.startswith("section:")
+                ),
+                SemanticParagraphV1(
+                    anchor="section:0:paragraph:0001",
+                    spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=overview.text),),
                 ),
                 *(
                     SemanticParagraphV1(
@@ -1007,10 +1025,10 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             assert "approver:m05d-human" not in pdf_text
             if label == "v6":
                 canonical_ref = str(first.id)
-                assert pdf_text.count(canonical_ref) == 1
-                reference_lines = [line for line in pdf_text.splitlines() if canonical_ref in line]
-                assert len(reference_lines) == 1
-                assert "[E1]" in reference_lines[0]
+                normalized_pdf_text = "".join(pdf_text.split())
+                assert "ANNEXE DE TRAÇABILITÉ" in pdf_text
+                assert normalized_pdf_text.count(canonical_ref) == 1
+                assert "supportedbyitscitedobservation.1,2" in normalized_pdf_text
                 chronology_alpha = "M05D-CHRONOLOGY-ALPHA"
                 chronology_beta = "M05D-CHRONOLOGY-BETA"
                 assert pdf_text.count(chronology_alpha) == 1

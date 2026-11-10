@@ -126,9 +126,12 @@ def _source_specs(
     }
 
 
-def _references(urls: tuple[str, ...]) -> str:
+def _references(urls: tuple[str, ...], *, primary_url: str | None = None) -> str:
     lines = ["# REFERENCES", "editorial-title: [Publication] Restart safety", ""]
+    if primary_url is not None and primary_url not in urls:
+        raise ValueError("primary_url must be one of the scripted sources")
     for index, url in enumerate(urls, start=1):
+        is_primary = url == primary_url if primary_url is not None else index == 1
         lines.extend(
             (
                 f"## SOURCE S{index}",
@@ -136,7 +139,12 @@ def _references(urls: tuple[str, ...]) -> str:
                 f"url: {url}",
                 f"publisher: Restart Lab {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
-                f"role: {'primary' if index == 1 else 'independent'}",
+                f"role: {'primary' if is_primary else 'independent'}",
+                *(
+                    (f"editorial-role: {'primary' if is_primary else 'corroboration'}",)
+                    if primary_url is not None
+                    else ()
+                ),
                 "reason: Coverage of the ExampleRAT activity",
                 "",
             )
@@ -166,10 +174,11 @@ def _configure_gateway(
     urls: tuple[str, ...],
     *,
     references: bool = True,
+    primary_url: str | None = None,
     q2: dict[str, str | Exception] | None = None,
 ) -> None:
     if references:
-        scenario.model.script.references(_references(urls))
+        scenario.model.script.references(_references(urls, primary_url=primary_url))
     for index, url in enumerate(urls, start=1):
         scenario.model.script.q2(
             source_url=url,
@@ -631,7 +640,7 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
     scenario = production_scenario_factory(_source_specs(urls, bodies={urls[0]: ""}))
     scenario.restrict_core_sources((urls[1],))
     scenario.edition.country = f"Restart Safety {scenario.edition.country_code}"
-    _configure_gateway(scenario, urls)
+    _configure_gateway(scenario, urls, primary_url=urls[1])
     await scenario.start()
     await _run_prefix(scenario, 3)
     before = await _reload(scenario)

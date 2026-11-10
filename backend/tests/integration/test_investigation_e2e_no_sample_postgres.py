@@ -95,7 +95,12 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionRun,
 )
-from cti_app.domain.publication import PublicationTimelineEntryV1
+from cti_app.domain.publication import (
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
+    PublicationTimelineEntryV1,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     publication_document_from_json,
@@ -281,6 +286,15 @@ async def _seed_no_sample_article(
     )
     base_v5 = _base_v5()
     citation = base_v5.document.lead[0].evidence_refs[0]
+    overview = PublicationParagraphV1(
+        text=base_v5.document.lead[0].text,
+        evidence_refs=base_v5.document.lead[0].evidence_refs,
+    )
+    overview_section = PublicationSectionV1(
+        kind=PublicationSectionKind.OVERVIEW,
+        heading="Vue d'ensemble",
+        paragraphs=(overview,),
+    )
     chronology = (
         PublicationTimelineEntryV1(
             event_date=date(2026, 10, 2),
@@ -298,12 +312,18 @@ async def _seed_no_sample_article(
     base_document = replace(
         base_v5.document,
         subject_id=subject.id,
+        sections=(overview_section,),
         timeline=chronology,
     )
     preserved_semantics = tuple(
         paragraph
         for paragraph in base_v5.semantic_text.paragraphs
         if not paragraph.anchor.startswith("timeline:")
+        and not paragraph.anchor.startswith("section:")
+    )
+    overview_semantics = SemanticParagraphV1(
+        anchor="section:0:paragraph:0001",
+        spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=overview.text),),
     )
     timeline_semantics = tuple(
         SemanticParagraphV1(
@@ -318,7 +338,7 @@ async def _seed_no_sample_article(
         semantic_text=SemanticTextV1(
             schema_version=base_v5.semantic_text.schema_version,
             policy_version=base_v5.semantic_text.policy_version,
-            paragraphs=(*preserved_semantics, *timeline_semantics),
+            paragraphs=(*preserved_semantics, overview_semantics, *timeline_semantics),
         ),
     )
     base_bytes = ProductionArtifactStore.canonical_json_bytes(
@@ -1059,7 +1079,8 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             assert "reviewer:m05b-human" not in text
             assert "approver:m05b-human" not in text
             if label == "v6":
-                assert text.count(str(observation.id)) == 1
+                assert "ANNEXE DE TRAÇABILITÉ" in text
+                assert "".join(text.split()).count(str(observation.id)) == 1
 
         # A fresh composition replays the uncertain operation key without another submission.
         uncertain_state = await _read_state(uow_factory, investigation_id)
