@@ -2229,9 +2229,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         "ilspycmd": ilspy_version,
         "ilspycmd_package_sha512": ilspy_package_sha512,
         "jadx": jadx_attestation.get("jadx") if jadx_attestation else None,
-        "jadx_zip_sha256": (
-            jadx_attestation.get("jadx_zip_sha256") if jadx_attestation else None
-        ),
+        "jadx_zip_sha256": (jadx_attestation.get("jadx_zip_sha256") if jadx_attestation else None),
         "jadx_jre_version": (
             jadx_attestation.get("jadx_jre_version") if jadx_attestation else None
         ),

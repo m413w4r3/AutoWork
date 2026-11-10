@@ -79,10 +79,7 @@ async def test_subprocess_applies_dotnet_address_space_and_gc_environment() -> N
 
 @pytest.mark.asyncio
 async def test_subprocess_can_deny_network_syscalls() -> None:
-    script = (
-        "import socket; "
-        "s = socket.socket(); s.close(); print('opened')"
-    )
+    script = "import socket; s = socket.socket(); s.close(); print('opened')"
     result = await run_analysis_subprocess(
         [sys.executable, "-c", script],
         timeout_seconds=5,

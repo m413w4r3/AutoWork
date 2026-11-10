@@ -29,9 +29,7 @@ APK_MAX_STRING_CANDIDATES = 50_000
 APK_MAX_SEARCH_MATCHES = 50_000
 APK_MAX_CONTEXT_LINES = 5
 
-_SAFE_CLASS_NAME = re.compile(
-    r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,63}$"
-)
+_SAFE_CLASS_NAME = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,63}$")
 _SAFE_PACKAGE_PREFIX = re.compile(r"^[A-Za-z0-9_$.]{1,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -90,10 +88,11 @@ class ApkAnalysisParameters:
                 raise ValueError("APK source line is invalid")
             if not 1 <= self.line_count <= APK_MAX_SOURCE_LINES:
                 raise ValueError("APK source line count is invalid")
-        elif any(
-            value is not None
-            for value in (self.class_name, self.source_path)
-        ) or self.start_line != 1 or self.line_count != APK_MAX_SOURCE_LINES:
+        elif (
+            any(value is not None for value in (self.class_name, self.source_path))
+            or self.start_line != 1
+            or self.line_count != APK_MAX_SOURCE_LINES
+        ):
             raise ValueError("APK source range requires apk.source.read")
 
         if self.operation is ApkAnalysisOperation.SOURCE_SEARCH:
@@ -156,10 +155,19 @@ class ApkAnalysisParameters:
             ApkAnalysisOperation.CLASSES_LIST: {"operation", "offset", "limit", "prefix"},
             ApkAnalysisOperation.STRINGS_EXTRACT: {"operation", "offset", "limit"},
             ApkAnalysisOperation.SOURCE_READ: {
-                "operation", "class_name", "source_path", "start_line", "line_count"
+                "operation",
+                "class_name",
+                "source_path",
+                "start_line",
+                "line_count",
             },
             ApkAnalysisOperation.SOURCE_SEARCH: {
-                "operation", "offset", "limit", "pattern", "regex", "context_lines"
+                "operation",
+                "offset",
+                "limit",
+                "pattern",
+                "regex",
+                "context_lines",
             },
         }[operation]
         if set(values) - allowed:
@@ -329,9 +337,12 @@ def _validate_source_path(value: str) -> None:
     ):
         raise ValueError("APK source path is invalid")
     parts = value.split("/")
-    if len(parts) < 2 or parts[0] != "sources" or any(
-        part in {"", ".", ".."} for part in parts
-    ) or not value.endswith(".java"):
+    if (
+        len(parts) < 2
+        or parts[0] != "sources"
+        or any(part in {"", ".", ".."} for part in parts)
+        or not value.endswith(".java")
+    ):
         raise ValueError("APK source path is invalid")
 
 

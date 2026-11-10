@@ -210,11 +210,11 @@ def test_apk_operation_results_have_canonical_hash_and_no_host_paths(tmp_path: P
     source = output_dir / "sources/org/autowork/fixture/MainActivity.java"
     source.parent.mkdir(parents=True)
     source.write_text(
-        'package org.autowork.fixture;\n'
-        'public class MainActivity {\n'
+        "package org.autowork.fixture;\n"
+        "public class MainActivity {\n"
         '  String url = "https://fixture.example.invalid/";\n'
         '  String marker = "AUTOWORK_APK_FIXTURE";\n'
-        '}\n',
+        "}\n",
         encoding="utf-8",
     )
     receiver = output_dir / "sources/org/autowork/fixture/FixtureReceiver.java"
@@ -232,7 +232,7 @@ def test_apk_operation_results_have_canonical_hash_and_no_host_paths(tmp_path: P
         'android:allowBackup="true" android:usesCleartextTraffic="false">'
         '<activity android:name=".MainActivity" android:exported="true"/>'
         '<receiver android:name=".FixtureReceiver" android:exported="false"/>'
-        '</application></manifest>',
+        "</application></manifest>",
         encoding="utf-8",
     )
 
@@ -274,9 +274,10 @@ def test_apk_operation_results_have_canonical_hash_and_no_host_paths(tmp_path: P
     repeated_manifest_json = json.dumps(
         asdict(_run_operation(cases[0], output_dir)), sort_keys=True, separators=(",", ":")
     )
-    assert hashlib.sha256(manifest_json.encode()).hexdigest() == hashlib.sha256(
-        repeated_manifest_json.encode()
-    ).hexdigest()
+    assert (
+        hashlib.sha256(manifest_json.encode()).hexdigest()
+        == hashlib.sha256(repeated_manifest_json.encode()).hexdigest()
+    )
     assert "/tmp/" not in json.dumps(asdict(outputs[3]))
 
 
@@ -360,8 +361,7 @@ def test_real_jadx_decompiles_only_the_synthetic_offline_fixture(
     }
     assert strings["status"] == "SUCCEEDED", strings
     assert any(
-        item["value"] == "https://fixture.example.invalid/"
-        for item in strings["data"]["items"]
+        item["value"] == "https://fixture.example.invalid/" for item in strings["data"]["items"]
     )
     assert any(item["value"] == "AUTOWORK_APK_FIXTURE" for item in strings["data"]["items"])
     assert source["status"] == "SUCCEEDED", source

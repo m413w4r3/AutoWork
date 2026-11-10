@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from cti_app.infrastructure.seccomp_network import install_network_seccomp_filter
 
@@ -91,7 +92,7 @@ async def run_analysis_subprocess(
                 None,
                 b"",
                 b"",
-                start_errno=exc.errno,
+                start_errno=getattr(exc, "errno", None),
             )
 
         async def read_stream(stream: asyncio.StreamReader) -> tuple[bytes, bool]:
@@ -147,13 +148,11 @@ async def run_analysis_subprocess(
             stdout_task = asyncio.create_task(read_stream(process.stdout))
             stderr_task = asyncio.create_task(read_stream(process.stderr))
             directory_task = (
-                asyncio.create_task(watch_directory())
-                if directory_limit_path is not None
-                else None
+                asyncio.create_task(watch_directory()) if directory_limit_path is not None else None
             )
             try:
                 while True:
-                    watched = {stdout_task, stderr_task}
+                    watched: set[asyncio.Task[Any]] = {stdout_task, stderr_task}
                     if directory_task is not None:
                         watched.add(directory_task)
                     done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
@@ -163,8 +162,7 @@ async def run_analysis_subprocess(
                         and directory_task.result()
                     )
                     output_limited = any(
-                        task in done and task.result()[1]
-                        for task in (stdout_task, stderr_task)
+                        task in done and task.result()[1] for task in (stdout_task, stderr_task)
                     )
                     if directory_limited or output_limited:
                         await kill_and_wait((stdout_task, stderr_task))

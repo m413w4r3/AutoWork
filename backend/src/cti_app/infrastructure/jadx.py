@@ -102,7 +102,8 @@ def _jre_major(value: str | None) -> int | None:
 
 
 def jadx_provenance(
-    *, address_space_limit_bytes: int = APK_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES,
+    *,
+    address_space_limit_bytes: int = APK_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES,
 ) -> dict[str, str] | None:
     """Attest only the installed manifest, CLI version, locked archive and supported JRE."""
     if not (
@@ -131,14 +132,13 @@ def jadx_provenance(
         manifest.get(key) != value for key, value in expected.items()
     ):
         return None
-    if not isinstance(manifest.get("zip_sha256"), str) or _SHA256.fullmatch(
-        manifest["zip_sha256"]
-    ) is None:
+    if (
+        not isinstance(manifest.get("zip_sha256"), str)
+        or _SHA256.fullmatch(manifest["zip_sha256"]) is None
+    ):
         return None
     executable = (
-        str(JADX_BINARY)
-        if JADX_BINARY.is_file() and os.access(JADX_BINARY, os.X_OK)
-        else None
+        str(JADX_BINARY) if JADX_BINARY.is_file() and os.access(JADX_BINARY, os.X_OK) else None
     )
     if executable is None:
         return None

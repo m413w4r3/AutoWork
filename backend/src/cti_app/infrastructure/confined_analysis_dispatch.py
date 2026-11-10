@@ -99,8 +99,7 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
         family = (
             "apk"
             if request.tool is ConfinedAnalysisTool.APK_JADX
-            else
-            "dotnet"
+            else "dotnet"
             if request.tool is ConfinedAnalysisTool.DOTNET_ILSPY
             else "archive_tools"
             if request.tool
@@ -518,9 +517,7 @@ def _family_statuses(
         apk = ConfinedAnalysisFamilyStatus(
             "apk", False, apk.version, "jadx_package_hash_unattested"
         )
-    if apk.available and not supported_jre_version(
-        _safe_version(versions.get("jadx_jre_version"))
-    ):
+    if apk.available and not supported_jre_version(_safe_version(versions.get("jadx_jre_version"))):
         apk = ConfinedAnalysisFamilyStatus(
             "apk", False, apk.version, f"jadx_jre_version_unattested_{JADX_JRE_VERSION}"
         )

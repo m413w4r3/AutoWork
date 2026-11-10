@@ -100,9 +100,7 @@ async def run_apk_analysis(
     tree, avoiding unbounded sample-derived output and cross-request reuse state.
     """
     try:
-        request = ApkAnalysisParameters.from_worker_parameters(
-            dict(parameters.analysis_parameters)
-        )
+        request = ApkAnalysisParameters.from_worker_parameters(dict(parameters.analysis_parameters))
     except (TypeError, ValueError):
         return _failure(
             ApkAnalysisOperation.MANIFEST,
@@ -292,7 +290,7 @@ def _fit_result_budget(result: ApkAnalysisResult, maximum_bytes: int) -> dict[st
     payload = result.as_json()
     if _canonical_size(payload) <= maximum_bytes:
         return payload
-    data = result.data
+    data: Any = result.data
     if isinstance(data, ApkPage):
         while data.items:
             keep = len(data.items) // 2
@@ -405,8 +403,7 @@ def _validate_apk_archive(payload: bytes) -> str | None:
                 if total_unpacked > APK_MAX_ARCHIVE_UNPACKED_BYTES:
                     return "apk_archive_unpacked_size_limit"
                 if item.file_size and (
-                    not item.compress_size
-                    or item.file_size > max(item.compress_size, 1) * 1000
+                    not item.compress_size or item.file_size > max(item.compress_size, 1) * 1000
                 ):
                     return "apk_archive_compression_ratio_limit"
                 if raw_name == "AndroidManifest.xml":
