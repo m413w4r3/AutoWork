@@ -37,6 +37,8 @@ Une phrase en `purpose` peut noter l’objectif et le résultat recherché; une 
 
 Pour le moment et le type de chaque consultation Bridge, suis la séquence de `autowork-bridge-collaboration`; cette carte sert à repérer les outils réellement annoncés dans l’enquête.
 
+Pour une règle YARA issue de Bridge, l’appel minimal est `rule.propose_bridge({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`; teste ensuite chaque candidate avec `rule.test` et le `candidate_id` retourné.
+
 ## Réactions aux réponses
 
 - Réponse Bridge partielle ou prose seule : lire d’abord le texte brut, puis les éléments extraits, avertissements et omissions; exploiter chaque recommandation utile. Distinguer reçu, parsé, testé et vérifié sans exiger que ces états coïncident.
