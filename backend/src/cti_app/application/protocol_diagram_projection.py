@@ -48,7 +48,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v5-m21-opinion-render"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v6-m21-opinion-render"
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )
@@ -148,7 +148,9 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
             edges.extend(_project_message(edge) for edge in _ordered_edges(spec.edges))
     elif spec.kind is ProtocolDiagramKind.STATE_MACHINE:
         if len(spec.nodes) > 8 or len(spec.edges) > 8:
-            state_labels = {node.node_id: _clean_display_text(node.label) for node in spec.nodes}
+            state_labels = {
+                node.node_id: _clean_display_text(node.label, limit=None) for node in spec.nodes
+            }
             represented_states: set[str] = set()
             for index, edge in enumerate(spec.edges, 1):
                 nodes.append(_project_transition_card(edge, index, state_labels))
@@ -491,7 +493,7 @@ def _resolved_evidence_level(
 def _project_participant(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
     return DiagramNodeV1(
         node_id=node.node_id,
-        label=_clean_display_text(node.label),
+        label=_clean_display_text(node.label, limit=None),
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_PARTICIPANT,
     )
@@ -500,14 +502,14 @@ def _project_participant(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
 def _project_state(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
     return DiagramNodeV1(
         node_id=node.node_id,
-        label=_clean_display_text(node.label),
+        label=_clean_display_text(node.label, limit=None),
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_STATE,
     )
 
 
 def _project_message(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
-    details = [_clean_display_text(edge.label)]
+    details = [_clean_display_text(edge.label, limit=None)]
     if edge.order is not None:
         details.insert(0, f"#{edge.order}")
     return DiagramEdgeV1(
@@ -534,8 +536,8 @@ def _project_ordered_message(
     participants: dict[str, str],
 ) -> DiagramNodeV1:
     order = edge.order if edge.order is not None else index
-    source = participants.get(edge.source_id, _clean_display_text(edge.source_id))
-    target = participants.get(edge.target_id, _clean_display_text(edge.target_id))
+    source = participants.get(edge.source_id, _clean_display_text(edge.source_id, limit=None))
+    target = participants.get(edge.target_id, _clean_display_text(edge.target_id, limit=None))
     message = _clean_display_text(edge.label, limit=None)
     return DiagramNodeV1(
         node_id=f"protocol-message-{index:04d}",
@@ -563,7 +565,7 @@ def _ordered_edges(
 
 
 def _project_transition(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
-    details = [_clean_display_text(edge.label)]
+    details = [_clean_display_text(edge.label, limit=None)]
     if edge.order is not None:
         details.insert(0, f"#{edge.order}")
     return DiagramEdgeV1(
@@ -589,13 +591,13 @@ def _project_transition_card(
     index: int,
     state_labels: dict[str, str],
 ) -> DiagramNodeV1:
-    source = state_labels.get(edge.source_id, _clean_display_text(edge.source_id))
-    target = state_labels.get(edge.target_id, _clean_display_text(edge.target_id))
+    source = state_labels.get(edge.source_id, _clean_display_text(edge.source_id, limit=None))
+    target = state_labels.get(edge.target_id, _clean_display_text(edge.target_id, limit=None))
     trigger_name, separator, message_name = edge.label.partition(": ")
     if separator and trigger_name.strip().casefold() == message_name.strip().casefold():
-        trigger = _clean_display_text(trigger_name, limit=72)
+        trigger = _clean_display_text(trigger_name, limit=None)
     else:
-        trigger = _clean_display_text(edge.label, limit=72)
+        trigger = _clean_display_text(edge.label, limit=None)
     return DiagramNodeV1(
         node_id=f"protocol-transition-{index:04d}",
         label=f"{source} → {target}: {trigger}",
@@ -614,7 +616,7 @@ def _project_field(
         field_name = "Opaque encrypted payload · bytes omitted"
     else:
         field_name = field.name.strip() or f"Field {index}"
-    label = _clean_display_text(field_name) or f"Champ {index}"
+    label = _clean_display_text(field_name, limit=None) or f"Champ {index}"
     if include_index:
         location = f"offset {field.offset} · " if field.offset is not None else ""
         label = f"#{index:02d} {location}{label}"

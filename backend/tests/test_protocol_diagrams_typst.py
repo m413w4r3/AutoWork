@@ -91,6 +91,51 @@ def test_protocol_sequence_projection_keeps_complete_card_labels() -> None:
     assert all("…" not in label for label in labels)
 
 
+def test_sparse_protocol_projection_keeps_full_node_detail_and_field_labels() -> None:
+    long_label = ("Long descriptive protocol label preserving every original term " * 3).strip()
+    sequence, state_machine, message_format = _three_views()
+
+    projected_sequence = project_protocol_diagram(
+        replace(
+            sequence,
+            nodes=(replace(sequence.nodes[0], label=long_label), *sequence.nodes[1:]),
+            edges=(replace(sequence.edges[0], label=long_label), *sequence.edges[1:]),
+        )
+    )
+    projected_state_machine = project_protocol_diagram(
+        replace(
+            state_machine,
+            nodes=(replace(state_machine.nodes[0], label=long_label), *state_machine.nodes[1:]),
+            edges=(replace(state_machine.edges[0], label=long_label), *state_machine.edges[1:]),
+        )
+    )
+    projected_message_format = project_protocol_diagram(
+        replace(
+            message_format,
+            fields=(replace(message_format.fields[0], name=long_label), *message_format.fields[1:]),
+        )
+    )
+
+    assert len(long_label) > 100
+    assert long_label in projected_sequence.nodes[0].label
+    assert any(long_label in (edge.label or "") for edge in projected_sequence.edges)
+    assert long_label in projected_state_machine.nodes[0].label
+    assert any(long_label in (edge.label or "") for edge in projected_state_machine.edges)
+    assert long_label in projected_message_format.nodes[0].label
+    assert all(
+        "…" not in label
+        for diagram in (
+            projected_sequence,
+            projected_state_machine,
+            projected_message_format,
+        )
+        for label in (
+            *(node.label for node in diagram.nodes),
+            *(edge.label or "" for edge in diagram.edges),
+        )
+    )
+
+
 class _MemoryBlobStore:
     def __init__(self) -> None:
         self._contents: dict[UUID, bytes] = {}
@@ -473,6 +518,32 @@ async def test_real_article_and_edition_render_all_protocol_figures(
 async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     tmp_path: Path,
 ) -> None:
+    long_sequence_label = (
+        "WebSocket establishment and secure transport negotiation with documented "
+        "request and response metadata preserved end to end"
+    )
+    long_state_label = (
+        "Waiting for the authenticated server acknowledgement while negotiated "
+        "transport identity and session readiness remain pending"
+    )
+    long_transition_label = (
+        "Validate the negotiated client identity and acknowledge the authenticated "
+        "session before accepting subsequent protocol commands"
+    )
+    long_field_label = (
+        "Client capability bitmap describing negotiated protocol extensions, "
+        "transport requirements, session flags, and compatibility metadata"
+    )
+    assert all(
+        len(label) > 100
+        for label in (
+            long_sequence_label,
+            long_state_label,
+            long_transition_label,
+            long_field_label,
+        )
+    )
+
     model_id = UUID(int=9910)
     evidence = ProtocolEvidenceRefV1(
         source="documented:claim:handshake-facts",
@@ -607,7 +678,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     messages = tuple(
         MessageDefinitionV1(
             message_id=message_id,
-            name=f"Message {index:02d}",
+            name=long_sequence_label if index == 1 else f"Message {index:02d}",
             ordinal=index,
             directions=(StreamDirection.UNRESOLVED,),
             min_length=None,
@@ -622,7 +693,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         FieldDefinitionV1(
             field_id=f"field-{index:02d}",
             message_id=message_ids[(index - 1) % len(message_ids)],
-            name=f"Field {index:02d}",
+            name=long_field_label if index == 1 else f"Field {index:02d}",
             offset=None,
             length=None,
             endianness="unknown",
@@ -639,7 +710,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     states = tuple(
         ProtocolStateV1(
             state_id=state_id,
-            name=f"State {index:02d}",
+            name=long_state_label if index == 1 else f"State {index:02d}",
             validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
             evidence=(evidence,),
         )
@@ -651,7 +722,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
             from_state=state_ids[(index - 1) % len(state_ids)],
             to_state=state_ids[index % len(state_ids)],
             message_id=message_ids[index - 1],
-            trigger=f"Message {index:02d}",
+            trigger=(long_transition_label if index == 1 else f"Message {index:02d}"),
             hypotheses=(),
             validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
             evidence=(evidence,),
@@ -718,14 +789,13 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         item for item in rendered if item.spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
     )
     assert len(format_view.diagram.nodes) == 22
-    assert format_view.diagram.nodes[0].label == "#01 Field 01"
+    assert format_view.diagram.nodes[0].label.startswith("#01 ")
     assert "offsets" in (format_view.diagram.caption or "").casefold()
     state_view = next(
         item for item in rendered if item.spec.kind is ProtocolDiagramKind.STATE_MACHINE
     )
     assert len(state_view.diagram.nodes) == 15
     assert not state_view.diagram.edges
-    assert state_view.diagram.nodes[0].label.endswith(": Message 01")
     assert all("Message 01 Message 01" not in node.label for node in state_view.diagram.nodes)
 
     base = _base_v5()
@@ -866,6 +936,31 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         " ".join((page.extract_text() or "").split())
         for page in PdfReader(preview_pdf_path, strict=True).pages
     ]
+    preview_text_result = _run_blocking_process(("pdftotext", str(preview_pdf_path), "-"), 30)
+    preview_text = " ".join(preview_text_result.stdout.decode("utf-8", errors="replace").split())
+    assert all(
+        label in preview_text
+        for label in (
+            long_sequence_label,
+            long_state_label,
+            long_transition_label,
+            long_field_label,
+        )
+    )
+    protocol_figure_pages = tuple(
+        page
+        for page in preview_pages
+        if any(
+            title in page
+            for title in (
+                "Séquence réseau du protocole",
+                "Machine à états du protocole",
+                "Format de message du protocole",
+            )
+        )
+    )
+    assert len(protocol_figure_pages) >= 3
+    assert all("…" not in page for page in protocol_figure_pages)
     assert all("Rendu hérité" not in page for page in preview_pages)
     assert all("Séquence de négociation" not in page for page in preview_pages)
     assert all(
@@ -965,11 +1060,41 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
             for text, size in lines
             if re.match(r"^#\d{2} Field \d{2}$", text)
         ]
-        assert len(sequence_sizes) >= 17
+        long_sequence_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if "WebSocket" in text or "end to end" in text
+        ]
+        long_state_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if "Waiting" in text or "identity" in text
+        ]
+        long_transition_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if "Validate" in text or "subsequent" in text
+        ]
+        long_field_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if "capability" in text or "compatibility metadata" in text
+        ]
+        assert len(sequence_sizes) >= 16
         assert state_sizes and field_sizes
+        assert long_sequence_sizes and long_state_sizes
+        assert long_transition_sizes and long_field_sizes
         assert min(sequence_sizes) >= 8.0, f"sequence labels: {min(sequence_sizes):.2f} pt"
         assert min(state_sizes) >= 8.0, f"state labels: {min(state_sizes):.2f} pt"
         assert min(field_sizes) >= 8.0, f"field labels: {min(field_sizes):.2f} pt"
+        assert min(long_sequence_sizes) >= 8.0
+        assert min(long_state_sizes) >= 8.0
+        assert min(long_transition_sizes) >= 8.0
+        assert min(long_field_sizes) >= 8.0
 
 
 def test_protocol_figures_are_persisted_in_the_exact_opinion_version() -> None:
