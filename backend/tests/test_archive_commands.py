@@ -812,6 +812,117 @@ async def test_7z_extract_hash_reports_bad_crc_and_timeout_statuses(
     assert requested_tempdirs == ["/tmp", "/tmp"]
 
 
+@pytest.mark.asyncio
+async def test_7z_extract_hash_reports_codec_failure_method_and_redacted_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    listing = (
+        "Path = sample.bin\nType = Rar\nPhysical Size = 100\n\n----------\n"
+        "Path = private/child.txt\nFolder = -\nSize = 4\nPacked Size = 2\n"
+        "Encrypted = -\nMethod = RAR:29\n\n"
+    )
+
+    async def fake_run(argv, **_kwargs):
+        if argv[1] == "l":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+            )
+        stderr = f"ERROR: Unsupported Method : {argv[-2]} {argv[-1]}\n".encode()
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+        b"benign archive fixture",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=32 * 1024,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+    )
+    report = _read_result(result)
+    member = report["members"][0]
+
+    assert result["detail_code"] == "archive_codec_unsupported"
+    assert member["status"] == "extract_failed"
+    assert member["detail_code"] == "archive_codec_unsupported"
+    assert member["method"] == "RAR:29"
+    assert member["archive_method"] == "RAR:29"
+    assert "Unsupported Method" in member["stderr_excerpt"]
+    assert "<archive>" in member["stderr_excerpt"]
+    assert "<member>" in member["stderr_excerpt"]
+    assert "/tmp/cti-archive-" not in member["stderr_excerpt"]
+    assert "private/child.txt" not in member["stderr_excerpt"]
+    assert len(member["stderr_excerpt"]) <= archive_commands._MAX_ARCHIVE_STDERR_CHARS
+
+
+@pytest.mark.asyncio
+async def test_7z_extract_member_reports_clear_not_found_and_codec_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    missing_listing = (
+        "Path = sample.bin\nType = Rar\nPhysical Size = 100\n\n----------\n"
+        "Path = present.txt\nFolder = -\nSize = 4\nPacked Size = 2\n"
+        "Encrypted = -\nMethod = RAR:29\n\n"
+    )
+
+    async def listing_only(argv, **_kwargs):
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.SUCCEEDED, 0, missing_listing.encode(), b""
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", listing_only)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    missing = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"benign archive fixture",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="missing.txt",
+    )
+    assert missing["member_status"] == "member_not_found"
+    assert missing["detail_code"] == "archive_member_not_found"
+
+    async def unsupported(argv, **_kwargs):
+        if argv[1] == "l":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, missing_listing.encode(), b""
+            )
+        stderr = f"ERROR: Unsupported Method : {argv[-2]} {argv[-1]}\n".encode()
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", unsupported)
+    failed = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"benign archive fixture",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="present.txt",
+    )
+    assert failed["member_status"] == "extract_failed"
+    assert failed["detail_code"] == "archive_codec_unsupported"
+    assert failed["archive_method"] == "RAR:29"
+    assert "/tmp/cti-archive-" not in failed["stderr_excerpt"]
+    assert "present.txt" not in failed["stderr_excerpt"]
+
+
 def test_seven_zip_version_reads_the_p7zip_package_version_from_a_double_banner(
     monkeypatch,
 ) -> None:

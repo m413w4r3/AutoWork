@@ -176,6 +176,28 @@ class _RaisingArchiveMemberWorker:
         raise RuntimeError("synthetic worker failure")
 
 
+class _FailedArchiveMemberWorker:
+    async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
+        return ConfinedAnalysisResult(
+            ToolInvocationStatus.SUCCEEDED,
+            "confined-analysis:archive-member-failure",
+            request.artifact_id,
+            request.sha256,
+            payload={
+                "investigation_id": str(request.investigation_id),
+                "association_id": str(request.association_id),
+                "sample_id": str(request.sample_id),
+                "artifact_sha256": request.sha256,
+                "result": {
+                    "member_status": "extract_failed",
+                    "detail_code": "archive_codec_unsupported",
+                    "archive_method": "RAR:29",
+                    "stderr_excerpt": "ERROR: Unsupported Method : <archive> <member>",
+                },
+            },
+        )
+
+
 def test_archive_member_transfer_bucket_fits_blob_address_limit() -> None:
     bucket = archive_member_transfer_bucket("a" * 64)
 
@@ -511,6 +533,22 @@ async def test_archive_member_registration_is_candidate_and_resolves_for_sample_
         "reason": "Inspect the archive member as a static candidate.",
         "expected_sha256": hashlib.sha256(member_bytes).hexdigest(),
     }
+    diagnostic_extractor = ArchiveExtractMemberAdapter(
+        hits=hits,
+        uow_factory=lambda: FakeUow(database),
+        artifact_store=cast(ProductionArtifactStore, store),
+        execution=cast(Any, _FailedArchiveMemberWorker()),
+        timeout_seconds=20,
+        max_output_bytes=4096,
+    )
+    diagnostic_result = await diagnostic_extractor.execute(arguments, context)
+    assert diagnostic_result.status is ToolInvocationStatus.FAILED
+    assert diagnostic_result.error_code == "archive_member_extract_failed"
+    assert diagnostic_result.message == "archive_codec_unsupported"
+    assert diagnostic_result.output["detail_code"] == "archive_codec_unsupported"
+    assert diagnostic_result.output["archive_method"] == "RAR:29"
+    assert "Unsupported Method" in diagnostic_result.output["stderr_excerpt"]
+
     first, second = await asyncio.gather(
         extractor.execute(arguments, context),
         extractor.execute(

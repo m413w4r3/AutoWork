@@ -62,6 +62,7 @@ from cti_app.application.operator_context_summary import InvestigationOperatorCo
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationService,
+    _archive_extract_member_failure_details,
     _canonical_context_content_bytes,
 )
 from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
@@ -2969,6 +2970,67 @@ async def test_policy_denied_publishes_only_a_safe_tool_refusal_detail_code() ->
 
     assert unsafe.invocation.status is ToolInvocationStatus.POLICY_DENIED
     assert "detail_code" not in unsafe.output["error"]
+
+
+def test_archive_extract_failure_diagnostics_are_bounded_and_path_redacted() -> None:
+    details = _archive_extract_member_failure_details(
+        {
+            "detail_code": "archive_codec_unsupported",
+            "archive_method": "RAR:29",
+            "stderr_excerpt": (
+                "ERROR: Unsupported Method : /tmp/worker/sample.bin private/child.txt\n"
+                "ignored second line"
+            ),
+        },
+        {"member_path": "private/child.txt"},
+    )
+
+    assert details["detail_code"] == "archive_codec_unsupported"
+    assert details["archive_method"] == "RAR:29"
+    assert details["stderr_excerpt"] == "ERROR: Unsupported Method : <path> <member>"
+    assert len(details["stderr_excerpt"]) <= 512
+
+
+@pytest.mark.asyncio
+async def test_archive_extract_failure_exposes_only_sanitized_worker_diagnostics() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "archive.extract_member",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "investigation.archive_extract_member",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    fixture.tools["archive.extract_member"].result = ToolResult(
+        status=ToolInvocationStatus.FAILED,
+        message="archive_codec_unsupported",
+        error_code="archive_member_extract_failed",
+        output={
+            "detail_code": "archive_codec_unsupported",
+            "archive_method": "RAR:29",
+            "stderr_excerpt": "ERROR: Unsupported Method : /tmp/worker/sample.bin",
+        },
+    )
+
+    result = await _service(fixture).invoke(
+        tool_name="archive.extract_member",
+        schema_version="1",
+        arguments={"query": "diagnostic"},
+        purpose="Inspect a failed local archive extraction.",
+        expected_version=state.version,
+        idempotency_key="archive-extract-diagnostic",
+    )
+
+    assert result.output["error"]["detail_code"] == "archive_codec_unsupported"
+    diagnostic = result.output["data"]["result"]
+    assert diagnostic["detail_code"] == "archive_codec_unsupported"
+    assert diagnostic["archive_method"] == "RAR:29"
+    assert diagnostic["stderr_excerpt"] == "ERROR: Unsupported Method : <path>"
 
 
 @pytest.mark.asyncio
