@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -632,6 +632,36 @@ class InvestigationFinding:
         object.__setattr__(self, "observation_refs", tuple(self.observation_refs))
         object.__setattr__(self, "claim_refs", tuple(self.claim_refs))
         object.__setattr__(self, "limitations", tuple(self.limitations))
+
+
+def logical_finding_id_by_version(
+    findings: Iterable[InvestigationFinding],
+) -> dict[UUID, UUID]:
+    """Map each unambiguously linked finding version to its current version ID."""
+    findings_by_id = {finding.id: finding for finding in findings}
+    successors: dict[UUID, set[UUID]] = {}
+    for finding in findings_by_id.values():
+        if finding.supersedes in findings_by_id:
+            assert finding.supersedes is not None
+            successors.setdefault(finding.supersedes, set()).add(finding.id)
+
+    logical_ids: dict[UUID, UUID] = {}
+    for version_id in findings_by_id:
+        current_id = version_id
+        seen = {current_id}
+        while True:
+            next_ids = successors.get(current_id, set())
+            if not next_ids:
+                logical_ids[version_id] = current_id
+                break
+            if len(next_ids) != 1:
+                break
+            next_id = next(iter(next_ids))
+            if next_id in seen:
+                break
+            current_id = next_id
+            seen.add(current_id)
+    return logical_ids
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

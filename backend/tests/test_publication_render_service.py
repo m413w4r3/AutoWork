@@ -1307,11 +1307,11 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     assert render.template_sha256 == template_bundle.sha256
     assert render.font_bundle_version == font_bundle.font_bundle_version
     assert render.render_policy_version == PUBLICATION_RENDER_POLICY_VERSION
-    assert PUBLICATION_RENDER_POLICY_VERSION == "typst-publication-v10-m21-opinion-render"
+    assert PUBLICATION_RENDER_POLICY_VERSION == "typst-publication-v11-m21-opinion-render"
     # C8 intentionally stamps the anchored editorial section layout as v11/v25.
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v18-typst-v36-m21-opinion-render"
+        == "publication-v19-typst-v37-m21-opinion-render"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

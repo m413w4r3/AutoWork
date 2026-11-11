@@ -22,7 +22,11 @@ from cti_app.domain.analyst_opinion import (
     opinion_internal_text_markers,
     verify_opinion_citations,
 )
-from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
+from cti_app.domain.investigation import (
+    EvidenceObservation,
+    InvestigationFinding,
+    logical_finding_id_by_version,
+)
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -106,7 +110,7 @@ class OpinionCitationContext:
 
 
 _BLOCK_HEADINGS = {
-    OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
+    OpinionBlockType.KEY_FINDINGS: "Apports de l'analyse",
     OpinionBlockType.ADDITIONAL_SAMPLES: "Échantillons complémentaires",
     OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES: "Chaîne d'infection et capacités",
     OpinionBlockType.NETWORK_AND_INFRASTRUCTURE: "Activité réseau et infrastructure",
@@ -231,6 +235,20 @@ def augment_publication_with_opinion(
         unresolved_points=opinion.unresolved_points,
         protocol_figures=opinion.protocol_figures,
     )
+    cited_finding_versions = {
+        reference_id for block in opinion.blocks for reference_id in block.finding_refs
+    }
+    cited_finding_versions.update(
+        reference_id
+        for observation in opinion.observations
+        for reference_id in observation.finding_refs
+    )
+    logical_finding_ids = logical_finding_id_by_version(citation_context.findings)
+    finding_version_logical_ids = tuple(
+        (version_id, logical_finding_ids[version_id])
+        for version_id in sorted(cited_finding_versions, key=str)
+        if version_id in logical_finding_ids and logical_finding_ids[version_id] != version_id
+    )
     provenance = PublicationDocumentV6ProvenanceV1(
         base_publication_artifact_id=citation_context.base_publication_artifact_id,
         base_publication_sha256=base_sha256,
@@ -241,6 +259,7 @@ def augment_publication_with_opinion(
         opinion_content_sha256=opinion.content_sha256,
         reviewer_id=opinion.reviewer_id,
         approver_id=citation_context.approver_id,
+        finding_version_logical_ids=finding_version_logical_ids,
     )
     try:
         augmented = PublicationDocumentV6(

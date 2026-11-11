@@ -206,8 +206,12 @@ def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
 
 def _layout_font_sizes(diagram: DiagramSpecV1, *, force_vertical: bool) -> tuple[int, int, int]:
     """Keep small graphs close to body size and scale denser horizontal graphs up."""
-    if diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE:
-        return 18, 14, 32
+    if diagram.profile in {
+        DiagramProfile.PROTOCOL_SEQUENCE,
+        DiagramProfile.PROTOCOL_STATE_MACHINE,
+        DiagramProfile.PROTOCOL_MESSAGE_FORMAT,
+    }:
+        return 20, 16, 40
     if force_vertical or len(diagram.nodes) <= 3:
         return _NODE_FONT_SIZE, _EDGE_FONT_SIZE, 24
     if len(diagram.nodes) == 4:
@@ -348,13 +352,7 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     if stack_unconnected_protocol_view:
         # Dense protocol views use independent cards. Use a D2 grid without
         # adding connector edges that are absent from the semantic projection.
-        grid_columns = (
-            4
-            if diagram.profile is DiagramProfile.PROTOCOL_MESSAGE_FORMAT and len(diagram.nodes) > 20
-            else 3
-            if len(diagram.nodes) > D2_VERTICAL_AFTER_NODES
-            else 1
-        )
+        grid_columns = 2 if len(diagram.nodes) > D2_VERTICAL_AFTER_NODES else 1
         grid_rows = (len(diagram.nodes) + grid_columns - 1) // grid_columns
         grid_options = [
             f"  grid-rows: {grid_rows}",

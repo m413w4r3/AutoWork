@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -136,6 +137,29 @@ def _typst_binary() -> str:
     reported = result.stdout.decode("utf-8", errors="replace").strip()
     assert result.returncode == 0 and reported.startswith("typst 0.15.1"), reported
     return _TYPST_BINARY
+
+
+def _pdf_text_line_sizes(
+    pdf_path: Path,
+    *,
+    mutool_binary: str,
+) -> dict[int, list[tuple[str, float]]]:
+    xml_path = pdf_path.with_suffix(".stext.xml")
+    _run_blocking_process(
+        (mutool_binary, "draw", "-F", "stext", "-o", str(xml_path), str(pdf_path)),
+        30,
+    )
+    root = ET.parse(xml_path).getroot()
+    result: dict[int, list[tuple[str, float]]] = {}
+    for page_number, page in enumerate(root.findall("page"), start=1):
+        lines = result.setdefault(page_number, [])
+        for line in page.findall(".//line"):
+            text = "".join(char.attrib.get("c", "") for char in line.findall(".//char"))
+            for font in line.findall("font"):
+                size = font.attrib.get("size")
+                if text and size is not None:
+                    lines.append((text, float(size)))
+    return result
 
 
 def _render_result() -> ProtocolRenderResultV1:
@@ -641,13 +665,15 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     sequence_svg = await media_store.read(sequence_figure.asset_id)
     view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', sequence_svg)
     assert view_box is not None
-    assert float(view_box.group(1)) / float(view_box.group(2)) >= 0.85
+    # The 17-message, two-column sequence view is intentionally portrait-shaped
+    # so its labels remain readable at full-page height.
+    assert float(view_box.group(1)) / float(view_box.group(2)) >= 0.45
     for figure in figures:
         svg = await media_store.read(figure.asset_id)
         view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', svg)
         assert view_box is not None
         ratio = float(view_box.group(1)) / float(view_box.group(2))
-        assert ratio >= 0.85, f"{figure.kind.value} SVG aspect ratio is {ratio:.3f}"
+        assert ratio >= 0.3, f"{figure.kind.value} SVG aspect ratio is {ratio:.3f}"
     assert all("ARTICLE_DOCUMENTED" in item.caption for item in figures)
     assert all(
         "offsets" in item.caption.casefold() or "valeurs" in item.caption.casefold()
@@ -757,9 +783,10 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     extracted_text = process_result.stdout.decode("utf-8", errors="replace")
     extracted_text = " ".join(extracted_text.split()).casefold().replace("\u2019", "'")
     assert "note de l'analyste" in extracted_text
-    assert "1.1 apports de l'enquête" in extracted_text
-    assert extracted_text.count("article_documented") == 3
+    assert "1.1 apports de l'analyse" in extracted_text
+    assert extracted_text.count("article_documented") == 0
     assert extracted_text.count("niveau de preuve") == 3
+    assert extracted_text.count("documenté, non observé") == 3
     assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted_text
     assert all(
         title in extracted_text
@@ -823,9 +850,9 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         lowered = pdf_text.casefold()
         expected_proof_levels = 3 if label == "publication" else 2
         assert pdf_text.count("Niveau de preuve") == expected_proof_levels
-        assert pdf_text.count("ARTICLE_DOCUMENTED") == expected_proof_levels
+        assert pdf_text.casefold().count("documenté, non observé") == expected_proof_levels
+        assert "ARTICLE_DOCUMENTED" not in pdf_text
         assert "offsets et valeurs d'octets inconnus" in lowered
-        assert "modèle documenté, non observé" not in lowered
         assert all(
             title in lowered
             for title in ("séquence réseau", "machine à états", "format de message")
@@ -844,6 +871,67 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         rasters = tuple(output_directory.glob("page-*.png"))
         assert len(rasters) == len(PdfReader(path, strict=True).pages)
         assert all(image.stat().st_size > 1024 for image in rasters)
+
+    publication_pages = [
+        " ".join((page.extract_text() or "").split())
+        for page in PdfReader(publication_pdf_path, strict=True).pages
+    ]
+    for figure_number, title in zip(
+        (1, 2, 3),
+        (
+            "Séquence réseau du protocole",
+            "Machine à états du protocole",
+            "Format de message du protocole",
+        ),
+        strict=True,
+    ):
+        figure_page = next(page for page in publication_pages if title in page)
+        assert f"Figure {figure_number} :" in figure_page
+        assert "documenté, non observé" in figure_page.casefold()
+        assert "observation étayée" in figure_page.casefold()
+
+    mutool_binary = shutil.which("mutool")
+    if mutool_binary is not None:
+        measured_lines = _pdf_text_line_sizes(
+            publication_pdf_path,
+            mutool_binary=mutool_binary,
+        )
+        figure_lines = {
+            page_number: lines
+            for page_number, lines in measured_lines.items()
+            if any(
+                title in text
+                for text, _size in lines
+                for title in (
+                    "Séquence réseau du protocole",
+                    "Machine à états du protocole",
+                    "Format de message du protocole",
+                )
+            )
+        }
+        sequence_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if re.match(r"^\d+\. Message \d{2}$", text)
+        ]
+        state_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if "State " in text or re.fullmatch(r"Message \d{2} Message \d{2}", text)
+        ]
+        field_sizes = [
+            size
+            for lines in figure_lines.values()
+            for text, size in lines
+            if re.match(r"^#\d{2} Field \d{2}$", text)
+        ]
+        assert len(sequence_sizes) >= 17
+        assert state_sizes and field_sizes
+        assert min(sequence_sizes) >= 8.0, f"sequence labels: {min(sequence_sizes):.2f} pt"
+        assert min(state_sizes) >= 8.0, f"state labels: {min(state_sizes):.2f} pt"
+        assert min(field_sizes) >= 8.0, f"field labels: {min(field_sizes):.2f} pt"
 
 
 def test_protocol_figures_are_persisted_in_the_exact_opinion_version() -> None:

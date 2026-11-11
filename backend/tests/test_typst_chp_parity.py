@@ -1331,8 +1331,8 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     normalized_extracted = extracted.upper().replace("\u2019", "'")
     assert "Note de l'analyste" in extracted.replace("\u2019", "'")
     assert "NOTE DE L'ANALYSTE" in normalized_extracted
-    assert "1.1 APPORTS DE L'ENQUÊTE" in normalized_extracted
-    assert "APPORTS DE L'ENQUÊTE" in normalized_extracted
+    assert "1.1 APPORTS DE L'ANALYSE" in normalized_extracted
+    assert "APPORTS DE L'ANALYSE" in normalized_extracted
     assert "FAIT ÉTAYÉ" in normalized_extracted
     assert "LE CONSTAT SUPPLÉMENTAIRE EST CORROBORÉ" in normalized_extracted
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", normalized_extracted) is None
@@ -2023,7 +2023,7 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v38-m21-opinion-render",
+        "schema_version": "typst-publication-model-v39-m21-opinion-render",
         "section_types": [
             "references",
             "chronology",

@@ -854,7 +854,7 @@
           #let context-summary = row.at("hash_context_summary", default: row.at("context_summary", default: ""))
           #let source-refs = row.at("source_refs", default: ())
           #if context-summary != "" [#linebreak() #text(size: 8.5pt, fill: grey)[#publication-display-text(row.at("hash_context_summary_spans", default: context-summary))]]
-          #if source-refs.len() > 0 [#if context-summary != "" [ · ] #text(size: 8.5pt, fill: grey)[src #render-source-references(source-refs, reference-scope: reference-scope)]]
+          #if source-refs.len() > 0 [#if context-summary != "" [ · ] #text(size: 8.5pt, fill: grey)[Sources : #render-source-references(source-refs, reference-scope: reference-scope)]]
           #let draft-refs = row.at("draft_refs", default: ())
           #if draft-refs.len() > 0 [#if context-summary != "" or source-refs.len() > 0 [ · ] #render-opinion-references(draft-refs, reference-scope: reference-scope)]
         ],
@@ -873,7 +873,7 @@
           #let context-summary = row.at("context_summary", default: "")
           #if context-summary != "" [#text(size: 8.5pt, fill: grey)[#publication-display-text(row.at("context_summary_spans", default: context-summary))]]
           #let source-refs = row.at("source_refs", default: ())
-          #if source-refs.len() > 0 [#if context-summary != "" [#linebreak()] #text(size: 8.5pt, fill: grey)[src #render-source-references(source-refs, reference-scope: reference-scope)]]
+          #if source-refs.len() > 0 [#if context-summary != "" [#linebreak()] #text(size: 8.5pt, fill: grey)[Sources : #render-source-references(source-refs, reference-scope: reference-scope)]]
           #let draft-refs = row.at("draft_refs", default: ())
           #if draft-refs.len() > 0 [#if context-summary != "" or source-refs.len() > 0 [#linebreak()] #render-opinion-references(draft-refs, reference-scope: reference-scope)]
         ],
@@ -1184,7 +1184,7 @@
     ]
     #if has-text(item.at("status_legend", default: none)) [
       #block(above: 3pt, below: 2pt)[
-        #text(size: 6.5pt, fill: grey)[#item.status_legend]
+        #text(size: 8pt, fill: grey)[#item.status_legend]
       ]
     ]
   ]
@@ -1534,17 +1534,12 @@
       )
       #if has-opinion-content [
       #let has-opinion-extras = (
-        protocol-figures.len() > 0
-        or unresolved-points.len() > 0
+        unresolved-points.len() > 0
         or unanchored-observations.len() > 0
         or content_section.at("investigation_chain_figure", default: none) != none
         or content_section.at("infrastructure_graph_figure", default: none) != none
       )
       #let opinion-extras = [
-          #for figure in protocol-figures [
-            #v(8pt)
-            #render-diagram(figure, max-height-fraction: 0.82)
-          ]
           #if content_section.at("investigation_chain_figure", default: none) != none [
             #v(8pt)
             #render-investigation-chain-figure(content_section.investigation_chain_figure, reference-scope: reference-scope)
@@ -1647,9 +1642,16 @@
             #parbreak()
           ]
         ]
-        #if has-opinion-extras or opinion-blocks.len() == 0 [
+        #if has-opinion-extras [
           #let extras-title = if opinion-blocks.len() == 0 { [Note de l'analyste] } else { none }
           #noteAnalyste(title: extras-title, breakable: true)[#opinion-extras]
+        ]
+      ]
+      #if protocol-figures.len() > 0 [
+        #for figure in protocol-figures [
+          #pagebreak(weak: true)
+          #v(8pt)
+          #render-diagram(figure, max-height-fraction: 0.82)
         ]
       ]
       ]
