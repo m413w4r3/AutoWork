@@ -682,6 +682,7 @@
     widths,
     cell-align: cell-alignments,
     title: title,
+    breakable: true,
     ..(header-cells + body-cells),
   )
   }

@@ -235,14 +235,14 @@ def _breakable_typst_display_text(
 
 
 def _opinion_traceability_refs(
-    references: list[dict[str, Any]], direct_finding_ids: set[UUID]
+    references: list[dict[str, Any]], cited_finding_ids: set[UUID]
 ) -> list[dict[str, Any]]:
     """Keep the finding annex scoped to logical findings explicitly cited by the opinion."""
-    direct_ids = {str(reference_id) for reference_id in direct_finding_ids}
+    cited_ids = {str(reference_id) for reference_id in cited_finding_ids}
     return [
         reference
         for reference in references
-        if reference["kind_label"] != "Finding" or reference["reference_id"] in direct_ids
+        if reference["kind_label"] != "Finding" or reference["reference_id"] in cited_ids
     ]
 
 
@@ -2414,7 +2414,7 @@ def project_publication_to_typst_model(
         return reference
 
     opinion_provenance_entries: list[dict[str, Any]] = []
-    direct_opinion_finding_ids: set[UUID] = set()
+    opinion_cited_finding_ids: set[UUID] = set()
     opinion_reference_by_id: dict[tuple[str, UUID], dict[str, Any]] = {}
     opinion_reference_numbers = {"finding": 0, "evidence": 0}
 
@@ -2445,7 +2445,7 @@ def project_publication_to_typst_model(
         for observation in opinion.observations:
             if not observation.text.strip():
                 continue
-            direct_opinion_finding_ids.update(observation.finding_refs)
+            opinion_cited_finding_ids.update(observation.finding_refs)
             note: dict[str, Any] = {
                 "type": "analyst_observation",
                 "text": observation.text,
@@ -3184,6 +3184,7 @@ def project_publication_to_typst_model(
                 "candidates": "Piste non confirmée",
             }[owner]
         draft_ioc_item["_draft_contexts"].append(draft_ioc.context)
+        opinion_cited_finding_ids.update(draft_ioc.finding_refs)
         provenance_context = (
             f"IOC original {display_value}"
             if draft_ioc.status == "originals"
@@ -3702,7 +3703,7 @@ def project_publication_to_typst_model(
             finding_refs,
             evidence_refs,
         ) in enumerate(display_blocks):
-            direct_opinion_finding_ids.update(finding_refs)
+            opinion_cited_finding_ids.update(finding_refs)
             context_label = f"Bloc 1.{index + 1} — {heading}"
             projected_opinion_blocks.append(
                 {
@@ -3912,7 +3913,7 @@ def project_publication_to_typst_model(
             "ioc_row_groups": ioc_row_groups,
             "original_indicator_note": original_indicator_note,
             "opinion_refs": _opinion_traceability_refs(
-                opinion_provenance_entries, direct_opinion_finding_ids
+                opinion_provenance_entries, opinion_cited_finding_ids
             ),
             "implant_identifier_rows": [
                 item for item in implant_material_rows if item["type"] == "attacker_github_c2_token"
