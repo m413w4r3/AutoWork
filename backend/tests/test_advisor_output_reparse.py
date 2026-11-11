@@ -61,9 +61,11 @@ class ArtifactStore:
     def __init__(self, values: dict) -> None:
         self.values = values
         self.calls = []
+        self.read_limits = []
 
     async def read_bytes(self, blob_id, *, max_bytes: int):
         self.calls.append(blob_id)
+        self.read_limits.append((blob_id, max_bytes))
         value = self.values[blob_id]
         if len(value) > max_bytes:
             raise ValueError("read exceeds test limit")
@@ -154,6 +156,7 @@ def _harness(
     consultation_type: str = "draft_text",
     input_refs: list[dict] | None = None,
     measurement_catalog: list[dict] | None = None,
+    persisted_payload_padding_bytes: int = 0,
 ):
     investigation_id = uuid4()
     original_id = uuid4()
@@ -202,6 +205,8 @@ def _harness(
         persisted["measurement_catalog"] = measurement_catalog
     if reparse_context is not None:
         persisted["reparse_context"] = reparse_context
+    if persisted_payload_padding_bytes:
+        persisted["assembled_dossier"] = "d" * persisted_payload_padding_bytes
     persisted_bytes = json.dumps(
         persisted, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -468,6 +473,79 @@ async def test_explicit_v4_reparse_appends_verified_parse_without_bridge_or_egre
     assert recorded["payload"]["bridge_turns_consumed"] == 0
     assert recorded["payload"]["output"]["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
     assert recorded["payload"]["output"]["candidates"][0]["validated"] is False
+
+
+@pytest.mark.asyncio
+async def test_v4_suricata_reparse_exposes_prose_rules_for_candidate_import() -> None:
+    rules = tuple(
+        f'alert http any any -> any any (msg:"Candidate {index}"; '
+        f'content:"example-{index}.invalid"; sid:{4_200_100 + index}; rev:1;)'
+        for index in range(1, 9)
+    )
+    source = "\n\n".join(rules)
+    raw = "Eight untested candidates follow:\n\n" + source
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    reparse_context = {
+        "transmitted_refs": input_refs,
+        "network_facts": [
+            {
+                "fact_id": "nf001",
+                "evidence_id": input_refs[0]["id"],
+                "observation_sha256": input_refs[0]["sha256"],
+                "field": "tls.sni",
+                "value": "updates.example.test",
+            }
+        ],
+    }
+    tool, recorder, original, context, _, _, _ = _harness(
+        raw,
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=reparse_context,
+        consultation_type="suricata_draft",
+        input_refs=input_refs,
+    )
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["output"]["rule_source"] == source
+    assert result.output["output"]["rules"][0]["rule_source"] == source
+    assert result.output["output"]["raw_output"] == raw
+    assert recorder.calls[0]["payload"]["output"]["rules"]
+
+
+@pytest.mark.asyncio
+async def test_v4_reparse_reads_multimegabyte_persisted_observation_by_descriptor_size() -> None:
+    raw = _semantic_raw()
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, _, store, _ = _harness(
+        raw,
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
+        persisted_payload_padding_bytes=2 * 1024 * 1024,
+    )
+    original_size = len(store.values[original.blob_id])
+    assert original_size > 2 * 1024 * 1024
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert store.read_limits[0] == (original.blob_id, original_size)
+    assert len(recorder.calls) == 1
 
 
 @pytest.mark.asyncio

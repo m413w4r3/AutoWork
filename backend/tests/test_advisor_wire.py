@@ -2044,6 +2044,22 @@ MOTIF: $marker | measurements=M1
     assert suricata.source == 'drop tcp any any -> any any (msg:"measured; rule"; sid:10; rev:1;) ;'
 
 
+def test_unfenced_suricata_prose_recovers_multiple_complete_rules() -> None:
+    rules = tuple(
+        f'alert http any any -> any any (msg:"Candidate {index}"; '
+        f'content:"example-{index}.invalid"; sid:{4_200_100 + index}; rev:1;)'
+        for index in range(1, 9)
+    )
+    raw = "Eight untested candidates follow:\n\n" + "\n\n".join(rules)
+
+    document = parse_advisor_wire(raw)
+
+    assert document.source_count == 1
+    assert document.source_language == "suricata"
+    assert document.source == "\n\n".join(rules)
+    assert document.suricata_rules == (document.source,)
+
+
 def test_incomplete_or_multiple_fallback_sources_are_never_truncated() -> None:
     incomplete = parse_advisor_wire(
         "advisor-wire.v1\nTYPE: yara_draft\nSTATUS: succeeded\n"

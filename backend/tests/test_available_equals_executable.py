@@ -18,6 +18,11 @@ from cti_app.application.investigation_acquisition_tools import (
     VT_DOWNLOAD_SAMPLE_SCHEMA,
     VT_FILE_DOWNLOAD_CAPABILITY,
 )
+from cti_app.application.investigation_advisor_tools import (
+    ADVISOR_REPARSE_SCHEMA_VERSION,
+    ADVISOR_REPARSE_TOOL_NAME,
+    register_advisor_reparse_tool,
+)
 from cti_app.application.investigation_composition import (
     FAMILY_CAPABILITY_KEYS,
     OPTIONAL_TOOL_NAMES,
@@ -413,6 +418,7 @@ async def _build_context(
     *,
     envelope: Any = ...,
     osint_policy_authorized: bool | None = None,
+    blocked_capabilities: tuple[str, ...] = (),
 ):
     active_envelope = (
         await fixture.envelopes.get(fixture.investigation_id) if envelope is ... else envelope
@@ -430,6 +436,7 @@ async def _build_context(
         idempotency_key="available-equals-executable-context",
         available_capabilities=capabilities,
         osint_policy_authorized=osint_policy_authorized,
+        blocked_capabilities=blocked_capabilities,
     )
     return await fixture.context_builder.build(
         investigation_id=fixture.investigation_id,
@@ -467,6 +474,71 @@ def _register_advisor(registry: InMemoryToolRegistry, fixture: _Fixture) -> None
     )
     registry.register(definition, adapter)
     fixture.available_capabilities = frozenset((*fixture.available_capabilities, "bridge.advisor"))
+
+
+@pytest.mark.asyncio
+async def test_local_advisor_reparse_stays_executable_after_advisor_provider_refusal() -> None:
+    fixture, state, registry, _summaries, _operator_service, _tools, _identifiers = (
+        await _seeded_fixture()
+    )
+    capability = "advisor.reparse"
+    capabilities = frozenset((*fixture.available_capabilities, capability))
+    capabilities = frozenset((*capabilities, "bridge.advisor"))
+    fixture.available_capabilities = capabilities
+    fixture.service._available_capabilities = capabilities
+    adapter = _RecordingTool(ADVISOR_REPARSE_TOOL_NAME)
+    register_advisor_reparse_tool(registry, adapter=adapter)
+    consult_definition, consult_adapter = _schema_tool(
+        "advisor.consult",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        ToolEffect.EXTERNAL_READ,
+        "bridge.advisor",
+    )
+    registry.register(consult_definition, consult_adapter)
+
+    blocked = ("advisor: provider authorization refused",)
+    context = await _build_context(
+        fixture,
+        state,
+        registry,
+        blocked_capabilities=blocked,
+    )
+    assert ADVISOR_REPARSE_TOOL_NAME in {item.name for item in context.available_tools}
+    assert "advisor.consult" not in {item.name for item in context.available_tools}
+
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    tool_context = ToolExecutionContext(
+        investigation_id=fixture.investigation_id,
+        envelope=envelope,
+        budget=envelope.budget,
+        idempotency_key="advisor-reparse-after-provider-refusal",
+        available_capabilities=capabilities,
+        blocked_capabilities=blocked,
+    )
+    observation_id = str(uuid4())
+    result = await RegistryToolDispatcher(registry).dispatch(
+        tool_context,
+        tool_name=ADVISOR_REPARSE_TOOL_NAME,
+        schema_version=ADVISOR_REPARSE_SCHEMA_VERSION,
+        arguments={"observation_id": observation_id},
+        purpose="Reparse a persisted advisor response locally.",
+        operation_key="advisor-reparse-after-provider-refusal",
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert adapter.calls == [{"observation_id": observation_id}]
+
+    consult_result = await RegistryToolDispatcher(registry).dispatch(
+        tool_context,
+        tool_name="advisor.consult",
+        schema_version="1",
+        arguments={},
+        purpose="Do not repeat a refused external advisor consultation.",
+        operation_key="advisor-consult-after-provider-refusal",
+    )
+    assert consult_result.status is ToolInvocationStatus.UNAVAILABLE
+    assert consult_adapter.calls == []
 
 
 @pytest.mark.asyncio

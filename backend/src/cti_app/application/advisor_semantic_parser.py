@@ -132,6 +132,44 @@ def _unstructured_semantic_result(
         "raw_output_sha256": hashlib.sha256(encoded).hexdigest(),
         "raw_output_retained": True,
         "raw_output_redacted": safe_raw_text != raw_text,
+        **(
+            _suricata_rule_projection(safe_raw_text)
+            if consultation_type == "suricata_draft"
+            else {}
+        ),
+    }
+
+
+def _suricata_rule_projection(
+    raw_text: str, opinion_texts: Sequence[str] = ()
+) -> dict[str, Any]:
+    """Expose exact complete Suricata source slices without validating or promoting them."""
+    sources: list[str] = []
+    seen: set[str] = set()
+    for text in (raw_text, *opinion_texts):
+        try:
+            document = parse_advisor_wire(text)
+        except (AttributeError, RecursionError, TypeError, ValueError):
+            continue
+        for source in document.suricata_rules:
+            identity = " ".join(source.split())
+            if identity and identity not in seen:
+                seen.add(identity)
+                sources.append(source)
+    if not sources:
+        return {}
+    rules = [
+        {
+            "rule_source": source,
+            "rule_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        }
+        for source in sources
+    ]
+    combined_source = "\n".join(source for source in sources)
+    return {
+        "rule_source": combined_source,
+        "rule_source_sha256": hashlib.sha256(combined_source.encode("utf-8")).hexdigest(),
+        "rules": rules,
     }
 
 
@@ -607,6 +645,17 @@ def parse_advisor_semantic_response(
         "evidence_preflight": completeness,
         **provenance,
     }
+    if consultation_type == "suricata_draft":
+        result.update(
+            _suricata_rule_projection(
+                safe_raw_text,
+                tuple(
+                    item["text"]
+                    for item in opinions
+                    if isinstance(item.get("text"), str)
+                ),
+            )
+        )
     if consultation_type == "review_text":
         result["reviews"] = normalized_reviews
         if overall_review is not None:
