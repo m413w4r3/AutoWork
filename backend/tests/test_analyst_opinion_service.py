@@ -13,12 +13,26 @@ import pytest
 from cti_app.application.analyst_opinion_service import (
     AnalystOpinionService,
     OperatorOpinionToolAdapter,
+    OperatorProtocolFigureAttachmentBuilder,
     OpinionCompositionSelection,
     OpinionError,
     OpinionErrorCode,
     OpinionRevisionEdits,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_contracts import OperatorOpinionProtocolFigureSelectionV1
+from cti_app.application.investigation_protocol_tools import (
+    PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
+    _protocol_render_observation_identity,
+)
+from cti_app.application.network_protocol_model import (
+    NETWORK_PROTOCOL_RENDERER_VERSION,
+    render_protocol_model,
+)
+from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+)
 from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
@@ -53,6 +67,11 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocationStatus,
 )
+from cti_app.domain.network_protocol import (
+    NetworkExtractionLimitsV1,
+    NetworkTransport,
+    StreamDirection,
+)
 from cti_app.domain.production import (
     AnalystInvestigation,
     LoopBudget,
@@ -61,7 +80,14 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.production_synthesis import production_synthesis_to_json
-from cti_app.domain.protocol_model import ProtocolDiagramKind
+from cti_app.domain.protocol_model import (
+    AssuranceLevel,
+    MessageDefinitionV1,
+    ProtocolDiagramKind,
+    ProtocolEvidenceRefV1,
+    ProtocolModelV1,
+    ProtocolValidationStatus,
+)
 from cti_app.domain.publication_document import (
     serialize_publication_document,
 )
@@ -761,6 +787,7 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
             "schema": "operator-advisor-call.v1",
             "consultation_type": "draft_text",
             "advisor_status": "partial",
+            "parse_status": "partially_parsed",
             "bridge_invocation_id": draft_invocation_id,
             "bridge_invocation_id_kind": "conversation_turn",
             "output_sha256": draft_output_sha,
@@ -898,6 +925,17 @@ async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_r
     assert composed_with_bridge.blocks[0].bridge_draft_ref == block.bridge_draft_ref
     assert composed_with_bridge.blocks[0].bridge_draft_ref.operator_modified is True
     assert composed_with_bridge.blocks[0].bridge_review_ref is None
+
+    wrong_target = replace(block, block_type=OpinionBlockType.CLAIM_VERIFICATION)
+    with pytest.raises(OpinionError) as target_error:
+        await harness.service.revise(
+            composed_with_bridge.id,
+            composed_with_bridge.version,
+            OpinionRevisionEdits((wrong_target,)),
+            "editor:one",
+            expected_sha256=composed_with_bridge.content_sha256,
+        )
+    assert target_error.value.code is OpinionErrorCode.INVALID_SELECTION
 
     material_section = OpinionBlock(
         block_type=OpinionBlockType.IMPLANT_MATERIALS,
@@ -1102,6 +1140,155 @@ async def test_protocol_figures_empty_list_detaches_but_none_preserves() -> None
     assert detached_observations == ()
     assert unchanged_opinion.protocol_figures == figures
     assert detached_opinion.protocol_figures == ()
+
+
+@pytest.mark.asyncio
+async def test_protocol_figure_builder_accepts_versioned_render_observation_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cti_app.application.protocol_diagram_projection as projection
+
+    harness = make_opinion_harness()
+    evidence = ProtocolEvidenceRefV1(
+        source="documented:claim:handshake",
+        documented_ref_kind="claim",
+        documented_ref_id="handshake",
+        documented_source_sha256="f" * 64,
+    )
+    model = ProtocolModelV1(
+        schema_version="ProtocolModelV1",
+        subject_id=str(harness.investigation.subject_id),
+        investigation_id=harness.investigation.id,
+        family=None,
+        cluster=None,
+        family_assurance=AssuranceLevel.UNCONFIRMED,
+        sample_sha256s=(),
+        capture_sha256s=(),
+        report_ids=(),
+        model_version="documented-protocol-model.v1",
+        protocol="Documented handshake",
+        transport=NetworkTransport.UNKNOWN,
+        endpoints=(),
+        client_server_orientation="unresolved",
+        infection_state=None,
+        conversations=(),
+        messages=(
+            MessageDefinitionV1(
+                message_id="hello",
+                name="ClientHello",
+                ordinal=1,
+                directions=(StreamDirection.UNRESOLVED,),
+                min_length=None,
+                max_length=None,
+                field_ids=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+        ),
+        fields=(),
+        transitions=(),
+        function_provenance=(),
+        validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+        verification_findings=(),
+        test_plan=(),
+        limits=NetworkExtractionLimitsV1(),
+        limitations=(),
+        extractor_versions=(),
+        documentary_evidence=(evidence,),
+    )
+    render_result = render_protocol_model(model)
+    render_identity = _protocol_render_observation_identity(model, render_result)
+    render_payload = {
+        **render_result.to_dict(),
+        "render_identity": render_identity,
+        "renderer_version": NETWORK_PROTOCOL_RENDERER_VERSION,
+        "projection_version": PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+        "figure_policy_version": PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    }
+    render_bytes = ProductionArtifactStore.canonical_json_bytes(render_payload)
+    model_blob_id = uuid4()
+    render_blob_id = uuid4()
+    model_observation = EvidenceObservation(
+        investigation_id=harness.investigation.id,
+        kind=EvidenceKind.OTHER,
+        blob_id=model_blob_id,
+        sha256=model.canonical_sha256,
+        source="network.protocol.document",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="protocol_model",
+        object_id=model.canonical_sha256,
+    )
+    render_observation = EvidenceObservation(
+        investigation_id=harness.investigation.id,
+        kind=EvidenceKind.OTHER,
+        blob_id=render_blob_id,
+        sha256=hashlib.sha256(render_bytes).hexdigest(),
+        source="network.protocol.render",
+        source_version=PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
+        observed_at=datetime.now(UTC),
+        object_type="protocol_diagram_specs",
+        object_id=render_identity,
+    )
+    harness.observations.items = (
+        *harness.observations.items,
+        model_observation,
+        render_observation,
+    )
+    harness.store.blobs[render_blob_id] = render_bytes
+
+    async def read_json(_blob_id: UUID, *, max_bytes: int | None = None):
+        return model.to_dict()
+
+    harness.store.read_json = read_json  # type: ignore[attr-defined,method-assign]
+
+    class BlobRepository:
+        async def get(self, blob_id: UUID):
+            if blob_id != model_blob_id:
+                return None
+            return SimpleNamespace(
+                descriptor=SimpleNamespace(
+                    logical_bucket="network-protocol-models",
+                    sha256=model.canonical_sha256,
+                )
+            )
+
+    def uow_factory():
+        unit = harness.uow_factory()
+        unit.blobs = BlobRepository()
+        return unit
+
+    async def compile_result(*_args, **_kwargs):
+        return ("compiled views",)
+
+    monkeypatch.setattr(projection, "compile_protocol_render_result", compile_result)
+    monkeypatch.setattr(projection, "opinion_protocol_figures", lambda _views: ("figure",))
+    builder = OperatorProtocolFigureAttachmentBuilder(
+        uow_factory=uow_factory,  # type: ignore[arg-type]
+        artifact_store=harness.store,  # type: ignore[arg-type]
+    )
+    selection = OperatorOpinionProtocolFigureSelectionV1(
+        protocol_model_blob_id=model_blob_id,
+        render_observation_id=render_observation.id,
+        views=tuple(ProtocolDiagramKind),
+    )
+
+    figures, observation_refs = await builder.build(harness.investigation.id, selection)
+
+    assert figures == ("figure",)
+    assert observation_refs == (model_observation.id, render_observation.id)
+
+    mismatched_identity = replace(
+        render_observation,
+        object_id=render_result.canonical_sha256,
+    )
+    harness.observations.items = (
+        *harness.observations.items[:-1],
+        mismatched_identity,
+    )
+    with pytest.raises(OpinionError) as error:
+        await builder.build(harness.investigation.id, selection)
+    assert error.value.code is OpinionErrorCode.PROTOCOL_FIGURES_INVALID
 
 
 @pytest.mark.asyncio

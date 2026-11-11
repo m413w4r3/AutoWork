@@ -59,6 +59,7 @@ from cti_app.domain.editorial import (
     AnalystDecisionType,
 )
 from cti_app.domain.investigation import (
+    EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
@@ -1619,9 +1620,19 @@ class OperatorProtocolFigureAttachmentBuilder:
         selection: OperatorOpinionProtocolFigureSelectionV1,
     ) -> tuple[tuple[OpinionProtocolFigureV1, ...], tuple[UUID, ...]]:
         from cti_app.application.diagram_compilation import DiagramCompilationError
+        from cti_app.application.evidence_recorder import _sanitize_json
         from cti_app.application.media_assets import MediaAssetStore
-        from cti_app.application.network_protocol_model import render_protocol_model
+        from cti_app.application.investigation_protocol_tools import (
+            PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
+            _protocol_render_observation_identity,
+        )
+        from cti_app.application.network_protocol_model import (
+            NETWORK_PROTOCOL_RENDERER_VERSION,
+            render_protocol_model,
+        )
         from cti_app.application.protocol_diagram_projection import (
+            PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+            PROTOCOL_DIAGRAM_PROJECTION_VERSION,
             ProtocolDiagramProjectionError,
             compile_protocol_render_result,
             opinion_protocol_figures,
@@ -1642,6 +1653,9 @@ class OperatorProtocolFigureAttachmentBuilder:
                 item
                 for item in observations
                 if blob is not None
+                and item.investigation_id == investigation_id
+                and item.kind is EvidenceKind.OTHER
+                and item.source == "network.protocol.document"
                 and item.object_type == "protocol_model"
                 and item.object_id == blob.descriptor.sha256
             )
@@ -1655,7 +1669,10 @@ class OperatorProtocolFigureAttachmentBuilder:
                 or blob.descriptor.logical_bucket != "network-protocol-models"
                 or not model_observations
                 or render_observation is None
+                or render_observation.investigation_id != investigation_id
+                or render_observation.kind is not EvidenceKind.OTHER
                 or render_observation.source != "network.protocol.render"
+                or render_observation.source_version != PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION
                 or render_observation.object_type != "protocol_diagram_specs"
             ):
                 raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_NOT_IN_INVESTIGATION)
@@ -1677,12 +1694,40 @@ class OperatorProtocolFigureAttachmentBuilder:
             raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_NOT_IN_INVESTIGATION)
 
         render_result = render_protocol_model(model)
+        render_identity = _protocol_render_observation_identity(model, render_result)
+        expected_render_payload = {
+            **render_result.to_dict(),
+            "render_identity": render_identity,
+            "renderer_version": NETWORK_PROTOCOL_RENDERER_VERSION,
+            "projection_version": PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+            "figure_policy_version": PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+        }
+        expected_render_payload = _sanitize_json(expected_render_payload)
+        try:
+            render_observation_bytes = await self._artifact_store.read_bytes(
+                render_observation.blob_id
+            )
+            render_observation_payload = json.loads(render_observation_bytes)
+        except ProductionReuseStorageUnavailableError as exc:
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_UNAVAILABLE) from exc
+        except (OSError, TypeError, ValueError) as exc:
+            raise OpinionError(
+                OpinionErrorCode.PROTOCOL_FIGURES_INVALID,
+                message="Protocol render observation payload is unreadable.",
+            ) from exc
         if (
-            render_observation.object_id != render_result.canonical_sha256
-            or render_observation.sha256 != render_result.canonical_sha256
+            hashlib.sha256(render_observation_bytes).hexdigest() != render_observation.sha256
+            or render_observation.object_id != render_identity
+            or render_observation_payload != expected_render_payload
             or render_result.model_sha256 != model.canonical_sha256
         ):
-            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_INVALID)
+            raise OpinionError(
+                OpinionErrorCode.PROTOCOL_FIGURES_INVALID,
+                message=(
+                    "Protocol render observation hash or versioned identity does not match "
+                    "the selected model."
+                ),
+            )
 
         try:
             rendered = await compile_protocol_render_result(
@@ -1953,11 +1998,39 @@ def register_operator_opinion_tools(
     uuid_list = {"type": "array", "maxItems": 128, "items": uuid_schema}
     bridge_draft_ref_schema = {
         "type": "object",
+        "description": (
+            "Reference a persisted advisor.consult draft_text call in this investigation. "
+            "invocation_id is its Bridge conversation-turn UUID. text_sha256 is SHA-256 of the "
+            "exact final block text encoded as UTF-8. For operator-edited text, also provide "
+            "source_text_sha256 (SHA-256 of the source block's sentence texts joined with one "
+            "space) and source_observation_id (the consultation observation_ref). The persisted "
+            "usable output block must match this block_type and, for notes, its form and anchor. "
+            "A partially parsed consultation is accepted only when that exact output block is "
+            "usable and its persisted observation and Bridge provenance verify."
+        ),
         "properties": {
-            "invocation_id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "text_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-            "source_text_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-            "source_observation_id": uuid_schema,
+            "invocation_id": {
+                "type": "string",
+                "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "description": "bridge_invocation_id from the persisted advisor.consult call.",
+            },
+            "text_sha256": {
+                "type": "string",
+                "pattern": r"^[0-9a-f]{64}$",
+                "description": "SHA-256 of the final exact opinion text, UTF-8 encoded.",
+            },
+            "source_text_sha256": {
+                "type": "string",
+                "pattern": r"^[0-9a-f]{64}$",
+                "description": (
+                    "For edited text, SHA-256 of the matching persisted output block's sentence "
+                    "texts joined with one space, UTF-8 encoded."
+                ),
+            },
+            "source_observation_id": {
+                **uuid_schema,
+                "description": "observation_ref returned by the matching advisor.consult call.",
+            },
         },
         "required": ["invocation_id", "text_sha256"],
         "additionalProperties": False,
@@ -1990,7 +2063,13 @@ def register_operator_opinion_tools(
                     "enum": [item.value for item in OpinionClaimQualification],
                 },
                 "certainty": {"type": "number", "minimum": 0, "maximum": 1},
-                "bridge_authored": {"type": "boolean"},
+                "bridge_authored": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, bridge_draft_ref must point to the matching persisted usable "
+                        "draft_text block from this investigation."
+                    ),
+                },
                 "bridge_draft_ref": bridge_draft_ref_schema,
                 "bridge_review_ref": bridge_review_ref_schema,
             },
@@ -2060,7 +2139,9 @@ def register_operator_opinion_tools(
             "Optionnel : joindre les trois vues D2 d'un modèle de protocole déjà rendu dans cette "
             "enquête. Indiquez son protocol_model_blob_id, le render_observation_id renvoyé par "
             "network.protocol.render, et les trois vues sequence, state_machine et message_format "
-            "ensemble. Un modèle documenté reste marqué « documenté, non observé »."
+            "ensemble. Utilisez l'observation exacte du rendu de ce modèle; son identité "
+            "versionnée et son SHA-256 sont vérifiés. Un modèle documenté reste marqué « documenté, "
+            "non observé »."
         ),
         "items": {
             "type": "object",
@@ -2172,7 +2253,17 @@ def register_operator_opinion_tools(
                 "type": "object",
                 "properties": {
                     "action": {"const": "note"},
-                    "anchor": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "anchor": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": (
+                            "Copy an exact article paragraph anchor from the current publication: "
+                            "lead:0001 or section:<zero-based-section-index>:paragraph:0001. "
+                            "The value must exist in the article snapshot; S6P7.1 and block types "
+                            "such as claim_verification are not anchors."
+                        ),
+                    },
                     "state": {
                         "type": "string",
                         "enum": [item.value for item in AnalystObservationState],
@@ -2186,7 +2277,13 @@ def register_operator_opinion_tools(
                     "expected_opinion_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
                     "finding_refs": {"type": "array", "maxItems": 16, "items": uuid_schema},
                     "evidence_refs": {"type": "array", "maxItems": 16, "items": uuid_schema},
-                    "bridge_authored": {"type": "boolean"},
+                    "bridge_authored": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, bridge_draft_ref must point to the matching persisted usable "
+                            "draft_text block from this investigation."
+                        ),
+                    },
                     "bridge_block_type": {
                         "type": "string",
                         "enum": [item.value for item in _OPERATOR_BLOCK_TYPES],

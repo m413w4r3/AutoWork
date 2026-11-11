@@ -1556,6 +1556,39 @@ async def test_malformed_top_level_draft_assertions_are_ignored_with_warning() -
     )
 
 
+@pytest.mark.asyncio
+async def test_draft_text_honors_top_level_single_target_for_bridge_attribution() -> None:
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Draft prose for the selected analyst note target.",
+        )
+    )
+    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "block_type": "claim_verification",
+            "anchor": "lead:0001",
+        },
+        make_context(investigation_id, key="draft-text-single-target"),
+    )
+
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert '"id": "U1"' in prompt
+    assert '"block_type": "claim_verification"' in prompt
+    assert '"form": "analyst_note"' in prompt
+    assert '"anchor": "lead:0001"' in prompt
+    assert not any(
+        item.get("field") in {"block_type", "form", "anchor"}
+        and item.get("reason") == "unsupported_for_consultation_type"
+        for item in result.output.get("ignored_inputs", ())
+    )
+
+
 def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> None:
     investigation_id = uuid4()
     tool, _ = make_tool(investigation_id=investigation_id, transport=Transport(None))
@@ -1575,6 +1608,8 @@ def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> 
     assert "maxItems" not in schema["units"]
     assert "maxItems" not in schema["measurements"]
     assert "maxItems" not in schema["evidence_refs"]
+    assert "one draft_text block" in schema["block_type"]["description"]
+    assert "multiple draft targets" in schema["units"]["description"]
 
 
 def test_advisor_registered_schema_accepts_canonical_editorial_assertion_refs() -> None:

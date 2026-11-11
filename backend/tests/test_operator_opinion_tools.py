@@ -91,11 +91,11 @@ async def test_observed_note_requires_existing_anchor_and_real_evidence_refs() -
         investigations=SimpleNamespace(
             get=async_get(SimpleNamespace(synthesis_artifact_id=uuid4()))
         ),
-        article_snapshots=ArticleSnapshots(("section:methods",)),
+        article_snapshots=ArticleSnapshots(("section:0:paragraph:0001",)),
     )
     args = {
         "action": "note",
-        "anchor": "section:methods",
+        "anchor": "section:0:paragraph:0001",
         "text": "The cited test covers this protocol statement.",
         "state": "observed",
         "relation": "qualifies",
@@ -110,7 +110,7 @@ async def test_observed_note_requires_existing_anchor_and_real_evidence_refs() -
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert service.revision is not None
     note = service.revision[2].observations[0]
-    assert note.anchor == "section:methods"
+    assert note.anchor == "section:0:paragraph:0001"
     assert note.state is AnalystObservationState.OBSERVED
     assert note.evidence_refs == (evidence_ref,)
     assert result.observation_refs == (evidence_ref,)
@@ -126,11 +126,11 @@ async def test_note_rejects_unlisted_anchor_and_synthetic_observed_note() -> Non
         investigations=SimpleNamespace(
             get=async_get(SimpleNamespace(synthesis_artifact_id=uuid4()))
         ),
-        article_snapshots=ArticleSnapshots(("section:methods",)),
+        article_snapshots=ArticleSnapshots(("section:0:paragraph:0001",)),
     )
     base = {
         "action": "note",
-        "anchor": "section:unknown",
+        "anchor": "S6P7.1",
         "text": "An unsupported operator statement.",
         "state": "observed",
         "relation": "unresolved",
@@ -140,10 +140,13 @@ async def test_note_rejects_unlisted_anchor_and_synthetic_observed_note() -> Non
         "evidence_refs": [],
     }
     bad_anchor = await adapter.execute(base, context(investigation_id))
-    base["anchor"] = "section:methods"
+    base["anchor"] = "claim_verification"
+    block_type_as_anchor = await adapter.execute(base, context(investigation_id))
+    base["anchor"] = "section:0:paragraph:0001"
     no_evidence = await adapter.execute(base, context(investigation_id))
 
     assert bad_anchor.error_code == "invalid_note_anchor"
+    assert block_type_as_anchor.error_code == "invalid_note_anchor"
     assert no_evidence.status is ToolInvocationStatus.FAILED
     assert service.revision is None
 
@@ -303,6 +306,17 @@ def test_compose_and_revise_schemas_describe_bounded_protocol_figure_selection()
                 schema,
             )
 
+    note_registration = registry.get("opinion.note", "operator-opinion.v1")
+    assert note_registration is not None
+    anchor_schema = note_registration[0].input_schema["properties"]["anchor"]
+    assert "lead:0001" in anchor_schema["description"]
+    assert "section:<zero-based-section-index>:paragraph:0001" in anchor_schema["description"]
+    draft_ref_schema = definitions["opinion.revise"].input_schema["properties"]["blocks"]["items"]
+    draft_ref_description = draft_ref_schema["properties"]["bridge_draft_ref"]["description"]
+    assert "source_observation_id" in draft_ref_description
+    assert "sentence texts joined with one space" in draft_ref_description
+    assert "partially parsed" in draft_ref_description
+
     implant_text = "Material CTI en clair ghp_" + "e" * 36
     text_sha256 = hashlib.sha256(implant_text.encode()).hexdigest()
     implant_block = {
@@ -313,7 +327,7 @@ def test_compose_and_revise_schemas_describe_bounded_protocol_figure_selection()
         "qualification": "fact",
         "certainty": 1,
         "bridge_authored": True,
-        "bridge_draft_ref": {"invocation_id": "draft-1", "text_sha256": text_sha256},
+        "bridge_draft_ref": {"invocation_id": str(uuid4()), "text_sha256": text_sha256},
         "bridge_review_ref": {
             "invocation_id": "review-1",
             "output_sha256": "d" * 64,
