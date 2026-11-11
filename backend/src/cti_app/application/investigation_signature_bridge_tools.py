@@ -289,7 +289,9 @@ class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
                 source = None
             if source is None and isinstance(raw_text, str):
                 document = parse_advisor_wire(raw_text)
-                if document.source_language == "suricata":
+                if document.suricata_rules:
+                    source = "\n".join(document.suricata_rules)
+                elif document.source_language == "suricata":
                     source = document.source
             if not isinstance(source, str) or not source.strip():
                 raise ValueError("suricata_rule_source_not_found")

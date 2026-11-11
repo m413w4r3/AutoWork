@@ -1119,12 +1119,17 @@ async def test_suricata_bridge_candidate_import_persists_source_and_untested_sta
 async def test_suricata_bridge_candidate_syntax_failure_is_still_persisted() -> None:
     local_invocation_id = uuid4()
     source_observation_id = uuid4()
-    raw_output = "alert tcp any any -> any any (sid:1; rev:1;)"
+    rules = tuple(
+        f'alert http any any -> any any (msg:"Candidate {index}"; '
+        f'content:"example-{index}.invalid"; sid:{4_200_100 + index}; rev:1;)'
+        for index in range(1, 9)
+    )
+    raw_output = "Eight untested candidates follow:\n\n" + "\n\n".join(rules)
     payload = {
         "schema": "operator-advisor-call.v1",
         "consultation_type": "suricata_draft",
         "advisor_status": "partial",
-        "output": {"usable": True, "rule_source": raw_output},
+        "output": {"usable": True, "raw_output": raw_output},
     }
     blob_id = uuid4()
     observation = SimpleNamespace(
@@ -1169,7 +1174,7 @@ async def test_suricata_bridge_candidate_syntax_failure_is_still_persisted() -> 
     assert result.output["rule_syntax_validation"] == "failed"
     assert result.output["candidate_observation_id"]
     stored = recorder.payloads[recorder.observations[0].blob_id]
-    assert stored["output"]["rule_source"] == raw_output
+    assert stored["output"]["rule_source"] == "\n\n".join(rules)
     assert stored["output"]["pcap_test_status"] == "not_tested"
     assert stored["bridge_invocation_id"] is None
     assert stored["local_tool_invocation_id"] == str(local_invocation_id)

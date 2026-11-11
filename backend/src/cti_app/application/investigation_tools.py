@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -50,6 +50,33 @@ class ToolEffect(StrEnum):
     # (e.g. a reviewed YARA rule). Provider and disclosure policy apply like an
     # external read; the tool itself enforces its own explicit human authorization.
     EXTERNAL_SUBMIT = "external_submit"
+
+
+_EXTERNAL_PROVIDER_EFFECTS = frozenset(
+    {
+        ToolEffect.EXTERNAL_READ,
+        ToolEffect.ACQUIRE,
+        ToolEffect.EXTERNAL_ACTIVE,
+        ToolEffect.EXTERNAL_SUBMIT,
+    }
+)
+
+
+def provider_authorization_blocks_tool(
+    definition: ToolDefinition, blocked_capabilities: Sequence[str]
+) -> bool:
+    """Apply persisted provider refusals only to tools that contact providers."""
+    if definition.effect not in _EXTERNAL_PROVIDER_EFFECTS:
+        return False
+    providers = {
+        definition.capability_key.split(".", 1)[0],
+        definition.name.split(".", 1)[0],
+    }
+    for blocked in blocked_capabilities:
+        key, separator, detail = blocked.partition(":")
+        if separator and key in providers and "provider authorization refused" in detail:
+            return True
+    return False
 
 
 _ANALYTIC_WRITE_TOOL_NAMES = frozenset(
@@ -326,13 +353,12 @@ def tool_unavailability_reason(
         return context.unavailable_tool_reasons.get(
             definition.name, f"capability_unavailable:{definition.capability_key}"
         )
-    provider = definition.capability_key.split(".", 1)[0]
     for blocked in context.blocked_capabilities:
         key, separator, detail = blocked.partition(":")
         if not separator:
             continue
         if key == definition.capability_key or (
-            key == provider and "provider authorization refused" in detail
+            provider_authorization_blocks_tool(definition, (blocked,))
         ):
             normalized = "_".join(detail.strip().lower().split())
             if (

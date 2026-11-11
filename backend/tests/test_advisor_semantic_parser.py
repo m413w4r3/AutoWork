@@ -146,6 +146,35 @@ def test_v4_plan_prose_is_usable_and_retains_raw_text_and_sha() -> None:
     assert "unstructured_response" in result["warnings"]
 
 
+def test_v4_suricata_prose_exposes_exact_rules_for_local_import() -> None:
+    rules = tuple(
+        f'alert http any any -> any any (msg:"Candidate {index}"; '
+        f'content:"example-{index}.invalid"; sid:{4_200_100 + index}; rev:1;)'
+        for index in range(1, 9)
+    )
+    source = "\n\n".join(rules)
+    raw = "Eight untested candidates follow:\n\n" + source
+    prompt_data = _prompt_data()
+    prompt_data["consultation_type"] = "suricata_draft"
+
+    result = parse_advisor_semantic_response(
+        raw,
+        consultation_type="suricata_draft",
+        prompt_data=prompt_data,
+    )
+
+    assert result["usable"] is True
+    assert result["untrusted"] is True
+    assert result["rule_source"] == source
+    assert result["rule_source_sha256"] == hashlib.sha256(source.encode("utf-8")).hexdigest()
+    assert result["rules"] == [
+        {
+            "rule_source": source,
+            "rule_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "consultation_type",
     [

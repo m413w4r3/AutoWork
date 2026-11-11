@@ -67,6 +67,7 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolRegistry,
     ToolResult,
+    provider_authorization_blocks_tool,
     tool_operation_cache_identity,
     uses_nonblocking_local_freshness,
 )
@@ -3108,16 +3109,18 @@ class InvestigationService:
                     )
                 )
             )
-            blocked_providers = {item.split(":", 1)[0] for item in blocked_capabilities}
             blocked_download_capabilities = {
                 item.split(":", 1)[0]
                 for item in blocked_capabilities
                 if item.startswith("vt.file_download:")
             }
-            provider = proposed.tool_name.split(".", 1)[0].lower()
             definition_adapter = self._registry.get(proposed.tool_name, proposed.schema_version)
             definition = definition_adapter[0] if definition_adapter else None
-            if provider in blocked_providers or (
+            provider = proposed.tool_name.split(".", 1)[0].lower()
+            if (
+                definition is not None
+                and provider_authorization_blocks_tool(definition, blocked_capabilities)
+            ) or (
                 definition is not None
                 and definition.capability_key in blocked_download_capabilities
             ):

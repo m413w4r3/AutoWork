@@ -35,6 +35,7 @@ class AdvisorWireDocument:
     source_error: str | None = None
     extraction_notes: tuple[str, ...] = ()
     yara_rules: tuple[tuple[str, str], ...] = ()
+    suricata_rules: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +57,15 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
     region = text[region_start:]
     source_blocks = _raw_source_blocks(region)
     source, language, source_count = _source_result(source_blocks)
+    suricata_rules = (
+        tuple(block.source for block in source_blocks if block.source is not None)
+        if source_blocks
+        and all(
+            block.language == "suricata" and block.source is not None and block.error is None
+            for block in source_blocks
+        )
+        else ()
+    )
     if source is not None and language == "yara" and source_blocks:
         source_start = text.find(source, region_start + source_blocks[0].start)
         source = _restore_source_line_endings(
@@ -198,6 +208,7 @@ def parse_advisor_wire(raw: str, *, sent_rule_sources: Sequence[str] = ()) -> Ad
         source_error=source_error,
         extraction_notes=tuple(extraction_notes),
         yara_rules=yara_rules,
+        suricata_rules=suricata_rules,
     )
 
 
@@ -631,13 +642,12 @@ def _raw_source_blocks(text: str) -> list[_RawSourceBlock]:
             current_yara_end = end
     masked = _mask_source_spans(text, [*wrapped_spans, *yara_spans])
 
-    action_line = re.compile(r"(?i)^[ \t]*(?:alert|drop|pass)\b[^\n]*;[ \t]*$")
     incomplete_action = re.compile(r"(?i)^[ \t]*(?:alert|drop|pass)\b[^\n]*$")
     action_lines: list[tuple[int, int, str, bool]] = []
     cursor = 0
     for line in masked.splitlines(keepends=True):
         body = line.rstrip("\n")
-        if action_line.fullmatch(body):
+        if _single_complete_suricata_rule(body) is not None:
             action_lines.append((cursor, cursor + len(line), body, True))
         elif incomplete_action.fullmatch(body):
             action_lines.append((cursor, cursor + len(line), body, False))
