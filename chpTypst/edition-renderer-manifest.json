@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v35-m20-opinion-render",
+  "template_version": "chp-edition-v36-m21-opinion-render",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

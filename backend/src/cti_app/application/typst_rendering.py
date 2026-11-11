@@ -54,6 +54,7 @@ from cti_app.domain.investigation import (
     FindingKind,
     InvestigationFinding,
     NoveltyClass,
+    logical_finding_id_by_version,
 )
 from cti_app.domain.investigation_graph import InvestigationGraph, InvestigationGraphNodeKind
 from cti_app.domain.media_assets import MediaAssetKind
@@ -96,8 +97,8 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v38 adds M21 display-only IOC refanging and safe wrapping for opinion/table text.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v38-m21-opinion-render"
+# v39 adds reader-facing opinion labels and logical finding IDs to opinion annexes.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v39-m21-opinion-render"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -142,6 +143,23 @@ _IOC_DISPOSITION_REASON_LABELS = {
     "unsupported_artifact_type": "type non publié",
     "unsupported_hash_format": "format de hash invalide",
 }
+_IOC_SOURCE_ROLE_LABELS = {
+    "primary": "source primaire",
+    "independent": "source indépendante",
+    "relay": "relais",
+    "aggregator": "agrégateur",
+    "social": "réseau social",
+    "unknown": "source non précisée",
+}
+_IOC_EVIDENCE_BASIS_LABELS = {
+    "source_verified": "vérifiée par la source",
+    "unverified_model_output": "sortie de modèle non vérifiée",
+    "analyst_override": "décision de l'analyste",
+}
+_IOC_RELEVANCE_LABELS = {
+    ("direct", "malicious_subject_relation"): "direct — relation malveillante au sujet",
+    ("context", "malicious_role_not_demonstrated"): ("contexte — rôle malveillant non démontré"),
+}
 _BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command", "technical_literal"})
 _TYPOGRAPHIC_BREAK_INTERVAL = 8
 _TYPOGRAPHIC_BREAK_THRESHOLD = 32
@@ -164,7 +182,7 @@ _TABLE_WINDOWS_REGISTRY_PATH = re.compile(
     re.IGNORECASE,
 )
 _OPINION_BLOCK_HEADINGS = {
-    OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
+    OpinionBlockType.KEY_FINDINGS: "Apports de l'analyse",
     OpinionBlockType.ADDITIONAL_SAMPLES: "Échantillons complémentaires",
     OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES: "Chaîne d'infection et capacités",
     OpinionBlockType.NETWORK_AND_INFRASTRUCTURE: "Activité réseau et infrastructure",
@@ -235,15 +253,39 @@ def _breakable_typst_display_text(
 
 
 def _opinion_traceability_refs(
-    references: list[dict[str, Any]], cited_finding_ids: set[UUID]
+    references: list[dict[str, Any]],
+    cited_finding_ids: set[UUID],
+    logical_finding_ids: Mapping[UUID, UUID] | None = None,
 ) -> list[dict[str, Any]]:
-    """Keep the finding annex scoped to logical findings explicitly cited by the opinion."""
-    cited_ids = {str(reference_id) for reference_id in cited_finding_ids}
-    return [
-        reference
-        for reference in references
-        if reference["kind_label"] != "Finding" or reference["reference_id"] in cited_ids
-    ]
+    """Keep one annex row per cited logical finding, while retaining evidence rows."""
+    version_to_logical = logical_finding_ids or {}
+    cited_logical_ids = {
+        version_to_logical.get(reference_id, reference_id) for reference_id in cited_finding_ids
+    }
+    seen_logical_ids: set[UUID] = set()
+    result: list[dict[str, Any]] = []
+    for reference in references:
+        if reference["kind_label"] != "Finding":
+            result.append(reference)
+            continue
+        try:
+            version_id = UUID(reference["reference_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        logical_id = version_to_logical.get(version_id, version_id)
+        if logical_id not in cited_logical_ids or logical_id in seen_logical_ids:
+            continue
+        seen_logical_ids.add(logical_id)
+        logical_reference = dict(reference)
+        logical_reference["reference_id"] = str(logical_id)
+        logical_reference["reference_id_spans"] = _breakable_typst_display_text(
+            str(logical_id), interval=8
+        )
+        href = logical_reference.get("href")
+        if isinstance(href, str) and "/" in href:
+            logical_reference["href"] = href.rsplit("/", 1)[0] + "/" + str(logical_id)
+        result.append(logical_reference)
+    return result
 
 
 def _article_ioc_category(artifact_type: ArtifactType) -> str | None:
@@ -2153,6 +2195,13 @@ def project_publication_to_typst_model(
         if draft_preview is not None
         else None
     )
+    finding_version_logical_ids: Mapping[UUID, UUID] = (
+        dict(publication_v6.provenance.finding_version_logical_ids)
+        if publication_v6 is not None
+        else logical_finding_id_by_version(draft_preview.findings)
+        if draft_preview is not None
+        else {}
+    )
     opinion_document = draft_preview is not None or (
         isinstance(value, (PublicationDocumentV6, PublicationDocumentV7, PublicationDocumentV8))
         and opinion is not None
@@ -2382,8 +2431,13 @@ def project_publication_to_typst_model(
     def opinion_citation(kind: str, reference_id: UUID) -> dict[str, Any]:
         noun = "Finding" if kind == "finding" else "Évidence"
         uri_kind = "findings" if kind == "finding" else "evidence"
-        reference_text = str(reference_id)
-        key = (kind, reference_id)
+        displayed_id = (
+            finding_version_logical_ids.get(reference_id, reference_id)
+            if kind == "finding"
+            else reference_id
+        )
+        reference_text = str(displayed_id)
+        key = (kind, displayed_id)
         reference = opinion_reference_by_id.get(key)
         if reference is not None:
             return reference
@@ -2943,11 +2997,19 @@ def project_publication_to_typst_model(
             if item.get("evidence_quote"):
                 evidence.add(abbreviated(item["evidence_quote"], 28))
             if item.get("reliability"):
-                reliabilities.add(item["reliability"])
+                reliability = str(item["reliability"])
+                reliabilities.add(
+                    _IOC_EVIDENCE_BASIS_LABELS.get(reliability, reliability.replace("_", " "))
+                )
             if item.get("relevance_classification"):
-                value = str(item["relevance_classification"])
-                if item.get("relevance_reason_code"):
-                    value += "/" + str(item["relevance_reason_code"])
+                classification = str(item["relevance_classification"])
+                reason_code = str(item.get("relevance_reason_code") or "")
+                value = _IOC_RELEVANCE_LABELS.get(
+                    (classification, reason_code),
+                    "/".join(
+                        part.replace("_", " ") for part in (classification, reason_code) if part
+                    ),
+                )
                 relevance.add(value)
             observed = "-".join(
                 value for value in (item.get("first_observed"), item.get("last_observed")) if value
@@ -2958,7 +3020,8 @@ def project_publication_to_typst_model(
         parts = ["TLP non précisé"]
         for (status, reason), roles in sorted(decisions.items()):
             role_label = "/".join(
-                sorted(roles, key=lambda role: (role != "primary", role.casefold()))
+                _IOC_SOURCE_ROLE_LABELS.get(role, role.replace("_", " "))
+                for role in sorted(roles, key=lambda role: (role != "primary", role.casefold()))
             )
             decision = f"{status} ({role_label}"
             if reason:
@@ -3758,6 +3821,16 @@ def project_publication_to_typst_model(
                 caption_lines = [
                     line.strip() for line in protocol_figure.caption.splitlines() if line.strip()
                 ]
+
+                def reader_caption(lines: list[str]) -> str:
+                    caption_text = "\n".join(lines).replace(
+                        "ARTICLE_DOCUMENTED — documenté, non observé",
+                        "documenté, non observé",
+                    )
+                    for enum_value, label in _PROTOCOL_FIGURE_EVIDENCE_LABELS.items():
+                        caption_text = caption_text.replace(enum_value, label)
+                    return caption_text
+
                 source_title = caption_lines[0].rstrip(".") if caption_lines else ""
                 has_legacy_proof_metadata = any(
                     line.startswith("Limits: ") for line in caption_lines
@@ -3775,7 +3848,7 @@ def project_publication_to_typst_model(
                     return title, "", None
 
                 if not has_legacy_proof_metadata:
-                    return title_prefix, "\n".join(caption_lines), None
+                    return title_prefix, reader_caption(caption_lines), None
 
                 proof_line = next(
                     line.removeprefix("Proof levels: ")
@@ -3798,9 +3871,16 @@ def project_publication_to_typst_model(
                 )
                 limit_line = limit_parts[min(limit_index, len(limit_parts) - 1)]
                 proof_levels = proof_line.partition(" — ")[0]
+                raw_levels = proof_levels.removeprefix("Niveau de preuve : ")
+                displayed_levels = ", ".join(
+                    _PROTOCOL_FIGURE_EVIDENCE_LABELS.get(
+                        item.strip(), item.strip().replace("_", " ").casefold()
+                    )
+                    for item in raw_levels.split(",")
+                )
                 proof_label = (
-                    "Niveaux de preuve : " if "," in proof_levels else "Niveau de preuve : "
-                ) + proof_line
+                    "Niveaux de preuve : " if "," in raw_levels else "Niveau de preuve : "
+                ) + displayed_levels
                 title = f"{title_prefix} — {source_title}"
                 return title, f"Limites : {limit_line}.", proof_label
 
@@ -3913,7 +3993,9 @@ def project_publication_to_typst_model(
             "ioc_row_groups": ioc_row_groups,
             "original_indicator_note": original_indicator_note,
             "opinion_refs": _opinion_traceability_refs(
-                opinion_provenance_entries, opinion_cited_finding_ids
+                opinion_provenance_entries,
+                opinion_cited_finding_ids,
+                finding_version_logical_ids,
             ),
             "implant_identifier_rows": [
                 item for item in implant_material_rows if item["type"] == "attacker_github_c2_token"
@@ -4153,6 +4235,13 @@ _PROTOCOL_FIGURE_TITLES = {
     "sequence": "Séquence réseau du protocole",
     "state_machine": "Machine à états du protocole",
     "message_format": "Format de message du protocole",
+}
+_PROTOCOL_FIGURE_EVIDENCE_LABELS = {
+    "ARTICLE_DOCUMENTED": "documenté, non observé",
+    "STATIC_INFERENCE": "inférence statique",
+    "SANDBOX_CAPTURE_OBSERVED": "observation d'une capture isolée",
+    "HYPOTHETICAL": "hypothèse",
+    "VERIFIED_ON_HOLDOUT": "validé sur un jeu de contrôle",
 }
 
 

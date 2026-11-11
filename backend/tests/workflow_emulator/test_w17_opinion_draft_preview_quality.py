@@ -487,6 +487,8 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         "contexte et provenance",
     ):
         assert table_heading in annex_text, f"W17 IOC annex table is missing {table_heading!r}"
+    assert "sources :" in annex_text
+    assert "src 1" not in annex_text
 
     assert rendered_pages
     final_page_label = f"{len(rendered_pages)}/{len(rendered_pages)}"

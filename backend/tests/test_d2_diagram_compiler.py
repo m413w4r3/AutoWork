@@ -339,7 +339,7 @@ def test_stacks_documentary_protocol_sequence_without_inventing_edges() -> None:
     assert " -> " not in source
 
 
-def test_compacts_long_protocol_sequence_into_three_column_ordered_grid() -> None:
+def test_compacts_long_protocol_sequence_into_two_column_ordered_grid() -> None:
     nodes = tuple(
         _node(f"message-{index:02d}", f"#{index:02d} client → server: message")
         for index in range(1, 18)
@@ -353,12 +353,13 @@ def test_compacts_long_protocol_sequence_into_three_column_ordered_grid() -> Non
         )
     ).decode()
 
-    assert "grid-rows: 6\n  grid-columns: 3\n" in source
+    assert "grid-rows: 9\n  grid-columns: 2\n" in source
+    assert "font-size: 20" in source
     assert 'n001: "#01 client → server: message"' in source
     assert 'n017: "#17 client → server: message"' in source
 
 
-def test_compacts_large_protocol_field_view_into_four_column_grid() -> None:
+def test_compacts_large_protocol_field_view_into_two_column_grid() -> None:
     nodes = tuple(_node(f"field-{index:02d}", f"#{index:02d} field name") for index in range(1, 23))
     source = encode_d2_source(
         _diagram(
@@ -369,7 +370,8 @@ def test_compacts_large_protocol_field_view_into_four_column_grid() -> None:
         )
     ).decode()
 
-    assert "grid-rows: 6\n  grid-columns: 4\n" in source
+    assert "grid-rows: 11\n  grid-columns: 2\n" in source
+    assert "font-size: 20" in source
 
 
 @pytest.mark.parametrize(
@@ -421,7 +423,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v9-m21-opinion-render"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v10-m21-opinion-render"
 
 
 @dataclass(frozen=True, slots=True)

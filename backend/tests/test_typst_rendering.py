@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
@@ -29,6 +30,7 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
     AnalystObservationState,
     AnalystObservationV1,
+    AnalystOpinionStatus,
     AnalystOpinionV1,
     BridgeDraftReferenceV1,
     ImplantMaterialEditorialV1,
@@ -39,6 +41,7 @@ from cti_app.domain.analyst_opinion import (
     opinion_blocks_with_observations,
 )
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.investigation import FindingAssessment, FindingKind, NoveltyClass
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_editorial_enrichment import (
@@ -47,6 +50,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementV1,
 )
 from cti_app.domain.production_references import ProductionEditorialRole
+from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     ArtifactType,
@@ -64,13 +68,18 @@ from cti_app.domain.publication_document import (
     PublicationChartV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV6,
+    PublicationDocumentV7,
     PublicationIOCDetailV1,
     PublicationIOCDisposition,
     PublicationTableColumnV1,
     PublicationTableRowV1,
+    publication_document_from_json,
     publication_document_text_anchors,
     publication_document_v5_sha256,
+    serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
     SEMANTIC_ANNOTATION_SCHEMA_VERSION,
@@ -79,6 +88,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
 )
 from tests.test_publication_builder_v4 import _frontmatter_v6_case
+from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 from tests.test_publication_v4 import _SOURCE_ID, _diagram, _document, _figure, _source, _table
 
 _SECOND_SOURCE_ID = UUID("00000000-0000-0000-0000-000000000002")
@@ -382,7 +392,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v38-m21-opinion-render"
+    assert data["schema_version"] == "typst-publication-model-v39-m21-opinion-render"
     assert data["kind"] == "brief"
     assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
@@ -664,6 +674,7 @@ def test_opinion_traceability_lists_only_logical_findings_cited_by_opinion() -> 
             {"kind_label": "Finding", "reference_id": str(reference_id)}
             for reference_id in sorted(cited_findings, key=str)
         ),
+        {"kind_label": "Finding", "reference_id": str(min(cited_findings, key=str))},
         {"kind_label": "Finding", "reference_id": str(unrelated_version)},
         {"kind_label": "Évidence", "reference_id": str(evidence_id)},
     ]
@@ -677,7 +688,286 @@ def test_opinion_traceability_lists_only_logical_findings_cited_by_opinion() -> 
     }
     assert projected_finding_ids == cited_findings
     assert len(projected_finding_ids) == 23
+    assert sum(item["kind_label"] == "Finding" for item in projected) == 23
     assert projected[-1] == references[-1]
+
+
+def test_opinion_block_headings_are_reader_facing(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    publication, *_ = _frontmatter_v6_case()
+    blocks = tuple(
+        OpinionBlock(block_type=block_type, text=f"Texte {block_type.value}.")
+        for block_type in (
+            OpinionBlockType.KEY_FINDINGS,
+            OpinionBlockType.ADDITIONAL_SAMPLES,
+            OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES,
+            OpinionBlockType.NETWORK_AND_INFRASTRUCTURE,
+            OpinionBlockType.CLAIM_VERIFICATION,
+            OpinionBlockType.PROPOSED_DETECTIONS,
+            OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
+        )
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=UUID(int=780),
+        synthesis_artifact_id=UUID(int=781),
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=UUID(int=782),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=blocks,
+        author_id="fixture-analyst",
+    )
+
+    data = json.loads(
+        _render(
+            renderer,
+            TypstDraftPreviewDocument(publication, opinion),
+            bundle,
+        ).render_data_bytes
+    )
+    section = next(item for item in data["content_sections"] if item["type"] == "analyst_opinion")
+    headings = [item["heading"] for item in section["blocks"]]
+
+    assert headings == [
+        "Apports de l'analyse",
+        "Échantillons complémentaires",
+        "Chaîne d'infection et capacités",
+        "Activité réseau et infrastructure",
+        "Vérification des affirmations",
+        "Détections proposées",
+        "Incertitudes et prochaines pistes",
+    ]
+    assert all("enquête" not in heading.casefold() for heading in headings)
+
+
+def test_opinion_traceability_maps_superseded_finding_versions_to_current_ids(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    base = _base_v5()
+    opinion, citation_context = _approved_opinion(base)
+    original = citation_context.findings[0]
+    first_version = replace(original, id=UUID(int=909), version=1, supersedes=None)
+    cited_version = replace(first_version, id=UUID(int=910), version=2, supersedes=first_version.id)
+    current = replace(original, version=3, supersedes=cited_version.id)
+    opinion = replace(
+        opinion,
+        blocks=(
+            replace(
+                opinion.blocks[0],
+                finding_refs=(cited_version.id, current.id, cited_version.id),
+            ),
+        ),
+        content_sha256="",
+    )
+    citation_context = replace(
+        citation_context,
+        findings=(first_version, cited_version, current),
+    )
+
+    augmented = augment_publication_with_opinion(base, opinion, citation_context)
+    article = PublicationDocumentV7(
+        base_publication=augmented,
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="c" * 64,
+        routing_policy_version="fixture-routing-v1",
+    )
+    source = _render(renderer, article, bundle)
+    data = json.loads(source.render_data_bytes)
+    annex = next(item for item in data["content_sections"] if item["type"] == "technical_annex")
+    finding_refs = [item for item in annex["opinion_refs"] if item["kind_label"] == "Finding"]
+    opinion_section = next(
+        item for item in data["content_sections"] if item["type"] == "analyst_opinion"
+    )
+    rendered_block_refs = opinion_section["blocks"][0]["finding_refs"]
+
+    assert [item["reference_id"] for item in finding_refs] == [str(current.id)]
+    assert [item["reference_id"] for item in rendered_block_refs] == [
+        str(current.id),
+        str(current.id),
+        str(current.id),
+    ]
+    assert augmented.provenance.finding_version_logical_ids == ((cited_version.id, current.id),)
+    assert opinion.content_sha256 == augmented.provenance.opinion_content_sha256
+    assert opinion.blocks[0].finding_refs == (
+        cited_version.id,
+        current.id,
+        cited_version.id,
+    )
+    round_tripped = publication_document_from_json(serialize_publication_document(augmented))
+    assert isinstance(round_tripped, PublicationDocumentV6)
+    assert round_tripped.provenance.finding_version_logical_ids == ((cited_version.id, current.id),)
+
+
+def test_draft_ioc_provenance_maps_finding_versions_to_logical_ids(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    base = _base_v5()
+    article_section = PublicationSectionV1(
+        kind=PublicationSectionKind.TECHNICAL,
+        heading="Contexte de l'article",
+        paragraphs=(
+            PublicationParagraphV1(
+                "Contexte documenté pour un rendu d'article.",
+                base.document.lead[0].evidence_refs,
+            ),
+        ),
+    )
+    article_document = replace(base.document, sections=(article_section,))
+    article_semantic_text = SemanticTextV1(
+        schema_version=base.semantic_text.schema_version,
+        policy_version=base.semantic_text.policy_version,
+        paragraphs=tuple(
+            SemanticAnnotator(EnglishTermDetector(())).annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=(),
+            )
+            for anchor, text in publication_document_text_anchors(
+                article_document,
+                references=base.references,
+            ).items()
+        ),
+    )
+    base = replace(
+        base,
+        document=article_document,
+        semantic_text=article_semantic_text,
+    )
+    opinion, citation_context = _approved_opinion(base)
+    original = citation_context.findings[0]
+    original_observation = citation_context.observations[0]
+    sample_hash = "d" * 64
+    observation = replace(
+        original_observation,
+        object_type="file",
+        object_id=sample_hash,
+    )
+    first_version = replace(
+        original,
+        id=UUID(int=920),
+        kind=FindingKind.NEW_SAMPLE,
+        assessment=FindingAssessment.SUPPORTED,
+        novelty=NoveltyClass.NEW_TO_ARTICLE,
+        scope=f"Subject reference: {sample_hash}",
+        version=1,
+        supersedes=None,
+    )
+    cited_version = replace(
+        first_version,
+        id=UUID(int=921),
+        version=2,
+        supersedes=first_version.id,
+    )
+    current = replace(
+        original,
+        id=UUID(int=922),
+        kind=FindingKind.NEW_SAMPLE,
+        assessment=FindingAssessment.SUPPORTED,
+        novelty=NoveltyClass.NEW_TO_ARTICLE,
+        scope=f"Subject reference: {sample_hash}",
+        version=3,
+        supersedes=cited_version.id,
+    )
+    draft_opinion = replace(
+        opinion,
+        status=AnalystOpinionStatus.DRAFT,
+        reviewer_id=None,
+        blocks=(replace(opinion.blocks[0], finding_refs=(cited_version.id,)),),
+        content_sha256="",
+    )
+    preview = TypstDraftPreviewDocument(
+        base,
+        draft_opinion,
+        findings=(current, cited_version, first_version),
+        evidence_observations=(observation,),
+    )
+
+    data = json.loads(_render(renderer, preview, bundle).render_data_bytes)
+    annex = next(item for item in data["content_sections"] if item["type"] == "technical_annex")
+    finding_refs = [item for item in annex["opinion_refs"] if item["kind_label"] == "Finding"]
+    ioc_rows = [row for group in annex["ioc_row_groups"] for row in group["rows"]]
+
+    assert [item["reference_id"] for item in finding_refs] == [str(current.id)]
+    assert len(ioc_rows) == 1
+    assert ioc_rows[0]["value"] == sample_hash
+    assert ioc_rows[0]["draft_refs"][0]["reference_id"] == str(current.id)
+    assert draft_opinion.blocks[0].finding_refs == (cited_version.id,)
+
+
+def test_opinion_ioc_appendix_localizes_provenance_enums_for_display(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    base = _base_v5()
+    source = base.document.sources[0]
+    independent_id = UUID(int=783)
+    independent_source = replace(
+        source,
+        source_document_id=independent_id,
+        canonical_url="https://independent.example/report",
+        role=SourceRole.INDEPENDENT,
+    )
+    article = replace(
+        base.document,
+        sources=(*base.document.sources, independent_source),
+        additional_source_ids=base.document.additional_source_ids | {independent_id},
+    )
+    details = (
+        PublicationIOCDetailV1(
+            artifact_type=ArtifactType.DOMAIN,
+            value="alpha.example",
+            normalized_value="alpha.example",
+            source_role=SourceRole.PRIMARY,
+            context="Domaine cité dans la source primaire.",
+            evidence_quote="La source mentionne alpha.example.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+            disposition=PublicationIOCDisposition.RETAINED,
+            disposition_reason="contextual_indicator",
+            relevance_classification=RelevanceClassification.DIRECT,
+            relevance_reason_code=RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+        ),
+        PublicationIOCDetailV1(
+            artifact_type=ArtifactType.DOMAIN,
+            value="beta.example",
+            normalized_value="beta.example",
+            source_role=SourceRole.INDEPENDENT,
+            context="Domaine cité par une source indépendante.",
+            evidence_quote="La source mentionne beta.example.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(independent_id,),
+            disposition=PublicationIOCDisposition.UNCERTAIN,
+            disposition_reason="unsupported_artifact_type",
+            relevance_classification=RelevanceClassification.CONTEXT,
+            relevance_reason_code=RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
+        ),
+    )
+    publication = replace(base, document=article, ioc_details=details)
+    opinion, citation_context = _approved_opinion(publication)
+    augmented = augment_publication_with_opinion(publication, opinion, citation_context)
+    routed_article = PublicationDocumentV7(
+        base_publication=augmented,
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="d" * 64,
+        routing_policy_version="fixture-routing-v1",
+    )
+
+    data = json.loads(_render(renderer, routed_article, bundle).render_data_bytes)
+    annex = next(item for item in data["content_sections"] if item["type"] == "technical_annex")
+    rows = [row for group in annex["ioc_row_groups"] for row in group["rows"]]
+    display_text = " ".join(row["context_summary"] for row in rows)
+
+    assert "vérifiée par la source" in display_text.casefold()
+    assert "source primaire" in display_text.casefold()
+    assert "source indépendante" in display_text.casefold()
+    assert "direct — relation malveillante au sujet" in display_text.casefold()
+    assert "contexte — rôle malveillant non démontré" in display_text.casefold()
+    assert "indicateur contextuel" in display_text.casefold()
+    assert "type non publié" in display_text.casefold()
+    assert "tlp non précisé" in display_text.casefold()
+    assert "source_verified" not in display_text
+    assert "primary" not in display_text
+    assert "independent" not in display_text
+    assert details[0].evidence_basis.value == "source_verified"
+    assert details[0].source_role.value == "primary"
+    assert details[0].relevance_reason_code.value == "malicious_subject_relation"
 
 
 def test_publication_document_label_is_required_and_kept_verbatim(tmp_path: Path) -> None:
@@ -1076,7 +1366,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v38-m21-opinion-render"
+    assert data["schema_version"] == "typst-publication-model-v39-m21-opinion-render"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
