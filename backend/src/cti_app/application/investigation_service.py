@@ -2080,7 +2080,7 @@ class InvestigationService:
                     envelope_exists=current_envelope is not None,
                     family=tool_name,
                 ):
-                    target_hash = next(
+                    refused_hash: str | None = next(
                         (
                             reference.id
                             for reference in external_effect_evidence_refs
@@ -2092,7 +2092,7 @@ class InvestigationService:
                         detail_code="vt_external_disclosure_not_allowed",
                         source_kind="vt_tool",
                         source_id=tool_name,
-                        target_hash=target_hash,
+                        target_hash=refused_hash,
                     )
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 rejection_detail: list[_VTSourceDisclosureRefusal] = []
@@ -2694,9 +2694,9 @@ class InvestigationService:
                 and not allow_unassociated_passive_read_observations
                 and not allow_unassociated_search_observations
             ):
-                observation_hash = sorted(
-                    observation_hashes - (associated_hashes | sample_hashes)
-                )[0]
+                observation_hash = sorted(observation_hashes - (associated_hashes | sample_hashes))[
+                    0
+                ]
                 return refuse(
                     "vt_unassociated_observation_not_allowed",
                     source_kind="sample_hash",
@@ -2739,11 +2739,11 @@ class InvestigationService:
         if document_ids:
             source_documents = self._source_documents
             if source_documents is None:
-                document_id = sorted(document_ids)[0]
+                first_document_id = sorted(document_ids)[0]
                 return refuse(
                     "vt_source_document_repository_unavailable",
                     source_kind="source_document",
-                    source_id=document_id,
+                    source_id=first_document_id,
                     target_hash=next(iter(sorted(sample_hashes)), None),
                 )
             for raw_document_id in document_ids:

@@ -2206,6 +2206,9 @@ class OperatorToolInvocationService:
                     if isinstance(value, str) and len(value) <= 128:
                         result_data[key] = value
                 output["error"]["detail_code"] = diagnostic_code
+                published_data = output.get("data")
+                if isinstance(published_data, dict):
+                    published_data["result"] = _sanitize_json(result_data)
             if (
                 invocation.tool_name == "experiment.record"
                 and isinstance(diagnostic_code, str)

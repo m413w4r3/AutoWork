@@ -1770,9 +1770,7 @@ async def test_vt_file_report_accepts_mixed_observation_versions() -> None:
     )
 
     observation_versions = {
-        reference.version
-        for reference in references
-        if reference.kind == "evidence_observation"
+        reference.version for reference in references if reference.kind == "evidence_observation"
     }
     assert observation_versions == {"vt.file-report.v1", "proxy:v3"}
     assert not await fixture.service._vt_source_disclosure_restricted(
@@ -1835,8 +1833,7 @@ async def test_vt_file_report_accepts_related_hash_with_parent_observation() -> 
     )
 
     assert any(
-        reference.kind == "evidence_observation"
-        and reference.id == str(observations[1].id)
+        reference.kind == "evidence_observation" and reference.id == str(observations[1].id)
         for reference in references
     )
     assert not await fixture.service._vt_source_disclosure_restricted(
