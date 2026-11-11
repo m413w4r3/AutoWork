@@ -523,6 +523,7 @@ class ConsumePolicyContext:
     effect_key: str
     database_session: Any
     investigation_subject_id: UUID
+    vt_observation_payloads: Mapping[UUID, bytes | None] | None = None
 
 
 class ExternalEffectPolicyGuard(Protocol):

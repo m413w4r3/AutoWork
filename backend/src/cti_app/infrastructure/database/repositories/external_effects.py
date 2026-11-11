@@ -50,6 +50,12 @@ from cti_app.application.external_effects import (
     resolve_bridge_vt_file_report_hashes,
     validate_external_observation_hash,
 )
+from cti_app.application.virustotal_evidence import (
+    MAX_VT_CANONICAL_EVIDENCE_BYTES,
+    VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES,
+    requested_vt_file_hash,
+    vt_observation_anchors_hash,
+)
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.external_effects import (
     EffectClaimState,
@@ -145,39 +151,7 @@ BRIDGE_RESOLVER_TURN_HASH_KEY = "_bridge_external_effect_turn_input_hash"
 
 
 def _vt_file_hash_from_request(prepared: PreparedExternalRequest) -> str | None:
-    path = prepared.canonical_request.get("path")
-    if not isinstance(path, str):
-        return None
-    path_parts = path.split("/")
-    try:
-        files_index = path_parts.index("files")
-    except ValueError:
-        files_index = -1
-    if files_index >= 0 and files_index + 1 < len(path_parts):
-        candidate = path_parts[files_index + 1]
-        return (
-            candidate
-            if re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", candidate)
-            else None
-        )
-    if not path.rstrip("/").endswith("/file/report"):
-        return None
-    query = prepared.canonical_request.get("query")
-    if not isinstance(query, (list, tuple)):
-        return None
-    resources = [
-        item[1]
-        for item in query
-        if isinstance(item, (list, tuple))
-        and len(item) == 2
-        and item[0] == "resource"
-        and isinstance(item[1], str)
-    ]
-    if len(resources) != 1 or not re.fullmatch(
-        r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", resources[0]
-    ):
-        return None
-    return resources[0]
+    return requested_vt_file_hash(prepared.family, prepared.canonical_request)
 
 
 def _vt_pcap_sandbox_from_request(prepared: PreparedExternalRequest) -> str | None:
@@ -397,6 +371,93 @@ class SqlAlchemyExternalEffectClaimStore:
                 contents[observation.id] = content
         return contents
 
+    async def _read_vt_observation_payloads(
+        self, prepared: PreparedExternalRequest, investigation_id: UUID
+    ) -> dict[UUID, bytes | None]:
+        """Load bounded VT relationship payloads before the consume transaction."""
+        if (
+            prepared.family not in VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES
+            or self._blob_store is None
+        ):
+            return {}
+        requested_hash = requested_vt_file_hash(prepared.family, prepared.canonical_request)
+        if requested_hash is None or len(requested_hash) != 64:
+            return {}
+        references: dict[UUID, EvidenceReference] = {}
+        for reference in prepared.evidence_refs:
+            if reference.kind != "evidence_observation":
+                continue
+            try:
+                references[UUID(reference.id)] = reference
+            except ValueError:
+                continue
+        if not references:
+            return {}
+        try:
+            async with self._session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(EvidenceObservationRow, BlobRow)
+                            .join(BlobRow, BlobRow.id == EvidenceObservationRow.blob_id)
+                            .where(
+                                EvidenceObservationRow.investigation_id == investigation_id,
+                                EvidenceObservationRow.id.in_(sorted(references, key=str)),
+                            )
+                        )
+                    ).all()
+                )
+        except Exception:
+            failed_reads: dict[UUID, bytes | None] = {}
+            for observation_id in references:
+                failed_reads[observation_id] = None
+            return failed_reads
+        contents: dict[UUID, bytes | None] = {}
+        for observation, blob in rows:
+            if (
+                observation.kind.casefold() != "vt_relationship"
+                or observation.source.casefold() != "virustotal"
+                or observation.object_type.casefold() != "file"
+            ):
+                continue
+            if vt_observation_anchors_hash(
+                observation_kind=observation.kind,
+                observation_source=observation.source,
+                object_type=observation.object_type,
+                object_id=observation.object_id,
+                requested_hash=requested_hash,
+            ):
+                continue
+            reference = references[observation.id]
+            contents[observation.id] = None
+            if (
+                reference.sha256 != observation.sha256
+                or reference.version != observation.source_version
+                or blob.sha256 != observation.sha256
+                or blob.size < 0
+                or blob.size > MAX_VT_CANONICAL_EVIDENCE_BYTES
+            ):
+                continue
+            try:
+                descriptor = BlobDescriptor(
+                    sha256=blob.sha256,
+                    size=blob.size,
+                    mime_type=blob.mime_type,
+                    logical_bucket=blob.logical_bucket,
+                )
+                raw = await self._blob_store.read(
+                    descriptor, max_bytes=MAX_VT_CANONICAL_EVIDENCE_BYTES
+                )
+            except Exception:
+                continue
+            if (
+                isinstance(raw, bytes)
+                and len(raw) == descriptor.size
+                and hashlib.sha256(raw).hexdigest() == descriptor.sha256
+            ):
+                contents[observation.id] = raw
+        return contents
+
     def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None:
         if type(verifier) is not _NoHandoffProofVerifier:
             raise TypeError("claim store requires a coordinator-bound no-handoff verifier")
@@ -527,6 +588,9 @@ class SqlAlchemyExternalEffectClaimStore:
         report_blob_contents = await self._read_bridge_vt_report_blobs(
             prepared, authority.investigation_id
         )
+        vt_observation_payloads = await self._read_vt_observation_payloads(
+            prepared, authority.investigation_id
+        )
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -567,6 +631,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         invocation,
                         family_binding,
                         allow_nonrunning_invocation=existing is not None,
+                        vt_observation_payloads=vt_observation_payloads,
                     )
                     await self._validate_external_source_refs(
                         session, authority, family_binding, invocation, prepared
@@ -662,6 +727,7 @@ class SqlAlchemyExternalEffectClaimStore:
                                 investigation.subject_id,
                                 family_binding,
                                 report_blob_contents=report_blob_contents,
+                                vt_observation_payloads=vt_observation_payloads,
                             )
                             await self._lock_and_start_model_attempt(
                                 session,
@@ -963,6 +1029,9 @@ class SqlAlchemyExternalEffectClaimStore:
         report_blob_contents = await self._read_bridge_vt_report_blobs(
             prepared, authority.investigation_id
         )
+        vt_observation_payloads = await self._read_vt_observation_payloads(
+            prepared, authority.investigation_id
+        )
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -992,6 +1061,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         envelope,
                         invocation,
                         family_binding,
+                        vt_observation_payloads=vt_observation_payloads,
                     )
                     await self._validate_external_source_refs(
                         session, authority, family_binding, invocation, prepared
@@ -1016,6 +1086,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         investigation.subject_id,
                         family_binding,
                         report_blob_contents=report_blob_contents,
+                        vt_observation_payloads=vt_observation_payloads,
                     )
                     if reservation.status == "released":
                         existing_use = await session.scalar(
@@ -1289,6 +1360,7 @@ class SqlAlchemyExternalEffectClaimStore:
         family_binding: ExternalEffectFamilyBinding,
         *,
         allow_nonrunning_invocation: bool = False,
+        vt_observation_payloads: Mapping[UUID, bytes | None] | None = None,
     ) -> None:
         if envelope.version != authority.expected_envelope_version:
             raise _ConsumeDenied("envelope_version_changed")
@@ -1329,6 +1401,7 @@ class SqlAlchemyExternalEffectClaimStore:
             effect_key=key,
             database_session=session,
             investigation_subject_id=investigation.subject_id,
+            vt_observation_payloads=vt_observation_payloads,
         )
         if authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY:
             if self._policy_guard is None:
@@ -1657,6 +1730,7 @@ class SqlAlchemyExternalEffectClaimStore:
         family_binding: ExternalEffectFamilyBinding,
         *,
         report_blob_contents: Mapping[UUID, bytes] | None = None,
+        vt_observation_payloads: Mapping[UUID, bytes | None] | None = None,
     ) -> None:
         sample_ids: set[UUID] = set()
         referenced_sample_ids: set[UUID] = set()
@@ -1665,15 +1739,21 @@ class SqlAlchemyExternalEffectClaimStore:
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
+        relationship_parent_hashes: set[str] = set()
         provider_report_hashes: set[str] = set()
         provider_report_aliases: dict[UUID, set[str]] = {}
         provider_report_sha256s: dict[UUID, str] = {}
         provider_report_observations: dict[UUID, EvidenceObservationRow] = {}
-        observation_file_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
         is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
         vt_file_hash_read = external_effect_vt_file_hash_read(prepared.family)
+        vt_hash_request = prepared.family in VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES
+        requested_file_hash = (
+            requested_vt_file_hash(prepared.family, prepared.canonical_request)
+            if vt_hash_request
+            else None
+        )
         # The policy and persisted invocation reference were already checked by
         # _check_authority and _validate_external_source_refs above.
         allows_unassociated_osint_vt_hash = (
@@ -1806,18 +1886,35 @@ class SqlAlchemyExternalEffectClaimStore:
                         provider_report_sha256s[observation.id] = resolved_report.sha256
                         provider_report_observations[observation.id] = observation
                         continue
-                    if vt_file_hash_read:
-                        observation_file_hashes.add(normalized_observation_hash)
+                    grounding_hash = normalized_observation_hash
+                    if vt_hash_request and requested_file_hash is not None:
+                        payload_bytes = (vt_observation_payloads or {}).get(observation.id)
+                        if not vt_observation_anchors_hash(
+                            observation_kind=observation.kind,
+                            observation_source=observation_source,
+                            object_type=observation.object_type,
+                            object_id=observation.object_id,
+                            requested_hash=requested_file_hash,
+                            canonical_payload_bytes=payload_bytes,
+                            canonical_payload_sha256=observation.sha256,
+                        ):
+                            raise _ConsumeDenied(
+                                "vt_source_observation_hash_mismatch",
+                                detail=_observation_refusal_detail(observation),
+                            )
+                        grounding_hash = requested_file_hash
+                        if normalized_observation_hash != requested_file_hash:
+                            relationship_parent_hashes.add(normalized_observation_hash)
                     if bridge_may_cite_provider_report_hash_without_sample(
                         family=prepared.family, observation=observation
                     ):
-                        aliases = {normalized_observation_hash}
+                        aliases = {grounding_hash}
                         provider_report_hashes.update(aliases)
                         provider_report_aliases[observation.id] = aliases
-                        provider_report_sha256s[observation.id] = normalized_observation_hash
+                        provider_report_sha256s[observation.id] = grounding_hash
                         provider_report_observations[observation.id] = observation
-                    elif len(normalized_observation_hash) == 64:
-                        observation_hashes.add(normalized_observation_hash)
+                    elif len(grounding_hash) == 64:
+                        observation_hashes.add(grounding_hash)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
@@ -1835,16 +1932,8 @@ class SqlAlchemyExternalEffectClaimStore:
         if vt_file_hash_read and sample_hashes and not observation_hashes.issubset(sample_hashes):
             raise _ConsumeDenied("vt_source_observation_hash_mismatch")
 
-        requested_file_hash = _vt_file_hash_from_request(prepared) if vt_file_hash_read else None
-        if (
-            requested_file_hash is not None
-            and observation_file_hashes
-            and observation_file_hashes != {requested_file_hash}
-        ):
-            raise _ConsumeDenied("vt_source_observation_hash_mismatch")
-
         association_terms: list[ColumnElement[bool]] = []
-        source_hashes = sample_hashes | observation_hashes
+        source_hashes = sample_hashes | observation_hashes | relationship_parent_hashes
         if association_ids:
             association_terms.append(SampleAssociationRow.id.in_(sorted(association_ids, key=str)))
         if sample_ids:
@@ -1891,13 +1980,19 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("sample_association_missing")
         found_hashes = {item.sample_sha256 for item in associations}
-        observation_grounding_hashes = observation_hashes if vt_file_hash_read else set()
+        observation_grounding_hashes = (
+            observation_hashes
+            if vt_file_hash_read or prepared.family == "vt.download_sample"
+            else set()
+        )
         if (
             sample_hashes - (found_hashes | observation_grounding_hashes)
             and not allows_unassociated_osint_vt_hash
         ):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
-        sample_hash_grounding = sample_hashes if vt_file_hash_read else set()
+        sample_hash_grounding = (
+            sample_hashes if vt_file_hash_read or prepared.family == "vt.download_sample" else set()
+        )
         if observation_hashes - (
             found_hashes | sample_hash_grounding
         ) and not osint_vt_search_may_cite_unassociated_observation_hash(

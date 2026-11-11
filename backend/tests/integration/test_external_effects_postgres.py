@@ -3193,24 +3193,37 @@ async def test_human_g2_vt_read_permits_acquired_sample_external_llm_flag(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "include_observation", "payload_contains_child", "expected_allowed"),
+    ("family", "case", "include_observation", "payload_contains_child", "expected_allowed"),
     [
-        ("relationship_payload_anchors_child", True, True, True),
-        ("relationship_payload_omits_child", True, False, False),
-        ("arbitrary_hash_has_no_observation", False, False, False),
+        ("vt.file_report", "relationship-payload-anchors-child", True, True, True),
+        ("vt.file_report", "relationship-payload-omits-child", True, False, False),
+        ("vt.file_report", "arbitrary-hash-has-no-observation", False, False, False),
+        ("vt.download_sample", "relationship-payload-anchors-child", True, True, True),
+        ("vt.download_sample", "relationship-payload-omits-child", True, False, False),
+        ("vt.download_sample", "arbitrary-hash-has-no-observation", False, False, False),
+    ],
+    ids=[
+        "file-report-relationship-anchors-child",
+        "file-report-relationship-omits-child",
+        "file-report-arbitrary-hash",
+        "download-sample-relationship-anchors-child",
+        "download-sample-relationship-omits-child",
+        "download-sample-arbitrary-hash",
     ],
 )
-async def test_human_g2_vt_child_hash_requires_canonical_relationship_payload(
+async def test_human_g2_vt_child_hash_guard_and_consume_match(
     migrated_postgres_url: str,
     tmp_path: Path,
+    family: str,
     case: str,
     include_observation: bool,
     payload_contains_child: bool,
     expected_allowed: bool,
 ) -> None:
-    case_slug = case.replace("_", "-")
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
-        migrated_postgres_url, tmp_path, suffix=f"vt-child-{case_slug}-{uuid4().hex[:8]}"
+        migrated_postgres_url,
+        tmp_path,
+        suffix=f"vt-child-{family.replace('.', '-')}-{case}-{uuid4().hex[:8]}",
     )
     authority, base = authorities[0]
     child_hash = "c" * 64
@@ -3277,12 +3290,16 @@ async def test_human_g2_vt_child_hash_requires_canonical_relationship_payload(
             evidence_refs.append(observation_reference)
 
         request_path = f"/api/v3/files/{child_hash}"
+        canonical_request = (
+            {"sha256": child_hash} if family == "vt.download_sample" else {"path": request_path}
+        )
+        normalizer_version = "vt-download.v1" if family == "vt.download_sample" else "vt-read.v1"
         prepared = PreparedExternalRequest.build(
-            family="vt.file_report",
+            family=family,
             provider=base.provider,
             provider_scope=base.provider_scope,
-            normalizer_version=base.normalizer_version,
-            canonical_request={"path": request_path},
+            normalizer_version=normalizer_version,
+            canonical_request=canonical_request,
             application_request=FrozenWireRequest(
                 method=b"GET",
                 target=request_path.encode(),
@@ -3305,6 +3322,45 @@ async def test_human_g2_vt_child_hash_requires_canonical_relationship_payload(
                     )
                 )
         assert allowed is expected_allowed
+        family_binding = ExternalEffectFamilyBinding(
+            provider=prepared.provider,
+            provider_scopes=frozenset({prepared.provider_scope}),
+            normalizer_versions=frozenset({prepared.normalizer_version}),
+            invocation_tool_binding=(family, "1"),
+            requires_source_refs=True,
+            source_reference_resolver=lambda _parameters: tuple(evidence_refs),
+        )
+        claim_store = SqlAlchemyExternalEffectClaimStore(
+            session_factory,
+            policy_guard=SqlAlchemyVirusTotalPolicyGuard(blob_store=blob_store),
+            family_bindings={family: family_binding},
+            blob_store=blob_store,
+        )
+        async with session_factory() as session:
+            async with session.begin():
+                if expected_allowed:
+                    await claim_store._check_source_restrictions(
+                        session,
+                        authority,
+                        prepared,
+                        subject_id,
+                        family_binding,
+                        vt_observation_payloads={
+                            observation_id: raw if include_observation else None
+                        },
+                    )
+                else:
+                    with pytest.raises(_ConsumeDenied):
+                        await claim_store._check_source_restrictions(
+                            session,
+                            authority,
+                            prepared,
+                            subject_id,
+                            family_binding,
+                            vt_observation_payloads={
+                                observation_id: raw if include_observation else None
+                            },
+                        )
     finally:
         await engine.dispose()
 

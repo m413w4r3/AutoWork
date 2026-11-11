@@ -26,8 +26,9 @@ from cti_app.application.virustotal import (
 )
 from cti_app.application.virustotal_evidence import (
     MAX_VT_CANONICAL_EVIDENCE_BYTES,
-    canonical_vt_evidence_payload,
-    vt_hash_payload_contains,
+    VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES,
+    requested_vt_file_hash,
+    vt_observation_anchors_hash,
 )
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.external_effects import (
@@ -58,7 +59,6 @@ from cti_app.infrastructure.database.models.osint_open_policy import (
 )
 from cti_app.infrastructure.database.repositories.external_effects import (
     ExternalEffectFamilyBinding,
-    _vt_file_hash_from_request,
 )
 
 VT_EXTERNAL_EFFECT_FAMILIES = {
@@ -79,7 +79,7 @@ _VT_HASH_READ_FAMILIES = {
     "vt.behaviour_pcap",
     "vt.relationships",
 }
-_VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES = _VT_HASH_READ_FAMILIES | {"vt.download_sample"}
+_VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES = VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES
 # VT and Bridge/advisor effects ignore source do_not_submit metadata;
 # external-LLM denials, TLP RED and licences continue to bind.
 _BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
@@ -189,13 +189,7 @@ def _source_resolver_for_family(
 
 
 def _requested_hash_for_source_guard(prepared: PreparedExternalRequest) -> str | None:
-    requested_hash = _vt_file_hash_from_request(prepared)
-    if requested_hash is not None or prepared.family != "vt.download_sample":
-        return requested_hash
-    download_hash = prepared.canonical_request.get("sha256")
-    if isinstance(download_hash, str) and re.fullmatch(r"[0-9a-f]{64}", download_hash):
-        return download_hash
-    return None
+    return requested_vt_file_hash(prepared.family, prepared.canonical_request)
 
 
 def virustotal_external_effect_family_bindings() -> dict[str, ExternalEffectFamilyBinding]:
@@ -253,23 +247,23 @@ class SqlAlchemyVirusTotalPolicyGuard:
     def __init__(self, blob_store: BlobStore | None = None) -> None:
         self._blob_store = blob_store
 
-    async def _relationship_payload_contains_requested_hash(
+    async def _relationship_payload_bytes(
         self,
         session: AsyncSession,
         observation: EvidenceObservationRow,
-        requested_hash: str,
-    ) -> bool:
+    ) -> bytes | None:
         if self._blob_store is None:
-            return False
+            return None
         blob = await session.scalar(
             select(BlobRow).where(BlobRow.id == observation.blob_id).with_for_update()
         )
         if (
             blob is None
             or blob.sha256 != observation.sha256
+            or blob.size < 0
             or blob.size > MAX_VT_CANONICAL_EVIDENCE_BYTES
         ):
-            return False
+            return None
         try:
             descriptor = BlobDescriptor(
                 sha256=blob.sha256,
@@ -279,9 +273,8 @@ class SqlAlchemyVirusTotalPolicyGuard:
             )
             raw = await self._blob_store.read(descriptor, max_bytes=MAX_VT_CANONICAL_EVIDENCE_BYTES)
         except Exception:
-            return False
-        payload = canonical_vt_evidence_payload(raw, observation.sha256)
-        return payload is not None and vt_hash_payload_contains(payload, requested_hash)
+            return None
+        return raw if isinstance(raw, bytes) else None
 
     async def lock_for_consume(
         self, database_session: AsyncSession, authority: ExternalEffectAuthority
@@ -451,6 +444,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
         session = context.database_session
         if not isinstance(session, AsyncSession):
             return False
+        relationship_payload_cache: dict[UUID, bytes | None] = dict(
+            context.vt_observation_payloads or {}
+        )
         sample_hashes = {
             reference.id
             for reference in context.prepared.evidence_refs
@@ -545,19 +541,33 @@ class SqlAlchemyVirusTotalPolicyGuard:
                     if (
                         context.prepared.family in _VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES
                         and requested_hash is not None
-                        and normalized_observation_hash != requested_hash
                     ):
-                        if (
-                            len(requested_hash) != 64
-                            or observation.kind.casefold() != "vt_relationship"
-                            or observation.source.casefold() != "virustotal"
-                            or object_type != "file"
-                            or not await self._relationship_payload_contains_requested_hash(
-                                session, observation, requested_hash
+                        anchored = vt_observation_anchors_hash(
+                            observation_kind=observation.kind,
+                            observation_source=observation.source,
+                            object_type=observation.object_type,
+                            object_id=observation.object_id,
+                            requested_hash=requested_hash,
+                        )
+                        if not anchored and len(requested_hash) == 64:
+                            if observation.id not in relationship_payload_cache:
+                                relationship_payload_cache[
+                                    observation.id
+                                ] = await self._relationship_payload_bytes(session, observation)
+                            anchored = vt_observation_anchors_hash(
+                                observation_kind=observation.kind,
+                                observation_source=observation.source,
+                                object_type=observation.object_type,
+                                object_id=observation.object_id,
+                                requested_hash=requested_hash,
+                                canonical_payload_bytes=relationship_payload_cache[observation.id],
+                                canonical_payload_sha256=observation.sha256,
                             )
-                        ):
+                        if not anchored:
                             return False
-                        relation_grounds_requested_hash = True
+                        relation_grounds_requested_hash = (
+                            normalized_observation_hash != requested_hash
+                        )
                     if len(normalized_observation_hash) == 64:
                         if bridge_may_cite_provider_report_hash_without_sample(
                             family=context.prepared.family, observation=observation

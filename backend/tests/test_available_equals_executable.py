@@ -1068,7 +1068,18 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
 
 
 @pytest.mark.asyncio
-async def test_relationship_grounded_child_download_is_available_and_executable() -> None:
+@pytest.mark.parametrize(
+    ("payload_contains_child", "expected_status"),
+    [
+        (True, ToolInvocationStatus.SUCCEEDED),
+        (False, ToolInvocationStatus.POLICY_DENIED),
+    ],
+    ids=["relationship-anchors-child", "relationship-omits-child"],
+)
+async def test_vt_download_relationship_payload_controls_pre_send_anchor(
+    payload_contains_child: bool,
+    expected_status: ToolInvocationStatus,
+) -> None:
     (
         fixture,
         state,
@@ -1107,7 +1118,7 @@ async def test_relationship_grounded_child_download_is_available_and_executable(
     parent_hash = "b" * 64
     payload = {
         "schema": "virustotal-investigation-summary.v1",
-        "descriptors": [{"id": child_hash, "type": "file"}],
+        "descriptors": [{"id": child_hash if payload_contains_child else "d" * 64, "type": "file"}],
     }
     raw = canonical_json_bytes(payload)
     blob_id = uuid4()
@@ -1140,7 +1151,12 @@ async def test_relationship_grounded_child_download_is_available_and_executable(
         idempotency_key="relationship-grounded-vt-download",
     )
 
-    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert result.invocation.status is expected_status
+    if not payload_contains_child:
+        assert result.error_code == "vt_hash_not_grounded"
+        assert tools["vt.download_sample"].calls == []
+        return
+
     source_refs = result.invocation.normalized_parameters["_vt_external_effect_source_refs"]
     assert [reference["kind"] for reference in source_refs] == [
         "sample_hash",

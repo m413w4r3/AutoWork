@@ -250,6 +250,8 @@ async def test_vt_source_gate_binds_md5_observation_to_exact_request(
         investigation_id=authority.investigation_id,
         source_version=reference.version,
         sha256=reference.sha256,
+        kind="vt_file_report",
+        source="VirusTotal",
         object_type="file",
         object_id=observed_hash,
     )
@@ -287,6 +289,92 @@ async def test_vt_source_gate_binds_md5_observation_to_exact_request(
                 prepared,
                 uuid4(),
                 binding,  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["vt.file_report", "vt.download_sample"])
+@pytest.mark.parametrize(
+    ("payload_contains_child", "expected_reason"),
+    [(True, None), (False, "vt_source_observation_hash_mismatch")],
+    ids=["child-grounded", "child-absent"],
+)
+async def test_consume_accepts_only_relationship_payload_anchored_vt_hash(
+    family: str,
+    payload_contains_child: bool,
+    expected_reason: str | None,
+) -> None:
+    child_hash = "c" * 64
+    observation_id = uuid4()
+    payload = {
+        "relationships": {
+            "dropped_files": [{"id": child_hash if payload_contains_child else "d" * 64}]
+        }
+    }
+    raw = canonical_json_bytes(payload)
+    reference = EvidenceReference(
+        "evidence_observation",
+        str(observation_id),
+        "vt.relationship.v1",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    sample_reference = EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash)
+    request = (
+        {"sha256": child_hash}
+        if family == "vt.download_sample"
+        else {"path": f"/api/v3/files/{child_hash}"}
+    )
+    prepared = PreparedExternalRequest.build(
+        family=family,
+        provider="vt",
+        provider_scope="default",
+        normalizer_version="vt-download.v1" if family == "vt.download_sample" else "vt-read.v1",
+        canonical_request=request,
+        application_request=_wire(target=f"/api/v3/files/{child_hash}".encode()),
+        evidence_refs=(sample_reference, reference),
+    )
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=_INVESTIGATION_ID,
+        source_version=reference.version,
+        sha256=reference.sha256,
+        kind="vt_relationship",
+        source="VirusTotal",
+        object_type="file",
+        object_id="b" * 64,
+    )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def scalars(self, *args: object, **kwargs: object):
+            self.calls += 1
+            return [observation] if self.calls == 1 else []
+
+    bindings = virustotal_external_effect_family_bindings()
+    store = SqlAlchemyExternalEffectClaimStore(
+        lambda: None,  # type: ignore[arg-type]
+        family_bindings=bindings,
+    )
+    session = _Session()
+    arguments = (
+        session,
+        _authority(),
+        prepared,
+        uuid4(),
+        bindings[family],  # type: ignore[arg-type]
+    )
+    if expected_reason is None:
+        await store._check_source_restrictions(
+            *arguments,  # type: ignore[arg-type]
+            vt_observation_payloads={observation_id: raw},
+        )
+    else:
+        with pytest.raises(_ConsumeDenied, match=expected_reason):
+            await store._check_source_restrictions(
+                *arguments,  # type: ignore[arg-type]
+                vt_observation_payloads={observation_id: raw},
             )
 
 
@@ -2679,6 +2767,8 @@ async def test_consume_allows_unassociated_vt_search_observation_only_under_osin
         id=observation_id,
         source_version=reference.version,
         sha256=reference.sha256,
+        kind="vt_file_report",
+        source="VirusTotal",
         object_type="file",
         object_id=sample_hash,
     )
@@ -2826,6 +2916,8 @@ async def test_vt_policy_guard_checks_unassociated_observation_for_passive_read(
         id=observation_id,
         source_version=reference.version,
         sha256=reference.sha256,
+        kind="vt_file_report",
+        source="VirusTotal",
         object_type="file",
         object_id=sample_hash,
     )
