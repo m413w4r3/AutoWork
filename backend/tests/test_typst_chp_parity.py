@@ -2135,8 +2135,18 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert re.search(r"\b[0-9a-f]{64}\b", narrative_text, re.IGNORECASE) is None
     compact_annex = re.sub(r"\s+", "", annex_text)
     for reference in annex["opinion_refs"]:
-        assert reference["reference_id"] in compact_annex
+        assert reference["label"] in compact_annex
+        assert re.sub(r"\s+", "", reference["display_label"]).upper() in compact_annex
+        assert reference["reference_id"].upper() not in compact_annex
         assert reference["reference_id"] not in re.sub(r"\s+", "", narrative_text)
+    assert (
+        re.search(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            annex_text,
+            re.IGNORECASE,
+        )
+        is None
+    )
 
     internal_link_count = 0
     internal_destination_pages: list[int] = []

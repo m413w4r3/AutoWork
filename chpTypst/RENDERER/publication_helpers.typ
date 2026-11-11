@@ -897,8 +897,7 @@
   let identity-provenance = section.at("publication_identity_provenance", default: none)
   let implant-rows = section.at("implant_identifier_rows", default: ())
   let opinion-refs = section.at("opinion_refs", default: ())
-  let figure-provenance = section.at("protocol_figure_provenance", default: ())
-  if ioc-rows.len() > 0 or has-text(identity-provenance) or implant-rows.len() > 0 or opinion-refs.len() > 0 or figure-provenance.len() > 0 [
+  if ioc-rows.len() > 0 or has-text(identity-provenance) or implant-rows.len() > 0 or opinion-refs.len() > 0 [
     #set page(flipped: true)
     #if has-text(identity-provenance) [
       #render-section-heading[PROVENANCE DE PUBLICATION]
@@ -918,38 +917,20 @@
     #if opinion-refs.len() > 0 [
       #v(10pt)
       #render-section-heading[ANNEXE DE TRAÇABILITÉ]
-      #text(size: 8pt, fill: grey)[Les renvois courts du corps désignent les identifiants canoniques suivants.]
+      #text(size: 8pt, fill: grey)[Les renvois du corps identifient les constats et observations cités.]
       #let finding-refs = opinion-refs.filter(item => item.at("kind", default: "") == "finding")
       #let evidence-refs = opinion-refs.filter(item => item.at("kind", default: "") == "evidence")
-      #for (group-title, refs) in (("Constats logiques cités", finding-refs), ("Évidences", evidence-refs)) [
+      #for (group-title, refs) in (("Constats logiques cités", finding-refs), ("Observations", evidence-refs)) [
         #if refs.len() > 0 [
           #v(4pt)
           #text(size: 8pt, weight: "bold")[#group-title]
-          #grid(
-            columns: (1fr, 1fr),
-            column-gutter: 8pt,
-            row-gutter: 2pt,
-            ..refs.map(item => [
-              #block(breakable: false)[
-                #text(size: 7.5pt, weight: "bold")[#super[#str(item.note_number)] #item.label #label(reference-scope + item.target_id)]
-                #h(0.35em)
-                #link(item.href)[#text(font: code-font-families, size: 7.5pt, hyphenate: false)[#publication-display-text(item.reference_id_spans)]]
-              ]
-            ]),
-          )
-        ]
-      ]
-    ]
-    #if figure-provenance.len() > 0 [
-      #v(10pt)
-      #render-section-heading[PROVENANCE DES FIGURES D'AVIS]
-      #for figure in figure-provenance [
-        #block(above: 3pt, below: 5pt, breakable: true)[
-          #text(size: 8pt, weight: "bold")[#figure.kind_label]
-          #linebreak()
-          #text(size: 7pt)[Identifiant d'actif : #figure.asset_id]
-          #for field in ("model_sha256", "spec_sha256", "asset_sha256", "preview_sha256", "pin_sha256") [
-            #if figure.at(field, default: none) != none [#linebreak() #text(size: 7pt)[#field : #figure.at(field)]]
+          #for item in refs [
+            #block(above: 1pt, below: 1pt, breakable: true)[
+              #link(item.href)[#text(size: 7.5pt, weight: "bold")[#item.label]]
+              #label(reference-scope + item.target_id)
+              #h(0.35em)
+              #text(size: 7.5pt)[#item.display_label]
+            ]
           ]
         ]
       ]

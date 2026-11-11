@@ -742,8 +742,10 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         # Short IDs remain in the traceability annex; body references use note numbers.
         "[F1]": 1,
         "[E1]": 1,
-        finding_id: 1,
-        evidence_id: 1,
+        finding_id: 0,
+        evidence_id: 0,
+        "Constat logique": 1,
+        "Observation technique": 1,
         "ANNEXE DE TRAÇABILITÉ": 1,
     }
     for marker, expected_count in base_expected_counts.items():

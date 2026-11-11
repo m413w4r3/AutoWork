@@ -49,6 +49,7 @@ from cti_app.domain.analyst_opinion import (
     normalize_opinion_text,
 )
 from cti_app.domain.investigation import (
+    EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
@@ -196,6 +197,58 @@ _FINDING_ASSESSMENT_LABELS = {
     FindingAssessment.QUALIFIED: "nuancé",
     FindingAssessment.INCONCLUSIVE: "non tranché",
 }
+_FINDING_KIND_LABELS = {
+    FindingKind.NEW_SAMPLE: "nouvel échantillon",
+    FindingKind.INFECTION_CHAIN: "chaîne d'infection",
+    FindingKind.CAPABILITY: "capacité",
+    FindingKind.NETWORK_BEHAVIOUR: "comportement réseau",
+    FindingKind.CLAIM_VERIFICATION: "vérification d'affirmation",
+    FindingKind.DETECTION: "détection",
+}
+_EVIDENCE_KIND_READER_LABELS = {
+    EvidenceKind.VT_FILE_REPORT: "rapport de réputation d'un fichier",
+    EvidenceKind.VT_RELATIONSHIP: "relation de réputation",
+    EvidenceKind.VT_BEHAVIOUR: "analyse comportementale",
+    EvidenceKind.SHODAN_OBSERVATION: "observation d'un service réseau",
+    EvidenceKind.BINARY_ANALYSIS: "analyse statique d'un échantillon",
+    EvidenceKind.BINARY_STRING: "chaîne extraite d'un échantillon",
+    EvidenceKind.YARA_MATCH: "correspondance avec une règle de détection",
+    EvidenceKind.NEGATIVE_RESULT: "résultat négatif",
+    EvidenceKind.CLAIM_SOURCE: "source d'affirmation",
+    EvidenceKind.OTHER: "observation technique",
+}
+_EVIDENCE_OBJECT_TYPE_READER_LABELS = {
+    "sample": "échantillon",
+    "sample_sha256": "empreinte d'échantillon",
+    "file": "fichier",
+    "apk_analysis": "analyse d'application Android",
+    "dotnet_analysis": "analyse d'application .NET",
+    "native_analysis": "analyse de code natif",
+    "network_capture": "capture réseau",
+    "network_capture_report": "compte rendu de capture réseau",
+    "network_stream": "flux réseau",
+    "protocol_evidence_pack": "dossier de preuves protocolaire",
+    "protocol_model": "modèle protocolaire",
+    "protocol_diagram_specs": "schémas protocolaires documentés",
+    "suricata_observation": "résultat de détection réseau",
+    "family_feature_comparison": "comparaison de caractéristiques",
+    "tool_result": "résultat technique",
+    "advisor_call": "consultation d'analyse",
+    "advisor_response_received": "réponse d'analyse",
+    "article_claim_citation": "affirmation d'article",
+    "detection_candidate_version": "version de règle de détection",
+    "detection_candidate_comparison": "comparaison de règles de détection",
+    "domain": "domaine",
+    "ip": "adresse IP",
+    "url": "URL",
+    "query": "requête",
+    "claim": "affirmation",
+}
+_OPINION_READER_UUID = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_OPINION_READER_LONG_HEX = re.compile(r"(?<![0-9a-f])[0-9a-f]{40,}(?![0-9a-f])", re.IGNORECASE)
 _NOVELTY_CLASS_LABELS = {
     NoveltyClass.NEW_TO_ARTICLE: "nouveau pour l'article",
     NoveltyClass.ALREADY_DOCUMENTED_BUT_NEW_DETAIL: "déjà documenté, avec un détail nouveau",
@@ -243,6 +296,36 @@ def _reader_code_key(value: object) -> str:
 
 def _reader_enum_label(value: object, labels: Mapping[str, str], fallback: str) -> str:
     return labels.get(_reader_code_key(value), fallback)
+
+
+def _opinion_finding_reader_label(finding: InvestigationFinding | None) -> str:
+    if finding is None:
+        return "Constat logique"
+    statement = " ".join(finding.statement.split())
+    statement = _OPINION_READER_UUID.sub("identifiant technique", statement)
+    statement = _OPINION_READER_LONG_HEX.sub("empreinte technique", statement)
+    statement = statement.replace("…", " ")
+    if len(statement) > 160:
+        boundary = statement.rfind(" ", 0, 161)
+        statement = statement[:boundary] if boundary > 0 else ""
+    statement = statement.rstrip(" ,;:-")
+    kind_label = _FINDING_KIND_LABELS.get(finding.kind, "constat")
+    if statement:
+        return f"{kind_label} : {statement}"
+    assessment_label = _FINDING_ASSESSMENT_LABELS.get(finding.assessment, "statut non précisé")
+    return f"{kind_label} — {assessment_label}"
+
+
+def _opinion_observation_reader_label(observation: EvidenceObservation | None) -> str:
+    if observation is None:
+        return "Observation technique"
+    kind_label = _EVIDENCE_KIND_READER_LABELS.get(observation.kind, "Observation technique")
+    object_label = _EVIDENCE_OBJECT_TYPE_READER_LABELS.get(observation.object_type)
+    if kind_label == "observation technique" and object_label is None:
+        return "Observation technique"
+    if object_label is None:
+        return kind_label
+    return f"{kind_label} — {object_label}"
 
 
 def _reader_ioc_relevance_label(classification: object, reason_code: object) -> str:
@@ -2525,6 +2608,20 @@ def project_publication_to_typst_model(
         rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
     )
     investigation_id = opinion.investigation_id if opinion is not None else None
+    preview_findings_by_logical_id: dict[UUID, InvestigationFinding] = {}
+    preview_evidence_by_id: dict[UUID, EvidenceObservation] = {}
+    if draft_preview is not None:
+        for preview_finding in draft_preview.findings:
+            logical_id = finding_version_logical_ids.get(preview_finding.id, preview_finding.id)
+            prior_preview_finding = preview_findings_by_logical_id.get(logical_id)
+            if (
+                prior_preview_finding is None
+                or preview_finding.version > prior_preview_finding.version
+            ):
+                preview_findings_by_logical_id[logical_id] = preview_finding
+        preview_evidence_by_id = {
+            observation.id: observation for observation in draft_preview.evidence_observations
+        }
 
     def opinion_citation(kind: str, reference_id: UUID) -> dict[str, Any]:
         noun = "Constat" if kind == "finding" else "Évidence"
@@ -2535,6 +2632,11 @@ def project_publication_to_typst_model(
             else reference_id
         )
         reference_text = str(displayed_id)
+        display_label = (
+            _opinion_finding_reader_label(preview_findings_by_logical_id.get(displayed_id))
+            if kind == "finding"
+            else _opinion_observation_reader_label(preview_evidence_by_id.get(displayed_id))
+        )
         key = (kind, displayed_id)
         reference = opinion_reference_by_id.get(key)
         if reference is not None:
@@ -2550,6 +2652,7 @@ def project_publication_to_typst_model(
             "href": f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}",
             "reference_id": reference_text,
             "kind": kind,
+            "display_label": display_label,
         }
         opinion_reference_by_id[key] = reference
         opinion_provenance_entries.append(
@@ -2562,6 +2665,7 @@ def project_publication_to_typst_model(
                 "reference_id": reference_text,
                 "reference_id_spans": _breakable_typst_display_text(reference_text, interval=8),
                 "href": reference["href"],
+                "display_label": display_label,
             }
         )
         return reference
