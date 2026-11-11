@@ -20,7 +20,10 @@ from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     ToolExecutionContext,
 )
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
     RuleWorkbench,
@@ -143,7 +146,9 @@ class _FakeRecorder:
             item for item in self.observations if item.investigation_id == investigation_id
         )
 
-    async def read_json(self, blob_id: UUID) -> Mapping[str, Any]:
+    async def read_json(
+        self, blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+    ) -> Mapping[str, Any]:
         return self.payloads[blob_id]
 
 
@@ -1033,6 +1038,7 @@ async def test_suricata_bridge_candidate_import_persists_source_and_untested_sta
         "schema": "operator-advisor-call.v1",
         "consultation_type": "suricata_draft",
         "advisor_status": "partial",
+        "dossier": "d" * (MAX_ARTIFACT_BYTES + 1),
         "bridge_invocation_id": str(invocation_id),
         "output_sha256": source_sha256,
         "output": {
@@ -1061,8 +1067,13 @@ async def test_suricata_bridge_candidate_import_persists_source_and_untested_sta
     )
 
     class ArtifactReader:
-        async def read_json(self, requested_blob_id: UUID) -> Mapping[str, Any]:
+        async def read_json(
+            self, requested_blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+        ) -> Mapping[str, Any]:
             assert requested_blob_id == blob_id
+            payload_bytes = len(ProductionArtifactStore.canonical_json_bytes(dict(payload)))
+            if max_bytes is not None and payload_bytes > max_bytes:
+                raise ValueError("Blob exceeds the read limit")
             return payload
 
     recorder = _FakeRecorder()
@@ -1128,7 +1139,9 @@ async def test_suricata_bridge_candidate_syntax_failure_is_still_persisted() -> 
     )
 
     class ArtifactReader:
-        async def read_json(self, requested_blob_id: UUID) -> Mapping[str, Any]:
+        async def read_json(
+            self, requested_blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+        ) -> Mapping[str, Any]:
             assert requested_blob_id == blob_id
             return payload
 

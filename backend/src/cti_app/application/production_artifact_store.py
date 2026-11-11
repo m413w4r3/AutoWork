@@ -85,7 +85,7 @@ class ProductionArtifactStore:
         )
         return record.id, hashlib.sha256(encoded).hexdigest()
 
-    async def read_text(self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> str:
+    async def read_text(self, blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES) -> str:
         return (await self.read_bytes(blob_id, max_bytes=max_bytes)).decode("utf-8")
 
     async def read_bytes(
@@ -102,8 +102,11 @@ class ProductionArtifactStore:
         except BlobStorageUnavailableError as exc:
             raise ProductionReuseStorageUnavailableError(str(exc)) from exc
 
-    async def read_json(self, blob_id: UUID) -> dict[str, Any]:
-        payload = json.loads(await self.read_text(blob_id))
+    async def read_json(
+        self, blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+    ) -> dict[str, Any]:
+        """Read canonical JSON, with an optional per-call byte bound."""
+        payload = json.loads(await self.read_text(blob_id, max_bytes=max_bytes))
         if not isinstance(payload, dict):
             raise ValueError("Artifact payload is not a JSON object")
         return payload

@@ -43,7 +43,10 @@ from cti_app.application.network_workbench import (
     QuarantinedCapture,
     _flows,
 )
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
@@ -1376,7 +1379,9 @@ async def test_protocol_tools_reject_model_from_another_investigation_without_ef
             self.read_calls = 0
             self.put_calls = 0
 
-        async def read_json(self, blob_id: UUID) -> dict[str, Any]:
+        async def read_json(
+            self, blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+        ) -> dict[str, Any]:
             self.read_calls += 1
             return self.payload
 

@@ -43,7 +43,10 @@ from cti_app.application.investigation_tools import (
     validate_json_schema,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
 from cti_app.application.rule_corpus_import import list_manual_rule_corpus_imports
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesPort,
@@ -429,7 +432,7 @@ _TOOL_CAPABILITY_KEYS = {name: name for name in _TOOL_SCHEMAS}
 class EvidencePayloadReader(Protocol):
     """Read the canonical JSON payload behind a recorded evidence blob."""
 
-    async def read_json(self, blob_id: UUID) -> dict[str, Any]: ...
+    async def read_json(self, blob_id: UUID, *, max_bytes: int | None = ...) -> dict[str, Any]: ...
 
 
 class RuleArticleClaimPort(Protocol):
@@ -1553,7 +1556,12 @@ class _RuleTools:
             item: EvidenceObservation, *, verify_sha256: bool = False
         ) -> Mapping[str, Any] | None:
             try:
-                payload = await payload_store.read_json(item.blob_id)
+                max_bytes = (
+                    None
+                    if item.source == "advisor.consult" and item.object_type == "advisor_call"
+                    else MAX_ARTIFACT_BYTES
+                )
+                payload = await payload_store.read_json(item.blob_id, max_bytes=max_bytes)
             except Exception:
                 return None
             if not isinstance(payload, Mapping):
@@ -1663,7 +1671,7 @@ class _RuleTools:
             context=context,
         )
         try:
-            persisted = await self.evidence_payloads.read_json(observation.blob_id)
+            persisted = await self.evidence_payloads.read_json(observation.blob_id, max_bytes=None)
         except Exception as exc:
             raise _ToolFailed("bridge_yara_observation_unreadable") from exc
         if not isinstance(persisted, Mapping):
@@ -1709,7 +1717,7 @@ class _RuleTools:
                 original_id = UUID(reparsed_from)
                 original = await self.evidence_observations.get(original_id)
                 original_payload = (
-                    await self.evidence_payloads.read_json(original.blob_id)
+                    await self.evidence_payloads.read_json(original.blob_id, max_bytes=None)
                     if original is not None
                     else None
                 )
