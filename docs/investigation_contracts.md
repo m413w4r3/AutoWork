@@ -52,7 +52,9 @@ leurs réserves sans être promues au rang de fait.
 pas le texte de l’article ; tailles, listes et chaînes sont bornées. Les payloads
 refusent octets, champs de secrets et URLs signées. `AgentTurnDecisionV1` garde
 les arguments de tool libres : seul le schéma JSON réellement enregistré les
-valide dans `RegistryToolDispatcher`.
+valide dans `RegistryToolDispatcher`. `InvestigationContextV1`
+(`investigation-context.v1`) limite `advisor_guidance.reminder` à 120
+caractères; `/operator-status` utilise le même DTO.
 
 Les lignes `sample_deltas` du contexte v1 sont des objets permissifs
 (`dict[str, Any]` côté backend) : le contrat accepte donc des clés de ligne

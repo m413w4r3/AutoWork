@@ -122,8 +122,8 @@ def _checkpoint_reminder(reason: str | None, consultation_type: str | None) -> s
             "absence ≠ négatif."
         ),
         "before_vt_pivot_campaign": (
-            "Règle mesurée: demander une stratégie de pivots discriminants avant la campagne VT; "
-            "hypothèse → pivot → succès/échec → coût; absence ≠ négatif."
+            "Avant VT: demander une stratégie de pivots discriminants; hypothèse → pivot → "
+            "succès/échec/coût; absence ≠ négatif."
         ),
         "editorial_draft_due": (
             "Brouillon modifié: texte courant seul; avis obsolète. Hypothèse → pivot → "

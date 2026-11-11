@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+import cti_app.application.operator_advisor_guidance as operator_advisor_guidance
 from cti_app.application.advisor_checkpoint import format_advisor_trace_purpose
 from cti_app.application.investigation_contracts import AdvisorGuidanceV1, AdvisorLastAdviceV1
 from cti_app.application.operator_advisor_guidance import (
@@ -74,6 +75,42 @@ async def test_guidance_requests_initial_plan_and_exposes_budget_and_safety_remi
     assert "absence ≠ négatif" in result["reminder"]
     assert "historique" in result["reminder"]
     assert len(result["reminder"]) <= 120
+
+
+@pytest.mark.parametrize(
+    ("reason", "consultation_type", "g2_bridge_turns_remaining"),
+    (
+        (None, None, None),
+        ("g2_bridge_budget_exhausted", None, 0),
+        ("new_pivot_discovered", "pivot_strategy", None),
+        ("pivot_without_measurement", "pivot_strategy", None),
+        ("repeated_tool_block", "pivot_strategy", None),
+        ("before_vt_pivot_campaign", "pivot_strategy", None),
+        ("editorial_draft_due", "draft_text", None),
+        ("opinion_review_due", "review_text", None),
+        ("unknown_checkpoint", "plan_investigation", None),
+    ),
+)
+@pytest.mark.asyncio
+async def test_every_checkpoint_reminder_validates_through_context_contract(
+    reason, consultation_type, g2_bridge_turns_remaining, monkeypatch
+):
+    monkeypatch.setattr(
+        operator_advisor_guidance,
+        "_checkpoint",
+        lambda *_args, **_kwargs: (reason, consultation_type),
+    )
+
+    result = await build_advisor_guidance(
+        invocations=(),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+        g2_bridge_turns_remaining=g2_bridge_turns_remaining,
+    )
+
+    guidance = AdvisorGuidanceV1.model_validate(result)
+    assert len(guidance.reminder) <= 120
 
 
 @pytest.mark.asyncio
