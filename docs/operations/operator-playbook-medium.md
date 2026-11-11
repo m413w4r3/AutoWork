@@ -23,23 +23,15 @@ Sérialise les POST et retrouve le résultat par l’identifiant d’invocation.
 
 ## Collaborer avec Bridge
 
-Charge `autowork-bridge-collaboration` au démarrage. Consulte Bridge par utilité, sans quota : dès le début pour cadrer, après une découverte importante, pour construire ou améliorer YARA, choisir des pivots VT discriminants, examiner le protocole C2 quand pertinent, et rédiger **chaque section analytique** avec `draft_text`. Demande `review_text` si une relecture apporte quelque chose.
-
-Appelle `advisor.consult` avec son `consultation_type` et une question naturelle qui donne le contexte utile dans une phrase. Le dossier est assemblé automatiquement; `evidence_refs` et `sample_sha256` sont facultatifs. Omet tout identifiant inconnu; les avertissements et omissions éventuels restent visibles. Lis d’abord le texte brut Bridge, puis `parse_status`, `extracted_elements`, `input_warnings`, `ignored_inputs` et `omissions`. Une réponse lisible reste exploitable si elle est `partially_parsed` ou `unparsed`.
-
-Vérifie et applique chaque recommandation utile avec les outils exposés; renvoie les résultats à Bridge pour critique ou révision. Évite une question identique lorsque sa réponse est déjà disponible. Une trace en prose dans `purpose` suffit; aucune validation de forme ne conditionne l’échange suivant.
-
-Si la réponse contient du code YARA, importe-le depuis l’observation persistée de la consultation avec `rule.propose_bridge({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`. Ce champ est le seul requis; `rule_index` et `rule_name` sont facultatifs. Pour chaque candidate non validée, appelle `rule.test` avec le `candidate_id` retourné et renvoie les résultats mesurés à Bridge. Utilise `rule.operator_syntax_fix` pour une correction syntaxique ou crée une nouvelle version reliée au parent courant pour une amélioration.
-
-Si la réponse contient du code Suricata, importe-le avec `rule.import_suricata_bridge_candidate({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`. Ce champ est le seul requis; l’import crée une candidate non validée sans références de mesure. Valide ou rejoue la règle seulement si une capture autorisée et les outils correspondants sont disponibles; communique les résultats à Bridge.
-
-Si Bridge est indisponible ou refusé par l’enveloppe, n’attribue aucun texte à Bridge, marque la section concernée incomplète et reprends la collaboration lorsqu’il redevient disponible.
+À chaque mission, consulte `plan_investigation` depuis l’état canonique; après un résultat important ou ambigu, demande son interprétation.
+Avant chaque lot de pivots VT ou de recherche d’échantillons, consulte `pivot_strategy`; avant toute règle YARA écrite à la main, consulte `yara_draft` et limite-toi à vérifier, affiner ou tester les candidates.
+Dès que le protocole le justifie, consulte `suricata_draft`; fais rédiger chaque bloc final de l’avis par `draft_text`, conserve `bridge_draft_ref` et ne rédige pas toi-même le texte final.
+Sérialise les appels `advisor.consult` : un à la fois, attends leur résultat (5–25 min) et ne rends pas la main pendant l’attente; les réponses ne sont ni preuves ni findings automatiques.
+Pour les détails, les résultats partiels et la consignation au handoff, suis `autowork-bridge-collaboration`; si Bridge est indisponible, marque la section incomplète.
 
 ## Preuves et rapport
 
-Sépare observation, interprétation et hypothèse. Qualifie chaque fait selon sa couverture : `supported` pour une observation directe étroite, `qualified` pour une interprétation limitée, `inconclusive` pour une question ouverte. `empty`, `partial`, `unavailable`, `blocked` et un refus d’outil ne démontrent pas une absence globale. Bridge ne crée pas de preuve et ne choisit pas le statut d’un finding.
-
-Pour chaque section analytique, demande à Bridge un brouillon `draft_text`; fais-le relire avec `review_text` si utile. Vérifie les faits contre les observations canoniques, corrige ou adapte le texte et intègre une prose naturelle. Les références facultatives non résolues ne bloquent pas la proposition de texte. Le rapport final ne contient pas de marqueurs internes. Utilise la checklist indicative du modèle de mandat pour `FINAL_REPORT.md`.
+Sépare observation, interprétation et hypothèse. Qualifie chaque fait selon sa couverture : `supported` pour une observation directe étroite, `qualified` pour une interprétation limitée, `inconclusive` pour une question ouverte. `empty`, `partial`, `unavailable`, `blocked` et un refus d’outil ne démontrent pas une absence globale. Bridge ne crée pas de preuve et ne choisit pas le statut d’un finding. Vérifie chaque bloc final contre les observations et conserve son `bridge_draft_ref`; utilise la checklist indicative du modèle de mandat pour `FINAL_REPORT.md`.
 
 ## Versions, budget et clôture
 

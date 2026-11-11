@@ -37,11 +37,9 @@ Les rapports VT behaviour ou PCAP sont des indices/références de provenance ; 
 
 - Chercher un invariant **visible sur le réseau** : sens du flux, framing, contenu d'un champ, séquence d'octets observée, particularité de requête/réponse. Une valeur interne chiffrée mais jamais visible en clair sur le fil ne doit pas devenir un motif Suricata présumé.
 - Choisir un contexte et une condition de règle proportionnés. Éviter de matcher seulement un protocole ou un header banal ; documenter la portée et le risque de faux positifs.
-- Utiliser `advisor.consult` avec `suricata_draft` quand il existe un fait réseau ou un modèle C2 statique, sans attendre une PCAP. Dans une phrase, résumer les champs ou séquences observés et demander une règle candidate et sa limite; le dossier auto-assemblé conserve le contexte disponible. Une réponse en prose ou partiellement parsée reste exploitable.
-- Si Bridge propose du code Suricata, l’importer immédiatement depuis l’observation de la consultation : `rule.import_suricata_bridge_candidate({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`. Ce seul champ est requis; l’import crée une candidate non validée et ne demande pas de références de mesure.
+- Dès qu’un fait réseau observé ou un modèle C2 justifie une signature, consulte `suricata_draft` et suis la procédure d’import Bridge de `autowork-bridge-collaboration`; renvoie les résultats mesurés après validation ou replay.
 - **Si une capture associée et le moteur sont disponibles**, utiliser network.suricata_validate_rules puis network.suricata_replay ; vérifier le schéma exact, les alertes observées, erreurs et références. Ces outils acceptent une capture : ne pas inventer d'arguments pour lancer un test sans PCAP.
 - **Sans PCAP**, conserver une règle candidate **non testée** avec ses fondements statiques ou documentaires ; ne pas fabriquer des hits. Le manque de capture ne bloque ni la rédaction ni la poursuite des autres axes CTI.
-- Après la validation ou le replay, renvoyer les alertes, erreurs et limites à Bridge pour critique ou révision. Évite les consultations identiques si rien n’a changé.
 - Les révisions sont motivées par de nouvelles observations ou faux positifs/faux négatifs mesurés, pas par une obligation de nombre de versions.
 
 ## Boucle vers la découverte

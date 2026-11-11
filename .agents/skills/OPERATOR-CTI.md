@@ -5,7 +5,7 @@ Ce registre est destiné à l'orchestrateur qui prépare une session CTI. Les sk
 | Déclencheur précis | Skill |
 | --- | --- |
 | Nouvelle question / expérience / arrêt | autowork-cti-investigation-loop |
-| Démarrage, résultat significatif, YARA, avant pivots VT, contradiction, rédaction : consulter/utiliser Bridge | autowork-bridge-collaboration |
+| Séquence Bridge de mission, interprétation, pivots VT, règles et rédaction de l’avis | autowork-bridge-collaboration |
 | Choisir un outil, budget, refus, CAS, besoin de bytes | autowork-tool-strategy |
 | Nouvel artefact, type inconnu, archive, script | autowork-artifact-triage |
 | Nouvelle relation/hash/IOC/similarité ; quel prochain test ? | autowork-cti-pivot-strategy |
