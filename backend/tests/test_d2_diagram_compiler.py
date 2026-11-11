@@ -333,10 +333,43 @@ def test_stacks_documentary_protocol_sequence_without_inventing_edges() -> None:
         )
     ).decode()
 
-    assert source.startswith("direction: down\nmessage_order: {\n  grid-rows: 2\n")
+    assert source.startswith('direction: down\nprotocol_view: {\n  label: ""\n  grid-rows: 2\n')
     assert '  n001: "1. First documented event"' in source
     assert '  n002: "2. Second documented event"' in source
     assert " -> " not in source
+
+
+def test_compacts_long_protocol_sequence_into_three_column_ordered_grid() -> None:
+    nodes = tuple(
+        _node(f"message-{index:02d}", f"#{index:02d} client → server: message")
+        for index in range(1, 18)
+    )
+    source = encode_d2_source(
+        _diagram(
+            profile=DiagramProfile.PROTOCOL_SEQUENCE,
+            direction=EnrichmentDiagramDirection.TOP_TO_BOTTOM,
+            nodes=nodes,
+            edges=(),
+        )
+    ).decode()
+
+    assert "grid-rows: 6\n  grid-columns: 3\n" in source
+    assert 'n001: "#01 client → server: message"' in source
+    assert 'n017: "#17 client → server: message"' in source
+
+
+def test_compacts_large_protocol_field_view_into_four_column_grid() -> None:
+    nodes = tuple(_node(f"field-{index:02d}", f"#{index:02d} field name") for index in range(1, 23))
+    source = encode_d2_source(
+        _diagram(
+            profile=DiagramProfile.PROTOCOL_MESSAGE_FORMAT,
+            direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+            nodes=nodes,
+            edges=(),
+        )
+    ).decode()
+
+    assert "grid-rows: 6\n  grid-columns: 4\n" in source
 
 
 @pytest.mark.parametrize(
@@ -388,7 +421,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v8-chapsvision"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v9-m21-opinion-render"
 
 
 @dataclass(frozen=True, slots=True)

@@ -493,7 +493,11 @@
       #rendered-table
     ]
   } else {
-    block(above: 10pt, below: 8pt)[
+    block(
+      breakable: breakable,
+      above: 10pt,
+      below: 8pt,
+    )[
       #if title != none [
         #block(sticky: true)[
           #title
@@ -604,7 +608,7 @@
             ] else [
               #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
             ]
-          ] else [#text(span.text)]
+          ] else [#publication-display-text(span)]
         ]
       ]
     ]
@@ -839,16 +843,16 @@
     let header-cells = if hash-only {
       ([Empreinte de fichier — une valeur par ligne], [Statut, relation et provenance])
     } else {
-      ([Type], [Valeur défanguée], [Statut indicateur], [Statut relation], [Contexte et provenance])
+      ([Type], [Valeur refangée], [Statut indicateur], [Statut relation], [Contexte et provenance])
     }
     let body-cells = if hash-only {
       group.rows.map(row => (
-        [#text(font: code-font-families, size: 9pt, hyphenate: false)[#publication-display-text(row.value)]],
+        [#text(font: code-font-families, size: 9pt, hyphenate: false)[#publication-display-text(row.at("value_spans", default: row.value))]],
         [
           #text(size: 8.5pt, weight: "bold")[Ind. #row.at("indicator_status_short_label", default: row.at("indicator_status_label", default: "")) · Rel. #row.at("relationship_status_short_label", default: row.at("relationship_status_label", default: row.at("status_label", default: "")))]
           #let context-summary = row.at("hash_context_summary", default: row.at("context_summary", default: ""))
           #let source-refs = row.at("source_refs", default: ())
-          #if context-summary != "" [#linebreak() #text(size: 8.5pt, fill: grey)[#context-summary]]
+          #if context-summary != "" [#linebreak() #text(size: 8.5pt, fill: grey)[#publication-display-text(row.at("hash_context_summary_spans", default: context-summary))]]
           #if source-refs.len() > 0 [#if context-summary != "" [ · ] #text(size: 8.5pt, fill: grey)[src #render-source-references(source-refs, reference-scope: reference-scope)]]
           #let draft-refs = row.at("draft_refs", default: ())
           #if draft-refs.len() > 0 [#if context-summary != "" or source-refs.len() > 0 [ · ] #render-opinion-references(draft-refs, reference-scope: reference-scope)]
@@ -859,18 +863,14 @@
         [#text(size: 9pt, weight: "bold")[#row.type_label]],
         [
           #text(font: code-font-families, size: 9pt, hyphenate: false)[
-            #if type(row.value) == str {
-              semantic-or-plain(row.value, row.at("value_spans", default: none))
-            } else {
-              publication-display-text(row.value)
-            }
+          #publication-display-text(row.at("value_spans", default: row.value))
           ]
         ],
         [#text(size: 8.5pt, weight: "bold")[#row.at("indicator_status_label", default: "")]],
         [#text(size: 8.5pt, weight: "bold")[#row.at("relationship_status_label", default: row.at("status_label", default: ""))]],
         [
           #let context-summary = row.at("context_summary", default: "")
-          #if context-summary != "" [#text(size: 8.5pt, fill: grey)[#context-summary]]
+          #if context-summary != "" [#text(size: 8.5pt, fill: grey)[#publication-display-text(row.at("context_summary_spans", default: context-summary))]]
           #let source-refs = row.at("source_refs", default: ())
           #if source-refs.len() > 0 [#if context-summary != "" [#linebreak()] #text(size: 8.5pt, fill: grey)[src #render-source-references(source-refs, reference-scope: reference-scope)]]
           #let draft-refs = row.at("draft_refs", default: ())
@@ -920,7 +920,7 @@
       #text(size: 8pt, fill: grey)[Les renvois courts du corps désignent les identifiants canoniques suivants.]
       #let finding-refs = opinion-refs.filter(item => item.kind_label == "Finding")
       #let evidence-refs = opinion-refs.filter(item => item.kind_label == "Évidence")
-      #for (group-title, refs) in (("Findings", finding-refs), ("Évidences", evidence-refs)) [
+      #for (group-title, refs) in (("Findings logiques cités", finding-refs), ("Évidences", evidence-refs)) [
         #if refs.len() > 0 [
           #v(4pt)
           #text(size: 8pt, weight: "bold")[#group-title]
@@ -1142,7 +1142,7 @@
   })
 ]
 
-#let render-diagram(item, article-style: false) = {
+#let render-diagram(item, article-style: false, max-height-fraction: none) = {
   let legacy-renderer = item.at("legacy_renderer", default: false)
   if not legacy-renderer {
   let caption = if legacy-renderer {
@@ -1187,18 +1187,25 @@
       ]
     ]
   ]
+  let image-height-fraction = if max-height-fraction != none {
+    max-height-fraction
+  } else if has-text(item.at("status_legend", default: none)) {
+    0.52
+  } else {
+    0.35
+  }
   if has-text(item.at("status_legend", default: none)) {
     render-publication-image(
       item.media_path,
       caption-content,
-      max-height-fraction: 0.52,
+      max-height-fraction: image-height-fraction,
       article-style: article-style,
     )
   } else {
     render-publication-image(
       item.media_path,
       caption-content,
-      max-height-fraction: 0.35,
+      max-height-fraction: image-height-fraction,
       article-style: article-style,
     )
   }
@@ -1535,7 +1542,7 @@
       #let opinion-extras = [
           #for figure in protocol-figures [
             #v(8pt)
-            #render-diagram(figure)
+            #render-diagram(figure, max-height-fraction: 0.82)
           ]
           #if content_section.at("investigation_chain_figure", default: none) != none [
             #v(8pt)
@@ -1547,8 +1554,14 @@
           ]
           #if unresolved-points.len() > 0 [
             #heading(level: 3)[Points non résolus]
-            #for point in unresolved-points [
-              #list.item[#point]
+        #let unresolved-point-render-data = content_section.at(
+          "unresolved_point_render_data",
+          default: unresolved-points,
+        )
+        #for point in unresolved-point-render-data [
+          #let point-text = if type(point) == str { point } else { point.text }
+          #let point-spans = if type(point) == str { none } else { point.at("text_spans", default: none) }
+          #list.item[#render-opinion-text(point-spans, point-text)]
             ]
           ]
           #for item in unanchored-observations [
@@ -1565,7 +1578,7 @@
         item => item.at("pipe_table", default: none) != none and item.pipe_table.wide,
       ).len() > 0
       #if not has-wide-opinion-table and opinion-blocks.len() > 0 [
-        #noteAnalyste(title: [Avis de l'analyste], breakable: true)[
+        #noteAnalyste(title: [Note de l'analyste], breakable: true)[
           #for item in opinion-blocks [
             #let pipe-table = item.at("pipe_table", default: none)
             #heading(level: 3)[#item.number #text(item.heading)]
@@ -1587,7 +1600,7 @@
         ]
       ] else [
         #for (index, item) in opinion-blocks.enumerate() [
-          #let opinion-title = if index == 0 { [Avis de l'analyste] } else { none }
+          #let opinion-title = if index == 0 { [Note de l'analyste] } else { none }
           #let pipe-table = item.at("pipe_table", default: none)
           #if pipe-table != none and pipe-table.wide [
             #noteAnalyste(title: opinion-title, breakable: true)[
@@ -1634,7 +1647,7 @@
           ]
         ]
         #if has-opinion-extras or opinion-blocks.len() == 0 [
-          #let extras-title = if opinion-blocks.len() == 0 { [Avis de l'analyste] } else { none }
+          #let extras-title = if opinion-blocks.len() == 0 { [Note de l'analyste] } else { none }
           #noteAnalyste(title: extras-title, breakable: true)[#opinion-extras]
         ]
       ]

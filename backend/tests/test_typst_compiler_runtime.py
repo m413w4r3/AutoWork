@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -91,6 +92,29 @@ _COPYABLE_VALUES = (
 def _run_blocking(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
     # Short Poppler/Typst probes in tests; thread offloading adds nothing here.
     return subprocess.run(*args, **kwargs)
+
+
+def _compile_real_typst_cli(
+    *,
+    typst_binary: str,
+    workspace_root: Path,
+    entrypoint: str,
+    font_paths: tuple[Path, ...],
+) -> bytes:
+    argv = [typst_binary, "compile", "--root", str(workspace_root)]
+    for font_path in font_paths:
+        argv.extend(("--font-path", str(font_path)))
+    argv.extend(
+        (
+            "--ignore-system-fonts",
+            "--creation-timestamp",
+            "0",
+            str(workspace_root / entrypoint),
+            str(workspace_root / "output.pdf"),
+        )
+    )
+    subprocess.run(tuple(argv), capture_output=True, check=True, timeout=30)
+    return (workspace_root / "output.pdf").read_bytes()
 
 
 def _copyable_ioc_document():
@@ -690,7 +714,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         timeline_date_marker: 1,
         second_timeline_marker: 1,
         second_timeline_date_marker: 1,
-        "Avis de l'analyste": 0,
+        "Note de l'analyste": 0,
         "Apports de l'enquête": 0,
         "Fait étayé": 0,
         "Confiance : 90%": 0,
@@ -708,7 +732,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         timeline_date_marker: 1,
         second_timeline_marker: 1,
         second_timeline_date_marker: 1,
-        "Avis de l'analyste": 1,
+        "Note de l'analyste": 1,
         "Apports de l'enquête": 1,
         "Fait étayé": 1,
         "Confiance : 90%": 0,
@@ -1288,6 +1312,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
     }
 
     def ioc_row(value: dict[str, Any], *, original: bool = False) -> dict[str, Any]:
+        row_marker = hashlib.sha256(value["text"].encode()).hexdigest()[:10]
         return {
             "type": "ioc",
             "type_label": "Indicateur",
@@ -1299,12 +1324,12 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
             "context_summary": (
                 "Le lien avec le sujet n'est pas démontré."
                 if original
-                else "Source : rapport public."
+                else f"Source : rapport public — ligne {row_marker}."
             ),
             "hash_context_summary": (
                 "Le lien avec le sujet n'est pas démontré."
                 if original
-                else "Source : rapport public."
+                else f"Source : rapport public — ligne {row_marker}."
             ),
             "source_refs": [],
             "draft_refs": [],
@@ -1489,12 +1514,11 @@ async def test_real_typst_lot6_a4_composition_fixture(
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
     font_root = tmp_path / "lot6-a4-font-snapshot"
     font_root.mkdir()
-    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
-        TypstCompileRequest(
-            workspace_root=workspace_root,
-            entrypoint_relative_path="RENDERER/publication.typ",
-            font_paths=materialize_font_bundle(font_snapshot, font_root),
-        )
+    compiled_pdf = _compile_real_typst_cli(
+        typst_binary=str(typst_binary),
+        workspace_root=workspace_root,
+        entrypoint="RENDERER/publication.typ",
+        font_paths=materialize_font_bundle(font_snapshot, font_root),
     )
 
     review_directory = Path(
@@ -1503,7 +1527,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
     pdf_path = _write_review_pdf(
         review_directory,
         "lot6-composition-a4.pdf",
-        compiled.content,
+        compiled_pdf,
     )
     rasterizer = shutil.which("pdftoppm")
     assert rasterizer is not None, "pdftoppm is required to inspect every fixture page"
@@ -1515,7 +1539,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
     assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
     png_pages = _review_pngs(review_directory, "lot6-composition-a4-*.png")
 
-    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    reader = PdfReader(BytesIO(compiled_pdf), strict=True)
     page_text = [page.extract_text() or "" for page in reader.pages]
     text = " ".join(" ".join(value.split()) for value in page_text)
     compact_text = "".join(text.split())
@@ -1563,6 +1587,32 @@ async def test_real_typst_lot6_a4_composition_fixture(
     assert all("".join(value.split()) in compact_text[reserve_position:] for value in original_iocs)
     missing_iocs = tuple(value for value in expected_iocs if value not in compact_text)
     assert not missing_iocs, f"IOC values missing from extracted PDF text: {missing_iocs[:8]!r}"
+    ioc_annex_start = next(
+        index for index, page in enumerate(page_text) if "ANNEXE TECHNIQUE" in page.upper()
+    )
+    ioc_annex_pages = tuple(page_text[ioc_annex_start:])
+    compact_pages = tuple("".join(page.split()) for page in ioc_annex_pages)
+    hash_values = set(expected_iocs[-20:])
+    for value in expected_iocs:
+        row_marker = hashlib.sha256(value.encode()).hexdigest()[:10]
+        page_indices = [
+            index
+            for index, compact_page in enumerate(compact_pages)
+            if "".join(value.split()) in compact_page
+        ]
+        assert len(page_indices) == 1, f"IOC row value {value!r} appears on pages {page_indices!r}"
+        page_index = page_indices[0]
+        assert row_marker in compact_pages[page_index], (
+            f"IOC row {value!r} was separated from its provenance marker"
+        )
+        expected_header = (
+            "Empreinte de fichier — une valeur par ligne"
+            if value in hash_values
+            else "Valeur refangée"
+        )
+        assert "".join(expected_header.split()) in compact_pages[page_index], (
+            f"IOC table continuation page omitted {expected_header!r}"
+        )
     assert len(png_pages) == len(reader.pages)
     png_sizes = [path.stat().st_size for path in png_pages]
     assert all(size > 0 for size in png_sizes)

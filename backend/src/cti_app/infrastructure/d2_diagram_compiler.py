@@ -229,8 +229,13 @@ def _d2_requires_vertical_layout(node_count: int, labels: Sequence[str]) -> bool
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
     node_references = _node_references(diagram)
-    stack_unconnected_sequence = (
-        diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE
+    stack_unconnected_protocol_view = (
+        diagram.profile
+        in {
+            DiagramProfile.PROTOCOL_SEQUENCE,
+            DiagramProfile.PROTOCOL_STATE_MACHINE,
+            DiagramProfile.PROTOCOL_MESSAGE_FORMAT,
+        }
         and len(diagram.nodes) > 1
         and not diagram.edges
     )
@@ -340,14 +345,26 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         edge_lines.extend(("  }", "}"))
         lines.extend(edge_lines)
 
-    if stack_unconnected_sequence:
-        # An evidence-backed documentary sequence has ordered events but no
-        # observed endpoints or exchange edges. Use a D2 grid to stack those
-        # events without inventing a relation merely to force vertical layout.
+    if stack_unconnected_protocol_view:
+        # Dense protocol views use independent cards. Use a D2 grid without
+        # adding connector edges that are absent from the semantic projection.
+        grid_columns = (
+            4
+            if diagram.profile is DiagramProfile.PROTOCOL_MESSAGE_FORMAT and len(diagram.nodes) > 20
+            else 3
+            if len(diagram.nodes) > D2_VERTICAL_AFTER_NODES
+            else 1
+        )
+        grid_rows = (len(diagram.nodes) + grid_columns - 1) // grid_columns
+        grid_options = [
+            f"  grid-rows: {grid_rows}",
+            *([f"  grid-columns: {grid_columns}"] if grid_columns > 1 else []),
+        ]
         lines = [
             lines[0],
-            "message_order: {",
-            f"  grid-rows: {len(diagram.nodes)}",
+            "protocol_view: {",
+            '  label: ""',
+            *grid_options,
             "  style: {",
             '    fill: "#FFFFFF"',
             '    stroke: "#FFFFFF"',

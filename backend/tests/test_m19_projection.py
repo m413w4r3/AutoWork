@@ -656,7 +656,7 @@ def test_v8_policy_v1_timeline_payload_roundtrips_with_identical_canonical_hash(
 def test_m19_contract_versions_are_bumped_and_bounded() -> None:
     assert ARTICLE_FORMAT_POLICY_VERSION == "3-m19-publication-events"
     assert ASSEMBLY_POLICY_VERSION.startswith("17-")
-    assert _RENDER_DATA_SCHEMA_VERSION == "typst-publication-model-v37-m20-opinion-render"
+    assert _RENDER_DATA_SCHEMA_VERSION == "typst-publication-model-v38-m21-opinion-render"
     assert all(
         len(value) <= 64
         for value in (

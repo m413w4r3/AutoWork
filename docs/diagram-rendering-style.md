@@ -11,11 +11,15 @@ readable rectangle fallback.
 
 Diagrams switch to a vertical layout above eight nodes or when any node, edge,
 or group label exceeds 44 characters. Typst preserves the SVG aspect ratio and
-limits a diagram to 35% of the available page height. D2 label sizes scale by
-graph density (12–18 px for nodes and 11–16 px for edges); labels are wrapped
-more tightly as graphs grow. The corpus layout check measures at least 8 pt
-node text and 7 pt relation labels after fitting. Captions are centered and
-italic below the diagram.
+limits a standard diagram to 35% of the available page height (52% when a
+status legend is present). Protocol figures inside an analyst-opinion box may
+use up to 82% of the available page height. Dense protocol sequence, state, and
+field views use ordered multi-column card grids so they can use the box width;
+their title, status, caption, and legend remain below the image. D2 label sizes
+scale by graph density (12–18 px for nodes and 11–16 px for edges); labels are
+wrapped more tightly as graphs grow. The corpus layout check measures at least
+8 pt node text and 7 pt relation labels after fitting. Captions are centered
+and italic below the diagram.
 
 Publication tables use an 8 pt sans-serif face, a muted blue-grey header
 (`#5D7374`) with white bold labels, fine grey borders, white body rows, and no
@@ -27,7 +31,7 @@ unchanged.
 
 - `D2_COMPILER_VERSION` remains pinned to the installed D2 executable. Visual
   source or SVG changes increment `DIAGRAM_COMPILATION_POLICY_VERSION`, now
-  `diagram-d2-svg-v8-chapsvision`.
+  `diagram-d2-svg-v9-m21-opinion-render`.
 - Publication Typst changes increment both `PUBLICATION_RENDERER_VERSION` and
   `PUBLICATION_RENDER_POLICY_VERSION`. The template bundle SHA is also part of
   the publication render input hash.

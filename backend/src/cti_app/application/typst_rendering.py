@@ -96,8 +96,8 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v37 binds the M20 analyst-opinion projection to render identity.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v37-m20-opinion-render"
+# v38 adds M21 display-only IOC refanging and safe wrapping for opinion/table text.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v38-m21-opinion-render"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -232,6 +232,18 @@ def _breakable_typst_display_text(
             chunks.append(piece)
 
     return {"text": value, "break_chunks": chunks, "break_after": break_after}
+
+
+def _opinion_traceability_refs(
+    references: list[dict[str, Any]], direct_finding_ids: set[UUID]
+) -> list[dict[str, Any]]:
+    """Keep the finding annex scoped to logical findings explicitly cited by the opinion."""
+    direct_ids = {str(reference_id) for reference_id in direct_finding_ids}
+    return [
+        reference
+        for reference in references
+        if reference["kind_label"] != "Finding" or reference["reference_id"] in direct_ids
+    ]
 
 
 def _article_ioc_category(artifact_type: ArtifactType) -> str | None:
@@ -1474,15 +1486,19 @@ class _DraftIOC:
 _SUBJECT_REF_SCOPE_PREFIX = "Subject reference: "
 _SAMPLE_HASH_PATTERN = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.IGNORECASE)
 _DEFANGED_URL_PATTERN = re.compile(r"\bhxxps?://[^\s\"'<>]+", re.IGNORECASE)
-_DEFANGED_IP_PATTERN = re.compile(r"(?<!\d)(?:\d{1,3}\[\.\]){3}\d{1,3}(?!\d)")
-_DEFANGED_DOMAIN_PATTERN = re.compile(r"(?<![\w.-])(?:[A-Za-z0-9-]+\[\.\])+[A-Za-z0-9-]+(?![\w.-])")
+_DEFANGED_IP_PATTERN = re.compile(r"(?<!\d)\d{1,3}(?:(?:\[\.\]|\.)\d{1,3}){3}(?!\d)")
+_DEFANGED_DOMAIN_PATTERN = re.compile(
+    r"(?<![\w.-])[A-Za-z0-9-]+(?:(?:\[\.\]|\.)[A-Za-z0-9-]+)+(?![\w.-])"
+)
 _OPINION_TECHNICAL_TOKEN = re.compile(
     r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
 )
 _OPINION_INLINE_CODE = re.compile(r"`([^`\n]+)`")
-_OPINION_FENCED_CODE_OPEN = re.compile(r"(?m)^[ \t]*```[ \t]*\r?\n")
+_OPINION_FENCED_CODE_OPEN = re.compile(
+    r"(?m)^[ \t]*```(?:[A-Za-z][A-Za-z0-9_+#.-]{0,23})?[ \t]*\r?\n"
+)
 _OPINION_FENCED_CODE_CLOSE = re.compile(r"(?m)^[ \t]*```[ \t]*(?:\r?\n|$)")
 _PIPE_TABLE_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 _PIPE_TABLE_SHA256 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE)
@@ -1492,15 +1508,30 @@ def _opinion_text_spans(
     value: str,
     *,
     parse_fenced_code: bool = False,
+    known_iocs: tuple[tuple[ArtifactType, str, str], ...] = (),
 ) -> list[dict[str, Any]]:
     """Project opinion literals and balanced fenced code for inert Typst rendering."""
     spans: list[dict[str, Any]] = []
 
     def add_plain_text(plain_text: str) -> None:
+        display_text, _offsets = _refang_known_iocs(plain_text, known_iocs)
         cursor = 0
-        for match in _OPINION_TECHNICAL_TOKEN.finditer(plain_text):
+
+        def append_plain(value: str) -> None:
+            breakable = _breakable_typst_display_text(
+                value,
+                interval=24,
+                break_at_technical_separators=True,
+            )
+            spans.append(
+                {**breakable, "technical": False}
+                if breakable.get("break_chunks")
+                else {"text": value, "technical": False}
+            )
+
+        for match in _OPINION_TECHNICAL_TOKEN.finditer(display_text):
             if match.start() > cursor:
-                spans.append({"text": plain_text[cursor : match.start()], "technical": False})
+                append_plain(display_text[cursor : match.start()])
             spans.append(
                 {
                     **_breakable_typst_display_text(
@@ -1510,17 +1541,18 @@ def _opinion_text_spans(
                 }
             )
             cursor = match.end()
-        if cursor < len(plain_text):
-            spans.append({"text": plain_text[cursor:], "technical": False})
+        if cursor < len(display_text):
+            append_plain(display_text[cursor:])
 
     def add_inline_and_plain_text(plain_text: str) -> None:
         cursor = 0
         for match in _OPINION_INLINE_CODE.finditer(plain_text):
             add_plain_text(plain_text[cursor : match.start()])
+            display_code, _offsets = _refang_known_iocs(match.group(1), known_iocs)
             spans.append(
                 {
                     **_breakable_typst_display_text(
-                        match.group(1), interval=8, break_at_technical_separators=True
+                        display_code, interval=8, break_at_technical_separators=True
                     ),
                     "technical": True,
                 }
@@ -2147,15 +2179,34 @@ def project_publication_to_typst_model(
     else:
         raise ValueError("Unsupported canonical publication document")
 
-    refang_replacements = (
-        ()
-        if opinion_document
-        else _publication_refang_pairs(
-            document,
-            publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None,
-            publication_v8,
+    publication_refang_replacements = _publication_refang_pairs(
+        document,
+        publication_v5 if isinstance(publication_v5, PublicationDocumentV5) else None,
+        publication_v8,
+    )
+    opinion_texts = (
+        tuple(block.text for block in opinion.blocks)
+        + tuple(item.text for item in opinion.observations)
+        + opinion.unresolved_points
+        if opinion is not None
+        else ()
+    )
+    opinion_refang_replacements = tuple(
+        sorted(
+            {
+                *publication_refang_replacements,
+                *(
+                    candidate
+                    for opinion_text in opinion_texts
+                    for candidate in _defanged_note_indicators(opinion_text)
+                ),
+            },
+            key=lambda item: (item[0].value, item[2].casefold(), item[1].casefold(), item[1]),
         )
     )
+    # Keep the underlying publication text stable; only opinion display spans
+    # use the opinion-local refang candidates below.
+    refang_replacements = () if opinion_document else publication_refang_replacements
 
     def project_text(anchor: str, text: str) -> tuple[str, list[dict[str, Any]] | None]:
         paragraph = semantic_by_anchor.get(anchor)
@@ -2363,6 +2414,7 @@ def project_publication_to_typst_model(
         return reference
 
     opinion_provenance_entries: list[dict[str, Any]] = []
+    direct_opinion_finding_ids: set[UUID] = set()
     opinion_reference_by_id: dict[tuple[str, UUID], dict[str, Any]] = {}
     opinion_reference_numbers = {"finding": 0, "evidence": 0}
 
@@ -2393,10 +2445,15 @@ def project_publication_to_typst_model(
         for observation in opinion.observations:
             if not observation.text.strip():
                 continue
+            direct_opinion_finding_ids.update(observation.finding_refs)
             note: dict[str, Any] = {
                 "type": "analyst_observation",
                 "text": observation.text,
-                "text_spans": _opinion_text_spans(observation.text),
+                "text_spans": _opinion_text_spans(
+                    observation.text,
+                    parse_fenced_code=True,
+                    known_iocs=opinion_refang_replacements,
+                ),
                 "finding_refs": collect_opinion_references(
                     f"Note ancrée {observation.anchor}", "finding", observation.finding_refs
                 ),
@@ -3299,6 +3356,25 @@ def project_publication_to_typst_model(
                 "source_refs": source_refs,
                 "context_summary": context_summary,
                 "hash_context_summary": hash_context_summary,
+                "value_spans": _breakable_typst_display_text(
+                    ioc_detail_row["value"],
+                    interval=8,
+                    break_at_technical_separators=True,
+                ),
+                "context_summary_spans": _breakable_typst_display_text(
+                    context_summary,
+                    interval=24,
+                    break_at_technical_separators=True,
+                ),
+                "hash_context_summary_spans": (
+                    _breakable_typst_display_text(
+                        hash_context_summary,
+                        interval=20,
+                        break_at_technical_separators=True,
+                    )
+                    if hash_context_summary is not None
+                    else None
+                ),
                 "draft_refs": list(
                     {
                         (reference["kind"], reference["reference_id"]): reference
@@ -3626,13 +3702,18 @@ def project_publication_to_typst_model(
             finding_refs,
             evidence_refs,
         ) in enumerate(display_blocks):
+            direct_opinion_finding_ids.update(finding_refs)
             context_label = f"Bloc 1.{index + 1} — {heading}"
             projected_opinion_blocks.append(
                 {
                     "number": f"1.{index + 1}",
                     "heading": heading,
                     "text": text,
-                    "text_spans": _opinion_text_spans(text, parse_fenced_code=True),
+                    "text_spans": _opinion_text_spans(
+                        text,
+                        parse_fenced_code=True,
+                        known_iocs=opinion_refang_replacements,
+                    ),
                     "pipe_table": _opinion_pipe_table(text),
                     "qualification": qualification,
                     "qualification_label": qualification_labels[qualification],
@@ -3650,6 +3731,17 @@ def project_publication_to_typst_model(
             "heading": "Avis de l'analyste",
             "blocks": projected_opinion_blocks,
             "unresolved_points": list(unresolved_points),
+            "unresolved_point_render_data": [
+                {
+                    "text": point,
+                    "text_spans": _opinion_text_spans(
+                        point,
+                        parse_fenced_code=True,
+                        known_iocs=opinion_refang_replacements,
+                    ),
+                }
+                for point in unresolved_points
+            ],
             "unanchored_observations": unanchored_observations,
             "has_anchored_observations": any(notes_by_anchor.values()),
         }
@@ -3819,7 +3911,9 @@ def project_publication_to_typst_model(
             "ioc_rows": ioc_rows,
             "ioc_row_groups": ioc_row_groups,
             "original_indicator_note": original_indicator_note,
-            "opinion_refs": opinion_provenance_entries,
+            "opinion_refs": _opinion_traceability_refs(
+                opinion_provenance_entries, direct_opinion_finding_ids
+            ),
             "implant_identifier_rows": [
                 item for item in implant_material_rows if item["type"] == "attacker_github_c2_token"
             ],
