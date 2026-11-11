@@ -1051,6 +1051,8 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
 
     assert response.status_code == 200
     body = response.json()
+    assert len(body["advisor_guidance"]["reminder"]) <= 120
+    assert body["bridge_usage"] == body["advisor_guidance"]["bridge_usage"]
     assert body["bridge_conversation_id_scope"] == "local_autowork_record_only"
     assert body["bridge_external_target"] == {
         "mode": "stateless",
@@ -1067,6 +1069,33 @@ def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
     assert body["next_idempotent_action"]["path"].endswith("/reconciliation/visible/preview")
     assert body["next_idempotent_action"]["resubmission_allowed"] is False
     assert "abandon_path" not in body["next_idempotent_action"]
+
+
+def test_operator_status_route_accepts_editorial_guidance_with_bounded_reminder() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].version = 1
+    store.states.rows[INVESTIGATION_ID] = replace(
+        _working_state(), execution_mode=InvestigationExecutionMode.OPERATOR_LED
+    )
+    store.invocations.append(
+        ToolInvocation(
+            investigation_id=INVESTIGATION_ID,
+            operation_key="operator-authored-opinion",
+            tool_name="opinion.compose",
+            schema_version="1",
+            normalized_parameters={"selection": {"block_types": ["claim_verification"]}},
+            purpose="Compose an operator opinion draft.",
+            status=ToolInvocationStatus.SUCCEEDED,
+        )
+    )
+
+    response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
+
+    assert response.status_code == 200, response.text
+    guidance = response.json()["advisor_guidance"]
+    assert guidance["reason"] == "editorial_draft_due"
+    assert guidance["suggested_consultation_type"] == "draft_text"
+    assert len(guidance["reminder"]) <= 120
 
 
 def test_operator_status_reconciles_needs_review_even_with_refs_and_links_reservation() -> None:
@@ -1198,6 +1227,8 @@ def test_operator_status_compact_view_limits_invocations_and_payload_size() -> N
         "version": 1,
     }
     assert compact["budget"] == full["budget"]
+    assert compact["bridge_usage"] == full["bridge_usage"]
+    assert compact["bridge_usage"]["tools_since_last_consult"] == 60
     assert compact["reconciliation_tasks"] == []
     assert compact["next_analytic_action"] == full["next_analytic_action"]
     assert compact["next_idempotent_action"] == full["next_idempotent_action"]
@@ -1206,6 +1237,7 @@ def test_operator_status_compact_view_limits_invocations_and_payload_size() -> N
         "sha256": full["evidence_checkpoint"]["sha256"],
     }
     assert compact["budget_reservation_counts"] == {"total": 1, "reserved": 1}
+    assert len(full["advisor_guidance"]["reminder"]) <= 120
     assert len(compact_response.content) < len(full_response.content) // 2
 
     invalid_response = client.get(
