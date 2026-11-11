@@ -31,6 +31,8 @@ from cti_app.application.external_effects import (
     ExternalObservationHashPolicy,
     NoSubmissionProofKind,
     ReuseDecision,
+    VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
+    VT_PASSIVE_READ_FAMILIES,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
     advisor_disclosure_policy,
@@ -718,13 +720,22 @@ class SqlAlchemyExternalEffectClaimStore:
     ) -> bool:
         if outcome_code is not None and (
             not isinstance(outcome_code, str)
-            or outcome_code not in {"bridge_rate_limited", "bridge_rejected"}
+            or outcome_code
+            not in {
+                "bridge_rate_limited",
+                "bridge_rejected",
+                *VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
+            }
         ):
             return False
         async with self._session_factory() as session:
             async with session.begin():
                 row = await self._claim_for_transition(session, claim_id)
                 if row is None:
+                    return False
+                if outcome_code in VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES and (
+                    row.provider != "vt" or row.family not in VT_PASSIVE_READ_FAMILIES
+                ):
                     return False
                 await self._lock_transition_parents(session, row)
                 now = datetime.now(UTC)
@@ -2294,7 +2305,12 @@ def _claim_to_domain(row: ExternalEffectClaimRow) -> ExternalEffectClaim:
         outcome_code=(
             row.last_error_code
             if row.state == EffectClaimState.COMPLETED.value
-            and row.last_error_code in {"bridge_rate_limited", "bridge_rejected"}
+            and row.last_error_code
+            in {
+                "bridge_rate_limited",
+                "bridge_rejected",
+                *VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
+            }
             else None
         ),
     )

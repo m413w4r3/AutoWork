@@ -476,6 +476,34 @@ async def test_pcap_redirect_is_archived_and_not_followed_outside_coordinator() 
 
 
 @pytest.mark.asyncio
+async def test_pcap_provider_404_is_a_terminal_http_error_not_needs_review() -> None:
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            404,
+            json={"error": {"code": "NotFound"}},
+            request=request,
+        )
+
+    adapter, clients = _make_adapter(upstream)
+    try:
+        with pytest.raises(VirusTotalHttpError) as caught:
+            await adapter.behaviour_pcap("sandbox-1", sink=BytesIO())
+    finally:
+        await _close(clients)
+
+    assert caught.value.status_code == 404
+    assert caught.value.code == "virustotal_not_found"
+    assert calls == 1
+    claims = tuple(adapter._test_external_effect_store.claims.values())
+    assert len(claims) == 1
+    assert claims[0].state.value == "COMPLETED"
+
+
+@pytest.mark.asyncio
 async def test_download_url_ticket_uses_same_headerless_signed_transport() -> None:
     seen: list[str] = []
 

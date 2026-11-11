@@ -458,6 +458,14 @@ class ExternalEffectFailureStage(StrEnum):
     ARCHIVE_REFERENCE_INVALID = "archive_reference_invalid"
 
 
+VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES = frozenset(
+    {
+        "vt_raw_archive_write_failed",
+        "vt_archive_reference_invalid",
+    }
+)
+
+
 class SafeExternalEffectFailure(RuntimeError):
     """A transport failure with a bounded, non-sensitive diagnostic stage."""
 
@@ -1206,11 +1214,40 @@ class ExternalEffectCoordinator:
                     mark_invocation_on_ambiguity=mark_invocation_on_ambiguity,
                 )
             except Exception as exc:
-                failure_stage = (
-                    _passive_read_failure_stage(exc)
-                    if record_passive_failure_stage
-                    else "transport_outcome_unknown"
+                terminal_archive_code = (
+                    f"vt_{exc.failure_stage.value}"
+                    if (
+                        isinstance(exc, SafeExternalEffectFailure)
+                        and record_passive_failure_stage
+                        and _is_retryable_vt_passive_read(prepared)
+                    )
+                    else None
                 )
+                if terminal_archive_code in VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES:
+                    try:
+                        completed = await claim_store.complete(
+                            consume.claim_id,
+                            result_ref=None,
+                            evidence_refs=(),
+                            outcome_code=terminal_archive_code,
+                        )
+                    except Exception:
+                        completed = False
+                    if completed:
+                        return Completed(
+                            consume.claim_id,
+                            None,
+                            (),
+                            terminal_archive_code,
+                            payload=b"",
+                        )
+                    failure_stage = "claim_completion_failed"
+                else:
+                    failure_stage = (
+                        _passive_read_failure_stage(exc)
+                        if record_passive_failure_stage
+                        else "transport_outcome_unknown"
+                    )
                 await self._seal_needs_review(
                     consume.claim_id,
                     failure_stage,
@@ -1350,6 +1387,9 @@ class ExternalEffectCoordinator:
         if claim.state is EffectClaimState.COMPLETED:
             if claim.outcome_code is not None:
                 if (
+                    claim.outcome_code in VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES
+                    and _is_retryable_vt_passive_read(prepared)
+                ) or (
                     claim.invocation_id == authority.invocation_id
                     and claim.bridge_turn_id == authority.bridge_turn_id
                     and claim.model_run_id == authority.model_run_id
@@ -1443,7 +1483,11 @@ del _bind_capability_init
 
 
 def _is_safe_outcome_code(value: str) -> bool:
-    return isinstance(value, str) and value in {"bridge_rate_limited", "bridge_rejected"}
+    return isinstance(value, str) and value in {
+        "bridge_rate_limited",
+        "bridge_rejected",
+        *VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
+    }
 
 
 def _passive_read_failure_stage(error: Exception) -> str:
@@ -1460,7 +1504,7 @@ def _passive_read_failure_stage(error: Exception) -> str:
     return f"transport_exception_{exception_name[:40]}"
 
 
-_RETRYABLE_VT_READ_FAMILIES = frozenset(
+VT_PASSIVE_READ_FAMILIES = frozenset(
     {
         "vt.file_report",
         "vt.object_report",
@@ -1470,6 +1514,7 @@ _RETRYABLE_VT_READ_FAMILIES = frozenset(
         "vt.behaviour_pcap",
     }
 )
+_RETRYABLE_VT_READ_FAMILIES = VT_PASSIVE_READ_FAMILIES
 
 
 def _is_retryable_vt_passive_read(prepared: PreparedExternalRequest) -> bool:
@@ -1504,4 +1549,6 @@ __all__ = [
     "Refused",
     "ReuseDecision",
     "TransportResponse",
+    "VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES",
+    "VT_PASSIVE_READ_FAMILIES",
 ]

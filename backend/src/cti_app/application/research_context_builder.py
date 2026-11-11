@@ -1334,7 +1334,7 @@ class ResearchContextBuilder:
                 effect=item.effect,
                 arguments_schema=thaw_json(item.input_schema),
             )
-            for item in (executable_definitions[:MAX_CONTEXT_TOOLS])
+            for item in executable_definitions
         )
         pivot_tools = tuple(
             ToolSummaryV1(

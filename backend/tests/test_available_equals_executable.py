@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -652,6 +653,28 @@ async def test_osint_policy_keeps_external_disclosure_denials(denial: str) -> No
 
 
 @pytest.mark.asyncio
+async def test_every_executable_tool_schema_is_exposed_past_context_tool_limit() -> None:
+    fixture, state, registry, _summaries, _service, _tools, _identifiers = (
+        await _seeded_fixture()
+    )
+    expected_names = set()
+    for index in range(65):
+        name = f"synthetic.context_tool_{index:02d}"
+        definition, adapter = _schema_tool(
+            name,
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            ToolEffect.LOCAL_COMPUTE,
+            "vt.read",
+        )
+        registry.register(definition, adapter)
+        expected_names.add(name)
+
+    context = await _build_context(fixture, state, registry)
+
+    assert expected_names <= {item.name for item in context.available_tools}
+
+
+@pytest.mark.asyncio
 async def test_available_pivots_and_exposed_families_execute_with_seeded_state() -> None:
     fixture, state, registry, _summaries, service, tools, identifiers = await _seeded_fixture()
     context = await _build_context(fixture, state, registry)
@@ -740,6 +763,64 @@ async def test_available_pivots_and_exposed_families_execute_with_seeded_state()
 
     assert invoked_tools >= {"sample.analyze", "archive.extract_member", "rule.propose"}
     assert all(tool.calls for tool in tools.values() if tool.name in invoked_tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("object_type", "object_id", "evidence_text"),
+    [
+        (
+            "domains",
+            "unconfirmed-evidence.example",
+            "Resolved endpoint: unconfirmed-evidence.example",
+        ),
+        (
+            "ip_addresses",
+            "203.0.113.42",
+            "Resolved address: 203.0.113.42",
+        ),
+    ],
+)
+async def test_vt_object_reads_resolve_canonical_evidence_payload_references(
+    object_type: str, object_id: str, evidence_text: str
+) -> None:
+    fixture, _state, _registry, _summaries, _service, _tools, _identifiers = (
+        await _seeded_fixture()
+    )
+    payload = {
+        "schema": "ghidra-investigation-observation.v1",
+        "data": {"strings": [evidence_text]},
+    }
+    raw = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    blob_id = uuid4()
+    fixture.proof_artifacts.store(blob_id, raw)
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="native.inspect",
+        source_version="synthetic.v1",
+        observed_at=datetime.now(UTC),
+        object_type="native_analysis",
+        object_id="native-analysis:synthetic",
+    )
+    await fixture.observations.append_if_absent(observation)
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.object_report",
+        arguments={"object_type": object_type, "object_id": object_id},
+        envelope=fixture.envelope,
+    )
+
+    assert any(
+        reference.kind == "evidence_observation" and reference.id == str(observation.id)
+        for reference in references
+    )
 
 
 @pytest.mark.asyncio

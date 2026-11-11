@@ -170,12 +170,13 @@ _OPERATOR_ERROR_MESSAGES = {
         "before retrying this action."
     ),
     "vt_hash_not_grounded": (
-        "Cite an observation or a source-documented SHA-256 IOC, or associate the hash through "
-        "vt.file_report before retrying."
+        "Cite an observation anchored to this SHA-256, a hash-verified canonical VT relationship "
+        "payload containing it, or a source-documented SHA-256 IOC before retrying."
     ),
     "source_references_required": (
-        "Add a canonical observation reference from this investigation that is associated with "
-        "the exact requested target, then retry."
+        "Add a server-resolvable source from this investigation: a confirmed IOC with source "
+        "documents, or an observation anchored to the exact target. For domains and IPs, a "
+        "hash-verified canonical JSON evidence payload containing the exact target also qualifies."
     ),
     "finding_observation_not_found": (
         "Refresh the observation list and cite an observation that exists in this investigation."

@@ -625,6 +625,7 @@ class _VirusTotalAdapter:
                         ToolInvocationStatus.UNAVAILABLE,
                         reason="provider_authorization_refused",
                         message="VirusTotal refused authorization for this provider capability.",
+                        error_code=_safe_error_code(exc),
                     )
                 if _explicit_not_found(exc):
                     observation = await self._record_negative(
@@ -640,6 +641,7 @@ class _VirusTotalAdapter:
                         ToolInvocationStatus.EMPTY,
                         reason="not_found",
                         message="VirusTotal explicitly reported that this object was not found.",
+                        error_code=_safe_error_code(exc),
                         extra={"negative_observation_ref": str(observation.id)},
                     )
                 return self._result(
@@ -647,14 +649,16 @@ class _VirusTotalAdapter:
                     ToolInvocationStatus.FAILED,
                     reason="provider_error",
                     message="VirusTotal returned an unsuccessful response.",
+                    error_code=_safe_error_code(exc),
                     extra={"http_status": exc.status_code} if exc.status_code is not None else {},
                 )
-            except VirusTotalError:
+            except VirusTotalError as exc:
                 return self._result(
                     state,
                     ToolInvocationStatus.FAILED,
                     reason="provider_error",
                     message="The VirusTotal operation failed.",
+                    error_code=_safe_error_code(exc),
                 )
             except (TypeError, ValueError):
                 return self._result(
@@ -1887,7 +1891,7 @@ def _external_disclosure_allowed(envelope: InvestigationEnvelope) -> bool:
 def _explicit_not_found(error: VirusTotalHttpError) -> bool:
     if error.status_code != 404:
         return False
-    code = (error.error_code or error.code or "").lower().replace("-", "_")
+    code = (error.error_code or "").casefold().replace("-", "_")
     return code in {
         "notfound",
         "not_found",
@@ -1897,8 +1901,25 @@ def _explicit_not_found(error: VirusTotalHttpError) -> bool:
     }
 
 
-def _safe_error_code(error: VirusTotalHttpError) -> str:
-    return sanitize_evidence_text(error.error_code or error.code, max_chars=128)
+def _safe_error_code(error: VirusTotalError) -> str:
+    raw_code = getattr(error, "error_code", None) or getattr(error, "code", None)
+    if not isinstance(raw_code, str):
+        return "virustotal_provider_error"
+    candidate = sanitize_evidence_text(raw_code, max_chars=128).casefold()
+    candidate = re.sub(r"[^a-z0-9]+", "_", candidate).strip("_")
+    if (
+        len(candidate) <= 64
+        and re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*", candidate) is not None
+        and not (
+            len(candidate) in {32, 40, 64}
+            and all(character in "0123456789abcdef" for character in candidate)
+        )
+    ):
+        return candidate
+    fallback = getattr(error, "code", None)
+    if isinstance(fallback, str) and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", fallback):
+        return fallback
+    return "virustotal_provider_error"
 
 
 def _safe_external_effect_error_code(error: Exception) -> str:

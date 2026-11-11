@@ -1564,6 +1564,50 @@ async def test_trusted_vt_source_refs_resolve_sha256_observation_and_confirmed_i
 
 
 @pytest.mark.asyncio
+async def test_trusted_vt_file_report_refs_resolve_hash_from_relationship_payload() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    related_hash = "c" * 64
+    parent_hash = "b" * 64
+    payload = {
+        "schema": "virustotal-investigation-summary.v1",
+        "descriptors": [{"id": related_hash, "type": "file"}],
+    }
+    raw = canonical_json_bytes(payload)
+    blob_id = uuid4()
+    fixture.proof_artifacts.store(blob_id, raw)
+    observation = EvidenceObservation(
+        investigation_id=investigation.id,
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="VirusTotal",
+        source_version="vt.relationship.v1",
+        observed_at=datetime.now(UTC),
+        object_type="sha256",
+        object_id=parent_hash,
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": related_hash},
+        envelope=fixture.envelope,
+    )
+
+    assert references == (
+        EvidenceReference("sample_hash", related_hash, "sample-hash.v1", related_hash),
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+    )
+
+@pytest.mark.asyncio
 async def test_vt_download_allows_unassociated_confirmed_documented_ioc() -> None:
     sample_hash = "a" * 64
     fixture = _vt_download_fixture(documented_hash=sample_hash)
