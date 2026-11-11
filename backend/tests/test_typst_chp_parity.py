@@ -63,6 +63,7 @@ from cti_app.domain.analyst_opinion import (
     opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
 )
+from cti_app.domain.investigation import FindingAssessment, FindingKind
 from cti_app.domain.investigation_graph import (
     InvestigationGraph,
     InvestigationGraphConfidence,
@@ -1916,6 +1917,15 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
         blocks=opinion_blocks_with_observations(opinion.blocks, observations),
         content_sha256="",
     )
+    rendered_findings = (
+        replace(
+            citation_context.findings[0],
+            kind=FindingKind.DETECTION,
+            assessment=FindingAssessment.SUPPORTED,
+            statement="Candidate real_partial avec model_blob_id et rule.test.",
+        ),
+        *citation_context.findings[1:],
+    )
     evidence_observation = citation_context.observations[0]
     infrastructure_graph = InvestigationGraph(
         investigation_id=preview_opinion.investigation_id,
@@ -1959,6 +1969,8 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     preview = TypstDraftPreviewDocument(
         publication,
         preview_opinion,
+        findings=rendered_findings,
+        evidence_observations=citation_context.observations,
         infrastructure_graph=infrastructure_graph,
     )
 
@@ -2093,6 +2105,11 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     )
     pdf_text = extracted.stdout.decode("utf-8", errors="replace")
     normalized_text = pdf_text.upper().replace("\u2019", "'")
+    assert "real_partial" not in pdf_text
+    assert "model_blob_id" not in pdf_text
+    assert "rule.test" not in pdf_text
+    compact_pdf_text = re.sub(r"\s+", " ", pdf_text).casefold()
+    assert "détection — étayé" in compact_pdf_text
     assert render_data["document_label"] == (
         f"Aperçu de l'avis v{preview.analyst_opinion.version} — BROUILLON non approuvé"
     )

@@ -244,11 +244,6 @@ _EVIDENCE_OBJECT_TYPE_READER_LABELS = {
     "query": "requête",
     "claim": "affirmation",
 }
-_OPINION_READER_UUID = re.compile(
-    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-    re.IGNORECASE,
-)
-_OPINION_READER_LONG_HEX = re.compile(r"(?<![0-9a-f])[0-9a-f]{40,}(?![0-9a-f])", re.IGNORECASE)
 _NOVELTY_CLASS_LABELS = {
     NoveltyClass.NEW_TO_ARTICLE: "nouveau pour l'article",
     NoveltyClass.ALREADY_DOCUMENTED_BUT_NEW_DETAIL: "déjà documenté, avec un détail nouveau",
@@ -300,19 +295,12 @@ def _reader_enum_label(value: object, labels: Mapping[str, str], fallback: str) 
 
 def _opinion_finding_reader_label(finding: InvestigationFinding | None) -> str:
     if finding is None:
-        return "Constat logique"
-    statement = " ".join(finding.statement.split())
-    statement = _OPINION_READER_UUID.sub("identifiant technique", statement)
-    statement = _OPINION_READER_LONG_HEX.sub("empreinte technique", statement)
-    statement = statement.replace("…", " ")
-    if len(statement) > 160:
-        boundary = statement.rfind(" ", 0, 161)
-        statement = statement[:boundary] if boundary > 0 else ""
-    statement = statement.rstrip(" ,;:-")
-    kind_label = _FINDING_KIND_LABELS.get(finding.kind, "constat")
-    if statement:
-        return f"{kind_label} : {statement}"
-    assessment_label = _FINDING_ASSESSMENT_LABELS.get(finding.assessment, "statut non précisé")
+        return "Constat technique"
+    kind_label = _FINDING_KIND_LABELS.get(finding.kind, "Constat technique")
+    assessment_label = _FINDING_ASSESSMENT_LABELS.get(
+        finding.assessment,
+        "évaluation non précisée",
+    )
     return f"{kind_label} — {assessment_label}"
 
 
