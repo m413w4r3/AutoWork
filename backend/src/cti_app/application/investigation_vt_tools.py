@@ -558,15 +558,35 @@ class _VirusTotalAdapter:
                 ):
                     proven_pre_send_refusal = True
                     refusal_status = _pre_send_refusal_status(pre_send_reason)
+                safe_pre_send_reason = (
+                    pre_send_reason
+                    if proven_pre_send_refusal
+                    and pre_send_reason is not None
+                    and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", pre_send_reason)
+                    else None
+                )
+                correction = (
+                    _pre_send_refusal_correction(safe_pre_send_reason)
+                    if safe_pre_send_reason is not None
+                    else None
+                )
                 return self._result(
                     state,
                     refusal_status,
-                    reason="external_effect_refused",
-                    message="The VirusTotal request was refused before a new send.",
-                    error_code=_safe_external_effect_error_code(exc),
+                    reason=safe_pre_send_reason or "external_effect_refused",
+                    message=correction or "The VirusTotal request was refused before a new send.",
+                    error_code=safe_pre_send_reason or _safe_external_effect_error_code(exc),
                     framework_pre_submission_proof=(
                         FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
                         if proven_pre_send_refusal
+                        else None
+                    ),
+                    extra=(
+                        {
+                            "detail_code": safe_pre_send_reason,
+                            "correction": correction,
+                        }
+                        if safe_pre_send_reason is not None and correction is not None
                         else None
                     ),
                     zero_cost=proven_pre_send_refusal,
@@ -1947,6 +1967,25 @@ def _pre_send_refusal_status(reason_code: str) -> ToolInvocationStatus:
     }:
         return ToolInvocationStatus.POLICY_DENIED
     return ToolInvocationStatus.FAILED
+
+
+def _pre_send_refusal_correction(reason_code: str) -> str:
+    if reason_code in {
+        "malformed_source_reference",
+        "source_references_mismatch",
+        "source_references_required",
+        "trusted_source_inputs_required",
+        "trusted_source_reference_resolution_failed",
+        "unrecognized_source_reference_kind",
+    }:
+        return (
+            "No VirusTotal request was sent. Refresh the current investigation's canonical source "
+            "references and verify that they still support the requested hash before retrying."
+        )
+    return (
+        "No VirusTotal request was sent. Review the refusal detail and current investigation "
+        "scope, then retry after resolving the preparation issue."
+    )
 
 
 def _normalize_dork(value: str) -> str:
