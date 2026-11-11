@@ -959,7 +959,13 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert 'rgb("#5D7374")' in production_helpers_source
     assert "fill: white" in production_helpers_source
     assert 'stroke: 0.4pt + rgb("#AEB7C0")' in production_helpers_source
-    assert "max-height-fraction: 0.35" in production_helpers_source
+    diagram_renderer = production_helpers_source.split("#let render-diagram(", 1)[1]
+    assert re.search(
+        r"let image-height-fraction = .*?else \{\s*0\.35\s*\}",
+        diagram_renderer,
+        re.DOTALL,
+    )
+    assert "max-height-fraction: image-height-fraction" in diagram_renderer
     assert "align(center)[" in production_helpers_source
     assert 'style: "italic"' in production_helpers_source
 
