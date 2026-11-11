@@ -21,9 +21,10 @@ from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _TEMPLATE_ROOT = _REPOSITORY_ROOT / "chpTypst"
+_FONT_BUNDLE_ROOT = Path(os.environ.get("FONT_BUNDLE_ROOT", str(_TEMPLATE_ROOT)))
 _FONT_PATHS = (
-    _TEMPLATE_ROOT / "HankenGrotesk",
-    _TEMPLATE_ROOT / "CascadiaCode" / "otf" / "static",
+    _FONT_BUNDLE_ROOT / "HankenGrotesk",
+    _FONT_BUNDLE_ROOT / "CascadiaCode" / "ttf" / "static",
 )
 _MARGIN = "Synthetic paragraph text documents a fictional formatting example. "
 _LONG_SENTENCE = (

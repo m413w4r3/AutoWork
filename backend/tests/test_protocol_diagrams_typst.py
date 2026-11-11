@@ -53,11 +53,24 @@ from cti_app.domain.protocol_model import (
     ProtocolTransitionV1,
     ProtocolValidationStatus,
 )
+from cti_app.domain.publication import (
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
+)
+from cti_app.domain.publication_document import publication_document_text_anchors
+from cti_app.domain.semantic_annotation import (
+    SemanticParagraphV1,
+    SemanticRole,
+    SemanticTextSpanV1,
+    SemanticTextV1,
+)
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.repositories.investigation import _opinion_from_row
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_edition_typst_rendering import _edition_document
 from tests.test_protocol_diagrams import _three_views
+from tests.test_publication_builder_v4 import _frontmatter_v6_case
 from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 from tests.test_typst_compiler_runtime import _build_runtime_workspace
 
@@ -549,7 +562,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         source="documented:claim:handshake-facts",
         documented_ref_kind="claim",
         documented_ref_id="handshake",
-        documented_source_sha256="a" * 64,
+        documented_source_sha256="b" * 64,
     )
     model = ProtocolModelV1(
         schema_version="ProtocolModelV1",
@@ -798,7 +811,36 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     assert not state_view.diagram.edges
     assert all("Message 01 Message 01" not in node.label for node in state_view.diagram.nodes)
 
-    base = _base_v5()
+    base, *_case = _frontmatter_v6_case()
+    article_section = PublicationSectionV1(
+        kind=PublicationSectionKind.TECHNICAL,
+        heading="Analyse complémentaire",
+        paragraphs=(
+            PublicationParagraphV1(
+                text="La source documente un fait utile à la vérification.",
+                evidence_refs=base.document.lead[0].evidence_refs,
+            ),
+        ),
+    )
+    article_document = replace(base.document, sections=(*base.document.sections, article_section))
+    base = replace(
+        base,
+        document=article_document,
+        semantic_text=SemanticTextV1(
+            schema_version=base.semantic_text.schema_version,
+            policy_version=base.semantic_text.policy_version,
+            paragraphs=tuple(
+                SemanticParagraphV1(
+                    anchor=anchor,
+                    spans=(SemanticTextSpanV1(SemanticRole.TEXT, text),),
+                )
+                for anchor, text in publication_document_text_anchors(
+                    article_document,
+                    references=base.references,
+                ).items()
+            ),
+        ),
+    )
     opinion, citation_context = _approved_opinion(base)
     long_hex = "AA" * 48
     yara_rule = (
@@ -910,7 +952,12 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         content_sha256="",
     )
     preview_source = TypstRenderer().render(
-        TypstDraftPreviewDocument(base, preview_opinion),
+        TypstDraftPreviewDocument(
+            base,
+            preview_opinion,
+            findings=citation_context.findings,
+            evidence_observations=citation_context.observations,
+        ),
         publication_bundle,
         document_label="Documented protocol preview test",
     )
@@ -938,6 +985,36 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     ]
     preview_text_result = _run_blocking_process(("pdftotext", str(preview_pdf_path), "-"), 30)
     preview_text = " ".join(preview_text_result.stdout.decode("utf-8", errors="replace").split())
+    assert "[F1]" in preview_text
+    assert "[E1]" in preview_text
+    assert "provenance des figures d'avis" not in preview_text.casefold()
+    assert "A" * 64 in preview_text
+    assert (
+        re.search(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            preview_text,
+            re.IGNORECASE,
+        )
+        is None
+    )
+    assert "The cited claim is supported." in preview_text
+    assert "source d'affirmation" in preview_text.casefold()
+    sha256_field = re.search(r"\b[a-z][a-z0-9_]*_sha256\b", preview_text, re.IGNORECASE)
+    assert sha256_field is None
+    text_without_content_hex = re.sub(re.escape(long_hex), "", preview_text, flags=re.IGNORECASE)
+    text_without_content_hex = re.sub(
+        r"\ba{40,}\b", "", text_without_content_hex, flags=re.IGNORECASE
+    )
+    assert (
+        re.search(
+            r"(?<![0-9a-f])[0-9a-f]{40,}(?![0-9a-f])",
+            text_without_content_hex,
+            re.IGNORECASE,
+        )
+        is None
+    )
+    assert "203.0.113.94" in preview_text
+    assert "203.0.113[.]94" in preview_text
     assert all(
         label in preview_text
         for label in (
