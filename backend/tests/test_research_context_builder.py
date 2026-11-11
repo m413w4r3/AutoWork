@@ -3565,9 +3565,10 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
     )
     changed_context = context.model_copy(update={"advisor_guidance": changed_guidance})
     # Guidance, including the compact usage summary, participates in context identity.
-    assert hashlib.sha256(context.canonical_bytes()).hexdigest() != hashlib.sha256(
-        changed_context.canonical_bytes()
-    ).hexdigest()
+    assert (
+        hashlib.sha256(context.canonical_bytes()).hexdigest()
+        != hashlib.sha256(changed_context.canonical_bytes()).hexdigest()
+    )
 
 
 @pytest.mark.asyncio

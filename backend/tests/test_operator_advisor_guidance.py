@@ -477,7 +477,10 @@ async def test_explicit_negative_result_is_measured_not_missing_data():
         available_tools=(),
     )
 
-    assert result["reason"] is None
+    # The negative result is measured (never "missing data"); the soft reminder only asks
+    # for a Bridge interpretation of the notable negative.
+    assert result["reason"] == "interpretation_after_result"
+    assert result["suggested_consultation_type"] == "pivot_strategy"
 
 
 @pytest.mark.asyncio
@@ -748,6 +751,16 @@ async def test_guidance_summarizes_bridge_usage_without_internal_identifiers():
 @pytest.mark.asyncio
 async def test_plan_checkpoint_reappears_after_three_analysis_tools_without_recent_plan():
     base = datetime.now(UTC)
+    tool_names = ("sample.get_feature_pack", "archive.list_members", "dotnet.list_types")
+    observation_ids = [uuid4() for _ in tool_names]
+    observations = tuple(
+        SimpleNamespace(
+            id=observation_id,
+            observed_at=base + timedelta(seconds=index + 1),
+            kind=EvidenceKind.BINARY_ANALYSIS,
+        )
+        for index, observation_id in enumerate(observation_ids, 1)
+    )
     result = await build_advisor_guidance(
         invocations=(
             invocation(
@@ -755,11 +768,18 @@ async def test_plan_checkpoint_reappears_after_three_analysis_tools_without_rece
                 created_at=base,
                 parameters={"consultation_type": "pivot_strategy"},
             ),
-            invocation("sample.get_feature_pack", created_at=base + timedelta(seconds=1)),
-            invocation("archive.list_members", created_at=base + timedelta(seconds=2)),
-            invocation("dotnet.list_types", created_at=base + timedelta(seconds=3)),
+            *(
+                invocation(
+                    name,
+                    created_at=base + timedelta(seconds=index),
+                    response_refs=(observation_id,),
+                )
+                for index, (name, observation_id) in enumerate(
+                    zip(tool_names, observation_ids, strict=True), 1
+                )
+            ),
         ),
-        observations=(),
+        observations=observations,
         evidence_summaries=None,
         available_tools=(),
     )
@@ -840,9 +860,7 @@ async def test_repeated_file_report_for_same_hash_does_not_raise_vt_checkpoint_c
 async def test_operator_authored_yara_rule_suggests_bridge_draft_before_next_action():
     base = datetime.now(UTC)
     result = await build_advisor_guidance(
-        invocations=(
-            invocation("rule.propose", created_at=base),
-        ),
+        invocations=(invocation("rule.propose", created_at=base),),
         observations=(),
         evidence_summaries=None,
         available_tools=("rule.propose_bridge",),

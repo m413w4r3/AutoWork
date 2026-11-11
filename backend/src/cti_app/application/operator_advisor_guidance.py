@@ -131,11 +131,9 @@ def _checkpoint_reminder(reason: str | None, consultation_type: str | None) -> s
             "Pivots VT répétés: demander une stratégie Bridge avant de poursuivre."
         ),
         "before_yara_proposal": (
-            "Règle YARA opérateur: demander un brouillon Bridge, puis l’importer."
+            "Règle YARA opérateur: demander un brouillon Bridge, puis l'importer."
         ),
-        "suricata_draft_due": (
-            "Modèle réseau exploitable: demander une règle Suricata à Bridge."
-        ),
+        "suricata_draft_due": ("Modèle réseau exploitable: demander une règle Suricata à Bridge."),
         "interpretation_after_result": (
             "Résultat important: demander une interprétation Bridge avant de conclure."
         ),
@@ -178,9 +176,7 @@ def _bridge_usage(invocations: Sequence[Any]) -> dict[str, Any]:
         "total_consultations": len(consultations),
         "last_consult": last_consult,
         "tools_since_last_consult": sum(
-            1
-            for item in invocations[last_position + 1 :]
-            if item.tool_name != ADVISOR_TOOL_NAME
+            1 for item in invocations[last_position + 1 :] if item.tool_name != ADVISOR_TOOL_NAME
         ),
     }
 
@@ -359,8 +355,7 @@ def _vt_pivot_checkpoint_position(invocations: Sequence[Any]) -> int | None:
         value.casefold()
         for item in invocations[: latest_pivot + 1]
         if item.tool_name == "vt.file_report"
-        if isinstance((value := _parameters(item).get("file_hash")), str)
-        and value
+        if isinstance((value := _parameters(item).get("file_hash")), str) and value
     }
     pivot_positions: list[int] = []
     for index, item in enumerate(invocations[latest_pivot + 1 :], start=latest_pivot + 1):
@@ -607,34 +602,25 @@ def _checkpoint(
             invocations, yara_trigger_position + 1
         )
         if (
-            (latest_yara < latest_corpus_activity or latest_yara < 0)
-            and not _checkpoint_disposition_after(
-                invocations, "before_yara_proposal", yara_trigger_position
-            )
+            latest_yara < latest_corpus_activity or latest_yara < 0
+        ) and not _checkpoint_disposition_after(
+            invocations, "before_yara_proposal", yara_trigger_position
         ):
             return "before_yara_proposal", "yara_draft"
 
     network_trigger_position = _network_checkpoint_position(invocations, observations)
     if network_trigger_position is not None:
-        latest_suricata = _latest_successful_consultation_position(
-            invocations, "suricata_draft"
-        )
-        if (
-            latest_suricata < network_trigger_position
-            and not _checkpoint_disposition_after(
-                invocations, "suricata_draft_due", network_trigger_position
-            )
+        latest_suricata = _latest_successful_consultation_position(invocations, "suricata_draft")
+        if latest_suricata < network_trigger_position and not _checkpoint_disposition_after(
+            invocations, "suricata_draft_due", network_trigger_position
         ):
             return "suricata_draft_due", "suricata_draft"
 
     opinion_trigger_position = _unattributed_opinion_position(invocations)
     if opinion_trigger_position is not None:
         latest_draft = _latest_successful_consultation_position(invocations, "draft_text")
-        if (
-            latest_draft < opinion_trigger_position
-            and not _checkpoint_disposition_after(
-                invocations, "editorial_draft_due", opinion_trigger_position
-            )
+        if latest_draft < opinion_trigger_position and not _checkpoint_disposition_after(
+            invocations, "editorial_draft_due", opinion_trigger_position
         ):
             return "editorial_draft_due", "draft_text"
 
@@ -648,11 +634,8 @@ def _checkpoint(
             )
             for index, item in enumerate(invocations)
         )
-        if (
-            not interpreted_after
-            and not _checkpoint_disposition_after(
-                invocations, "interpretation_after_result", important_result_position
-            )
+        if not interpreted_after and not _checkpoint_disposition_after(
+            invocations, "interpretation_after_result", important_result_position
         ):
             return "interpretation_after_result", "pivot_strategy"
 
