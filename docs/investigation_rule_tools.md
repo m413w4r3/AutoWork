@@ -20,7 +20,24 @@ arguments avant d’appeler les adaptateurs.
 | `rule.test` | `candidate_id`, `version` facultatif | Recompile et teste la version sélectionnée (par défaut la dernière) contre le corpus courant. Ajoute une observation de rapport, sans créer de nouvelle version. |
 | `rule.revise` | `candidate_id`, `parent_version` ; au moins un de `motifs` ou `condition` à l’exécution ; `meta` facultatif | Construit, compile et teste la nouvelle version. Le parent doit être la dernière version. |
 | `rule.compare` | `candidate_id`, `version_a`, `version_b` | Compare les résultats des deux sources sur le même corpus courant et propose un finding `detection` avec les références d’observation. |
-| `rule.get` | `candidate_id`, `version` facultatif, `include_history` facultatif | Retourne les résumés et rapports enregistrés ; l’historique est borné aux 64 dernières versions. |
+| `rule.get` | `candidate_id`, `version`, `include_history` et `source_offset` facultatifs | Retourne les résumés et rapports enregistrés, ainsi qu’une page de la source YARA exacte de la version sélectionnée ; l’historique est borné aux 64 dernières versions. |
+
+`rule.get` retourne au plus 16 Kio de source par appel. Si `source_complete`
+est faux, reprendre à `source_next_offset` avec `source_offset`, concaténer les
+pages dans l’ordre et vérifier le SHA-256 annoncé dans `source_sha256`.
+`source_version`, `source_status` et `latest_test_report_id` identifient la
+version et son rapport le plus récent ; les résumés d’historique donnent aussi
+l’identifiant d’observation de leur dernier rapport disponible. Les versions
+et rapports restent limités à l’enquête appelante.
+
+`rule.get` expose les candidates YARA du RuleWorkbench. Les candidates
+Suricata importées par `rule.import_suricata_bridge_candidate` sont des
+observations `advisor_call` séparées : récupérer `candidate_observation_id`
+dans le résultat d’import, puis lire
+`GET /api/investigations/{investigation_id}/operator/observations/{observation_id}?view=payload`.
+Reconstituer le JSON avec les champs `offset`, `length` et `next_offset`, puis
+exporter `payload.output.rule_source` et vérifier son hash avec
+`payload.output.rule_source_sha256`.
 
 Les entrées de `motifs` sont limitées à 128 motifs, chacun avec son type,
 provenance et références d’observation. Chaque chaîne est bornée à 512
@@ -121,10 +138,11 @@ non-comparables et les faux positifs ajoutés/retirés. Le finding `detection`
 retourné par `rule.compare` est une proposition à l’agent, pas un finding
 persisté automatiquement.
 
-La source YARA, les octets et les extraits ne sont jamais renvoyés par les
-outils ni incorporés aux observations. Les sorties et rapports exposent des
-hashes et des résumés bornés. Les chaînes de motifs restent des données non
-fiables validées localement avant compilation.
+La source YARA candidate sélectionnée est renvoyée par pages bornées à
+`rule.get`; les octets d’échantillon et les extraits ne sont pas renvoyés par
+les outils ni incorporés aux observations. Les sorties et rapports exposent
+des hashes et des résumés bornés. Les chaînes de motifs restent des données
+non fiables validées localement avant compilation.
 
 Les versions persistées sont immuables et portent leur parent (`v1`, `v2`, …).
 Le rejeu d’un appel avec la même clé d’idempotence renvoie le résultat mis en
