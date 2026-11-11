@@ -226,7 +226,7 @@ def create_external_effect_coordinator(
     return ExternalEffectCoordinator(
         SqlAlchemyExternalEffectClaimStore(
             session_factory,
-            policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
+            policy_guard=SqlAlchemyVirusTotalPolicyGuard(blob_store=blob_store),
             family_bindings=family_bindings,
             blob_store=blob_store,
         ),

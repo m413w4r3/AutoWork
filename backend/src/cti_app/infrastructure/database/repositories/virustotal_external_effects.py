@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.application.blob_storage import BlobStore
 from cti_app.application.external_effects import (
     ConsumePolicyContext,
     ExternalEffectClaim,
@@ -23,6 +24,12 @@ from cti_app.application.virustotal import (
     VirusTotalInvalidInputError,
     normalize_file_hash,
 )
+from cti_app.application.virustotal_evidence import (
+    MAX_VT_CANONICAL_EVIDENCE_BYTES,
+    canonical_vt_evidence_payload,
+    vt_hash_payload_contains,
+)
+from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.external_effects import (
     EffectClaimState,
     EvidenceReference,
@@ -72,6 +79,7 @@ _VT_HASH_READ_FAMILIES = {
     "vt.behaviour_pcap",
     "vt.relationships",
 }
+_VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES = _VT_HASH_READ_FAMILIES | {"vt.download_sample"}
 # VT and Bridge/advisor effects ignore source do_not_submit metadata;
 # external-LLM denials, TLP RED and licences continue to bind.
 _BRIDGE_FAMILY_PREFIXES = ("bridge.", "advisor.")
@@ -180,6 +188,16 @@ def _source_resolver_for_family(
     return resolve
 
 
+def _requested_hash_for_source_guard(prepared: PreparedExternalRequest) -> str | None:
+    requested_hash = _vt_file_hash_from_request(prepared)
+    if requested_hash is not None or prepared.family != "vt.download_sample":
+        return requested_hash
+    download_hash = prepared.canonical_request.get("sha256")
+    if isinstance(download_hash, str) and re.fullmatch(r"[0-9a-f]{64}", download_hash):
+        return download_hash
+    return None
+
+
 def virustotal_external_effect_family_bindings() -> dict[str, ExternalEffectFamilyBinding]:
     return {
         family: ExternalEffectFamilyBinding(
@@ -231,6 +249,43 @@ class VirusTotalReadReusePolicy:
 
 class SqlAlchemyVirusTotalPolicyGuard:
     """Check VT source disclosure and lock pinned OSINT policy before the envelope."""
+
+    def __init__(self, blob_store: BlobStore | None = None) -> None:
+        self._blob_store = blob_store
+
+    async def _relationship_payload_contains_requested_hash(
+        self,
+        session: AsyncSession,
+        observation: EvidenceObservationRow,
+        requested_hash: str,
+    ) -> bool:
+        if self._blob_store is None:
+            return False
+        blob = await session.scalar(
+            select(BlobRow)
+            .where(BlobRow.id == observation.blob_id)
+            .with_for_update()
+        )
+        if (
+            blob is None
+            or blob.sha256 != observation.sha256
+            or blob.size > MAX_VT_CANONICAL_EVIDENCE_BYTES
+        ):
+            return False
+        try:
+            descriptor = BlobDescriptor(
+                sha256=blob.sha256,
+                size=blob.size,
+                mime_type=blob.mime_type,
+                logical_bucket=blob.logical_bucket,
+            )
+            raw = await self._blob_store.read(
+                descriptor, max_bytes=MAX_VT_CANONICAL_EVIDENCE_BYTES
+            )
+        except Exception:
+            return False
+        payload = canonical_vt_evidence_payload(raw, observation.sha256)
+        return payload is not None and vt_hash_payload_contains(payload, requested_hash)
 
     async def lock_for_consume(
         self, database_session: AsyncSession, authority: ExternalEffectAuthority
@@ -406,6 +461,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             if reference.kind == "sample_hash"
         }
         observation_hashes: set[str] = set()
+        relationship_parent_hashes: set[str] = set()
         provider_report_hashes: set[str] = set()
         sample_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
@@ -483,30 +539,47 @@ class SqlAlchemyVirusTotalPolicyGuard:
                     )
                 ):
                     normalized_observation_hash = observation.object_id.casefold()
-                    requested_hash = _vt_file_hash_from_request(context.prepared)
+                    requested_hash = _requested_hash_for_source_guard(context.prepared)
                     if not re.fullmatch(
                         r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})",
                         normalized_observation_hash,
-                    ) or (
-                        context.prepared.family in _VT_HASH_READ_FAMILIES
+                    ):
+                        return False
+                    relation_grounds_requested_hash = False
+                    if (
+                        context.prepared.family in _VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES
                         and requested_hash is not None
                         and normalized_observation_hash != requested_hash
                     ):
-                        return False
+                        if (
+                            len(requested_hash) != 64
+                            or observation.kind.casefold() != "vt_relationship"
+                            or observation.source.casefold() != "virustotal"
+                            or object_type != "file"
+                            or not await self._relationship_payload_contains_requested_hash(
+                                session, observation, requested_hash
+                            )
+                        ):
+                            return False
+                        relation_grounds_requested_hash = True
                     if len(normalized_observation_hash) == 64:
                         if bridge_may_cite_provider_report_hash_without_sample(
                             family=context.prepared.family, observation=observation
                         ):
                             provider_report_hashes.add(normalized_observation_hash)
                         else:
-                            observation_hashes.add(normalized_observation_hash)
+                            if relation_grounds_requested_hash and requested_hash is not None:
+                                relationship_parent_hashes.add(normalized_observation_hash)
+                                observation_hashes.add(requested_hash)
+                            else:
+                                observation_hashes.add(normalized_observation_hash)
                 elif observation.object_type.casefold() in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
                     except ValueError:
                         return False
 
-        source_hashes = sample_hashes | observation_hashes
+        source_hashes = sample_hashes | observation_hashes | relationship_parent_hashes
         if (
             context.prepared.family in _VT_HASH_READ_FAMILIES
             and sample_hashes

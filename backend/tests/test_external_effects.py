@@ -49,6 +49,7 @@ from cti_app.application.external_effects import (
     validate_external_observation_hash,
 )
 from cti_app.application.model_gateway import BridgeExternalEffectBinding
+from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.external_effects import (
     ConsumedEffectPermit,
     EffectClaimState,
@@ -85,6 +86,7 @@ from cti_app.integrations.models import (
     HttpResponsesTransport,
     create_coordinated_http_responses_transport,
 )
+from tests.virustotal_external_effect_fakes import authorized_vt_read
 
 _INVESTIGATION_ID = UUID("b4079022-263e-48cb-86f7-460be4457fcb")
 _INVOCATION_ID = UUID("7f540f99-69eb-49c5-b512-94a297c57208")
@@ -3007,6 +3009,163 @@ async def test_vt_policy_guard_unassociated_hash_requires_matching_service_refs(
     allowed = await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(context)
 
     assert allowed is expected_allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "family",
+    ["vt.file_report", "vt.relationships", "vt.behaviour", "vt.download_sample"],
+)
+@pytest.mark.parametrize("payload_contains_requested_hash", [True, False])
+async def test_vt_policy_guard_uses_canonical_relationship_payload_for_requested_hash(
+    family: str, payload_contains_requested_hash: bool
+) -> None:
+    child_hash = "c" * 64
+    parent_hash = "b" * 64
+    payload = {
+        "schema": "virustotal-investigation-summary.v1",
+        "descriptors": [
+            {
+                "type": "file",
+                "id": child_hash if payload_contains_requested_hash else "d" * 64,
+            }
+        ],
+    }
+    raw = canonical_json_bytes(payload)
+    observation_id = uuid4()
+    observation_sha256 = hashlib.sha256(raw).hexdigest()
+    blob_id = uuid4()
+    observation_reference = EvidenceReference(
+        "evidence_observation", str(observation_id), "vt.relationship.v1", observation_sha256
+    )
+    sample_reference = EvidenceReference(
+        "sample_hash", child_hash, "sample-hash.v1", child_hash
+    )
+
+    class _BlobStore:
+        async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
+            assert descriptor.sha256 == observation_sha256
+            assert descriptor.size == len(raw)
+            assert max_bytes >= len(raw)
+            return raw
+
+    blob = SimpleNamespace(
+        id=blob_id,
+        sha256=observation_sha256,
+        size=len(raw),
+        mime_type="application/json",
+        logical_bucket="evidence",
+    )
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=None,
+        kind="vt_relationship",
+        source="VirusTotal",
+        source_version=observation_reference.version,
+        sha256=observation_sha256,
+        blob_id=blob_id,
+        object_type="file",
+        object_id=parent_hash,
+    )
+
+    class _Session(AsyncSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scalars_count = 0
+
+        async def scalar(self, *_args: object, **_kwargs: object):
+            return blob
+
+        async def scalars(self, *_args: object, **_kwargs: object):
+            self.scalars_count += 1
+            return [observation] if self.scalars_count == 1 else []
+
+    with authorized_vt_read() as active_authority:
+        authority = active_authority
+        observation.investigation_id = authority.investigation_id
+        path = f"/api/v3/files/{child_hash}"
+        prepared = PreparedExternalRequest.build(
+            family=family,
+            provider="vt",
+            provider_scope="default",
+            normalizer_version="vt-read.v1",
+            canonical_request={
+                "path": path,
+                **({"sha256": child_hash} if family == "vt.download_sample" else {}),
+            },
+            application_request=_wire(target=path.encode()),
+            evidence_refs=(sample_reference, observation_reference),
+        )
+        context = ConsumePolicyContext(
+            authority=authority,
+            prepared=prepared,
+            effect_key=f"relationship-grounded-{family}",
+            database_session=_Session(),
+            investigation_subject_id=uuid4(),
+        )
+        guard = SqlAlchemyVirusTotalPolicyGuard(blob_store=_BlobStore())
+        allowed = await guard.authorize_source_disclosure(context)
+
+    assert allowed is payload_contains_requested_hash
+
+
+@pytest.mark.asyncio
+async def test_vt_policy_guard_keeps_exact_parent_observation_and_rejects_unanchored_hash() -> None:
+    parent_hash = "b" * 64
+    child_hash = "c" * 64
+    observation_id = uuid4()
+    observation_reference = EvidenceReference(
+        "evidence_observation", str(observation_id), "vt.file-report.v1", "a" * 64
+    )
+    sample_reference = EvidenceReference("sample_hash", parent_hash, "sample-hash.v1", parent_hash)
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=_INVESTIGATION_ID,
+        kind="vt_file_report",
+        source="VirusTotal",
+        source_version=observation_reference.version,
+        sha256=observation_reference.sha256,
+        object_type="file",
+        object_id=parent_hash,
+    )
+
+    class _Session(AsyncSession):
+        def __init__(self, *, include_observation: bool) -> None:
+            super().__init__()
+            self.scalars_count = 0
+            self.include_observation = include_observation
+
+        async def scalars(self, *_args: object, **_kwargs: object):
+            self.scalars_count += 1
+            return [observation] if self.include_observation and self.scalars_count == 1 else []
+
+    async def authorize(
+        target_hash: str, references: tuple[EvidenceReference, ...], *, include: bool
+    ):
+        prepared = PreparedExternalRequest.build(
+            family="vt.file_report",
+            provider="vt",
+            provider_scope="default",
+            normalizer_version="vt-read.v1",
+            canonical_request={"path": f"/api/v3/files/{target_hash}"},
+            application_request=_wire(target=f"/api/v3/files/{target_hash}".encode()),
+            evidence_refs=references,
+        )
+        return await SqlAlchemyVirusTotalPolicyGuard().authorize_source_disclosure(
+            ConsumePolicyContext(
+                authority=_authority(),
+                prepared=prepared,
+                effect_key=f"parent-or-unanchored-{target_hash}",
+                database_session=_Session(include_observation=include),
+                investigation_subject_id=uuid4(),
+            )
+        )
+
+    assert await authorize(parent_hash, (sample_reference, observation_reference), include=True)
+    arbitrary_reference = EvidenceReference(
+        "sample_hash", child_hash, "sample-hash.v1", child_hash
+    )
+    assert not await authorize(child_hash, (arbitrary_reference,), include=False)
 
 
 @pytest.mark.asyncio
