@@ -1621,11 +1621,11 @@ class OperatorProtocolFigureAttachmentBuilder:
     ) -> tuple[tuple[OpinionProtocolFigureV1, ...], tuple[UUID, ...]]:
         from cti_app.application.diagram_compilation import DiagramCompilationError
         from cti_app.application.evidence_recorder import _sanitize_json
-        from cti_app.application.media_assets import MediaAssetStore
         from cti_app.application.investigation_protocol_tools import (
             PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
             _protocol_render_observation_identity,
         )
+        from cti_app.application.media_assets import MediaAssetStore
         from cti_app.application.network_protocol_model import (
             NETWORK_PROTOCOL_RENDERER_VERSION,
             render_protocol_model,
@@ -2140,8 +2140,8 @@ def register_operator_opinion_tools(
             "enquête. Indiquez son protocol_model_blob_id, le render_observation_id renvoyé par "
             "network.protocol.render, et les trois vues sequence, state_machine et message_format "
             "ensemble. Utilisez l'observation exacte du rendu de ce modèle; son identité "
-            "versionnée et son SHA-256 sont vérifiés. Un modèle documenté reste marqué « documenté, "
-            "non observé »."
+            "versionnée et son SHA-256 sont vérifiés. Un modèle documenté reste marqué "
+            "« documenté, non observé »."
         ),
         "items": {
             "type": "object",

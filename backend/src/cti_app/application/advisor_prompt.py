@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -52,6 +53,18 @@ def render_advisor_prompt(
                 ]
             )
         lines.append("TEXTE CIBLE:")
+        if consultation_type == "draft_text":
+            lines.append(
+                "CIBLES CANONIQUES (conserver exactement ces champs pour attribuer chaque bloc):"
+            )
+            for index, target in enumerate(targets, start=1):
+                if not isinstance(target, Mapping):
+                    continue
+                target_fields = {"id": target.get("id", target.get("unit_id", f"U{index}"))}
+                target_fields.update(
+                    {key: target[key] for key in ("block_type", "form", "anchor") if key in target}
+                )
+                lines.append(json.dumps(target_fields, ensure_ascii=False))
         for index, target in enumerate(targets, start=1):
             if not isinstance(target, Mapping):
                 continue
@@ -194,10 +207,16 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
             "Ce brouillon est consultatif et ne modifie aucune version d\u2019avis canonique.",
         ]
         if not isinstance(assertions, (list, tuple)) or not assertions:
-            guidance.append(
-                "Aucune assertion cible n\u2019a été fournie; rédiger à partir du dossier et citer "
-                "les références disponibles quand elles étayent le texte."
-            )
+            if data.get("units"):
+                guidance.append(
+                    "Aucune assertion factuelle optionnelle n\u2019a été fournie; rédiger "
+                    "uniquement les unités cibles identifiées ci-dessus à partir du dossier."
+                )
+            else:
+                guidance.append(
+                    "Aucune assertion cible n\u2019a été fournie; rédiger à partir du dossier et "
+                    "citer les références disponibles quand elles étayent le texte."
+                )
         return guidance
     if consultation_type == "yara_draft":
         return [

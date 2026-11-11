@@ -28,21 +28,21 @@ from cti_app.application.analyst_opinion_service import (
 )
 from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.identity import Identity, IdentityScope
-from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.investigation_protocol_tools import (
     PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
     _protocol_render_observation_identity,
 )
+from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.network_protocol_model import (
     NETWORK_PROTOCOL_RENDERER_VERSION,
     render_protocol_model,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.protocol_diagram_projection import (
     PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
     PROTOCOL_DIAGRAM_PROJECTION_VERSION,
 )
-from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.typst_compilation import CompiledTypstDocument
@@ -516,9 +516,7 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
         "projection_version": PROTOCOL_DIAGRAM_PROJECTION_VERSION,
         "figure_policy_version": PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
     }
-    protocol_render_bytes = ProductionArtifactStore.canonical_json_bytes(
-        protocol_render_payload
-    )
+    protocol_render_bytes = ProductionArtifactStore.canonical_json_bytes(protocol_render_payload)
     protocol_render_blob_id = await store.put_bytes(
         protocol_render_bytes,
         bucket="investigation-evidence",

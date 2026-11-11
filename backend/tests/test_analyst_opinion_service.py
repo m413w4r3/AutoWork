@@ -19,24 +19,24 @@ from cti_app.application.analyst_opinion_service import (
     OpinionErrorCode,
     OpinionRevisionEdits,
 )
-from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_contracts import OperatorOpinionProtocolFigureSelectionV1
+from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_protocol_tools import (
     PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
     _protocol_render_observation_identity,
 )
+from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.network_protocol_model import (
     NETWORK_PROTOCOL_RENDERER_VERSION,
     render_protocol_model,
 )
-from cti_app.application.protocol_diagram_projection import (
-    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
-    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
-)
-from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
+)
+from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
 )
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,

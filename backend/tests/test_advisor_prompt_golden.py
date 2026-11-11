@@ -261,7 +261,7 @@ def test_prompt_golden_corpus_matches_current_free_prose_prompts() -> None:
             "eb71c1b57c1ba2af5edcaddc89711f7942fb560d63126a17492a74a56c7982f4",
             1221,
         ),
-        "draft_text": ("4ec7622f59f261687794627bc6d448c2d0c357329628b7384cf8fff834d0867f", 1736),
+        "draft_text": ("badaeea3e964533b16f8d5865536e0bfc50c91488730b204fcbc2d5a8f81f209", 1859),
         "suricata_draft": (
             "6e219f616c98ec311024f122cd00d3c6e1caea56bf08e160a211cb823fb99c53",
             1350,
