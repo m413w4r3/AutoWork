@@ -1686,7 +1686,12 @@ async def test_vt_download_still_rejects_restricted_source_document(
     )
 
     assert invocation.status is ToolInvocationStatus.POLICY_DENIED
-    assert result.error_code == "external_disclosure_revoked_before_dispatch"
+    assert result.error_code == "source_document_restricted"
+    assert result.output["detail_code"] == "source_document_restricted"
+    assert result.output["source_kind"] == "source_document"
+    assert result.output["source_id"] == str(document_id)
+    assert result.output["object_id"] == sample_hash
+    assert "source document" in result.output["correction"].casefold()
     assert fixture.tools["vt.download_sample"].calls == []
 
 
@@ -1708,12 +1713,138 @@ async def test_vt_download_still_rejects_restricted_existing_sample(
         ),
     )
 
-    invocation, _result, _response_refs, _external_effect = await _execute_vt_download(
+    invocation, result, _response_refs, _external_effect = await _execute_vt_download(
         fixture, sample_hash
     )
 
     assert invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.error_code == "sample_source_restricted"
+    assert result.output["detail_code"] == "sample_source_restricted"
+    assert "sample source" in result.output["correction"].casefold()
+    assert result.output["source_id"] == sample_hash
+    assert result.output["object_id"] == sample_hash
     assert fixture.tools["vt.download_sample"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_vt_file_report_accepts_mixed_observation_versions() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+    sample_hash = "f" * 64
+    observations = (
+        EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.VT_FILE_REPORT,
+            blob_id=uuid4(),
+            sha256="a" * 64,
+            source="VirusTotal",
+            source_version="vt.file-report.v1",
+            observed_at=datetime.now(UTC),
+            object_type="file",
+            object_id=sample_hash,
+        ),
+        EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.VT_RELATIONSHIP,
+            blob_id=uuid4(),
+            sha256="b" * 64,
+            source="VirusTotal",
+            source_version="proxy:v3",
+            observed_at=datetime.now(UTC),
+            object_type="file",
+            object_id=sample_hash,
+        ),
+    )
+    for observation in observations:
+        await fixture.observations.append_if_absent(observation)
+
+    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    fixture.service._samples = _DownloadSampleRepository()
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": sample_hash},
+        envelope=envelope,
+    )
+
+    observation_versions = {
+        reference.version
+        for reference in references
+        if reference.kind == "evidence_observation"
+    }
+    assert observation_versions == {"vt.file-report.v1", "proxy:v3"}
+    assert not await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.file_report",
+        envelope=envelope,
+    )
+
+
+@pytest.mark.asyncio
+async def test_vt_file_report_accepts_related_hash_with_parent_observation() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    envelope, _effective = _enable_osint_vt_hash_reads(fixture)
+    sample_hash = "c" * 64
+    parent_hash = "b" * 64
+    payload = {
+        "schema": "virustotal-investigation-summary.v1",
+        "descriptors": [{"id": sample_hash, "type": "file"}],
+    }
+    raw = canonical_json_bytes(payload)
+    relationship_blob_id = uuid4()
+    fixture.proof_artifacts.store(relationship_blob_id, raw)
+    observations = (
+        EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.VT_FILE_REPORT,
+            blob_id=uuid4(),
+            sha256="a" * 64,
+            source="VirusTotal",
+            source_version="vt.file-report.v1",
+            observed_at=datetime.now(UTC),
+            object_type="file",
+            object_id=sample_hash,
+        ),
+        EvidenceObservation(
+            investigation_id=investigation.id,
+            kind=EvidenceKind.VT_RELATIONSHIP,
+            blob_id=relationship_blob_id,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            source="VirusTotal",
+            source_version="proxy:v3",
+            observed_at=datetime.now(UTC),
+            object_type="file",
+            object_id=parent_hash,
+        ),
+    )
+    for observation in observations:
+        await fixture.observations.append_if_absent(observation)
+
+    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    fixture.service._samples = _DownloadSampleRepository()
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": sample_hash},
+        envelope=envelope,
+    )
+
+    assert any(
+        reference.kind == "evidence_observation"
+        and reference.id == str(observations[1].id)
+        for reference in references
+    )
+    assert not await fixture.service._vt_source_disclosure_restricted(
+        investigation,
+        references,
+        "vt.file_report",
+        envelope=envelope,
+    )
 
 
 @pytest.mark.asyncio
