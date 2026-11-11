@@ -9,7 +9,6 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
-import anyio
 import pytest
 from pypdf import PdfReader
 
@@ -41,6 +40,8 @@ from cti_app.domain.network_protocol import (
 )
 from cti_app.domain.protocol_model import (
     AssuranceLevel,
+    FieldDefinitionV1,
+    FieldStability,
     MessageDefinitionV1,
     ProtocolDiagramKind,
     ProtocolEvidenceRefV1,
@@ -209,6 +210,43 @@ def _compile_pdf(
     )
 
 
+def _run_blocking_process(
+    arguments: tuple[str, ...], timeout_seconds: int
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        arguments,
+        capture_output=True,
+        check=True,
+        timeout=timeout_seconds,
+    )
+
+
+def _compile_real_typst_pdf(
+    *,
+    typst_binary: str,
+    workspace_root: Path,
+    font_root: Path,
+    entrypoint: str,
+) -> bytes:
+    font_bundle_root = Path(os.environ.get("FONT_BUNDLE_ROOT") or _REPOSITORY_ROOT / "chpTypst")
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_LOCK)
+    font_paths = materialize_font_bundle(font_snapshot, font_root)
+    argv = [typst_binary, "compile", "--root", str(workspace_root)]
+    for font_path in font_paths:
+        argv.extend(("--font-path", str(font_path)))
+    argv.extend(
+        (
+            "--ignore-system-fonts",
+            "--creation-timestamp",
+            "0",
+            str(workspace_root / entrypoint),
+            str(workspace_root / "output.pdf"),
+        )
+    )
+    _run_blocking_process(tuple(argv), 30)
+    return (workspace_root / "output.pdf").read_bytes()
+
+
 def _persist_and_verify_pdf_outputs(
     output_root: Path,
     rendered,
@@ -314,7 +352,7 @@ async def test_real_article_and_edition_render_all_protocol_figures(
         article_workspace,
         entrypoint="RENDERER/publication.typ",
     )
-    article_pdf = await _compile_pdf(
+    article_pdf = _compile_real_typst_pdf(
         typst_binary=typst_binary,
         workspace_root=article_workspace,
         font_root=tmp_path / "article-fonts",
@@ -371,7 +409,7 @@ async def test_real_article_and_edition_render_all_protocol_figures(
         edition_workspace,
         entrypoint="RENDERER/edition.typ",
     )
-    edition_pdf = await _compile_pdf(
+    edition_pdf = _compile_real_typst_pdf(
         typst_binary=typst_binary,
         workspace_root=edition_workspace,
         font_root=tmp_path / "edition-fonts",
@@ -379,14 +417,10 @@ async def test_real_article_and_edition_render_all_protocol_figures(
     )
 
     _persist_and_verify_pdf_outputs(
-        _REPOSITORY_ROOT
-        / ".autowork-runs"
-        / "run12-editorial-2026-10-20"
-        / "lots"
-        / "protocol-typst-test",
+        tmp_path / "protocol-typst-test",
         rendered,
-        article_pdf.content,
-        edition_pdf.content,
+        article_pdf,
+        edition_pdf,
     )
 
 
@@ -518,10 +552,76 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         ),
         documentary_evidence=(evidence,),
     )
+    message_ids = tuple(f"message-{index:02d}" for index in range(1, 18))
+    field_ids_by_message = {
+        message_id: tuple(
+            f"field-{field_index:02d}"
+            for field_index in range(1, 23)
+            if (field_index - 1) % len(message_ids) == message_ids.index(message_id)
+        )
+        for message_id in message_ids
+    }
+    messages = tuple(
+        MessageDefinitionV1(
+            message_id=message_id,
+            name=f"Message {index:02d}",
+            ordinal=index,
+            directions=(StreamDirection.UNRESOLVED,),
+            min_length=None,
+            max_length=None,
+            field_ids=field_ids_by_message[message_id],
+            validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+            evidence=(evidence,),
+        )
+        for index, message_id in enumerate(message_ids, 1)
+    )
+    fields = tuple(
+        FieldDefinitionV1(
+            field_id=f"field-{index:02d}",
+            message_id=message_ids[(index - 1) % len(message_ids)],
+            name=f"Field {index:02d}",
+            offset=None,
+            length=None,
+            endianness="unknown",
+            encoding=None,
+            condition=None,
+            source="documented protocol model",
+            validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+            stability=FieldStability.UNKNOWN,
+            evidence=(evidence,),
+        )
+        for index in range(1, 23)
+    )
+    state_ids = tuple(f"state-{index:02d}" for index in range(1, 10))
+    states = tuple(
+        ProtocolStateV1(
+            state_id=state_id,
+            name=f"State {index:02d}",
+            validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+            evidence=(evidence,),
+        )
+        for index, state_id in enumerate(state_ids, 1)
+    )
+    transitions = tuple(
+        ProtocolTransitionV1(
+            transition_id=f"transition-{index:02d}",
+            from_state=state_ids[(index - 1) % len(state_ids)],
+            to_state=state_ids[index % len(state_ids)],
+            message_id=message_ids[index - 1],
+            trigger=f"Message {index:02d}",
+            hypotheses=(),
+            validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+            evidence=(evidence,),
+        )
+        for index in range(1, 16)
+    )
+    model = replace(model, messages=messages, fields=fields, states=states, transitions=transitions)
     result = render_protocol_model(model)
     assert len(result.diagrams) == 3
-    assert len(result.diagrams[0].nodes) == 4
-    assert len(result.diagrams[1].nodes) == 3
+    assert len(result.diagrams[0].nodes) == 17
+    assert len(result.diagrams[1].nodes) == 9
+    assert len(result.diagrams[1].edges) == 15
+    assert len(result.diagrams[2].fields) == 22
     assert all("documenté, non observé" not in item.title.casefold() for item in result.diagrams)
     assert all(
         not item.edges or all(not edge.frame_numbers for edge in item.edges)
@@ -537,6 +637,17 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     figures = opinion_protocol_figures(rendered)
     assert {item.kind for item in figures} == set(ProtocolDiagramKind)
+    sequence_figure = next(item for item in figures if item.kind is ProtocolDiagramKind.SEQUENCE)
+    sequence_svg = await media_store.read(sequence_figure.asset_id)
+    view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', sequence_svg)
+    assert view_box is not None
+    assert float(view_box.group(1)) / float(view_box.group(2)) >= 0.85
+    for figure in figures:
+        svg = await media_store.read(figure.asset_id)
+        view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', svg)
+        assert view_box is not None
+        ratio = float(view_box.group(1)) / float(view_box.group(2))
+        assert ratio >= 0.85, f"{figure.kind.value} SVG aspect ratio is {ratio:.3f}"
     assert all("ARTICLE_DOCUMENTED" in item.caption for item in figures)
     assert all(
         "offsets" in item.caption.casefold() or "valeurs" in item.caption.casefold()
@@ -561,12 +672,30 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     format_view = next(
         item for item in rendered if item.spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
     )
-    assert len(format_view.diagram.nodes) == 1
-    assert format_view.diagram.nodes[0].label == "Aucun élément établi"
+    assert len(format_view.diagram.nodes) == 22
+    assert format_view.diagram.nodes[0].label == "#01 Field 01"
     assert "offsets" in (format_view.diagram.caption or "").casefold()
+    state_view = next(
+        item for item in rendered if item.spec.kind is ProtocolDiagramKind.STATE_MACHINE
+    )
+    assert len(state_view.diagram.nodes) == 15
+    assert not state_view.diagram.edges
+    assert state_view.diagram.nodes[0].label.endswith(": Message 01")
+    assert all("Message 01 Message 01" not in node.label for node in state_view.diagram.nodes)
 
     base = _base_v5()
     opinion, citation_context = _approved_opinion(base)
+    long_hex = "AA" * 48
+    yara_rule = (
+        'rule synthetic_endpoint { strings: $ip = "203.0.113[.]94" $hex = { '
+        + long_hex
+        + " } condition: $ip and $hex }"
+    )
+    code_display_block = replace(
+        opinion.blocks[0],
+        text=(f"Adresse refangée à l'affichage : 203.0.113[.]94.\n```yara\n{yara_rule}\n```"),
+    )
+    opinion = replace(opinion, blocks=(code_display_block, *opinion.blocks[1:]), content_sha256="")
     opinion_with_figures = replace(opinion, protocol_figures=figures, content_sha256="")
     publication = augment_publication_with_opinion(base, opinion_with_figures, citation_context)
     publication_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
@@ -616,22 +745,19 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         workspace,
         entrypoint="RENDERER/publication.typ",
     )
-    pdf = await _compile_pdf(
+    pdf = _compile_real_typst_pdf(
         typst_binary=_typst_binary(),
         workspace_root=workspace,
         font_root=tmp_path / "documented-protocol-fonts",
         entrypoint="RENDERER/publication.typ",
     )
     pdf_path = tmp_path / "documented-protocol.pdf"
-    pdf_path.write_bytes(pdf.content)
-    process_result = await anyio.run_process(
-        ("pdftotext", str(pdf_path), "-"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
+    pdf_path.write_bytes(pdf)
+    process_result = _run_blocking_process(("pdftotext", str(pdf_path), "-"), 30)
     extracted_text = process_result.stdout.decode("utf-8", errors="replace")
-    extracted_text = " ".join(extracted_text.split()).casefold()
+    extracted_text = " ".join(extracted_text.split()).casefold().replace("\u2019", "'")
+    assert "note de l'analyste" in extracted_text
+    assert "1.1 apports de l'enquête" in extracted_text
     assert extracted_text.count("article_documented") == 3
     assert extracted_text.count("niveau de preuve") == 3
     assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted_text
@@ -639,18 +765,14 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         title in extracted_text
         for title in ("séquence réseau", "machine à états", "format de message")
     )
+    assert "203.0.113.94" in extracted_text
+    assert "203.0.113[.]94" in extracted_text
+    assert long_hex.casefold() in "".join(extracted_text.split())
 
-    audit_root = (
-        _REPOSITORY_ROOT
-        / ".autowork-runs"
-        / "run12-editorial-2026-10-20"
-        / "lots"
-        / "protocol-typst-test"
-        / "audit"
-    )
+    audit_root = tmp_path / "protocol-typst-audit"
     audit_root.mkdir(parents=True, exist_ok=True)
     publication_pdf_path = audit_root / "publication.pdf"
-    publication_pdf_path.write_bytes(pdf.content)
+    publication_pdf_path.write_bytes(pdf)
 
     preview_opinion = replace(
         opinion,
@@ -674,14 +796,14 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         preview_workspace,
         entrypoint="RENDERER/publication.typ",
     )
-    preview_pdf = await _compile_pdf(
+    preview_pdf = _compile_real_typst_pdf(
         typst_binary=_typst_binary(),
         workspace_root=preview_workspace,
         font_root=tmp_path / "documented-protocol-preview-fonts",
         entrypoint="RENDERER/publication.typ",
     )
     preview_pdf_path = audit_root / "preview.pdf"
-    preview_pdf_path.write_bytes(preview_pdf.content)
+    preview_pdf_path.write_bytes(preview_pdf)
     preview_pages = [
         " ".join((page.extract_text() or "").split())
         for page in PdfReader(preview_pdf_path, strict=True).pages
@@ -696,13 +818,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     pdftoppm = shutil.which("pdftoppm")
     assert pdftotext is not None and pdftoppm is not None
     for label, path in (("publication", publication_pdf_path), ("preview", preview_pdf_path)):
-        with anyio.fail_after(30):
-            extracted = await anyio.run_process(
-                (pdftotext, "-layout", str(path), "-"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
+        extracted = _run_blocking_process((pdftotext, "-layout", str(path), "-"), 30)
         pdf_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
         lowered = pdf_text.casefold()
         expected_proof_levels = 3 if label == "publication" else 2
@@ -721,13 +837,10 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         for existing in output_directory.glob("*.png"):
             existing.unlink()
         raster_prefix = output_directory / "page"
-        with anyio.fail_after(30):
-            await anyio.run_process(
-                (pdftoppm, "-png", "-r", "110", str(path), str(raster_prefix)),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
+        _run_blocking_process(
+            (pdftoppm, "-png", "-r", "110", str(path), str(raster_prefix)),
+            30,
+        )
         rasters = tuple(output_directory.glob("page-*.png"))
         assert len(rasters) == len(PdfReader(path, strict=True).pages)
         assert all(image.stat().st_size > 1024 for image in rasters)

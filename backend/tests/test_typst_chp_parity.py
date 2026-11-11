@@ -1323,8 +1323,8 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     )
     extracted = text_result.stdout.decode("utf-8", errors="replace")
     normalized_extracted = extracted.upper().replace("\u2019", "'")
-    assert "Avis de l'analyste" in extracted.replace("\u2019", "'")
-    assert "AVIS DE L'ANALYSTE" in normalized_extracted
+    assert "Note de l'analyste" in extracted.replace("\u2019", "'")
+    assert "NOTE DE L'ANALYSTE" in normalized_extracted
     assert "1.1 APPORTS DE L'ENQUÊTE" in normalized_extracted
     assert "APPORTS DE L'ENQUÊTE" in normalized_extracted
     assert "FAIT ÉTAYÉ" in normalized_extracted
@@ -1669,7 +1669,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     )
     limitation_page_text = limitation_page_text.replace("\u2019", "'")
     limitation_start = limitation_page_text.index("Limites des preuves")
-    opinion_start = limitation_page_text.index("Avis de l'analyste", limitation_start)
+    opinion_start = limitation_page_text.index("Note de l'analyste", limitation_start)
     limitation_section_text = limitation_page_text[limitation_start:opinion_start]
     assert limitation_section_text.count("https://a.example/report") == 1
     assert limitation_section_text.count("https://example.com/report") == 1
@@ -1721,8 +1721,7 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     )
 
 
-@pytest.mark.asyncio
-async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigable_refs(
+def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigable_refs(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -2018,7 +2017,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v37-m20-opinion-render",
+        "schema_version": "typst-publication-model-v38-m21-opinion-render",
         "section_types": [
             "references",
             "chronology",
@@ -2064,23 +2063,27 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
     font_root = tmp_path / "c8-font-snapshot"
     font_root.mkdir()
-    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
-        TypstCompileRequest(
-            workspace_root=workspace,
-            entrypoint_relative_path=render_source.entrypoint_relative_path,
-            font_paths=materialize_font_bundle(font_snapshot, font_root),
+    pdf_path = workspace / "c8-preview-non-approuve.pdf"
+    argv = [typst_binary, "compile", "--root", str(workspace)]
+    for font_path in materialize_font_bundle(font_snapshot, font_root):
+        argv.extend(("--font-path", str(font_path)))
+    argv.extend(
+        (
+            "--ignore-system-fonts",
+            "--creation-timestamp",
+            "0",
+            str(workspace / render_source.entrypoint_relative_path),
+            str(pdf_path),
         )
     )
-
-    output_directory = _expanded_path(os.environ.get("C8_PREVIEW_OUTPUT_DIR", str(tmp_path)))
-    pdf_path = output_directory / "c8-preview-non-approuve.pdf"
-    _write_pdf(pdf_path, compiled.content)
-    reader = PdfReader(BytesIO(compiled.content), strict=True)
-    extracted = await anyio.run_process(
+    compile_result = _run_typst_compile(tuple(argv))
+    assert compile_result.returncode == 0, compile_result.stderr.decode("utf-8", errors="replace")
+    reader = PdfReader(pdf_path, strict=True)
+    extracted = _run_blocking(
         ("pdftotext", "-layout", str(pdf_path), "-"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=True,
+        timeout=15,
     )
     pdf_text = extracted.stdout.decode("utf-8", errors="replace")
     normalized_text = pdf_text.upper().replace("\u2019", "'")
@@ -2104,12 +2107,13 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     assert "D" * 64 not in normalized_text
     assert "OBSERVED_CONTACT" not in normalized_text
     assert "CONTACT OBSERVÉ" in normalized_text
-    assert normalized_text.count("NOTE DE L'ANALYSTE") == 2
+    assert normalized_text.count("NOTE DE L'ANALYSTE") == 3
     assert "SHA-256 DU PASSAGE" not in normalized_text
 
     annex_start = normalized_text.index("ANNEXE DE TRAÇABILITÉ")
     narrative_text = normalized_text[:annex_start]
     annex_text = normalized_text[annex_start:]
+    assert "FINDINGS LOGIQUES CITÉS" in annex_text
     forbidden_narrative_markers = (
         r"\bFinding\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
         r"\bÉvidence\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",

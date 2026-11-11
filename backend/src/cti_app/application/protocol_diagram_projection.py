@@ -48,7 +48,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v3"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v4-m21-opinion-render"
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )
@@ -135,18 +135,42 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
             )
         )
     elif spec.kind is ProtocolDiagramKind.SEQUENCE:
-        nodes.extend(_project_participant(node) for node in spec.nodes)
-        edges.extend(_project_message(edge) for edge in _ordered_edges(spec.edges))
+        if len(spec.edges) > 8:
+            participants = {node.node_id: _clean_display_text(node.label) for node in spec.nodes}
+            nodes.extend(
+                _project_ordered_message(edge, index, participants)
+                for index, edge in enumerate(_ordered_edges(spec.edges), 1)
+            )
+        else:
+            nodes.extend(_project_participant(node) for node in spec.nodes)
+            edges.extend(_project_message(edge) for edge in _ordered_edges(spec.edges))
     elif spec.kind is ProtocolDiagramKind.STATE_MACHINE:
-        nodes.extend(_project_state(node) for node in spec.nodes)
-        edges.extend(_project_transition(edge) for edge in spec.edges)
+        if len(spec.nodes) > 8 or len(spec.edges) > 8:
+            state_labels = {node.node_id: _clean_display_text(node.label) for node in spec.nodes}
+            represented_states: set[str] = set()
+            for index, edge in enumerate(spec.edges, 1):
+                nodes.append(_project_transition_card(edge, index, state_labels))
+                represented_states.update((edge.source_id, edge.target_id))
+            nodes.extend(
+                _project_state(node)
+                for node in spec.nodes
+                if node.node_id not in represented_states
+            )
+        else:
+            nodes.extend(_project_state(node) for node in spec.nodes)
+            edges.extend(_project_transition(edge) for edge in spec.edges)
     else:
         if not spec.fields:
             raise ProtocolDiagramProjectionError(
                 "A ready message-format spec must contain at least one field"
             )
-        nodes.extend(_project_field(field, index) for index, field in enumerate(spec.fields, 1))
-        edges.extend(_field_order_edges(spec.fields))
+        dense_format = len(spec.fields) > 8
+        nodes.extend(
+            _project_field(field, index, include_index=dense_format)
+            for index, field in enumerate(spec.fields, 1)
+        )
+        if not dense_format:
+            edges.extend(_field_order_edges(spec.fields))
 
     _validate_projected_graph(spec, nodes, edges)
     return DiagramSpecV1(
@@ -502,6 +526,23 @@ def _project_message(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
     )
 
 
+def _project_ordered_message(
+    edge: ProtocolDiagramEdgeV1,
+    index: int,
+    participants: dict[str, str],
+) -> DiagramNodeV1:
+    order = edge.order if edge.order is not None else index
+    source = participants.get(edge.source_id, _clean_display_text(edge.source_id))
+    target = participants.get(edge.target_id, _clean_display_text(edge.target_id))
+    message = _clean_display_text(edge.label, limit=88)
+    return DiagramNodeV1(
+        node_id=f"protocol-message-{index:04d}",
+        label=f"#{order:02d} {source} → {target}: {message}",
+        evidence_refs=(),
+        role=DiagramNodeRole.PROTOCOL_PARTICIPANT,
+    )
+
+
 def _ordered_edges(
     edges: tuple[ProtocolDiagramEdgeV1, ...],
 ) -> tuple[ProtocolDiagramEdgeV1, ...]:
@@ -541,12 +582,40 @@ def _project_transition(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
     )
 
 
-def _project_field(field: ProtocolDiagramFieldV1, index: int) -> DiagramNodeV1:
+def _project_transition_card(
+    edge: ProtocolDiagramEdgeV1,
+    index: int,
+    state_labels: dict[str, str],
+) -> DiagramNodeV1:
+    source = state_labels.get(edge.source_id, _clean_display_text(edge.source_id))
+    target = state_labels.get(edge.target_id, _clean_display_text(edge.target_id))
+    trigger_name, separator, message_name = edge.label.partition(": ")
+    if separator and trigger_name.strip().casefold() == message_name.strip().casefold():
+        trigger = _clean_display_text(trigger_name, limit=72)
+    else:
+        trigger = _clean_display_text(edge.label, limit=72)
+    return DiagramNodeV1(
+        node_id=f"protocol-transition-{index:04d}",
+        label=f"{source} → {target}: {trigger}",
+        evidence_refs=(),
+        role=DiagramNodeRole.PROTOCOL_STATE,
+    )
+
+
+def _project_field(
+    field: ProtocolDiagramFieldV1,
+    index: int,
+    *,
+    include_index: bool = False,
+) -> DiagramNodeV1:
     if field.encrypted_opaque:
         field_name = "Opaque encrypted payload · bytes omitted"
     else:
         field_name = field.name.strip() or f"Field {index}"
     label = _clean_display_text(field_name) or f"Champ {index}"
+    if include_index:
+        location = f"offset {field.offset} · " if field.offset is not None else ""
+        label = f"#{index:02d} {location}{label}"
     return DiagramNodeV1(
         node_id=f"protocol-field-{index:04d}",
         label=label,

@@ -19,12 +19,16 @@ from cti_app.application.typst_rendering import (
     _indicator_values,
     _opinion_pipe_table,
     _opinion_text_spans,
+    _opinion_traceability_refs,
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
     project_publication_to_typst_model,
 )
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
     AnalystOpinionV1,
     BridgeDraftReferenceV1,
     ImplantMaterialEditorialV1,
@@ -32,6 +36,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     opinion_blocks_with_implant_materials,
+    opinion_blocks_with_observations,
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import MediaAssetKind
@@ -136,7 +141,7 @@ def test_opinion_pipe_table_parser_handles_alignment_inline_code_and_safe_limits
 
 def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals() -> None:
     code_text = '#import "inert-fixture.typ" $x$ @name <tag> & `literal`\n#set page(margin: 0pt)'
-    source = f"Before `inline`.\n```\n{code_text}\n```\nAfter."
+    source = f"Before `inline`.\n```yara\n{code_text}\n```\nAfter."
 
     spans = _opinion_text_spans(source, parse_fenced_code=True)
 
@@ -153,11 +158,11 @@ def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals
     ]
     assert spans[-1]["text"] == "After."
 
-    unclosed = 'Before `inline`.\n```\n#import "still inert.typ" $x$ @name'
+    unclosed = 'Before `inline`.\n```yara\n#import "still inert.typ" $x$ @name'
     unclosed_spans = _opinion_text_spans(unclosed, parse_fenced_code=True)
     assert not any(span.get("code_block") for span in unclosed_spans)
     assert unclosed_spans[-1] == {
-        "text": '```\n#import "still inert.typ" $x$ @name',
+        "text": '```yara\n#import "still inert.typ" $x$ @name',
         "technical": False,
     }
 
@@ -170,6 +175,55 @@ def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals
     observation_spans = _opinion_text_spans(source)
     assert not any(span.get("code_block") for span in observation_spans)
     assert "```" in "".join(span["text"] for span in observation_spans)
+
+
+def test_opinion_text_spans_refang_known_iocs_outside_fenced_code() -> None:
+    known_iocs = (
+        (ArtifactType.IP, "203.0.113[.]94", "203.0.113.94"),
+        (ArtifactType.DOMAIN, "updates.example[.]com", "updates.example.com"),
+    )
+    long_hex = "AA" * 48
+    code = (
+        'rule synthetic_endpoint { strings: $ip = "203.0.113[.]94" $hex = { '
+        + long_hex
+        + " } condition: $ip and $hex }"
+    )
+    source = (
+        "Endpoint `203.0.113[.]94:80` and 203.0.113[.]94:80. "
+        f"Domain `updates.example[.]com:443`.\n```yara\n{code}\n```"
+    )
+
+    spans = _opinion_text_spans(
+        source,
+        parse_fenced_code=True,
+        known_iocs=known_iocs,
+    )
+
+    prose = "".join(span["text"] for span in spans if not span.get("code_block"))
+    fenced = next(span for span in spans if span.get("code_block"))
+    assert "203.0.113.94:80" in prose
+    assert "updates.example.com:443" in prose
+    assert fenced["text"] == code + "\n"
+    assert fenced["code_lines"][0]["text"] == code
+    assert "".join(fenced["code_lines"][0]["break_chunks"]) == code
+    assert long_hex in "".join(fenced["code_lines"][0]["break_chunks"])
+    assert "203.0.113[.]94" in source
+
+    ordinary_text = "Ordinary `inline` prose without an IOC or fence."
+    assert _opinion_text_spans(
+        ordinary_text,
+        parse_fenced_code=True,
+        known_iocs=known_iocs,
+    ) == _opinion_text_spans(ordinary_text)
+
+    long_identifier = "C2-" + "A" * 96
+    long_identifier_span = next(
+        span
+        for span in _opinion_text_spans("Endpoint " + long_identifier)
+        if span["text"] == "Endpoint " + long_identifier
+    )
+    assert "".join(long_identifier_span["break_chunks"]) == "Endpoint " + long_identifier
+    assert len(long_identifier_span["break_chunks"]) > 1
 
 
 def _full_document(
@@ -328,7 +382,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v37-m20-opinion-render"
+    assert data["schema_version"] == "typst-publication-model-v38-m21-opinion-render"
     assert data["kind"] == "brief"
     assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
@@ -522,9 +576,108 @@ def test_typst_opinion_text_keeps_reservations_and_excludes_bridge_audit_metadat
 
     assert "non déterminée" in opinion_text
     assert "non testé" in opinion_text
+    assert "bridge" not in opinion_text.casefold()
+    assert invocation_id not in opinion_text
+    assert str(UUID(int=707)) not in opinion_text
     assert "bridge_authored" not in data_text
     assert invocation_id not in data_text
     assert str(UUID(int=707)) not in data_text
+
+
+def test_opinion_projection_refangs_blocks_and_notes_only_for_display(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    publication, *_ = _frontmatter_v6_case()
+    block_text = "C2 indiqué : `203.0.113[.]94:80` et 203.0.113[.]94:80."
+    note_text = (
+        "Note: `203.0.113[.]94:80`.\n```yara\n"
+        'rule synthetic_endpoint { strings: $ip = "203.0.113[.]94" condition: $ip }\n```'
+    )
+    publication_anchors = publication_document_text_anchors(
+        publication.document,
+        references=publication.references,
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=710),
+        anchor=next(
+            anchor for anchor in publication_anchors if anchor.startswith(("lead:", "section:"))
+        ),
+        text=note_text,
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=opinion_blocks_with_observations(
+            (OpinionBlock(OpinionBlockType.NETWORK_AND_INFRASTRUCTURE, block_text),),
+            (note,),
+        ),
+        author_id="fixture-analyst",
+    )
+    canonical_hash = opinion.content_sha256
+
+    rendered = _render(
+        renderer,
+        TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion),
+        bundle,
+    )
+    data = json.loads(rendered.render_data_bytes)
+    opinion_section = next(
+        item for item in data["content_sections"] if item["type"] == "analyst_opinion"
+    )
+    projected_block = opinion_section["blocks"][0]
+    synthesis_section = next(
+        item for item in data["content_sections"] if item["type"] == "synthesis"
+    )
+    projected_note = next(
+        item for item in synthesis_section["blocks"] if item["type"] == "analyst_observation"
+    )
+    inline_block_code = next(
+        span
+        for span in projected_block["text_spans"]
+        if span.get("technical") and span["text"].endswith(":80")
+    )
+    inline_note_code = next(
+        span
+        for span in projected_note["text_spans"]
+        if span.get("technical") and not span.get("code_block")
+    )
+    fenced_note_code = next(span for span in projected_note["text_spans"] if span.get("code_block"))
+
+    assert projected_block["text"] == block_text
+    assert inline_block_code["text"] == "203.0.113.94:80"
+    assert projected_note["text"] == note_text
+    assert inline_note_code["text"] == "203.0.113.94:80"
+    assert "203.0.113[.]94" in fenced_note_code["text"]
+    assert opinion.content_sha256 == canonical_hash
+
+
+def test_opinion_traceability_lists_only_logical_findings_cited_by_opinion() -> None:
+    cited_findings = {UUID(int=index) for index in range(720, 743)}
+    unrelated_version = UUID(int=743)
+    evidence_id = UUID(int=744)
+    references = [
+        *(
+            {"kind_label": "Finding", "reference_id": str(reference_id)}
+            for reference_id in sorted(cited_findings, key=str)
+        ),
+        {"kind_label": "Finding", "reference_id": str(unrelated_version)},
+        {"kind_label": "Évidence", "reference_id": str(evidence_id)},
+    ]
+
+    projected = _opinion_traceability_refs(references, cited_findings)
+
+    projected_finding_ids = {
+        UUID(reference["reference_id"])
+        for reference in projected
+        if reference["kind_label"] == "Finding"
+    }
+    assert projected_finding_ids == cited_findings
+    assert len(projected_finding_ids) == 23
+    assert projected[-1] == references[-1]
 
 
 def test_publication_document_label_is_required_and_kept_verbatim(tmp_path: Path) -> None:
@@ -923,7 +1076,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v37-m20-opinion-render"
+    assert data["schema_version"] == "typst-publication-model-v38-m21-opinion-render"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])

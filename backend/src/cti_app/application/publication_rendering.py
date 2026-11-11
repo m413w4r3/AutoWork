@@ -82,7 +82,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v17-typst-v35-brief-paragraph-gap"
+PUBLICATION_RENDERER_VERSION = "publication-v18-typst-v36-m21-opinion-render"
 PUBLICATION_IDENTITY_LABEL_FIELD = "document_label"
 PDF_LINEAGE_RENDER_DATA_FIELD = "pdf_lineage"
 

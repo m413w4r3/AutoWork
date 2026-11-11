@@ -73,10 +73,6 @@ from tests.test_publication_builder_v4 import (
 )
 
 
-def _repository_temp_root() -> Path:
-    return Path(__file__).resolve().parents[2] / ".tmp-typst-w17"
-
-
 def _inspect_rendered_pdf(
     content: bytes,
     capture_path: Path,
@@ -407,9 +403,10 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     assert findings[0].observation_refs == (observations[0].id,)
 
     template_root, font_root, fonts_lock = typst_bundle_paths()
-    repository_tmp = _repository_temp_root()
+    repository_tmp = tmp_path / ".tmp-typst-w17"
     repository_tmp.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TMPDIR", str(repository_tmp))
+    monkeypatch.setenv("AUTOWORK_LOTC_PREVIEW_PATH", str(tmp_path / "w17-draft-preview.pdf"))
     tempfile.tempdir = None
     service = PublicationRenderService(
         uow_factory=cast(Any, object()),
@@ -444,14 +441,14 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     for heading in (
         "Synthèse",
         "Chronologie",
-        "Avis de l'analyste",
+        "Note de l'analyste",
         "Limites des preuves",
     ):
         assert heading in punctuation_normalized_text
     for uppercase_heading in (
         "CHRONOLOGIE",
         "SYNTHÈSE",
-        "AVIS DE L'ANALYSTE",
+        "NOTE DE L'ANALYSTE",
         "LIMITES DES PREUVES",
     ):
         assert uppercase_heading not in text
@@ -460,7 +457,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         "Synthèse",
         "Infrastructure réseau",
         "Chronologie",
-        "Avis de l'analyste",
+        "Note de l'analyste",
         "Incertitudes et prochaines pistes",
         "15 janvier 2025",
         "alpha.example",
@@ -484,7 +481,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     annex_text = normalized_text.split("annexe technique", 1)[1]
     for table_heading in (
         "type",
-        "valeur défanguée",
+        "valeur refangée",
         "statut indicateur",
         "statut relation",
         "contexte et provenance",
