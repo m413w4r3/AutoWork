@@ -3173,6 +3173,7 @@ async def test_large_operator_led_context_is_preserved_deterministically() -> No
         since_version=state.version,
         since_fingerprint=baseline_summary.fingerprint,
     )
+    assert summary.status.bridge_usage == context.advisor_guidance.bridge_usage
     complete_evidence_ids = []
     evidence_total, _ = await builder.read_context_section(
         section="evidence_index",
@@ -3551,10 +3552,22 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
 
     assert context.advisor_guidance.checkpoint_due is False
     assert context.advisor_guidance.truncated is False
-    # The bounded reminder and source pagination flags are canonical context.
-    assert hashlib.sha256(context.canonical_bytes()).hexdigest() == (
-        "3f3c0fd550438a6f2b3b4cee31cad0e1dcc11c17e31775193366ec794ad99059"
+    assert len(context.advisor_guidance.reminder) <= 120
+    assert context.advisor_guidance.bridge_usage.tools_since_last_consult == 0
+    context_payload = json.loads(context.canonical_bytes())
+    assert context_payload["advisor_guidance"]["bridge_usage"]["total_consultations"] == 0
+    changed_guidance = context.advisor_guidance.model_copy(
+        update={
+            "bridge_usage": context.advisor_guidance.bridge_usage.model_copy(
+                update={"total_consultations": 1}
+            )
+        }
     )
+    changed_context = context.model_copy(update={"advisor_guidance": changed_guidance})
+    # Guidance, including the compact usage summary, participates in context identity.
+    assert hashlib.sha256(context.canonical_bytes()).hexdigest() != hashlib.sha256(
+        changed_context.canonical_bytes()
+    ).hexdigest()
 
 
 @pytest.mark.asyncio

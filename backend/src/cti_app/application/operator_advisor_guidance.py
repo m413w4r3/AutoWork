@@ -27,6 +27,8 @@ ADVISOR_GUIDANCE_REMINDER = (
 MAX_ADVISOR_GUIDANCE_POINTS = 5
 MAX_ADVISOR_GUIDANCE_TEXT = 600
 DEFAULT_CHECKPOINT_TOOL_THRESHOLD = 12
+PLAN_GUIDANCE_TOOL_THRESHOLD = 3
+VT_PIVOT_GUIDANCE_THRESHOLD = 5
 
 
 class EvidenceSummaryPort(Protocol):
@@ -85,14 +87,11 @@ async def build_advisor_guidance(
     guidance: dict[str, Any] = {
         "checkpoint_due": reason is not None,
         "reason": reason,
-        # The strict context DTO currently accepts only the legacy four-value enum.
-        # Keep the checkpoint reason visible without making context construction fail
-        # until the DTO is extended in its separately scoped module.
         "suggested_consultation_type": consultation_type
-        if consultation_type
-        in {"plan_investigation", "pivot_strategy", "yara_draft", "review_text"}
+        if consultation_type in ADVISOR_CONSULTATION_TYPES
         else None,
         "last_advice": latest_advice,
+        "bridge_usage": _bridge_usage(ordered),
         "reminder": _checkpoint_reminder(reason, consultation_type),
         "advisor_turns_used": used,
         "advisor_turn_limit": None,
@@ -125,9 +124,23 @@ def _checkpoint_reminder(reason: str | None, consultation_type: str | None) -> s
             "Avant VT: demander une stratégie de pivots discriminants; hypothèse → pivot → "
             "succès/échec/coût; absence ≠ négatif."
         ),
+        "plan_investigation_due": (
+            "Analyses en cours: demander un plan Bridge pour prioriser la suite."
+        ),
+        "vt_pivot_campaign_due": (
+            "Pivots VT répétés: demander une stratégie Bridge avant de poursuivre."
+        ),
+        "before_yara_proposal": (
+            "Règle YARA opérateur: demander un brouillon Bridge, puis l’importer."
+        ),
+        "suricata_draft_due": (
+            "Modèle réseau exploitable: demander une règle Suricata à Bridge."
+        ),
+        "interpretation_after_result": (
+            "Résultat important: demander une interprétation Bridge avant de conclure."
+        ),
         "editorial_draft_due": (
-            "Brouillon modifié: texte courant seul; avis obsolète. Hypothèse → pivot → "
-            "succès/échec → coût; pas d'historique."
+            "Chaque bloc rédigé: demander un draft_text Bridge avant la version finale."
         ),
         "opinion_review_due": (
             "Revue obsolète: texte/version courants; hypothèse → pivot → succès/échec → coût; "
@@ -137,6 +150,39 @@ def _checkpoint_reminder(reason: str | None, consultation_type: str | None) -> s
     if reason in targeted:
         return targeted[reason]
     return ADVISOR_GUIDANCE_REMINDER
+
+
+def _bridge_usage(invocations: Sequence[Any]) -> dict[str, Any]:
+    consultations = tuple(item for item in invocations if item.tool_name == ADVISOR_TOOL_NAME)
+    counts: dict[str, int] = {}
+    for item in consultations:
+        consultation_type = _consultation_type(item)
+        if consultation_type is not None:
+            counts[consultation_type] = counts.get(consultation_type, 0) + 1
+
+    last_consult = None
+    last_position = max(
+        (index for index, item in enumerate(invocations) if item.tool_name == ADVISOR_TOOL_NAME),
+        default=-1,
+    )
+    if consultations:
+        last = consultations[-1]
+        timestamp = getattr(last, "updated_at", None) or getattr(last, "created_at", None)
+        if timestamp is not None:
+            last_consult = {
+                "consultation_type": _consultation_type(last),
+                "date": timestamp,
+            }
+    return {
+        "consultations_by_type": counts,
+        "total_consultations": len(consultations),
+        "last_consult": last_consult,
+        "tools_since_last_consult": sum(
+            1
+            for item in invocations[last_position + 1 :]
+            if item.tool_name != ADVISOR_TOOL_NAME
+        ),
+    }
 
 
 async def _latest_advice(
@@ -255,6 +301,225 @@ def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> tu
     return tuple(points)
 
 
+def _parameters(invocation: Any) -> Mapping[str, Any]:
+    value = getattr(invocation, "normalized_parameters", {})
+    return value if isinstance(value, Mapping) else {}
+
+
+def _successful_consultation(invocation: Any, consultation_type: str) -> bool:
+    return (
+        invocation.tool_name == ADVISOR_TOOL_NAME
+        and _consultation_type(invocation) == consultation_type
+        and getattr(invocation.status, "value", invocation.status) in {"succeeded", "partial"}
+    )
+
+
+def _latest_successful_consultation_position(
+    invocations: Sequence[Any], consultation_type: str
+) -> int:
+    return max(
+        (
+            index
+            for index, item in enumerate(invocations)
+            if _successful_consultation(item, consultation_type)
+        ),
+        default=-1,
+    )
+
+
+def _is_analysis_tool(tool_name: str) -> bool:
+    return tool_name.startswith(
+        ("sample.", "archive.", "dotnet.", "apk.", "native.", "network.protocol.")
+    )
+
+
+def _analysis_positions(invocations: Sequence[Any]) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, item in enumerate(invocations)
+        if item.tool_name != ADVISOR_TOOL_NAME and _is_analysis_tool(item.tool_name)
+    )
+
+
+def _plan_checkpoint_position(invocations: Sequence[Any]) -> int | None:
+    positions = _analysis_positions(invocations)
+    latest_plan = _latest_successful_consultation_position(invocations, "plan_investigation")
+    after_plan = tuple(index for index in positions if index > latest_plan)
+    if len(after_plan) < PLAN_GUIDANCE_TOOL_THRESHOLD:
+        return None
+    count_at_checkpoint = (len(after_plan) // PLAN_GUIDANCE_TOOL_THRESHOLD) * (
+        PLAN_GUIDANCE_TOOL_THRESHOLD
+    )
+    return after_plan[count_at_checkpoint - 1]
+
+
+def _vt_pivot_checkpoint_position(invocations: Sequence[Any]) -> int | None:
+    latest_pivot = _latest_successful_consultation_position(invocations, "pivot_strategy")
+    known_hashes = {
+        value.casefold()
+        for item in invocations[: latest_pivot + 1]
+        if item.tool_name == "vt.file_report"
+        if isinstance((value := _parameters(item).get("file_hash")), str)
+        and value
+    }
+    pivot_positions: list[int] = []
+    for index, item in enumerate(invocations[latest_pivot + 1 :], start=latest_pivot + 1):
+        if item.tool_name in {
+            "vt.relationships",
+            "vt.intelligence_search",
+            "vt.object_report",
+            "vt.behaviour",
+        }:
+            pivot_positions.append(index)
+        elif item.tool_name == "vt.file_report":
+            value = _parameters(item).get("file_hash")
+            if isinstance(value, str) and value and value.casefold() not in known_hashes:
+                known_hashes.add(value.casefold())
+                pivot_positions.append(index)
+    if len(pivot_positions) < VT_PIVOT_GUIDANCE_THRESHOLD:
+        return None
+    count_at_checkpoint = (len(pivot_positions) // VT_PIVOT_GUIDANCE_THRESHOLD) * (
+        VT_PIVOT_GUIDANCE_THRESHOLD
+    )
+    return pivot_positions[count_at_checkpoint - 1]
+
+
+def _latest_corpus_activity_position(invocations: Sequence[Any], end: int) -> int:
+    return max(
+        (
+            index
+            for index, item in enumerate(invocations[:end])
+            if item.tool_name.startswith("vt.") or _is_analysis_tool(item.tool_name)
+        ),
+        default=-1,
+    )
+
+
+def _operator_yara_checkpoint_position(invocations: Sequence[Any]) -> int | None:
+    source_positions = [
+        index
+        for index, item in enumerate(invocations)
+        if item.tool_name in {"rule.propose", "rule.operator_syntax_fix", "rule.revise"}
+    ]
+    latest_bridge_import = max(
+        (
+            index
+            for index, item in enumerate(invocations)
+            if item.tool_name == "rule.propose_bridge"
+        ),
+        default=-1,
+    )
+    source_positions = [index for index in source_positions if index > latest_bridge_import]
+    for index, item in enumerate(invocations):
+        if item.tool_name != "rule.test":
+            continue
+        prior_writers = tuple(
+            position
+            for position, candidate in enumerate(invocations[:index])
+            if candidate.tool_name
+            in {"rule.propose", "rule.propose_bridge", "rule.operator_syntax_fix", "rule.revise"}
+        )
+        if not prior_writers or invocations[prior_writers[-1]].tool_name != "rule.propose_bridge":
+            source_positions.append(index)
+    return max(source_positions, default=None)
+
+
+def _network_checkpoint_position(
+    invocations: Sequence[Any], observations: Sequence[Any]
+) -> int | None:
+    positions = [
+        index
+        for index, item in enumerate(invocations)
+        if item.tool_name == "network.protocol.document"
+        or any(
+            field in _parameters(item)
+            for field in (
+                "url",
+                "uri",
+                "user_agent",
+                "user-agent",
+                "port",
+                "destination_port",
+                "remote_port",
+                "host",
+                "domain",
+                "network_strings",
+                "http_header",
+            )
+        )
+    ]
+    network_object_types = {
+        "protocol_model",
+        "protocol_evidence_pack",
+        "network_stream",
+        "network_capture_report",
+        "network_string",
+        "network_indicator",
+        "url",
+        "uri",
+        "user_agent",
+        "user-agent",
+        "http_header",
+        "domain",
+        "dns_name",
+        "host",
+        "ip",
+        "port",
+    }
+    for observation in observations:
+        source = str(getattr(observation, "source", "")).casefold()
+        object_type = str(getattr(observation, "object_type", "")).casefold()
+        if not (
+            source.startswith("network.")
+            or object_type in network_object_types
+            or any(marker in object_type for marker in ("network", "protocol", "url", "user_agent"))
+        ):
+            continue
+        position = _observation_invocation_position(invocations, observation)
+        positions.append(position if position is not None else max(0, len(invocations) - 1))
+    return max(positions, default=None)
+
+
+def _unattributed_opinion_position(invocations: Sequence[Any]) -> int | None:
+    positions: list[int] = []
+    for index, item in enumerate(invocations):
+        if item.tool_name not in {"opinion.compose", "opinion.revise", "opinion.note"}:
+            continue
+        if getattr(item.status, "value", item.status) not in {"succeeded", "partial"}:
+            continue
+        params = _parameters(item)
+        raw_blocks = params.get("blocks")
+        if item.tool_name == "opinion.note":
+            unattributed = params.get("bridge_authored") is not True
+        elif isinstance(raw_blocks, (list, tuple)):
+            unattributed = any(
+                not isinstance(block, Mapping) or block.get("bridge_authored") is not True
+                for block in raw_blocks
+            )
+        else:
+            unattributed = True
+        if unattributed:
+            positions.append(index)
+    return max(positions, default=None)
+
+
+def _important_result_position(
+    invocations: Sequence[Any], observations: Sequence[Any]
+) -> int | None:
+    positions: list[int] = []
+    for observation in observations:
+        raw_kind = getattr(observation, "kind", None)
+        kind = getattr(raw_kind, "value", raw_kind)
+        object_type = str(getattr(observation, "object_type", "")).casefold()
+        is_component_result = object_type == "apk_analysis" or "component" in object_type
+        if kind != "negative_result" and not is_component_result:
+            continue
+        position = _observation_invocation_position(invocations, observation)
+        if position is not None:
+            positions.append(position)
+    return max(positions, default=None)
+
+
 def _checkpoint(
     invocations: Sequence[Any],
     *,
@@ -334,6 +599,74 @@ def _checkpoint(
             )
             if not acknowledged:
                 return "new_pivot_discovered", "pivot_strategy"
+
+    yara_trigger_position = _operator_yara_checkpoint_position(invocations)
+    if yara_trigger_position is not None:
+        latest_yara = _latest_successful_consultation_position(invocations, "yara_draft")
+        latest_corpus_activity = _latest_corpus_activity_position(
+            invocations, yara_trigger_position + 1
+        )
+        if (
+            (latest_yara < latest_corpus_activity or latest_yara < 0)
+            and not _checkpoint_disposition_after(
+                invocations, "before_yara_proposal", yara_trigger_position
+            )
+        ):
+            return "before_yara_proposal", "yara_draft"
+
+    network_trigger_position = _network_checkpoint_position(invocations, observations)
+    if network_trigger_position is not None:
+        latest_suricata = _latest_successful_consultation_position(
+            invocations, "suricata_draft"
+        )
+        if (
+            latest_suricata < network_trigger_position
+            and not _checkpoint_disposition_after(
+                invocations, "suricata_draft_due", network_trigger_position
+            )
+        ):
+            return "suricata_draft_due", "suricata_draft"
+
+    opinion_trigger_position = _unattributed_opinion_position(invocations)
+    if opinion_trigger_position is not None:
+        latest_draft = _latest_successful_consultation_position(invocations, "draft_text")
+        if (
+            latest_draft < opinion_trigger_position
+            and not _checkpoint_disposition_after(
+                invocations, "editorial_draft_due", opinion_trigger_position
+            )
+        ):
+            return "editorial_draft_due", "draft_text"
+
+    important_result_position = _important_result_position(invocations, observations)
+    if important_result_position is not None:
+        interpreted_after = any(
+            index > important_result_position
+            and (
+                _successful_consultation(item, "plan_investigation")
+                or _successful_consultation(item, "pivot_strategy")
+            )
+            for index, item in enumerate(invocations)
+        )
+        if (
+            not interpreted_after
+            and not _checkpoint_disposition_after(
+                invocations, "interpretation_after_result", important_result_position
+            )
+        ):
+            return "interpretation_after_result", "pivot_strategy"
+
+    vt_trigger_position = _vt_pivot_checkpoint_position(invocations)
+    if vt_trigger_position is not None and not _checkpoint_disposition_after(
+        invocations, "vt_pivot_campaign_due", vt_trigger_position
+    ):
+        return "vt_pivot_campaign_due", "pivot_strategy"
+
+    plan_trigger_position = _plan_checkpoint_position(invocations)
+    if plan_trigger_position is not None and not _checkpoint_disposition_after(
+        invocations, "plan_investigation_due", plan_trigger_position
+    ):
+        return "plan_investigation_due", "plan_investigation"
 
     analyzed_positions = [
         index
@@ -500,6 +833,8 @@ def _observation_invocation_position(invocations: Sequence[Any], observation: An
         if any(
             str(reference) == observation_id
             for reference in getattr(invocations[index], "response_refs", ())
+        ) or str(getattr(invocations[index], "id", "")) == str(
+            getattr(observation, "invocation_ref", "")
         ):
             return index
     return None

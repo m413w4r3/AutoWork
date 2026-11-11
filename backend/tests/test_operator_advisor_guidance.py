@@ -207,13 +207,13 @@ async def test_event_checkpoint_fixture_fits_eight_consultations_and_keeps_twelv
             ),
             (),
             (),
-            "yara_revision_review",
+            "before_yara_proposal",
         ),
         (
             (advisor, invocation("opinion.compose", created_at=base + timedelta(seconds=1))),
             (),
             (),
-            "opinion_review_due",
+            "editorial_draft_due",
         ),
     )
 
@@ -302,10 +302,8 @@ async def test_complete_editorial_checkpoint_path_uses_six_bridge_turns_with_new
     add_advice("pivot_strategy", 7)
     editorial_checkpoint = await checkpoint()
     assert editorial_checkpoint["reason"] == "editorial_draft_due"
-    assert "Brouillon modifié" in editorial_checkpoint["reminder"]
-    assert "texte courant" in editorial_checkpoint["reminder"]
-    assert "pas d'historique" in editorial_checkpoint["reminder"]
-    assert "hypothèse → pivot → succès/échec → coût" in editorial_checkpoint["reminder"].lower()
+    assert "chaque bloc" in editorial_checkpoint["reminder"].lower()
+    assert "draft_text" in editorial_checkpoint["reminder"]
 
     add_advice("draft_text", 8)
     calls.append(
@@ -314,12 +312,14 @@ async def test_complete_editorial_checkpoint_path_uses_six_bridge_turns_with_new
             created_at=base + timedelta(seconds=9),
         )
     )
-    assert (await checkpoint())["reason"] == "opinion_review_due"
+    assert (await checkpoint())["reason"] == "editorial_draft_due"
 
-    add_advice("review_text", 10)
+    add_advice("draft_text", 10)
+    assert (await checkpoint())["reason"] == "opinion_review_due"
+    add_advice("review_text", 11)
     completed = await checkpoint()
     assert completed["checkpoint_due"] is False
-    assert completed["advisor_turns_used"] == 6
+    assert completed["advisor_turns_used"] == 7
     assert completed["advisor_turns_remaining"] is None
 
 
@@ -531,11 +531,11 @@ def test_advisor_guidance_recap_is_counted_and_trimmed_by_context_budget_stage()
         advisor_turns_remaining=None,
     )
 
-    bounded, truncated = bound_advisor_guidance(guidance, max_bytes=320)
+    bounded, truncated = bound_advisor_guidance(guidance, max_bytes=512)
 
     assert truncated is True
     assert bounded.truncated is True
-    assert len(canonical_json_bytes(bounded.model_dump(mode="json"))) <= 320
+    assert len(canonical_json_bytes(bounded.model_dump(mode="json"))) <= 512
 
 
 @pytest.mark.asyncio
@@ -702,3 +702,256 @@ async def test_new_pivot_checkpoint_disposition_does_not_hide_a_later_pivot():
         )
     )
     assert (await checkpoint())["reason"] == "new_pivot_discovered"
+
+
+@pytest.mark.asyncio
+async def test_guidance_summarizes_bridge_usage_without_internal_identifiers():
+    base = datetime.now(UTC)
+    first_consult = invocation(
+        "advisor.consult",
+        created_at=base,
+        parameters={"consultation_type": "plan_investigation"},
+        consumed=1,
+    )
+    second_consult = invocation(
+        "advisor.consult",
+        created_at=base + timedelta(seconds=2),
+        parameters={"consultation_type": "pivot_strategy"},
+        consumed=1,
+    )
+    result = await build_advisor_guidance(
+        invocations=(
+            first_consult,
+            invocation("sample.analyze", created_at=base + timedelta(seconds=1)),
+            second_consult,
+            invocation("vt.relationships", created_at=base + timedelta(seconds=3)),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    usage = result["bridge_usage"]
+    assert usage["total_consultations"] == 2
+    assert usage["consultations_by_type"]["plan_investigation"] == 1
+    assert usage["consultations_by_type"]["pivot_strategy"] == 1
+    assert usage["last_consult"] == {
+        "consultation_type": "pivot_strategy",
+        "date": second_consult.updated_at,
+    }
+    assert usage["tools_since_last_consult"] == 1
+    assert str(first_consult.id) not in str(usage)
+    assert str(second_consult.id) not in str(usage)
+    AdvisorGuidanceV1.model_validate(result)
+
+
+@pytest.mark.asyncio
+async def test_plan_checkpoint_reappears_after_three_analysis_tools_without_recent_plan():
+    base = datetime.now(UTC)
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation(
+                "advisor.consult",
+                created_at=base,
+                parameters={"consultation_type": "pivot_strategy"},
+            ),
+            invocation("sample.get_feature_pack", created_at=base + timedelta(seconds=1)),
+            invocation("archive.list_members", created_at=base + timedelta(seconds=2)),
+            invocation("dotnet.list_types", created_at=base + timedelta(seconds=3)),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] == "plan_investigation_due"
+    assert result["suggested_consultation_type"] == "plan_investigation"
+
+
+@pytest.mark.asyncio
+async def test_vt_pivot_checkpoint_counts_search_calls_and_distinct_new_file_hashes():
+    base = datetime.now(UTC)
+    repeated_hash = "a" * 64
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation(
+                "advisor.consult",
+                created_at=base,
+                parameters={"consultation_type": "plan_investigation"},
+            ),
+            invocation("vt.relationships", created_at=base + timedelta(seconds=1)),
+            invocation("vt.intelligence_search", created_at=base + timedelta(seconds=2)),
+            invocation("vt.object_report", created_at=base + timedelta(seconds=3)),
+            invocation(
+                "vt.file_report",
+                created_at=base + timedelta(seconds=4),
+                parameters={"file_hash": repeated_hash},
+            ),
+            invocation(
+                "vt.file_report",
+                created_at=base + timedelta(seconds=5),
+                parameters={"file_hash": repeated_hash},
+            ),
+            invocation("vt.behaviour", created_at=base + timedelta(seconds=6)),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] == "vt_pivot_campaign_due"
+    assert result["suggested_consultation_type"] == "pivot_strategy"
+    assert repeated_hash not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_repeated_file_report_for_same_hash_does_not_raise_vt_checkpoint_count():
+    base = datetime.now(UTC)
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation(
+                "advisor.consult",
+                created_at=base,
+                parameters={"consultation_type": "plan_investigation"},
+            ),
+            invocation("vt.relationships", created_at=base + timedelta(seconds=1)),
+            invocation("vt.intelligence_search", created_at=base + timedelta(seconds=2)),
+            invocation("vt.object_report", created_at=base + timedelta(seconds=3)),
+            invocation(
+                "vt.file_report",
+                created_at=base + timedelta(seconds=4),
+                parameters={"file_hash": "b" * 64},
+            ),
+            invocation(
+                "vt.file_report",
+                created_at=base + timedelta(seconds=5),
+                parameters={"file_hash": "b" * 64},
+            ),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] != "vt_pivot_campaign_due"
+
+
+@pytest.mark.asyncio
+async def test_operator_authored_yara_rule_suggests_bridge_draft_before_next_action():
+    base = datetime.now(UTC)
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation("rule.propose", created_at=base),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=("rule.propose_bridge",),
+    )
+
+    assert result["reason"] == "before_yara_proposal"
+    assert result["suggested_consultation_type"] == "yara_draft"
+    assert "import" in result["reminder"].lower()
+
+
+@pytest.mark.asyncio
+async def test_network_protocol_observation_suggests_suricata_draft():
+    base = datetime.now(UTC)
+    network_observation = SimpleNamespace(
+        id=uuid4(),
+        source="network.protocol.document",
+        object_type="protocol_model",
+        observed_at=base + timedelta(seconds=1),
+    )
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation(
+                "network.protocol.document",
+                created_at=base,
+                response_refs=(network_observation.id,),
+            ),
+        ),
+        observations=(network_observation,),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] == "suricata_draft_due"
+    assert result["suggested_consultation_type"] == "suricata_draft"
+
+
+@pytest.mark.asyncio
+async def test_unattributed_opinion_block_suggests_bridge_draft_text():
+    base = datetime.now(UTC)
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation(
+                "opinion.note",
+                created_at=base,
+                parameters={"bridge_authored": False, "text": "private draft content"},
+            ),
+        ),
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] == "editorial_draft_due"
+    assert result["suggested_consultation_type"] == "draft_text"
+    assert "private draft content" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_negative_result_requests_bridge_interpretation():
+    base = datetime.now(UTC)
+    observation_id = uuid4()
+    observation = SimpleNamespace(
+        id=observation_id,
+        observed_at=base + timedelta(seconds=2),
+        kind=EvidenceKind.NEGATIVE_RESULT,
+    )
+    result = await build_advisor_guidance(
+        invocations=(
+            invocation(
+                "advisor.consult",
+                created_at=base,
+                parameters={"consultation_type": "plan_investigation"},
+            ),
+            invocation(
+                "vt.file_report",
+                created_at=base + timedelta(seconds=1),
+                response_refs=(observation_id,),
+            ),
+        ),
+        observations=(observation,),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+
+    assert result["reason"] == "interpretation_after_result"
+    assert result["suggested_consultation_type"] == "pivot_strategy"
+
+
+@pytest.mark.asyncio
+async def test_all_checkpoint_reminders_stay_within_route_contract_limit():
+    reasons = (
+        ("plan_investigation_due", "plan_investigation"),
+        ("vt_pivot_campaign_due", "pivot_strategy"),
+        ("before_yara_proposal", "yara_draft"),
+        ("suricata_draft_due", "suricata_draft"),
+        ("editorial_draft_due", "draft_text"),
+        ("interpretation_after_result", "pivot_strategy"),
+    )
+    for reason, consultation_type in reasons:
+        result = await build_advisor_guidance(
+            invocations=(),
+            observations=(),
+            evidence_summaries=None,
+            available_tools=(),
+        )
+        result["reason"] = reason
+        result["suggested_consultation_type"] = consultation_type
+        result["reminder"] = operator_advisor_guidance._checkpoint_reminder(
+            reason, consultation_type
+        )
+        validated = AdvisorGuidanceV1.model_validate(result)
+        assert len(validated.reminder) <= 120

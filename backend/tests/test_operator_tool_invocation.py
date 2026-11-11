@@ -1870,9 +1870,22 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
                 "expected_sha256": current_state.sha256,
             },
         )
+        operator_context_full = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator/context",
+            params={
+                "expected_version": current_state.version,
+                "expected_sha256": current_state.sha256,
+            },
+        )
 
     assert operator_status.status_code == 200, operator_status.text
     assert operator_status_compact.status_code == 200, operator_status_compact.text
+    status_usage = operator_status.json()["bridge_usage"]
+    assert status_usage["total_consultations"] == 1
+    assert status_usage["consultations_by_type"]["pivot_strategy"] == 1
+    assert operator_status.json()["advisor_guidance"]["bridge_usage"] == status_usage
+    assert len(operator_status.json()["advisor_guidance"]["reminder"]) <= 120
+    assert operator_status_compact.json()["bridge_usage"] == status_usage
     compact_advisor = next(
         item
         for item in operator_status_compact.json()["invocations"]
@@ -1888,6 +1901,11 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     assert last_advice["invocation_id"] == str(advice.invocation.id)
     assert operator_context.status_code == 200, operator_context.text
     assert operator_context.json()["schema"] == "investigation-operator-context-summary.v1"
+    assert operator_context.json()["status"]["bridge_usage"] == status_usage
+    assert operator_context_full.status_code == 200, operator_context_full.text
+    full_context = operator_context_full.json()["context"]
+    assert full_context["advisor_guidance"]["bridge_usage"] == status_usage
+    assert len(full_context["advisor_guidance"]["reminder"]) <= 120
 
     fixture.tools["sample.analyze"].result = ToolResult(
         status=ToolInvocationStatus.SUCCEEDED,

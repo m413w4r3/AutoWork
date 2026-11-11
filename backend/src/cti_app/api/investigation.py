@@ -51,6 +51,7 @@ from cti_app.application.investigation_composition import (
     InvestigationCompositionFactory,
 )
 from cti_app.application.investigation_contracts import (
+    AdvisorBridgeUsageV1,
     AdvisorGuidanceV1,
     InvestigationContextV1,
     InvestigationOperatorContextV1,
@@ -869,6 +870,7 @@ class InvestigationOperatorStatusResponse(BaseModel):
     budget_reservations: list[dict[str, Any]]
     dependencies: dict[str, list[str]]
     tool_inventory: dict[str, list[str]]
+    bridge_usage: AdvisorBridgeUsageV1
     advisor_guidance: AdvisorGuidanceV1
     reconciliation_tasks: list[dict[str, Any]]
     next_analytic_action: dict[str, Any]
@@ -887,6 +889,7 @@ class InvestigationOperatorStatusCompactResponse(BaseModel):
     g2: dict[str, Any]
     budget: dict[str, Any]
     invocation_counts_by_status: dict[str, int]
+    bridge_usage: AdvisorBridgeUsageV1
     invocations: list[dict[str, Any]]
     reconciliation_tasks: list[dict[str, Any]]
     next_analytic_action: dict[str, Any]
@@ -2300,6 +2303,7 @@ async def get_investigation_operator_status(
                 },
                 "budget": payload["budget"],
                 "invocation_counts_by_status": invocation_counts_by_status,
+                "bridge_usage": payload["bridge_usage"],
                 "invocations": payload["invocations"][-10:],
                 "reconciliation_tasks": payload["reconciliation_tasks"],
                 "next_analytic_action": payload["next_analytic_action"],

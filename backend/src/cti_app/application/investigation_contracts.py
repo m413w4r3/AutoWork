@@ -276,6 +276,18 @@ AdvisorConsultationType = Literal[
 ]
 
 
+class AdvisorLastConsultV1(_StrictContract):
+    consultation_type: AdvisorConsultationType | None = None
+    date: datetime
+
+
+class AdvisorBridgeUsageV1(_StrictContract):
+    consultations_by_type: dict[AdvisorConsultationType, int]
+    total_consultations: int = Field(ge=0)
+    last_consult: AdvisorLastConsultV1 | None = None
+    tools_since_last_consult: int = Field(ge=0)
+
+
 class AdvisorLastAdviceV1(_StrictContract):
     consultation_type: AdvisorConsultationType
     date: datetime
@@ -288,6 +300,14 @@ class AdvisorGuidanceV1(_StrictContract):
     reason: str | None = Field(default=None, max_length=96)
     suggested_consultation_type: AdvisorConsultationType | None = None
     last_advice: AdvisorLastAdviceV1 | None = None
+    bridge_usage: AdvisorBridgeUsageV1 = Field(
+        default_factory=lambda: AdvisorBridgeUsageV1(
+            consultations_by_type={},
+            total_consultations=0,
+            last_consult=None,
+            tools_since_last_consult=0,
+        )
+    )
     reminder: str = Field(max_length=120)
     advisor_turns_used: int = Field(ge=0)
     advisor_turn_limit: int | None = Field(default=None, ge=0)

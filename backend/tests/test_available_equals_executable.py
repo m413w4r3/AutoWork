@@ -1860,6 +1860,7 @@ async def test_operator_led_needs_review_keeps_analytic_action_separate() -> Non
     }
     advisor_view = build_view(state, (reviewed,), advisor_guidance=due_guidance)
     assert advisor_view["next_analytic_action"]["code"] == "advisor_checkpoint_due"
+    assert advisor_view["next_analytic_action"]["blocking"] is False
     assert advisor_view["next_idempotent_action"]["code"] == "reconcile_tool_invocation"
 
     running = ToolInvocation(

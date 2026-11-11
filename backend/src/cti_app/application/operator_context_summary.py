@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.context_pagination import ContextOmissionManifestEntryV1
 from cti_app.application.investigation_contracts import (
+    AdvisorBridgeUsageV1,
     InvestigationContextV1,
     InvestigationSourceV1,
 )
@@ -136,6 +137,7 @@ class OperatorContextStatusV1(_OperatorContextContract):
     working_state_version: int = Field(ge=1)
     pending_context_checkpoint: bool
     advisor_checkpoint_due: bool
+    bridge_usage: AdvisorBridgeUsageV1
 
 
 class OperatorContextBriefV1(_OperatorContextContract):
@@ -322,6 +324,7 @@ def build_operator_context_summary(
             working_state_version=state.version,
             pending_context_checkpoint=state.pending_context_sha256 is not None,
             advisor_checkpoint_due=context.advisor_guidance.checkpoint_due,
+            bridge_usage=context.advisor_guidance.bridge_usage,
         ),
         brief=OperatorContextBriefV1(
             article_summary=article_summary,
