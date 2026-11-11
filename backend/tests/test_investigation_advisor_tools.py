@@ -1559,10 +1559,19 @@ async def test_malformed_top_level_draft_assertions_are_ignored_with_warning() -
 @pytest.mark.asyncio
 async def test_draft_text_honors_top_level_single_target_for_bridge_attribution() -> None:
     investigation_id = uuid4()
+    invocation_id = str(uuid4())
     transport = Transport(
         TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text="Draft prose for the selected analyst note target.",
+            output_text=(
+                "advisor-wire.v1\n"
+                "TYPE: draft_text\n"
+                "STATUS: succeeded\n"
+                "UNIT: U1\n"
+                "S: Draft prose for the selected analyst note target.\n"
+                "LIMITATION: none"
+            ),
+            bridge_invocation_id=invocation_id,
         )
     )
     tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
@@ -1582,11 +1591,50 @@ async def test_draft_text_honors_top_level_single_target_for_bridge_attribution(
     assert '"block_type": "claim_verification"' in prompt
     assert '"form": "analyst_note"' in prompt
     assert '"anchor": "lead:0001"' in prompt
+    assert "Aucune assertion cible n\u2019a été fournie" not in prompt
     assert not any(
         item.get("field") in {"block_type", "form", "anchor"}
         and item.get("reason") == "unsupported_for_consultation_type"
         for item in result.output.get("ignored_inputs", ())
     )
+
+    manifest_observation = next(
+        item
+        for item in await tool._observations.list_for_investigation(investigation_id)
+        if item.id in result.observation_refs
+        and item.object_type == "advisor_call"
+        and item.source == "advisor.consult"
+    )
+    manifest = json.loads(
+        await tool._artifact_store.read_bytes(manifest_observation.blob_id, max_bytes=1_000_000)
+    )
+    assert manifest["unit_provenance"]["U1"] == {
+        "bridge_invocation_id": invocation_id,
+        "output_sha256": manifest["output_sha256"],
+        "text_sha256": hashlib.sha256(
+            b"Draft prose for the selected analyst note target."
+        ).hexdigest(),
+        "form": "analyst_note",
+        "block_type": "claim_verification",
+        "anchor": "lead:0001",
+    }
+
+    explicit_result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "claim_verification",
+                    "form": "analyst_note",
+                    "anchor": "lead:0001",
+                }
+            ],
+        },
+        make_context(investigation_id, key="draft-text-explicit-single-target"),
+    )
+    assert explicit_result.status is ToolInvocationStatus.SUCCEEDED
+    assert transport.calls[1]["prompt"] == prompt
 
 
 def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> None:
