@@ -2809,11 +2809,12 @@ async def test_rule_get_marks_version_without_report_untested() -> None:
     assert result.output["source_status"] == DetectionCandidateStatus.CANDIDATE.value
     assert result.output["source_sha256"] == version.source_sha256
     assert result.output["latest_test_report_id"] is None
+    assert result.output["source"].startswith("rule untested")
     assert (
         result.output["source"].encode("utf-8")
         == source.encode("utf-8")[: len(result.output["source"].encode("utf-8"))]
     )
-    assert len(result.output["source"].encode("utf-8")) <= 16 * 1024
+    assert 16 * 1024 - 3 <= len(result.output["source"].encode("utf-8")) <= 16 * 1024
     assert result.output["source_complete"] is False
     source_pages = [result.output["source"]]
     next_offset = result.output["source_next_offset"]

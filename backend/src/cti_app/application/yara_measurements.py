@@ -127,12 +127,14 @@ def _decode_yara_string_literal(literal: str) -> tuple[str, bytes] | None:
     if len(literal) < 2 or literal[0] != '"' or literal[-1] != '"':
         return None
     text: list[str] = []
+    raw_bytes = bytearray()
     index = 1
     while index < len(literal) - 1:
         character = literal[index]
         index += 1
         if character != "\\":
             text.append(character)
+            raw_bytes.extend(character.encode("utf-8", errors="strict"))
             continue
         if index >= len(literal) - 1:
             return None
@@ -141,17 +143,17 @@ def _decode_yara_string_literal(literal: str) -> tuple[str, bytes] | None:
         escaped = {"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}.get(escape)
         if escaped is not None:
             text.append(escaped)
+            raw_bytes.extend(escaped.encode("utf-8", errors="strict"))
             continue
         if escape == "x" and index + 2 <= len(literal) - 1:
             digits = literal[index : index + 2]
             if re.fullmatch(r"[0-9a-fA-F]{2}", digits) is None:
                 return None
-            text.append(chr(int(digits, 16)))
+            value = int(digits, 16)
+            text.append(chr(value))
+            raw_bytes.append(value)
             index += 2
             continue
         return None
     decoded = "".join(text)
-    try:
-        return decoded, decoded.encode("utf-8", errors="strict")
-    except UnicodeEncodeError:
-        return None
+    return decoded, bytes(raw_bytes)

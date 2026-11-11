@@ -20,6 +20,7 @@ from cti_app.application.rule_workbench import (
     RuleValidationReason,
     RuleWorkbench,
     YaraSampleInput,
+    _extract_yara_string_hits,
     classify_rule_validation_issues,
     rule_validation_reason,
     validate_single_rule_candidate,
@@ -478,6 +479,193 @@ async def test_confined_rule_test_marks_one_failed_file_non_measurable(
 
 
 @pytest.mark.asyncio
+async def test_confined_pe_rule_skips_bytes_missing_and_measures_available_members() -> None:
+    missing_bytes = b"synthetic sample whose bytes were not acquired"
+    pe_bytes = bytearray(0x180)
+    pe_bytes[:2] = b"MZ"
+    pe_bytes[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    pe_bytes[0x80:0x84] = b"PE\0\0"
+    pe_bytes[0x98:0x9A] = (0x10B).to_bytes(2, "little")
+    pe_bytes.extend(b"Project1.dll LockBox3 HTTP/1.0")
+    missing_sha256 = _sha256(missing_bytes)
+    pe_sha256 = _sha256(bytes(pe_bytes))
+    artifacts = {missing_sha256: uuid4(), pe_sha256: uuid4()}
+    investigation_id = uuid4()
+
+    class CorpusArtifactIds:
+        async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+            return artifacts[sample_sha256]
+
+    class ConfinedYara:
+        family_statuses: ClassVar[dict[str, ConfinedAnalysisFamilyStatus]] = {
+            "yara": ConfinedAnalysisFamilyStatus("yara", True, "4.5.0")
+        }
+
+        def __init__(self) -> None:
+            self.measured_hashes: list[str] = []
+
+        async def execute(self, request: Any) -> ConfinedAnalysisResult:
+            assert 'import "pe"' in request.analysis_parameters["rule_source"]
+            if request.sha256 == missing_sha256:
+                return ConfinedAnalysisResult(
+                    status=ToolInvocationStatus.SUCCEEDED,
+                    operation_key="confined-analysis:bytes-missing-pe",
+                    artifact_id=request.artifact_id,
+                    input_sha256=request.sha256,
+                    payload={
+                        "result": {
+                            "status": "compile_error",
+                            "version": "4.5.0",
+                            "message": "sample bytes are unavailable to the PE worker",
+                        }
+                    },
+                )
+            self.measured_hashes.append(request.sha256)
+            return ConfinedAnalysisResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                operation_key="confined-analysis:bytes-missing-pe",
+                artifact_id=request.artifact_id,
+                input_sha256=request.sha256,
+                payload={
+                    "result": {
+                        "status": "ok",
+                        "version": "4.5.0",
+                        "matches": True,
+                        "format_magic": "pe",
+                        "string_hits": [{"identifier": "$marker", "offsets": [384]}],
+                        "unavailable_strings": [],
+                        "coverage_details_complete": True,
+                    }
+                },
+            )
+
+    confined = ConfinedYara()
+    workbench = RuleWorkbench(
+        corpus_bytes=CorpusArtifactIds(),  # type: ignore[arg-type]
+        yara_engine=None,
+        confined_analysis=confined,  # type: ignore[arg-type]
+        detection_candidates=MemoryDetectionCandidates(),
+        non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
+        legitimate_services=LegitimateServiceRegistry(()),
+    )
+    source = '''import "pe"
+rule synthetic_pe {
+    strings:
+        $marker = "Project1.dll" ascii
+    condition:
+        pe.is_pe and $marker
+}
+'''
+
+    report = await workbench.compile_and_test(
+        source,
+        (
+            RuleTestCase(
+                sample_sha256=missing_sha256,
+                role=RuleTestCorpusRole.BYTES_MISSING,
+                format_magic="unknown",
+            ),
+            RuleTestCase(
+                sample_sha256=pe_sha256,
+                role=RuleTestCorpusRole.HUMAN_CONFIRMED,
+                format_magic="pe",
+            ),
+        ),
+        investigation_id=investigation_id,
+        selection_bias="One synthetic PE and one unavailable synthetic member.",
+        coverage_statement="The unavailable member is not measurable; PE bytes are measured.",
+    )
+
+    missing = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.BYTES_MISSING
+    )
+    positive = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.HUMAN_CONFIRMED
+    )
+    assert report.execution_status is YaraExecutionStatus.OK
+    assert confined.measured_hashes == [pe_sha256]
+    assert missing.non_measurable == (missing_sha256,)
+    assert missing.file_results[0].unavailable_strings == ("sample_bytes_missing",)
+    assert positive.matches == (pe_sha256,)
+
+
+@pytest.mark.asyncio
+async def test_confined_compile_error_is_recorded_for_every_corpus_member() -> None:
+    first_bytes = b"synthetic first corpus member"
+    second_bytes = b"synthetic second corpus member"
+    first_sha256 = _sha256(first_bytes)
+    second_sha256 = _sha256(second_bytes)
+    artifacts = {first_sha256: uuid4(), second_sha256: uuid4()}
+
+    class CorpusArtifactIds:
+        async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+            return artifacts[sample_sha256]
+
+    class ConfinedYara:
+        family_statuses: ClassVar[dict[str, ConfinedAnalysisFamilyStatus]] = {
+            "yara": ConfinedAnalysisFamilyStatus("yara", True, "4.5.0")
+        }
+
+        async def execute(self, request: Any) -> ConfinedAnalysisResult:
+            return ConfinedAnalysisResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                operation_key="confined-analysis:compile-error",
+                artifact_id=request.artifact_id,
+                input_sha256=request.sha256,
+                payload={
+                    "result": {
+                        "status": "compile_error",
+                        "version": "4.5.0",
+                        "message": "YARA module not supported: hash",
+                        "line": 1,
+                    }
+                },
+            )
+
+    workbench = RuleWorkbench(
+        corpus_bytes=CorpusArtifactIds(),  # type: ignore[arg-type]
+        yara_engine=None,
+        confined_analysis=ConfinedYara(),  # type: ignore[arg-type]
+        detection_candidates=MemoryDetectionCandidates(),
+        non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
+        legitimate_services=LegitimateServiceRegistry(()),
+    )
+
+    report = await workbench.compile_and_test(
+        '''import "hash"
+rule synthetic_hash {
+    strings:
+        $marker = "SyntheticHashMarker" ascii
+    condition:
+        $marker
+}
+''',
+        (
+            RuleTestCase(
+                sample_sha256=first_sha256,
+                role=RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
+            ),
+            RuleTestCase(sample_sha256=second_sha256, role=RuleTestCorpusRole.GOODWARE),
+        ),
+        investigation_id=uuid4(),
+        selection_bias="Both corpus members are synthetic.",
+        coverage_statement="A source-wide compile error applies to every measured member.",
+    )
+
+    candidate = next(
+        role
+        for role in report.roles
+        if role.role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
+    )
+    goodware = next(role for role in report.roles if role.role is RuleTestCorpusRole.GOODWARE)
+    assert report.execution_status is YaraExecutionStatus.COMPILE_ERROR
+    assert candidate.errors[0].sample_sha256 == first_sha256
+    assert candidate.errors[0].message == "YARA module not supported: hash"
+    assert goodware.errors[0].sample_sha256 == second_sha256
+    assert goodware.errors[0].message == "YARA module not supported: hash"
+
+
+@pytest.mark.asyncio
 async def test_confined_rule_test_resolves_worker_bytes_for_every_operator_corpus_role() -> None:
     roles = (
         RuleTestCorpusRole.DOCUMENTED_SEED_UNCONFIRMED,
@@ -735,6 +923,78 @@ def test_rule_source_escapes_metadata_and_uses_safe_deterministic_identity() -> 
     assert invalid.validation.issues[0].code is RuleMotifIssueCode.INVALID_METADATA
 
 
+@pytest.mark.asyncio
+async def test_generated_string_and_wide_motifs_match_synthetic_pe_bytes() -> None:
+    data = bytearray(0x180)
+    data[:2] = b"MZ"
+    data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    data[0x80:0x84] = b"PE\0\0"
+    data[0x98:0x9A] = (0x10B).to_bytes(2, "little")
+    data.extend(b"\0Project1.dll\0HTTP/1.0\0")
+    data.extend("LockBox3".encode("utf-16le"))
+    data.extend("WinInetKeyboardMarker".encode("utf-16le"))
+    sample = bytes(data)
+    values = (
+        (RuleMotifKind.STRING, "Project1.dll"),
+        (RuleMotifKind.STRING, "HTTP/1.0"),
+        (RuleMotifKind.WIDE, "LockBox3"),
+        (RuleMotifKind.WIDE, "WinInetKeyboardMarker"),
+    )
+    motifs = tuple(
+        RuleMotif(
+            kind=kind,
+            value=value,
+            provenance_kind=RuleMotifProvenanceKind.MANUAL,
+            provenance_id=f"synthetic-motif-{index}",
+            observation_refs=(uuid4(),),
+        )
+        for index, (kind, value) in enumerate(values)
+    )
+    workbench = _workbench({_sha256(sample): sample})
+    built = workbench.build_rule(motifs, RuleConditionStrategy.ALL)
+    assert built.valid and built.source is not None
+    assert '"Project1.dll" ascii' in built.source
+    assert '"LockBox3" wide' in built.source
+    assert "all of them" in built.source
+
+    report = await workbench.compile_and_test(
+        built.source,
+        (_case(sample, RuleTestCorpusRole.HUMAN_CONFIRMED),),
+        selection_bias="The fixture contains only synthetic bytes and motifs.",
+        coverage_statement="This synthetic fixture checks generated source and byte matching.",
+    )
+
+    positive = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.HUMAN_CONFIRMED
+    )
+    assert report.execution_status is YaraExecutionStatus.OK
+    assert positive.matches == (_sha256(sample),)
+    assert positive.file_results[0].format_magic == "pe"
+    assert {hit.identifier for hit in positive.file_results[0].strings} == {
+        "$m0",
+        "$m1",
+        "$m2",
+        "$m3",
+    }
+
+
+def test_yara_string_hit_extraction_preserves_escaped_utf8_bytes() -> None:
+    source = r'''rule escaped_utf8_marker {
+    strings:
+        $marker = "\xC3\xA9Project1" ascii
+    condition:
+        $marker
+}
+'''
+
+    hits, unavailable = _extract_yara_string_hits(source, "éProject1".encode("utf-8"))
+
+    assert unavailable == ()
+    assert len(hits) == 1
+    assert hits[0].identifier == "$marker"
+    assert hits[0].offsets == (0,)
+
+
 def test_feature_proposals_keep_p09_identity_offsets_and_goodware_counts() -> None:
     data = b"synthetic feature data"
     sample_sha256 = _sha256(data)
@@ -840,6 +1100,35 @@ async def test_compile_errors_are_typed_and_engine_unavailable_is_local() -> Non
             if role.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
         )[0].code
         is RuleTestErrorCode.ENGINE_UNAVAILABLE
+    )
+
+
+@pytest.mark.asyncio
+async def test_hash_only_rule_reports_source_guard_before_yara_compilation() -> None:
+    data = b"synthetic hash-only corpus member"
+    sample_sha256 = _sha256(data)
+    source = f'''import "hash"
+rule exact_identity {{
+    condition:
+        hash.sha256(0, filesize) == "{sample_sha256}"
+}}
+'''
+
+    report = await _workbench({sample_sha256: data}).compile_and_test(
+        source,
+        (_case(data, RuleTestCorpusRole.HUMAN_CONFIRMED),),
+        selection_bias="The only source is synthetic and hash-addressed.",
+        coverage_statement="Hash-only rules are rejected before sample measurement.",
+    )
+
+    assert report.execution_status is YaraExecutionStatus.INVALID_INPUT
+    assert report.source_validator_findings == (
+        "measured_string_or_byte_pattern_required",
+        "hash_equality_condition_forbidden",
+    )
+    positive = next(role for role in report.roles if role.role is RuleTestCorpusRole.HUMAN_CONFIRMED)
+    assert positive.errors[0].message == (
+        "single-rule source guard: measured_string_or_byte_pattern_required"
     )
 
 

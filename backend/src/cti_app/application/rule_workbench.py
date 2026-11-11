@@ -1381,6 +1381,22 @@ class RuleWorkbench:
             if case.sample_sha256 in seen:
                 continue
             seen.add(case.sample_sha256)
+            if case.role is RuleTestCorpusRole.BYTES_MISSING:
+                for same_sample in cases:
+                    if same_sample.sample_sha256 != case.sample_sha256:
+                        continue
+                    results[same_sample.role]["non_measurable"].add(case.sample_sha256)
+                    results[same_sample.role]["file_results"][case.sample_sha256] = (
+                        RuleFileCoverage(
+                            sample_sha256=case.sample_sha256,
+                            role=same_sample.role,
+                            matched=None,
+                            format_magic=same_sample.format_magic,
+                            details_complete=False,
+                            unavailable_strings=("sample_bytes_missing",),
+                        )
+                    )
+                continue
             try:
                 artifact_id = await resolver(case.sample_sha256)
             except Exception:
@@ -1498,6 +1514,37 @@ class RuleWorkbench:
                 }:
                     status = worker_status
                 if status is YaraExecutionStatus.COMPILE_ERROR:
+                    for unprocessed_case in cases:
+                        role_result = results[unprocessed_case.role]
+                        if unprocessed_case.sample_sha256 in role_result["file_results"]:
+                            continue
+                        role_result["errors"].append(
+                            RuleTestError(
+                                code=RuleTestErrorCode.COMPILE_ERROR,
+                                message=message[:1000],
+                                sample_sha256=unprocessed_case.sample_sha256,
+                                line=(
+                                    worker_result.get("line")
+                                    if isinstance(worker_result.get("line"), int)
+                                    else None
+                                ),
+                                column=(
+                                    worker_result.get("column")
+                                    if isinstance(worker_result.get("column"), int)
+                                    else None
+                                ),
+                            )
+                        )
+                        role_result["file_results"][unprocessed_case.sample_sha256] = (
+                            RuleFileCoverage(
+                                sample_sha256=unprocessed_case.sample_sha256,
+                                role=unprocessed_case.role,
+                                matched=None,
+                                format_magic=unprocessed_case.format_magic,
+                                details_complete=False,
+                                unavailable_strings=(YaraExecutionStatus.COMPILE_ERROR.value,),
+                            )
+                        )
                     break
                 continue
             matched = worker_result.get("matches") is True
