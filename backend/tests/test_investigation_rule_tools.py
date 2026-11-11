@@ -2809,9 +2809,10 @@ async def test_rule_get_marks_version_without_report_untested() -> None:
     assert result.output["source_status"] == DetectionCandidateStatus.CANDIDATE.value
     assert result.output["source_sha256"] == version.source_sha256
     assert result.output["latest_test_report_id"] is None
-    assert result.output["source"].encode("utf-8") == source.encode("utf-8")[
-        : len(result.output["source"].encode("utf-8"))
-    ]
+    assert (
+        result.output["source"].encode("utf-8")
+        == source.encode("utf-8")[: len(result.output["source"].encode("utf-8"))]
+    )
     assert len(result.output["source"].encode("utf-8")) <= 16 * 1024
     assert result.output["source_complete"] is False
     source_pages = [result.output["source"]]
@@ -3064,7 +3065,7 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
         default=lambda value: dict(value) if isinstance(value, Mapping) else str(value),
     )
     assert all("source" not in item for item in history.output["versions"])
-    assert "rule candidate" in serialized_history.lower()
+    assert v2.source.splitlines()[0].lower() in serialized_history.lower()
 
 
 @pytest.mark.asyncio

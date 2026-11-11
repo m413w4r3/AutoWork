@@ -3063,9 +3063,7 @@ class _RuleTools:
                 payload = await self.evidence_payloads.read_json(observation.blob_id)
             except Exception:
                 payload = None
-            reports[observation.object_id].append(
-                payload if isinstance(payload, Mapping) else None
-            )
+            reports[observation.object_id].append(payload if isinstance(payload, Mapping) else None)
             report_observation_ids[observation.object_id].append(observation.id)
         comparison_observations = [
             observation
@@ -5214,11 +5212,7 @@ def _rule_source_page(source: str, requested_offset: Any) -> dict[str, Any]:
     if offset < len(encoded) and (encoded[offset] & 0b1100_0000) == 0b1000_0000:
         raise _ToolFailed("rule_source_offset_not_utf8_boundary")
     end = min(offset + _MAX_RULE_SOURCE_PAGE_BYTES, len(encoded))
-    while (
-        end > offset
-        and end < len(encoded)
-        and (encoded[end] & 0b1100_0000) == 0b1000_0000
-    ):
+    while end > offset and end < len(encoded) and (encoded[end] & 0b1100_0000) == 0b1000_0000:
         end -= 1
     return {
         "text": encoded[offset:end].decode("utf-8"),
