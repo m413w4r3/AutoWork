@@ -34,6 +34,7 @@ from cti_app.application.external_effects import (
     Reused,
     SafeExternalEffectFailure,
     TransportResponse,
+    VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
 )
 from cti_app.application.sample_acquisition import (
     SampleAcquisitionCacheScope,
@@ -586,8 +587,9 @@ async def _read_vt_archive(
     try:
         return await archive.read_external_response(reference, max_bytes=maximum)
     except Exception:
-        raise VirusTotalExternalEffectNeedsReviewError(
-            "The VirusTotal response archive is missing or unverifiable."
+        raise VirusTotalError(
+            "The VirusTotal response archive is unavailable or unverifiable.",
+            code="virustotal_raw_response_archive_unavailable",
         ) from None
 
 
@@ -2132,6 +2134,24 @@ class VirusTotalHttpAdapter(VirusTotalPort):
 
             try:
                 if isinstance(outcome, Completed):
+                    if (
+                        outcome.outcome_code is not None
+                        and outcome.outcome_code in VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES
+                    ):
+                        if outcome.payload is None:
+                            record_virustotal_external_effect(reused=True)
+                        public_error_code = {
+                            "vt_raw_archive_write_failed": (
+                                "virustotal_raw_response_archive_failed"
+                            ),
+                            "vt_archive_reference_invalid": (
+                                "virustotal_raw_response_reference_invalid"
+                            ),
+                        }[outcome.outcome_code]
+                        raise VirusTotalError(
+                            "The completed VirusTotal response could not be archived.",
+                            code=public_error_code,
+                        )
                     envelope = outcome.payload
                     decoded = (
                         _decode_vt_transient_response(envelope)
@@ -2140,8 +2160,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     )
                     reference = _one_raw_response_reference(outcome.evidence_refs)
                     if reference is None or outcome.result_ref != reference.id:
-                        raise VirusTotalExternalEffectNeedsReviewError(
-                            "The completed VirusTotal response has no raw archive reference."
+                        raise VirusTotalError(
+                            "The completed VirusTotal response has an invalid "
+                            "raw archive reference.",
+                            code="virustotal_raw_response_reference_invalid",
                         )
                     archived = await _read_vt_archive(
                         archive,
@@ -2160,8 +2182,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     if decoded is None:
                         decoded = archived_transient
                     elif decoded != archived_transient:
-                        raise VirusTotalExternalEffectNeedsReviewError(
-                            "The completed VirusTotal response does not match its raw archive."
+                        raise VirusTotalError(
+                            "The completed VirusTotal response does not match its raw archive.",
+                            code="virustotal_raw_response_archive_mismatch",
                         )
                     if outcome.payload is None:
                         record_virustotal_external_effect(reused=True)
@@ -2170,8 +2193,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 if isinstance(outcome, Reused):
                     reference = _one_raw_response_reference(outcome.observation_refs)
                     if reference is None:
-                        raise VirusTotalExternalEffectNeedsReviewError(
-                            "The reused VirusTotal effect has no raw response archive."
+                        raise VirusTotalError(
+                            "The reused VirusTotal effect has an invalid raw archive reference.",
+                            code="virustotal_raw_response_reference_invalid",
                         )
                     archived = await _read_vt_archive(
                         archive,
@@ -4130,6 +4154,7 @@ def _http_error(
             if isinstance(fallback_message, str):
                 raw_message = _safe_error_detail(fallback_message, 1024, secret_values)
     normalized = f"{raw_code or ''} {raw_message or ''}".lower().replace("_", " ").replace("-", " ")
+    normalized_error_code = (raw_code or "").casefold().replace("-", "_")
     issuer = issuer or _response_issuer({}, body)
     route_missing = (
         status == 404
@@ -4189,7 +4214,15 @@ def _http_error(
             if operation is VirusTotalOperation.FILE_DOWNLOAD and issuer != "upstream-vt-likely"
             else "virustotal_upstream_not_found"
             if operation is VirusTotalOperation.FILE_DOWNLOAD
-            else "virustotal_not_found",
+            else "virustotal_not_found"
+            if normalized_error_code in {
+                "notfound",
+                "not_found",
+                "object_not_found",
+                "file_not_found",
+                "virustotal_not_found",
+            }
+            else "virustotal_http_404_unattributed",
             False,
         ),
         407: ("virustotal_proxy_auth_required", False),

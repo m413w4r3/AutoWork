@@ -222,11 +222,22 @@ _VT_HASH_READ_TOOLS = frozenset(
 )
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 _MAX_VT_SOURCE_REFERENCES = 16
+_MAX_VT_OBJECT_GROUNDING_BYTES = 4 * 1024 * 1024
+_VT_OBJECT_GROUNDING_EVIDENCE_KINDS = frozenset(
+    {
+        EvidenceKind.BINARY_ANALYSIS,
+        EvidenceKind.BINARY_STRING,
+        EvidenceKind.SHODAN_OBSERVATION,
+        EvidenceKind.VT_BEHAVIOUR,
+        EvidenceKind.VT_FILE_REPORT,
+        EvidenceKind.VT_RELATIONSHIP,
+    }
+)
 _ADVISOR_PREFLIGHT_REFUSAL_PARAMETER = "_advisor_preflight_refusal_expected"
 _VT_HASH_NOT_GROUNDED_REASON = "vt_hash_not_grounded"
 _VT_HASH_NOT_GROUNDED_CORRECTION = (
-    "Cite an observation or a source-documented SHA-256 IOC, or associate the hash through "
-    "vt.file_report before retrying."
+    "Cite an observation anchored to this SHA-256, a hash-verified canonical VT relationship "
+    "payload containing it, or a source-documented SHA-256 IOC before retrying."
 )
 
 
@@ -244,6 +255,47 @@ def _bounded_vt_source_references(
         *documents,
         *other_references[: _MAX_VT_SOURCE_REFERENCES - len(documents)],
     )
+
+
+def _vt_object_payload_contains(
+    payload: object, object_type: VirusTotalObjectType, normalized_object_id: str
+) -> bool:
+    boundary = (
+        r"(?<![A-Za-z0-9.-])"
+        if object_type is VirusTotalObjectType.DOMAIN
+        else r"(?<![A-Za-z0-9.])"
+    )
+    trailing_boundary = (
+        r"(?![A-Za-z0-9.-])"
+        if object_type is VirusTotalObjectType.DOMAIN
+        else r"(?![A-Za-z0-9.])"
+    )
+    pattern = re.compile(
+        boundary + re.escape(normalized_object_id) + trailing_boundary,
+        re.IGNORECASE,
+    )
+    return any(pattern.search(value) is not None for value in _nested_evidence_strings(payload))
+
+
+def _nested_evidence_strings(value: object) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, nested in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _nested_evidence_strings(nested)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for nested in value:
+            yield from _nested_evidence_strings(nested)
+
+
+def _vt_hash_payload_contains(payload: object, normalized_sha256: str) -> bool:
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])" + re.escape(normalized_sha256) + r"(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    )
+    return any(pattern.search(value) is not None for value in _nested_evidence_strings(payload))
 
 
 class _BudgetSnapshotPersistenceError(RuntimeError):
@@ -2622,14 +2674,23 @@ class InvestigationService:
                         document_refs[reference.id] = reference
 
             observations = await self._observations.list_for_investigation(investigation.id)
-            matching_observations = tuple(
-                item
-                for item in observations
-                if item.investigation_id == investigation.id
-                and item.object_type.casefold()
-                in {"sample", "file", "sample_observation", "sha256"}
-                and item.object_id.casefold() == normalized_hash
-            )
+            matching_observation_items: list[EvidenceObservation] = []
+            for item in observations:
+                if item.investigation_id != investigation.id:
+                    continue
+                exact_anchor = (
+                    item.object_type.casefold()
+                    in {"sample", "file", "sample_observation", "sha256"}
+                    and item.object_id.casefold() == normalized_hash
+                )
+                relationship_payload_match = (
+                    not exact_anchor
+                    and item.kind is EvidenceKind.VT_RELATIONSHIP
+                    and await self._canonical_evidence_contains_vt_hash(item, normalized_hash)
+                )
+                if exact_anchor or relationship_payload_match:
+                    matching_observation_items.append(item)
+            matching_observations = tuple(matching_observation_items)
             observation_refs = tuple(
                 EvidenceReference(
                     kind="evidence_observation",
@@ -2763,16 +2824,31 @@ class InvestigationService:
         }[object_type]
         object_observation_refs: dict[str, EvidenceReference] = {}
         for observation in await self._observations.list_for_investigation(investigation.id):
+            if observation.investigation_id != investigation.id:
+                continue
+
+            grounded = False
+            if observation.object_type.casefold() in observation_types:
+                try:
+                    candidate = _normalize_object_id(object_type, observation.object_id)
+                except (TypeError, ValueError, VirusTotalInvalidInputError):
+                    candidate = None
+                grounded = candidate == normalized_object_id
+
+            evidence_kind = observation.kind
+            trusted_payload_source = evidence_kind in _VT_OBJECT_GROUNDING_EVIDENCE_KINDS or (
+                evidence_kind is EvidenceKind.OTHER
+                and observation.source.startswith("network.capture.")
+            )
             if (
-                observation.investigation_id != investigation.id
-                or observation.object_type.casefold() not in observation_types
+                not grounded
+                and trusted_payload_source
+                and object_type in {VirusTotalObjectType.DOMAIN, VirusTotalObjectType.IP_ADDRESS}
             ):
-                continue
-            try:
-                candidate = _normalize_object_id(object_type, observation.object_id)
-            except (TypeError, ValueError, VirusTotalInvalidInputError):
-                continue
-            if candidate != normalized_object_id:
+                grounded = await self._canonical_evidence_contains_vt_object(
+                    observation, object_type, normalized_object_id
+                )
+            if not grounded:
                 continue
             reference = EvidenceReference(
                 kind="evidence_observation",
@@ -2787,6 +2863,46 @@ class InvestigationService:
             for reference in (*object_document_refs.values(), *object_observation_refs.values())
         }
         return _bounded_vt_source_references(references[key] for key in sorted(references))
+
+    async def _canonical_evidence_contains_vt_object(
+        self,
+        observation: EvidenceObservation,
+        object_type: VirusTotalObjectType,
+        normalized_object_id: str,
+    ) -> bool:
+        payload = await self._canonical_evidence_payload(observation)
+        return payload is not None and _vt_object_payload_contains(
+            payload, object_type, normalized_object_id
+        )
+
+    async def _canonical_evidence_contains_vt_hash(
+        self, observation: EvidenceObservation, normalized_sha256: str
+    ) -> bool:
+        payload = await self._canonical_evidence_payload(observation)
+        return payload is not None and _vt_hash_payload_contains(payload, normalized_sha256)
+
+    async def _canonical_evidence_payload(
+        self, observation: EvidenceObservation
+    ) -> dict[str, Any] | None:
+        reader = getattr(self._artifact_store, "read_bytes", None)
+        if not callable(reader):
+            return None
+        try:
+            raw = await reader(
+                observation.blob_id,
+                max_bytes=_MAX_VT_OBJECT_GROUNDING_BYTES,
+            )
+            if (
+                not isinstance(raw, bytes)
+                or hashlib.sha256(raw).hexdigest() != observation.sha256
+            ):
+                return None
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or canonical_json_bytes(payload) != raw:
+                return None
+        except Exception:
+            return None
+        return payload
 
     async def _osint_open_vt_hash_reads_allowed(
         self,

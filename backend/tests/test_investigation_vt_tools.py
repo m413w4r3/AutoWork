@@ -61,6 +61,7 @@ from cti_app.application.virustotal import (
     VirusTotalFileReport,
     VirusTotalHttpError,
     VirusTotalInvalidInputError,
+    VirusTotalJsonError,
     VirusTotalNotAuthorizedError,
     VirusTotalObjectReport,
     VirusTotalOperationRoute,
@@ -1012,6 +1013,34 @@ async def test_explicit_not_found_and_successful_empty_results_are_negative_evid
             not_found_tools.context.investigation_id
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_unattributed_404_and_deterministic_provider_errors_are_terminal_with_codes() -> None:
+    missing_tools = _tool_set()
+    missing_tools.vt.errors["file_report"] = VirusTotalHttpError(
+        "an unattributed response", status_code=404, code="virustotal_http_404_unattributed"
+    )
+    missing = await _dispatch(missing_tools, "vt.file_report", {"file_hash": _SEED_HASH})
+    assert missing.status is ToolInvocationStatus.FAILED
+    assert missing.error_code == "virustotal_http_404_unattributed"
+
+    provider_tools = _tool_set()
+    provider_tools.vt.errors["file_report"] = VirusTotalHttpError(
+        "a deterministic provider response",
+        status_code=400,
+        code="virustotal_upstream_error",
+        error_code="InvalidQuery",
+    )
+    provider = await _dispatch(provider_tools, "vt.file_report", {"file_hash": _SEED_HASH})
+    assert provider.status is ToolInvocationStatus.FAILED
+    assert provider.error_code == "invalidquery"
+
+    parse_tools = _tool_set()
+    parse_tools.vt.errors["file_report"] = VirusTotalJsonError("invalid JSON response")
+    parse = await _dispatch(parse_tools, "vt.file_report", {"file_hash": _SEED_HASH})
+    assert parse.status is ToolInvocationStatus.FAILED
+    assert parse.error_code == "virustotal_json_invalid"
 
 
 @pytest.mark.asyncio

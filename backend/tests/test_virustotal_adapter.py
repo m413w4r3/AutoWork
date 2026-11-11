@@ -466,7 +466,7 @@ async def test_capability_disabled_and_missing_proxy_are_local() -> None:
     [
         (401, "virustotal_upstream_unauthorized", False),
         (403, "virustotal_not_authorized", False),
-        (404, "virustotal_not_found", False),
+        (404, "virustotal_http_404_unattributed", False),
         (407, "virustotal_proxy_auth_required", False),
         (429, "virustotal_quota_exceeded", True),
         (503, "virustotal_upstream_error", True),
@@ -599,7 +599,6 @@ async def test_passive_read_transport_retry_uses_a_fresh_coordinator_claim() -> 
     ("failure_kind", "failure_stage"),
     [
         ("transport", "transport_exception_ReadTimeout"),
-        ("archive", "raw_archive_write_failed"),
         ("completion", "claim_completion_failed"),
     ],
 )
@@ -621,14 +620,7 @@ async def test_uncertain_passive_read_records_safe_failure_diagnostics(
         )
 
     value, client = adapter(handler)
-    if failure_kind == "archive":
-        archive = cast(InMemoryVirusTotalArchive, cast(Any, value)._test_vt_response_archive)
-
-        async def fail_archive(*_args: Any, **_kwargs: Any) -> Any:
-            raise OSError("must-not-be-logged secret=discard-me")
-
-        archive.archive_external_response = fail_archive  # type: ignore[method-assign]
-    elif failure_kind == "completion":
+    if failure_kind == "completion":
         store = cast(Any, value)._test_external_effect_store
 
         async def fail_complete(*_args: Any, **_kwargs: Any) -> bool:
@@ -671,6 +663,78 @@ async def test_uncertain_passive_read_records_safe_failure_diagnostics(
     assert "must-not-be-logged" not in application_log
     assert "secret=discard-me" not in application_log
     assert "?x=1" not in application_log
+
+
+@pytest.mark.asyncio
+async def test_complete_response_archive_failure_is_terminal_for_passive_read() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            400,
+            json={"error": {"code": "InvalidQuery"}},
+            request=request,
+        )
+
+    value, client = adapter(handler)
+    archive = cast(InMemoryVirusTotalArchive, cast(Any, value)._test_vt_response_archive)
+
+    async def fail_archive(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("synthetic archive write failure")
+
+    archive.archive_external_response = fail_archive  # type: ignore[method-assign]
+    try:
+        with pytest.raises(VirusTotalError) as caught:
+            await value.intelligence_search('pdb:"synthetic"')
+        with authorized_vt_read(invocation_id=UUID("e439a7f5-77cd-49b7-a8cb-b59366cdb0fb")):
+            with pytest.raises(VirusTotalError) as replay:
+                await value.intelligence_search('pdb:"synthetic"')
+    finally:
+        await client.aclose()
+
+    store = cast(Any, value)._test_external_effect_store
+    claims = tuple(store.claims.values())
+    assert caught.value.code == "virustotal_raw_response_archive_failed"
+    assert replay.value.code == caught.value.code
+    assert calls == 1
+    assert len(claims) == 1
+    assert claims[0].state.value == "COMPLETED"
+    assert claims[0].outcome_code == "vt_raw_archive_write_failed"
+    assert store.needs_review_reason_codes == []
+
+
+@pytest.mark.asyncio
+async def test_received_response_archive_read_failure_is_terminal() -> None:
+    calls = 0
+    body = json.dumps({"data": {"id": SHA256.lower(), "type": "file"}}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=body, request=request)
+
+    value, client = adapter(handler)
+    archive = cast(Any, value)._test_vt_response_archive
+
+    async def fail_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("synthetic archive read failure")
+
+    archive.read_external_response = fail_read  # type: ignore[method-assign]
+    try:
+        with pytest.raises(VirusTotalError) as caught:
+            await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+
+    store = cast(Any, value)._test_external_effect_store
+    claims = tuple(store.claims.values())
+    assert caught.value.code == "virustotal_raw_response_archive_unavailable"
+    assert calls == 1
+    assert len(claims) == 1
+    assert claims[0].state.value == "COMPLETED"
+    assert store.needs_review_reason_codes == []
 
 
 @pytest.mark.asyncio
@@ -746,7 +810,7 @@ async def test_completed_read_replay_resolves_verified_archive_without_a_second_
 
 
 @pytest.mark.asyncio
-async def test_missing_replay_archive_is_recovered_by_a_fresh_passive_read() -> None:
+async def test_missing_replay_archive_is_terminal_without_a_second_send() -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -768,11 +832,12 @@ async def test_missing_replay_archive_is_recovered_by_a_fresh_passive_read() -> 
         archive = cast(Any, value)._test_vt_response_archive
         del archive.items[claim.result_ref]
         with authorized_vt_read(invocation_id=second_id):
-            recovered = await value.file_report(SHA256)
+            with pytest.raises(VirusTotalError) as caught:
+                await value.file_report(SHA256)
     finally:
         await client.aclose()
-    assert recovered.file.lookup_value == SHA256.lower()
-    assert calls == 2
+    assert caught.value.code == "virustotal_raw_response_archive_unavailable"
+    assert calls == 1
 
 
 @pytest.mark.asyncio
