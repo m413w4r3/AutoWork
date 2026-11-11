@@ -2023,7 +2023,7 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v39-m21-opinion-render",
+        "schema_version": "typst-publication-model-v40-m21-opinion-render",
         "section_types": [
             "references",
             "chronology",

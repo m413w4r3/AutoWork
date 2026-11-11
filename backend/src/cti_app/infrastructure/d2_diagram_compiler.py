@@ -284,7 +284,11 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             if protocol_status is not None
             else (_NODE_STROKE_BY_ROLE[node.role], _NODE_FILL)
         )
-        label = _wrap_d2_label(node.label, width=node_wrap_width)
+        label = _wrap_d2_label(
+            node.label,
+            width=node_wrap_width,
+            wrap_long_tokens=diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE,
+        )
         lines.extend(
             (
                 f"{node_references[node.node_id]}: {_escape_d2_label(label)} {{",
@@ -393,22 +397,32 @@ def _protocol_edge_color(label: str | None) -> str:
     return _PROTOCOL_STATUS_COLORS[status][0] if status is not None else _EDGE_COLOR
 
 
-def _wrap_d2_label(value: str, width: int = 24) -> str:
-    """Wrap labels between words while leaving long technical literals intact."""
+def _wrap_d2_label(
+    value: str,
+    width: int = 24,
+    *,
+    wrap_long_tokens: bool = False,
+) -> str:
+    """Wrap between words, optionally wrapping long protocol tokens intact."""
     words = value.split()
     if not words:
         return value
-    lines: list[str] = []
-    current = ""
+    lines = [""]
     for word in words:
-        candidate = f"{current} {word}" if current else word
-        if current and len(candidate) > width:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
+        pieces = (
+            [word[index : index + width] for index in range(0, len(word), width)]
+            if wrap_long_tokens and len(word) > width
+            else [word]
+        )
+        for index, piece in enumerate(pieces):
+            if index > 0:
+                lines.append(piece)
+                continue
+            separator = " " if lines[-1] else ""
+            if lines[-1] and len(lines[-1]) + len(separator) + len(piece) > width:
+                lines.append(piece)
+            else:
+                lines[-1] += separator + piece
     return "\n".join(lines)
 
 

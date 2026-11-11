@@ -97,8 +97,8 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_hash
 
-# v39 adds reader-facing opinion labels and logical finding IDs to opinion annexes.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v39-m21-opinion-render"
+# v40 localizes opinion IOC labels and keeps protocol figure proof captions visible.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v40-m21-opinion-render"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -130,6 +130,10 @@ _INDICATOR_KEYS = {
     ArtifactType.HASH: "hashes",
 }
 _PUBLICATION_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
+_SHORT_PUBLICATION_HOST = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\.?"
+    r"(?::\d{1,5})?$"
+)
 _IOC_DISPOSITION_LABELS = {
     PublicationIOCDisposition.RETAINED: "Retenu",
     PublicationIOCDisposition.UNCERTAIN: "Incertain",
@@ -156,9 +160,47 @@ _IOC_EVIDENCE_BASIS_LABELS = {
     "unverified_model_output": "sortie de modèle non vérifiée",
     "analyst_override": "décision de l'analyste",
 }
-_IOC_RELEVANCE_LABELS = {
-    ("direct", "malicious_subject_relation"): "direct — relation malveillante au sujet",
-    ("context", "malicious_role_not_demonstrated"): ("contexte — rôle malveillant non démontré"),
+_IOC_RELEVANCE_CLASSIFICATION_LABELS = {
+    "direct": "direct",
+    "corroboration": "corroboration",
+    "context": "contexte",
+    "counter_indication": "contre-indication",
+    "out_of_scope": "hors périmètre",
+    "indeterminate": "indéterminée",
+}
+_IOC_RELEVANCE_REASON_LABELS = {
+    "primary_core_default": "élément central de la source primaire",
+    "subject_matched_primary": "correspondance avec le sujet dans la source primaire",
+    "subject_matched_corroboration": "sujet corroboré par une autre source",
+    "explicit_counter_analysis": "analyse contradictoire explicite",
+    "explicit_other_actor": "autre acteur explicitement mentionné",
+    "relation_not_established": "lien non établi",
+    "context_source_without_relation": "source contextuelle sans lien démontré",
+    "generic_filename": "nom de fichier générique",
+    "footer_contact": "coordonnée de contact",
+    "malicious_role_not_demonstrated": "rôle malveillant non démontré",
+    "subject_link_not_demonstrated": "lien au sujet non démontré",
+    "indicator_section_other_case": "indicateur cité dans le contexte d'un autre cas",
+    "malicious_subject_relation": "relation malveillante au sujet",
+    "malicious_subject_corroboration": "relation au sujet corroborée",
+    "explicit_subject_denial": "démenti explicite du lien au sujet",
+}
+_IOC_GROUP_STATUS_LABELS = {
+    "retained": "Documenté dans l'article",
+    "originals": "Indicateur découvert dans cette analyse",
+    "candidates": "Piste non confirmée",
+}
+_FINDING_ASSESSMENT_LABELS = {
+    FindingAssessment.SUPPORTED: "étayé",
+    FindingAssessment.REFUTED: "réfuté",
+    FindingAssessment.QUALIFIED: "nuancé",
+    FindingAssessment.INCONCLUSIVE: "non tranché",
+}
+_NOVELTY_CLASS_LABELS = {
+    NoveltyClass.NEW_TO_ARTICLE: "nouveau pour l'article",
+    NoveltyClass.ALREADY_DOCUMENTED_BUT_NEW_DETAIL: "déjà documenté, avec un détail nouveau",
+    NoveltyClass.CLAIM_CORRECTION: "correction d'une affirmation",
+    NoveltyClass.NOT_CONFIRMED: "non confirmé",
 }
 _BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command", "technical_literal"})
 _TYPOGRAPHIC_BREAK_INTERVAL = 8
@@ -192,6 +234,51 @@ _OPINION_BLOCK_HEADINGS = {
 }
 
 
+def _reader_code_key(value: object) -> str:
+    raw = getattr(value, "value", value)
+    if not isinstance(raw, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
+
+
+def _reader_enum_label(value: object, labels: Mapping[str, str], fallback: str) -> str:
+    return labels.get(_reader_code_key(value), fallback)
+
+
+def _reader_ioc_relevance_label(classification: object, reason_code: object) -> str:
+    classification_label = _reader_enum_label(
+        classification,
+        _IOC_RELEVANCE_CLASSIFICATION_LABELS,
+        "pertinence non précisée",
+    )
+    reason_label = _reader_enum_label(
+        reason_code,
+        _IOC_RELEVANCE_REASON_LABELS,
+        "motif non précisé",
+    )
+    if classification is None:
+        return reason_label
+    if reason_code is None:
+        return classification_label
+    return f"{classification_label} — {reason_label}"
+
+
+def _draft_finding_ioc_qualification(finding: Any) -> str:
+    novelty = _reader_enum_label(
+        finding.novelty,
+        {item.value: label for item, label in _NOVELTY_CLASS_LABELS.items()},
+        "nouveauté non précisée",
+    )
+    assessment = _reader_enum_label(
+        finding.assessment,
+        {item.value: label for item, label in _FINDING_ASSESSMENT_LABELS.items()},
+        "statut du constat non précisé",
+    )
+    if finding.assessment is FindingAssessment.SUPPORTED:
+        return f"Constat portant sur un élément {novelty}, étayé par les observations citées."
+    return f"Piste non confirmée : constat {assessment} ({novelty}) au vu des observations citées."
+
+
 def _breakable_typst_display_text(
     value: str,
     *,
@@ -203,6 +290,12 @@ def _breakable_typst_display_text(
 
     def should_break(token: str) -> bool:
         if token.isspace() or len(token) <= interval:
+            return False
+        if (
+            break_at_technical_separators
+            and len(token) <= _TYPOGRAPHIC_BREAK_THRESHOLD
+            and _SHORT_PUBLICATION_HOST.fullmatch(token.replace("[.]", "."))
+        ):
             return False
         return len(token) > _TYPOGRAPHIC_BREAK_THRESHOLD or (
             break_at_technical_separators
@@ -265,7 +358,13 @@ def _opinion_traceability_refs(
     seen_logical_ids: set[UUID] = set()
     result: list[dict[str, Any]] = []
     for reference in references:
-        if reference["kind_label"] != "Finding":
+        reference_kind = reference.get("kind")
+        is_finding = (
+            reference_kind == "finding"
+            if reference_kind is not None
+            else reference.get("kind_label") in {"Finding", "Constat"}
+        )
+        if not is_finding:
             result.append(reference)
             continue
         try:
@@ -1850,10 +1949,9 @@ def _draft_opinion_iocs(value: TypstDraftPreviewDocument) -> tuple[_DraftIOC, ..
             continue
         if finding.assessment is FindingAssessment.SUPPORTED:
             status = "originals"
-            qualification = "Finding new_to_article étayé par les observations citées."
         else:
             status = "candidates"
-            qualification = "Candidat non confirmé : le finding n'est pas supported."
+        qualification = _draft_finding_ioc_qualification(finding)
         for subject_hash in subject_hashes:
             item = _DraftIOC(
                 artifact_type=ArtifactType.HASH,
@@ -2429,7 +2527,7 @@ def project_publication_to_typst_model(
     investigation_id = opinion.investigation_id if opinion is not None else None
 
     def opinion_citation(kind: str, reference_id: UUID) -> dict[str, Any]:
-        noun = "Finding" if kind == "finding" else "Évidence"
+        noun = "Constat" if kind == "finding" else "Évidence"
         uri_kind = "findings" if kind == "finding" else "evidence"
         displayed_id = (
             finding_version_logical_ids.get(reference_id, reference_id)
@@ -2460,6 +2558,7 @@ def project_publication_to_typst_model(
                 "target_id": target_id,
                 "note_number": note_number,
                 "kind_label": noun,
+                "kind": kind,
                 "reference_id": reference_text,
                 "reference_id_spans": _breakable_typst_display_text(reference_text, interval=8),
                 "href": reference["href"],
@@ -2997,20 +3096,20 @@ def project_publication_to_typst_model(
             if item.get("evidence_quote"):
                 evidence.add(abbreviated(item["evidence_quote"], 28))
             if item.get("reliability"):
-                reliability = str(item["reliability"])
                 reliabilities.add(
-                    _IOC_EVIDENCE_BASIS_LABELS.get(reliability, reliability.replace("_", " "))
+                    _reader_enum_label(
+                        item["reliability"],
+                        _IOC_EVIDENCE_BASIS_LABELS,
+                        "fiabilité non précisée",
+                    )
                 )
             if item.get("relevance_classification"):
-                classification = str(item["relevance_classification"])
-                reason_code = str(item.get("relevance_reason_code") or "")
-                value = _IOC_RELEVANCE_LABELS.get(
-                    (classification, reason_code),
-                    "/".join(
-                        part.replace("_", " ") for part in (classification, reason_code) if part
-                    ),
+                relevance.add(
+                    _reader_ioc_relevance_label(
+                        item["relevance_classification"],
+                        item.get("relevance_reason_code"),
+                    )
                 )
-                relevance.add(value)
             observed = "-".join(
                 value for value in (item.get("first_observed"), item.get("last_observed")) if value
             )
@@ -3020,24 +3119,28 @@ def project_publication_to_typst_model(
         parts = ["TLP non précisé"]
         for (status, reason), roles in sorted(decisions.items()):
             role_label = "/".join(
-                _IOC_SOURCE_ROLE_LABELS.get(role, role.replace("_", " "))
+                _reader_enum_label(role, _IOC_SOURCE_ROLE_LABELS, "source non précisée")
                 for role in sorted(roles, key=lambda role: (role != "primary", role.casefold()))
             )
             decision = f"{status} ({role_label}"
             if reason:
-                reason_label = _IOC_DISPOSITION_REASON_LABELS.get(reason, reason.replace("_", " "))
+                reason_label = _reader_enum_label(
+                    reason,
+                    _IOC_DISPOSITION_REASON_LABELS,
+                    "motif non précisé",
+                )
                 decision += f"; {reason_label}"
             parts.append(decision + ")")
         if contexts:
-            parts.append("ctx: " + " / ".join(sorted(contexts, key=str.casefold)))
+            parts.append("Contexte : " + " / ".join(sorted(contexts, key=str.casefold)))
         if evidence:
-            parts.append("preuve: " + " / ".join(sorted(evidence, key=str.casefold)))
+            parts.append("Extrait cité : " + " / ".join(sorted(evidence, key=str.casefold)))
         if reliabilities:
-            parts.append("fiab: " + "/".join(sorted(reliabilities, key=str.casefold)))
+            parts.append("Fiabilité : " + "/".join(sorted(reliabilities, key=str.casefold)))
         if relevance:
-            parts.append("pert.: " + "/".join(sorted(relevance, key=str.casefold)))
+            parts.append("Pertinence : " + "/".join(sorted(relevance, key=str.casefold)))
         if observations:
-            parts.append("obs.: " + "/".join(sorted(observations)))
+            parts.append("Période d'observation : " + "/".join(sorted(observations)))
         return " · ".join(parts)
 
     ioc_lists_by_status: dict[str, dict[tuple[ArtifactType, str], dict[str, Any]]] = {
@@ -3116,19 +3219,15 @@ def project_publication_to_typst_model(
                 "_draft_contexts": [],
                 "_draft_references": [],
                 "qualifications": set(),
-                "indicator_status_label": {
-                    "retained": "Documenté dans l'article",
-                    "originals": "IOC original du run",
-                    "candidates": "Piste non confirmée",
-                }[owner],
+                "indicator_status_label": _IOC_GROUP_STATUS_LABELS.get(
+                    owner, "Statut d'indicateur non précisé"
+                ),
             }
             grouped[key] = item
         else:
-            item["indicator_status_label"] = {
-                "retained": "Documenté dans l'article",
-                "originals": "IOC original du run",
-                "candidates": "Piste non confirmée",
-            }[owner]
+            item["indicator_status_label"] = _IOC_GROUP_STATUS_LABELS.get(
+                owner, "Statut d'indicateur non précisé"
+            )
         item["_source_ids"].add(source_id)
         item["qualifications"].add(qualification)
         for detail in details:
@@ -3193,9 +3292,15 @@ def project_publication_to_typst_model(
                 normalized_value=detail.normalized_value,
                 source_id=source_id,
                 details=[detail],
-                qualification="Candidat non confirmé : "
-                + detail.disposition_reason.replace("_", " ")
-                + ".",
+                qualification=(
+                    "Piste non confirmée : "
+                    + _reader_enum_label(
+                        detail.disposition_reason,
+                        _IOC_DISPOSITION_REASON_LABELS,
+                        "motif non précisé",
+                    )
+                    + "."
+                ),
             )
 
     for draft_ioc in draft_iocs:
@@ -3233,25 +3338,21 @@ def project_publication_to_typst_model(
                 "_draft_contexts": [],
                 "_draft_references": [],
                 "qualifications": set(),
-                "indicator_status_label": {
-                    "retained": "Documenté dans l'article",
-                    "originals": "IOC original du run",
-                    "candidates": "Piste non confirmée",
-                }[owner],
+                "indicator_status_label": _IOC_GROUP_STATUS_LABELS.get(
+                    owner, "Statut d'indicateur non précisé"
+                ),
             }
             grouped[list_key] = draft_ioc_item
         else:
-            draft_ioc_item["indicator_status_label"] = {
-                "retained": "Documenté dans l'article",
-                "originals": "IOC original du run",
-                "candidates": "Piste non confirmée",
-            }[owner]
+            draft_ioc_item["indicator_status_label"] = _IOC_GROUP_STATUS_LABELS.get(
+                owner, "Statut d'indicateur non précisé"
+            )
         draft_ioc_item["_draft_contexts"].append(draft_ioc.context)
         opinion_cited_finding_ids.update(draft_ioc.finding_refs)
         provenance_context = (
-            f"IOC original {display_value}"
+            f"Indicateur découvert dans cette analyse : {display_value}"
             if draft_ioc.status == "originals"
-            else f"IOC candidat {display_value}"
+            else f"Piste à vérifier : {display_value}"
         )
         draft_ioc_item["_draft_references"].extend(
             collect_opinion_references(
@@ -3274,7 +3375,9 @@ def project_publication_to_typst_model(
         )
         if draft_ioc_row is not None:
             draft_ioc_row["statuses"].add(
-                "IOC original — finding étayé" if status == "originals" else "Candidat non confirmé"
+                "Indicateur découvert dans cette analyse — constat étayé"
+                if status == "originals"
+                else "Piste non confirmée"
             )
             draft_ioc_row["_draft_contexts"].append(draft_ioc.context)
             reference_count = len(draft_ioc.finding_refs) + len(draft_ioc.observation_refs)
@@ -3364,14 +3467,14 @@ def project_publication_to_typst_model(
         indicator_status_label = (
             "Documenté par l'article"
             if "article" in origins
-            else "IOC original du run"
+            else "Indicateur découvert dans cette analyse"
             if "original" in origins
             else "Piste non confirmée"
         )
         draft_contexts = tuple(dict.fromkeys(ioc_detail_row.pop("_draft_contexts")))
         draft_references = ioc_detail_row.pop("_draft_references")
         if draft_contexts:
-            context_summary += " · Contexte du finding : " + " / ".join(draft_contexts)
+            context_summary += " · Contexte du constat : " + " / ".join(draft_contexts)
         source_ids = sorted(ioc_detail_row.pop("_source_ids"), key=str)
         ioc_detail_row.pop("_provenance_keys")
         ioc_detail_row.pop("provenance")
@@ -3407,7 +3510,7 @@ def project_publication_to_typst_model(
                 "indicator_status_short_label": (
                     "Article"
                     if "article" in origins
-                    else "Original"
+                    else "Analyse"
                     if "original" in origins
                     else "Piste"
                 ),
@@ -3815,79 +3918,13 @@ def project_publication_to_typst_model(
             projected_opinion_section["infrastructure_graph_figure"] = infrastructure_graph_figure
         if visible_opinion_figures:
 
-            def protocol_figure_brief(
-                protocol_figure: OpinionProtocolFigureV1,
-            ) -> tuple[str, str, str | None]:
-                caption_lines = [
-                    line.strip() for line in protocol_figure.caption.splitlines() if line.strip()
-                ]
-
-                def reader_caption(lines: list[str]) -> str:
-                    caption_text = "\n".join(lines).replace(
-                        "ARTICLE_DOCUMENTED — documenté, non observé",
-                        "documenté, non observé",
-                    )
-                    for enum_value, label in _PROTOCOL_FIGURE_EVIDENCE_LABELS.items():
-                        caption_text = caption_text.replace(enum_value, label)
-                    return caption_text
-
-                source_title = caption_lines[0].rstrip(".") if caption_lines else ""
-                has_legacy_proof_metadata = any(
-                    line.startswith("Limits: ") for line in caption_lines
-                ) and any(line.startswith("Proof levels: ") for line in caption_lines)
-                title_prefix = _PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value]
-
-                if (
-                    protocol_figure.compiler_policy_version
-                    != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
-                ):
-                    if draft_preview is not None:
-                        return title_prefix, "", None
-                    source_title = source_title.partition(". ")[0].rstrip(".").strip()
-                    title = f"{title_prefix} — {source_title}" if source_title else title_prefix
-                    return title, "", None
-
-                if not has_legacy_proof_metadata:
-                    return title_prefix, reader_caption(caption_lines), None
-
-                proof_line = next(
-                    line.removeprefix("Proof levels: ")
-                    for line in caption_lines
-                    if line.startswith("Proof levels: ")
-                )
-                raw_limit_line = next(
-                    line.removeprefix("Limits: ")
-                    for line in caption_lines
-                    if line.startswith("Limits: ")
-                )
-                limit_parts = [part.strip() for part in raw_limit_line.split(";")]
-                limit_index = (
-                    1
-                    if len(limit_parts) > 1
-                    and (
-                        "ARTICLE_DOCUMENTED" in proof_line or proof_line == "INSUFFICIENT_EVIDENCE"
-                    )
-                    else 0
-                )
-                limit_line = limit_parts[min(limit_index, len(limit_parts) - 1)]
-                proof_levels = proof_line.partition(" — ")[0]
-                raw_levels = proof_levels.removeprefix("Niveau de preuve : ")
-                displayed_levels = ", ".join(
-                    _PROTOCOL_FIGURE_EVIDENCE_LABELS.get(
-                        item.strip(), item.strip().replace("_", " ").casefold()
-                    )
-                    for item in raw_levels.split(",")
-                )
-                proof_label = (
-                    "Niveaux de preuve : " if "," in raw_levels else "Niveau de preuve : "
-                ) + displayed_levels
-                title = f"{title_prefix} — {source_title}"
-                return title, f"Limites : {limit_line}.", proof_label
-
             def project_protocol_figure(
                 index: int, protocol_figure: OpinionProtocolFigureV1
             ) -> dict[str, Any]:
-                title, caption, status_label = protocol_figure_brief(protocol_figure)
+                title, caption, status_label = _protocol_figure_brief(
+                    protocol_figure,
+                    is_draft_preview=draft_preview is not None,
+                )
                 return {
                     "type": "diagram",
                     "key": f"protocol-{protocol_figure.kind.value}",
@@ -3900,10 +3937,7 @@ def project_publication_to_typst_model(
                         != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
                         and draft_preview is None
                     ),
-                    "status_legend": (
-                        "Observation étayée : vert · inférence : orange · "
-                        "non résolu : gris · contredit : rouge."
-                    ),
+                    "status_legend": _PROTOCOL_FIGURE_STATUS_LEGEND,
                     "media_path": media_ref(
                         asset_id=protocol_figure.asset_id,
                         expected_kind=MediaAssetKind.DIAGRAM_SVG,
@@ -4243,6 +4277,87 @@ _PROTOCOL_FIGURE_EVIDENCE_LABELS = {
     "HYPOTHETICAL": "hypothèse",
     "VERIFIED_ON_HOLDOUT": "validé sur un jeu de contrôle",
 }
+_PROTOCOL_FIGURE_STATUS_LEGEND = (
+    "Observation étayée : vert · inférence : orange · non résolu : gris · "
+    "contredit : rouge · documenté, non observé : bleu."
+)
+
+
+def _protocol_figure_brief(
+    protocol_figure: OpinionProtocolFigureV1,
+    *,
+    is_draft_preview: bool,
+) -> tuple[str, str, str | None]:
+    caption_lines = [line.strip() for line in protocol_figure.caption.splitlines() if line.strip()]
+
+    def reader_caption(lines: list[str]) -> str:
+        caption_text = "\n".join(lines).replace(
+            "ARTICLE_DOCUMENTED — documenté, non observé",
+            "documenté, non observé",
+        )
+        caption_text = caption_text.replace("Proof levels:", "Niveaux de preuve :")
+        caption_text = caption_text.replace("Limits:", "Limites :")
+        for enum_value, label in _PROTOCOL_FIGURE_EVIDENCE_LABELS.items():
+            caption_text = caption_text.replace(enum_value, label)
+        return caption_text
+
+    source_title = caption_lines[0].rstrip(".") if caption_lines else ""
+    has_legacy_proof_metadata = any(line.startswith("Limits: ") for line in caption_lines) and any(
+        line.startswith("Proof levels: ") for line in caption_lines
+    )
+    title_prefix = _PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value]
+
+    if protocol_figure.compiler_policy_version != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION:
+        if is_draft_preview:
+            proof_lines = [
+                line
+                for line in caption_lines
+                if line.casefold().startswith(
+                    ("niveau de preuve :", "proof levels:", "limits:", "limites :")
+                )
+            ]
+            return title_prefix, reader_caption(proof_lines), None
+        source_title = source_title.partition(". ")[0].rstrip(".").strip()
+        title = f"{title_prefix} — {source_title}" if source_title else title_prefix
+        return title, "", None
+
+    if not has_legacy_proof_metadata:
+        caption_content = caption_lines
+        if caption_content and caption_content[0].casefold() == title_prefix.casefold():
+            caption_content = caption_content[1:]
+        return title_prefix, reader_caption(caption_content), None
+
+    proof_line = next(
+        line.removeprefix("Proof levels: ")
+        for line in caption_lines
+        if line.startswith("Proof levels: ")
+    )
+    raw_limit_line = next(
+        line.removeprefix("Limits: ") for line in caption_lines if line.startswith("Limits: ")
+    )
+    limit_parts = [part.strip() for part in raw_limit_line.split(";")]
+    limit_index = (
+        1
+        if len(limit_parts) > 1
+        and ("ARTICLE_DOCUMENTED" in proof_line or proof_line == "INSUFFICIENT_EVIDENCE")
+        else 0
+    )
+    limit_line = limit_parts[min(limit_index, len(limit_parts) - 1)]
+    proof_levels = proof_line.partition(" — ")[0]
+    raw_levels = proof_levels.removeprefix("Niveau de preuve : ").removeprefix("Proof levels: ")
+    displayed_levels = ", ".join(
+        _reader_enum_label(
+            item.strip(),
+            _PROTOCOL_FIGURE_EVIDENCE_LABELS,
+            "niveau de preuve non précisé",
+        )
+        for item in raw_levels.split(",")
+    )
+    proof_label = (
+        "Niveaux de preuve : " if "," in raw_levels else "Niveau de preuve : "
+    ) + displayed_levels
+    title = f"{title_prefix} — {source_title}"
+    return title, f"Limites : {limit_line}.", proof_label
 
 
 def _figure_block(

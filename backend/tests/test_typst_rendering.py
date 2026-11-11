@@ -5,22 +5,37 @@ import json
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.protocol_diagram_projection import PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_rendering import (
+    _FINDING_ASSESSMENT_LABELS,
+    _IOC_DISPOSITION_LABELS,
+    _IOC_EVIDENCE_BASIS_LABELS,
+    _IOC_GROUP_STATUS_LABELS,
+    _IOC_RELEVANCE_CLASSIFICATION_LABELS,
+    _IOC_RELEVANCE_REASON_LABELS,
+    _IOC_SOURCE_ROLE_LABELS,
+    _NOVELTY_CLASS_LABELS,
+    _PROTOCOL_FIGURE_STATUS_LEGEND,
     TemplateBundleInvalidError,
     TypstDraftPreviewDocument,
     TypstRenderer,
     TypstTemplateBundle,
+    _breakable_typst_display_text,
     _display_date,
+    _draft_finding_ioc_qualification,
     _indicator_values,
     _opinion_pipe_table,
     _opinion_text_spans,
     _opinion_traceability_refs,
+    _protocol_figure_brief,
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
@@ -37,6 +52,7 @@ from cti_app.domain.analyst_opinion import (
     ImplantMaterialType,
     OpinionBlock,
     OpinionBlockType,
+    OpinionProtocolFigureV1,
     opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
 )
@@ -392,7 +408,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v39-m21-opinion-render"
+    assert data["schema_version"] == "typst-publication-model-v40-m21-opinion-render"
     assert data["kind"] == "brief"
     assert data["article_format"] is None
     assert data["document_label"] == "Libellé de fixture"
@@ -774,7 +790,7 @@ def test_opinion_traceability_maps_superseded_finding_versions_to_current_ids(
     source = _render(renderer, article, bundle)
     data = json.loads(source.render_data_bytes)
     annex = next(item for item in data["content_sections"] if item["type"] == "technical_annex")
-    finding_refs = [item for item in annex["opinion_refs"] if item["kind_label"] == "Finding"]
+    finding_refs = [item for item in annex["opinion_refs"] if item["kind_label"] == "Constat"]
     opinion_section = next(
         item for item in data["content_sections"] if item["type"] == "analyst_opinion"
     )
@@ -883,13 +899,31 @@ def test_draft_ioc_provenance_maps_finding_versions_to_logical_ids(tmp_path: Pat
 
     data = json.loads(_render(renderer, preview, bundle).render_data_bytes)
     annex = next(item for item in data["content_sections"] if item["type"] == "technical_annex")
-    finding_refs = [item for item in annex["opinion_refs"] if item["kind_label"] == "Finding"]
+    ioc_section = next(item for item in data["content_sections"] if item["type"] == "ioc")
+    finding_refs = [item for item in annex["opinion_refs"] if item["kind_label"] == "Constat"]
     ioc_rows = [row for group in annex["ioc_row_groups"] for row in group["rows"]]
 
     assert [item["reference_id"] for item in finding_refs] == [str(current.id)]
     assert len(ioc_rows) == 1
     assert ioc_rows[0]["value"] == sample_hash
     assert ioc_rows[0]["draft_refs"][0]["reference_id"] == str(current.id)
+    assert (
+        ioc_section["original_indicators"][0]["items"][0]["indicator_status_label"]
+        == "Indicateur découvert dans cette analyse"
+    )
+    assert (
+        "Constat portant sur un élément nouveau pour l'article"
+        in ioc_section["original_indicators"][0]["items"][0]["qualification"]
+    )
+    reader_ioc = json.dumps(ioc_section, ensure_ascii=False).casefold()
+    reader_annex = json.dumps(annex, ensure_ascii=False).casefold()
+    assert "new_to_article" not in reader_ioc
+    assert "finding new_to_article" not in reader_ioc
+    assert "ioc original du run" not in reader_ioc
+    assert "constat" in reader_annex
+    assert "étayé par les observations citées" in reader_ioc
+    assert str(current.id) in reader_annex
+    assert str(observation.id) in reader_annex
     assert draft_opinion.blocks[0].finding_refs == (cited_version.id,)
 
 
@@ -920,7 +954,7 @@ def test_opinion_ioc_appendix_localizes_provenance_enums_for_display(tmp_path: P
             evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
             source_document_ids=(source.source_document_id,),
             disposition=PublicationIOCDisposition.RETAINED,
-            disposition_reason="contextual_indicator",
+            disposition_reason="contextual indicator",
             relevance_classification=RelevanceClassification.DIRECT,
             relevance_reason_code=RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
         ),
@@ -937,6 +971,20 @@ def test_opinion_ioc_appendix_localizes_provenance_enums_for_display(tmp_path: P
             disposition_reason="unsupported_artifact_type",
             relevance_classification=RelevanceClassification.CONTEXT,
             relevance_reason_code=RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
+        ),
+        PublicationIOCDetailV1(
+            artifact_type=ArtifactType.DOMAIN,
+            value="gamma.example",
+            normalized_value="gamma.example",
+            source_role=SourceRole.PRIMARY,
+            context="Domaine avec un motif de statut inconnu.",
+            evidence_quote="La source mentionne gamma.example.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+            disposition=PublicationIOCDisposition.UNCERTAIN,
+            disposition_reason="provider_internal_reason",
+            first_observed=date(2026, 1, 2),
+            last_observed=date(2026, 1, 3),
         ),
     )
     publication = replace(base, document=article, ioc_details=details)
@@ -960,7 +1008,12 @@ def test_opinion_ioc_appendix_localizes_provenance_enums_for_display(tmp_path: P
     assert "direct — relation malveillante au sujet" in display_text.casefold()
     assert "contexte — rôle malveillant non démontré" in display_text.casefold()
     assert "indicateur contextuel" in display_text.casefold()
+    assert "contextual indicator" not in display_text.casefold()
     assert "type non publié" in display_text.casefold()
+    assert "motif non précisé" in display_text.casefold()
+    assert "période d'observation : 2026-01-02-2026-01-03" in display_text.casefold()
+    assert "obs.:" not in display_text.casefold()
+    assert "provider_internal_reason" not in display_text.casefold()
     assert "tlp non précisé" in display_text.casefold()
     assert "source_verified" not in display_text
     assert "primary" not in display_text
@@ -968,6 +1021,98 @@ def test_opinion_ioc_appendix_localizes_provenance_enums_for_display(tmp_path: P
     assert details[0].evidence_basis.value == "source_verified"
     assert details[0].source_role.value == "primary"
     assert details[0].relevance_reason_code.value == "malicious_subject_relation"
+
+
+def test_short_monospace_host_has_no_internal_page_break_opportunities() -> None:
+    host = "www.xionamiconm.com"
+
+    rendered = _breakable_typst_display_text(
+        host,
+        interval=8,
+        break_at_technical_separators=True,
+    )
+
+    assert rendered["text"] == host
+    assert rendered["break_chunks"] == []
+
+
+def test_ioc_reader_label_maps_cover_their_domain_enums() -> None:
+    assert set(_IOC_DISPOSITION_LABELS) == set(PublicationIOCDisposition)
+    assert set(_IOC_SOURCE_ROLE_LABELS) == {item.value for item in SourceRole}
+    assert set(_IOC_EVIDENCE_BASIS_LABELS) == {item.value for item in ProductionEvidenceBasis}
+    assert set(_IOC_RELEVANCE_CLASSIFICATION_LABELS) == {
+        item.value for item in RelevanceClassification
+    }
+    assert set(_IOC_RELEVANCE_REASON_LABELS) == {item.value for item in RelevanceReasonCode}
+    assert set(_FINDING_ASSESSMENT_LABELS) == set(FindingAssessment)
+    assert set(_NOVELTY_CLASS_LABELS) == set(NoveltyClass)
+    assert set(_IOC_GROUP_STATUS_LABELS) == {"retained", "originals", "candidates"}
+
+
+def test_unconfirmed_finding_ioc_qualification_uses_neutral_french_labels() -> None:
+    finding = SimpleNamespace(
+        novelty=NoveltyClass.NEW_TO_ARTICLE,
+        assessment=FindingAssessment.INCONCLUSIVE,
+    )
+
+    qualification = _draft_finding_ioc_qualification(finding)
+
+    assert qualification == (
+        "Piste non confirmée : constat non tranché (nouveau pour l'article) "
+        "au vu des observations citées."
+    )
+    assert "finding" not in qualification.casefold()
+    assert "inconclusive" not in qualification.casefold()
+
+
+def test_stale_protocol_preview_caption_keeps_only_localized_proof_reservation() -> None:
+    figure = cast(
+        OpinionProtocolFigureV1,
+        SimpleNamespace(
+            kind=SimpleNamespace(value="sequence"),
+            caption=(
+                "Séquence du protocole\n"
+                "Niveau de preuve : ARTICLE_DOCUMENTED — documenté, non observé. "
+                "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+            ),
+            compiler_policy_version="diagram-d2-svg-v9-legacy",
+        ),
+    )
+
+    title, caption, status_label = _protocol_figure_brief(figure, is_draft_preview=True)
+
+    assert title == "Séquence réseau du protocole"
+    assert caption == (
+        "Niveau de preuve : documenté, non observé. "
+        "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+    )
+    assert status_label is None
+    assert "Niveau de preuve non précisé" not in caption
+    assert "documenté, non observé : bleu" in _PROTOCOL_FIGURE_STATUS_LEGEND
+
+
+def test_current_protocol_figure_caption_keeps_proof_without_repeating_title() -> None:
+    figure = cast(
+        OpinionProtocolFigureV1,
+        SimpleNamespace(
+            kind=SimpleNamespace(value="sequence"),
+            caption=(
+                "Séquence réseau du protocole\n"
+                "Niveau de preuve : ARTICLE_DOCUMENTED — documenté, non observé. "
+                "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+            ),
+            compiler_policy_version=PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+        ),
+    )
+
+    title, caption, status_label = _protocol_figure_brief(figure, is_draft_preview=False)
+
+    assert title == "Séquence réseau du protocole"
+    assert caption == (
+        "Niveau de preuve : documenté, non observé. "
+        "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+    )
+    assert status_label is None
 
 
 def test_publication_document_label_is_required_and_kept_verbatim(tmp_path: Path) -> None:
@@ -1366,7 +1511,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v39-m21-opinion-render"
+    assert data["schema_version"] == "typst-publication-model-v40-m21-opinion-render"
     assert data["kind"] == "article"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])

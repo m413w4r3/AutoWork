@@ -19,6 +19,7 @@ from cti_app.application.protocol_diagram_projection import (
     PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
     compile_protocol_render_result,
     opinion_protocol_figures,
+    project_protocol_diagram,
 )
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.typst_compilation import (
@@ -70,6 +71,24 @@ _GENERIC_SVG = (
     '<rect width="320" height="80" fill="#f2f4f7"/>'
     '<text x="8" y="44" font-size="18">Synthetic fixture</text></svg>'
 )
+
+
+def test_protocol_sequence_projection_keeps_complete_card_labels() -> None:
+    base = _three_views()[0]
+    participant = "CLIENT_ESTABLISHED_" * 6
+    message = "handshake (lws, tls) " + "payload_field_" * 7
+    spec = replace(
+        base,
+        nodes=(replace(base.nodes[0], label=participant), *base.nodes[1:]),
+        edges=tuple(replace(base.edges[0], label=message, order=index) for index in range(1, 10)),
+    )
+    projected = project_protocol_diagram(spec)
+    labels = tuple(node.label for node in projected.nodes)
+
+    assert len(labels) == 9
+    assert all(participant in label for label in labels)
+    assert all(message in label for label in labels)
+    assert all("…" not in label for label in labels)
 
 
 class _MemoryBlobStore:
@@ -801,11 +820,22 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     publication_pdf_path = audit_root / "publication.pdf"
     publication_pdf_path.write_bytes(pdf)
 
+    preview_sequence = replace(
+        figures[0],
+        caption=(
+            "Séquence du protocole\n"
+            "Niveau de preuve : ARTICLE_DOCUMENTED — documenté, non observé. "
+            "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+        ),
+        compiler_policy_version=(
+            "diagram-d2-svg-v9-m21-opinion-render+protocol-diagram-projection-v4-m21-opinion-render"
+        ),
+    )
     preview_opinion = replace(
         opinion,
         status=AnalystOpinionStatus.DRAFT,
         reviewer_id=None,
-        protocol_figures=(legacy_sequence, *figures[1:]),
+        protocol_figures=(preview_sequence, *figures[1:]),
         content_sha256="",
     )
     preview_source = TypstRenderer().render(
@@ -848,7 +878,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         extracted = _run_blocking_process((pdftotext, "-layout", str(path), "-"), 30)
         pdf_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
         lowered = pdf_text.casefold()
-        expected_proof_levels = 3 if label == "publication" else 2
+        expected_proof_levels = 3
         assert pdf_text.count("Niveau de preuve") == expected_proof_levels
         assert pdf_text.casefold().count("documenté, non observé") == expected_proof_levels
         assert "ARTICLE_DOCUMENTED" not in pdf_text
@@ -889,6 +919,12 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         assert f"Figure {figure_number} :" in figure_page
         assert "documenté, non observé" in figure_page.casefold()
         assert "observation étayée" in figure_page.casefold()
+        preview_figure_page = next(page for page in preview_pages if title in page)
+        assert f"Figure {figure_number} :" in preview_figure_page
+        assert "documenté, non observé" in preview_figure_page.casefold()
+        assert "offsets et valeurs d'octets inconnus" in preview_figure_page.casefold()
+        assert "observation étayée" in preview_figure_page.casefold()
+        assert "documenté, non observé : bleu" in preview_figure_page.casefold()
 
     mutool_binary = shutil.which("mutool")
     if mutool_binary is not None:

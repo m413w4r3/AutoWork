@@ -48,7 +48,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v4-m21-opinion-render"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v5-m21-opinion-render"
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )
@@ -136,7 +136,9 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
         )
     elif spec.kind is ProtocolDiagramKind.SEQUENCE:
         if len(spec.edges) > 8:
-            participants = {node.node_id: _clean_display_text(node.label) for node in spec.nodes}
+            participants = {
+                node.node_id: _clean_display_text(node.label, limit=None) for node in spec.nodes
+            }
             nodes.extend(
                 _project_ordered_message(edge, index, participants)
                 for index, edge in enumerate(_ordered_edges(spec.edges), 1)
@@ -228,7 +230,7 @@ def _display_title(value: str) -> str:
     return title or "Vue du protocole"
 
 
-def _clean_display_text(value: str, *, limit: int = 72) -> str:
+def _clean_display_text(value: str, *, limit: int | None = 72) -> str:
     text = _UUID_TEXT.sub("", value)
     text = _HASH_TEXT.sub("", text)
     text = _REFERENCE_TAIL.sub("", text)
@@ -244,7 +246,7 @@ def _clean_display_text(value: str, *, limit: int = 72) -> str:
     )
     text = re.sub(r"\s*[·|—:-]\s*", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" .,:;—-")
-    if len(text) > limit:
+    if limit is not None and len(text) > limit:
         text = text[: limit - 1].rstrip() + "…"
     return text
 
@@ -534,7 +536,7 @@ def _project_ordered_message(
     order = edge.order if edge.order is not None else index
     source = participants.get(edge.source_id, _clean_display_text(edge.source_id))
     target = participants.get(edge.target_id, _clean_display_text(edge.target_id))
-    message = _clean_display_text(edge.label, limit=88)
+    message = _clean_display_text(edge.label, limit=None)
     return DiagramNodeV1(
         node_id=f"protocol-message-{index:04d}",
         label=f"#{order:02d} {source} → {target}: {message}",

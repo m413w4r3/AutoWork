@@ -152,7 +152,7 @@ def _publication_fixture(
     content_sections.append({"type": "synthesis", "blocks": body_blocks})
 
     result: dict[str, Any] = {
-        "schema_version": "typst-publication-model-v39-m21-opinion-render",
+        "schema_version": "typst-publication-model-v40-m21-opinion-render",
         "document_label": f"m19-{kind}-format-fixture",
         "kind": kind,
         "title": f"Synthetic {kind} publication",
