@@ -936,8 +936,10 @@ async def test_framework_presend_refusal_is_terminal_and_carries_no_send_proof(
     assert result.framework_pre_submission_proof is (
         FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
     )
-    assert result.error_code == f"virustotal_external_effect_refused_{reason_code}"
-    assert result.output["reason"] == "external_effect_refused"
+    # The proven pre-send reason is published as-is so the operator can act on it.
+    assert result.error_code == reason_code
+    assert result.output["reason"] == reason_code
+    assert result.output["detail_code"] == reason_code
     assert result.budget_consumed[BudgetDimension.VT_UNITS] == 0
     assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 0
     assert tools.context.budget.consumed[BudgetDimension.VT_UNITS] == 0
