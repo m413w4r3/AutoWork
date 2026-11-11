@@ -8,6 +8,10 @@ from typing import Any
 
 from cti_app.application.advisor_dossier import AdvisorDossier
 from cti_app.application.advisor_wire import advisor_wire_aliases, render_advisor_wire_input
+from cti_app.infrastructure.confined_suricata import (
+    RESERVED_SURICATA_SID_MAX,
+    RESERVED_SURICATA_SID_MIN,
+)
 
 
 def render_advisor_prompt(
@@ -248,6 +252,11 @@ def _advisor_free_prose_guidance(consultation_type: str, data: Mapping[str, Any]
                 "réseau pertinents si disponibles, et distinguer statique/observé."
             ),
             "Placer toute règle Suricata proposée, complète, dans un bloc clôturé ```suricata.",
+            (
+                "Utiliser pour chaque règle un SID dans la plage locale réservée "
+                f"{RESERVED_SURICATA_SID_MIN}-{RESERVED_SURICATA_SID_MAX}; "
+                "ne pas réutiliser un SID dans le même brouillon."
+            ),
             (
                 "Expliciter la visibilité TLS, les champs réellement observables, les "
                 "faux positifs possibles et le test sur PCAP à réaliser si une capture existe."

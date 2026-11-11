@@ -1172,9 +1172,16 @@ async def test_suricata_bridge_candidate_syntax_failure_is_still_persisted() -> 
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["bridge_invocation_id"] is None
     assert result.output["rule_syntax_validation"] == "failed"
+    assert result.output["rule_syntax_validation_error"] == (
+        "suricata_rule_sid_outside_reserved_range: expected SID in 9900000-9999999"
+    )
+    assert "9900000-9999999" in result.message
     assert result.output["candidate_observation_id"]
     stored = recorder.payloads[recorder.observations[0].blob_id]
     assert stored["output"]["rule_source"] == "\n\n".join(rules)
+    assert stored["output"]["rule_source_sha256"] == hashlib.sha256(
+        ("\n\n".join(rules)).encode()
+    ).hexdigest()
     assert stored["output"]["pcap_test_status"] == "not_tested"
     assert stored["bridge_invocation_id"] is None
     assert stored["local_tool_invocation_id"] == str(local_invocation_id)

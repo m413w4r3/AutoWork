@@ -52,7 +52,11 @@ from cti_app.domain.sample_similarity import (
     SignatureMotifKind,
     SimilarityFeatureKind,
 )
-from cti_app.infrastructure.confined_suricata import validate_suricata_rule_source
+from cti_app.infrastructure.confined_suricata import (
+    RESERVED_SURICATA_SID_MAX,
+    RESERVED_SURICATA_SID_MIN,
+    validate_suricata_rule_source,
+)
 
 _TOOL_NAME = "rule.propose_from_candidates"
 _SURICATA_IMPORT_TOOL_NAME = "rule.import_suricata_bridge_candidate"
@@ -325,6 +329,11 @@ class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
             except ValueError as exc:
                 syntax_status = "failed"
                 syntax_error = str(exc)
+                if syntax_error == "suricata_rule_sid_outside_reserved_range":
+                    syntax_error = (
+                        f"{syntax_error}: expected SID in "
+                        f"{RESERVED_SURICATA_SID_MIN}-{RESERVED_SURICATA_SID_MAX}"
+                    )
             source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
             bridge_provenance = output.get("bridge_provenance")
             bridge_provenance = (
@@ -437,7 +446,15 @@ class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
                     "pcap_test_status": "not_tested",
                 },
                 message=(
-                    "Suricata candidate imported; correct its syntax and retry the import."
+                    (
+                        "Suricata candidate imported unchanged, but its SID is outside the "
+                        f"local reserved range {RESERVED_SURICATA_SID_MIN}-"
+                        f"{RESERVED_SURICATA_SID_MAX}; request a re-draft in that range and "
+                        "re-import."
+                    )
+                    if syntax_error
+                    and syntax_error.startswith("suricata_rule_sid_outside_reserved_range")
+                    else "Suricata candidate imported; correct its syntax and retry the import."
                     if syntax_error
                     else "Suricata candidate imported; PCAP validation remains not_tested."
                 ),

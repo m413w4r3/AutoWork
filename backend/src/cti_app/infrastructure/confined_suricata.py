@@ -21,8 +21,8 @@ _RULE_HEADER = re.compile(
     re.IGNORECASE,
 )
 _FORBIDDEN_RULE_DIRECTIVE = re.compile(r"\b(?:include|lua|filestore)\b", re.IGNORECASE)
-_RESERVED_SID_MIN = 9_900_000
-_RESERVED_SID_MAX = 9_999_999
+RESERVED_SURICATA_SID_MIN = 9_900_000
+RESERVED_SURICATA_SID_MAX = 9_999_999
 _DEFAULT_MAX_RULE_BYTES = 512 * 1024 * 1024
 
 
@@ -73,7 +73,7 @@ def validate_suricata_rule_source(
         if not revisions[0].isascii() or not revisions[0].isdecimal():
             raise ValueError("suricata_rule_revision_invalid")
         sid, revision = int(sids[0]), int(revisions[0])
-        if not _RESERVED_SID_MIN <= sid <= _RESERVED_SID_MAX:
+        if not RESERVED_SURICATA_SID_MIN <= sid <= RESERVED_SURICATA_SID_MAX:
             raise ValueError("suricata_rule_sid_outside_reserved_range")
         if candidate_version is not None and revision != int(candidate_version):
             raise ValueError("suricata_rule_revision_mismatch")

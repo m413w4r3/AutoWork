@@ -2733,12 +2733,53 @@ def test_rule_version_summary_separates_latest_result_from_historical_crash() ->
     assert summary["reports"] == reports
 
 
+def test_rule_get_does_not_fall_back_to_older_report_when_latest_is_unreadable() -> None:
+    version = SimpleNamespace(
+        id=uuid4(),
+        candidate_id=uuid4(),
+        investigation_id=uuid4(),
+        version=1,
+        version_label="v1",
+        parent_version_id=None,
+        source="rule candidate { condition: true }",
+        source_sha256="a" * 64,
+        status=DetectionCandidateStatus.CANDIDATE,
+        test_refs=(),
+        motif_provenance=(),
+    )
+    older_report_id, latest_report_id = uuid4(), uuid4()
+    reports = [
+        {
+            "operation": "test",
+            "version_id": str(version.id),
+            "rule_version_id": str(version.id),
+            "source_sha256": version.source_sha256,
+            "execution_status": "ok",
+            "validation_status": "real_validated",
+            "corpus_sha256": "b" * 64,
+        },
+        None,
+    ]
+
+    summary = _version_summary(
+        version,
+        reports,
+        report_observation_ids=(older_report_id, latest_report_id),
+    )
+
+    assert summary["latest_test_report"] == {
+        "observation_id": str(latest_report_id),
+        "availability": "unavailable",
+    }
+    assert summary["validation_status"] == "untested"
+
+
 @pytest.mark.asyncio
 async def test_rule_get_marks_version_without_report_untested() -> None:
     from cti_app.domain.investigation import DetectionCandidateVersion
 
     harness = _harness(samples={})
-    source = "rule untested { condition: true }"
+    source = "rule untested { condition: true }\n// " + "é" * 9_000
     candidate_id = uuid4()
     version = DetectionCandidateVersion(
         investigation_id=harness.investigation_id,
@@ -2748,6 +2789,15 @@ async def test_rule_get_marks_version_without_report_untested() -> None:
         motif_provenance=(),
     )
     await harness.candidates.append_version(version, expected_previous_id=None)
+    foreign_source = "rule foreign_investigation { condition: true }"
+    foreign_version = DetectionCandidateVersion(
+        investigation_id=uuid4(),
+        candidate_id=candidate_id,
+        source=foreign_source,
+        source_sha256=_sha256(foreign_source.encode()),
+        motif_provenance=(),
+    )
+    await harness.candidates.append_version(foreign_version, expected_previous_id=None)
 
     result = await _call(harness, "rule.get", {"candidate_id": str(candidate_id)})
 
@@ -2755,6 +2805,28 @@ async def test_rule_get_marks_version_without_report_untested() -> None:
     assert result.output["versions"][0]["validation_status"] == "untested"
     assert result.output["versions"][0]["validation_reason"] == "explicit_rule_test_required"
     assert result.output["versions"][0]["latest_test_report"] is None
+    assert result.output["source_version"] == "v1"
+    assert result.output["source_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert result.output["source_sha256"] == version.source_sha256
+    assert result.output["latest_test_report_id"] is None
+    assert result.output["source"].encode("utf-8") == source.encode("utf-8")[
+        : len(result.output["source"].encode("utf-8"))
+    ]
+    assert len(result.output["source"].encode("utf-8")) <= 16 * 1024
+    assert result.output["source_complete"] is False
+    source_pages = [result.output["source"]]
+    next_offset = result.output["source_next_offset"]
+    while not result.output["source_complete"]:
+        result = await _call(
+            harness,
+            "rule.get",
+            {"candidate_id": str(candidate_id), "source_offset": next_offset},
+        )
+        assert result.status is ToolInvocationStatus.SUCCEEDED
+        source_pages.append(result.output["source"])
+        next_offset = result.output["source_next_offset"]
+    assert "".join(source_pages) == source
+    assert _sha256("".join(source_pages).encode("utf-8")) == version.source_sha256
 
 
 @pytest.mark.asyncio
@@ -2978,12 +3050,21 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
     assert history.status is ToolInvocationStatus.SUCCEEDED
     assert [item["version"] for item in history.output["versions"]] == ["v1", "v2"]
     assert history.output["comparisons"]
+    assert history.output["source"] == v2.source
+    assert history.output["source_sha256"] == v2.source_sha256
+    assert history.output["latest_test_report_id"] == str(v2_test.observation_refs[0])
+    assert history.output["versions"][0]["latest_test_report"]["observation_id"] == str(
+        v1_test.observation_refs[0]
+    )
+    assert history.output["versions"][1]["latest_test_report"]["observation_id"] == str(
+        v2_test.observation_refs[0]
+    )
     serialized_history = json.dumps(
         history.output,
         default=lambda value: dict(value) if isinstance(value, Mapping) else str(value),
     )
-    assert '"source":' not in serialized_history
-    assert "rule " not in serialized_history.lower()
+    assert all("source" not in item for item in history.output["versions"])
+    assert "rule candidate" in serialized_history.lower()
 
 
 @pytest.mark.asyncio

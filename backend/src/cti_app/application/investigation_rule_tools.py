@@ -116,6 +116,7 @@ _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _SAFE_TEXT_PATTERN = r"^(?!.*[\x00-\x1f\x7f])[\s\S]*$"
 _UUID_NAMESPACE = UUID("a24a70a5-f901-451a-8969-a0ad0ea0b267")
 _MAX_HISTORY = 64
+_MAX_RULE_SOURCE_PAGE_BYTES = 16 * 1024
 _PERSISTED_MOTIF_PREFIX = "rule-workbench-motif-v1:"
 MAX_RULE_REPORT_SUMMARY_BYTES = 64 * 1024
 _MAX_SOURCE_DIFF_LINE_NUMBERS = 20
@@ -412,6 +413,14 @@ RULE_GET_SCHEMA = _schema(
         "include_history": _allow_empty_optional(
             {"type": "boolean"},
             "Optional boolean; omit or leave empty to return only the selected version.",
+        ),
+        "source_offset": _allow_empty_optional(
+            {"type": "integer", "minimum": 0},
+            (
+                "Optional UTF-8 byte offset into the selected version's exact source. "
+                f"Each response returns at most {_MAX_RULE_SOURCE_PAGE_BYTES} source bytes; "
+                "continue with source_next_offset and verify source_sha256 after reassembly."
+            ),
         ),
     },
     ("candidate_id",),
@@ -964,8 +973,11 @@ def register_rule_tools(
                 confidentiality=ToolConfidentiality.INTERNAL,
                 limitations=(
                     "Règle locale facultative; aucun statut approuvé ou publié n'est produit.",
-                    "Les sorties exposent des hashes et résumés bornés, jamais la source YARA "
-                    "ni les octets.",
+                    (
+                        "rule.get expose uniquement la source YARA exacte de la version "
+                        "sélectionnée, par pages UTF-8 de 16 Kio maximum avec hash vérifiable; "
+                        "aucun octet d'échantillon n'est exposé."
+                    ),
                     *(
                         (
                             "rule.propose et rule.revise ne font qu'un contrôle de compilation; "
@@ -3017,7 +3029,17 @@ class _RuleTools:
             else versions[-1]
         )
         include_history = bool(_empty_optional_value(arguments.get("include_history")))
-        visible = versions[-_MAX_HISTORY:] if include_history else (selected,)
+        if include_history:
+            visible = versions[-_MAX_HISTORY:]
+            if selected.id not in {version.id for version in visible}:
+                visible = tuple(
+                    sorted(
+                        (*versions[-(_MAX_HISTORY - 1) :], selected),
+                        key=lambda item: item.version,
+                    )
+                )
+        else:
+            visible = (selected,)
         visible_ids = {str(version.id) for version in visible}
         observations = await self.evidence_observations.list_for_investigation(
             context.investigation_id
@@ -3030,13 +3052,21 @@ class _RuleTools:
             and observation.object_id in visible_ids
         ]
         report_observations.sort(key=lambda item: (item.observed_at, item.id.hex))
-        reports: dict[str, list[Mapping[str, Any]]] = {version_id: [] for version_id in visible_ids}
+        reports: dict[str, list[Mapping[str, Any] | None]] = {
+            version_id: [] for version_id in visible_ids
+        }
+        report_observation_ids: dict[str, list[UUID]] = {
+            version_id: [] for version_id in visible_ids
+        }
         for observation in report_observations:
             try:
                 payload = await self.evidence_payloads.read_json(observation.blob_id)
             except Exception:
-                continue
-            reports[observation.object_id].append(payload)
+                payload = None
+            reports[observation.object_id].append(
+                payload if isinstance(payload, Mapping) else None
+            )
+            report_observation_ids[observation.object_id].append(observation.id)
         comparison_observations = [
             observation
             for observation in observations
@@ -3057,13 +3087,37 @@ class _RuleTools:
                 version,
                 reports.get(str(version.id), ()),
                 compile_status=self.workbench.compile_check(version.source).status,
+                report_observation_ids=report_observation_ids.get(str(version.id), ()),
             )
             for version in visible
         ]
+        source_page = _rule_source_page(
+            selected.source,
+            _empty_optional_value(arguments.get("source_offset")),
+        )
+        selected_report = next(
+            (
+                item["latest_test_report"]
+                for item in history
+                if item["version_id"] == str(selected.id)
+            ),
+            None,
+        )
         return (
             {
                 "candidate_id": str(candidate_id),
                 "selected_version": selected.version_label,
+                "source": source_page["text"],
+                "source_offset": source_page["offset"],
+                "source_next_offset": source_page["next_offset"],
+                "source_length": source_page["length"],
+                "source_complete": source_page["complete"],
+                "source_sha256": selected.source_sha256,
+                "source_version": selected.version_label,
+                "source_status": selected.status.value,
+                "latest_test_report_id": (
+                    selected_report.get("observation_id") if selected_report is not None else None
+                ),
                 "versions": history,
                 "comparisons": comparisons,
             },
@@ -5017,20 +5071,43 @@ def _comparison_summary(
 
 def _version_summary(
     version: DetectionCandidateVersion,
-    reports: Sequence[Mapping[str, Any]],
+    reports: Sequence[Mapping[str, Any] | None],
     *,
     compile_status: YaraExecutionStatus = YaraExecutionStatus.ENGINE_UNAVAILABLE,
+    report_observation_ids: Sequence[UUID] = (),
 ) -> dict[str, Any]:
     """Expose stable validation status/reason fields for rule.get and publication consumers."""
-    matching_reports = tuple(
-        report
-        for report in reports
-        if report.get("operation") == "test"
+    matching_report_pairs = tuple(
+        (index, report)
+        for index, report in enumerate(reports)
+        if isinstance(report, Mapping)
+        and report.get("operation") == "test"
         and report.get("version_id") == str(version.id)
         and report.get("source_sha256") == version.source_sha256
         and report.get("rule_version_id", str(version.id)) == str(version.id)
     )
-    latest_report = matching_reports[-1] if matching_reports else None
+    latest_observed_report_id = report_observation_ids[-1] if report_observation_ids else None
+    latest_matching_report_id = (
+        report_observation_ids[matching_report_pairs[-1][0]]
+        if matching_report_pairs and matching_report_pairs[-1][0] < len(report_observation_ids)
+        else None
+    )
+    latest_report = (
+        matching_report_pairs[-1][1]
+        if matching_report_pairs
+        and (
+            latest_observed_report_id is None
+            or latest_matching_report_id == latest_observed_report_id
+        )
+        else None
+    )
+    latest_report_observation_id = (
+        str(latest_observed_report_id)
+        if latest_observed_report_id is not None
+        else str(latest_matching_report_id)
+        if latest_matching_report_id is not None
+        else None
+    )
     has_identified_test_report = bool(
         latest_report is not None
         and isinstance(latest_report.get("corpus_sha256"), str)
@@ -5096,6 +5173,7 @@ def _version_summary(
                 "validation_reasons": latest_report.get("validation_reasons", []),
                 "execution_status": latest_report.get("execution_status"),
                 "rule_version_id": latest_report.get("rule_version_id", str(version.id)),
+                "observation_id": latest_report_observation_id,
                 "rule_source_sha256": latest_report.get(
                     "rule_source_sha256", version.source_sha256
                 ),
@@ -5109,6 +5187,11 @@ def _version_summary(
                 "revision_guidance": latest_report.get("revision_guidance"),
             }
             if latest_report is not None
+            else {
+                "observation_id": str(latest_observed_report_id),
+                "availability": "unavailable",
+            }
+            if latest_observed_report_id is not None
             else None
         ),
         "test_refs": [str(reference) for reference in version.test_refs],
@@ -5116,7 +5199,33 @@ def _version_summary(
         "motif_kinds": sorted(
             {_motif_kind_from_provenance(item.rationale) for item in version.motif_provenance}
         ),
-        "reports": list(reports),
+        "reports": [report for report in reports if isinstance(report, Mapping)],
+    }
+
+
+def _rule_source_page(source: str, requested_offset: Any) -> dict[str, Any]:
+    """Return one bounded, UTF-8-safe byte page from an exact candidate source."""
+    offset = 0 if requested_offset is None else requested_offset
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise _ToolFailed("rule_source_offset_invalid")
+    encoded = source.encode("utf-8")
+    if offset > len(encoded):
+        raise _ToolFailed("rule_source_offset_out_of_range")
+    if offset < len(encoded) and (encoded[offset] & 0b1100_0000) == 0b1000_0000:
+        raise _ToolFailed("rule_source_offset_not_utf8_boundary")
+    end = min(offset + _MAX_RULE_SOURCE_PAGE_BYTES, len(encoded))
+    while (
+        end > offset
+        and end < len(encoded)
+        and (encoded[end] & 0b1100_0000) == 0b1000_0000
+    ):
+        end -= 1
+    return {
+        "text": encoded[offset:end].decode("utf-8"),
+        "offset": offset,
+        "next_offset": end,
+        "length": len(encoded),
+        "complete": end == len(encoded),
     }
 
 
