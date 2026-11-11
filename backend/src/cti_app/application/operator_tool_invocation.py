@@ -199,6 +199,25 @@ _OPERATOR_ERROR_MESSAGES = {
         "matching observations for object-specific findings."
     ),
 }
+_VT_SOURCE_DISCLOSURE_DETAIL_CODES = frozenset(
+    {
+        "vt_external_disclosure_not_allowed",
+        "vt_evidence_reference_invalid",
+        "vt_evidence_reference_unavailable_or_changed",
+        "vt_observation_hash_invalid",
+        "vt_sample_grounding_repository_unavailable",
+        "vt_hash_observation_mismatch",
+        "vt_hash_not_grounded",
+        "vt_unassociated_observation_not_allowed",
+        "vt_sample_repository_unavailable",
+        "sample_source_restricted",
+        "vt_source_document_repository_unavailable",
+        "vt_source_document_reference_invalid",
+        "vt_source_document_unavailable",
+        "source_document_restricted",
+        "source_document_external_llm_not_allowed",
+    }
+)
 _SIGNED_QUERY = frozenset(
     {
         "signature",
@@ -2043,6 +2062,7 @@ class OperatorToolInvocationService:
                 result_data = {"error_code": safe_nested_error_code}
                 if safe_nested_error_code == "vt_hash_not_grounded":
                     result_data["reason"] = safe_nested_error_code
+                    result_data["detail_code"] = safe_nested_error_code
                     result_data["correction"] = _OPERATOR_ERROR_MESSAGES[safe_nested_error_code]
                 if safe_nested_error_code == "invalid_tool_arguments" and tool_result is not None:
                     result_data["validation_errors"] = _operator_validation_errors(
@@ -2165,6 +2185,27 @@ class OperatorToolInvocationService:
                 output["error"]["detail_code"] = detail_code
             result_output = tool_result.output if tool_result is not None else {}
             diagnostic_code = result_output.get("detail_code")
+            if (
+                invocation.tool_name.startswith("vt.")
+                and isinstance(diagnostic_code, str)
+                and diagnostic_code in _VT_SOURCE_DISCLOSURE_DETAIL_CODES
+                and diagnostic_code == safe_nested_error_code
+            ):
+                result_data = {
+                    "error_code": diagnostic_code,
+                    "reason": diagnostic_code,
+                    "detail_code": diagnostic_code,
+                }
+                correction = result_output.get("correction")
+                if isinstance(correction, str) and len(correction) <= 512:
+                    result_data["correction"] = correction
+                    output["error"]["reason"] = correction
+                    output["error"]["correction"] = correction
+                for key in ("source_kind", "source_id", "object_type", "object_id"):
+                    value = result_output.get(key)
+                    if isinstance(value, str) and len(value) <= 128:
+                        result_data[key] = value
+                output["error"]["detail_code"] = diagnostic_code
             if (
                 invocation.tool_name == "experiment.record"
                 and isinstance(diagnostic_code, str)

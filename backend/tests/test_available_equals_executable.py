@@ -1049,6 +1049,54 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
 
 
 @pytest.mark.asyncio
+async def test_restricted_vt_error_exposes_guard_and_target() -> None:
+    (
+        fixture,
+        state,
+        _registry,
+        _summaries,
+        operator_service,
+        tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+    sample_hash = "d" * 64
+
+    class _RestrictedSamples:
+        async def list_by_subject_and_sha256(self, subject_id: UUID, sha256: str):
+            assert subject_id == fixture.subject_id
+            assert sha256 == sample_hash
+            return (
+                SimpleNamespace(
+                    subject_id=subject_id,
+                    tlp=TLP.RED,
+                    do_not_submit=False,
+                    license_restriction=None,
+                ),
+            )
+
+    fixture.service._samples = _RestrictedSamples()
+    refused = await operator_service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"file_hash": sample_hash},
+        purpose="Read a restricted synthetic hash report.",
+        expected_version=state.version,
+        idempotency_key="restricted-vt-hash-report",
+    )
+
+    assert refused.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert refused.error_code == "sample_source_restricted"
+    assert refused.output["error"]["code"] == "sample_source_restricted"
+    assert refused.output["error"]["detail_code"] == "sample_source_restricted"
+    assert "sample source" in refused.output["error"]["correction"].casefold()
+    result_data = refused.output["data"]["result"]
+    assert result_data["object_type"] == "sha256"
+    assert result_data["object_id"] == sample_hash
+    assert result_data["source_id"] == sample_hash
+    assert len(tools["vt.file_report"].calls) == 0
+
+
+@pytest.mark.asyncio
 async def test_osint_documented_hash_read_relationship_download_behaviour_sources_match() -> None:
     (
         fixture,

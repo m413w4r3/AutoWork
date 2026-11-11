@@ -9,7 +9,7 @@ import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid5
@@ -240,6 +240,63 @@ _VT_HASH_NOT_GROUNDED_CORRECTION = (
     "Cite an observation anchored to this SHA-256, a hash-verified canonical VT relationship "
     "payload containing it, or a source-documented SHA-256 IOC before retrying."
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _VTSourceDisclosureRefusal:
+    detail_code: str
+    source_kind: str
+    source_id: str
+    target_hash: str | None = None
+
+
+def _vt_source_disclosure_correction(refusal: _VTSourceDisclosureRefusal) -> str:
+    if refusal.detail_code == _VT_HASH_NOT_GROUNDED_REASON:
+        return _VT_HASH_NOT_GROUNDED_CORRECTION
+    if refusal.detail_code == "vt_external_disclosure_not_allowed":
+        return (
+            "Review the current approved investigation envelope, TLP, and external_llm_allowed "
+            "bounds; obtain any required human approval before retrying."
+        )
+    if refusal.detail_code in {
+        "sample_source_restricted",
+        "source_document_restricted",
+        "source_document_external_llm_not_allowed",
+    }:
+        if refusal.source_kind == "sample":
+            source = f"sample source {refusal.source_id}"
+        else:
+            source = f"source document {refusal.source_id}"
+        target = f" for SHA-256 {refusal.target_hash}" if refusal.target_hash else ""
+        return (
+            f"VT disclosure{target} was refused because {source} is restricted. Have the "
+            "source owner verify its subject, TLP, and licence restrictions, or cite another "
+            "eligible source before retrying."
+        )
+    if refusal.detail_code == "vt_sample_repository_unavailable":
+        return (
+            f"The sample source lookup for SHA-256 {refusal.target_hash or refusal.source_id} "
+            "was unavailable. Restore the investigation repository lookup before retrying."
+        )
+    if refusal.detail_code == "vt_source_document_unavailable":
+        return (
+            f"Source document {refusal.source_id} could not be resolved. Refresh its canonical "
+            "reference or cite another eligible source before retrying."
+        )
+    if refusal.source_kind == "sample":
+        source = f"sample hash {refusal.source_id}"
+    elif refusal.source_kind == "source_document":
+        source = f"source document {refusal.source_id}"
+    elif refusal.source_kind == "evidence_observation":
+        source = f"evidence observation {refusal.source_id}"
+    else:
+        source = refusal.source_id
+    target = f" for SHA-256 {refusal.target_hash}" if refusal.target_hash else ""
+    return (
+        f"VT disclosure{target} was refused by the {refusal.detail_code} guard for {source}. "
+        "Refresh the canonical source references or restore the required source lookup before "
+        "retrying."
+    )
 
 
 def _bounded_vt_source_references(
@@ -1942,12 +1999,28 @@ class InvestigationService:
             purpose=purpose,
         )
 
-        pre_submission_correction: str | None = None
+        pre_submission_refusal: _VTSourceDisclosureRefusal | None = None
+
+        def vt_target_hash() -> str | None:
+            raw_hash: Any = None
+            if tool_name == "vt.download_sample":
+                raw_hash = arguments.get("sha256")
+            elif tool_name == "vt.relationships" and arguments.get("object_type") == "file":
+                raw_hash = arguments.get("object_id")
+            elif tool_name in {"vt.file_report", "vt.behaviour", "vt.behaviour_pcap"}:
+                raw_hash = arguments.get("file_hash")
+            if not isinstance(raw_hash, str):
+                return None
+            try:
+                normalized_hash = normalize_file_hash(raw_hash)
+            except (TypeError, ValueError, VirusTotalInvalidInputError):
+                return None
+            return normalized_hash if len(normalized_hash) == 64 else None
 
         async def check_current_admission(
             _context: ToolExecutionContext,
         ) -> FrameworkPreSubmissionProof | None:
-            nonlocal pre_submission_correction
+            nonlocal pre_submission_refusal
             if not external_effect or envelope is None:
                 return None
             current_envelope = await self._envelopes.get(investigation.id)
@@ -1992,7 +2065,12 @@ class InvestigationService:
                         )
                         != 1
                     ):
-                        pre_submission_correction = _VT_HASH_NOT_GROUNDED_CORRECTION
+                        pre_submission_refusal = _VTSourceDisclosureRefusal(
+                            detail_code=_VT_HASH_NOT_GROUNDED_REASON,
+                            source_kind="sample_hash",
+                            source_id=target_hash,
+                            target_hash=target_hash,
+                        )
                         return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
@@ -2002,17 +2080,31 @@ class InvestigationService:
                     envelope_exists=current_envelope is not None,
                     family=tool_name,
                 ):
+                    target_hash = next(
+                        (
+                            reference.id
+                            for reference in external_effect_evidence_refs
+                            if reference.kind == "sample_hash"
+                        ),
+                        vt_target_hash(),
+                    )
+                    pre_submission_refusal = _VTSourceDisclosureRefusal(
+                        detail_code="vt_external_disclosure_not_allowed",
+                        source_kind="vt_tool",
+                        source_id=tool_name,
+                        target_hash=target_hash,
+                    )
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
-                rejection_reason: list[str] = []
+                rejection_detail: list[_VTSourceDisclosureRefusal] = []
                 if await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
                     tool_name,
                     envelope=current_envelope,
-                    rejection_reason=rejection_reason,
+                    rejection_detail=rejection_detail,
                 ):
-                    if rejection_reason == [_VT_HASH_NOT_GROUNDED_REASON]:
-                        pre_submission_correction = _VT_HASH_NOT_GROUNDED_CORRECTION
+                    if rejection_detail:
+                        pre_submission_refusal = rejection_detail[0]
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
                 current_investigation = await self._investigations.get(investigation.id)
@@ -2164,23 +2256,29 @@ class InvestigationService:
             pre_dispatch_check=check_current_admission,
         )
         if (
-            pre_submission_correction is not None
+            pre_submission_refusal is not None
             and result.framework_pre_submission_proof
             is FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
         ):
-            reason = _VT_HASH_NOT_GROUNDED_REASON
+            refusal = pre_submission_refusal
+            correction = _vt_source_disclosure_correction(refusal)
             output = dict(result.output)
             output.update(
                 {
-                    "reason": reason,
-                    "error_code": reason,
-                    "correction": pre_submission_correction,
+                    "reason": refusal.detail_code,
+                    "error_code": refusal.detail_code,
+                    "detail_code": refusal.detail_code,
+                    "source_kind": refusal.source_kind,
+                    "source_id": refusal.source_id,
+                    "object_type": "sha256" if refusal.target_hash else "vt_tool",
+                    "object_id": refusal.target_hash or refusal.source_id,
+                    "correction": correction,
                 }
             )
             result = replace(
                 result,
-                error_code=reason,
-                message=pre_submission_correction,
+                error_code=refusal.detail_code,
+                message=correction,
                 output=output,
             )
         advisor_admission_recheck = (
@@ -2427,13 +2525,35 @@ class InvestigationService:
         family: str,
         *,
         envelope: InvestigationEnvelope | None = None,
-        rejection_reason: list[str] | None = None,
+        rejection_detail: list[_VTSourceDisclosureRefusal] | None = None,
     ) -> bool:
         sample_hashes = {
             reference.id.casefold() for reference in references if reference.kind == "sample_hash"
         }
         observation_hashes: set[str] = set()
         hashes = set(sample_hashes)
+
+        def refuse(
+            detail_code: str,
+            *,
+            source_kind: str,
+            source_id: str,
+            target_hash: str | None = None,
+        ) -> bool:
+            if target_hash is None:
+                candidate_hashes = sample_hashes or hashes
+                target_hash = sorted(candidate_hashes)[0] if candidate_hashes else None
+            if rejection_detail is not None:
+                rejection_detail[:] = [
+                    _VTSourceDisclosureRefusal(
+                        detail_code=detail_code,
+                        source_kind=source_kind,
+                        source_id=source_id,
+                        target_hash=target_hash,
+                    )
+                ]
+            return True
+
         document_ids = {
             reference.id for reference in references if reference.kind == "source_document"
         }
@@ -2443,7 +2563,11 @@ class InvestigationService:
             try:
                 observation_id = UUID(reference.id)
             except ValueError:
-                return True
+                return refuse(
+                    "vt_evidence_reference_invalid",
+                    source_kind="evidence_observation",
+                    source_id=reference.id,
+                )
             observation = await self._observations.get(observation_id)
             if (
                 observation is None
@@ -2451,7 +2575,11 @@ class InvestigationService:
                 or observation.source_version != reference.version
                 or observation.sha256 != reference.sha256
             ):
-                return True
+                return refuse(
+                    "vt_evidence_reference_unavailable_or_changed",
+                    source_kind="evidence_observation",
+                    source_id=reference.id,
+                )
             object_type = observation.object_type.casefold()
             if object_type in {"sample", "file", "sample_observation", "md5", "sha1"} or (
                 family in _VT_HASH_READ_TOOLS and object_type == "sha256"
@@ -2459,11 +2587,36 @@ class InvestigationService:
                 try:
                     sample_hash = normalize_file_hash(observation.object_id)
                 except (TypeError, ValueError):
-                    return True
+                    return refuse(
+                        "vt_observation_hash_invalid",
+                        source_kind="evidence_observation",
+                        source_id=str(observation.id),
+                    )
                 if len(sample_hash) not in {32, 40, 64}:
-                    return True
+                    return refuse(
+                        "vt_observation_hash_invalid",
+                        source_kind="evidence_observation",
+                        source_id=str(observation.id),
+                    )
                 if len(sample_hash) == 64:
-                    observation_hashes.add(sample_hash)
+                    relationship_targets: set[str] = set()
+                    if (
+                        sample_hashes
+                        and sample_hash not in sample_hashes
+                        and family in _VT_HASH_READ_TOOLS
+                        and observation.kind is EvidenceKind.VT_RELATIONSHIP
+                    ):
+                        for target_hash in sample_hashes:
+                            if await self._canonical_evidence_contains_vt_hash(
+                                observation, target_hash
+                            ):
+                                relationship_targets.add(target_hash)
+                    if relationship_targets:
+                        # The relationship observation's object_id is its parent hash;
+                        # its canonical payload grounds the related target hash instead.
+                        observation_hashes.update(relationship_targets)
+                    else:
+                        observation_hashes.add(sample_hash)
                     hashes.add(sample_hash)
             elif object_type in {"source_document", "document"}:
                 document_ids.add(observation.object_id)
@@ -2498,7 +2651,12 @@ class InvestigationService:
             if not allow_unobserved_hash and (
                 sample_associations is None or sample_repository is None
             ):
-                return True
+                return refuse(
+                    "vt_sample_grounding_repository_unavailable",
+                    source_kind="sample_hash",
+                    source_id=sorted(hashes)[0],
+                    target_hash=sorted(hashes)[0],
+                )
             associations = (
                 await sample_associations.list_for_investigation(investigation.id)
                 if sample_associations is not None
@@ -2514,20 +2672,37 @@ class InvestigationService:
             if any(
                 reference.kind == "sample_hash" for reference in references
             ) and not observation_hashes.issubset(sample_hashes):
-                return True
+                return refuse(
+                    "vt_hash_observation_mismatch",
+                    source_kind="sample_hash",
+                    source_id=sorted(sample_hashes)[0],
+                    target_hash=sorted(sample_hashes)[0],
+                )
             ungrounded_hashes = sample_hashes - (
                 associated_hashes | observation_hashes | documented_hashes
             )
             if ungrounded_hashes and not allow_unobserved_hash:
-                if rejection_reason is not None:
-                    rejection_reason[:] = [_VT_HASH_NOT_GROUNDED_REASON]
-                return True
+                ungrounded_hash = sorted(ungrounded_hashes)[0]
+                return refuse(
+                    _VT_HASH_NOT_GROUNDED_REASON,
+                    source_kind="sample_hash",
+                    source_id=ungrounded_hash,
+                    target_hash=ungrounded_hash,
+                )
             if (
                 observation_hashes - (associated_hashes | sample_hashes)
                 and not allow_unassociated_passive_read_observations
                 and not allow_unassociated_search_observations
             ):
-                return True
+                observation_hash = sorted(
+                    observation_hashes - (associated_hashes | sample_hashes)
+                )[0]
+                return refuse(
+                    "vt_unassociated_observation_not_allowed",
+                    source_kind="sample_hash",
+                    source_id=observation_hash,
+                    target_hash=observation_hash,
+                )
         for sample_hash in hashes:
             if sample_repository is None:
                 if (
@@ -2535,13 +2710,18 @@ class InvestigationService:
                     or sample_hash in observation_hashes
                     or sample_hash in associated_hashes
                 ):
-                    return True
+                    return refuse(
+                        "vt_sample_repository_unavailable",
+                        source_kind="sample_hash",
+                        source_id=sample_hash,
+                        target_hash=sample_hash,
+                    )
                 continue
             samples = await sample_repository.list_by_subject_and_sha256(
                 investigation.subject_id, sample_hash
             )
-            if any(
-                external_effect_source_restriction_reason(
+            for sample in samples:
+                restriction_reason = external_effect_source_restriction_reason(
                     source_kind="sample",
                     source=sample,
                     subject_id=investigation.subject_id,
@@ -2549,33 +2729,56 @@ class InvestigationService:
                     is_model_submission=False,
                     disclosure_profile=self._disclosure_policy.profile,
                 )
-                is not None
-                for sample in samples
-            ):
-                return True
+                if restriction_reason is not None:
+                    return refuse(
+                        restriction_reason,
+                        source_kind="sample",
+                        source_id=sample_hash,
+                        target_hash=sample_hash,
+                    )
         if document_ids:
             source_documents = self._source_documents
             if source_documents is None:
-                return True
+                document_id = sorted(document_ids)[0]
+                return refuse(
+                    "vt_source_document_repository_unavailable",
+                    source_kind="source_document",
+                    source_id=document_id,
+                    target_hash=next(iter(sorted(sample_hashes)), None),
+                )
             for raw_document_id in document_ids:
                 try:
                     document_id = UUID(raw_document_id)
                 except ValueError:
-                    return True
-                document = await source_documents.get(document_id)
-                if (
-                    document is None
-                    or external_effect_source_restriction_reason(
+                    return refuse(
+                        "vt_source_document_reference_invalid",
                         source_kind="source_document",
-                        source=document,
-                        subject_id=investigation.subject_id,
-                        family=family,
-                        is_model_submission=False,
-                        disclosure_profile=self._disclosure_policy.profile,
+                        source_id=raw_document_id,
+                        target_hash=next(iter(sorted(sample_hashes)), None),
                     )
-                    is not None
-                ):
-                    return True
+                document = await source_documents.get(document_id)
+                if document is None:
+                    return refuse(
+                        "vt_source_document_unavailable",
+                        source_kind="source_document",
+                        source_id=raw_document_id,
+                        target_hash=next(iter(sorted(sample_hashes)), None),
+                    )
+                restriction_reason = external_effect_source_restriction_reason(
+                    source_kind="source_document",
+                    source=document,
+                    subject_id=investigation.subject_id,
+                    family=family,
+                    is_model_submission=False,
+                    disclosure_profile=self._disclosure_policy.profile,
+                )
+                if restriction_reason is not None:
+                    return refuse(
+                        restriction_reason,
+                        source_kind="source_document",
+                        source_id=raw_document_id,
+                        target_hash=next(iter(sorted(sample_hashes)), None),
+                    )
         return False
 
     async def _trusted_vt_source_references(
