@@ -828,7 +828,7 @@ async def test_result_preserves_safe_tool_error_code_and_uses_actionable_message
 
     assert result.error_code == "source_references_required"
     assert result.output["error"]["code"] == "source_references_required"
-    assert "canonical observation reference" in result.output["error"]["reason"]
+    assert "server-resolvable source" in result.output["error"]["reason"]
     assert "exception details" not in result.output["error"]["reason"]
 
     unsafe_code = "a" * 64

@@ -266,9 +266,7 @@ def _vt_object_payload_contains(
         else r"(?<![A-Za-z0-9.])"
     )
     trailing_boundary = (
-        r"(?![A-Za-z0-9.-])"
-        if object_type is VirusTotalObjectType.DOMAIN
-        else r"(?![A-Za-z0-9.])"
+        r"(?![A-Za-z0-9.-])" if object_type is VirusTotalObjectType.DOMAIN else r"(?![A-Za-z0-9.])"
     )
     pattern = re.compile(
         boundary + re.escape(normalized_object_id) + trailing_boundary,
@@ -2830,10 +2828,12 @@ class InvestigationService:
             grounded = False
             if observation.object_type.casefold() in observation_types:
                 try:
-                    candidate = _normalize_object_id(object_type, observation.object_id)
+                    candidate_object_id: str | None = _normalize_object_id(
+                        object_type, observation.object_id
+                    )
                 except (TypeError, ValueError, VirusTotalInvalidInputError):
-                    candidate = None
-                grounded = candidate == normalized_object_id
+                    candidate_object_id = None
+                grounded = candidate_object_id == normalized_object_id
 
             evidence_kind = observation.kind
             trusted_payload_source = evidence_kind in _VT_OBJECT_GROUNDING_EVIDENCE_KINDS or (
@@ -2892,10 +2892,7 @@ class InvestigationService:
                 observation.blob_id,
                 max_bytes=_MAX_VT_OBJECT_GROUNDING_BYTES,
             )
-            if (
-                not isinstance(raw, bytes)
-                or hashlib.sha256(raw).hexdigest() != observation.sha256
-            ):
+            if not isinstance(raw, bytes) or hashlib.sha256(raw).hexdigest() != observation.sha256:
                 return None
             payload = json.loads(raw)
             if not isinstance(payload, dict) or canonical_json_bytes(payload) != raw:

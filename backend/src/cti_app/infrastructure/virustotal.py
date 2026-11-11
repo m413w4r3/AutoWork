@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from cti_app.application.external_effects import (
+    VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
     Ambiguous,
     Completed,
     DefinitelyNotSubmitted,
@@ -34,7 +35,6 @@ from cti_app.application.external_effects import (
     Reused,
     SafeExternalEffectFailure,
     TransportResponse,
-    VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
 )
 from cti_app.application.sample_acquisition import (
     SampleAcquisitionCacheScope,
@@ -4215,7 +4215,8 @@ def _http_error(
             else "virustotal_upstream_not_found"
             if operation is VirusTotalOperation.FILE_DOWNLOAD
             else "virustotal_not_found"
-            if normalized_error_code in {
+            if normalized_error_code
+            in {
                 "notfound",
                 "not_found",
                 "object_not_found",

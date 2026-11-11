@@ -21,6 +21,8 @@ from sqlalchemy.sql.elements import ColumnElement
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.external_effects import (
     VIRUSTOTAL_OBSERVATION_SOURCE,
+    VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
+    VT_PASSIVE_READ_FAMILIES,
     ConsumeCommitted,
     ConsumePolicyContext,
     ConsumeRefused,
@@ -31,8 +33,6 @@ from cti_app.application.external_effects import (
     ExternalObservationHashPolicy,
     NoSubmissionProofKind,
     ReuseDecision,
-    VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
-    VT_PASSIVE_READ_FAMILIES,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
     advisor_disclosure_policy,

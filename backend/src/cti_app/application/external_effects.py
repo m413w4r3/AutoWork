@@ -1526,6 +1526,8 @@ def _is_retryable_vt_passive_read(prepared: PreparedExternalRequest) -> bool:
 
 
 __all__ = [
+    "VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES",
+    "VT_PASSIVE_READ_FAMILIES",
     "Ambiguous",
     "Completed",
     "ConsumeCommitted",
@@ -1549,6 +1551,4 @@ __all__ = [
     "Refused",
     "ReuseDecision",
     "TransportResponse",
-    "VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES",
-    "VT_PASSIVE_READ_FAMILIES",
 ]

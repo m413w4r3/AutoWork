@@ -1607,6 +1607,7 @@ async def test_trusted_vt_file_report_refs_resolve_hash_from_relationship_payloa
         ),
     )
 
+
 @pytest.mark.asyncio
 async def test_vt_download_allows_unassociated_confirmed_documented_ioc() -> None:
     sample_hash = "a" * 64
@@ -1640,7 +1641,7 @@ async def test_vt_download_rejects_ungrounded_hash_with_actionable_reason() -> N
     assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
     assert result.error_code == "vt_hash_not_grounded"
     assert result.output["reason"] == "vt_hash_not_grounded"
-    assert "vt.file_report" in result.output["correction"]
+    assert "canonical VT relationship payload" in result.output["correction"]
     assert fixture.tools["vt.download_sample"].calls == []
     envelope = await fixture.envelopes.get(fixture.investigation_id)
     assert envelope is not None

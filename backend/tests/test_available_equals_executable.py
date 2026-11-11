@@ -654,9 +654,7 @@ async def test_osint_policy_keeps_external_disclosure_denials(denial: str) -> No
 
 @pytest.mark.asyncio
 async def test_every_executable_tool_schema_is_exposed_past_context_tool_limit() -> None:
-    fixture, state, registry, _summaries, _service, _tools, _identifiers = (
-        await _seeded_fixture()
-    )
+    fixture, state, registry, _summaries, _service, _tools, _identifiers = await _seeded_fixture()
     expected_names = set()
     for index in range(65):
         name = f"synthetic.context_tool_{index:02d}"
@@ -784,9 +782,7 @@ async def test_available_pivots_and_exposed_families_execute_with_seeded_state()
 async def test_vt_object_reads_resolve_canonical_evidence_payload_references(
     object_type: str, object_id: str, evidence_text: str
 ) -> None:
-    fixture, _state, _registry, _summaries, _service, _tools, _identifiers = (
-        await _seeded_fixture()
-    )
+    fixture, _state, _registry, _summaries, _service, _tools, _identifiers = await _seeded_fixture()
     payload = {
         "schema": "ghidra-investigation-observation.v1",
         "data": {"strings": [evidence_text]},
@@ -969,7 +965,7 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
     assert refused.error_code == "vt_hash_not_grounded"
     result_data = refused.output["data"]["result"]
     assert result_data["reason"] == "vt_hash_not_grounded"
-    assert "vt.file_report" in result_data["correction"]
+    assert "canonical VT relationship payload" in result_data["correction"]
     assert refused.output["error"]["reason"] == result_data["correction"]
     assert len(tools["vt.download_sample"].calls) == 1
 
