@@ -812,8 +812,8 @@
   if original.len() > 0 [
     #v(8pt)
     #render-opinion-ioc-section(
-      "IOC originaux",
-      "Découverts dans les sources de ce run et associés au sujet par l'extrait cité.",
+      "Indicateurs découverts dans cette analyse",
+      "Repérés dans les sources examinées pendant cette analyse et associés au sujet par l'extrait cité.",
       original,
       reference-scope: reference-scope,
     )
@@ -919,9 +919,9 @@
       #v(10pt)
       #render-section-heading[ANNEXE DE TRAÇABILITÉ]
       #text(size: 8pt, fill: grey)[Les renvois courts du corps désignent les identifiants canoniques suivants.]
-      #let finding-refs = opinion-refs.filter(item => item.kind_label == "Finding")
-      #let evidence-refs = opinion-refs.filter(item => item.kind_label == "Évidence")
-      #for (group-title, refs) in (("Findings logiques cités", finding-refs), ("Évidences", evidence-refs)) [
+      #let finding-refs = opinion-refs.filter(item => item.at("kind", default: "") == "finding")
+      #let evidence-refs = opinion-refs.filter(item => item.at("kind", default: "") == "evidence")
+      #for (group-title, refs) in (("Constats logiques cités", finding-refs), ("Évidences", evidence-refs)) [
         #if refs.len() > 0 [
           #v(4pt)
           #text(size: 8pt, weight: "bold")[#group-title]

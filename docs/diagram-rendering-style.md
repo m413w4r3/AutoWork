@@ -31,7 +31,7 @@ unchanged.
 
 - `D2_COMPILER_VERSION` remains pinned to the installed D2 executable. Visual
   source or SVG changes increment `DIAGRAM_COMPILATION_POLICY_VERSION`, now
-  `diagram-d2-svg-v9-m21-opinion-render`.
+  `diagram-d2-svg-v11-m21-opinion-render`.
 - Publication Typst changes increment both `PUBLICATION_RENDERER_VERSION` and
   `PUBLICATION_RENDER_POLICY_VERSION`. The template bundle SHA is also part of
   the publication render input hash.

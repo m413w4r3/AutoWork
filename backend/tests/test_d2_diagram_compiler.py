@@ -359,6 +359,24 @@ def test_compacts_long_protocol_sequence_into_two_column_ordered_grid() -> None:
     assert 'n017: "#17 client → server: message"' in source
 
 
+def test_wraps_long_protocol_sequence_tokens_without_dropping_text() -> None:
+    label = "CLIENT_ESTABLISHED_" * 7
+    source = encode_d2_source(
+        _diagram(
+            profile=DiagramProfile.PROTOCOL_SEQUENCE,
+            direction=EnrichmentDiagramDirection.TOP_TO_BOTTOM,
+            nodes=(_node("message", label),),
+            edges=(),
+        )
+    ).decode()
+    encoded_label = source.split('n001: "', 1)[1].split('" {', 1)[0]
+
+    assert "\\n" in encoded_label
+    assert encoded_label.replace("\\n", "") == label
+    assert "…" not in encoded_label
+    assert "font-size: 20" in source
+
+
 def test_compacts_large_protocol_field_view_into_two_column_grid() -> None:
     nodes = tuple(_node(f"field-{index:02d}", f"#{index:02d} field name") for index in range(1, 23))
     source = encode_d2_source(
@@ -423,7 +441,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v10-m21-opinion-render"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v11-m21-opinion-render"
 
 
 @dataclass(frozen=True, slots=True)
