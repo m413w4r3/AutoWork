@@ -130,7 +130,7 @@ def requested_vt_file_hash(family: str, canonical_request: object) -> str | None
                 ):
                     return resources[0]
     if family == "vt.download_sample":
-        candidate = canonical_request.get("sha256")
-        if isinstance(candidate, str) and re.fullmatch(r"[0-9a-f]{64}", candidate):
-            return candidate
+        sha256 = canonical_request.get("sha256")
+        if isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return sha256
     return None

@@ -3223,10 +3223,12 @@ async def test_human_g2_vt_child_hash_guard_and_consume_match(
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
         migrated_postgres_url,
         tmp_path,
-        suffix=f"vt-child-{family.replace('.', '-')}-{case}-{uuid4().hex[:8]}",
+        suffix=f"vt-child-{family.replace('.', '-').replace('_', '-')}-{case}-{uuid4().hex[:8]}",
     )
     authority, base = authorities[0]
-    child_hash = "c" * 64
+    case_seed = f"{family}-{case}-{uuid4().hex}".encode()
+    child_hash = hashlib.sha256(b"child-" + case_seed).hexdigest()
+    other_hash = hashlib.sha256(b"other-" + case_seed).hexdigest()
     parent_hash = "b" * 64
     observation_id = uuid4()
     payload = {
@@ -3234,7 +3236,7 @@ async def test_human_g2_vt_child_hash_guard_and_consume_match(
         "relationships": {
             "dropped_files": [
                 {
-                    "id": child_hash if payload_contains_child else "d" * 64,
+                    "id": child_hash if payload_contains_child else other_hash,
                     "type": "file",
                 }
             ]
