@@ -265,7 +265,7 @@ class _SuricataBridgeCandidateImportAdapter(ToolAdapter):
                 or observation.object_id != "suricata_draft"
             ):
                 raise ValueError("bridge_observation_identity_mismatch")
-            payload = await self._artifact_store.read_json(observation.blob_id)
+            payload = await self._artifact_store.read_json(observation.blob_id, max_bytes=None)
             encoded = ProductionArtifactStore.canonical_json_bytes(payload)
             if hashlib.sha256(encoded).hexdigest() != observation.sha256:
                 raise ValueError("bridge_observation_payload_sha256_mismatch")

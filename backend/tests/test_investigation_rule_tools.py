@@ -52,6 +52,10 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     validate_json_schema,
 )
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
     RuleWorkbench,
@@ -368,8 +372,14 @@ class _MemoryEvidence:
     async def record_negative(self, **_kwargs: Any) -> EvidenceObservation:
         raise AssertionError("rule tools do not record negative observations")
 
-    async def read_json(self, blob_id: UUID) -> dict[str, Any]:
-        return self.payloads[blob_id]
+    async def read_json(
+        self, blob_id: UUID, *, max_bytes: int | None = MAX_ARTIFACT_BYTES
+    ) -> dict[str, Any]:
+        payload = self.payloads[blob_id]
+        payload_bytes = len(ProductionArtifactStore.canonical_json_bytes(payload))
+        if max_bytes is not None and payload_bytes > max_bytes:
+            raise ValueError("Blob exceeds the read limit")
+        return payload
 
 
 class _MemoryInventory(_MemoryCorpusBytes):
@@ -694,6 +704,8 @@ async def _bridge_yara_observation(
     source: str,
     measurement_catalog: Sequence[Mapping[str, Any]] | None = None,
     motifs: Sequence[Mapping[str, Any]] | None = None,
+    dossier: str | None = None,
+    output_fields: Mapping[str, Any] | None = None,
 ) -> tuple[UUID, UUID, str]:
     motif_observation_id = await _source_observation(harness, "BridgeMeasuredMarker")
     motif_observation = await harness.evidence.repository.get(motif_observation_id)
@@ -752,6 +764,7 @@ async def _bridge_yara_observation(
                 *measurement_input_refs,
             ],
             "measurement_catalog": selected_catalog,
+            **({"dossier": dossier} if dossier is not None else {}),
             "output": {
                 "schema": "advisor-response.v3",
                 "consultation_type": "yara_draft",
@@ -765,6 +778,7 @@ async def _bridge_yara_observation(
                 "rule_source": source,
                 "rule_source_sha256": source_sha256,
                 "motifs": selected_motifs,
+                **(dict(output_fields) if output_fields is not None else {}),
             },
         },
         source="advisor.consult",
@@ -2173,6 +2187,52 @@ async def test_bridge_yara_import_recomputes_hash_and_selects_from_raw_multi_rul
     assert len(versions) == 1
     assert versions[0].source == second
     assert versions[0].source_sha256 == expected_sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", [{"rule_index": 2}, {"rule_name": "SECOND"}])
+async def test_bridge_yara_import_reads_large_usable_advisor_observation(
+    selector: Mapping[str, Any],
+) -> None:
+    harness = _harness(samples={})
+    first = "rule first { condition: true }"
+    second = "rule second { condition: true }"
+    source = f"{first}\n{second}\n"
+    observation_id, _invocation_id, _source_sha256 = await _bridge_yara_observation(
+        harness,
+        source=source,
+        motifs=(),
+        dossier="d" * (MAX_ARTIFACT_BYTES + 1),
+        output_fields={
+            "rules": [
+                {"name": "first", "rule_source": first},
+                {"name": "second", "rule_source": second},
+            ],
+            "status": "partial",
+            "advisor_status": "partial",
+            "parse_status": "partially_parsed",
+            "normalization_errors": [
+                "yara_rule_validation_failed",
+                "or_branches_disguised_as_multiple_rules_forbidden",
+            ],
+            "canonicalization_eligible": False,
+        },
+    )
+
+    selected = await _call(
+        harness,
+        "rule.propose_bridge",
+        {"bridge_observation_id": str(observation_id), **selector},
+    )
+
+    expected_sha256 = hashlib.sha256(second.encode()).hexdigest()
+    assert selected.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert selected.output["source_sha256"] == expected_sha256
+    assert selected.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert selected.output["validation_status"] != RuleValidationStatus.REAL_VALIDATED.value
+    versions = await harness.candidates.list_for_candidate(UUID(selected.output["candidate_id"]))
+    assert len(versions) == 1
+    assert versions[0].source == second
 
 
 @pytest.mark.asyncio
