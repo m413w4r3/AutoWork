@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.external_effects import FrameworkNoSendProof
 from cti_app.application.investigation_acquisition_tools import (
     ARCHIVE_EXTRACT_MEMBER_SCHEMA,
     SAMPLE_ANALYZE_SCHEMA,
@@ -39,6 +40,7 @@ from cti_app.application.investigation_tools import (
     ToolEffect,
     ToolExecutionContext,
     ToolResult,
+    _authorize_framework_refusal_proof_adapter,
     project_tool_availability,
 )
 from cti_app.application.investigation_vt_tools import (
@@ -48,16 +50,20 @@ from cti_app.application.investigation_vt_tools import (
     OBJECT_REPORT_SCHEMA,
     RELATIONSHIPS_SCHEMA,
     VT_PASSIVE_RETRY_TRUSTED_PARAMETER,
+    _FileReportAdapter,
 )
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationService,
 )
 from cti_app.application.research_context_builder import blocked_capabilities_from_history
+from cti_app.application.virustotal import VirusTotalExternalEffectRefusedError
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.external_effects import (
     EvidenceReference,
+    FrozenWireRequest,
+    PreparedExternalRequest,
     canonical_json_bytes,
     invocation_arguments_digest,
 )
@@ -77,8 +83,12 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     tool_operation_key,
 )
+from cti_app.infrastructure.database.repositories.external_effects import (
+    SqlAlchemyExternalEffectClaimStore,
+)
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
     _source_refs_for_family,
+    virustotal_external_effect_family_bindings,
 )
 from tests.test_investigation_service import (
     InMemorySampleAssociationRepository,
@@ -1145,6 +1155,154 @@ async def test_relationship_grounded_child_download_is_available_and_executable(
             "evidence_refs": [],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_relationship_grounded_file_report_source_refs_match_db_resolver() -> None:
+    (
+        fixture,
+        _state,
+        _registry,
+        _summaries,
+        _operator_service,
+        _tools,
+        _ids,
+    ) = await _seeded_fixture()
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+    assert investigation is not None
+    child_hash = "c" * 64
+    parent_hash = "b" * 64
+    payload = {
+        "schema": "virustotal-investigation-summary.v1",
+        "relationships": {
+            "dropped_files": [{"id": child_hash, "type": "file"}],
+        },
+    }
+    raw = canonical_json_bytes(payload)
+    blob_id = uuid4()
+    fixture.proof_artifacts.store(blob_id, raw)
+    observation = EvidenceObservation(
+        investigation_id=investigation.id,
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="VirusTotal",
+        source_version="vt.relationship.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=parent_hash,
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    references = await fixture.service._trusted_vt_source_references(
+        investigation=investigation,
+        tool_name="vt.file_report",
+        arguments={"file_hash": child_hash},
+        envelope=fixture.envelope,
+    )
+    parameters = {
+        "file_hash": child_hash,
+        "_vt_external_effect_source_refs": [reference.to_json() for reference in references],
+    }
+
+    assert references == (
+        EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash),
+        EvidenceReference(
+            "evidence_observation",
+            str(observation.id),
+            observation.source_version,
+            observation.sha256,
+        ),
+    )
+    assert _source_refs_for_family("vt.file_report", parameters) == references
+    binding = virustotal_external_effect_family_bindings()["vt.file_report"]
+    request_path = f"/api/v3/files/{child_hash}"
+    prepared = PreparedExternalRequest.build(
+        family="vt.file_report",
+        provider="vt",
+        provider_scope="default",
+        normalizer_version=next(iter(binding.normalizer_versions)),
+        canonical_request={"path": request_path},
+        application_request=FrozenWireRequest(
+            method=b"GET",
+            target=request_path.encode(),
+            headers=((b"accept", b"application/json"),),
+            body=b"",
+        ),
+        evidence_refs=references,
+    )
+    claim_store = SqlAlchemyExternalEffectClaimStore(
+        lambda: None, family_bindings={"vt.file_report": binding}
+    )
+    claim_store._validate_family_source_refs(
+        binding,
+        SimpleNamespace(normalized_parameters=parameters),
+        prepared,
+    )
+
+
+@pytest.mark.asyncio
+async def test_vt_preconsume_refusal_exposes_framework_reason_to_operator() -> None:
+    (
+        _fixture,
+        state,
+        registry,
+        _summaries,
+        operator_service,
+        _tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+
+    refusal_calls: list[str] = []
+
+    class _RefusedVirusTotal:
+        async def file_report(self, _file_hash: str):
+            refusal_calls.append(_file_hash)
+            raise VirusTotalExternalEffectRefusedError(
+                "The synthetic coordinator refused before send.",
+                code="virustotal_external_effect_refused_trusted_source_reference_resolution_failed",
+                framework_no_send_proof=FrameworkNoSendProof(
+                    "PRE_CONSUME", "trusted_source_reference_resolution_failed"
+                ),
+            )
+
+    adapter = _FileReportAdapter(
+        name="vt.file_report",
+        virustotal=_RefusedVirusTotal(),
+        observations=None,
+        recorder=None,
+        max_pages=1,
+        page_size=10,
+        max_results=10,
+        max_tool_seconds=30,
+        reserved_vt_units=1,
+    )
+    _authorize_framework_refusal_proof_adapter(adapter)
+    registered_tool = registry.get("vt.file_report", "1")
+    assert registered_tool is not None
+    definition, _previous_adapter = registered_tool
+    registry.unregister("vt.file_report", "1")
+    registry.register(definition, adapter)
+
+    result = await operator_service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"file_hash": _identifiers["sample_rows"][0]["sha256"]},
+        purpose="Read a synthetic VT file report.",
+        expected_version=state.version,
+        idempotency_key="vt-preconsume-source-refusal",
+    )
+
+    assert refusal_calls == [_identifiers["sample_rows"][0]["sha256"]]
+    assert result.invocation.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "trusted_source_reference_resolution_failed"
+    assert result.output["error"]["code"] == "trusted_source_reference_resolution_failed"
+    assert result.output["error"]["detail_code"] == "trusted_source_reference_resolution_failed"
+    assert "source references" in result.output["error"]["correction"].casefold()
+    assert (
+        result.output["data"]["result"]["detail_code"]
+        == "trusted_source_reference_resolution_failed"
+    )
 
 
 @pytest.mark.asyncio

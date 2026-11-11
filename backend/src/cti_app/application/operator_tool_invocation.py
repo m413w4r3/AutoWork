@@ -2185,10 +2185,18 @@ class OperatorToolInvocationService:
                 output["error"]["detail_code"] = detail_code
             result_output = tool_result.output if tool_result is not None else {}
             diagnostic_code = result_output.get("detail_code")
+            framework_pre_send_refusal = (
+                tool_result is not None
+                and tool_result.framework_pre_submission_proof
+                is FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+            )
             if (
                 invocation.tool_name.startswith("vt.")
                 and isinstance(diagnostic_code, str)
-                and diagnostic_code in _VT_SOURCE_DISCLOSURE_DETAIL_CODES
+                and (
+                    diagnostic_code in _VT_SOURCE_DISCLOSURE_DETAIL_CODES
+                    or framework_pre_send_refusal
+                )
                 and diagnostic_code == safe_nested_error_code
             ):
                 result_data = {
