@@ -3192,6 +3192,125 @@ async def test_human_g2_vt_read_permits_acquired_sample_external_llm_flag(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "include_observation", "payload_contains_child", "expected_allowed"),
+    [
+        ("relationship_payload_anchors_child", True, True, True),
+        ("relationship_payload_omits_child", True, False, False),
+        ("arbitrary_hash_has_no_observation", False, False, False),
+    ],
+)
+async def test_human_g2_vt_child_hash_requires_canonical_relationship_payload(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    case: str,
+    include_observation: bool,
+    payload_contains_child: bool,
+    expected_allowed: bool,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=f"vt-child-{case}-{uuid4().hex[:8]}"
+    )
+    authority, base = authorities[0]
+    child_hash = "c" * 64
+    parent_hash = "b" * 64
+    observation_id = uuid4()
+    payload = {
+        "schema": "virustotal-investigation-summary.v1",
+        "relationships": {
+            "dropped_files": [
+                {
+                    "id": child_hash if payload_contains_child else "d" * 64,
+                    "type": "file",
+                }
+            ]
+        },
+    }
+    raw = canonical_json_bytes(payload)
+    blob_sha256 = hashlib.sha256(raw).hexdigest()
+    descriptor = BlobDescriptor(
+        sha256=blob_sha256,
+        size=len(raw),
+        mime_type="application/json",
+        logical_bucket="evidence",
+    )
+    blob_store = _MemoryBlobStore()
+    blob_store.add(descriptor, raw)
+    blob_id = uuid4()
+    observation_version = "vt.relationship.v1"
+    observation_reference = EvidenceReference(
+        "evidence_observation", str(observation_id), observation_version, blob_sha256
+    )
+    evidence_refs = [
+        EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash)
+    ]
+    try:
+        if include_observation:
+            async with session_factory() as session:
+                async with session.begin():
+                    session.add(
+                        BlobRow(
+                            id=blob_id,
+                            sha256=descriptor.sha256,
+                            size=descriptor.size,
+                            mime_type=descriptor.mime_type,
+                            logical_bucket=descriptor.logical_bucket,
+                            object_key=descriptor.object_key,
+                            created_at=datetime.now(UTC),
+                        )
+                    )
+                    session.add(
+                        EvidenceObservationRow(
+                            id=observation_id,
+                            investigation_id=investigation_id,
+                            kind="vt_relationship",
+                            blob_id=blob_id,
+                            sha256=blob_sha256,
+                            source="VirusTotal",
+                            source_version=observation_version,
+                            observed_at=datetime.now(UTC),
+                            object_type="file",
+                            object_id=parent_hash,
+                            limitations=[],
+                            invocation_ref=None,
+                        )
+                    )
+            evidence_refs.append(observation_reference)
+
+        request_path = f"/api/v3/files/{child_hash}"
+        prepared = PreparedExternalRequest.build(
+            family="vt.file_report",
+            provider=base.provider,
+            provider_scope=base.provider_scope,
+            normalizer_version=base.normalizer_version,
+            canonical_request={"path": request_path},
+            application_request=FrozenWireRequest(
+                method=b"GET",
+                target=request_path.encode(),
+                headers=((b"accept", b"application/json"),),
+                body=b"",
+            ),
+            evidence_refs=tuple(evidence_refs),
+        )
+        async with session_factory() as session:
+            async with session.begin():
+                allowed = await SqlAlchemyVirusTotalPolicyGuard(
+                    blob_store=blob_store
+                ).authorize_source_disclosure(
+                    ConsumePolicyContext(
+                        authority=authority,
+                        prepared=prepared,
+                        effect_key=effect_key(investigation_id, prepared),
+                        database_session=session,
+                        investigation_subject_id=subject_id,
+                    )
+                )
+        assert allowed is expected_allowed
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("external_llm_allowed", [True, False])
 @pytest.mark.parametrize(
     "reference_kind",

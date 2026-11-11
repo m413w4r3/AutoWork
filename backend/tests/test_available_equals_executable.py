@@ -56,7 +56,11 @@ from cti_app.application.operator_tool_invocation import (
 from cti_app.application.research_context_builder import blocked_capabilities_from_history
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import SourceDocument
-from cti_app.domain.external_effects import EvidenceReference, invocation_arguments_digest
+from cti_app.domain.external_effects import (
+    EvidenceReference,
+    canonical_json_bytes,
+    invocation_arguments_digest,
+)
 from cti_app.domain.investigation import (
     BudgetDimension,
     EnvelopeAuthorityKind,
@@ -76,7 +80,12 @@ from cti_app.domain.investigation import (
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
     _source_refs_for_family,
 )
-from tests.test_investigation_service import _enable_osint_vt_hash_reads, _Fixture
+from tests.test_investigation_service import (
+    InMemorySampleAssociationRepository,
+    _DownloadSampleRepository,
+    _enable_osint_vt_hash_reads,
+    _Fixture,
+)
 
 
 def test_dotnet_field_data_tool_is_composed_under_the_existing_dotnet_capability() -> None:
@@ -1046,6 +1055,98 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
     assert "canonical VT relationship payload" in result_data["correction"]
     assert refused.output["error"]["reason"] == result_data["correction"]
     assert len(tools["vt.download_sample"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_relationship_grounded_child_download_is_available_and_executable() -> None:
+    (
+        fixture,
+        state,
+        registry,
+        _summaries,
+        operator_service,
+        tools,
+        _identifiers,
+    ) = await _seeded_fixture()
+    definition, adapter = _schema_tool(
+        "vt.download_sample",
+        VT_DOWNLOAD_SAMPLE_SCHEMA,
+        ToolEffect.ACQUIRE,
+        VT_FILE_DOWNLOAD_CAPABILITY,
+    )
+    definition = replace(
+        definition,
+        cost_model={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+    )
+    registry.register(definition, adapter)
+    tools["vt.download_sample"] = adapter
+    capabilities = frozenset((*fixture.available_capabilities, VT_FILE_DOWNLOAD_CAPABILITY))
+    fixture.available_capabilities = capabilities
+    fixture.service._available_capabilities = capabilities
+    operator_service._available_capabilities = capabilities
+
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    envelope = replace(envelope, acquire_hits_allowed=True)
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    fixture.service._samples = _DownloadSampleRepository()
+
+    child_hash = "c" * 64
+    parent_hash = "b" * 64
+    payload = {
+        "schema": "virustotal-investigation-summary.v1",
+        "descriptors": [{"id": child_hash, "type": "file"}],
+    }
+    raw = canonical_json_bytes(payload)
+    blob_id = uuid4()
+    fixture.proof_artifacts.store(blob_id, raw)
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="VirusTotal",
+        source_version="vt.relationship.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id=parent_hash,
+    )
+    await fixture.observations.append_if_absent(observation)
+
+    context = await _build_context(fixture, state, registry)
+    assert "vt.download_sample" in {tool.name for tool in context.available_tools}
+    result = await operator_service.invoke(
+        tool_name="vt.download_sample",
+        schema_version="1",
+        arguments={
+            "sha256": child_hash,
+            "purpose": "Acquire a synthetic relationship-grounded child.",
+            "evidence_refs": [],
+        },
+        purpose="Acquire a synthetic relationship-grounded child.",
+        expected_version=state.version,
+        idempotency_key="relationship-grounded-vt-download",
+    )
+
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    source_refs = result.invocation.normalized_parameters[
+        "_vt_external_effect_source_refs"
+    ]
+    assert [reference["kind"] for reference in source_refs] == [
+        "sample_hash",
+        "evidence_observation",
+    ]
+    assert source_refs[0]["id"] == child_hash
+    assert source_refs[1]["id"] == str(observation.id)
+    assert tools["vt.download_sample"].calls == [
+        {
+            "sha256": child_hash,
+            "purpose": "Acquire a synthetic relationship-grounded child.",
+            "evidence_refs": [],
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -99,6 +99,12 @@ from cti_app.application.virustotal import (
     VirusTotalInvalidInputError,
     normalize_file_hash,
 )
+from cti_app.application.virustotal_evidence import (
+    MAX_VT_CANONICAL_EVIDENCE_BYTES,
+    canonical_vt_evidence_payload,
+    nested_vt_evidence_strings,
+    vt_hash_payload_contains,
+)
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
@@ -221,9 +227,10 @@ _RECONCILIATION_INTERPRETATIONS = {
 _VT_HASH_READ_TOOLS = frozenset(
     {"vt.file_report", "vt.relationships", "vt.behaviour", "vt.behaviour_pcap"}
 )
+_VT_RELATIONSHIP_HASH_GROUNDING_TOOLS = _VT_HASH_READ_TOOLS | {"vt.download_sample"}
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 _MAX_VT_SOURCE_REFERENCES = 16
-_MAX_VT_OBJECT_GROUNDING_BYTES = 4 * 1024 * 1024
+_MAX_VT_OBJECT_GROUNDING_BYTES = MAX_VT_CANONICAL_EVIDENCE_BYTES
 _VT_OBJECT_GROUNDING_EVIDENCE_KINDS = frozenset(
     {
         EvidenceKind.BINARY_ANALYSIS,
@@ -330,28 +337,7 @@ def _vt_object_payload_contains(
         boundary + re.escape(normalized_object_id) + trailing_boundary,
         re.IGNORECASE,
     )
-    return any(pattern.search(value) is not None for value in _nested_evidence_strings(payload))
-
-
-def _nested_evidence_strings(value: object) -> Iterable[str]:
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, Mapping):
-        for key, nested in value.items():
-            if isinstance(key, str):
-                yield key
-            yield from _nested_evidence_strings(nested)
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for nested in value:
-            yield from _nested_evidence_strings(nested)
-
-
-def _vt_hash_payload_contains(payload: object, normalized_sha256: str) -> bool:
-    pattern = re.compile(
-        r"(?<![A-Za-z0-9_])" + re.escape(normalized_sha256) + r"(?![A-Za-z0-9_])",
-        re.IGNORECASE,
-    )
-    return any(pattern.search(value) is not None for value in _nested_evidence_strings(payload))
+    return any(pattern.search(value) is not None for value in nested_vt_evidence_strings(payload))
 
 
 class _BudgetSnapshotPersistenceError(RuntimeError):
@@ -2603,8 +2589,10 @@ class InvestigationService:
                     if (
                         sample_hashes
                         and sample_hash not in sample_hashes
-                        and family in _VT_HASH_READ_TOOLS
+                        and family in _VT_RELATIONSHIP_HASH_GROUNDING_TOOLS
                         and observation.kind is EvidenceKind.VT_RELATIONSHIP
+                        and observation.source.casefold() == "virustotal"
+                        and object_type == "file"
                     ):
                         for target_hash in sample_hashes:
                             if await self._canonical_evidence_contains_vt_hash(
@@ -2888,6 +2876,8 @@ class InvestigationService:
                 relationship_payload_match = (
                     not exact_anchor
                     and item.kind is EvidenceKind.VT_RELATIONSHIP
+                    and item.source.casefold() == "virustotal"
+                    and item.object_type.casefold() == "file"
                     and await self._canonical_evidence_contains_vt_hash(item, normalized_hash)
                 )
                 if exact_anchor or relationship_payload_match:
@@ -3083,7 +3073,7 @@ class InvestigationService:
         self, observation: EvidenceObservation, normalized_sha256: str
     ) -> bool:
         payload = await self._canonical_evidence_payload(observation)
-        return payload is not None and _vt_hash_payload_contains(payload, normalized_sha256)
+        return payload is not None and vt_hash_payload_contains(payload, normalized_sha256)
 
     async def _canonical_evidence_payload(
         self, observation: EvidenceObservation
@@ -3096,14 +3086,9 @@ class InvestigationService:
                 observation.blob_id,
                 max_bytes=_MAX_VT_OBJECT_GROUNDING_BYTES,
             )
-            if not isinstance(raw, bytes) or hashlib.sha256(raw).hexdigest() != observation.sha256:
-                return None
-            payload = json.loads(raw)
-            if not isinstance(payload, dict) or canonical_json_bytes(payload) != raw:
-                return None
+            return canonical_vt_evidence_payload(raw, observation.sha256)
         except Exception:
             return None
-        return payload
 
     async def _osint_open_vt_hash_reads_allowed(
         self,
