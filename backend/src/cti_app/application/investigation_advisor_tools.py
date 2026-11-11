@@ -889,9 +889,9 @@ class InvestigationAdvisorTool:
             optional_field_consultations = {
                 "opinion_id": {"review_text"},
                 "opinion_version": {"review_text"},
-                "form": {"review_text"},
-                "anchor": {"review_text"},
-                "block_type": {"review_text"},
+                "form": {"draft_text", "review_text"},
+                "anchor": {"draft_text", "review_text"},
+                "block_type": {"draft_text", "review_text"},
                 "assertions": {"draft_text"},
                 "finding_refs": {"figure_plan"},
             }
@@ -915,6 +915,42 @@ class InvestigationAdvisorTool:
                         {"field": "form", "reason": "analyst_note_anchor_missing"},
                     )
                     arguments.pop("form", None)
+            if consultation_type == "draft_text":
+                target_fields = tuple(
+                    field for field in ("block_type", "form", "anchor") if field in arguments
+                )
+                raw_units = arguments.get("units")
+                if target_fields and isinstance(raw_units, (tuple, list)) and raw_units:
+                    for field in target_fields:
+                        self._append_ignored_advisor_input(
+                            context.idempotency_key,
+                            {"field": field, "reason": "units_target_takes_precedence"},
+                        )
+                        arguments.pop(field, None)
+                elif target_fields:
+                    if "units" in arguments:
+                        self._append_ignored_advisor_input(
+                            context.idempotency_key,
+                            {"field": "units", "reason": "invalid_optional_units_ignored"},
+                        )
+                        arguments.pop("units", None)
+                    block_type = arguments.get("block_type")
+                    if not isinstance(block_type, str):
+                        raise _AdvisorInputValidationError("editorial_unit_target_invalid")
+                    anchor = arguments.get("anchor")
+                    target = {
+                        "id": "U1",
+                        "block_type": block_type,
+                        "form": arguments.get(
+                            "form", "analyst_note" if anchor is not None else "body"
+                        ),
+                        "anchor": anchor,
+                    }
+                    if "assertions" in arguments:
+                        target["assertions"] = arguments.pop("assertions")
+                    arguments["units"] = [target]
+                    for field in target_fields:
+                        arguments.pop(field, None)
             if "units" in arguments:
                 raw_units = arguments.get("units")
                 if consultation_type not in {"draft_text", "review_text"}:
@@ -8309,14 +8345,34 @@ def register_investigation_advisor_tool(
                     },
                     "opinion_id": {},
                     "opinion_version": {},
-                    "form": {},
-                    "anchor": {},
-                    "block_type": {},
+                    "form": {
+                        "description": (
+                            "Draft target form: body or analyst_note. For one draft_text target, "
+                            "analyst_note is inferred when anchor is supplied."
+                        )
+                    },
+                    "anchor": {
+                        "description": (
+                            "Exact target anchor for one draft_text analyst_note block. For "
+                            "multiple targets, provide anchors inside units."
+                        )
+                    },
+                    "block_type": {
+                        "description": (
+                            "Target block type for one draft_text block. For multiple targets, "
+                            "provide block types inside units."
+                        )
+                    },
                     "assertions": {
                         "additionalProperties": True,
                         "items": {"additionalProperties": True},
                     },
                     "units": {
+                        "description": (
+                            "Explicit editorial targets for draft_text and review_text. Each "
+                            "unit supplies id, block_type, form and anchor; use units for "
+                            "multiple draft targets."
+                        ),
                         "additionalProperties": True,
                         "items": {"additionalProperties": True},
                     },

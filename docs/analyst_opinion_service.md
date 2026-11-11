@@ -68,3 +68,34 @@ identiques réutilisent la version ou l'artefact déjà produit. Codes d'erreur
 principaux : `stale_version`, `version_hash_mismatch`, `citations_invalid`,
 `tlp_forbidden`, `do_not_submit`, `stale_base` et
 `opinion_not_approved`.
+
+## Saisie des outils opérateur
+
+- `opinion.compose` et `opinion.revise` acceptent `protocol_figures` seulement
+  avec le `protocol_model_blob_id` et l'`observation_ref` exacts renvoyés par
+  `network.protocol.render`. L'observation doit appartenir à la même enquête,
+  porter la version de rendu courante et contenir un payload dont le SHA-256 et
+  l'identité versionnée correspondent au modèle et aux trois vues. Le hash de
+  l'observation couvre le JSON complet enregistré; il est distinct du hash
+  canonique du résultat de rendu.
+- Pour attribuer un bloc à Bridge, `bridge_draft_ref.invocation_id` reprend le
+  `bridge_invocation_id` de l'appel `advisor.consult` `draft_text`, et
+  `text_sha256` est le SHA-256 du texte final exact du bloc encodé en UTF-8. La
+  consultation persistée doit appartenir à la même enquête et ses provenance,
+  observation et hash doivent être vérifiés. Le bloc de sortie doit être
+  utilisable et correspondre au même `block_type`; pour une note, son `form`
+  et son `anchor` doivent aussi correspondre. Un résultat partiellement analysé
+  reste admissible si ce bloc précis est utilisable.
+- Si le texte a été adapté après la réponse Bridge, fournissez également
+  `source_text_sha256`, calculé sur les phrases du bloc source réunies avec un
+  espace, puis encodées en UTF-8, et `source_observation_id`, égal à
+  l'`observation_ref` de la consultation. `text_sha256` continue de désigner
+  le texte final. Pour demander un seul bloc précis à `advisor.consult`, les
+  champs de cible `block_type`, `form` et `anchor` sont acceptés; pour plusieurs
+  blocs, fournissez-les dans `units` avec un identifiant `U1`, `U2`, etc.
+- `opinion.note.anchor` doit être copié exactement depuis les ancres de
+  paragraphes de l'article courant. Les formes sont `lead:0001` et
+  `section:<index_de_section_commençant_à_zéro>:paragraph:<paragraphe_sur_4_chiffres>`;
+  par exemple `section:5:paragraph:0007`. L'ancre doit exister dans le snapshot
+  courant. `S6P7.1` est une notation éditoriale, pas une ancre du contrat; de
+  même, `claim_verification` est un type de bloc, pas une ancre.
