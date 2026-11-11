@@ -140,9 +140,7 @@ def _unstructured_semantic_result(
     }
 
 
-def _suricata_rule_projection(
-    raw_text: str, opinion_texts: Sequence[str] = ()
-) -> dict[str, Any]:
+def _suricata_rule_projection(raw_text: str, opinion_texts: Sequence[str] = ()) -> dict[str, Any]:
     """Expose exact complete Suricata source slices without validating or promoting them."""
     sources: list[str] = []
     seen: set[str] = set()
@@ -649,11 +647,7 @@ def parse_advisor_semantic_response(
         result.update(
             _suricata_rule_projection(
                 safe_raw_text,
-                tuple(
-                    item["text"]
-                    for item in opinions
-                    if isinstance(item.get("text"), str)
-                ),
+                tuple(item["text"] for item in opinions if isinstance(item.get("text"), str)),
             )
         )
     if consultation_type == "review_text":

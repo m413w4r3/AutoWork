@@ -478,9 +478,15 @@ def _register_advisor(registry: InMemoryToolRegistry, fixture: _Fixture) -> None
 
 @pytest.mark.asyncio
 async def test_local_advisor_reparse_stays_executable_after_advisor_provider_refusal() -> None:
-    fixture, state, registry, _summaries, _operator_service, _tools, _identifiers = (
-        await _seeded_fixture()
-    )
+    (
+        fixture,
+        state,
+        registry,
+        _summaries,
+        _operator_service,
+        _tools,
+        _identifiers,
+    ) = await _seeded_fixture()
     capability = "advisor.reparse"
     capabilities = frozenset((*fixture.available_capabilities, capability))
     capabilities = frozenset((*capabilities, "bridge.advisor"))
