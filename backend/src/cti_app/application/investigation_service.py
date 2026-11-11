@@ -101,9 +101,10 @@ from cti_app.application.virustotal import (
 )
 from cti_app.application.virustotal_evidence import (
     MAX_VT_CANONICAL_EVIDENCE_BYTES,
+    VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES,
     canonical_vt_evidence_payload,
     nested_vt_evidence_strings,
-    vt_hash_payload_contains,
+    vt_observation_anchors_hash,
 )
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
@@ -227,7 +228,7 @@ _RECONCILIATION_INTERPRETATIONS = {
 _VT_HASH_READ_TOOLS = frozenset(
     {"vt.file_report", "vt.relationships", "vt.behaviour", "vt.behaviour_pcap"}
 )
-_VT_RELATIONSHIP_HASH_GROUNDING_TOOLS = _VT_HASH_READ_TOOLS | {"vt.download_sample"}
+_VT_RELATIONSHIP_HASH_GROUNDING_TOOLS = VT_RELATIONSHIP_HASH_GROUNDING_FAMILIES
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 _MAX_VT_SOURCE_REFERENCES = 16
 _MAX_VT_OBJECT_GROUNDING_BYTES = MAX_VT_CANONICAL_EVIDENCE_BYTES
@@ -1678,6 +1679,7 @@ class InvestigationService:
         independent_local_effect = uses_nonblocking_local_freshness(tool_name, definition)
         invocation_parameters: Mapping[str, Any] = arguments
         external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
+        vt_observation_payload_cache: dict[tuple[UUID, str], bytes | None] = {}
         if tool_name in _VT_COORDINATED_READ_TOOLS:
             if existing is not None:
                 invocation_parameters = existing.normalized_parameters
@@ -1693,6 +1695,7 @@ class InvestigationService:
                         tool_name="vt.file_report",
                         arguments={"file_hash": arguments.get("sha256")},
                         envelope=envelope,
+                        canonical_payload_cache=vt_observation_payload_cache,
                     )
                 else:
                     external_effect_evidence_refs = await self._trusted_vt_source_references(
@@ -1700,6 +1703,7 @@ class InvestigationService:
                         tool_name=tool_name,
                         arguments=arguments,
                         envelope=envelope,
+                        canonical_payload_cache=vt_observation_payload_cache,
                     )
                 invocation_parameters = {
                     **arguments,
@@ -2088,6 +2092,7 @@ class InvestigationService:
                     tool_name,
                     envelope=current_envelope,
                     rejection_detail=rejection_detail,
+                    canonical_payload_cache=vt_observation_payload_cache,
                 ):
                     if rejection_detail:
                         pre_submission_refusal = rejection_detail[0]
@@ -2512,6 +2517,7 @@ class InvestigationService:
         *,
         envelope: InvestigationEnvelope | None = None,
         rejection_detail: list[_VTSourceDisclosureRefusal] | None = None,
+        canonical_payload_cache: dict[tuple[UUID, str], bytes | None] | None = None,
     ) -> bool:
         sample_hashes = {
             reference.id.casefold() for reference in references if reference.kind == "sample_hash"
@@ -2586,17 +2592,12 @@ class InvestigationService:
                     )
                 if len(sample_hash) == 64:
                     relationship_targets: set[str] = set()
-                    if (
-                        sample_hashes
-                        and sample_hash not in sample_hashes
-                        and family in _VT_RELATIONSHIP_HASH_GROUNDING_TOOLS
-                        and observation.kind is EvidenceKind.VT_RELATIONSHIP
-                        and observation.source.casefold() == "virustotal"
-                        and object_type == "file"
-                    ):
+                    if family in _VT_RELATIONSHIP_HASH_GROUNDING_TOOLS:
                         for target_hash in sample_hashes:
                             if await self._canonical_evidence_contains_vt_hash(
-                                observation, target_hash
+                                observation,
+                                target_hash,
+                                canonical_payload_cache=canonical_payload_cache,
                             ):
                                 relationship_targets.add(target_hash)
                     if relationship_targets:
@@ -2776,6 +2777,7 @@ class InvestigationService:
         tool_name: str,
         arguments: Mapping[str, Any],
         envelope: InvestigationEnvelope | None = None,
+        canonical_payload_cache: dict[tuple[UUID, str], bytes | None] | None = None,
     ) -> tuple[EvidenceReference, ...]:
         """Resolve VT source refs from current-investigation evidence, never caller claims."""
         hash_value: Any = None
@@ -2868,19 +2870,11 @@ class InvestigationService:
             for item in observations:
                 if item.investigation_id != investigation.id:
                     continue
-                exact_anchor = (
-                    item.object_type.casefold()
-                    in {"sample", "file", "sample_observation", "sha256"}
-                    and item.object_id.casefold() == normalized_hash
-                )
-                relationship_payload_match = (
-                    not exact_anchor
-                    and item.kind is EvidenceKind.VT_RELATIONSHIP
-                    and item.source.casefold() == "virustotal"
-                    and item.object_type.casefold() == "file"
-                    and await self._canonical_evidence_contains_vt_hash(item, normalized_hash)
-                )
-                if exact_anchor or relationship_payload_match:
+                if await self._canonical_evidence_contains_vt_hash(
+                    item,
+                    normalized_hash,
+                    canonical_payload_cache=canonical_payload_cache,
+                ):
                     matching_observation_items.append(item)
             matching_observations = tuple(matching_observation_items)
             observation_refs = tuple(
@@ -3070,10 +3064,57 @@ class InvestigationService:
         )
 
     async def _canonical_evidence_contains_vt_hash(
-        self, observation: EvidenceObservation, normalized_sha256: str
+        self,
+        observation: EvidenceObservation,
+        normalized_sha256: str,
+        *,
+        canonical_payload_cache: dict[tuple[UUID, str], bytes | None] | None = None,
     ) -> bool:
-        payload = await self._canonical_evidence_payload(observation)
-        return payload is not None and vt_hash_payload_contains(payload, normalized_sha256)
+        if vt_observation_anchors_hash(
+            observation_kind=observation.kind,
+            observation_source=observation.source,
+            object_type=observation.object_type,
+            object_id=observation.object_id,
+            requested_hash=normalized_sha256,
+        ):
+            return True
+        if len(normalized_sha256) != 64:
+            return False
+        raw = await self._canonical_evidence_bytes(observation, canonical_payload_cache)
+        return vt_observation_anchors_hash(
+            observation_kind=observation.kind,
+            observation_source=observation.source,
+            object_type=observation.object_type,
+            object_id=observation.object_id,
+            requested_hash=normalized_sha256,
+            canonical_payload_bytes=raw,
+            canonical_payload_sha256=observation.sha256,
+        )
+
+    async def _canonical_evidence_bytes(
+        self,
+        observation: EvidenceObservation,
+        cache: dict[tuple[UUID, str], bytes | None] | None,
+    ) -> bytes | None:
+        cache_key = (observation.id, observation.sha256)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+        reader = getattr(self._artifact_store, "read_bytes", None)
+        if not callable(reader):
+            if cache is not None:
+                cache[cache_key] = None
+            return None
+        try:
+            raw = await reader(
+                observation.blob_id,
+                max_bytes=MAX_VT_CANONICAL_EVIDENCE_BYTES,
+            )
+            result = raw if isinstance(raw, bytes) else None
+        except Exception:
+            result = None
+        if cache is not None:
+            cache[cache_key] = result
+        return result
 
     async def _canonical_evidence_payload(
         self, observation: EvidenceObservation
