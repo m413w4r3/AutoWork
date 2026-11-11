@@ -1131,9 +1131,7 @@ async def test_relationship_grounded_child_download_is_available_and_executable(
     )
 
     assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
-    source_refs = result.invocation.normalized_parameters[
-        "_vt_external_effect_source_refs"
-    ]
+    source_refs = result.invocation.normalized_parameters["_vt_external_effect_source_refs"]
     assert [reference["kind"] for reference in source_refs] == [
         "sample_hash",
         "evidence_observation",

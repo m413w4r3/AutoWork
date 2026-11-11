@@ -13,9 +13,7 @@ from cti_app.domain.investigation import canonical_json_bytes
 MAX_VT_CANONICAL_EVIDENCE_BYTES = 4 * 1024 * 1024
 
 
-def canonical_vt_evidence_payload(
-    raw: bytes, expected_sha256: str
-) -> dict[str, Any] | None:
+def canonical_vt_evidence_payload(raw: bytes, expected_sha256: str) -> dict[str, Any] | None:
     if (
         not isinstance(raw, bytes)
         or len(raw) > MAX_VT_CANONICAL_EVIDENCE_BYTES
@@ -49,6 +47,4 @@ def vt_hash_payload_contains(payload: object, normalized_sha256: str) -> bool:
         r"(?<![A-Za-z0-9_])" + re.escape(normalized_sha256) + r"(?![A-Za-z0-9_])",
         re.IGNORECASE,
     )
-    return any(
-        pattern.search(value) is not None for value in nested_vt_evidence_strings(payload)
-    )
+    return any(pattern.search(value) is not None for value in nested_vt_evidence_strings(payload))

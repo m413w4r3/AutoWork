@@ -3208,8 +3208,9 @@ async def test_human_g2_vt_child_hash_requires_canonical_relationship_payload(
     payload_contains_child: bool,
     expected_allowed: bool,
 ) -> None:
+    case_slug = case.replace("_", "-")
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
-        migrated_postgres_url, tmp_path, suffix=f"vt-child-{case}-{uuid4().hex[:8]}"
+        migrated_postgres_url, tmp_path, suffix=f"vt-child-{case_slug}-{uuid4().hex[:8]}"
     )
     authority, base = authorities[0]
     child_hash = "c" * 64
@@ -3241,9 +3242,7 @@ async def test_human_g2_vt_child_hash_requires_canonical_relationship_payload(
     observation_reference = EvidenceReference(
         "evidence_observation", str(observation_id), observation_version, blob_sha256
     )
-    evidence_refs = [
-        EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash)
-    ]
+    evidence_refs = [EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash)]
     try:
         if include_observation:
             async with session_factory() as session:

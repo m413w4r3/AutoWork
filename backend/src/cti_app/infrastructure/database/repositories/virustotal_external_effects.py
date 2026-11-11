@@ -262,9 +262,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
         if self._blob_store is None:
             return False
         blob = await session.scalar(
-            select(BlobRow)
-            .where(BlobRow.id == observation.blob_id)
-            .with_for_update()
+            select(BlobRow).where(BlobRow.id == observation.blob_id).with_for_update()
         )
         if (
             blob is None
@@ -279,9 +277,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 mime_type=blob.mime_type,
                 logical_bucket=blob.logical_bucket,
             )
-            raw = await self._blob_store.read(
-                descriptor, max_bytes=MAX_VT_CANONICAL_EVIDENCE_BYTES
-            )
+            raw = await self._blob_store.read(descriptor, max_bytes=MAX_VT_CANONICAL_EVIDENCE_BYTES)
         except Exception:
             return False
         payload = canonical_vt_evidence_payload(raw, observation.sha256)

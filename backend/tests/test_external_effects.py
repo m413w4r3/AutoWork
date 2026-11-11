@@ -3038,9 +3038,7 @@ async def test_vt_policy_guard_uses_canonical_relationship_payload_for_requested
     observation_reference = EvidenceReference(
         "evidence_observation", str(observation_id), "vt.relationship.v1", observation_sha256
     )
-    sample_reference = EvidenceReference(
-        "sample_hash", child_hash, "sample-hash.v1", child_hash
-    )
+    sample_reference = EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash)
 
     class _BlobStore:
         async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
@@ -3162,9 +3160,7 @@ async def test_vt_policy_guard_keeps_exact_parent_observation_and_rejects_unanch
         )
 
     assert await authorize(parent_hash, (sample_reference, observation_reference), include=True)
-    arbitrary_reference = EvidenceReference(
-        "sample_hash", child_hash, "sample-hash.v1", child_hash
-    )
+    arbitrary_reference = EvidenceReference("sample_hash", child_hash, "sample-hash.v1", child_hash)
     assert not await authorize(child_hash, (arbitrary_reference,), include=False)
 
 

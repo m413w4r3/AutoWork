@@ -1585,7 +1585,7 @@ async def test_trusted_vt_file_report_refs_resolve_hash_from_relationship_payloa
         source="VirusTotal",
         source_version="vt.relationship.v1",
         observed_at=datetime.now(UTC),
-        object_type="sha256",
+        object_type="file",
         object_id=parent_hash,
     )
     await fixture.observations.append_if_absent(observation)
