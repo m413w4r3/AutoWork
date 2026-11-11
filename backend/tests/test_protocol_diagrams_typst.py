@@ -805,7 +805,8 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     assert "1.1 apports de l'analyse" in extracted_text
     assert extracted_text.count("article_documented") == 0
     assert extracted_text.count("niveau de preuve") == 3
-    assert extracted_text.count("documenté, non observé") == 3
+    # One occurrence in each figure caption (evidence caveat) plus one in each colour legend.
+    assert extracted_text.count("documenté, non observé") == 6
     assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted_text
     assert all(
         title in extracted_text
@@ -880,7 +881,8 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         lowered = pdf_text.casefold()
         expected_proof_levels = 3
         assert pdf_text.count("Niveau de preuve") == expected_proof_levels
-        assert pdf_text.casefold().count("documenté, non observé") == expected_proof_levels
+        # Evidence caveat in each figure caption plus the colour legend of each figure.
+        assert pdf_text.casefold().count("documenté, non observé") == 2 * expected_proof_levels
         assert "ARTICLE_DOCUMENTED" not in pdf_text
         assert "offsets et valeurs d'octets inconnus" in lowered
         assert all(

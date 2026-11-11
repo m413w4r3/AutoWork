@@ -2119,7 +2119,7 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     annex_start = normalized_text.index("ANNEXE DE TRAÇABILITÉ")
     narrative_text = normalized_text[:annex_start]
     annex_text = normalized_text[annex_start:]
-    assert "FINDINGS LOGIQUES CITÉS" in annex_text
+    assert "CONSTATS LOGIQUES CITÉS" in annex_text
     forbidden_narrative_markers = (
         r"\bFinding\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
         r"\bÉvidence\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",

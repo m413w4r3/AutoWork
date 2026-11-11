@@ -812,7 +812,7 @@
   if original.len() > 0 [
     #v(8pt)
     #render-opinion-ioc-section(
-      "Indicateurs découverts dans cette analyse",
+      "IOC originaux",
       "Repérés dans les sources examinées pendant cette analyse et associés au sujet par l'extrait cité.",
       original,
       reference-scope: reference-scope,
