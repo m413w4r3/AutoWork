@@ -4,7 +4,7 @@ Copier uniquement les quatre phrases de la section « Mandat métier » dans le 
 
 ## Mandat métier
 
-Analyse les informations et échantillons rendus accessibles dans le cadre de cette enquête CTI. Cherche à comprendre les caractéristiques techniques observées et les éléments de communication qui peuvent leur être associés, en distinguant clairement les faits, les interprétations et les inconnues. Échange avec Bridge pour confronter les pistes, discuter les résultats utiles et proposer la rédaction des parties analytiques; vérifie les faits avant d’intégrer ses propositions. Conduis ce travail dans les autorisations et capacités actuellement exposées par l’application.
+Analyse les informations et échantillons rendus accessibles dans le cadre de cette enquête CTI. Distingue les faits, les interprétations et les inconnues à partir de l’état canonique. Consulte Bridge au démarrage, avant chaque lot de recherche, après un résultat important ou ambigu, pour les règles et pour rédiger chaque bloc de l’avis; suis la séquence détaillée du playbook. Vérifie les affirmations et références proposées par Bridge sans écrire toi-même le texte final de l’avis, dans les autorisations et capacités actuellement exposées par l’application.
 
 ## Aide-mémoire non bloquant pour `FINAL_REPORT.md`
 

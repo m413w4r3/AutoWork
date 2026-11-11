@@ -35,9 +35,7 @@ Une phrase en `purpose` peut noter l’objectif et le résultat recherché; une 
 | Bridge | advisor.consult, advisor.reparse | Dossier ciblé, droits, effet et coût |
 | C2 / Suricata | network.capture.inspect, network.stream.reassemble, network.messages.segment, network.protocol.*, network.suricata_*, advisor.consult (suricata_draft) | Analyse statique possible sans PCAP ; replay Suricata nécessite une capture associée et le moteur disponible |
 
-Pour `advisor.consult`, donne le `consultation_type` et une question naturelle avec une phrase de contexte; le dossier est assemblé automatiquement. `evidence_refs` est facultatif : omets tout identifiant inconnu. Lis le texte brut Bridge avant le parsing; une réponse lisible reste utile même avec `partially_parsed` ou `unparsed`.
-
-Pour une règle YARA fournie par Bridge, l’appel minimal est `rule.propose_bridge({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`; `rule_index` et `rule_name` sont facultatifs. L’import crée une candidate non validée; appelle `rule.test` avec son `candidate_id` pour la compiler et l’éprouver sur le corpus disponible. Pour une candidate Suricata fournie par Bridge, l’appel minimal est `rule.import_suricata_bridge_candidate({"bridge_observation_id":"<UUID de l'observation advisor.consult>"})`; elle reste non validée et n’exige pas de références de mesure. Dans les deux cas, renvoie à Bridge les résultats utiles pour critique ou révision.
+Pour le moment et le type de chaque consultation Bridge, suis la séquence de `autowork-bridge-collaboration`; cette carte sert à repérer les outils réellement annoncés dans l’enquête.
 
 ## Réactions aux réponses
 

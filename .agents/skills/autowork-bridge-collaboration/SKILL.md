@@ -1,22 +1,29 @@
 ---
 name: autowork-bridge-collaboration
-description: Collaborer librement avec Bridge pour cadrer, critiquer, tester et rédiger l’analyse CTI, sans quotas ni contrôle de forme entre échanges. Pour operator_led uniquement.
+description: Consulter Bridge aux étapes de chaque mission operator_led : cadrage, pivots VT, interprétation, règles YARA/Suricata et rédaction de chaque bloc de l’avis.
 ---
 
 # Bridge, partenaire de l’enquête
 
-Bridge propose et critique; l’opérateur vérifie les faits, réalise les tests disponibles et choisit la suite. Une réponse Bridge est un conseil, jamais une preuve. Une réponse partiellement parsée ou non parsée reste utile dès que son texte est lisible.
+Bridge conseille; l’opérateur vérifie les faits, réalise les tests disponibles et choisit la suite. Une réponse n’est ni une preuve ni un finding automatique. Une réponse partiellement parsée ou non parsée reste utile dès que son texte est lisible.
 
 ## Quand le consulter
 
-Déclencher les échanges par leur utilité, sans quota :
+Utilise cette séquence pour chaque mission :
 
-- Dès que l’article et l’inventaire initial sont disponibles, demander un cadrage (`plan_investigation`) avant d’approfondir l’analyse.
-- Après une découverte CTI importante, demander à Bridge (`plan_investigation`) ce qu’elle change et quelle vérification est utile.
-- Pendant la création ou la révision d’une règle YARA (`yara_draft`), pour choisir des pivots VT discriminants (`pivot_strategy`), et pour le protocole C2 (`plan_investigation` ou `suricata_draft`) quand ces sujets sont pertinents.
-- Pour rédiger **chaque section analytique** du rapport, demander `draft_text`; demander `review_text` ensuite si la relecture peut aider.
+| Moment | Consultation | Action |
+|---|---|---|
+| Début de mission | `plan_investigation` | Dès que l’article et l’inventaire initial sont disponibles, demande le cadrage à partir de l’état canonique courant avant d’approfondir l’analyse. |
+| Résultat important ou ambigu | `plan_investigation` | Après une découverte CTI importante ou un résultat ambigu, demande ce qui change et quelle vérification suit. |
+| Chaque lot VT / nouveaux échantillons | `pivot_strategy` | Avant chaque lot de pivots VT ou de recherche d’échantillons, demande les pivots VT discriminants pour la question de ce lot. |
+| Rétroconception | `plan_investigation` | Demande une interprétation critique de la configuration ou des variantes à partir des octets réellement observés. |
+| Règles YARA | `yara_draft` | Consulte avant d’écrire toute règle à la main; l’opérateur vérifie, affine et teste les candidates proposées. |
+| Protocole / réseau | `suricata_draft` | Consulte dès que la compréhension du protocole et les faits réseau observés justifient une candidate. |
+| Avis final | `draft_text` | Fais rédiger chaque section analytique et chaque bloc final de l’avis par Bridge; demande `review_text` si utile, rattache chaque bloc à `bridge_draft_ref` et n’écris aucun texte final comme opérateur. |
 
-Évite une question identique lorsque sa réponse est déjà disponible. Reviens vers Bridge quand un résultat nouveau permet une critique ou une réévaluation utile; les sujets distincts peuvent être abordés librement.
+Le budget de 500 tours ne limite pas le recours attendu à Bridge. Sérialise les appels `advisor.consult` : un à la fois; attends leur résultat (5–25 min) avant l’appel suivant et ne rends pas la main pendant l’attente. Ne pose pas une question identique sans élément nouveau.
+
+Dans le handoff, ajoute `CONSULTATIONS_BRIDGE` et liste chaque consultation avec son type, son objet et l’apport retenu ou écarté. Une mission d’analyse substantielle avec 0–2 consultations est incomplète.
 
 ## Poser la question
 
@@ -44,7 +51,7 @@ L’import est une candidate non validée et n’exige aucune référence de mes
 
 ## Rédiger le rapport
 
-Fais proposer par Bridge chaque section analytique avec `draft_text`. Demande `review_text` lorsque la relecture apporte quelque chose. L’opérateur vérifie les affirmations contre les observations, adapte le texte et l’intègre dans une prose naturelle. Les références non résolues n’empêchent pas la rédaction; conserve les faits incertains comme incertains. Le rapport final ne contient pas de marqueurs internes. Si Bridge est indisponible, n’attribue aucun texte à Bridge, marque la section incomplète et reprends la collaboration lorsqu’il redevient disponible.
+L’opérateur vérifie les affirmations de chaque brouillon contre les observations canoniques; conserve les faits incertains comme incertains et attribue chaque bloc à son `bridge_draft_ref`. Si Bridge est indisponible ou refusé par l’enveloppe, marque la section incomplète et reprends la collaboration lorsqu’il redevient disponible; ne remplace pas le brouillon par un texte final écrit par l’opérateur.
 
 Le `purpose` peut résumer librement une disposition utile. Cette trace structurée facultative est acceptée par le parseur, mais sa présence ou sa forme ne conditionne ni l’action ni l’échange suivant :
 

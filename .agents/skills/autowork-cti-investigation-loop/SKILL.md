@@ -9,7 +9,7 @@ Les observations versionnées font foi; Bridge conseille et peut proposer le tex
 
 ## Collaborer avec Bridge
 
-Charge `autowork-bridge-collaboration` dès le démarrage. Demande un cadrage naturel dès que l’article et l’inventaire initial sont disponibles, puis sollicite Bridge après une découverte importante, pour construire ou améliorer YARA, choisir des pivots VT discriminants, étudier le C2 quand pertinent et rédiger **chaque section analytique** avec `draft_text` (`review_text` si utile). Ces moments sont des déclencheurs, sans quota. Donne le contexte utile dans une phrase, lis le texte brut avant son état de parsing et agis sur chaque recommandation utile. Reviens avec les résultats lorsqu’ils peuvent changer l’analyse; évite une question identique dont la réponse est déjà disponible.
+Au début de chaque mission, demande `plan_investigation` à partir de l’état canonique; après une découverte importante ou ambiguë, consulte Bridge pour l’interpréter. Pour les pivots VT, les règles et chaque bloc final de l’avis, suis la séquence de `autowork-bridge-collaboration`.
 
 ## Boucle souple
 
