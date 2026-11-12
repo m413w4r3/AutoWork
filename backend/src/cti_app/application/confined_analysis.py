@@ -339,14 +339,9 @@ class ConfinedAnalysisRequest:
                 if has_offset:
                     if not _bounded_decimal(parameters["offset"], 0, 0xFFFFFFFFFFFFFFFF):
                         raise ValueError("strings option offset is invalid")
-                    if not _bounded_decimal(
-                        parameters["length"], 1, LOCAL_COMMAND_MAX_RANGE_BYTES
-                    ):
+                    if not _bounded_decimal(parameters["length"], 1, LOCAL_COMMAND_MAX_RANGE_BYTES):
                         raise ValueError("strings option length is invalid")
-                    if (
-                        int(parameters["offset"]) + int(parameters["length"])
-                        > 0xFFFFFFFFFFFFFFFF
-                    ):
+                    if int(parameters["offset"]) + int(parameters["length"]) > 0xFFFFFFFFFFFFFFFF:
                         raise ValueError("strings offset and length exceed the address limit")
             elif command_id == "readelf":
                 if set(parameters) != {"mode"} or parameters["mode"] not in {

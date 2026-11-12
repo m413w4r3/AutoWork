@@ -629,8 +629,7 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                 started=started,
                 reason="option_value_invalid",
                 message=(
-                    f"Invalid value for option '{option_name or 'unknown'}' "
-                    f"in {command_id.value}."
+                    f"Invalid value for option '{option_name or 'unknown'}' in {command_id.value}."
                 ),
                 sample_sha256=sample_sha256,
                 option_name=option_name,

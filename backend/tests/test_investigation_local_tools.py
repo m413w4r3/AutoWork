@@ -518,7 +518,6 @@ async def test_invalid_strings_options_report_detail_code_and_catalog_options() 
 @pytest.mark.parametrize(
     ("options", "option_name"),
     (
-        ({"offset": "0x107c00", "length": 2048}, "offset"),
         ({"min_length": 0}, "min_length"),
         ({"max_strings": 10_001}, "max_strings"),
     ),

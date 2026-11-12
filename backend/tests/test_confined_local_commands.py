@@ -405,9 +405,14 @@ async def test_real_catalogue_binaries_run_through_confined_dispatcher_worker(
 @pytest.mark.asyncio
 async def test_strings_options_reach_confined_execution_as_validated_parameters() -> None:
     sample_payload = b"MZ" + bytes(1_253_886)
-    service, investigation_id, sha256, _artifact_store, _harness, _marker = (
-        await _local_worker_fixture(sample_payload)
-    )
+    (
+        service,
+        investigation_id,
+        sha256,
+        _artifact_store,
+        _harness,
+        _marker,
+    ) = await _local_worker_fixture(sample_payload)
 
     class _RecordingExecution:
         available = True
