@@ -542,6 +542,7 @@ def _valid_archive_member_path(value: str) -> bool:
         not value
         or len(value) > 1024
         or value.startswith("/")
+        or value.startswith("-")
         or "\\" in value
         or ":" in value
         or any(ord(character) < 32 or ord(character) == 127 for character in value)

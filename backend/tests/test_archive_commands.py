@@ -374,7 +374,14 @@ def test_archive_preset_and_member_options_are_strictly_allowlisted() -> None:
         (),
         {"member_path": "bin/loader.dll", "expected_sha256": "a" * 64},
     )
-    for path in ("../loader.dll", "/loader.dll", "C:/loader.dll", "bin\\loader.dll", "a//b"):
+    for path in (
+        "../loader.dll",
+        "/loader.dll",
+        "C:/loader.dll",
+        "bin\\loader.dll",
+        "a//b",
+        "--evil",
+    ):
         with pytest.raises(ValueError, match="path"):
             validate_archive_tool_request(
                 ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
@@ -402,7 +409,7 @@ _SEVEN_Z_LISTING = (
 
 
 @pytest.mark.asyncio
-async def test_7z_extract_hash_streams_member_to_stdout_with_no_path_extraction(
+async def test_7z_extract_hash_rejects_unsafe_member_path_without_extracting(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     calls: list[list[str]] = []
@@ -436,13 +443,11 @@ async def test_7z_extract_hash_streams_member_to_stdout_with_no_path_extraction(
 
     assert report["archive_type"] == "zip"
     assert report["members"][0]["name"] == "../outside.dll"
-    assert report["members"][0]["sha256"] == hashlib.sha256(b"abcdef").hexdigest()
-    assert report["members"][0]["status"] == "hashed"
-    extract_argv = calls[1]
-    assert "-so" in extract_argv
-    assert "-spd" in extract_argv
-    assert "-pinfected" in extract_argv
-    assert extract_argv[-1] == "../outside.dll"
+    assert report["members"][0]["sha256"] is None
+    assert report["members"][0]["status"] == "invalid_member_name"
+    assert report["members"][0]["detail_code"] == "archive_member_path_invalid"
+    assert len(calls) == 1
+    assert "-pinfected" in calls[0]
     assert not any("outside.dll" in path.name for path in tmp_path.iterdir())
     assert list(tmp_path.iterdir()) == []
     assert requested_tempdirs == ["/tmp"]
@@ -487,6 +492,8 @@ async def test_7z_extract_member_returns_verified_bytes_without_writing_member(
     assert result["member_status"] == "extracted"
     assert result["_member_bytes"] == member
     assert result["member_sha256"] == hashlib.sha256(member).hexdigest()
+    assert len(calls) == 2
+    assert all(argv[0] == "/usr/bin/7z" for argv in calls)
     assert "-so" in calls[1] and "-spd" in calls[1]
     assert calls[1][-1] == "bin/loader.dll"
     assert list(tmp_path.iterdir()) == []
@@ -813,7 +820,207 @@ async def test_7z_extract_hash_reports_bad_crc_and_timeout_statuses(
 
 
 @pytest.mark.asyncio
-async def test_7z_extract_hash_reports_codec_failure_method_and_redacted_stderr(
+async def test_7z_rar_codec_failure_uses_bsdtar_for_extract_hash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    member = b"data"
+    listing = (
+        "Path = sample.bin\nType = Rar\nPhysical Size = 100\n\n----------\n"
+        f"Path = private/child.txt\nFolder = -\nSize = {len(member)}\n"
+        f"Packed Size = 2\nEncrypted = -\nMethod = RAR:29\n\n"
+    )
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    async def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        if argv[0] == "/usr/bin/7z" and argv[1] == "l":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+            )
+        if argv[0] == "/usr/bin/7z":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.NON_ZERO_EXIT,
+                2,
+                b"partial 7z output",
+                b"ERROR: Unsupported Method\n",
+            )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, member, b"")
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH,
+        b"mocked archive bytes",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=32 * 1024,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+    )
+    report = _read_result(result)
+    record = report["members"][0]
+    bsdtar_argv, bsdtar_kwargs = calls[2]
+
+    assert record["status"] == "hashed"
+    assert record["sha256"] == hashlib.sha256(member).hexdigest()
+    assert record["archive_decoder"] == "bsdtar"
+    assert report["uncompressed_bytes_read"] == len(member)
+    assert bsdtar_argv[:2] == ["/usr/bin/bsdtar", "-xOf"]
+    assert bsdtar_argv[-2:] == ["--", "private/child.txt"]
+    assert bsdtar_kwargs["output_limit"] == len(member)
+    assert bsdtar_kwargs["memory_limit_bytes"] == 128 * 1024 * 1024
+    assert bsdtar_kwargs["environment"] == {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    assert bsdtar_kwargs["deny_network"] is True
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_7z_rar_codec_failure_uses_bsdtar_for_extract_member(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    member = b"data"
+    listing = (
+        "Path = sample.bin\nType = Rar\nPhysical Size = 100\n\n----------\n"
+        f"Path = present.txt\nFolder = -\nSize = {len(member)}\n"
+        f"Packed Size = 2\nEncrypted = -\nMethod = RAR:29\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv[0] == "/usr/bin/7z" and argv[1] == "l":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+            )
+        if argv[0] == "/usr/bin/7z":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.NON_ZERO_EXIT,
+                2,
+                b"",
+                b"ERROR: Unsupported Method\n",
+            )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, member, b"")
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"mocked archive bytes",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="present.txt",
+        expected_sha256=hashlib.sha256(member).hexdigest(),
+    )
+
+    assert result["member_status"] == "extracted"
+    assert result["_member_bytes"] == member
+    assert result["member_sha256"] == hashlib.sha256(member).hexdigest()
+    assert result["archive_decoder"] == "bsdtar"
+    assert calls[2][0] == "/usr/bin/bsdtar"
+    assert calls[2][-2:] == ["--", "present.txt"]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_extract_member_rejects_option_like_member_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    listing = (
+        "Path = sample.bin\nType = Rar\nPhysical Size = 100\n\n----------\n"
+        "Path = --evil\nFolder = -\nSize = 4\nPacked Size = 2\n"
+        "Encrypted = -\nMethod = RAR:29\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"mocked archive bytes",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="--evil",
+    )
+
+    assert result["member_status"] == "invalid_member_name"
+    assert result["detail_code"] == "archive_member_path_invalid"
+    assert len(calls) == 1
+    assert calls[0][1] == "l"
+
+
+@pytest.mark.asyncio
+async def test_bsdtar_fallback_enforces_member_output_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    listing = (
+        "Path = sample.bin\nType = Rar\nPhysical Size = 100\n\n----------\n"
+        "Path = present.txt\nFolder = -\nSize = 4\nPacked Size = 2\n"
+        "Encrypted = -\nMethod = RAR:29\n\n"
+    )
+    bsdtar_calls: list[dict[str, object]] = []
+
+    async def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/7z" and argv[1] == "l":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+            )
+        if argv[0] == "/usr/bin/7z":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.NON_ZERO_EXIT,
+                2,
+                b"",
+                b"ERROR: Unsupported Method\n",
+            )
+        bsdtar_calls.append(kwargs)
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.OUTPUT_LIMIT, 0, b"data", b""
+        )
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        b"mocked archive bytes",
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="present.txt",
+    )
+
+    assert result["member_status"] == "actual_size_or_member_limit"
+    assert result["detail_code"] == "archive_member_output_limit"
+    assert bsdtar_calls[0]["output_limit"] == 4
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_bsdtar_failure_reports_clear_code_and_redacted_stderr(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     listing = (
@@ -823,12 +1030,21 @@ async def test_7z_extract_hash_reports_codec_failure_method_and_redacted_stderr(
     )
 
     async def fake_run(argv, **_kwargs):
-        if argv[1] == "l":
+        if argv[0] == "/usr/bin/7z" and argv[1] == "l":
             return AnalysisSubprocessResult(
                 AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
             )
-        stderr = f"ERROR: Unsupported Method : {argv[-2]} {argv[-1]}\n".encode()
-        return AnalysisSubprocessResult(AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr)
+        if argv[0] == "/usr/bin/7z":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.NON_ZERO_EXIT,
+                2,
+                b"partial output",
+                b"ERROR: Unsupported Method\n",
+            )
+        stderr = f"bsdtar: Could not decompress {argv[2]} {argv[-1]}\n".encode()
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr
+        )
 
     monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
     _redirect_archive_tempdir(monkeypatch, tmp_path)
@@ -846,12 +1062,12 @@ async def test_7z_extract_hash_reports_codec_failure_method_and_redacted_stderr(
     report = _read_result(result)
     member = report["members"][0]
 
-    assert result["detail_code"] == "archive_codec_unsupported"
+    assert result["detail_code"] == "archive_bsdtar_extract_failed"
     assert member["status"] == "extract_failed"
-    assert member["detail_code"] == "archive_codec_unsupported"
+    assert member["detail_code"] == "archive_bsdtar_extract_failed"
     assert member["method"] == "RAR:29"
     assert member["archive_method"] == "RAR:29"
-    assert "Unsupported Method" in member["stderr_excerpt"]
+    assert "Could not decompress" in member["stderr_excerpt"]
     assert "<archive>" in member["stderr_excerpt"]
     assert "<member>" in member["stderr_excerpt"]
     assert "/tmp/cti-archive-" not in member["stderr_excerpt"]
@@ -913,7 +1129,7 @@ async def test_7z_extract_member_reports_clear_not_found_and_codec_diagnostics(
         member_path="present.txt",
     )
     assert failed["member_status"] == "extract_failed"
-    assert failed["detail_code"] == "archive_codec_unsupported"
+    assert failed["detail_code"] == "archive_bsdtar_extract_failed"
     assert failed["archive_method"] == "RAR:29"
     assert "/tmp/cti-archive-" not in failed["stderr_excerpt"]
     assert "present.txt" not in failed["stderr_excerpt"]
