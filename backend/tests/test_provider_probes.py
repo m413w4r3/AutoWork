@@ -104,7 +104,7 @@ async def test_offline_preflight_passes_six_mocked_provider_contracts_only() -> 
     [
         (401, VirusTotalHttpError, "virustotal_upstream_unauthorized"),
         (403, VirusTotalNotAuthorizedError, None),
-        (404, VirusTotalHttpError, "virustotal_not_found"),
+        (404, VirusTotalHttpError, "virustotal_http_404_unattributed"),
         (429, VirusTotalQuotaExceededError, None),
     ],
 )

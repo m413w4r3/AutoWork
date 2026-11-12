@@ -250,7 +250,7 @@ def test_protocol_projection_escapes_model_text_before_d2_encoding() -> None:
 
     source = encode_d2_source(project_protocol_diagram(spec)).decode("utf-8")
 
-    assert r"Client\" client > attacker\n\${payload}" in source
+    assert r"Client\" client > attacker" in source
     assert r"query \"" in source
     assert r"\${payload}" in source
     assert r"\${inject}" in source

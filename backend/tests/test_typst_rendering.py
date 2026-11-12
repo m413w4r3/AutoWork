@@ -797,11 +797,8 @@ def test_opinion_traceability_maps_superseded_finding_versions_to_current_ids(
     rendered_block_refs = opinion_section["blocks"][0]["finding_refs"]
 
     assert [item["reference_id"] for item in finding_refs] == [str(current.id)]
-    assert [item["reference_id"] for item in rendered_block_refs] == [
-        str(current.id),
-        str(current.id),
-        str(current.id),
-    ]
+    # Repeated citations of the same logical finding are rendered once.
+    assert [item["reference_id"] for item in rendered_block_refs] == [str(current.id)]
     assert augmented.provenance.finding_version_logical_ids == ((cited_version.id, current.id),)
     assert opinion.content_sha256 == augmented.provenance.opinion_content_sha256
     assert opinion.blocks[0].finding_refs == (

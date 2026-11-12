@@ -555,7 +555,8 @@ async def test_real_typst_brief_opinion_preview_keeps_tables_without_technical_a
     assert "Synthetic table preface marker." in text
     assert "PIPE_ROW_45" in text and "Synthetic table note marker." in text
     assert "Run token" in text
-    assert "1,2" in compact_text
+    assert "[F1]" in compact_text
+    assert "[E1]" in compact_text
     assert re.sub(r"\s+", "", code_text) in compact_text
     assert re.sub(r"\s+", " ", code_text).strip() in re.sub(r"\s+", " ", text)
     assert "PROVENANCE DE PUBLICATION" not in text
