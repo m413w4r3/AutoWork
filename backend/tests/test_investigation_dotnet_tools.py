@@ -188,6 +188,56 @@ async def test_dotnet_tools_use_canonical_blob_and_report_the_actual_engine() ->
     assert any("C2" in item for item in evidence["limitations"])
 
     execution.result = {
+        "status": "OBFUSCATED",
+        "operation": "methods",
+        "records": [
+            {
+                "rid": rid,
+                "token": f"0x060000{rid:02x}",
+                "type_name": "Fixture",
+                "method_name": "method\x01" if rid == 1 else f"method{rid}",
+                "signature": f"void method{rid}()",
+            }
+            for rid in range(1, 201)
+        ],
+        "total_items": 409,
+        "offset": 0,
+        "limit": 200,
+        "next_offset": 200,
+        "truncated": True,
+        "obfuscation_assessment": "likely_renamed",
+        "obfuscation_metrics": {"eligible_name_count": 409},
+    }
+    large_page = await adapter.execute(
+        {"sample_sha256": SAMPLE_SHA256, "offset": 0, "limit": 200}, context
+    )
+    page_result = large_page.output["result"]
+    assert page_result["records"]
+    assert page_result["next_offset"] == len(page_result["records"])
+    assert [record["rid"] for record in page_result["records"]] == sorted(
+        record["rid"] for record in page_result["records"]
+    )
+    assert all("\x01" not in record["method_name"] for record in page_result["records"])
+    assert any(r"\u0001" in record["method_name"] for record in page_result["records"])
+
+    execution.result = {
+        "status": "SUCCEEDED",
+        "operation": "methods",
+        "records": [],
+        "total_items": 0,
+        "offset": 0,
+        "limit": 200,
+        "next_offset": None,
+        "truncated": False,
+    }
+    empty_page = await adapter.execute(
+        {"sample_sha256": SAMPLE_SHA256, "offset": 0, "limit": 200}, context
+    )
+    assert empty_page.output["result"]["records"] == []
+    assert empty_page.output["result"]["next_offset"] is None
+    assert empty_page.output["result"]["detail_code"] == "dotnet_methods_empty"
+
+    execution.result = {
         "status": "PARTIAL",
         "operation": "decompile",
         "engine": "monodis-fallback",

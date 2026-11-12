@@ -867,7 +867,9 @@ def test_advisor_observation_payload_is_not_truncated_by_configured_size_cap() -
     assert "complete result " * 20 in payload["payload"]
 
 
-def _read_operator_observation(payload: dict[str, Any]):
+def _read_operator_observation(
+    payload: dict[str, Any], *, offset: int = 0, length: int = 32_000
+):
     canonical = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     blob_id = uuid4()
     observation_id = uuid4()
@@ -917,7 +919,7 @@ def _read_operator_observation(payload: dict[str, Any]):
     client.app.state.identity_provider = OperatorIdentityProvider()
     response = client.get(
         f"/api/investigations/{INVESTIGATION_ID}/operator/observations/{observation_id}",
-        params={"offset": 0, "length": 32_000},
+        params={"offset": offset, "length": length},
     )
     return response
 
@@ -953,6 +955,42 @@ def test_operator_observation_reads_verified_xxd_base64_utf8_chunks() -> None:
     assert decoded == xxd_output
     assert len(decoded) == visible["output_byte_length"] == 9_728
     assert hashlib.sha256(decoded).hexdigest() == visible["output_sha256"]
+
+
+def test_operator_observation_reads_paged_strings_text_beyond_the_preview() -> None:
+    sample_sha256 = "e" * 64
+    strings_output = b"A" * 45_000 + b"LITERAL_AFTER_4000_CHAR_PREVIEW"
+    encoded_output = base64.b64encode(strings_output).decode("ascii")
+    chunks = [
+        encoded_output[index : index + 4_000] for index in range(0, len(encoded_output), 4_000)
+    ]
+    payload = {
+        "schema": "local-command-execution.v1",
+        "command_id": "strings",
+        "sample_sha256": sample_sha256,
+        "output_encoding": "base64-utf8",
+        "output_byte_length": len(strings_output),
+        "output_sha256": hashlib.sha256(strings_output).hexdigest(),
+        "output_chunks": chunks,
+    }
+
+    offset = 0
+    pages = []
+    while True:
+        response = _read_operator_observation(payload, offset=offset)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        pages.append(page["payload"])
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+
+    visible = json.loads("".join(pages))
+    decoded = base64.b64decode("".join(visible["output_chunks"]), validate=True)
+    assert len(pages) > 1
+    assert visible["output_chunks"] == chunks
+    assert decoded == strings_output
+    assert b"LITERAL_AFTER_4000_CHAR_PREVIEW" in decoded
 
 
 def test_operator_observation_masks_non_utf8_declared_text_chunks() -> None:

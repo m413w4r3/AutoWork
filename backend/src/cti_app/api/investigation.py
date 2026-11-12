@@ -598,7 +598,7 @@ def _observation_base64_text_chunk_spec(
         return None
     if (
         value.get("schema") == "local-command-execution.v1"
-        and value.get("command_id") == "xxd"
+        and value.get("command_id") in {"xxd", "strings"}
         and value.get("output_encoding") == "base64-utf8"
     ):
         return ("output_chunks", "output_byte_length", "output_sha256", _LOCAL_TEXT_CHUNK_MAX_BYTES)
