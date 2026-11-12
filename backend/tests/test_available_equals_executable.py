@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -1097,9 +1097,15 @@ async def test_trusted_download_failure_terminality_is_limited_to_vt_404(
     expected_status: ToolInvocationStatus,
     second_is_success: bool,
 ) -> None:
-    fixture, state, registry, _summaries, operator_service, _tools, _identifiers = (
-        await _seeded_fixture()
-    )
+    (
+        fixture,
+        state,
+        registry,
+        _summaries,
+        operator_service,
+        _tools,
+        _identifiers,
+    ) = await _seeded_fixture()
     capabilities = frozenset((*fixture.available_capabilities, VT_FILE_DOWNLOAD_CAPABILITY))
     fixture.available_capabilities = capabilities
     fixture.service._available_capabilities = capabilities

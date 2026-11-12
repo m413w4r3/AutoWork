@@ -271,9 +271,7 @@ class ToolResult:
     error_code: str | None = None
     framework_pre_submission_proof: FrameworkPreSubmissionProof | None = None
     idempotent_replay: bool = False
-    framework_terminal_external_effect_failure: (
-        FrameworkTerminalExternalEffectFailure | None
-    ) = None
+    framework_terminal_external_effect_failure: FrameworkTerminalExternalEffectFailure | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ToolInvocationStatus):

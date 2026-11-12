@@ -2192,9 +2192,7 @@ async def test_real_postgres_download_404_is_terminal_and_server_error_needs_rev
             )
         assert invocation.status is expected_status
         assert len(invocation.response_refs) == 1
-        observation = next(
-            item for item in observations if item.id == invocation.response_refs[0]
-        )
+        observation = next(item for item in observations if item.id == invocation.response_refs[0])
         assert failed_attempt is not None
         assert envelope is not None
         if response_status == 404:

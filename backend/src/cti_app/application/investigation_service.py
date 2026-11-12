@@ -36,14 +36,14 @@ from cti_app.application.external_effects import (
     external_effect_source_do_not_submit_blocks,
     external_effect_source_restriction_reason,
 )
+from cti_app.application.investigation_acquisition_tools import (
+    is_trusted_vt_download_sample_adapter,
+)
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
     InvestigationContextV1,
     parse_investigation_context,
     validate_decision_hypothesis_references,
-)
-from cti_app.application.investigation_acquisition_tools import (
-    is_trusted_vt_download_sample_adapter,
 )
 from cti_app.application.investigation_findings import (
     constrain_supported_assessment,

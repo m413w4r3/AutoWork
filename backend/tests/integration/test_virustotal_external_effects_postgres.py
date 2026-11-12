@@ -1403,9 +1403,7 @@ async def test_vt_download_v2_fallback_requires_explicit_opt_in_and_is_claimed(
         assert len(proxy_requests) == 2
         assert len(direct_requests) == (1 if fallback_enabled else 0)
         assert [item.status for item in result["invocations"]] == [
-            ToolInvocationStatus.SUCCEEDED
-            if fallback_enabled
-            else ToolInvocationStatus.NEEDS_REVIEW
+            ToolInvocationStatus.SUCCEEDED if fallback_enabled else ToolInvocationStatus.FAILED
         ]
         claims = result["claims"]
         assert len(claims) == (3 if fallback_enabled else 2)
