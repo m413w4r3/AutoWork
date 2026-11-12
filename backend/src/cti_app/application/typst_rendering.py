@@ -451,9 +451,6 @@ def _opinion_traceability_refs(
         logical_reference["reference_id_spans"] = _breakable_typst_display_text(
             str(logical_id), interval=8
         )
-        href = logical_reference.get("href")
-        if isinstance(href, str) and "/" in href:
-            logical_reference["href"] = href.rsplit("/", 1)[0] + "/" + str(logical_id)
         result.append(logical_reference)
     return result
 
@@ -2595,7 +2592,6 @@ def project_publication_to_typst_model(
     reference_blocks = list(
         rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
     )
-    investigation_id = opinion.investigation_id if opinion is not None else None
     preview_findings_by_logical_id: dict[UUID, InvestigationFinding] = {}
     preview_evidence_by_id: dict[UUID, EvidenceObservation] = {}
     if draft_preview is not None:
@@ -2613,7 +2609,6 @@ def project_publication_to_typst_model(
 
     def opinion_citation(kind: str, reference_id: UUID) -> dict[str, Any]:
         noun = "Constat" if kind == "finding" else "Évidence"
-        uri_kind = "findings" if kind == "finding" else "evidence"
         displayed_id = (
             finding_version_logical_ids.get(reference_id, reference_id)
             if kind == "finding"
@@ -2637,7 +2632,6 @@ def project_publication_to_typst_model(
             "label": short_label,
             "target_id": target_id,
             "note_number": note_number,
-            "href": f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}",
             "reference_id": reference_text,
             "kind": kind,
             "display_label": display_label,
@@ -2652,7 +2646,6 @@ def project_publication_to_typst_model(
                 "kind": kind,
                 "reference_id": reference_text,
                 "reference_id_spans": _breakable_typst_display_text(reference_text, interval=8),
-                "href": reference["href"],
                 "display_label": display_label,
             }
         )
@@ -2668,7 +2661,15 @@ def project_publication_to_typst_model(
         kind: str,
         reference_ids: tuple[UUID, ...],
     ) -> list[dict[str, Any]]:
-        return [opinion_citation(kind, reference_id) for reference_id in reference_ids]
+        references: list[dict[str, Any]] = []
+        seen_labels: set[str] = set()
+        for reference_id in reference_ids:
+            reference = opinion_citation(kind, reference_id)
+            if reference["label"] in seen_labels:
+                continue
+            seen_labels.add(reference["label"])
+            references.append(reference)
+        return references
 
     lead_fingerprints = {
         " ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead
@@ -3140,7 +3141,7 @@ def project_publication_to_typst_model(
         reference_row["number"] = index
         reference_source_id = reference_row.get("_source_id")
         if isinstance(reference_source_id, UUID):
-            target_id = f"publication-source-{reference_source_id.hex}-{index:04d}"
+            target_id = f"publication-source-{index:04d}"
             reference_row["target_id"] = target_id
             reference_source_ids = reference_row.get("_source_ids", (reference_source_id,))
             for source_id in reference_source_ids:
