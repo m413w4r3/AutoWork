@@ -847,10 +847,38 @@ class ArchiveExtractMemberAdapter:
                 if isinstance(worker_result, Mapping)
                 else "extract_failed"
             )
+            raw_detail_code = (
+                worker_result.get("detail_code")
+                if isinstance(worker_result, Mapping)
+                else None
+            )
+            detail_code = (
+                raw_detail_code
+                if isinstance(raw_detail_code, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", raw_detail_code)
+                else f"archive_member_{status}"
+            )
+            failure_output: dict[str, Any] = {
+                "parent_sha256": parent.sha256,
+                "member_path": member_path,
+                "detail_code": detail_code,
+            }
+            if isinstance(worker_result, Mapping):
+                archive_method = worker_result.get("archive_method")
+                if isinstance(archive_method, str) and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9:._+ -]{0,63}", archive_method
+                ):
+                    failure_output["archive_method"] = archive_method
+                stderr_excerpt = worker_result.get("stderr_excerpt")
+                if isinstance(stderr_excerpt, str) and len(stderr_excerpt) <= 512:
+                    failure_output["stderr_excerpt"] = "".join(
+                        " " if ord(character) < 32 or ord(character) == 127 else character
+                        for character in stderr_excerpt
+                    )
             return ToolResult(
                 ToolInvocationStatus.FAILED,
-                output={"parent_sha256": parent.sha256, "member_path": member_path},
-                message=f"Archive member extraction failed ({status}).",
+                output=failure_output,
+                message=detail_code,
                 error_code=f"archive_member_{status}",
                 budget_consumed=consumed(),
             )

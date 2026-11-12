@@ -33,10 +33,18 @@ from cti_app.infrastructure.analysis_subprocess import (
 _ZIP_OUTPUT_SCHEMA = "zip-members.v1"
 _ARCHIVE_OUTPUT_SCHEMA = "archive-members.v1"
 _MAX_REPORTED_NAME_CHARS = 512
+_MAX_ARCHIVE_STDERR_CHARS = 512
 _CHUNK_BYTES = 64 * 1024
 _MAX_ZIP_METADATA_BYTES = 32 * 1024 * 1024
 _CRC_ERROR = re.compile(r"crc", re.I)
 _PASSWORD_ERROR = re.compile(r"password|encrypted", re.I)
+_UNSUPPORTED_CODEC_ERROR = re.compile(
+    r"unsupported method|unsupported compression|cannot find codec|codec not available",
+    re.I,
+)
+_SAFE_ARCHIVE_METHOD = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._+ -]{0,63}")
+_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?:[^\s\"']+)")
+_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"']+")
 
 
 class _ArchiveEntry(TypedDict):
@@ -432,6 +440,14 @@ async def run_7z_archive_command(
                     record["archive_error_code"] = _7z_start_error_code(extract)
                 else:
                     record["status"] = _member_failure_status(extract.stderr, entry)
+                    record.update(
+                        _member_failure_diagnostics(
+                            extract.stderr,
+                            entry,
+                            sample_path=sample_path,
+                            member_path=str(entry["name"]),
+                        )
+                    )
             records.append(record)
 
     truncation_reasons = []
@@ -454,7 +470,19 @@ async def run_7z_archive_command(
         tuple(truncation_reasons),
         total_read,
     )
-    return _worker_result(text, truncated, tool.value, tool_version)
+    result = _worker_result(text, truncated, tool.value, tool_version)
+    if tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH:
+        detail_code = next(
+            (
+                item["detail_code"]
+                for item in records
+                if isinstance(item.get("detail_code"), str)
+            ),
+            None,
+        )
+        if isinstance(detail_code, str):
+            result["detail_code"] = detail_code
+    return result
 
 
 def _parse_7z_listing(
@@ -525,10 +553,23 @@ async def _extract_7z_archive_member(
     memory_limit_bytes: int,
     tool_version: str | None,
 ) -> dict[str, Any]:
-    def refusal(status: str, *, error_code: str | None = None) -> dict[str, Any]:
+    def refusal(
+        status: str,
+        *,
+        error_code: str | None = None,
+        detail_code: str | None = None,
+        archive_method: str | None = None,
+        stderr_excerpt: str | None = None,
+    ) -> dict[str, Any]:
         report = {"schema_version": _ARCHIVE_OUTPUT_SCHEMA, "status": status}
         if error_code is not None:
             report["archive_error_code"] = error_code
+        if detail_code is not None:
+            report["detail_code"] = detail_code
+        if archive_method is not None:
+            report["archive_method"] = archive_method
+        if stderr_excerpt is not None:
+            report["stderr_excerpt"] = stderr_excerpt
         result = _worker_result(
             json.dumps(report, separators=(",", ":")),
             False,
@@ -538,35 +579,43 @@ async def _extract_7z_archive_member(
         result["member_status"] = status
         if error_code is not None:
             result["archive_error_code"] = error_code
+        if detail_code is not None:
+            result["detail_code"] = detail_code
+        if archive_method is not None:
+            result["archive_method"] = archive_method
+        if stderr_excerpt is not None:
+            result["stderr_excerpt"] = stderr_excerpt
         return result
 
     if not _safe_archive_member_path(member_path):
-        return refusal("invalid_member_name")
+        return refusal("invalid_member_name", detail_code="archive_member_path_invalid")
     matches = [entry for entry in entries if entry["name"] == member_path]
     if not matches:
-        return refusal("member_not_found")
+        return refusal("member_not_found", detail_code="archive_member_not_found")
     if len(matches) != 1:
-        return refusal("duplicate_name_ambiguous")
+        return refusal("duplicate_name_ambiguous", detail_code="archive_member_name_ambiguous")
     entry = matches[0]
     if entry["is_dir"]:
-        return refusal("directory")
+        return refusal("directory", detail_code="archive_member_is_directory")
     if entry["is_link"]:
-        return refusal("link_not_allowed")
+        return refusal("link_not_allowed", detail_code="archive_member_link_not_allowed")
     if entry["encrypted"] and archive_preset == "none":
-        return refusal("encrypted_password_required")
+        return refusal(
+            "encrypted_password_required", detail_code="archive_member_password_required"
+        )
     size = entry["size"]
     packed_size = entry["packed_size"]
     if size is None or size < 0:
-        return refusal("invalid_size_metadata")
+        return refusal("invalid_size_metadata", detail_code="archive_member_size_invalid")
     if size > LOCAL_ARCHIVE_MAX_MEMBER_BYTES:
-        return refusal("declared_member_size_limit")
+        return refusal("declared_member_size_limit", detail_code="archive_member_size_limit")
     if size > LOCAL_ARCHIVE_MAX_TOTAL_BYTES:
-        return refusal("declared_total_size_limit")
+        return refusal("declared_total_size_limit", detail_code="archive_total_size_limit")
     if size > max(1, packed_size or 0) * LOCAL_ARCHIVE_MAX_COMPRESSION_RATIO:
-        return refusal("compression_ratio_limit")
+        return refusal("compression_ratio_limit", detail_code="archive_compression_ratio_limit")
     remaining_timeout = deadline - time.monotonic()
     if remaining_timeout <= 0:
-        return refusal("timeout")
+        return refusal("timeout", detail_code="archive_member_timeout")
     extracted = await run_analysis_subprocess(
         [
             executable,
@@ -588,18 +637,43 @@ async def _extract_7z_archive_member(
     )
     data = extracted.stdout
     if extracted.status is AnalysisSubprocessStatus.TIMED_OUT:
-        return refusal("timeout")
+        return refusal("timeout", detail_code="archive_member_timeout")
     if extracted.status is AnalysisSubprocessStatus.FAILED_TO_START:
-        return refusal("7z_start_failed", error_code=_7z_start_error_code(extracted))
+        return refusal(
+            "7z_start_failed",
+            error_code=_7z_start_error_code(extracted),
+            detail_code="archive_tool_start_failed",
+        )
     if extracted.status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
-        return refusal("actual_size_or_member_limit")
+        return refusal(
+            "actual_size_or_member_limit", detail_code="archive_member_output_limit"
+        )
     if extracted.status is not AnalysisSubprocessStatus.SUCCEEDED:
-        return refusal(_member_failure_status(extracted.stderr, entry))
+        diagnostics = _member_failure_diagnostics(
+            extracted.stderr,
+            entry,
+            sample_path=sample_path,
+            member_path=member_path,
+        )
+        return refusal(
+            _member_failure_status(extracted.stderr, entry),
+            detail_code=str(diagnostics["detail_code"]),
+            archive_method=(
+                str(diagnostics["archive_method"])
+                if diagnostics.get("archive_method") is not None
+                else None
+            ),
+            stderr_excerpt=(
+                str(diagnostics["stderr_excerpt"])
+                if diagnostics.get("stderr_excerpt") is not None
+                else None
+            ),
+        )
     if len(data) != size or len(data) > LOCAL_ARCHIVE_MAX_MEMBER_BYTES:
-        return refusal("actual_size_mismatch")
+        return refusal("actual_size_mismatch", detail_code="archive_member_size_mismatch")
     digest = hashlib.sha256(data).hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:
-        return refusal("expected_sha256_mismatch")
+        return refusal("expected_sha256_mismatch", detail_code="archive_member_sha256_mismatch")
     result = _worker_result(
         json.dumps(
             {
@@ -644,7 +718,7 @@ def _archive_entry_record(entry: _ArchiveEntry) -> dict[str, object]:
         "size": entry.get("size"),
         "compressed_size": entry.get("packed_size"),
         "crc32": entry.get("crc32"),
-        "method": entry.get("method"),
+        "method": _safe_archive_method(entry.get("method")),
         "is_dir": entry.get("is_dir") is True,
         "encrypted": entry.get("encrypted") is True,
         "sha256": None,
@@ -661,6 +735,57 @@ def _member_failure_status(stderr: bytes, entry: _ArchiveEntry) -> str:
     if re.search(r"data error|headers error|unexpected end|can not open", text, re.I):
         return "corrupt_member"
     return "extract_failed"
+
+
+def _member_failure_diagnostics(
+    stderr: bytes,
+    entry: _ArchiveEntry,
+    *,
+    sample_path: Path,
+    member_path: str,
+) -> dict[str, str]:
+    text = stderr.decode("utf-8", "replace")[:4096]
+    if _UNSUPPORTED_CODEC_ERROR.search(text):
+        detail_code = "archive_codec_unsupported"
+    elif _CRC_ERROR.search(text):
+        detail_code = "archive_member_bad_crc"
+    elif _PASSWORD_ERROR.search(text) or entry.get("encrypted"):
+        detail_code = "archive_member_password_required"
+    elif re.search(r"data error|headers error|unexpected end|can not open", text, re.I):
+        detail_code = "archive_member_corrupt"
+    else:
+        detail_code = "archive_member_decompress_failed"
+
+    diagnostics = {"detail_code": detail_code}
+    safe_method = _safe_archive_method(entry.get("method"))
+    if safe_method is not None:
+        diagnostics["archive_method"] = safe_method
+    stderr_excerpt = _safe_archive_stderr(stderr, sample_path=sample_path, member_path=member_path)
+    if stderr_excerpt:
+        diagnostics["stderr_excerpt"] = stderr_excerpt
+    return diagnostics
+
+
+def _safe_archive_method(value: object) -> str | None:
+    if not isinstance(value, str) or _SAFE_ARCHIVE_METHOD.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _safe_archive_stderr(stderr: bytes, *, sample_path: Path, member_path: str) -> str:
+    text = stderr.decode("utf-8", "replace")[:4096]
+    sensitive_values = {str(sample_path), sample_path.name, member_path}
+    for sensitive in sorted(sensitive_values, key=len, reverse=True):
+        if sensitive:
+            text = text.replace(sensitive, "<archive>" if sensitive != member_path else "<member>")
+    text = _WINDOWS_PATH.sub("<path>", text)
+    text = _ABSOLUTE_PATH.sub("<path>", text)
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    first_line = "".join(
+        " " if ord(character) < 32 or ord(character) == 127 else character
+        for character in first_line
+    )
+    return " ".join(first_line.split())[:_MAX_ARCHIVE_STDERR_CHARS]
 
 
 def _7z_status(result: Any, stderr: bytes) -> str:

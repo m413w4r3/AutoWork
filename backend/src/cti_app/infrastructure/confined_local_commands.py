@@ -32,6 +32,7 @@ from cti_app.domain.local_analysis import (
 from cti_app.infrastructure.local_command_runner import _render_yara_rule
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DETAIL_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
 
 
 class ConfinedLocalCommands:
@@ -342,6 +343,7 @@ class ConfinedLocalCommands:
                 LocalCommandId.ARCHIVE_EXTRACT_HASH: "local_7z",
             }[normalized_id]
             version = self.execution.attestation.versions.get(version_key)
+        detail_code = _worker_detail_code(result_data)
         return LocalCommandResult(
             command_id=normalized_id,
             status=status,
@@ -352,11 +354,7 @@ class ConfinedLocalCommands:
             exit_code=_optional_int(result_data.get("return_code")),
             duration_seconds=duration,
             started_at=started_at,
-            detail_code=(
-                str(result_data.get("available_reason"))
-                if result_data.get("available_reason") is not None
-                else None
-            ),
+            detail_code=detail_code,
         )
 
     async def _canonical_sample(
@@ -419,3 +417,12 @@ def _result(
         started_at=started_at,
         duration_seconds=duration_seconds,
     )
+
+
+def _worker_detail_code(result_data: Mapping[str, Any]) -> str | None:
+    detail_code = result_data.get("available_reason")
+    if detail_code is None:
+        detail_code = result_data.get("detail_code")
+    if not isinstance(detail_code, str) or _DETAIL_CODE.fullmatch(detail_code) is None:
+        return None
+    return detail_code

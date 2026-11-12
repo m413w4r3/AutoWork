@@ -2141,6 +2141,7 @@ def _reduce_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "code_ngram_count",
             "error_type",
             "available_reason",
+            "detail_code",
             "return_code",
             "truncated",
             "mode",

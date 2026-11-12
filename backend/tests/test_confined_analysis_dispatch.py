@@ -72,6 +72,7 @@ from cti_app.workers.confined_analysis import (
     ConfinedAnalysisArtifactMismatch,
     _extract_monodis_method_body,
     _parse_monodis_method_table,
+    _reduce_result,
     _run_capa,
     _run_floss,
     _run_local_command,
@@ -867,6 +868,18 @@ def test_archive_capabilities_require_worker_and_7z_attestations() -> None:
     old_worker = _attestation_from_response(json.dumps(payload).encode(), settings)
     assert old_worker.families["zip_members"].available is False
     assert old_worker.families["archive_tools"].available is False
+
+
+def test_worker_result_reduction_preserves_archive_detail_code() -> None:
+    reduced = _reduce_result(
+        {
+            "status": "SUCCEEDED",
+            "detail_code": "archive_codec_unsupported",
+            "stdout": "large bounded archive report",
+        }
+    )
+
+    assert reduced["detail_code"] == "archive_codec_unsupported"
 
 
 def test_apk_family_requires_pinned_jadx_hash_and_supported_jre() -> None:

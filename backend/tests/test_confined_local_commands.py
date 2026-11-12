@@ -26,7 +26,10 @@ from cti_app.application.local_analysis import (
 from cti_app.config import Settings
 from cti_app.domain.investigation import SampleOrigin
 from cti_app.domain.local_analysis import LocalCommandId, LocalCommandStatus
-from cti_app.infrastructure.confined_local_commands import ConfinedLocalCommands
+from cti_app.infrastructure.confined_local_commands import (
+    ConfinedLocalCommands,
+    _worker_detail_code,
+)
 from cti_app.workers.confined_analysis import (
     _monodis_package_version,
     _run_monodis,
@@ -86,6 +89,16 @@ def _full_catalog() -> LocalCommandCatalog:
         ),
         which=lambda name: f"/usr/bin/{name}",
     )
+
+
+def test_confined_local_command_preserves_worker_detail_code() -> None:
+    assert _worker_detail_code({"detail_code": "archive_codec_unsupported"}) == (
+        "archive_codec_unsupported"
+    )
+    assert _worker_detail_code({"available_reason": "worker_unavailable"}) == (
+        "worker_unavailable"
+    )
+    assert _worker_detail_code({"detail_code": "/tmp/private/sample.rar"}) is None
 
 
 @pytest.mark.asyncio

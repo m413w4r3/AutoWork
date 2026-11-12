@@ -2060,6 +2060,13 @@ class OperatorToolInvocationService:
         }:
             if safe_nested_error_code is not None:
                 result_data = {"error_code": safe_nested_error_code}
+                if invocation.tool_name == "archive.extract_member" and tool_result is not None:
+                    result_data.update(
+                        _archive_extract_member_failure_details(
+                            tool_result.output,
+                            invocation.normalized_parameters,
+                        )
+                    )
                 if safe_nested_error_code == "vt_hash_not_grounded":
                     result_data["reason"] = safe_nested_error_code
                     result_data["detail_code"] = safe_nested_error_code
@@ -2262,6 +2269,41 @@ def _safe_operator_error_code(value: object, parameters: Mapping[str, Any]) -> s
     if value.casefold() in _parameter_string_values(parameters):
         return None
     return value
+
+
+def _archive_extract_member_failure_details(
+    output: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> dict[str, str]:
+    """Preserve only bounded diagnostics emitted by the confined archive worker."""
+    details: dict[str, str] = {}
+    detail_code = _safe_operator_error_code(output.get("detail_code"), parameters)
+    if detail_code is not None:
+        details["detail_code"] = detail_code
+
+    method = output.get("archive_method")
+    if (
+        isinstance(method, str)
+        and len(method) <= 64
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._+ -]{0,63}", method)
+    ):
+        details["archive_method"] = method
+
+    excerpt = output.get("stderr_excerpt")
+    if isinstance(excerpt, str):
+        excerpt = excerpt.splitlines()[0] if excerpt.splitlines() else ""
+        member_path = parameters.get("member_path")
+        if isinstance(member_path, str) and member_path:
+            excerpt = excerpt.replace(member_path, "<member>")
+        excerpt = re.sub(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"']+", "<path>", excerpt)
+        excerpt = re.sub(r"(?<![A-Za-z0-9])/(?:[^\s\"']+)", "<path>", excerpt)
+        excerpt = "".join(
+            " " if ord(character) < 32 or ord(character) == 127 else character
+            for character in excerpt
+        )
+        excerpt = " ".join(excerpt.split())[:512]
+        if excerpt:
+            details["stderr_excerpt"] = excerpt
+    return details
 
 
 def _operator_validation_errors(value: Any) -> list[dict[str, str]]:
