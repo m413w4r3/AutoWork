@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -31,10 +33,26 @@ from cti_app.application.typst_compilation import (
     TypstOutputInvalidError,
     TypstOutputTooLargeError,
 )
+from cti_app.logging import get_correlation_id
 
 TYPST_PROCESS_LOCALE = "C.UTF-8"
 TYPST_EXIT_REAP_TIMEOUT_SECONDS = 5.0
 _READ_CHUNK_BYTES = 64 * 1024
+_LOGGER = logging.getLogger(__name__)
+_DIAGNOSTIC_HEADER = re.compile(r"^(error|warning|hint|help|note):\s*(.*)$", re.IGNORECASE)
+_SOURCE_LOCATION = re.compile(r"\s*[:](\d+):(\d+)\s*$")
+_QUOTED_VALUE = re.compile(
+    r'(?:"[^"\n]*"|\'[^\'\n]*\'|`[^`\n]*`|\u201c[^\u201d\n]*\u201d|\u2018[^\u2019\n]*\u2019)'
+)
+_URL_VALUE = re.compile(r"\b(?:https?|hxxps?)://[^\s,;]+", re.IGNORECASE)
+_EMAIL_VALUE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+_DOMAIN_VALUE = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+_IPV4_VALUE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_IPV6_VALUE = re.compile(r"(?<![\w:])(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}(?![\w:])", re.IGNORECASE)
+_UUID_VALUE = re.compile(r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", re.IGNORECASE)
+_LONG_HEX_VALUE = re.compile(r"\b[0-9a-f]{32,}\b", re.IGNORECASE)
+_UNIX_PATH = re.compile(r"(?<!\w)/(?:[^\s/:]+/)*[^\s/:]+")
+_WINDOWS_PATH = re.compile(r"\b[A-Za-z]:\\[^\s,;]+")
 
 
 class TypstProcessStatus(StrEnum):
@@ -222,6 +240,42 @@ def _stderr_note(stderr: bytes) -> str:
     return f": {text[:512]}"
 
 
+def _safe_stderr_excerpt(stderr: bytes) -> str:
+    """Keep Typst error summaries and locations, omitting echoed source text."""
+    if not stderr:
+        return "(compiler returned no stderr)"
+
+    lines: list[str] = []
+    for line in stderr.decode("utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        header = _DIAGNOSTIC_HEADER.match(stripped)
+        if header is not None and header.group(1).lower() == "error":
+            message = _QUOTED_VALUE.sub("[value]", header.group(2))
+            for pattern in (
+                _URL_VALUE,
+                _EMAIL_VALUE,
+                _DOMAIN_VALUE,
+                _IPV4_VALUE,
+                _IPV6_VALUE,
+                _UUID_VALUE,
+                _LONG_HEX_VALUE,
+                _UNIX_PATH,
+                _WINDOWS_PATH,
+            ):
+                message = pattern.sub("[value]", message)
+            message = "".join(char if char.isprintable() else " " for char in message)
+            lines.append(f"error: {message.strip()}")
+            continue
+
+        location = _SOURCE_LOCATION.search(stripped)
+        if location is not None and any(marker in stripped for marker in ("┌", "╭", "-->")):
+            lines.append(f"source line {location.group(1)}, column {location.group(2)}")
+
+    if not lines:
+        return f"(stderr summary omitted; {len(stderr)} bytes; source text omitted)"
+    return " | ".join(lines)[:2000]
+
+
 def _raise_process_failure(result: TypstProcessResult) -> None:
     if result.status is TypstProcessStatus.SUCCEEDED and result.exit_code == 0:
         return
@@ -302,6 +356,14 @@ class TypstSubprocessCompiler:
             )
         )
         result = await self._run(argv)
+        if result.status is not TypstProcessStatus.SUCCEEDED or result.exit_code != 0:
+            _LOGGER.warning(
+                "typst_compile_failed correlation_id=%s status=%s exit_code=%s stderr_excerpt=%s",
+                get_correlation_id(),
+                result.status.value,
+                result.exit_code,
+                _safe_stderr_excerpt(result.stderr),
+            )
         _raise_process_failure(result)
 
         try:

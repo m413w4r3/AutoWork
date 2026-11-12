@@ -59,6 +59,7 @@ from cti_app.domain.semantic_annotation import (
     section_paragraph_anchor,
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from tests.test_publication_augmentation import _reduced_article03_draft_preview
 from tests.test_publication_builder_v4 import _cited_technical_context_case
 from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 from tests.test_publication_v4 import _SOURCE_ID
@@ -1567,6 +1568,42 @@ async def test_real_typst_compiles_representative_workspace_deterministically(
         "identical Typst workspace produced different PDF SHA-256 values: "
         f"{first.sha256} != {second.sha256}"
     )
+
+
+@pytest.mark.asyncio
+async def test_real_typst_compiles_reduced_article03_draft_preview(
+    tmp_path: Path, typst_binary: str, font_bundle_root: Path
+) -> None:
+    base = _base_v5()
+    preview = _reduced_article03_draft_preview(base)
+    bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
+    render_source = TypstRenderer().render(
+        preview,
+        bundle,
+        document_label=_PUBLICATION_RENDER_LABEL,
+    )
+    render_data = json.loads(render_source.render_data_bytes)
+    workspace_root = tmp_path / "reduced-art03-opinion-workspace"
+    _build_runtime_workspace(
+        _REPOSITORY_ROOT,
+        workspace_root,
+        render_data=render_data,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "reduced-art03-opinion-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    assert len(reader.pages) >= 1
+    assert not reader.is_encrypted
+    assert "Anonymized opinion block" in (reader.pages[0].extract_text() or "")
 
 
 @pytest.mark.asyncio
