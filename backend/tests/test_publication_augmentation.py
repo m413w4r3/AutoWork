@@ -15,9 +15,14 @@ from cti_app.application.publication_augmentation import (
     PublicationAugmentationErrorCode,
     augment_publication_with_opinion,
 )
-from cti_app.application.typst_rendering import project_publication_to_typst_model
+from cti_app.application.typst_rendering import (
+    TypstDraftPreviewDocument,
+    project_publication_to_typst_model,
+)
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
+    OpinionBlockType,
+    OpinionClaimQualification,
 )
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -29,6 +34,61 @@ from cti_app.domain.publication_document import (
     serialize_publication_document,
 )
 from tests.test_publication_document_v6 import _approved_opinion, _base_v5
+
+
+def _reduced_article03_draft_preview(base: PublicationDocumentV5) -> TypstDraftPreviewDocument:
+    opinion, _context = _approved_opinion(base)
+    block_types = (
+        OpinionBlockType.KEY_FINDINGS,
+        OpinionBlockType.NETWORK_AND_INFRASTRUCTURE,
+        OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES,
+        OpinionBlockType.PROPOSED_DETECTIONS,
+        OpinionBlockType.CLAIM_VERIFICATION,
+        OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
+    )
+    finding_ref_counts = (10, 12, 11, 2, 8, 8)
+    evidence_ref_counts = (10, 11, 12, 7, 8, 8)
+    qualifications = (
+        OpinionClaimQualification.INFERENCE,
+        OpinionClaimQualification.FACT,
+        OpinionClaimQualification.INFERENCE,
+        OpinionClaimQualification.INFERENCE,
+        OpinionClaimQualification.INFERENCE,
+        OpinionClaimQualification.HYPOTHESIS,
+    )
+    blocks = []
+    for index, block_type in enumerate(block_types):
+        finding_start = 2_000 + sum(finding_ref_counts[:index])
+        evidence_start = 3_000 + sum(evidence_ref_counts[:index])
+        blocks.append(
+            replace(
+                opinion.blocks[0],
+                block_type=block_type,
+                text=f"Anonymized opinion block {index + 1}.",
+                finding_refs=tuple(
+                    UUID(int=finding_start + ref_index)
+                    for ref_index in range(finding_ref_counts[index])
+                ),
+                evidence_refs=tuple(
+                    UUID(int=evidence_start + ref_index)
+                    for ref_index in range(evidence_ref_counts[index])
+                ),
+                qualification=qualifications[index],
+                certainty=0.7,
+                bridge_authored=False,
+                bridge_draft_ref=None,
+                bridge_review_ref=None,
+            )
+        )
+    draft = replace(
+        opinion,
+        status=AnalystOpinionStatus.DRAFT,
+        reviewer_id=None,
+        blocks=tuple(blocks),
+        unresolved_points=tuple(f"Anonymized unresolved point {index + 1}." for index in range(12)),
+        content_sha256="",
+    )
+    return TypstDraftPreviewDocument(base, draft)
 
 
 def test_augmentation_projects_ordered_blocks_and_keeps_v5_bytes_unchanged() -> None:
@@ -154,6 +214,22 @@ def test_empty_opinions_do_not_create_an_empty_render_section() -> None:
     assert isinstance(base, PublicationDocumentV5)
     v5_model = project_publication_to_typst_model(base)
     assert all(section["type"] != "analyst_opinion" for section in v5_model.content_sections)
+
+
+def test_reduced_article03_draft_projection_preserves_reference_and_unresolved_counts() -> None:
+    preview = _reduced_article03_draft_preview(_base_v5())
+
+    model = project_publication_to_typst_model(preview)
+    section = next(item for item in model.content_sections if item["type"] == "analyst_opinion")
+
+    assert preview.analyst_opinion.implant_materials == ()
+    assert preview.analyst_opinion.implant_materials_section is None
+    assert len(section["blocks"]) == 6
+    assert sum(len(item["finding_refs"]) for item in section["blocks"]) == 51
+    assert sum(len(item["evidence_refs"]) for item in section["blocks"]) == 56
+    assert len(section["unresolved_points"]) == 12
+    assert len(section["unresolved_point_render_data"]) == 12
+    assert all(item["text"].startswith("Anonymized opinion block") for item in section["blocks"])
 
 
 class _ArtifactRepository:

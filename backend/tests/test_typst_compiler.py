@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from io import BytesIO
 from pathlib import Path
@@ -36,6 +37,7 @@ from cti_app.infrastructure.typst_compiler import (
     TypstSubprocessCompiler,
     typst_process_environment,
 )
+from cti_app.logging import reset_correlation_id, set_correlation_id
 
 
 def _valid_pdf() -> bytes:
@@ -208,6 +210,46 @@ async def test_nonzero_exit_maps_to_compile_failed_with_stderr(tmp_path: Path) -
         await TypstSubprocessCompiler(runner=runner).compile(_request(tmp_path))
 
     assert error.value.code == "typst_compile_failed"
+
+
+@pytest.mark.asyncio
+async def test_nonzero_exit_logs_redacted_bounded_diagnostic_with_correlation_id(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    stderr = (
+        'error: invalid value "sensitive-token.example" in template\n'
+        "  ┌─ /tmp/private-workspace/RENDERER/publication.typ:42:5\n"
+        "42 │ sensitive-token.example\n"
+        "  │ ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    ).encode()
+    stderr += ("error: repeated diagnostic " * 100).encode()
+    runner = FakeTypstProcessRunner(
+        compile_result=TypstProcessResult(TypstProcessStatus.NON_ZERO_EXIT, 7, b"", stderr)
+    )
+    correlation_token = set_correlation_id("typst-preview-test-correlation")
+    try:
+        with caplog.at_level(logging.WARNING, logger="cti_app.infrastructure.typst_compiler"):
+            with pytest.raises(TypstCompileFailedError) as error:
+                await TypstSubprocessCompiler(runner=runner).compile(_request(tmp_path))
+    finally:
+        reset_correlation_id(correlation_token)
+
+    assert error.value.code == "typst_compile_failed"
+    warning = next(
+        record
+        for record in caplog.records
+        if record.name == "cti_app.infrastructure.typst_compiler"
+        and record.levelno == logging.WARNING
+    )
+    message = warning.getMessage()
+    assert "correlation_id=typst-preview-test-correlation" in message
+    assert "error: invalid value [value] in template" in message
+    assert "source line 42, column 5" in message
+    assert "sensitive-token.example" not in message
+    assert "/tmp/private-workspace" not in message
+    excerpt = message.split("stderr_excerpt=", maxsplit=1)[1]
+    assert len(excerpt) <= 2000
+    assert len(message) <= 2200
 
 
 @pytest.mark.asyncio
