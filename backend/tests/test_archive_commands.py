@@ -933,6 +933,57 @@ async def test_7z_rar_codec_failure_uses_bsdtar_for_extract_member(
 
 
 @pytest.mark.asyncio
+async def test_pe_sfx_rar_without_listing_type_uses_bsdtar_by_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    member = b"data"
+    listing = (
+        "Path = sample.bin\nPhysical Size = 100\n\n----------\n"
+        f"Path = present.txt\nFolder = -\nSize = {len(member)}\n"
+        "Packed Size = 2\nEncrypted = -\nMethod = m3:20\n\n"
+    )
+    calls: list[list[str]] = []
+
+    async def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv[0] == "/usr/bin/7z" and argv[1] == "l":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
+            )
+        if argv[0] == "/usr/bin/7z":
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.NON_ZERO_EXIT,
+                2,
+                b"",
+                b"ERROR: Unsupported Method : <member>\n",
+            )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, member, b"")
+
+    monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
+    _redirect_archive_tempdir(monkeypatch, tmp_path)
+    payload = b"MZ" + b"\x00" * 200 + b"Rar!\x1a\x07\x00" + b"\x00" * 64
+    result = await run_7z_archive_command(
+        ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER,
+        payload,
+        member_prefix=None,
+        max_members=10,
+        archive_preset="none",
+        max_output_bytes=4096,
+        timeout_seconds=20,
+        memory_limit_bytes=128 * 1024 * 1024,
+        tool_version="16.02",
+        member_path="present.txt",
+        expected_sha256=hashlib.sha256(member).hexdigest(),
+    )
+
+    assert result["member_status"] == "extracted"
+    assert result["archive_decoder"] == "bsdtar"
+    assert calls[2][0] == "/usr/bin/bsdtar"
+    assert calls[2][-2:] == ["--", "present.txt"]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_extract_member_rejects_option_like_member_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

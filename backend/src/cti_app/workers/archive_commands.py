@@ -463,8 +463,7 @@ async def run_7z_archive_command(
                         member_path=member_name,
                     )
                     rar_codec_failure = (
-                        archive_type is not None
-                        and archive_type.casefold().startswith("rar")
+                        _is_rar_archive(archive_type, payload)
                         and diagnostics["detail_code"] == "archive_codec_unsupported"
                     )
                     if rar_codec_failure and not _safe_bsdtar_member_path(member_name):
@@ -725,8 +724,7 @@ async def _extract_7z_archive_member(
             member_path=member_path,
         )
         if (
-            archive_type is not None
-            and archive_type.casefold().startswith("rar")
+            _is_rar_archive(archive_type, payload)
             and diagnostics["detail_code"] == "archive_codec_unsupported"
         ):
             if not _safe_bsdtar_member_path(member_path):
@@ -836,9 +834,16 @@ def _rar_archive_offset(payload: bytes) -> int | None:
     return min(offsets) if offsets else None
 
 
-def _prepare_bsdtar_archive(sample_path: Path, payload: bytes, *, archive_type: str) -> Path:
+def _is_rar_archive(archive_type: str | None, payload: bytes) -> bool:
+    """Recognise RAR by listing type or by signature (PE SFX stubs list no RAR type)."""
+    if archive_type is not None and archive_type.casefold().startswith("rar"):
+        return True
+    return _rar_archive_offset(payload) is not None
+
+
+def _prepare_bsdtar_archive(sample_path: Path, payload: bytes, *, archive_type: str | None) -> Path:
     """Strip an SFX prefix for RAR readers whose PE scan is deliberately bounded."""
-    offset = _rar_archive_offset(payload) if archive_type.casefold().startswith("rar") else None
+    offset = _rar_archive_offset(payload) if _is_rar_archive(archive_type, payload) else None
     if offset is None or offset == 0:
         return sample_path
 
